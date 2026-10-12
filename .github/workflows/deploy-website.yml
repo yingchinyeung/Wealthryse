@@ -1,0 +1,53 @@
+name: Deploy website
+
+# Manual: run it from the Actions tab (or the API) on main. It ships the
+# website code in src/ibkr_etl only; jobs, settings, secrets and sign-in
+# are left as they are. See deploy/website_release.py for the steps.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-website
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Identifiers of the wealthryse-github-deploy identity (not secrets). It can
+    # only sign in from this repo's main branch and only has the narrow
+    # "WealthRyse website release" role on the build VM and the website.
+    env:
+      AZURE_CLIENT_ID: 17708c85-b855-4209-81dd-a613a91315d3
+      AZURE_TENANT_ID: 0578a50b-a7a1-40a4-905b-8b20dba84124
+      AZURE_SUBSCRIPTION_ID: 3956e821-cee4-403f-8708-e84e2ed490eb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      - name: Check what changed since the live website
+        run: python deploy/website_release.py prepare
+      - name: Build the image on the private build VM
+        run: python deploy/website_release.py build
+      - name: Switch the website to the new image
+        run: python deploy/website_release.py deploy
+      - name: Check health and sign-in
+        run: python deploy/website_release.py verify
+      - name: Roll back if the switch or checks failed
+        if: failure() && hashFiles('release-state.json') != ''
+        run: |
+          if python -c "import json,sys;sys.exit(0 if 'revision' in json.load(open('release-state.json')) else 1)"; then
+            python deploy/website_release.py rollback
+          else
+            echo "Website was not changed; nothing to roll back."
+          fi

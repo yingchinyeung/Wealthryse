@@ -158,6 +158,14 @@ const showFreshness=latest=>{
 };
 wrTable('#holdings',{filter:'#holdings-filter',count:'#holdings-filter-count'});
 wrTable('#sector-detail',{stack:false});wrTable('#trade-history');wrTable('#cash-activity');wrTable('#flows-statement',{stack:false});
+const chartInk=(name,fallback)=>getComputedStyle(document.documentElement).getPropertyValue(name).trim()||fallback;
+const pageError=message=>{
+  let box=document.querySelector('#page-error');
+  if(!message){if(box)box.remove();return}
+  if(!box){box=document.createElement('div');box.id='page-error';box.className='card wide page-error';box.setAttribute('role','alert');document.querySelector('#portfolio-grid').prepend(box)}
+  box.innerHTML=`<strong>${esc(message)}</strong> <a href="/system-health">Check System health</a>`;
+};
+const loadFailure=(error,fallback)=>{const select=document.querySelector('#asof-select');if(select&&select.options.length===1&&select.options[0].textContent==='Loading…')select.options[0].textContent='Unavailable';document.querySelectorAll('.skeleton-line').forEach(x=>x.parentElement.remove());pageError(error&&error.message==='No NAV is available on or before this date'?'No NAV is available on or before this date. Pick a later As of date.':fallback)};
 const asOfLabel=value=>{const d=new Date(String(value).slice(0,10)+'T00:00:00Z');return Number.isNaN(d.getTime())?String(value):d.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric',timeZone:'UTC'})};
 document.querySelectorAll('.chart-mode').forEach(group=>group.addEventListener('click',event=>{
   const button=event.target.closest('button[data-mode]');if(!button)return;

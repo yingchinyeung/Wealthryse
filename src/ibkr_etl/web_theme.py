@@ -586,6 +586,8 @@ table.correlation-matrix th.text-col { text-align: left; }
 .chart-mode button:hover { color: var(--ink); background: rgba(255, 255, 255, .7); }
 .chart-mode button.active { color: #fff; background: var(--ink-soft); }
 .chart-view .legend { margin-top: 10px; }
+.page-error { margin-bottom: 16px; color: #9f1d14; background: rgba(180, 35, 24, .06); border-color: rgba(180, 35, 24, .22); }
+.page-error a { margin-left: 6px; color: inherit; font-weight: 650; }
 @media (max-width: 650px) {
   .account-hero-controls { flex-direction: column; align-items: stretch; }
   .asof-control .asof-select { min-width: 0; width: 100%; }

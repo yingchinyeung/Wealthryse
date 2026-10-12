@@ -262,5 +262,23 @@ class FailureStateTests(unittest.TestCase):
         self.assertIn("emptyMessage:'Drawdowns need at least two NAV dates.'", page)
 
 
+class DarkModeTests(unittest.TestCase):
+    def test_dark_theme_follows_the_computer_setting_on_every_page(self):
+        from ibkr_etl.web_theme import ACCOUNT_THEME_CSS, DARK_THEME_CSS, HOME_THEME_CSS
+        self.assertIn("@media screen and (prefers-color-scheme: dark)", DARK_THEME_CSS)
+        self.assertTrue(ACCOUNT_THEME_CSS.endswith(DARK_THEME_CSS))
+        self.assertTrue(HOME_THEME_CSS.endswith(DARK_THEME_CSS))
+        for token in ("--bg:", "--surface:", "--ink:", "--chart-grid:", "--chart-text:"):
+            self.assertIn(token, DARK_THEME_CSS)
+
+    def test_chart_lines_and_labels_use_theme_colours(self):
+        for source in (web._render_account_page({"email": "o@example.com", "role": "owner"},
+                                                account_id="U16088571", section="performance"),
+                       Path("deploy/live-merged/src/ibkr_etl/web.py").read_text(encoding="utf-8")):
+            self.assertIn("chartInk('--chart-grid','#e7ebf2')", source)
+            self.assertNotIn("ctx.strokeStyle='#e7ebf2'", source)
+            self.assertNotIn("ctx.fillStyle='#667085'", source)
+
+
 if __name__ == "__main__":
     unittest.main()

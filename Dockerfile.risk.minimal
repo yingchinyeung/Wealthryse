@@ -1,0 +1,22 @@
+# ISOLATED RISK CANDIDATE ONLY. Not the website or reporting runtime.
+FROM python:3.12.15-slim-bookworm@sha256:2ed6491b93cd49272ee6de2b5a38440c3448360322c089fc23e370722d74179d AS builder
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONPATH=/app/src
+WORKDIR /app
+COPY requirements.lock ./
+RUN python -m pip install --require-hashes -r requirements.lock && python -m pip check
+COPY src ./src
+COPY scripts/assemble_minimal_risk_runtime.py ./scripts/
+RUN python scripts/assemble_minimal_risk_runtime.py
+
+FROM scratch
+COPY --from=builder /runtime/ /
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    IBKR_PROJECT_ROOT=/app PYTHONPATH=/app/src LD_LIBRARY_PATH=/usr/local/lib \
+    PATH=/usr/local/bin SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+WORKDIR /app
+COPY src ./src
+COPY scripts/build_risk_snapshots.py scripts/check_risk_runtime.py scripts/audit_risk_cache.py scripts/assemble_minimal_risk_runtime.py ./scripts/
+COPY Dockerfile.risk.minimal requirements.lock SOURCE_MANIFEST.json ./
+USER 10001:10001
+RUN ["python", "scripts/check_risk_runtime.py"]
+CMD ["python", "scripts/build_risk_snapshots.py"]

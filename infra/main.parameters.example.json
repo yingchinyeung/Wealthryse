@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "prefix": { "value": "ibkrv11" },
+    "location": { "value": "eastasia" },
+    "administratorLogin": { "value": "ibkradmin" },
+    "administratorLoginPassword": { "value": "DO-NOT-STORE-A-REAL-PASSWORD-HERE" },
+    "applicationLoginPassword": { "value": "DO-NOT-STORE-A-REAL-PASSWORD-HERE" },
+    "ibkrFlexToken": { "value": "DO-NOT-STORE-A-REAL-TOKEN-HERE" },
+    "ibkrFlexQueryId": { "value": "DO-NOT-STORE-A-REAL-QUERY-ID-HERE" },
+    "postgresSkuName": { "value": "Standard_B1ms" },
+    "postgresSkuTier": { "value": "Burstable" }
+  }
+}

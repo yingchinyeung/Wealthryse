@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FlexQueryResponse queryName="Portfolio Database Daily" type="AF">
+  <FlexStatements count="1">
+    <FlexStatement accountId="U1234567" fromDate="20260817" toDate="20260818" period="Last 2 Calendar Days">
+      <AccountInformation accountId="U1234567" accountAlias="Main" baseCurrency="USD" accountType="Individual" ibEntity="IBHK" />
+      <FinancialInstrumentInformation>
+        <FinancialInstrument conid="265598" symbol="AAPL" description="APPLE INC" assetCategory="STK" currency="USD" listingExchange="NASDAQ" isin="US0378331005" />
+      </FinancialInstrumentInformation>
+      <Trades>
+        <Trade accountId="U1234567" currency="USD" assetCategory="STK" symbol="AAPL" conid="265598" tradeID="1001" ibExecID="0001.01" tradeDate="20260818" tradeTime="10:30:00" settleDateTarget="20260819" buySell="BUY" quantity="10" tradePrice="225.50" proceeds="-2255.00" ibCommission="-1.00" ibCommissionCurrency="USD" netCash="-2256.00" orderReference="test" />
+      </Trades>
+      <CashTransactions>
+        <CashTransaction accountId="U1234567" currency="USD" transactionID="CASH1" date="20260818" type="Deposits/Withdrawals" description="Deposit" amount="5000.00" />
+      </CashTransactions>
+      <OpenPositions>
+        <OpenPosition accountId="U1234567" currency="USD" assetCategory="STK" symbol="AAPL" conid="265598" reportDate="20260818" position="10" markPrice="226.00" positionValue="2260.00" costBasisMoney="2256.00" fifoPnlUnrealized="4.00" />
+      </OpenPositions>
+      <CashReport>
+        <CashReportCurrency accountId="U1234567" reportDate="20260818" currency="USD" endingCash="2744.00" settledCash="2744.00" fxRateToBase="1" />
+      </CashReport>
+      <NetAssetValue>
+        <NetAssetValueByAssetClass accountId="U1234567" reportDate="20260818" currency="USD" assetClass="TOTAL" total="5004.00" cash="2744.00" stock="2260.00" options="0" futures="0" bonds="0" accruals="0" />
+      </NetAssetValue>
+      <CurrencyConversionRates>
+        <ConversionRate accountId="U1234567" reportDate="20260818" currency="USD" baseCurrency="USD" rate="1" />
+      </CurrencyConversionRates>
+    </FlexStatement>
+  </FlexStatements>
+</FlexQueryResponse>
+

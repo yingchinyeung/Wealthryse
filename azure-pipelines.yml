@@ -1,0 +1,2 @@
+extends:
+  template: .azuredevops/ci.yml

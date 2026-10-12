@@ -1,0 +1,15 @@
+{
+  "catalog_sha256": "0c231c9cce20499aabf693206989a84cb0552d83bb6af80ec1ea471bfeb282bb",
+  "credentials_included": false,
+  "deployment_alias": "gpt-5-6-sol-apac",
+  "edits": [
+    "slug",
+    "upgrade"
+  ],
+  "inference_called": false,
+  "local_binary_sha256": "7d4588265a55adb1403f85d2e058b11dc971459842de84876c86ff02fb7771f2",
+  "native_entry_sha256": "6d1d665f8d03d6dfb18f51d87a510712a0f72fda44423538896b8e1c59427413",
+  "native_model": "gpt-5.6-sol",
+  "runtime_version": "0.160.0",
+  "schema": "codex-exec-bundled-catalog-v1"
+}

@@ -1,0 +1,50 @@
+trigger:
+  branches:
+    include:
+      - main
+      - institutional-onboarding-*
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  UV_CACHE_DIR: $(Pipeline.Workspace)/.uv-cache
+
+steps:
+  - checkout: self
+    clean: true
+    fetchDepth: 0
+
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.12'
+    displayName: Use Python 3.12
+
+  - script: |
+      python -m pip install --disable-pip-version-check uv
+      uv sync --frozen
+    displayName: Restore locked dependencies
+
+  - script: uv run --frozen python scripts/ci_policy_check.py
+    displayName: Enforce repository and secret policy
+
+  - script: uv run --frozen python -m compileall -q -x node_modules src scripts
+    displayName: Compile Python sources
+
+  - script: uv run --frozen python -m unittest discover -s tests -v
+    displayName: Run deterministic test suite
+
+  - script: |
+      set -euo pipefail
+      for template in infra/*.bicep; do
+        az bicep build --file "$template" --stdout >/dev/null
+      done
+    displayName: Compile infrastructure templates
+
+  - script: docker build --file Dockerfile --tag ibkr-platform:$(Build.BuildId) .
+    displayName: Build immutable application image

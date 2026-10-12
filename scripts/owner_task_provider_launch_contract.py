@@ -1,0 +1,329 @@
+"""Inert exact launch contract for the separately approved catalog observation.
+
+No source/environment reads, connector, secret lookup, cloud SDK, dispatch or
+model tool is provided here. A trusted controller supplies independently hashed
+source bytes and an independently accepted runtime descriptor. The returned
+definition is a candidate, not permission to create a job or start it. Each live
+mutation still needs its own protected reservation and fresh scoped readback.
+
+The emitted fixed trampoline rejects ambient libpq/TLS overrides and verifies
+the exact runtime BEFORE looking up the one secret environment variable. The
+secret is never embedded in argv, tags or returned metadata. Removing an env
+reference does not prove memory erasure or a restricted administrator capability.
+"""
+import base64
+from dataclasses import asdict
+import gzip
+import hashlib
+import json
+import math
+import re
+from types import MappingProxyType
+
+import owner_task_provider_runtime as runtime
+from ibkr_etl import owner_codex_catalog_transport as codec
+from ibkr_etl import owner_codex_isolated_target as registry
+
+
+OPERATION_ID = "4482b962-755d-4eda-987d-d954fc288143"
+CONTAINER = "isolated-provider-catalog"
+IMAGE = ("ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:"
+         "276a4783bf4ddf437bd5d449e08df39729fb43f449975082af80fd4c13e1142c")
+REGISTRY_SERVER = "ibkrv2stgauhecwc4itaoo.azurecr.io"
+SECRET_ENV = "OWNERTRIAL_ADMIN_URL"
+SECRET_VERSION_URL = ("https://ibkrv2stg-auhecwc4itaoo.vault.azure.net/secrets/"
+                      "ownertrial-20261004-admin-url/88cb24e00839444cb528ffe84427bb20")
+RUNTIME_SOURCE_PATH = "scripts/owner_task_provider_runtime.py"
+WORKER_SOURCE_PATHS = (
+    "src/ibkr_etl/owner_codex_isolated_target.py",
+    "src/ibkr_etl/owner_codex_catalog_transport.py",
+    "scripts/inspect_owner_task_isolated_provider.py",
+    "scripts/run_owner_task_isolated_provider_observation.py",
+)
+SOURCE_PATHS = WORKER_SOURCE_PATHS + (RUNTIME_SOURCE_PATH,)
+FROZEN_WORKER_HASHES = MappingProxyType({
+    WORKER_SOURCE_PATHS[0]: "de25392695ccd4e12e6fa3e861a7c853dbdc605b73b9e2f7cee0a8de163de7a2",
+    WORKER_SOURCE_PATHS[1]: "619d8f67e55526ac42f1eb32b16506eb0f0f085c521ca1d7d5848952acc4f3e1",
+    WORKER_SOURCE_PATHS[2]: "591e6c37f391ebbc99c42995e9a70419ae54f69254126a12ea0a67b76070830e",
+    WORKER_SOURCE_PATHS[3]: "c61d19ae105f6026231db55abd9e9f099c02ba03e74ceec719296ca53a8faa7d",
+})
+TLS_OVERRIDE_KEYS = frozenset(("SSL_CERT_FILE", "SSL_CERT_DIR", "OPENSSL_CONF", "OPENSSL_MODULES"))
+MAX_SOURCE_BYTES = 512 * 1024
+MAX_ARGS_BYTES = 65536
+_SHA = re.compile(r"[0-9a-f]{64}")
+_GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_CODES = frozenset(("launch_source_invalid", "launch_expected_runtime_invalid", "launch_environment_unsafe",
+    "launch_definition_invalid", "launch_readback_invalid", "launch_identity_invalid", "launch_contract_failed"))
+
+
+class LaunchContractError(ValueError):
+    """Fixed metadata codes only; no source, environment, secret or exceptions."""
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in _CODES else "launch_contract_failed"
+        super().__init__(self.code)
+
+
+def require(condition, code):
+    if not condition:
+        raise LaunchContractError(code)
+
+
+def _native(value, depth=0):
+    require(depth <= 64, "launch_definition_invalid")
+    if type(value) in (type(None), bool, int, str):
+        return
+    if type(value) is float:
+        require(math.isfinite(value), "launch_definition_invalid")
+        return
+    if type(value) is list:
+        for item in value:
+            _native(item, depth + 1)
+        return
+    require(type(value) is dict and all(type(key) is str for key in value), "launch_definition_invalid")
+    for item in value.values():
+        _native(item, depth + 1)
+
+
+def canonical(value):
+    _native(value)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                      allow_nan=False).encode("ascii")
+
+
+def digest(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def require_clean_environment(environment):
+    """Inspect supplied native key names only; never copy or inspect values."""
+    require(type(environment) is dict and all(type(key) is str and 0 < len(key) <= 512
+        and key.isascii() and all(char.isprintable() for char in key) for key in environment),
+            "launch_environment_unsafe")
+    require(not any(key.upper().startswith("PG") or key.upper() in TLS_OVERRIDE_KEYS
+                    for key in environment), "launch_environment_unsafe")
+    return dict(ambient_libpq_overrides_absent=True, ambient_tls_overrides_absent=True,
+                environment_values_read=False, credential_erasure_verified=False)
+
+
+# This static template is a separate reviewed artifact from the four-source
+# catalog binding. Inputs below are generated by build(), not caller argv.
+LAUNCHER_SOURCE = '''import hashlib,json,os,sys,types
+_secret = None
+try:
+    if any(type(_key) is not str or not 0 < len(_key) <= 512 or not _key.isascii() or not all(_char.isprintable() for _char in _key) or _key.upper().startswith("PG") or _key.upper() in ("SSL_CERT_FILE","SSL_CERT_DIR","OPENSSL_CONF","OPENSSL_MODULES") for _key in os.environ):
+        raise ValueError("provider_launch_environment_unsafe")
+    if set(_sources) != set(_expected_hashes):
+        raise ValueError("provider_launch_source_mismatch")
+    for _path in _sources:
+        if hashlib.sha256(_sources[_path].encode("utf-8")).hexdigest() != _expected_hashes[_path]:
+            raise ValueError("provider_launch_source_mismatch")
+    _package = types.ModuleType("ibkr_etl")
+    _package.__path__ = []
+    sys.modules["ibkr_etl"] = _package
+    for _path,_name in (
+        ("src/ibkr_etl/owner_codex_isolated_target.py","ibkr_etl.owner_codex_isolated_target"),
+        ("src/ibkr_etl/owner_codex_catalog_transport.py","ibkr_etl.owner_codex_catalog_transport"),
+        ("scripts/inspect_owner_task_isolated_provider.py","inspect_owner_task_isolated_provider"),
+        ("scripts/owner_task_provider_runtime.py","owner_task_provider_runtime")):
+        _module = types.ModuleType(_name)
+        _module.__file__ = _path
+        _module.__package__ = "ibkr_etl" if _name.startswith("ibkr_etl.") else ""
+        sys.modules[_name] = _module
+        if _name.startswith("ibkr_etl."):
+            setattr(_package,_name.rsplit(".",1)[1],_module)
+        exec(compile(_sources[_path],_path,"exec"),_module.__dict__)
+    _runtime = sys.modules["owner_task_provider_runtime"]
+    _runtime.validate_descriptor(_expected_runtime)
+    if _runtime.check_runtime() != _expected_runtime:
+        raise ValueError("provider_launch_runtime_mismatch")
+    _path = "scripts/run_owner_task_isolated_provider_observation.py"
+    _worker = types.ModuleType("run_owner_task_isolated_provider_observation")
+    _worker.__file__ = _path
+    _worker.__package__ = ""
+    sys.modules[_worker.__name__] = _worker
+    exec(compile(_sources[_path],_path,"exec"),_worker.__dict__)
+    import psycopg
+    _secret = os.environ.pop("OWNERTRIAL_ADMIN_URL",None)
+    if type(_secret) is not str or not _secret:
+        raise ValueError("provider_launch_secret_unavailable")
+    _worker.main(_binding,_secret,connect=psycopg.connect)
+except BaseException:
+    print(json.dumps({"status":"provider_launch_not_accepted","automatic_retry":False,"provider_semantics_verified":False,"restricted_login_verified":False,"credential_isolation_verified":False}),flush=True)
+    raise SystemExit(1) from None
+finally:
+    _secret = None
+'''
+LAUNCHER_SOURCE_SHA256 = hashlib.sha256(LAUNCHER_SOURCE.encode("utf-8")).hexdigest()
+
+
+def _sources(source_bytes, expected_hashes):
+    require(type(source_bytes) is dict and type(expected_hashes) is dict
+        and set(source_bytes) == set(SOURCE_PATHS) and set(expected_hashes) == set(SOURCE_PATHS)
+        and all(type(key) is str for key in source_bytes) and all(type(key) is str for key in expected_hashes),
+        "launch_source_invalid")
+    require(all(type(expected_hashes[name]) is str and _SHA.fullmatch(expected_hashes[name])
+        and type(source_bytes[name]) is bytes and 0 < len(source_bytes[name]) <= MAX_SOURCE_BYTES
+        for name in SOURCE_PATHS), "launch_source_invalid")
+    require(sum(len(source_bytes[name]) for name in SOURCE_PATHS) <= MAX_SOURCE_BYTES, "launch_source_invalid")
+    require(all(expected_hashes[name] == FROZEN_WORKER_HASHES[name] for name in WORKER_SOURCE_PATHS),
+        "launch_source_invalid")
+    copied = {}
+    for name in SOURCE_PATHS:
+        require(hashlib.sha256(source_bytes[name]).hexdigest() == expected_hashes[name], "launch_source_invalid")
+        try:
+            copied[name] = source_bytes[name].decode("utf-8", errors="strict")
+            require("\x00" not in copied[name] and copied[name].encode("utf-8") == source_bytes[name],
+                    "launch_source_invalid")
+            compile(copied[name], name, "exec")  # Parsing only; no source execution.
+        except LaunchContractError:
+            raise
+        except Exception:
+            raise LaunchContractError("launch_source_invalid") from None
+    return copied, {name: expected_hashes[name] for name in SOURCE_PATHS}
+
+
+def _runtime_descriptor(value):
+    try:
+        _native(value)
+        result = runtime.validate_descriptor(value)
+        require(type(result) is dict and canonical(result) == canonical(value), "launch_expected_runtime_invalid")
+        return json.loads(canonical(result))
+    except LaunchContractError:
+        raise
+    except Exception:
+        raise LaunchContractError("launch_expected_runtime_invalid") from None
+
+
+def build(source_bytes, expected_hashes, expected_runtime):
+    """Pure deterministic candidate; no implied runtime acceptance or dispatch."""
+    try:
+        source, hashes = _sources(source_bytes, expected_hashes)
+        expected = _runtime_descriptor(expected_runtime)
+        worker_hashes = {name: hashes[name] for name in WORKER_SOURCE_PATHS}
+        binding = asdict(codec.Binding("provider", registry.PROFILE_KEY, registry.JOB_ID,
+                                      OPERATION_ID, digest(worker_hashes)))
+        script = ("_sources = " + repr(source) + "\n_expected_hashes = " + repr(hashes)
+            + "\n_expected_runtime = " + repr(expected) + "\n_binding = " + repr(binding) + "\n" + LAUNCHER_SOURCE)
+        packed = base64.b64encode(gzip.compress(script.encode("utf-8"), mtime=0)).decode("ascii")
+        args = ["-I", "-B", "-c", "import base64,gzip;exec(compile(gzip.decompress(base64.b64decode('"
+            + packed + "')),'owner-catalog-provider-launch','exec'))"]
+        require(len(canonical(args)) <= MAX_ARGS_BYTES, "launch_source_invalid")
+        metadata = dict(worker_source_sha256=binding["source_sha256"],
+            runtime_source_sha256=hashes[RUNTIME_SOURCE_PATH], launcher_source_sha256=LAUNCHER_SOURCE_SHA256,
+            full_source_sha256=hashlib.sha256(script.encode("utf-8")).hexdigest(),
+            expected_runtime_sha256=digest(expected))
+        definition = dict(location=registry.LOCATION,
+            identity=dict(type="UserAssigned", userAssignedIdentities={registry.IDENTITY_ID: {}}),
+            tags=dict(purpose="owner-isolated-provider-catalog", operation=OPERATION_ID,
+                profile=registry.PROFILE_KEY, workerSourceSha256=metadata["worker_source_sha256"],
+                runtimeSourceSha256=metadata["runtime_source_sha256"],
+                launcherSourceSha256=metadata["launcher_source_sha256"],
+                fullSourceSha256=metadata["full_source_sha256"],
+                expectedRuntimeSha256=metadata["expected_runtime_sha256"]),
+            properties=dict(environmentId=registry.ENVIRONMENT,
+                configuration=dict(triggerType="Manual", replicaTimeout=600, replicaRetryLimit=0,
+                    manualTriggerConfig=dict(parallelism=1, replicaCompletionCount=1),
+                    secrets=[dict(name=registry.SECRET_NAME, keyVaultUrl=SECRET_VERSION_URL,
+                                  identity=registry.IDENTITY_ID)],
+                    registries=[dict(server=REGISTRY_SERVER, identity=registry.IDENTITY_ID)]),
+                template=dict(containers=[dict(name=CONTAINER, image=IMAGE, command=["python"], args=args,
+                    env=[dict(name=SECRET_ENV, secretRef=registry.SECRET_NAME)],
+                    resources=dict(cpu=0.5, memory="1Gi"))])))
+        return dict(status="candidate_catalog_only_launch_contract", definition=definition,
+            definition_sha256=digest(definition), binding=binding, source_hashes=hashes,
+            expected_runtime=expected, **metadata, image_runtime_qualified=False,
+            effective_identity_permissions_verified=False, dispatch_authorized=False,
+            provider_semantics_verified=False, fresh_restricted_login_verified=False,
+            model_credential_containment_verified=False, owner_runtime_active=False,
+            six_specialist_runtimes_active=False, ibkr_source_writes=False)
+    except LaunchContractError:
+        raise
+    except Exception:
+        raise LaunchContractError("launch_contract_failed") from None
+
+
+def definition(source_bytes, expected_hashes, expected_runtime):
+    return build(source_bytes, expected_hashes, expected_runtime)["definition"]
+
+
+def validate_definition(value, source_bytes, expected_hashes, expected_runtime):
+    """Creation/start authority still belongs to a separate trusted controller."""
+    expected = definition(source_bytes, expected_hashes, expected_runtime)
+    require(canonical(value) == canonical(expected), "launch_definition_invalid")
+    return dict(definition_sha256=digest(expected), candidate_image=IMAGE,
+        dispatch_authorized=False, effective_identity_permissions_verified=False)
+
+
+def _empty(value):
+    return value is None or type(value) is list and not value
+
+
+def validate_template(value, source_bytes, expected_hashes, expected_runtime, *, execution=False):
+    require(type(execution) is bool, "launch_readback_invalid")
+    expected = definition(source_bytes, expected_hashes, expected_runtime)["properties"]["template"]
+    _native(value)
+    require(type(value) is dict and set(value) <= {"containers", "volumes", "initContainers"}
+        and _empty(value.get("volumes")) and _empty(value.get("initContainers")), "launch_readback_invalid")
+    containers = value.get("containers")
+    require(type(containers) is list and len(containers) == 1 and type(containers[0]) is dict,
+            "launch_readback_invalid")
+    actual, wanted = containers[0], expected["containers"][0]
+    require(set(actual) <= set(wanted) | {"volumeMounts", "probes"}
+        and _empty(actual.get("volumeMounts")) and _empty(actual.get("probes")), "launch_readback_invalid")
+    require(all(canonical(actual.get(key)) == canonical(wanted[key])
+        for key in ("name", "image", "command", "args")), "launch_readback_invalid")
+    env = actual.get("env")
+    require(type(env) is list and len(env) == 1 and type(env[0]) is dict
+        and set(env[0]) == {"name", "secretRef"} and env[0]["name"] == SECRET_ENV
+        and env[0]["secretRef"] in ((registry.SECRET_NAME, "cappjob-" + registry.JOB)
+                                  if execution else (registry.SECRET_NAME,)), "launch_readback_invalid")
+    resources = actual.get("resources")
+    require(type(resources) is dict and set(resources) <= {"cpu", "memory", "ephemeralStorage"}
+        and resources.get("ephemeralStorage", "") == ""
+        and canonical({key: resources.get(key) for key in ("cpu", "memory")}) == canonical(wanted["resources"]),
+        "launch_readback_invalid")
+    return dict(template_sha256=digest(expected), candidate_image=IMAGE,
+        secret_value_retained=False, key_vault_binding_verified=False, dispatch_authorized=False)
+
+
+def _guid(value):
+    require(type(value) is str and _GUID.fullmatch(value) is not None
+        and value != "00000000-0000-0000-0000-000000000000", "launch_identity_invalid")
+
+
+def validate_job(value, source_bytes, expected_hashes, expected_runtime, *, principal_id, client_id):
+    """Exact config readback, NOT effective RBAC or actual execution evidence."""
+    _guid(principal_id); _guid(client_id)
+    expected = definition(source_bytes, expected_hashes, expected_runtime)
+    _native(value)
+    require(type(value) is dict and set(value) <= {"id", "name", "type", "location", "tags", "identity",
+        "properties", "systemData"} and value.get("id") == registry.JOB_ID and value.get("name") == registry.JOB
+        and value.get("type") == "Microsoft.App/jobs" and value.get("location") in (registry.LOCATION, "East Asia")
+        and canonical(value.get("tags")) == canonical(expected["tags"]), "launch_readback_invalid")
+    identity = value.get("identity")
+    require(type(identity) is dict and set(identity) <= {"type", "userAssignedIdentities", "principalId", "tenantId"}
+        and identity.get("type") == "UserAssigned" and identity.get("principalId") is None
+        and identity.get("tenantId") is None, "launch_identity_invalid")
+    assigned = identity.get("userAssignedIdentities")
+    require(type(assigned) is dict and set(assigned) == {registry.IDENTITY_ID}
+        and type(assigned[registry.IDENTITY_ID]) is dict
+        and assigned[registry.IDENTITY_ID] == dict(principalId=principal_id, clientId=client_id),
+        "launch_identity_invalid")
+    properties = value.get("properties")
+    require(type(properties) is dict and set(properties) <= {"environmentId", "configuration", "template",
+        "provisioningState", "outboundIpAddresses", "workloadProfileName"}
+        and properties.get("environmentId") == registry.ENVIRONMENT
+        and properties.get("provisioningState") == "Succeeded"
+        and properties.get("workloadProfileName") in (None, "Consumption"), "launch_readback_invalid")
+    config = properties.get("configuration")
+    wanted = expected["properties"]["configuration"]
+    require(type(config) is dict and set(config) <= set(wanted) | {"scheduleTriggerConfig", "eventTriggerConfig"}
+        and config.get("scheduleTriggerConfig") is None and config.get("eventTriggerConfig") is None
+        and all(canonical(config.get(key)) == canonical(wanted[key]) for key in wanted), "launch_readback_invalid")
+    validate_template(properties.get("template"), source_bytes, expected_hashes, expected_runtime)
+    return dict(job_id=registry.JOB_ID, definition_sha256=digest(expected), candidate_image=IMAGE,
+        principal_id=principal_id, client_id=client_id, version_pinned_secret_configuration_verified=True,
+        effective_identity_permissions_verified=False, actual_execution_verified=False,
+        provider_semantics_verified=False, restricted_login_verified=False,
+        model_credential_containment_verified=False, credentials_retained=False,
+        owner_runtime_active=False, six_specialist_runtimes_active=False, ibkr_source_writes=False)

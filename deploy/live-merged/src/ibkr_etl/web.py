@@ -141,6 +141,7 @@ from .authorization import (
 from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_guide
 from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS
+from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
 from .holdings_view import combine_holdings, enrich_holdings
 from .sector_classification import YAHOO_PROVIDER as HOLDINGS_SECTOR_PROVIDER
 
@@ -1719,6 +1720,84 @@ def holdings(
         "snapshot_date": rows[0]["snapshot_date"] if rows else None,
         "holdings": rows,
     }
+
+
+@app.get("/api/portfolio/{account_id}/sectors")
+def sector_allocation(
+    account_id: str,
+    request: Request,
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Sector weights from the same validated tool the AI analyst and factsheets use."""
+    _portfolio_access_context(account_id, user)
+    requested_as_of = _parse_as_of(as_of)
+    context = AgentToolContext(
+        tenant_id=TENANT_ID,
+        actor_object_id=str(user.get("object_id") or user.get("email") or "viewer"),
+        allowed_subject_ids=frozenset({account_id}),
+        correlation_id=getattr(request.state, "correlation_id", str(uuid.uuid4())),
+    )
+    arguments = {"subject_id": account_id}
+    if requested_as_of:
+        arguments["as_of"] = requested_as_of
+    try:
+        with _database() as connection:
+            result = execute_tool(
+                _portable_database_connection(connection), context, "get_sector_allocation", arguments
+            )
+    except AgentToolError as error:
+        if error.status_code in (401, 403):
+            raise HTTPException(status_code=error.status_code, detail=error.code) from error
+        return {
+            "account_id": account_id,
+            "requested_as_of": requested_as_of,
+            "available": False,
+            "allocation": [],
+            "reason": str(error),
+            "code": error.code,
+        }
+    return {
+        "account_id": account_id,
+        "requested_as_of": requested_as_of,
+        "as_of": result["as_of"],
+        "quality_status": result["quality_status"],
+        **result["data"],
+    }
+
+
+@app.get("/api/accounts/overview")
+def accounts_overview(user: dict[str, object] = Depends(_authorized_user)) -> dict:
+    """Latest NAV, month-to-date and year-to-date return for each visible account."""
+    accounts = []
+    for subject in _account_directory(user):
+        subject_id = str(subject["subject_id"])
+        entry = {
+            "account_id": subject_id,
+            "currency": subject.get("reporting_currency"),
+            "nav": None,
+            "nav_date": None,
+            "mtd": None,
+            "ytd": None,
+        }
+        accounts.append(entry)
+        try:
+            access = _portfolio_access_context(subject_id, user)
+            with _database() as connection:
+                nav = _subject_nav_values(connection, subject_id, access, None)
+                if not nav:
+                    continue
+                entry["currency"] = access["reporting_currency"]
+                entry["nav_date"], latest = nav[-1]
+                entry["nav"] = float(latest)
+                flows = _subject_external_flows(connection, subject_id, access)
+            periods = calculate_performance_periods(nav, flows or {})["periods"]
+        except (HTTPException, PerformanceInputError, PostgresError, ValueError):
+            continue
+        for period in periods:
+            if period["key"] in ("mtd", "ytd") and period["status"] not in ("fail", "empty"):
+                entry[period["key"]] = period["twr"]
+    return {"accounts": accounts}
 
 
 @app.get("/api/holdings/combined")
@@ -4486,9 +4565,13 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
             start_label = str(start_value)
         account_cards.append(
             f'<a class="account-card" href="/accounts/{account}/overview">'
-            '<div class="account-badge">Managed portfolio</div>'
+            f'<div class="account-badge">{currency} reporting</div>'
             f'<div class="account-id">{account_display_name}</div>'
-            f'<div class="muted">{currency} reporting · Data from {escape(start_label)}</div>'
+            f'<div class="account-stats" data-account-stats="{account}">'
+            '<div class="account-nav-value" data-nav>…</div>'
+            '<div class="account-returns" data-returns></div>'
+            '<div class="muted" data-asof></div></div>'
+            f'<div class="muted account-since">Data from {escape(start_label)}</div>'
             '<div class="open">Open account <span aria-hidden="true">→</span></div></a>'
         )
     cards_html = "".join(account_cards) or (
@@ -4501,8 +4584,8 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
 <title>Accounts · {PLATFORM_NAME}</title>
 <style>{HOME_THEME_CSS}</style></head><body>
 <header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
-<main><section class="home-hero"><div class="eyebrow">Portfolio intelligence</div><h1>Accounts</h1><div class="lead">Select an account to open its portfolio workspace. Each workspace brings validated data, risk analytics and reporting into one institutional view.</div><div class="actions"><a class="button" href="/combined-holdings">Combined holdings</a></div></section><div class="accounts">{cards_html}</div></main>
-</body></html>"""
+<main><section class="home-hero"><div class="eyebrow">Portfolio intelligence</div><h1>Accounts</h1><div class="lead">Select an account to open its portfolio workspace.</div><div id="accounts-summary" class="accounts-summary" aria-live="polite"></div></section><div class="accounts">{cards_html}</div></main>
+{HOME_SCRIPT}</body></html>"""
 
 
 COMBINED_HOLDINGS_PAGE_SCRIPT = r"""
@@ -4511,6 +4594,8 @@ const esc=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','
 const json=async response=>{const payload=await response.json();if(!response.ok)throw new Error(payload.detail||`http_${response.status}`);return payload};
 const fmt=n=>n==null||n===''?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(n));
 const pct=n=>n==null?'—':new Intl.NumberFormat('en-US',{style:'percent',maximumFractionDigits:2}).format(Number(n));
+const money=n=>n==null||n===''||!Number.isFinite(Number(n))?'—':new Intl.NumberFormat('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}).format(Number(n)).replace(/^-/,'−');
+const toned=(text,n)=>!Number.isFinite(Number(n))||n==null||Math.abs(Number(n))<1e-12?text:`<span class="${Number(n)>0?'gain':'loss'}">${Number(n)>0?'+':''}${text.replace(/^-/,'−')}</span>`;
 const combinedForm=document.querySelector('#combined-form');
 const loadCombined=()=>{
   const currency=document.querySelector('#combined-currency').value.trim().toUpperCase()||'USD',asOf=document.querySelector('#combined-asof').value,params=new URLSearchParams({currency});
@@ -4519,11 +4604,12 @@ const loadCombined=()=>{
   fetch(`/api/holdings/combined?${params}`).then(json).then(data=>{
     document.querySelector('#combined-currency-label').textContent=data.currency;
     document.querySelector('#combined-accounts').innerHTML=data.accounts.map(item=>`<div class="status-item"><span class="label">${esc(item.display_name)}</span><strong>${esc(item.snapshot_date||'No snapshot')}</strong><span class="muted">${esc(item.holdings_count)} holdings${item.fx_missing_conids.length?` · ${esc(item.fx_missing_conids.length)} without FX`:''}</span></div>`).join('');
-    document.querySelector('#combined-holdings').innerHTML=data.holdings.map(x=>`<tr><td>${esc(x.symbol||x.conid)}</td><td>${esc(x.description||'')}</td><td>${esc(x.sector||'')}</td><td><details><summary>${esc(x.account_count)}</summary>${x.accounts.map(a=>`<div class="muted">${esc(a.display_name)}: ${fmt(a.quantity_text)} · ${a.fx_missing?'FX unavailable':esc(fmt(a.reporting_market_value_text))}</div>`).join('')}</details></td><td>${fmt(x.quantity_text)}</td><td>${fmt(x.reporting_market_value_text)}${x.incomplete?' <span class="muted" title="At least one account has no usable FX rate for this holding">(partial)</span>':''}</td><td>${fmt(x.reporting_cost_basis_text)}</td><td>${fmt(x.reporting_unrealized_pnl_text)}</td><td>${pct(x.unrealized_pnl_pct)}</td><td>${pct(x.weight)}</td></tr>`).join('')||'<tr><td colspan="10">No holdings are available for your accounts on or before this date.</td></tr>';
+    document.querySelector('#combined-holdings').innerHTML=data.holdings.map(x=>`<tr><td>${esc(x.symbol||x.conid)}</td><td>${esc(x.description||'')}</td><td>${esc(x.sector||'')}</td><td><details><summary>${esc(x.account_count)}</summary>${x.accounts.map(a=>`<div class="muted">${esc(a.display_name)}: ${fmt(a.quantity_text)} · ${a.fx_missing?'FX unavailable':esc(fmt(a.reporting_market_value_text))}</div>`).join('')}</details></td><td>${fmt(x.quantity_text)}</td><td>${money(x.reporting_market_value_text)}${x.incomplete?' <span class="muted" title="At least one account has no usable FX rate for this holding">(partial)</span>':''}</td><td>${money(x.reporting_cost_basis_text)}</td><td>${toned(money(x.reporting_unrealized_pnl_text),x.reporting_unrealized_pnl_text)}</td><td>${toned(pct(x.unrealized_pnl_pct),x.unrealized_pnl_pct)}</td><td data-sort="${x.weight??''}">${pct(x.weight)}</td></tr>`).join('')||'<tr><td colspan="10">No holdings are available for your accounts on or before this date.</td></tr>';
     document.querySelector('#combined-note').textContent=`${data.accounts.length} physical account(s) combined in ${data.currency}. Filtered and composite portfolios are excluded because they are built from these accounts. Each account uses its own latest snapshot and dated FX history. Weights are shares of gross combined holdings value (cash excluded).${data.incomplete?' Some holdings have no usable FX rate; their values are partial.':''}${data.skipped_accounts.length?` ${data.skipped_accounts.length} account(s) could not be included.`:''}`;
   }).catch(error=>{document.querySelector('#combined-note').textContent=`Combined holdings are unavailable: ${error.message}`;document.querySelector('#combined-holdings').innerHTML=''});
 };
 combinedForm.addEventListener('submit',event=>{event.preventDefault();loadCombined()});
+wrTable('#combined-holdings',{filter:'#combined-filter',count:'#combined-filter-count'});
 loadCombined();
 </script>
 """
@@ -10049,8 +10135,8 @@ def _render_platform_page(user: dict[str, str], *, section: str) -> str:
     platform_navigation = _platform_navigation(user, active=section)
     if section == "combined-holdings":
         description = "Latest holdings across every physical account you can view, converted into one currency with each account's own dated FX history and aggregated by instrument."
-        content = """<div class="page-view active" data-section="combined-holdings"><div class="card wide"><div class="label">Combined holdings</div><form id="combined-form" class="actions"><label><span class="label">Currency</span> <input id="combined-currency" name="currency" value="USD" maxlength="3" pattern="[A-Za-z]{3}" required size="4"></label><label><span class="label">As of</span> <input id="combined-asof" name="as_of" type="date"></label><button class="button" type="submit">Update</button></form><div id="combined-note" class="muted" aria-live="polite">Loading…</div><div id="combined-accounts" class="status-row"></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Accounts</th><th>Quantity</th><th>Value (<span id="combined-currency-label">USD</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="combined-holdings"></tbody></table></div></div></div>"""
-        script = COMBINED_HOLDINGS_PAGE_SCRIPT
+        content = """<div class="page-view active" data-section="combined-holdings"><div class="card wide"><div class="label">Combined holdings</div><form id="combined-form" class="actions"><label><span class="label">Currency</span> <input id="combined-currency" name="currency" value="USD" maxlength="3" pattern="[A-Za-z]{3}" required size="4"></label><label><span class="label">As of</span> <input id="combined-asof" name="as_of" type="date"></label><button class="button" type="submit">Update</button></form><div id="combined-note" class="muted" aria-live="polite">Loading…</div><div id="combined-accounts" class="status-row"></div><div class="table-tools"><input id="combined-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter combined holdings"><span id="combined-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Accounts</th><th>Quantity</th><th>Value (<span id="combined-currency-label">USD</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="combined-holdings"></tbody></table></div></div></div>"""
+        script = TABLE_SCRIPT + COMBINED_HOLDINGS_PAGE_SCRIPT
     elif section == "system-health":
         description = "Platform-wide data freshness, ingestion, benchmark, assurance and reporting status across every account and portfolio."
         content = """<div class="page-view active" data-section="system-health"><div class="card wide"><div class="label">Platform health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Benchmark coverage</div><div id="benchmark-health" class="status-row"></div></div><div class="card wide"><div class="label">Latest portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Platform acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>"""
@@ -10204,7 +10290,7 @@ def _render_account_page(
 <style>{ACCOUNT_THEME_CSS}</style></head>
 <body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
 <main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>{account_display_name}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{account_display_name}</h1><div class="muted">{reporting_currency} reporting · Data from {history_start_date}</div></div></div><nav class="account-nav" aria-label="{account} sections">{navigation}</nav><div class="account-toolbar"><div><div class="label">Account workspace</div><strong>{page_title}</strong></div><label class="asof-toolbar-control{' report-date-hidden' if section == 'reports' else ''}"><span class="label">As of</span><select id="asof-select" class="asof-select" aria-label="Portfolio as of date"><option>Loading…</option></select></label></div><h2>{page_title}</h2>
-<section class="grid" id="portfolio-grid">{preview_notice}<div class="page-view{active['overview']}" data-section="overview"><div class="card"><div class="label">NAV</div><div id="nav" class="value">—</div></div><div class="card"><div class="label">Observations</div><div id="obs" class="value">—</div></div><div class="card"><div class="label">Positions</div><div id="positions" class="value">—</div></div><div class="card"><div class="label">Reporting currency</div><div class="value">{reporting_currency}</div></div></div>
+<section class="grid" id="portfolio-grid">{preview_notice}<div class="page-view{active['overview']}" data-section="overview"><div class="card wide overview-nav"><div class="overview-nav-head"><div class="overview-nav-copy"><div class="label">Net asset value</div><div class="overview-nav-line"><span id="nav" class="value">—</span><span id="overview-day" class="overview-day"></span></div><div id="overview-asof" class="muted">{reporting_currency} reporting</div></div><svg id="overview-spark" class="overview-spark" viewBox="0 0 320 64" preserveAspectRatio="none" role="img" aria-label="NAV trend over the last year"></svg></div><div id="overview-returns" class="metrics overview-returns"></div></div><div class="card overview-half"><div class="label">Top holdings · <span id="positions">—</span> positions</div><div id="overview-holdings" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">All holdings <span aria-hidden="true">→</span></a></div><div class="card overview-half"><div class="label">Sector allocation</div><div id="overview-sectors" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">Sector detail <span aria-hidden="true">→</span></a></div></div>
 <div class="page-view{active['performance']}" data-section="performance">
 <div class="card wide"><div class="label">Comparison benchmark</div><select id="benchmark-select" aria-label="Comparison benchmark"></select><div id="benchmark" class="value">Loading…</div><div id="benchmark-note" class="muted"></div><div id="benchmark-metrics" class="metrics"></div></div>
 <div class="card wide"><div class="label">Rebased performance comparison</div><div class="legend"><span><i class="swatch portfolio"></i>{account_display_name}</span><span><i class="swatch index"></i><span id="benchmark-legend">Primary benchmark</span></span></div><div class="chart-wrap"><canvas id="benchmark-chart" width="1100" height="320" aria-label="Rebased performance comparison chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div>
@@ -10213,13 +10299,13 @@ def _render_account_page(
 <div class="page-view{active['risk']}" data-section="risk"><div class="card wide"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div></div>
 <div class="page-view{active['cash']}" data-section="cash"><div class="card wide"><div class="label"><span id="cash-kind">Cash balances</span> as of <span id="cash-asof">—</span></div><div id="cash-balances" class="metrics"></div><div id="cash-ledger-controls"><div class="label" style="margin-top:18px">Cash activity history</div><div class="muted">Choose a custom date range to view every matching IBKR cash activity. The CSV download contains the same complete filtered result.</div><div class="filter-grid"><label><span class="label">From</span><input id="cash-from" type="date" min="{history_start_date}" aria-label="Cash activity start date"></label><label><span class="label">To</span><input id="cash-to" type="date" min="{history_start_date}" aria-label="Cash activity end date"></label></div><div class="actions"><button id="cash-apply" class="button" type="button">Apply cash filters</button><a id="cash-export" class="button" href="#">Download cash activity CSV</a></div></div><div id="cash-note" class="muted" style="margin-top:12px">Loading cash activity…</div><div id="cash-ledger-table" class="table-scroll"><table><thead><tr><th>Date</th><th>Time</th><th>Type</th><th>Description</th><th>Currency</th><th>Amount</th></tr></thead><tbody id="cash-activity"></tbody></table></div></div></div>
 <div class="page-view{active['trades']}" data-section="trades"><div class="card wide"><div class="label">Trade history</div><div id="trade-source-title" class="value">Trade records</div><div id="trade-source-note" class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div id="trade-filter-controls" class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
-<div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
+<div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Sector allocation</div><div id="sector-summary" class="muted"></div><div id="sector-bars" class="sector-bars"></div><details class="sector-detail"><summary>Industries within each sector</summary><div class="table-scroll"><table><thead><tr><th class="text-col">Sector</th><th class="text-col">Industry</th><th class="text-col">Region</th><th>Holdings</th><th>Value (<span>{reporting_currency}</span>)</th><th>Weight</th></tr></thead><tbody id="sector-detail"></tbody></table></div></details><div id="sector-note" class="muted sector-note"></div></div><div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-tools"><input id="holdings-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter holdings"><span id="holdings-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
 <div class="page-view{active['reports']}" data-section="reports"><div class="card wide"><div class="label">Monthly factsheets and presentations</div><div class="value">Report centre</div><div id="report-note" class="muted">Loading frozen month-end reports…</div><div class="actions"><select id="report-month" aria-label="Monthly report period"></select><button id="report-prepare" class="button" type="button" disabled>Generate secure downloads</button></div><div id="report-status" class="muted" style="margin-top:14px"></div><div id="report-downloads" class="actions"></div><div id="report-owner-review" style="display:none;margin-top:22px"><h3>Review and release files</h3><p class="muted">Tick a file to make it available to authorized users. Untick it and submit to revoke its download access. The original file and approval history are retained. Review files before approving; client distribution remains prohibited.</p><div id="report-release-details" class="muted" style="margin-top:12px"></div><div id="report-release-list" style="display:grid;gap:12px;margin:16px 0"></div><button id="report-release" class="button" type="button" disabled>Submit approval changes</button><div id="report-release-status" class="muted" role="status" aria-live="polite"></div></div></div></div>
 <div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a><a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
 <div class="page-view{active['ai-analyst']}" data-section="ai-analyst"><div class="card wide ai-chat-card"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Saved chats</div><strong>AI Analyst</strong></div><button id="ai-new-chat" class="button" type="button">New chat</button></div><div id="ai-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="ai-chat-title">New conversation</strong><div id="agent-status" class="muted">Loading analyst…</div></div><div class="actions"><a id="ai-export-md" class="button" href="#" hidden>Save Markdown</a><a id="ai-export-json" class="button" href="#" hidden>Save JSON</a><button id="ai-archive-chat" class="button" type="button" hidden>Archive</button></div></div><div id="ai-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Live grounded analysis</div><div class="value">Ask about this portfolio</div><div id="agent-note" class="muted">The analyst uses validated portfolio tools for every figure and chart.</div><div class="ai-prompt-chips"><button class="ai-prompt-chip" type="button">Compare performance with the selected benchmark</button><button class="ai-prompt-chip" type="button">Explain the portfolio's main risks</button><button class="ai-prompt-chip" type="button">Show NAV history and key performance metrics</button></div></div></div><div class="ai-chat-composer"><textarea id="analysis-question" maxlength="1200" aria-label="Message the AI Portfolio Analyst" placeholder="Message the AI Portfolio Analyst…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Conversations save automatically</div><button id="analysis-run" class="button" type="button" disabled>Send</button></div></div></section></div></div></div>
 <div class="page-view{active['system-health']}" data-section="system-health"><div class="card wide"><div class="label">System health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Daily portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Stage 4 acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>
 <div class="page-view{active['administration']}" data-section="administration"><div class="admin-layout"><div class="card admin-overview"><div class="label">24/7 controlled autonomy</div><div id="autonomy-status" class="value">Loading…</div><div id="autonomy-note" class="muted"></div><div id="autonomy-summary" class="status-row"></div><div id="autonomy-incidents" class="muted"></div><div id="autonomy-reviews" class="muted"></div></div><div class="card admin-actions-panel"><div class="label">Owner-approved administrator actions</div><div id="admin-status" class="value">Loading…</div><div id="admin-note" class="muted"></div><div class="actions"><select id="admin-action" aria-label="Staging administrative action"></select><button id="admin-preview" class="button" type="button" disabled>Preview action</button></div><div id="admin-preview-result" class="muted" style="margin-top:14px"></div><div class="actions"><input id="admin-confirmation" type="text" maxlength="80" aria-label="Type the exact approval phrase" placeholder="Preview an action to obtain the approval phrase" disabled><button id="admin-execute" class="button" type="button" disabled>Approve and execute once</button></div><div id="admin-result" class="muted" style="margin-top:14px"></div></div></div></div></section></main>
-<script>
+{TABLE_SCRIPT}<script>
 const account='{account}'; const accountDisplayName={json.dumps(account_display_name_value, ensure_ascii=False)}; const reportingCurrency={json.dumps(reporting_currency_value)}; const historyStartDate={json.dumps(history_start_date_value)}; const activeSection={json.dumps(section)}; const previewMode={str(preview_mode).lower()}; const portalOwner={str(is_owner).lower()}; const fmt=n=>n==null||n===''?'—':new Intl.NumberFormat('en-US',{{maximumFractionDigits:2}}).format(Number(n));
 const pct=n=>{{if(n==null||!Number.isFinite(Number(n)))return '—';const formatter=new Intl.NumberFormat('en-US',{{style:'percent',maximumFractionDigits:2}}),parts=formatter.formatToParts(Number(n)),zero=parts.filter(p=>p.type==='integer'||p.type==='fraction').every(p=>Number(p.value)===0);return (zero?parts.filter(p=>p.type!=='minusSign'):parts).map(p=>p.value).join('');}};
 const axis=n=>new Intl.NumberFormat('en-US',{{maximumFractionDigits:2}}).format(Number(n));
@@ -10297,6 +10383,7 @@ draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio
 }};
 {RISK_DISPLAY_SCRIPT}
 const mergeRiskResponses=(core,details)=>{{const risk={{...core,...details}};if(core.cache_status!=='hit'||details.cache_status!=='hit'||core.snapshot_payload_sha256!==details.snapshot_payload_sha256){{risk.metrics={{}};risk.analytics_evidence={{}};risk.risk_free=null;risk.expected_tail_loss_contributors={{top:[],bottom:[]}};risk.crisis_replay=null;risk.cache_status='unavailable';risk.message=core.message||details.message||'Risk cache changed during this request; refresh to load one validated version.';}}return risk;}};
+{ACCOUNT_UI_SCRIPT}
 const renderAsOf=async asOf=>{{
 const grid=document.querySelector('#portfolio-grid');grid.classList.add('loading');
 try{{
@@ -10309,13 +10396,14 @@ const healthRequest=Promise.resolve({{environment:'staging',status:'available',m
 const [s,p,h,riskCore,riskDetails,health]=await Promise.all([fetch(`/api/portfolio/${{account}}/summary${{suffix}}`).then(json),performanceRequest,holdingsRequest,riskRequest,riskDetailsRequest,healthRequest]);
 const risk=activeSection==='risk'?mergeRiskResponses(riskCore,riskDetails):{{...riskCore,...riskDetails}};
 if(!s.latest_nav)throw new Error('No NAV is available on or before this date');
-document.querySelector('#nav').textContent=fmt(s.latest_nav.total_text)+' '+s.latest_nav.currency;
-document.querySelector('#obs').textContent=s.nav_coverage.observations;
+document.querySelector('#nav').textContent=money(s.latest_nav.total_text)+' '+s.latest_nav.currency;
 document.querySelector('#positions').textContent=s.current_positions;
+if(activeSection==='overview')await renderOverview(asOf,s);
+if(activeSection==='holdings')void renderSectors(asOf);
 document.querySelector('#holdings-asof').textContent=h.snapshot_date||'No snapshot';
 document.querySelector('#holdings-quantity-label').textContent=h.holdings.some(x=>x.holding_kind==='synthetic_exposure')?'Sleeve coefficient (not shares)':'Quantity';
 document.querySelector('#holdings-reporting-currency').textContent=h.reporting_currency||reportingCurrency;
-document.querySelector('#holdings').innerHTML=h.holdings.map(x=>`<tr><td>${{esc(x.symbol||x.conid)}}</td><td>${{esc(x.description||'')}}</td><td>${{esc(x.sector||'')}}</td><td>${{esc(x.currency||'')}}</td><td>${{fmt(x.holding_kind==='synthetic_exposure'?x.coefficient:x.quantity_text)}}</td><td>${{fmt(x.market_value_text)}}</td><td>${{x.fx_missing?'<span class="muted" title="No dated FX rate is available for this currency">FX unavailable</span>':fmt(x.reporting_market_value_text)}}</td><td>${{fmt(x.cost_basis_text)}}</td><td>${{fmt(x.unrealized_pnl_text)}}</td><td>${{pct(x.unrealized_pnl_pct)}}</td><td>${{pct(x.weight)}}</td></tr>`).join('')||'<tr><td colspan="11">No holdings snapshot is available on or before this date.</td></tr>';
+document.querySelector('#holdings').innerHTML=holdingsRows(h);
 document.querySelector('#holdings-note').textContent=h.weight_basis?`Cost basis and unrealized P&L are in each holding's own currency. Value is converted to ${{h.reporting_currency}} with the dated FX rate on or before the holdings date. Weight basis: ${{h.weight_basis==='nav'?'net asset value':'gross holdings value (NAV unavailable for this date)'}}.${{(h.fx_missing_conids||[]).length?` ${{h.fx_missing_conids.length}} holding(s) have no usable FX rate and are excluded from weights.`:''}}`:'';
 const rm=risk.metrics||{{}},riskItems=[['Total return',pct(rm.total_return)],['Annualized return',pct(rm.annualized_return)],['Annualized volatility',pct(rm.annualized_volatility)],['Risk-free rate',rm.risk_free_annual_rate==null?'Unavailable':pct(rm.risk_free_annual_rate)],['Sharpe ratio',rm.sharpe_ratio==null?'Unavailable':fmt(rm.sharpe_ratio)],['Expected maximum drawdown (1 year)',rm.expected_maximum_drawdown_1y==null?'Unavailable':pct(rm.expected_maximum_drawdown_1y)],['Actual maximum drawdown (1 year)',rm.actual_maximum_drawdown_1y==null?'Unavailable':pct(rm.actual_maximum_drawdown_1y)],['Tail maximum drawdown (1 year)',rm.tail_maximum_drawdown_1y==null?'Unavailable':pct(rm.tail_maximum_drawdown_1y)],['Crisis maximum drawdown (15/9/2008–9/3/2009)',rm.crisis_maximum_drawdown==null?'Unavailable':pct(rm.crisis_maximum_drawdown)],['VaR 95% — daily',pct(rm.var_95_daily)],['Daily Expected Tail Loss (95%)',pct(rm.daily_expected_tail_loss)],['Win rate',pct(rm.win_rate)],['BLUE mean daily return',pct(rm.blue_mean_daily_return)]];
 document.querySelector('#risk-asof').textContent=rm.period_end||risk.as_of||'—';document.querySelector('#risk-metrics').innerHTML=riskItems.map(metricCard).join('');const etl=risk.expected_tail_loss_contributors||{{}},contributorRows=items=>items.map(x=>`<tr><td><strong>${{esc(x.symbol||x.conid)}}</strong><div class="muted">${{esc(x.description||'')}}</div></td><td>${{pct(x.expected_tail_loss_contribution)}}</td></tr>`).join('')||'<tr><td colspan="2">Unavailable</td></tr>';document.querySelector('#etl-top').innerHTML=contributorRows(etl.top||[]);document.querySelector('#etl-bottom').innerHTML=contributorRows(etl.bottom||[]);const displayNotes=riskDisplayNotes(risk,pct);document.querySelector('#etl-note').textContent=displayNotes.attribution;document.querySelector('#risk-note').textContent=displayNotes.risk;

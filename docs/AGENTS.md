@@ -84,6 +84,10 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
    --principal id-wr-agent-tools=reader --principal id-wr-agent=writer --principal id-wr-agent-jobs=writer
    --grant holdings_explainer=<account> --grant month_end_drafter=<account> --grant data_quality=<account>
    ```
+   Only an Entra administrator can create the logins. If that administrator
+   doesn't own the platform tables, run it twice: first as the Entra
+   administrator with `--logins-only` and the `--principal` flags, then as the
+   table owner with `--existing-logins` and all the flags.
 4. **Image.** Build `Dockerfile.agent` on the private build VM and push it to
    the registry as `wealthryse-agent`.
 5. **Apps and jobs** (`infra/agent-apps.bicep`) with the outputs of steps 1

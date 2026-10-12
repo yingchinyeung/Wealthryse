@@ -82,6 +82,11 @@ from .monthly_reports import (
     validate_review_artifact,
 )
 from .monthly_release import review_package
+from .performance_periods import (
+    PerformanceInputError,
+    flow_statement,
+    performance_periods as calculate_performance_periods,
+)
 from . import report_design_updates
 from .report_design_ui import controls as report_design_controls, SCRIPT as REPORT_DESIGN_SCRIPT
 from .internal_release import InternalReleaseError
@@ -1411,6 +1416,127 @@ def performance(
         "currency": access["reporting_currency"],
         "as_of": requested_as_of,
         "series": values,
+    }
+
+
+COMPOSITE_FLOWS_REASON = (
+    "Composite portfolios are synthetic model sleeves without investor "
+    "contributions or withdrawals; returns use NAV changes only."
+)
+
+
+def _subject_external_flows(connection, account_id: str, access: dict) -> dict[str, float] | None:
+    """Net external flows per date in the NAV currency, or None for composites.
+
+    Flows come from the same reader as the website comparison. Physical and
+    filtered flows are in the account base currency, so a subject reporting
+    in another currency fails closed instead of mixing currencies.
+    """
+    subject_type = str(access.get("subject_type") or "physical_account")
+    if subject_type == "composite_portfolio":
+        return None
+    base_currency = access.get("base_currency")
+    if base_currency and str(base_currency).upper() != str(access["reporting_currency"]).upper():
+        raise HTTPException(
+            status_code=409,
+            detail="External flows are recorded in the base currency, which differs from the reporting currency.",
+        )
+    from .provisional_benchmark import _external_flows
+
+    try:
+        return _external_flows(
+            _portable_database_connection(connection), account_id, subject_type=subject_type
+        )
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+def _subject_nav_values(connection, account_id: str, access: dict, through: str | None) -> list[tuple[str, str]]:
+    rows = connection.execute(
+        """
+        SELECT snapshot_date, total_text
+        FROM subject_nav_series
+        WHERE tenant_id = %s AND subject_id = %s AND snapshot_date >= %s
+          AND currency = """
+        + ACTIVE_NAV_CURRENCY_SQL
+        + """
+          AND (%s::text IS NULL OR snapshot_date <= %s)
+        ORDER BY snapshot_date
+        """,
+        (TENANT_ID, account_id, access["history_start_date"], through, through),
+    ).fetchall()
+    return [
+        (str(row["snapshot_date"]), row["total_text"])
+        for row in rows
+        if row["total_text"] not in (None, "")
+    ]
+
+
+@app.get("/api/portfolio/{account_id}/performance/periods")
+def performance_periods_view(
+    account_id: str,
+    as_of: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    access = _portfolio_access_context(account_id, user)
+    requested_as_of = _parse_as_of(as_of)
+    custom_start, custom_end = _parse_as_of(start), _parse_as_of(end)
+    if custom_start and custom_end and custom_start > custom_end:
+        raise HTTPException(status_code=400, detail="The custom start date cannot be after the end date")
+    with _database() as connection:
+        nav = _subject_nav_values(connection, account_id, access, requested_as_of)
+        flows = _subject_external_flows(connection, account_id, access)
+    try:
+        result = calculate_performance_periods(
+            nav,
+            flows or {},
+            as_of=requested_as_of,
+            custom_start=custom_start,
+            custom_end=custom_end,
+        )
+    except PerformanceInputError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "account_id": account_id,
+        "currency": access["reporting_currency"],
+        **result,
+        "requested_as_of": requested_as_of,
+        "flows_applicable": flows is not None,
+        "flows_message": COMPOSITE_FLOWS_REASON if flows is None else "",
+        "methodology": (
+            "Time-weighted returns chain-link daily Modified Dietz returns between NAV "
+            "observations; flows dated on an observation day are inside that day's NAV. "
+            "Each period is valued from the last NAV before it starts. IRR is an annualised "
+            "XIRR on the opening value, external flows and closing value."
+        ),
+        "viewer": user["email"],
+    }
+
+
+@app.get("/api/portfolio/{account_id}/flows")
+def external_flows_statement(
+    account_id: str,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    access = _portfolio_access_context(account_id, user)
+    start = _parse_as_of(from_date) or str(access["history_start_date"])
+    end = _parse_as_of(to_date)
+    if end is not None and start > end:
+        raise HTTPException(status_code=400, detail="from_date cannot be after to_date")
+    with _database() as connection:
+        flows = _subject_external_flows(connection, account_id, access)
+    statement = flow_statement(flows or {}, start, end)
+    return {
+        "account_id": account_id,
+        "currency": access["reporting_currency"],
+        **statement,
+        "applicable": flows is not None,
+        "message": COMPOSITE_FLOWS_REASON if flows is None else "",
+        "viewer": user["email"],
     }
 
 
@@ -4153,6 +4279,22 @@ def export_csv(
     )
 
 
+BENCHMARK_RETURN_BASIS = {
+    "price": ("price_return", "Price return (excludes dividends)"),
+    "gross_total_return": ("total_return", "Gross total return (dividends reinvested)"),
+    "net_total_return": ("total_return", "Net total return (dividends reinvested after withholding)"),
+    "fund_total_return": ("total_return", "Fund total return"),
+}
+
+
+def _benchmark_return_basis(return_convention: object) -> dict[str, str]:
+    """Label the registered benchmark convention; unknown conventions stay explicit."""
+    basis, label = BENCHMARK_RETURN_BASIS.get(
+        str(return_convention or ""), ("unknown", "Return convention not registered")
+    )
+    return {"return_basis": basis, "return_basis_label": label}
+
+
 @app.get("/api/portfolio/{account_id}/benchmark-status")
 def benchmark_status(
     account_id: str, user: dict[str, str] = Depends(_authorized_user)
@@ -4201,6 +4343,7 @@ def benchmark_status(
     items = []
     for row in benchmarks:
         item = dict(row)
+        item.update(_benchmark_return_basis(item.get("return_convention")))
         item["publishable"] = (
             item["license_status"] == "approved"
             and int(item["observations"] or 0) >= 31
@@ -4312,6 +4455,11 @@ def benchmark_comparison(
         "internal_release_allowed": True,
         "publishable": False,
         "benchmark": benchmark,
+        "benchmark_return_convention": benchmark["return_convention"],
+        **{
+            f"benchmark_{key}": value
+            for key, value in _benchmark_return_basis(benchmark["return_convention"]).items()
+        },
         "reporting_currency": benchmark["reporting_currency"],
         "calculation_version": website_comparison_version(account_id, benchmark["reporting_currency"]),
         "metrics": comparison_metrics(rows),
@@ -10131,6 +10279,7 @@ def _render_account_page(
 <div class="page-view{active['performance']}" data-section="performance">
 <div class="card wide"><div class="label">Comparison benchmark</div><select id="benchmark-select" aria-label="Comparison benchmark"></select><div id="benchmark" class="value">Loading…</div><div id="benchmark-note" class="muted"></div><div id="benchmark-metrics" class="metrics"></div></div>
 <div class="card wide"><div class="label">Rebased performance comparison</div><div class="legend"><span><i class="swatch portfolio"></i>{account_display_name}</span><span><i class="swatch index"></i><span id="benchmark-legend">Primary benchmark</span></span></div><div class="chart-wrap"><canvas id="benchmark-chart" width="1100" height="320" aria-label="Rebased performance comparison chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div>
+<div class="card wide"><div class="label">Period returns</div><div class="muted">Time-weighted returns (TWR) chain-link daily cash-flow-adjusted returns, so contributions and withdrawals do not count as performance. IRR is the annualised money-weighted return including the timing of those flows.</div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-returns"></tbody></table></div><div class="label" style="margin-top:18px">Custom period</div><div class="filter-grid"><label><span class="label">From</span><input id="period-from" type="date" min="{history_start_date}" aria-label="Custom period start date"></label><label><span class="label">To</span><input id="period-to" type="date" min="{history_start_date}" aria-label="Custom period end date"></label></div><div class="actions"><button id="period-apply" class="button" type="button">Calculate custom period</button></div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-custom"></tbody></table></div><div id="period-note" class="muted" style="margin-top:12px">Loading period returns…</div></div><div class="card wide"><div class="label">Contributions and withdrawals</div><div id="flows-totals" class="metrics"></div><div class="table-scroll"><table><thead><tr><th>Date</th><th>Type</th><th>Amount ({reporting_currency})</th></tr></thead><tbody id="flows-statement"></tbody></table></div><div id="flows-note" class="muted" style="margin-top:12px">Loading contributions and withdrawals…</div></div>
 <div class="card wide"><div class="label">NAV history</div><div class="chart-wrap"><canvas id="chart" width="1100" height="320" aria-label="NAV history chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div></div>
 <div class="page-view{active['risk']}" data-section="risk"><div class="card wide"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div></div>
 <div class="page-view{active['cash']}" data-section="cash"><div class="card wide"><div class="label">Cash balances as of <span id="cash-asof">—</span></div><div id="cash-balances" class="metrics"></div><div class="label" style="margin-top:18px">Cash activity history</div><div class="muted">Choose a custom date range to view every matching IBKR cash activity. The CSV download contains the same complete filtered result.</div><div class="filter-grid"><label><span class="label">From</span><input id="cash-from" type="date" min="{history_start_date}" aria-label="Cash activity start date"></label><label><span class="label">To</span><input id="cash-to" type="date" min="{history_start_date}" aria-label="Cash activity end date"></label></div><div class="actions"><button id="cash-apply" class="button" type="button">Apply cash filters</button><a id="cash-export" class="button" href="#">Download cash activity CSV</a></div><div id="cash-note" class="muted" style="margin-top:12px">Loading cash activity…</div><div class="table-scroll"><table><thead><tr><th>Date</th><th>Time</th><th>Type</th><th>Description</th><th>Currency</th><th>Amount</th></tr></thead><tbody id="cash-activity"></tbody></table></div></div></div>
@@ -10149,7 +10298,7 @@ const exact=n=>new Intl.NumberFormat('en-US',{{minimumFractionDigits:2,maximumFr
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
 const metricGuideAnchors={metric_anchors_json};
 const metricGuideHref=label=>`/metrics-guide#${{metricGuideAnchors[label]||''}}`;
-const metricCard=x=>`<a class="metric metric-guide-card" href="${{esc(metricGuideHref(x[0]))}}" aria-label="Read the Metrics Guide explanation for ${{esc(x[0])}}"><div class="label">${{esc(x[0])}} <span aria-hidden="true">↗</span></div><div class="value">${{esc(x[1])}}</div></a>`;
+const metricCard=x=>`<a class="metric metric-guide-card" href="${{esc(metricGuideHref(x[0]))}}" aria-label="Read the Metrics Guide explanation for ${{esc(x[0])}}"><div class="label">${{esc(x[2]||x[0])}} <span aria-hidden="true">↗</span></div><div class="value">${{esc(x[1])}}</div></a>`;
 const json=async r=>{{const payload=await r.json();if(!r.ok){{const code=payload&&payload.detail&&payload.detail.code;throw new Error(code||`http_${{r.status}}`)}}return payload}};
 const rootStyle=getComputedStyle(document.documentElement);
 const chartColors={{portfolio:rootStyle.getPropertyValue('--chart-portfolio').trim()||'#2646a6',benchmark:rootStyle.getPropertyValue('--chart-benchmark').trim()||'#d97706'}};
@@ -10180,16 +10329,30 @@ if(result.not_applicable){{document.querySelector('#trade-history').innerHTML='<
 const exportParams=new URLSearchParams({{as_of:end,from_date:start}});if(symbol)exportParams.set('symbol',symbol);if(side)exportParams.set('side',side);document.querySelector('#export-trades').href=`/api/portfolio/${{account}}/export/trades.csv?${{exportParams}}`;
 }};
 document.querySelector('#trade-apply').addEventListener('click',()=>loadTradeHistory().catch(()=>{{document.querySelector('#trade-note').textContent='Unable to load trade history for these filters.'}}));
+const periodRow=x=>{{const failed=x.status==='fail'||x.status==='empty',shortIrr=x.irr_annualized!=null&&Boolean(x.irr_note);return `<tr><td>${{esc(x.label)}}${{x.partial?' <span class="muted">(partial: history starts '+esc(x.start_date)+')</span>':''}}</td><td>${{esc(x.start_date||'—')}}</td><td>${{esc(x.end_date||'—')}}</td><td title="${{esc((x.issues||[]).join(' '))}}">${{failed?'Unavailable':pct(x.twr)}}</td><td>${{pct(x.twr_annualized)}}</td><td title="${{esc(x.irr_note||'')}}">${{failed?'—':pct(x.irr_annualized)}}${{shortIrr?' *':''}}</td><td>${{fmt(x.net_flows)}}</td></tr>`}};
+const loadPerformancePeriods=async()=>{{
+const asOf=document.querySelector('#asof-select').value,start=document.querySelector('#period-from').value,end=document.querySelector('#period-to').value;
+const params=new URLSearchParams({{as_of:asOf}});if(start)params.set('start',start);if(end)params.set('end',end);
+const flowParams=new URLSearchParams({{from_date:start||historyStartDate,to_date:end||asOf}});
+const [r,f]=await Promise.all([fetch(`/api/portfolio/${{account}}/performance/periods?${{params}}`).then(json),fetch(`/api/portfolio/${{account}}/flows?${{flowParams}}`).then(json)]);
+document.querySelector('#period-returns').innerHTML=r.periods.map(periodRow).join('')||'<tr><td colspan="7">No NAV history is available on or before this date.</td></tr>';
+document.querySelector('#period-custom').innerHTML=r.custom?periodRow(r.custom):'<tr><td colspan="7">Choose a start and end date, then calculate a custom period.</td></tr>';
+document.querySelector('#period-note').textContent=`Returns through ${{r.effective_as_of||'—'}} in ${{r.currency}}. Each period is valued from the last NAV before it starts to the last NAV on or before it ends. * Period under one year: the annualised IRR extrapolates a short-period result. ${{r.flows_message||''}}`;
+document.querySelector('#flows-totals').innerHTML=f.applicable?[['Contributions',f.totals.flows_in],['Withdrawals',f.totals.flows_out],['Net external flow',f.totals.net]].map(x=>`<div class="metric"><div class="label">${{esc(x[0])}}</div><div class="value">${{fmt(x[1])}} ${{esc(f.currency)}}</div></div>`).join(''):'';
+document.querySelector('#flows-statement').innerHTML=f.flows.map(x=>`<tr><td>${{esc(x.date)}}</td><td>${{x.direction==='contribution'?'Contribution':'Withdrawal'}}</td><td>${{fmt(x.amount)}}</td></tr>`).join('')||`<tr><td colspan="3">${{f.applicable?'No contributions or withdrawals in this date range.':'Not applicable.'}}</td></tr>`;
+document.querySelector('#flows-note').textContent=f.applicable?`Showing ${{f.totals.count}} dated external flows from ${{f.from_date}} through ${{f.to_date||asOf}}, net per day in ${{f.currency}}. Deposits, withdrawals and transfers in or out are external flows; dividends, interest and fees are not.`:f.message;
+}};
+document.querySelector('#period-apply').addEventListener('click',()=>loadPerformancePeriods().catch(()=>{{document.querySelector('#period-note').textContent='Unable to calculate this period. Check that the start date is not after the end date.'}}));
 const renderBenchmark=async(id,meta,asOf)=>{{
 const query=`benchmark_id=${{encodeURIComponent(id)}}&as_of=${{encodeURIComponent(asOf)}}`;
 const bc=await fetch(`/api/portfolio/${{account}}/benchmark-comparison?${{query}}`).then(json);
-document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':'Secondary'}}`;
-document.querySelector('#benchmark-legend').textContent=`${{meta.name}} (${{meta.symbol}})`;
-document.querySelector('#benchmark-note').textContent=meta.message+` Provider: ${{meta.provider||'—'}} · Convention: ${{meta.return_convention}} · License: ${{meta.license_status}} · Provisional observations: ${{meta.provisional_observations}} · Latest feed observation: ${{meta.latest_provisional_observation||'—'}}`;
+document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':'Secondary'}} · ${{meta.return_basis_label||meta.return_convention}}`;
+document.querySelector('#benchmark-legend').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.return_basis==='price_return'?'price return':meta.return_basis==='total_return'?'total return':meta.return_convention}}`;
+document.querySelector('#benchmark-note').textContent=meta.message+`${{meta.return_basis==='price_return'?' The benchmark is a price index: its returns exclude dividends, while portfolio returns include income, so the comparison favours the portfolio by the index dividend yield.':''}} Provider: ${{meta.provider||'—'}} · Convention: ${{meta.return_convention}} · License: ${{meta.license_status}} · Provisional observations: ${{meta.provisional_observations}} · Latest feed observation: ${{meta.latest_provisional_observation||'—'}}`;
 document.querySelector('#benchmark-metrics').innerHTML='';
 draw('#benchmark-chart',[],[]);
 if(bc.available){{
-const m=bc.metrics,items=[['Portfolio total return',pct(m.portfolio_total_return)],['Benchmark total return',pct(m.benchmark_total_return)],['Excess total return',pct(m.excess_total_return)],['Tracking error',pct(m.tracking_error)],['Information ratio',m.information_ratio==null?'—':fmt(m.information_ratio)],['Beta',m.beta==null?'—':fmt(m.beta)],['Correlation',m.correlation==null?'—':fmt(m.correlation)],['Relative win rate',pct(m.relative_win_rate)]];
+const m=bc.metrics,items=[['Portfolio total return',pct(m.portfolio_total_return)],['Benchmark total return',pct(m.benchmark_total_return),bc.benchmark_return_basis==='price_return'?'Benchmark price return (excludes dividends)':undefined],['Excess total return',pct(m.excess_total_return),bc.benchmark_return_basis==='price_return'?'Excess return vs price index':undefined],['Tracking error',pct(m.tracking_error)],['Information ratio',m.information_ratio==null?'—':fmt(m.information_ratio)],['Beta',m.beta==null?'—':fmt(m.beta)],['Correlation',m.correlation==null?'—':fmt(m.correlation)],['Relative win rate',pct(m.relative_win_rate)]];
 document.querySelector('#benchmark-note').textContent+=` Aligned comparison: ${{m.period_start}} through ${{m.period_end}} · Reporting currency: ${{bc.reporting_currency}} · ${{m.observations}} common-date observations. Rebased to 100 at the first common observation; unmatched market dates are not filled.`;
 document.querySelector('#benchmark-metrics').innerHTML=items.map(metricCard).join('');
 draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}})
@@ -10234,7 +10397,9 @@ const cashFrom=document.querySelector('#cash-from'),cashTo=document.querySelecto
 const tradeFrom=document.querySelector('#trade-from'),tradeTo=document.querySelector('#trade-to');if(!tradeFrom.value)tradeFrom.value=historyStartDate;tradeTo.max=asOf;tradeTo.value=asOf;if(tradeFrom.value>asOf)tradeFrom.value=historyStartDate;if(activeSection==='trades')await loadTradeHistory();
 draw('#chart',p.series,[{{key:'nav',color:chartColors.portfolio,label:`${{accountDisplayName}} NAV`}}],{{yLabel:`NAV (${{reportingCurrency}})`,unit:reportingCurrency,niceYTicks:true,targetYIntervals:8}});
 const benchmarkSelect=document.querySelector('#benchmark-select'),selected=benchmarks.find(x=>x.benchmark_id===benchmarkSelect.value);
-if(activeSection==='performance'&&selected)await renderBenchmark(selected.benchmark_id,selected,asOf)
+if(activeSection==='performance'&&selected)await renderBenchmark(selected.benchmark_id,selected,asOf);
+const periodFrom=document.querySelector('#period-from'),periodTo=document.querySelector('#period-to');periodFrom.max=asOf;periodTo.max=asOf;if(periodTo.value>asOf)periodTo.value=asOf;if(periodFrom.value>asOf)periodFrom.value='';
+if(activeSection==='performance')await loadPerformancePeriods().catch(()=>{{document.querySelector('#period-note').textContent='Period returns are unavailable for this date.'}})
 }}finally{{grid.classList.remove('loading')}}
 }};
 const autonomyRequest=portalOwner?fetch('/api/system/autonomous-administrator').then(json):Promise.resolve({{status:'viewer_restricted',control:{{}},latest_run:{{}},open_incidents:[],recent_actions:[],last_known_good:{{}},recovery:{{}},authority_reviews:[]}});

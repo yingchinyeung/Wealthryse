@@ -702,15 +702,19 @@ if (isMsHkd) {
   }
 }
 
-// The template's disclaimer heading drops its first letter. Only that exact
-// heading is corrected; the disclaimer wording itself is left untouched.
+// Owner-confirmed corrections to two fixed template texts: the disclaimer
+// heading dropped its first letter and the contact email had a stray "www.".
+// Only these exact texts change; the disclaimer wording itself is untouched.
 {
-  const headings = await presentation.inspect({kind:'textbox',maxChars:1000000});
-  for (const line of headings.ndjson.split('\n').filter(Boolean)) {
+  const corrections = new Map([
+    ['llustrative examples only', 'Illustrative examples only'],
+    ['inquiry@www.sprout-asset.com', 'inquiry@sprout-asset.com'],
+  ]);
+  const fixedText = await presentation.inspect({kind:'textbox',maxChars:1000000});
+  for (const line of fixedText.ndjson.split('\n').filter(Boolean)) {
     const item = JSON.parse(line);
-    if (String(item.text || item.textPreview || '').replace(/\s+/g, ' ').trim() === 'llustrative examples only') {
-      setText(item.id, 'Illustrative examples only');
-    }
+    const text = String(item.text || item.textPreview || '').replace(/\s+/g, ' ').trim();
+    if (corrections.has(text)) setText(item.id, corrections.get(text));
   }
 }
 

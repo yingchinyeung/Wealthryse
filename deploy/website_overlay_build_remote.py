@@ -7,7 +7,7 @@ of the live files (every hunk must apply exactly), builds
 with no network, and pushes one new tag over the registry's private endpoint.
 No application starts and no database is touched.
 """
-import base64, gzip, hashlib, json, os, shutil, socket, ssl, subprocess, tempfile, time, urllib.error, urllib.parse, urllib.request
+import base64, gzip, hashlib, json, os, re, shutil, socket, ssl, subprocess, tempfile, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 CONFIG = None  # replaced by the workflow
@@ -33,6 +33,22 @@ def request(url, data=None, headers=None):
 def tree_hashes(folder):
     return {p.relative_to(folder).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(folder.rglob('*.py')) if '__pycache__' not in p.parts}
+
+
+def rejected_context(package):
+    """For each hunk patch rejected, the live lines it was aimed at (gzip+base64)."""
+    out = {}
+    for rej in sorted(package.rglob('*.rej')):
+        name = rej.relative_to(package).as_posix()[:-len('.rej')]
+        lines = (package / name).read_text(errors='replace').splitlines()
+        parts = []
+        for header in re.findall(r'^@@ -(\d+)(?:,(\d+))? ', rej.read_text(errors='replace'), re.M):
+            start, count = int(header[0]), int(header[1] or 1)
+            lo, hi = max(start - 40, 1), min(start + count + 40, len(lines))
+            parts.append('--- live lines %d-%d\n' % (lo, hi) + '\n'.join(lines[lo - 1:hi]))
+        text = rej.read_text(errors='replace') + '\n' + '\n'.join(parts)
+        out[name] = base64.b64encode(gzip.compress(text.encode(), 9)).decode()
+    return out
 
 
 def main():
@@ -101,10 +117,12 @@ def main():
         package = context / 'src' / 'ibkr_etl'
         live = tree_hashes(package)
         expected, wanted = config['live_hashes'], config['new_hashes']
+        # Counts only: the full lists were reported by earlier runs and the
+        # Run Command output is small.
         result['live_drift'] = {
-            'only_live': sorted(set(live) - set(expected)),
-            'only_expected': sorted(set(expected) - set(live)),
-            'different': sorted(n for n in set(live) & set(expected) if live[n] != expected[n]),
+            'only_live': len(set(live) - set(expected)),
+            'only_expected': len(set(expected) - set(live)),
+            'different': len([n for n in set(live) & set(expected) if live[n] != expected[n]]),
         }
         # The live source is not exactly the commit the change was made on, so the
         # change is applied on top of whatever the live files are. Each file the
@@ -114,9 +132,24 @@ def main():
         for name in touched:
             if (name in expected) != (name in live):
                 raise ValueError('Live website file ' + name + ' is not where the change expects it; nothing built')
+        # Some live files were saved with Windows line endings; the change uses
+        # Unix ones. Python reads both, so touched files are normalised first.
+        normalised = []
+        for name in touched:
+            path = package / name
+            if path.exists() and b'\r\n' in path.read_bytes():
+                path.write_bytes(path.read_bytes().replace(b'\r\n', b'\n'))
+                normalised.append(name)
+        result['line_endings_normalised'] = normalised
+        live = {**live, **{n: h for n, h in tree_hashes(package).items() if n in normalised}}
         patch_file = root / 'change.patch'
         patch_file.write_bytes(gzip.decompress(base64.b64decode(config['patch'])))
-        run(['patch', '-p1', '--forward', '--fuzz=0', '--no-backup-if-mismatch', '-i', str(patch_file)], 'source patch', cwd=str(context))
+        applied = subprocess.run(['patch', '-p1', '--forward', '--fuzz=0', '--no-backup-if-mismatch', '-i', str(patch_file)],
+                                 capture_output=True, text=True, timeout=300, cwd=str(context))
+        if applied.returncode:
+            result['rejects'] = rejected_context(package)
+            raise ValueError('Some of the change does not apply to the live files; nothing built: ' +
+                             ', '.join(sorted(n for n in result['rejects'])))
         patched = tree_hashes(package)
         for name in touched:
             if live.get(name) == expected.get(name) and patched.get(name) != wanted.get(name):

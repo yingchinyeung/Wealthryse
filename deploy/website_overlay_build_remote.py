@@ -61,6 +61,23 @@ for root, dirs, files in os.walk('/app/src'):
 """
 
 
+def find_python(client, base, env):
+    """Absolute path of the live image's Python, tried from its entrypoint and the usual names."""
+    config = json.loads(run(client + ['image', 'inspect', base, '--format', '{{json .Config}}'], 'live image config', env=env))
+    command = (config.get('Entrypoint') or []) + (config.get('Cmd') or [])
+    candidates = [c for c in command if os.path.basename(c).startswith('python')]
+    candidates += [os.path.join(os.path.dirname(c), 'python') for c in command if c.startswith('/') and '/bin/' in c]
+    candidates += ['python3', 'python', '/usr/local/bin/python3', '/usr/bin/python3', '/opt/venv/bin/python', '/app/.venv/bin/python']
+    for candidate in dict.fromkeys(candidates):
+        r = subprocess.run(client + ['run', '--rm', '--network=none', '--user', '0:0', '--entrypoint', candidate, base,
+                                     '-c', 'import sys, ibkr_etl; print(sys.executable)'],
+                           capture_output=True, text=True, timeout=120, env=env)
+        found = r.stdout.strip().splitlines()[-1:] if r.returncode == 0 else []
+        if found and found[0].startswith('/'):
+            return found[0]
+    raise ValueError('No Python that can import ibkr_etl found in the live image')
+
+
 class Captured(Exception):
     """Capture finished; skip the build."""
 
@@ -208,15 +225,16 @@ def main():
         # the build uses numeric ids and exec-form Python steps only, and runs
         # the checks as the image's own user.
         user = run(client + ['image', 'inspect', base, '--format', '{{.Config.User}}'], 'live image user', env=env).strip() or '0'
+        python = find_python(client, base, env)
         install = (INSTALL_SCRIPT.replace('REMOVED', repr(removed)).replace('RUNTIME_USER', repr(user)))
         lines = ['FROM ' + base, 'USER 0:0',
                  'LABEL ai.wealthryse.source-commit="' + config['source_commit'] + '"',
                  'COPY src/ibkr_etl/ /app/src/ibkr_etl/',
-                 'RUN ' + json.dumps(['python', '-c', install]),
+                 'RUN ' + json.dumps([python, '-c', install]),
                  'USER ' + user,
-                 'RUN ' + json.dumps(['python', '-c', 'import ibkr_etl.web']),
-                 'RUN ' + json.dumps(['python', 'scripts/check_report_runtime.py'])]
-        result['runtime_user'] = user
+                 'RUN ' + json.dumps([python, '-c', 'import ibkr_etl.web']),
+                 'RUN ' + json.dumps([python, 'scripts/check_report_runtime.py'])]
+        result.update(runtime_user=user, python=python)
         (context / 'Dockerfile').write_text('\n'.join(lines) + '\n')
         run(client + ['build', '--network=none', '--pull=false', '-t', target, str(context)], 'website image build', timeout=1800, env=env)
         run(client + ['push', target], 'website image push', env=env)

@@ -111,9 +111,15 @@ def build():
             if time.time() > deadline:
                 raise SystemExit('Build did not finish in time')
             time.sleep(20)
-        lines = [l[len('WEBSITE_BUILD_RESULT '):] for l in (view.get('output') or '').splitlines() if l.startswith('WEBSITE_BUILD_RESULT ')]
-        result = json.loads(lines[-1]) if lines else {'passed': False, 'error': (view.get('error') or '')[-1500:]}
+        output = view.get('output') or ''
+        lines = [l[len('WEBSITE_BUILD_RESULT '):] for l in output.splitlines() if l.startswith('WEBSITE_BUILD_RESULT ')]
+        result = json.loads(lines[-1]) if lines else {'passed': False, 'error': (view.get('error') or '')[-1500:],
+                                                      'output_length': len(output), 'output_tail': output[-800:]}
         print(json.dumps(result, indent=2))
+        for l in output.splitlines():
+            if l.startswith('WEBSITE_BUILD_REJECTS '):
+                for name, text in json.loads(gzip.decompress(base64.b64decode(l[len('WEBSITE_BUILD_REJECTS '):]))).items():
+                    print('Live code where the change to ' + name + ' does not apply:\n' + text)
         if not result.get('passed') or view.get('exitCode') != 0:
             raise SystemExit('Build failed; the website was not changed')
         state['pushed_image'] = result['pushed_image']

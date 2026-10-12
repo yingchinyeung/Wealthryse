@@ -23,6 +23,18 @@ class PresentationPortfolioReturnTests(unittest.TestCase):
         self.assertEqual([row["date"] for row in model["month_rows"]], ["2025-01-31", "2025-02-28"])
         self.assertAlmostEqual(model["month_rows"][0]["portfolio_monthly_return"], 0.02)
         self.assertAlmostEqual(model["month_rows"][1]["portfolio_monthly_return"], 107.1 / 102.0 - 1)
+        # Annualized over the same window as the total return, so their signs agree.
+        self.assertAlmostEqual(model["annualized_return"], 1.071 ** (365.25 / 39) - 1)
+
+    def test_annualized_return_matches_total_return_sign(self):
+        # The benchmark window here would be 21-31 Jan (a loss); the portfolio window is a gain.
+        model = portfolio_return_model(_snapshot([
+            {"date": "2025-01-20", "nav": 100.0},
+            {"date": "2025-01-21", "nav": 101.0},
+            {"date": "2025-01-31", "nav": 100.35},
+        ], "2025-01-31"))
+        self.assertGreater(model["total_return"], 0)
+        self.assertGreater(model["annualized_return"], 0)
 
     def test_deposits_are_not_returns(self):
         model = portfolio_return_model(_snapshot([

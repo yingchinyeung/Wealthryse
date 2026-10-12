@@ -188,5 +188,15 @@ class NavigationAndChartTests(unittest.TestCase):
             self.assertIn('id="freshness"', source)
             self.assertNotIn("c.width/r.width", source)
 
+
+class PhoneLayoutTests(unittest.TestCase):
+    def test_data_tables_stack_on_phones_with_column_labels(self):
+        from ibkr_etl.web_theme import ACCOUNT_THEME_CSS
+        from ibkr_etl.web_ui import TABLE_SCRIPT
+        self.assertIn("table.stack-mobile thead { display: none; }", ACCOUNT_THEME_CSS)
+        self.assertIn("content: attr(data-label)", ACCOUNT_THEME_CSS)
+        self.assertIn("cell.dataset.label=names[i]", TABLE_SCRIPT)
+        self.assertIn("position: sticky; top: 76px", ACCOUNT_THEME_CSS)
+
 if __name__ == "__main__":
     unittest.main()

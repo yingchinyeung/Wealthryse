@@ -207,8 +207,9 @@ ACCOUNT_THEME_CSS = COMMON_THEME_CSS + r"""
 .breadcrumbs a:hover { color: var(--brand); }
 .account-hero { display: flex; align-items: end; justify-content: space-between; gap: 24px; }
 .account-hero-copy .muted { margin-top: 11px; font-size: 15px; }
+.account-hero h1 { font-size: clamp(28px, 3.6vw, 42px); line-height: 1.08; letter-spacing: -.035em; text-wrap: balance; }
 .account-hero::after { display: block; width: clamp(90px, 17vw, 220px); height: 2px; margin-bottom: 13px; content: ""; background: linear-gradient(90deg, var(--brand), var(--accent), transparent); border-radius: 999px; }
-.account-nav { display: flex; gap: 4px; overflow-x: auto; margin: 31px 0 0; padding: 7px; background: rgba(255, 255, 255, .67); border: 1px solid rgba(255, 255, 255, .85); border-radius: 17px; box-shadow: var(--shadow-sm); scrollbar-width: thin; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); -webkit-overflow-scrolling: touch; }
+.account-nav { display: flex; gap: 4px; overflow-x: auto; margin: 31px 0 0; padding: 7px; background: rgba(255, 255, 255, .67); border: 1px solid rgba(255, 255, 255, .85); border-radius: 17px; box-shadow: var(--shadow-sm); scrollbar-width: thin; position: sticky; top: 76px; z-index: 40; background: rgba(255, 255, 255, .9); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); -webkit-overflow-scrolling: touch; }
 .account-nav-link { flex: 0 0 auto; padding: 9px 12px; color: var(--muted-strong); border: 1px solid transparent; border-radius: 11px; font-size: 12px; font-weight: 640; text-decoration: none; white-space: nowrap; transition: color .18s ease, background .18s ease, box-shadow .18s ease; }
 .account-nav-link:hover, .account-nav-link:focus-visible { color: var(--ink); background: rgba(255, 255, 255, .82); }
 .account-nav-link.active { color: #fff; background: linear-gradient(135deg, #121826, #25334d); border-color: rgba(255, 255, 255, .12); box-shadow: 0 7px 17px rgba(15, 23, 42, .17); }
@@ -471,7 +472,18 @@ table.sortable thead th[aria-sort="descending"]::after { content: "↓"; opacity
   .account-hero::after { display: none; }
   .account-hero { align-items: stretch; flex-direction: column; gap: 16px; }
   .account-switcher select { min-width: 0; width: 100%; }
-  .account-nav { margin-top: 24px; border-radius: 15px; }
+  .account-nav { top: 0; margin-top: 24px; border-radius: 15px; }
+  .account-hero h1 { font-size: 28px; }
+  table.stack-mobile, table.stack-mobile.trade-table { min-width: 0; }
+  table.stack-mobile thead { display: none; }
+  table.stack-mobile tbody tr { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 14px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  table.stack-mobile tbody tr[hidden] { display: none; }
+  table.stack-mobile tbody td { display: flex; flex-direction: column; padding: 0; border: 0; text-align: left; }
+  table.stack-mobile tbody td::before { color: var(--muted); content: attr(data-label); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+  table.stack-mobile tbody td:first-child { grid-column: 1 / -1; font-size: 15px; }
+  table.stack-mobile tbody td:first-child::before, table.stack-mobile tbody td:not([data-label])::before, table.stack-mobile tbody td[data-label=""]::before { display: none; }
+  table.stack-mobile tbody td[colspan] { grid-column: 1 / -1; }
+  table.stack-mobile tbody td:empty { display: none; }
   .account-toolbar { align-items: stretch; flex-direction: column; padding: 17px; border-radius: 18px; }
   .account-toolbar label { min-width: 0; }
   .page-view.active { grid-template-columns: 1fr; }

@@ -13,6 +13,7 @@ const parse=text=>{const clean=String(text).replace(/[−–]/g,'-').replace(/[,
 const cellKey=(row,index)=>{const cell=row.cells[index];return cell?(cell.dataset.sort??cell.textContent.trim()):''};
 const sortable=row=>!row.classList.contains('total-row')&&!(row.cells.length===1&&row.cells[0].colSpan>1);
 const observers=new WeakMap();
+const labelCells=table=>{const names=Array.from(table.tHead.rows[0].cells).map(th=>th.textContent.trim());Array.from(table.tBodies[0]?.rows||[]).forEach(row=>Array.from(row.cells).forEach((cell,i)=>{if(cell.colSpan===1&&names[i])cell.dataset.label=names[i]}))};
 const applySort=table=>{
   const body=table.tBodies[0],index=Number(table.dataset.sortIndex),dir=table.dataset.sortDir;
   if(!body||!Number.isFinite(index)||!dir)return;
@@ -38,7 +39,8 @@ window.wrTable=(bodySelector,options={})=>{
   const body=document.querySelector(bodySelector);if(!body)return;const table=body.closest('table');if(!table||table.classList.contains('sortable'))return;
   table.classList.add('sortable');Array.from(table.tHead.rows[0].cells).forEach(th=>{th.tabIndex=0;th.setAttribute('aria-sort','none');th.title='Sort by this column'});
   if(options.filter){const input=document.querySelector(options.filter);if(input){table.filterInput=input;table.filterCount=options.count?document.querySelector(options.count):null;input.addEventListener('input',()=>applyFilter(table))}}
-  const observer=new MutationObserver(()=>{applySort(table);applyFilter(table)});observer.observe(body,{childList:true});observers.set(body,observer);
+  if(options.stack!==false)table.classList.add('stack-mobile');labelCells(table);
+  const observer=new MutationObserver(()=>{labelCells(table);applySort(table);applyFilter(table)});observer.observe(body,{childList:true});observers.set(body,observer);
 };
 })();
 </script>
@@ -155,7 +157,7 @@ const showFreshness=latest=>{
   node.hidden=false;
 };
 wrTable('#holdings',{filter:'#holdings-filter',count:'#holdings-filter-count'});
-wrTable('#sector-detail');wrTable('#trade-history');wrTable('#cash-activity');wrTable('#flows-statement');
+wrTable('#sector-detail',{stack:false});wrTable('#trade-history');wrTable('#cash-activity');wrTable('#flows-statement',{stack:false});
 """
 
 # Account directory cards: fills in NAV and returns after the page loads.

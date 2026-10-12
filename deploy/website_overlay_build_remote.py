@@ -30,6 +30,37 @@ def request(url, data=None, headers=None):
         return json.load(r)
 
 
+# Runs inside the new image as root: mirror the source into the installed package
+# if it lives elsewhere, drop removed files and caches, and hand /app/src back to
+# the image's runtime user.
+INSTALL_SCRIPT = """
+import importlib.util, os, pwd, grp, shutil
+src = '/app/src/ibkr_etl'
+removed = REMOVED
+site = os.path.dirname(importlib.util.find_spec('ibkr_etl').origin)
+for name in removed:
+    if os.path.exists(os.path.join(src, name)):
+        os.remove(os.path.join(src, name))
+if os.path.realpath(site) != os.path.realpath(src):
+    shutil.copytree(src, site, dirs_exist_ok=True)
+    for name in removed:
+        if os.path.exists(os.path.join(site, name)):
+            os.remove(os.path.join(site, name))
+for top in {src, site}:
+    for root, dirs, files in os.walk(top):
+        if '__pycache__' in dirs:
+            shutil.rmtree(os.path.join(root, '__pycache__'))
+            dirs.remove('__pycache__')
+spec = RUNTIME_USER
+user, _, group = spec.partition(':')
+uid = int(user) if user.isdigit() else pwd.getpwnam(user).pw_uid
+gid = int(group) if group.isdigit() else (grp.getgrnam(group).gr_gid if group else (pwd.getpwuid(uid).pw_gid if not user.isdigit() else uid))
+for root, dirs, files in os.walk('/app/src'):
+    for name in [root] + [os.path.join(root, f) for f in dirs + files]:
+        os.chown(name, uid, gid)
+"""
+
+
 class Captured(Exception):
     """Capture finished; skip the build."""
 
@@ -173,17 +204,19 @@ def main():
             raise ValueError('The change altered files it should not have; nothing built')
         result['touched_files'] = touched
         removed = sorted(n for n in set(expected) - set(wanted) if n in live)
-        lines = ['FROM ' + base, 'USER root',
+        # The live image has no "root" passwd entry and may have no shell, so
+        # the build uses numeric ids and exec-form Python steps only, and runs
+        # the checks as the image's own user.
+        user = run(client + ['image', 'inspect', base, '--format', '{{.Config.User}}'], 'live image user', env=env).strip() or '0'
+        install = (INSTALL_SCRIPT.replace('REMOVED', repr(removed)).replace('RUNTIME_USER', repr(user)))
+        lines = ['FROM ' + base, 'USER 0:0',
                  'LABEL ai.wealthryse.source-commit="' + config['source_commit'] + '"',
-                 'COPY src/ibkr_etl/ /app/src/ibkr_etl/']
-        if removed:
-            lines.append('RUN rm -f ' + ' '.join('/app/src/ibkr_etl/' + name for name in removed))
-        lines += ['RUN SITE=$(python -c "import ibkr_etl,os;print(os.path.dirname(ibkr_etl.__file__))") && '
-                  'if [ "$SITE" != "/app/src/ibkr_etl" ]; then cp -r /app/src/ibkr_etl/. "$SITE"/' +
-                  (' && cd "$SITE" && rm -f ' + ' '.join(removed) if removed else '') + '; fi && '
-                  'find /app/src/ibkr_etl -name __pycache__ -prune -exec rm -rf {} + && chown -R 10001:10001 /app/src',
-                  'USER 10001:10001',
-                  'RUN python -c "import ibkr_etl.web" && python scripts/check_report_runtime.py']
+                 'COPY src/ibkr_etl/ /app/src/ibkr_etl/',
+                 'RUN ' + json.dumps(['python', '-c', install]),
+                 'USER ' + user,
+                 'RUN ' + json.dumps(['python', '-c', 'import ibkr_etl.web']),
+                 'RUN ' + json.dumps(['python', 'scripts/check_report_runtime.py'])]
+        result['runtime_user'] = user
         (context / 'Dockerfile').write_text('\n'.join(lines) + '\n')
         run(client + ['build', '--network=none', '--pull=false', '-t', target, str(context)], 'website image build', timeout=1800, env=env)
         run(client + ['push', target], 'website image push', env=env)

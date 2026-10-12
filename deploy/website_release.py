@@ -8,7 +8,7 @@ Steps, each a subcommand so the workflow can show and stop at each one:
   rollback point the website back at the image recorded by prepare
 State passes between steps in release-state.json.
 """
-import base64, gzip, hashlib, json, subprocess, sys, time, urllib.request, urllib.error
+import base64, gzip, hashlib, json, subprocess, sys, tempfile, time, urllib.request, urllib.error
 from pathlib import Path
 
 RG = 'rg-ibkr-database-v11'
@@ -25,6 +25,8 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
                     # CI-only helper; the website never runs it.
                     'scripts/ci_run_tests.py')
 STATE = Path('release-state.json')
+SNAPSHOT = Path(__file__).resolve().parent / 'live-snapshot'
+MERGED = Path(__file__).resolve().parent / 'live-merged'
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -37,9 +39,41 @@ def git(*args, binary=False):
     return subprocess.run(['git', *args], check=True, capture_output=True, cwd=ROOT, text=not binary).stdout
 
 
-def package_hashes(commit):
+def package_files(commit):
     files = [f for f in git('ls-tree', '-r', '--name-only', commit, PACKAGE).split() if f.endswith('.py')]
-    return {f[len(PACKAGE) + 1:]: hashlib.sha256(git('show', commit + ':' + f, binary=True)).hexdigest() for f in files}
+    return {f[len(PACKAGE) + 1:]: git('show', commit + ':' + f, binary=True) for f in files}
+
+
+def change_set(state):
+    """The patch from what is live to what should be live, with before/after hashes.
+
+    Files copied from the live image into deploy/live-snapshot/ go to their merged
+    version in deploy/live-merged/ (live code plus our changes); every other file
+    goes from the deployed commit to HEAD.
+    """
+    before, after = package_files(state['deployed_commit']), package_files(state['head'])
+    snapshot = SNAPSHOT / PACKAGE
+    if snapshot.exists():
+        if (SNAPSHOT / 'IMAGE').read_text().strip() != state['live_image']:
+            raise SystemExit('deploy/live-snapshot was copied from a different live image; copy it again')
+        for path in sorted(snapshot.glob('*.py')):
+            merged = MERGED / PACKAGE / path.name
+            if not merged.exists():
+                raise SystemExit('No merged version of live ' + path.name + ' in deploy/live-merged')
+            before[path.name] = path.read_bytes().replace(b'\r\n', b'\n')
+            after[path.name] = merged.read_bytes()
+    changed = [n for n in set(before) | set(after) if before.get(n) != after.get(n)]
+    with tempfile.TemporaryDirectory() as tmp:
+        for side, files in (('a', before), ('b', after)):
+            (Path(tmp) / side / PACKAGE).mkdir(parents=True)
+            for name in changed:
+                if name in files:
+                    (Path(tmp) / side / PACKAGE / name).write_bytes(files[name])
+        diff = subprocess.run(['git', 'diff', '--no-index', '--binary', '--no-prefix', 'a', 'b'], cwd=tmp, capture_output=True)
+        if diff.returncode not in (0, 1):
+            raise SystemExit('Could not compute the change: ' + diff.stderr.decode()[-500:])
+    digest = lambda files: {n: hashlib.sha256(d).hexdigest() for n, d in files.items()}
+    return diff.stdout, digest(before), digest(after)
 
 
 def prepare():
@@ -74,10 +108,10 @@ def build():
     state = json.loads(STATE.read_text())
     if not state['changed_files']:
         return
-    patch = git('diff', '--binary', state['deployed_commit'], state['head'], '--', PACKAGE, binary=True)
+    patch, live_hashes, new_hashes = change_set(state)
     config = {
         'base_image': state['live_image'], 'target_image': state['target_image'], 'source_commit': state['head'],
-        'live_hashes': package_hashes(state['deployed_commit']), 'new_hashes': package_hashes(state['head']),
+        'live_hashes': live_hashes, 'new_hashes': new_hashes,
         'patch': base64.b64encode(gzip.compress(patch, 9)).decode(),
     }
     code = (ROOT / 'deploy' / 'website_overlay_build_remote.py').read_text()

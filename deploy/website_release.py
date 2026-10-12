@@ -15,8 +15,9 @@ RG = 'rg-ibkr-database-v11'
 APP = 'ibkrv2stg-web'
 VM = 'ibkrv2stg-private-admin'
 REG = 'ibkrv2stgauhecwc4itaoo.azurecr.io'
-# Source the website image was built from before releases came from GitHub;
-# the build refuses if the live files differ from it.
+# Commit the change is measured from before releases came from GitHub. The live
+# files differ from it in places, so the build applies only the change on top of
+# the live files and refuses if any hunk does not apply exactly.
 BASELINE_COMMIT = '59dbd295c32b8503aa9f66be5b9cf0e5b70562b2'
 PACKAGE = 'src/ibkr_etl'
 # Paths that are not part of the website image.

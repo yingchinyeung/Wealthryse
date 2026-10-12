@@ -326,6 +326,19 @@ class MonthlyReportingAnalyticsTests(unittest.TestCase):
                 "INSERT INTO fx_rates VALUES ('U-SOURCE', ?, 'HKD', 'USD', ?)",
                 (day, rate),
             )
+        # The derived ledger's opening cash and trade cash legs are not listed
+        # cash activity; "non-interest-bearing" must not read as interest.
+        connection.executemany(
+            "INSERT INTO subject_cash_activity_series VALUES ('filtered', ?, ?, ?, ?, 'HKD', ?, ?, 1)",
+            (
+                ("2026-08-01", "opening balance",
+                 "Approved non-interest-bearing opening balance before activity on 2026-08-01",
+                 "5000", None, "opening:2026-08-01:HKD"),
+                ("2026-08-03", "security trade net cash", "BUY TEST", "-4990", "1", "trade:t1:net"),
+                ("2026-08-03", "commission", "TEST commission", "-10", "1", "trade:t1:commission"),
+                ("2026-08-03", "Dividends", "TEST CASH DIVIDEND", "100", "1", "cash:c1"),
+            ),
+        )
         connection.commit()
         try:
             result = build_monthly_reporting_analytics(
@@ -341,6 +354,12 @@ class MonthlyReportingAnalyticsTests(unittest.TestCase):
         self.assertTrue(result["data"]["available"])
         self.assertEqual(result["data"]["fx_conversion"]["converted_currencies"], ["HKD"])
         self.assertEqual(result["data"]["fx_conversion"]["missing_currencies"], [])
+        cash = result["data"]["cash_activity"]
+        self.assertAlmostEqual(cash["total_dividends"], 2.02)
+        self.assertEqual(cash["interest_received"], 0)
+        self.assertEqual(cash["fees_and_withholding"], 0)
+        self.assertEqual(cash["other_internal_cash"], 0)
+        self.assertAlmostEqual(cash["net_listed_cash_activity"], 2.02)
 
 
 if __name__ == "__main__":

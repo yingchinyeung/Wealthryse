@@ -5,7 +5,7 @@ import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {artifactToolUrl,bindTemplateObjectIds,bindTReportImports} from './alpha_t_presentation_runtime.mjs';
 const src=await fs.readFile(new URL('./render_monthly_presentation.mjs',import.meta.url),'utf8');
-if(createHash('sha256').update(src).digest('hex')!=='3ea837db6eb497a73deee64252ff65c61cce3dc92cf3480a7afc2b0263881fe8')
+if(createHash('sha256').update(src).digest('hex')!=='bc2e3120c26fedfda202e29fc40b8ef59191ca43b9cfed5a3b2568de63d58882')
   throw Error('Reference renderer changed; inspect before adapting');
 // Desktop finalization remains enabled when its complete environment is set.
 // Azure uses the installed, image-pinned package and the same financial audit.
@@ -14,6 +14,7 @@ let code=src.replaceAll('alpha-world-ms','alpha-world-t').replaceAll('Alpha Worl
  .replaceAll('line: { fill:',"line: { style: 'solid', fill:")
  .replaceAll('chartLine: { fill:',"chartLine: { style: 'solid', fill:")
  .replace("['-m','ibkr_etl.alpha_world_ms_presentation',snapshotPath]","['-m','ibkr_etl.alpha_world_t_presentation',snapshotPath]")
+ .replace("'alpha-world-t-presentation-hkd-hibor-v2'","'alpha-world-t-presentation-hkd-hibor-v1'")
  .replace("from \"@oai/artifact-tool\"",`from ${JSON.stringify(artifactRuntimeUrl)}`)
  .replace("scripts/audit_alpha_ms_presentation.py","scripts/audit_alpha_t_private_presentation.py")
  .replaceAll('Frongello-linked contribution to return','Fixed-unit contribution to return')

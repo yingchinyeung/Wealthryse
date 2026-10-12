@@ -16,6 +16,20 @@ What it does, in one transaction:
      (pgaadauth_create_principal) and grants it agent_reader or agent_writer;
   3. records which accounts each scheduled job may cover.
 Nothing in the public schema is changed. --dry-run rolls everything back.
+
+On a server where the Entra administrator does not own the platform tables,
+run it in two parts. First, signed in as the Entra administrator, create the
+logins only:
+
+    python scripts/install_agent_schema.py --database-url "<Entra admin URL>" --logins-only \
+        --principal id-wr-agent-tools=reader --principal id-wr-agent=writer \
+        --principal id-wr-agent-jobs=writer
+
+Then, signed in as the table owner, install the schema and grants for the
+logins that now exist:
+
+    python scripts/install_agent_schema.py --database-url "<owner URL>" --existing-logins \
+        --principal ... --grant ...
 """
 from __future__ import annotations
 
@@ -47,6 +61,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="job=account_id")
     parser.add_argument("--granted-by", default="install_agent_schema")
     parser.add_argument("--dry-run", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--logins-only", action="store_true",
+                      help="only create the Entra logins and set their search_path (run as the Entra administrator)")
+    mode.add_argument("--existing-logins", action="store_true",
+                      help="do not create logins; each must already exist (run as the table owner)")
     args = parser.parse_args(argv)
 
     import psycopg
@@ -55,18 +74,27 @@ def main(argv: list[str] | None = None) -> int:
     for name, role in args.principal:
         if role not in ("reader", "writer"):
             parser.error(f"{name}: role must be reader or writer")
+    if args.logins_only and args.grant:
+        parser.error("--logins-only does not take --grant")
     for job, _ in args.grant:
         if job not in JOBS:
             parser.error(f"unknown job {job}")
 
     with psycopg.connect(args.database_url, options=f"-c app.tenant_id={args.tenant_id}") as connection:
-        connection.execute(SCHEMA.read_text(encoding="utf-8"))
+        if not args.logins_only:
+            connection.execute(SCHEMA.read_text(encoding="utf-8"))
         for name, role in args.principal:
             exists = connection.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (name,)).fetchone()
             if not exists:
+                if args.existing_logins:
+                    raise SystemExit(f"{name} has no login yet; run --logins-only first. Nothing was changed")
                 connection.execute("SELECT * FROM pgaadauth_create_principal(%s, false, false)", (name,))
+            if not args.existing_logins:
+                connection.execute(sql.SQL("ALTER ROLE {} SET search_path = agent").format(sql.Identifier(name)))
+            if args.logins_only:
+                print(f"{name}: login {'exists' if exists else 'created'}")
+                continue
             connection.execute(sql.SQL("GRANT {} TO {}").format(sql.Identifier(f"agent_{role}"), sql.Identifier(name)))
-            connection.execute(sql.SQL("ALTER ROLE {} SET search_path = agent").format(sql.Identifier(name)))
             print(f"{name}: agent_{role}{'' if exists else ' (login created)'}")
         for job, account in args.grant:
             found = connection.execute(

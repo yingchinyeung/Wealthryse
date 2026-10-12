@@ -1503,6 +1503,40 @@ def _refresh_alpha_world_portfolio(
     }
 
 
+def _flow_adjusted_nav(
+    connection: Any, subject_id: str, values: dict[str, float], *, subject_type: str
+) -> dict[str, float]:
+    """Return a NAV path with external deposits and withdrawals removed.
+
+    The first date keeps its NAV. Each later date grows by the daily Modified
+    Dietz return the website uses, r = (V1 - V0 - F) / (V0 + F / 2), with F the
+    net external flow dated after the previous NAV and up to this one.
+    """
+
+    if len(values) < 2:
+        return dict(values)
+    from .provisional_benchmark import _external_flows
+
+    flows = _external_flows(connection, subject_id, subject_type=subject_type)
+    dates = sorted(values)
+    # Scale the raw NAV by a factor that only changes on flow days, so a sleeve
+    # without external flows keeps exactly its raw NAV.
+    factor = 1.0
+    adjusted = {dates[0]: values[dates[0]]}
+    for previous, current in zip(dates, dates[1:]):
+        flow = sum(amount for day, amount in flows.items() if previous < day <= current)
+        if flow:
+            denominator = values[previous] + 0.5 * flow
+            if denominator <= 0 or values[current] <= 0:
+                raise ValueError(
+                    f"Cash-flow-adjusted return is invalid for {subject_id} on {current}"
+                )
+            daily_return = (values[current] - values[previous] - flow) / denominator
+            factor = adjusted[previous] * (1.0 + daily_return) / values[current]
+        adjusted[current] = values[current] * factor
+    return adjusted
+
+
 def refresh_fixed_unit_composite(
     connection: Any,
     contract: dict[str, Any],
@@ -1530,6 +1564,9 @@ def refresh_fixed_unit_composite(
     maximum_age_days = int(contract.get("market_carry_days", 7))
     components = [dict(item) for item in contract["components"]]
     nav_series: dict[str, dict[str, float]] = {}
+    # Account and portfolio sleeves are normalized on a deposit-neutral NAV so
+    # external cash flows do not show up as sleeve performance.
+    adjusted_series: dict[str, dict[str, float]] = {}
     market_series: dict[str, list[tuple[str, float]]] = {}
     actual_currencies: dict[str, str] = {}
     calendar_sets: list[set[str]] = []
@@ -1564,6 +1601,7 @@ def refresh_fixed_unit_composite(
             }
             preferred_accounts.append(component_id)
             nav_series[component_id] = values
+            adjusted_series[component_id] = _flow_adjusted_nav(connection, component_id, values, subject_type="account")
             calendar_sets.append(set(values))
             actual_currencies[component_id] = currency
         elif component_type == "portfolio":
@@ -1591,6 +1629,7 @@ def refresh_fixed_unit_composite(
                 if _number(row["total_nav"]) is not None
             }
             nav_series[component_id] = values
+            adjusted_series[component_id] = _flow_adjusted_nav(connection, component_id, values, subject_type="filtered_portfolio")
             calendar_sets.append(set(values))
             actual_currencies[component_id] = currency
         elif component_type == "benchmark":
@@ -1655,8 +1694,13 @@ def refresh_fixed_unit_composite(
             )
         return values
 
+    def performance_value(component_id: str, value: float, day: str) -> float:
+        adjusted = adjusted_series.get(component_id)
+        return value if adjusted is None else adjusted[day]
+
     base_values: dict[str, float] = {}
     for component_id, (value, currency, _) in inputs_for(normalization_date).items():
+        value = performance_value(component_id, value, normalization_date)
         rate, fx_date = fx.rate(
             currency, base_currency, normalization_date,
             preferred_accounts=preferred_accounts,
@@ -1682,7 +1726,10 @@ def refresh_fixed_unit_composite(
             converted = value * rate
             if reference_hkd and (not math.isfinite(converted) or converted<=0):
                 raise ValueError(f'{reference_label} requires positive finite converted source values')
-            normalized = 100.0 * converted / base_values[component_id]
+            normalized = (
+                100.0 * performance_value(component_id, value, day) * rate
+                / base_values[component_id]
+            )
             coefficient = float(component["coefficient"])
             rows.append(
                 {

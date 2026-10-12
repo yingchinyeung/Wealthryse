@@ -508,6 +508,13 @@ def _ascii_label(value: Any) -> str:
 
 
 def _normalize_nav(series: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Chain-link a cash-flow-adjusted index (start = 100) from daily NAV.
+
+    Each row may carry ``flow``: the net external deposit (+) or withdrawal (-)
+    since the previous row. Daily returns use the same Modified Dietz formula as
+    the website comparison, r = (V1 - V0 - F) / (V0 + F / 2), so deposits and
+    withdrawals no longer show up as performance. ``nav`` stays the raw value.
+    """
     rows = list(series)
     if not rows:
         raise MonthlyArtifactError("Performance series is empty")
@@ -516,16 +523,31 @@ def _normalize_nav(series: Iterable[dict[str, Any]]) -> tuple[dict[str, Any], ..
         raise MonthlyArtifactError("First NAV must be positive")
     normalized = []
     prior_date = ""
-    for row in rows:
+    prior_nav = first_nav
+    index = 100.0
+    for position, row in enumerate(rows):
         observed = str(row.get("date") or "")
         date.fromisoformat(observed)
         if prior_date and observed <= prior_date:
             raise MonthlyArtifactError("Performance dates are not strictly increasing")
-        prior_date = observed
         nav = _number(row.get("nav"), field=f"NAV {observed}")
         if nav <= 0:
             raise MonthlyArtifactError(f"NAV {observed} must be positive")
-        normalized.append({"date": observed, "value": nav / first_nav * 100.0, "nav": nav})
+        flow = 0.0
+        if position:
+            flow = _number(row.get("flow") or 0.0, field=f"external flow {observed}")
+            denominator = prior_nav + 0.5 * flow
+            if denominator <= 0:
+                raise MonthlyArtifactError(
+                    f"Cash-flow-adjusted denominator is not positive on {observed}"
+                )
+            daily_return = (nav - prior_nav - flow) / denominator
+            if not math.isfinite(daily_return) or daily_return <= -1:
+                raise MonthlyArtifactError(f"Daily return is invalid on {observed}")
+            index *= 1.0 + daily_return
+        normalized.append({"date": observed, "value": index, "nav": nav, "flow": flow})
+        prior_date = observed
+        prior_nav = nav
     return tuple(normalized)
 
 
@@ -540,8 +562,9 @@ def _trailing_twelve_month_return(
     eligible = [row for row in normalized_nav if date.fromisoformat(row["date"]) >= target]
     if not eligible or date.fromisoformat(normalized_nav[0]["date"]) > target:
         return None
-    start_value = float(eligible[0]["nav"])
-    end_value = float(normalized_nav[-1]["nav"])
+    # Use the flow-adjusted index so deposits and withdrawals are not returns.
+    start_value = float(eligible[0]["value"])
+    end_value = float(normalized_nav[-1]["value"])
     return end_value / start_value - 1.0
 
 
@@ -1421,7 +1444,7 @@ def _alpha_world_return_distribution(
         from .alpha_world_t_analytics import simulate
         return simulate(inputs.chart_daily_returns, inputs.period_end, paths=paths)
     returns = [
-        float(current["nav"]) / float(previous["nav"]) - 1.0
+        float(current["value"]) / float(previous["value"]) - 1.0
         for previous, current in zip(inputs.normalized_nav, inputs.normalized_nav[1:])
     ]
     if not returns:

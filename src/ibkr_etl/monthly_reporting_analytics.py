@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import calendar
 import bisect
 from collections import defaultdict
@@ -29,18 +30,11 @@ def _month_start(period_end: str) -> str:
 
 def _external_cash_flow(transaction_type: Any, description: Any) -> bool:
     text = f"{transaction_type or ''} {description or ''}".upper()
-    return any(
-        token in text
-        for token in (
-            "DEPOSIT",
-            "WITHDRAW",
-            "TRANSFER",
-            "WIRE",
-            "ACH",
-            "CONTRIBUTION",
-            "DISTRIBUTION",
-        )
-    )
+    # Whole words only: "SWIRE PACIFIC" dividends are not wires.
+    return re.search(
+        r"\b(DEPOSITS?|WITHDRAW\w*|TRANSFERS?|WIRE|ACH|CONTRIBUTIONS?|DISTRIBUTIONS?)\b",
+        text,
+    ) is not None
 
 
 def _cash_bucket(transaction_type: Any, description: Any, amount: float) -> str:
@@ -407,6 +401,15 @@ def build_monthly_reporting_analytics(
     # unmatched effects remain explicitly in the reconciliation residual.
     dates = sorted(nav_by_date)
     missing_position_dates = [day for day in dates if not positions.get(day)]
+    # Deposits and withdrawals are not performance: use the website's daily
+    # Modified Dietz return and weight contributions on the same denominator.
+    from .provisional_benchmark import _external_flows
+
+    flows = _external_flows(
+        connection,
+        subject_id,
+        subject_type="account" if subject_type == "physical_account" else subject_type,
+    )
     daily: list[dict[str, Any]] = []
     for prior_day, current_day in zip(dates, dates[1:]):
         if current_day < month_start:
@@ -415,7 +418,13 @@ def build_monthly_reporting_analytics(
         current_nav = nav_by_date[current_day]
         if prior_nav is None or current_nav is None or prior_nav <= 0:
             continue
-        portfolio_return = current_nav / prior_nav - 1.0
+        external_flow = sum(
+            amount for day, amount in flows.items() if prior_day < day <= current_day
+        )
+        denominator = prior_nav + 0.5 * external_flow
+        if denominator <= 0:
+            continue
+        portfolio_return = (current_nav - prior_nav - external_flow) / denominator
         contributions: dict[str, float] = {}
         for conid, prior_position in positions[prior_day].items():
             current_position = positions[current_day].get(conid)
@@ -424,7 +433,7 @@ def build_monthly_reporting_analytics(
             contributions[conid] = (
                 prior_position["quantity"]
                 * (current_position["price"] - prior_position["price"])
-                / prior_nav
+                / denominator
             )
         residual = portfolio_return - sum(contributions.values())
         daily.append(

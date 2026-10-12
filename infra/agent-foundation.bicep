@@ -222,7 +222,7 @@ resource zoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023
     privateDnsZoneConfigs: [for (zone, i) in dnsZones: {
       name: replace(zone, '.', '-')
       properties: {
-        privateDnsZoneId: createPrivateDns ? resourceId('Microsoft.Network/privateDnsZones', zone) : privateDnsZoneIds[i]
+        privateDnsZoneId: createPrivateDns ? resourceId('Microsoft.Network/privateDnsZones', zone) : privateDnsZoneIds[?i]
       }
     }]
   }

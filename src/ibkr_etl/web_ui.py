@@ -32,6 +32,7 @@ const applyFilter=table=>{
 const setHeader=(table,index,dir)=>{Array.from(table.tHead.rows[0].cells).forEach((th,i)=>th.setAttribute('aria-sort',i===index?(dir==='asc'?'ascending':'descending'):'none'))};
 const sortBy=(th)=>{const table=th.closest('table'),index=th.cellIndex,current=Number(table.dataset.sortIndex)===index?table.dataset.sortDir:null,numericColumn=th.classList.contains('text-col')?false:index>1,dir=current?(current==='asc'?'desc':'asc'):(numericColumn?'desc':'asc');table.dataset.sortIndex=index;table.dataset.sortDir=dir;setHeader(table,index,dir);applySort(table)};
 document.addEventListener('click',event=>{const th=event.target.closest('table.sortable thead th');if(th)sortBy(th)});
+document.addEventListener('click',e=>document.querySelectorAll('details.platform-menu[open]').forEach(d=>{if(!d.contains(e.target))d.removeAttribute('open')}));
 document.addEventListener('keydown',event=>{const th=event.target.closest&&event.target.closest('table.sortable thead th');if(th&&(event.key==='Enter'||event.key===' ')){event.preventDefault();sortBy(th)}});
 window.wrTable=(bodySelector,options={})=>{
   const body=document.querySelector(bodySelector);if(!body)return;const table=body.closest('table');if(!table||table.classList.contains('sortable'))return;
@@ -125,6 +126,34 @@ const renderOverview=async(asOf,s)=>{
   if(sectors.status==='fulfilled'&&(sectors.value.allocation||[]).length)sectorList.innerHTML=sectorBars(sectors.value.allocation,5);
   else sectorList.innerHTML='<div class="empty">Sector allocation is unavailable for this date.</div>';
 };
+const chartSource=new Map(),chartRanges=new Map();
+const rangeStart=(range,last)=>{const d=new Date(last+'T00:00:00Z');if(range==='ytd')return `${last.slice(0,4)}-01-01`;const months={'1m':1,'3m':3,'1y':12}[range];if(!months)return null;d.setUTCMonth(d.getUTCMonth()-months);return d.toISOString().slice(0,10)};
+const rangeSeries=(id,series,options)=>{
+  const start=series.length?rangeStart(chartRanges.get(id)||'all',series[series.length-1].date):null;if(!start)return series;
+  const shown=series.filter(x=>x.date>=start);if(shown.length<2)return series;
+  if(options.yLabel!=='Rebased value')return shown;
+  const first=shown[0];return shown.map(row=>Object.fromEntries(Object.entries(row).map(([k,v])=>[k,k!=='date'&&Number.isFinite(Number(v))&&Number(first[k])?100*Number(v)/Number(first[k]):v])));
+};
+document.querySelectorAll('.range-buttons').forEach(group=>group.addEventListener('click',event=>{
+  const button=event.target.closest('button[data-range]');if(!button)return;const id=group.dataset.chart;chartRanges.set(id,button.dataset.range);
+  group.querySelectorAll('button').forEach(b=>{b.classList.toggle('active',b===button);b.setAttribute('aria-pressed',String(b===button))});
+  const source=chartSource.get(id);if(source)draw(id,source.series,source.lines,source.options);
+}));
+let resizeTimer=null;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>chartState.forEach((_,id)=>renderChart(id)),120)});
+const asOfKey=`wealthryse-asof-${account}`;
+const storedAsOf=dates=>{try{const value=sessionStorage.getItem(asOfKey);return value&&dates.includes(value)?value:null}catch(error){return null}};
+const rememberAsOf=value=>{try{sessionStorage.setItem(asOfKey,value)}catch(error){}};
+const showFreshness=latest=>{
+  const node=document.querySelector('#freshness');if(!node||!latest)return;
+  const parts=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Hong_Kong',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+  const back=day=>{const d=new Date(day+'T00:00:00Z');do{d.setUTCDate(d.getUTCDate()-1)}while(d.getUTCDay()===0||d.getUTCDay()===6);return d.toISOString().slice(0,10)};
+  const expected=back(parts),grace=back(expected);
+  const label=new Date(latest+'T00:00:00Z').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric',timeZone:'UTC'});
+  const state=latest>=expected?'current':latest>=grace?'late':'stale';
+  node.className=`freshness ${state}`;
+  node.innerHTML=`Data as of ${esc(label)}${state==='late'?' · one business day behind':state==='stale'?' · daily refresh overdue · <a href="/system-health">Check system health</a>':''}`;
+  node.hidden=false;
+};
 wrTable('#holdings',{filter:'#holdings-filter',count:'#holdings-filter-count'});
 wrTable('#sector-detail');wrTable('#trade-history');wrTable('#cash-activity');wrTable('#flows-statement');
 """
@@ -139,6 +168,7 @@ const pct=n=>n==null||!Number.isFinite(Number(n))?'—':(Number(n)>=5e-5?'+':'')
 const tone=n=>n==null||!Number.isFinite(Number(n))||Math.abs(Number(n))<5e-5?'':Number(n)>0?'gain':'loss';
 const money=(n,currency)=>{if(n==null||!Number.isFinite(Number(n)))return '—';try{return minus(new Intl.NumberFormat('en-US',{style:'currency',currency,maximumFractionDigits:0}).format(Number(n)))}catch(error){return minus(new Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Number(n)))+' '+currency}};
 const date=value=>{if(!value)return '—';const d=new Date(value+'T00:00:00Z');return Number.isNaN(d.getTime())?value:d.toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'})};
+document.addEventListener('click',e=>document.querySelectorAll('details.platform-menu[open]').forEach(d=>{if(!d.contains(e.target))d.removeAttribute('open')}));
 fetch('/api/accounts/overview').then(r=>r.ok?r.json():Promise.reject(r.status)).then(data=>{
   const latest=data.accounts.map(a=>a.nav_date).filter(Boolean).sort().pop();
   document.querySelectorAll('[data-account-stats]').forEach(node=>{

@@ -146,5 +146,47 @@ class PageMarkupTests(unittest.TestCase):
         self.assertNotIn("#obs", live)
 
 
+
+class NavigationAndChartTests(unittest.TestCase):
+    def test_operations_menu_groups_operator_pages_by_role(self):
+        owner = web._platform_navigation({"role": "owner"}, active="administration")
+        self.assertIn('<summary class="platform-nav-link active">Operations</summary>', owner)
+        for href in ("/system-health", "/ibkr-connections", "/account-onboarding", "/administration"):
+            self.assertIn(f'class="platform-menu-link', owner)
+            self.assertIn(f'href="{href}"', owner)
+        self.assertIn('aria-current="page">Administration</a>', owner)
+        viewer = web._platform_navigation({"role": "viewer"})
+        self.assertIn('href="/system-health"', viewer)
+        self.assertNotIn('href="/administration"', viewer)
+        self.assertNotIn('href="/account-onboarding"', viewer)
+        self.assertNotIn("platform-nav-link active", viewer)
+
+    def test_account_switcher_lists_visible_accounts_and_keeps_the_tab(self):
+        directory = [{"subject_id": "U16088571", "display_name": "Tech"},
+                     {"subject_id": "alpha-world-t", "display_name": "Alpha <T>"}]
+        with patch.object(web, "_account_directory", return_value=directory):
+            page = web._render_account_page({"email": "o@example.com", "role": "owner"},
+                                            account_id="U16088571", section="holdings")
+        self.assertIn('id="account-switcher"', page)
+        self.assertIn("+'/holdings'", page)
+        self.assertIn('<option value="U16088571" selected>Tech</option>', page)
+        self.assertIn("Alpha &lt;T&gt;", page)
+        with patch.object(web, "_account_directory", side_effect=RuntimeError("db down")):
+            page = web._render_account_page({"email": "o@example.com", "role": "owner"},
+                                            account_id="U16088571", section="holdings")
+        self.assertNotIn('id="account-switcher"', page)
+
+    def test_charts_are_sharp_and_have_period_buttons(self):
+        for source in (web._render_account_page({"email": "o@example.com", "role": "owner"},
+                                                account_id="U16088571", section="performance"),
+                       Path("deploy/live-merged/src/ibkr_etl/web.py").read_text(encoding="utf-8")):
+            self.assertIn("ctx.setTransform(dpr,0,0,dpr,0,0)", source)
+            self.assertIn('data-chart="#chart"', source)
+            self.assertIn('data-chart="#benchmark-chart"', source)
+            self.assertIn("series=rangeSeries(id,series,options)", source)
+            self.assertIn("showFreshness(d.latest)", source)
+            self.assertIn('id="freshness"', source)
+            self.assertNotIn("c.width/r.width", source)
+
 if __name__ == "__main__":
     unittest.main()

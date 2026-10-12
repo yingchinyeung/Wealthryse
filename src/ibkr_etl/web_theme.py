@@ -514,5 +514,9 @@ table.monthly-returns th.text-col { text-align: left; }
 .heat-cell sup { margin-left: 1px; color: var(--muted-strong); font-size: 9px; }
 .year-cell { border-left: 1px solid var(--line-strong); font-weight: 750; }
 .analytics-methodology { font-size: 12px; line-height: 1.6; }
+.sector-fill.negative { background: linear-gradient(90deg, #b42318, #e5484d); }
+table.correlation-matrix th, table.correlation-matrix td { padding: 8px; text-align: center; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.correlation-matrix th.text-col { text-align: left; }
+.corr-cell { font-size: 12.5px; font-weight: 600; }
 @media (max-width: 900px) { .half-card { grid-column: 1 / -1; } }
 """

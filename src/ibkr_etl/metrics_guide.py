@@ -368,6 +368,42 @@ METRIC_SECTIONS = (
                 "Sum of holding weights grouped by each holding's trading currency; with a NAV weight basis the remainder is cash and other NAV components.",
                 'Shows foreign-exchange risk relative to the reporting currency. Cash balances by currency are on the Cash tab.',
             ),
+            MetricDefinition(
+                'Contribution to return',
+                "How much a holding or sector added to or subtracted from the portfolio's return in one month.",
+                'Each day: prior-day units × change in mark price (converted to the reporting currency) ÷ the cash-flow-adjusted NAV denominator. Daily effects are Frongello-linked so holdings plus residual add exactly to the compounded monthly return. Same engine as the monthly factsheet.',
+                'The residual captures cash, interest, fees, FX on cash, intramonth trading and unmatched movements.',
+            ),
+            MetricDefinition(
+                'Portfolio turnover',
+                'How much of the portfolio was traded, excluding new money that was simply invested.',
+                'Lesser of purchases and sales (in the reporting currency) ÷ average NAV. The headline figure covers the latest 12 months, scaled to a year when less history exists.',
+                '100% means the equivalent of the whole portfolio was replaced once in the year.',
+            ),
+            MetricDefinition(
+                'Commissions / NAV',
+                'Broker commissions as a share of average portfolio value.',
+                'Sum of commissions converted to the reporting currency ÷ average NAV, over the latest 12 months or one month.',
+                'A direct measure of trading cost drag on returns.',
+            ),
+            MetricDefinition(
+                'Trading activity',
+                'Counts and values of executed trades: purchases, sales, commissions and realised P&L by month.',
+                "Executed IBKR trades from the daily refresh, converted to the reporting currency with the latest FX rate on or before each trade date. Realised P&L uses IBKR's lot accounting.",
+                'Trades without a usable FX rate are left out and listed.',
+            ),
+            MetricDefinition(
+                'Rolling beta and correlation',
+                'Sensitivity to, and co-movement with, the selected benchmark over a moving six-month window.',
+                'For each date, beta = covariance(portfolio, benchmark) ÷ variance(benchmark) and the Pearson correlation, over the latest 126 common-date daily returns.',
+                "Shows whether the portfolio's market exposure has changed over time.",
+            ),
+            MetricDefinition(
+                'Holdings correlation',
+                'How closely the daily price moves of the largest holdings track each other.',
+                "Pearson correlation of daily mark-price returns in each holding's own currency over the latest 252 dates, using days both were held (at least 40). One-day moves above 50% are treated as corporate actions and excluded.",
+                'High correlations mean the holdings diversify each other less than the count suggests.',
+            ),
         ),
     ),
     MetricSection(
@@ -647,6 +683,12 @@ CLIENT_CALCULATIONS = {
     'Top 10 weight': 'Add up the weights of the ten biggest holdings.',
     'Effective number of holdings': "Square each holding's share of the portfolio, add them up and take the reciprocal.",
     'Currency exposure': 'Group the holdings by the currency they trade in and add up their weights.',
+    'Contribution to return': "For each day, value the change in each holding's price on the units held the day before, then link the days into a monthly total.",
+    'Portfolio turnover': 'Take the smaller of what was bought and what was sold and divide by the average portfolio value.',
+    'Commissions / NAV': 'Add up the commissions paid and divide by the average portfolio value.',
+    'Trading activity': 'Group the executed trades by month and add up their values in the reporting currency.',
+    'Rolling beta and correlation': 'Measure how the portfolio moved with the benchmark over roughly the last six months, and repeat for each date.',
+    'Holdings correlation': "Compare each pair of top holdings' daily price changes and score how often they move together.",
 }
 
 

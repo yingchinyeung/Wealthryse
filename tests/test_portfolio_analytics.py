@@ -163,6 +163,75 @@ class ConcentrationTests(unittest.TestCase):
         self.assertFalse(result["available"])
 
 
+class RollingBenchmarkTests(unittest.TestCase):
+    def test_beta_of_a_levered_copy_is_its_leverage(self):
+        from types import SimpleNamespace
+        rows = [SimpleNamespace(observation_date=f"d{i:03d}", portfolio_return=2 * r, benchmark_return=r)
+                for i, r in enumerate((0.01 * math.sin(i) for i in range(140)))]
+        rows.append(SimpleNamespace(observation_date="gap", portfolio_return=None, benchmark_return=0.01))
+        series = analytics.rolling_benchmark_statistics(rows, window=126)
+        self.assertEqual(len(series), 140 - 126 + 1)
+        self.assertEqual(series[0]["date"], "d125")
+        self.assertAlmostEqual(series[-1]["beta"], 2.0)
+        self.assertAlmostEqual(series[-1]["correlation"], 1.0)
+
+
+class TradingActivityTests(unittest.TestCase):
+    def test_monthly_turnover_commissions_and_fx(self):
+        trades = [
+            {"trade_date": "2026-01-05", "buy_sell": "BUY", "currency": "USD", "proceeds_text": "-1000",
+             "commission_text": "-1", "commission_currency": "USD", "realized_pnl_text": "0"},
+            {"trade_date": "2026-01-20", "buy_sell": "SELL", "currency": "HKD", "proceeds_text": "3900",
+             "commission_text": "-7.8", "commission_currency": "HKD", "realized_pnl_text": "780"},
+            {"trade_date": "2026-01-21", "buy_sell": "SELL", "currency": "JPY", "proceeds_text": "100",
+             "commission_text": "0", "commission_currency": "JPY", "realized_pnl_text": "0"},
+            {"trade_date": "2026-03-01", "buy_sell": "BUY", "currency": "USD", "proceeds_text": "-1"},
+        ]
+        nav = {"2026-01-02": 9000.0, "2026-01-30": 11000.0, "2026-02-27": 10000.0}
+        rates = {"USD": 1.0, "HKD": 0.128}
+        result = analytics.trading_activity(trades, nav, lambda c, d: rates.get(c), as_of="2026-02-28")
+        self.assertEqual(result["missing_fx_currencies"], ["JPY"])
+        months = {row["month"]: row for row in result["monthly"]}
+        self.assertEqual(list(months), ["2026-02", "2026-01"])
+        jan = months["2026-01"]
+        self.assertEqual(jan["trades"], 2)
+        self.assertAlmostEqual(jan["purchases"], 1000)
+        self.assertAlmostEqual(jan["sales"], 3900 * 0.128)
+        self.assertAlmostEqual(jan["commissions"], 1 + 7.8 * 0.128)
+        self.assertAlmostEqual(jan["realized_pnl"], 780 * 0.128)
+        self.assertAlmostEqual(jan["turnover"], 3900 * 0.128 / 10000)
+        self.assertEqual(months["2026-02"]["trades"], 0)
+        totals = result["trailing_12_months"]
+        self.assertEqual(totals["months"], 2)
+        self.assertAlmostEqual(totals["annualized_turnover"], totals["turnover"] * 6)
+
+
+class CorrelationTests(unittest.TestCase):
+    def test_pairs_use_shared_days_and_skip_price_breaks(self):
+        days = [(date(2026, 1, 1) + timedelta(days=i)).isoformat() for i in range(80)]
+        moves = [0.01 * math.sin(i * 1.7) for i in range(80)]
+        a, b, c, price_a, price_b, price_c = {}, {}, {}, 100.0, 50.0, 20.0
+        for i, day in enumerate(days):
+            price_a *= 1 + moves[i]
+            price_b *= 1 - moves[i]
+            price_c *= 1 + (0.02 if i % 2 else -0.02)
+            a[day], b[day], c[day] = price_a, price_b, price_c
+        b[days[40]] = b[days[40]] * 3  # a bad mark: two 50%+ jumps
+        result = analytics.holdings_correlation({"1": a, "2": b, "3": c},
+                                                {"1": "AAA", "2": "BBB", "3": "CCC", "9": "ZZZ"})
+        self.assertTrue(result["available"])
+        self.assertEqual([h["symbol"] for h in result["holdings"]], ["AAA", "BBB", "CCC"])
+        self.assertAlmostEqual(result["matrix"][0][1]["correlation"], -1.0, places=3)
+        self.assertEqual(result["excluded_price_breaks"], 2)
+        self.assertEqual(result["matrix"][0][0]["correlation"], 1.0)
+
+    def test_too_few_shared_days_is_unavailable(self):
+        prices = {"1": {"2026-01-01": 1.0, "2026-01-02": 1.1}, "2": {"2026-01-01": 2.0, "2026-01-02": 2.1}}
+        result = analytics.holdings_correlation(prices, {"1": "A", "2": "B"})
+        self.assertFalse(result["available"])
+        self.assertIsNone(result["matrix"][0][1]["correlation"])
+
+
 @contextmanager
 def _no_database():
     yield object()
@@ -193,15 +262,49 @@ class EndpointAndPageTests(unittest.TestCase):
         performance = web._render_account_page(self.OWNER, account_id="U16088571", section="performance")
         for marker in ('id="monthly-returns"', 'id="drawdown-chart"', 'id="drawdown-episodes"',
                        'id="rolling-volatility-chart"', 'id="analytics-statistics"',
-                       "void renderAnalytics(asOf)", "/analytics?as_of="):
+                       "void renderAnalytics(asOf)", "/analytics?as_of=", 'id="attribution-month"',
+                       'id="rolling-beta-chart"', "renderRollingBenchmark(bc);"):
             self.assertIn(marker, performance)
+        trades = web._render_account_page(self.OWNER, account_id="U16088571", section="trades")
+        self.assertIn('id="trading-monthly"', trades)
+        self.assertIn("void renderTradingActivity(asOf)", trades)
+        risk = web._render_account_page(self.OWNER, account_id="U16088571", section="risk")
+        self.assertIn('id="correlation-body"', risk)
         holdings = web._render_account_page(self.OWNER, account_id="U16088571", section="holdings")
         self.assertIn('id="concentration-metrics"', holdings)
         self.assertIn("renderConcentration(h)", holdings)
 
+    def test_attribution_endpoint_uses_the_factsheet_engine(self):
+        from ibkr_etl import web
+        payload = {"quality_status": "pass", "message": "ok",
+                   "data": {"available": True, "portfolio_monthly_return": 0.01, "security_contributions": []}}
+        with patch.object(web, "_database", _no_database), \
+                patch.object(web, "_portable_database_connection", lambda c: c), \
+                patch.object(web, "_portfolio_access_context", return_value=self.ACCESS), \
+                patch("ibkr_etl.monthly_reporting_analytics.build_monthly_reporting_analytics",
+                      return_value=payload) as engine:
+            result = web.monthly_attribution_view("U1", month="2026-02", as_of="2026-03-05", user=self.VIEWER)
+        self.assertEqual(engine.call_args.kwargs["period_end"], "2026-02-28")
+        self.assertEqual(engine.call_args.kwargs["reporting_currency"], "USD")
+        self.assertTrue(result["available"])
+        self.assertEqual(result["month"], "2026-02")
+        from fastapi import HTTPException
+        with patch.object(web, "_portfolio_access_context", return_value=self.ACCESS):
+            for bad in ("2026-13", "26-01", "2026-04"):
+                with self.assertRaises(HTTPException):
+                    web.monthly_attribution_view("U1", month=bad, as_of="2026-03-05", user=self.VIEWER)
+
+    def test_composites_have_no_trading_or_correlation(self):
+        from ibkr_etl import web
+        access = {**self.ACCESS, "subject_type": "composite_portfolio"}
+        with patch.object(web, "_portfolio_access_context", return_value=access):
+            self.assertTrue(web.trading_activity_view("U1", user=self.VIEWER)["not_applicable"])
+            self.assertTrue(web.holdings_correlation_view("U1", user=self.VIEWER)["not_applicable"])
+
     def test_new_metrics_have_guide_entries(self):
         from ibkr_etl.metrics_guide import CLIENT_CALCULATIONS, METRIC_ANCHORS
-        for name in ("Sortino ratio", "Calmar ratio", "Maximum drawdown (since inception)",
+        for name in ("Contribution to return", "Portfolio turnover", "Commissions / NAV", "Trading activity",
+                     "Sortino ratio", "Calmar ratio", "Maximum drawdown (since inception)",
                      "Effective number of holdings", "Best and worst month", "Annualized volatility"):
             self.assertIn(name, METRIC_ANCHORS)
             self.assertIn(name, CLIENT_CALCULATIONS)
@@ -213,12 +316,15 @@ class EndpointAndPageTests(unittest.TestCase):
                     return ast.dump(node, include_attributes=False)
             raise AssertionError(f"{name} not found in {path}")
 
-        self.assertEqual(function(LIVE_WEB, "portfolio_analytics_view"),
-                         function(SRC_WEB, "portfolio_analytics_view"))
+        for name in ("portfolio_analytics_view", "monthly_attribution_view", "trading_activity_view",
+                     "holdings_correlation_view", "benchmark_comparison"):
+            self.assertEqual(function(LIVE_WEB, name), function(SRC_WEB, name), name)
         live = LIVE_WEB.read_text(encoding="utf-8")
-        for marker in ("from .web_analytics_ui import ANALYTICS_SCRIPT", "{PERFORMANCE_ANALYTICS_CARDS}</div>",
+        for marker in ("from .web_analytics_ui import (\n    ANALYTICS_SCRIPT,", "{PERFORMANCE_ANALYTICS_CARDS}</div>",
                        "{HOLDINGS_CONCENTRATION_CARD}", "{ACCOUNT_UI_SCRIPT}\n{ANALYTICS_SCRIPT}",
-                       '"concentration": holdings_concentration(view)', "void renderAnalytics(asOf)"):
+                       '"concentration": holdings_concentration(view)', "void renderAnalytics(asOf)",
+                       "{CORRELATION_CARD}</div>", 'data-section="trades">{TRADING_ACTIVITY_CARD}',
+                       "renderRollingBenchmark(null);", "void renderCorrelation(asOf)"):
             self.assertIn(marker, live)
 
 

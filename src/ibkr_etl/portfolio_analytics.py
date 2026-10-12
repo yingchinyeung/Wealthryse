@@ -382,14 +382,221 @@ def holdings_concentration(view: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+ROLLING_BENCHMARK_OBSERVATIONS = 126
+CORRELATION_HOLDINGS = 10
+CORRELATION_OBSERVATIONS = 252
+CORRELATION_MINIMUM_OBSERVATIONS = 40
+# A one-day price move this large in a position mark is far more likely to be
+# a split or other corporate action than a market move, so it is left out.
+PRICE_BREAK_THRESHOLD = 0.5
+
+
+def rolling_benchmark_statistics(
+    rows: Iterable[Any], window: int = ROLLING_BENCHMARK_OBSERVATIONS
+) -> list[dict[str, Any]]:
+    """Rolling beta and correlation of portfolio against benchmark daily returns.
+
+    ``rows`` are validated benchmark comparison rows (``observation_date``,
+    ``portfolio_return``, ``benchmark_return``); rows without both returns are
+    skipped. Each point uses the latest ``window`` common-date returns.
+    """
+
+    pairs = [
+        (row.observation_date, float(row.portfolio_return), float(row.benchmark_return))
+        for row in rows
+        if row.portfolio_return is not None and row.benchmark_return is not None
+    ]
+    series = []
+    for index in range(window, len(pairs) + 1):
+        sample = pairs[index - window:index]
+        portfolio = [item[1] for item in sample]
+        benchmark = [item[2] for item in sample]
+        variance = statistics.variance(benchmark)
+        spread = statistics.stdev(portfolio)
+        beta = statistics.covariance(portfolio, benchmark) / variance if variance else None
+        correlation = (
+            statistics.correlation(portfolio, benchmark) if variance and spread else None
+        )
+        series.append({"date": sample[-1][0], "beta": beta, "correlation": correlation})
+    return series
+
+
+def _number(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def trading_activity(
+    trades: Iterable[Mapping[str, Any]],
+    nav: Mapping[str, float],
+    rate: Any,
+    *,
+    as_of: str,
+) -> dict[str, Any]:
+    """Monthly traded value, turnover, commissions and realised P&L.
+
+    ``rate(currency, day)`` returns the non-forward-looking FX rate into the
+    reporting currency or None. Trades whose currency cannot be converted are
+    left out and their currencies listed. Turnover is the lesser of purchases
+    and sales divided by the month's average NAV, so contributions that are
+    simply invested do not count as turnover.
+    """
+
+    months: dict[str, dict[str, Any]] = {}
+    missing: set[str] = set()
+    for trade in trades:
+        day = str(trade.get("trade_date") or "")[:10]
+        if not day or day > as_of:
+            continue
+        currency = str(trade.get("currency") or "").upper()
+        fx = rate(currency, day)
+        if fx is None:
+            missing.add(currency or "Unknown")
+            continue
+        month = months.setdefault(day[:7], {
+            "month": day[:7], "trades": 0, "purchases": 0.0, "sales": 0.0,
+            "commissions": 0.0, "realized_pnl": 0.0,
+        })
+        month["trades"] += 1
+        proceeds = _number(trade.get("proceeds_text"))
+        if proceeds is not None:
+            side = str(trade.get("buy_sell") or "").upper()
+            is_buy = side.startswith("BUY") if side else proceeds < 0
+            month["purchases" if is_buy else "sales"] += abs(proceeds) * fx
+        commission = _number(trade.get("commission_text"))
+        if commission is not None:
+            commission_currency = str(trade.get("commission_currency") or currency).upper()
+            commission_fx = rate(commission_currency, day)
+            if commission_fx is None:
+                missing.add(commission_currency)
+            else:
+                month["commissions"] += -commission * commission_fx
+        realized = _number(trade.get("realized_pnl_text"))
+        if realized is not None:
+            month["realized_pnl"] += realized * fx
+    nav_by_month: dict[str, list[float]] = defaultdict(list)
+    for day, value in nav.items():
+        if day <= as_of:
+            nav_by_month[day[:7]].append(value)
+    rows = []
+    for key in sorted(set(months) | set(nav_by_month), reverse=True):
+        month = months.get(key) or {"month": key, "trades": 0, "purchases": 0.0, "sales": 0.0,
+                                    "commissions": 0.0, "realized_pnl": 0.0}
+        values = nav_by_month.get(key)
+        average = statistics.fmean(values) if values else None
+        month["average_nav"] = average
+        month["turnover"] = (
+            min(month["purchases"], month["sales"]) / average if average and average > 0 else None
+        )
+        month["commission_ratio"] = month["commissions"] / average if average and average > 0 else None
+        rows.append(month)
+    last_year = rows[:12]
+    navs = [row["average_nav"] for row in last_year if row["average_nav"]]
+    average_nav = statistics.fmean(navs) if navs else None
+    totals = {
+        "months": len(last_year),
+        "trades": sum(row["trades"] for row in last_year),
+        "purchases": sum(row["purchases"] for row in last_year),
+        "sales": sum(row["sales"] for row in last_year),
+        "commissions": sum(row["commissions"] for row in last_year),
+        "realized_pnl": sum(row["realized_pnl"] for row in last_year),
+        "average_nav": average_nav,
+    }
+    totals["turnover"] = (
+        min(totals["purchases"], totals["sales"]) / average_nav if average_nav else None
+    )
+    totals["annualized_turnover"] = (
+        totals["turnover"] * 12 / len(last_year) if totals["turnover"] is not None and last_year else None
+    )
+    totals["commission_ratio"] = totals["commissions"] / average_nav if average_nav else None
+    return {
+        "available": bool(rows),
+        "monthly": rows,
+        "trailing_12_months": totals,
+        "missing_fx_currencies": sorted(missing),
+    }
+
+
+def holdings_correlation(
+    prices: Mapping[str, Mapping[str, float]],
+    labels: Mapping[str, str],
+    *,
+    observations: int = CORRELATION_OBSERVATIONS,
+    minimum: int = CORRELATION_MINIMUM_OBSERVATIONS,
+) -> dict[str, Any]:
+    """Pairwise correlation of daily mark-price returns for a set of holdings.
+
+    ``prices`` maps conid to ``{date: mark price}`` in the holding's own
+    currency. Returns use consecutive observations of each holding; each pair
+    uses the dates both share within the latest ``observations`` dates. One-day
+    moves beyond PRICE_BREAK_THRESHOLD are treated as corporate actions and left out.
+    """
+
+    conids = [conid for conid in labels if conid in prices]
+    returns: dict[str, dict[str, float]] = {}
+    excluded_breaks = 0
+    all_dates: set[str] = set()
+    for conid in conids:
+        series = sorted((day, value) for day, value in prices[conid].items() if value and value > 0)
+        result = {}
+        for (_, previous), (day, current) in zip(series, series[1:]):
+            change = current / previous - 1.0
+            if abs(change) > PRICE_BREAK_THRESHOLD:
+                excluded_breaks += 1
+                continue
+            result[day] = change
+        returns[conid] = result
+        all_dates.update(result)
+    window = set(sorted(all_dates)[-observations:])
+    matrix = []
+    pair_values = []
+    minimum_pair = None
+    for left in conids:
+        row = []
+        for right in conids:
+            if left == right:
+                row.append({"correlation": 1.0, "observations": len(window & set(returns[left]))})
+                continue
+            common = sorted(window & set(returns[left]) & set(returns[right]))
+            value = None
+            if len(common) >= minimum:
+                a = [returns[left][day] for day in common]
+                b = [returns[right][day] for day in common]
+                if statistics.stdev(a) and statistics.stdev(b):
+                    value = statistics.correlation(a, b)
+            row.append({"correlation": value, "observations": len(common)})
+            if value is not None and left < right:
+                pair_values.append(value)
+                minimum_pair = len(common) if minimum_pair is None else min(minimum_pair, len(common))
+        matrix.append(row)
+    return {
+        "available": len(conids) >= 2 and bool(pair_values),
+        "holdings": [{"conid": conid, "symbol": labels[conid]} for conid in conids],
+        "matrix": matrix,
+        "average_correlation": statistics.fmean(pair_values) if pair_values else None,
+        "window_start": min(window) if window else None,
+        "window_end": max(window) if window else None,
+        "minimum_pair_observations": minimum_pair,
+        "excluded_price_breaks": excluded_breaks,
+    }
+
+
 __all__ = [
     "CALCULATION_VERSION",
     "PerformanceInputError",
     "daily_return_series",
     "drawdown_analysis",
     "holdings_concentration",
+    "holdings_correlation",
     "monthly_calendar",
     "portfolio_analytics",
     "return_statistics",
+    "rolling_benchmark_statistics",
     "rolling_series",
+    "trading_activity",
 ]

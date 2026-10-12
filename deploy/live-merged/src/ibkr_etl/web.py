@@ -142,8 +142,21 @@ from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_
 from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS
 from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
-from .web_analytics_ui import ANALYTICS_SCRIPT, HOLDINGS_CONCENTRATION_CARD, PERFORMANCE_ANALYTICS_CARDS
-from .portfolio_analytics import holdings_concentration, portfolio_analytics as calculate_portfolio_analytics
+from .web_analytics_ui import (
+    ANALYTICS_SCRIPT,
+    CORRELATION_CARD,
+    HOLDINGS_CONCENTRATION_CARD,
+    PERFORMANCE_ANALYTICS_CARDS,
+    TRADING_ACTIVITY_CARD,
+)
+from .portfolio_analytics import (
+    CORRELATION_HOLDINGS,
+    holdings_concentration,
+    holdings_correlation as calculate_holdings_correlation,
+    portfolio_analytics as calculate_portfolio_analytics,
+    rolling_benchmark_statistics,
+    trading_activity as calculate_trading_activity,
+)
 from .holdings_view import combine_holdings, enrich_holdings
 from .sector_classification import YAHOO_PROVIDER as HOLDINGS_SECTOR_PROVIDER
 
@@ -1546,6 +1559,149 @@ def portfolio_analytics_view(
         "requested_as_of": requested_as_of,
         "flows_applicable": flows is not None,
         **result,
+    }
+
+
+@app.get("/api/portfolio/{account_id}/attribution")
+def monthly_attribution_view(
+    account_id: str,
+    month: str,
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Contribution to return by holding and sector for one calendar month."""
+    from .monthly_reporting_analytics import build_monthly_reporting_analytics
+
+    access = _portfolio_access_context(account_id, user)
+    requested_as_of = _parse_as_of(as_of)
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month or ""):
+        raise HTTPException(status_code=400, detail="Month must be YYYY-MM")
+    if requested_as_of and month > requested_as_of[:7]:
+        raise HTTPException(status_code=400, detail="Month is after the as-of date")
+    year, number = int(month[:4]), int(month[5:])
+    next_month = date(year + number // 12, number % 12 + 1, 1)
+    period_end = (next_month - timedelta(days=1)).isoformat()
+    try:
+        with _database() as connection:
+            result = build_monthly_reporting_analytics(
+                _portable_database_connection(connection), subject_id=account_id,
+                period_end=period_end, reporting_currency=str(access["reporting_currency"]),
+            )
+    except (RuntimeError, ValueError) as error:
+        return {"account_id": account_id, "month": month, "available": False,
+                "quality_status": "fail", "message": str(error)}
+    return {
+        "account_id": account_id,
+        "month": month,
+        "quality_status": result["quality_status"],
+        "message": result["message"],
+        **result["data"],
+    }
+
+
+@app.get("/api/portfolio/{account_id}/trading-activity")
+def trading_activity_view(
+    account_id: str,
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Monthly traded value, turnover, commissions and realised P&L in the reporting currency."""
+    from .holdings_view import fx_history, reporting_fx
+    from .subject_exports import subject_export
+
+    access = _portfolio_access_context(account_id, user)
+    subject_type = str(access.get("subject_type") or "physical_account")
+    if subject_type == "composite_portfolio":
+        return {"account_id": account_id, "available": False, "not_applicable": True,
+                "message": "A composite portfolio has no independently executed trades."}
+    requested_as_of = _parse_as_of(as_of)
+    target = str(access["reporting_currency"]).upper()
+    with _database() as connection:
+        nav = _subject_nav_values(connection, account_id, access, requested_as_of)
+        if not nav:
+            return {"account_id": account_id, "available": False, "message": "No NAV history is available."}
+        effective = requested_as_of or nav[-1][0]
+        _, trades, _, _ = subject_export(
+            connection, tenant_id=TENANT_ID, subject_id=account_id, access=access,
+            dataset="trades", requested_as_of=effective, from_date=None, symbol=None, side=None,
+            cash_filter=_cash_filter_values, trade_filter=_trade_filter_values,
+        )
+        fx_account = _holdings_fx_account(connection, account_id, subject_type)
+        fx_rows = [] if fx_account is None else connection.execute(
+            """
+            SELECT rate_date, from_currency, to_currency, rate_text
+            FROM fx_rates
+            WHERE account_id = %s AND rate_date <= %s
+            ORDER BY from_currency, to_currency, rate_date
+            """,
+            (fx_account, effective),
+        ).fetchall()
+    history = fx_history(fx_rows)
+
+    def rate(currency: str, day: str) -> float | None:
+        quote, _ = reporting_fx(history, currency, target, day)
+        return float(quote["rate"]) if quote else None
+
+    nav_values = {}
+    for day, value in nav:
+        try:
+            nav_values[day] = float(value)
+        except (TypeError, ValueError):
+            continue
+    result = calculate_trading_activity([dict(row) for row in trades], nav_values, rate, as_of=effective)
+    return {"account_id": account_id, "currency": target, "effective_as_of": effective, **result}
+
+
+@app.get("/api/portfolio/{account_id}/holdings-correlation")
+def holdings_correlation_view(
+    account_id: str,
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Correlation of daily price returns between the ten largest holdings."""
+    access = _portfolio_access_context(account_id, user)
+    subject_type = str(access.get("subject_type") or "physical_account")
+    if subject_type == "composite_portfolio":
+        return {"account_id": account_id, "available": False, "not_applicable": True,
+                "message": "Composite sleeves have no security-level price history."}
+    requested_as_of = _parse_as_of(as_of)
+    with _database() as connection:
+        rows = _latest_subject_holdings(connection, account_id, requested_as_of)
+        if not rows:
+            return {"account_id": account_id, "available": False, "message": "No holdings are available."}
+        view = _enrich_subject_holdings(
+            connection, account_id, rows, subject_type=subject_type,
+            reporting_currency=str(access["reporting_currency"]),
+            nav_currency=str(access["reporting_currency"]),
+        )
+        ranked = sorted(
+            (row for row in view["holdings"] if row.get("weight") is not None),
+            key=lambda row: -abs(float(row["weight"])),
+        )[:CORRELATION_HOLDINGS]
+        labels = {str(row["conid"]): str(row.get("symbol") or row["conid"]) for row in ranked}
+        snapshot = str(rows[0]["snapshot_date"])
+        start = (date.fromisoformat(snapshot[:10]) - timedelta(days=550)).isoformat()
+        price_rows = connection.execute(
+            """
+            SELECT snapshot_date, conid::text AS conid, mark_price_text
+            FROM subject_position_series
+            WHERE tenant_id = %s AND subject_id = %s AND conid::text = ANY(%s)
+              AND snapshot_date BETWEEN %s AND %s
+            ORDER BY snapshot_date
+            """,
+            (TENANT_ID, account_id, list(labels), start, snapshot),
+        ).fetchall() if labels else []
+    prices: dict[str, dict[str, float]] = {}
+    for row in price_rows:
+        try:
+            value = float(row["mark_price_text"])
+        except (TypeError, ValueError):
+            continue
+        prices.setdefault(str(row["conid"]), {})[str(row["snapshot_date"])] = value
+    return {
+        "account_id": account_id,
+        "snapshot_date": snapshot,
+        **calculate_holdings_correlation(prices, labels),
     }
 
 
@@ -4526,6 +4682,7 @@ def benchmark_comparison(
         "reporting_currency": benchmark["reporting_currency"],
         "calculation_version": website_comparison_version(account_id, benchmark["reporting_currency"]),
         "metrics": comparison_metrics(rows),
+        "rolling": rolling_benchmark_statistics(rows),
         "series": [
             {
                 "date": row.observation_date,
@@ -10392,9 +10549,9 @@ def _render_account_page(
 <div class="card wide"><div class="label">Rebased performance comparison</div><div class="legend"><span><i class="swatch portfolio"></i>{account_display_name}</span><span><i class="swatch index"></i><span id="benchmark-legend">Primary benchmark</span></span></div><div class="range-buttons" data-chart="#benchmark-chart" role="group" aria-label="Chart period"><button type="button" data-range="1m">1M</button><button type="button" data-range="3m">3M</button><button type="button" data-range="ytd">YTD</button><button type="button" data-range="1y">1Y</button><button type="button" data-range="all" class="active" aria-pressed="true">All</button></div><div class="chart-wrap"><canvas id="benchmark-chart" width="1100" height="320" aria-label="Rebased performance comparison chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div>
 <div class="card wide"><div class="label">Period returns</div><div class="muted">Time-weighted returns (TWR) chain-link daily cash-flow-adjusted returns, so contributions and withdrawals do not count as performance. IRR is the annualised money-weighted return including the timing of those flows.</div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-returns"></tbody></table></div><div class="label" style="margin-top:18px">Custom period</div><div class="filter-grid"><label><span class="label">From</span><input id="period-from" type="date" min="{history_start_date}" aria-label="Custom period start date"></label><label><span class="label">To</span><input id="period-to" type="date" min="{history_start_date}" aria-label="Custom period end date"></label></div><div class="actions"><button id="period-apply" class="button" type="button">Calculate custom period</button></div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-custom"></tbody></table></div><div id="period-note" class="muted" style="margin-top:12px">Loading period returns…</div></div><div class="card wide"><div class="label">Contributions and withdrawals</div><div id="flows-totals" class="metrics"></div><div class="table-scroll"><table><thead><tr><th>Date</th><th>Type</th><th>Amount ({reporting_currency})</th></tr></thead><tbody id="flows-statement"></tbody></table></div><div id="flows-note" class="muted" style="margin-top:12px">Loading contributions and withdrawals…</div></div>
 <div class="card wide"><div class="label">NAV history</div><div class="range-buttons" data-chart="#chart" role="group" aria-label="Chart period"><button type="button" data-range="1m">1M</button><button type="button" data-range="3m">3M</button><button type="button" data-range="ytd">YTD</button><button type="button" data-range="1y">1Y</button><button type="button" data-range="all" class="active" aria-pressed="true">All</button></div><div class="chart-wrap"><canvas id="chart" width="1100" height="320" aria-label="NAV history chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div>{PERFORMANCE_ANALYTICS_CARDS}</div>
-<div class="page-view{active['risk']}" data-section="risk"><div class="card wide"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div></div>
+<div class="page-view{active['risk']}" data-section="risk"><div class="card wide"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div>{CORRELATION_CARD}</div>
 <div class="page-view{active['cash']}" data-section="cash"><div class="card wide"><div class="label"><span id="cash-kind">Cash balances</span> as of <span id="cash-asof">—</span></div><div id="cash-balances" class="metrics"></div><div id="cash-ledger-controls"><div class="label" style="margin-top:18px">Cash activity history</div><div class="muted">Choose a custom date range to view every matching IBKR cash activity. The CSV download contains the same complete filtered result.</div><div class="filter-grid"><label><span class="label">From</span><input id="cash-from" type="date" min="{history_start_date}" aria-label="Cash activity start date"></label><label><span class="label">To</span><input id="cash-to" type="date" min="{history_start_date}" aria-label="Cash activity end date"></label></div><div class="actions"><button id="cash-apply" class="button" type="button">Apply cash filters</button><a id="cash-export" class="button" href="#">Download cash activity CSV</a></div></div><div id="cash-note" class="muted" style="margin-top:12px">Loading cash activity…</div><div id="cash-ledger-table" class="table-scroll"><table><thead><tr><th>Date</th><th>Time</th><th>Type</th><th>Description</th><th>Currency</th><th>Amount</th></tr></thead><tbody id="cash-activity"></tbody></table></div></div></div>
-<div class="page-view{active['trades']}" data-section="trades"><div class="card wide"><div class="label">Trade history</div><div id="trade-source-title" class="value">Trade records</div><div id="trade-source-note" class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div id="trade-filter-controls" class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
+<div class="page-view{active['trades']}" data-section="trades">{TRADING_ACTIVITY_CARD}<div class="card wide"><div class="label">Trade history</div><div id="trade-source-title" class="value">Trade records</div><div id="trade-source-note" class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div id="trade-filter-controls" class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
 <div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Sector allocation</div><div id="sector-summary" class="muted"></div><div id="sector-bars" class="sector-bars"></div><details class="sector-detail"><summary>Industries within each sector</summary><div class="table-scroll"><table><thead><tr><th class="text-col">Sector</th><th class="text-col">Industry</th><th class="text-col">Region</th><th>Holdings</th><th>Value (<span>{reporting_currency}</span>)</th><th>Weight</th></tr></thead><tbody id="sector-detail"></tbody></table></div></details><div id="sector-note" class="muted sector-note"></div></div>{HOLDINGS_CONCENTRATION_CARD}<div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-tools"><input id="holdings-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter holdings"><span id="holdings-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
 <div class="page-view{active['reports']}" data-section="reports"><div class="card wide"><div class="label">Monthly factsheets and presentations</div><div class="value">Report centre</div><div id="report-note" class="muted">Loading frozen month-end reports…</div><div class="actions"><select id="report-month" aria-label="Monthly report period"></select><button id="report-prepare" class="button" type="button" disabled>Generate secure downloads</button></div><div id="report-status" class="muted" style="margin-top:14px"></div><div id="report-downloads" class="actions"></div><div id="report-owner-review" style="display:none;margin-top:22px"><h3>Review and release files</h3><p class="muted">Tick a file to make it available to authorized users. Untick it and submit to revoke its download access. The original file and approval history are retained. Review files before approving; client distribution remains prohibited.</p><div id="report-release-details" class="muted" style="margin-top:12px"></div><div id="report-release-list" style="display:grid;gap:12px;margin:16px 0"></div><button id="report-release" class="button" type="button" disabled>Submit approval changes</button><div id="report-release-status" class="muted" role="status" aria-live="polite"></div></div></div></div>
 <div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a>{trade_export_link}<a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
@@ -10469,11 +10626,12 @@ document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol
 document.querySelector('#benchmark-legend').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.return_basis==='price_return'?'price return':meta.return_basis==='total_return'?'total return':meta.return_convention}}`;
 document.querySelector('#benchmark-note').textContent=meta.message+`${{meta.return_basis==='price_return'?' The benchmark is a price index: its returns exclude dividends, while portfolio returns include income, so the comparison favours the portfolio by the index dividend yield.':''}} Provider: ${{meta.provider||'—'}} · Convention: ${{meta.return_convention}} · License: ${{meta.license_status}} · Provisional observations: ${{meta.provisional_observations}} · Latest feed observation: ${{meta.latest_provisional_observation||'—'}}`;
 document.querySelector('#benchmark-metrics').innerHTML='';
-draw('#benchmark-chart',[],[]);
+draw('#benchmark-chart',[],[]);renderRollingBenchmark(null);
 if(bc.available){{
 const m=bc.metrics,items=[['Portfolio total return',pct(m.portfolio_total_return)],['Benchmark total return',pct(m.benchmark_total_return),bc.benchmark_return_basis==='price_return'?'Benchmark price return (excludes dividends)':undefined],['Excess total return',pct(m.excess_total_return),bc.benchmark_return_basis==='price_return'?'Excess return vs price index':undefined],['Tracking error',pct(m.tracking_error)],['Information ratio',m.information_ratio==null?'—':fmt(m.information_ratio)],['Beta',m.beta==null?'—':fmt(m.beta)],['Correlation',m.correlation==null?'—':fmt(m.correlation)],['Relative win rate',pct(m.relative_win_rate)]];
 document.querySelector('#benchmark-note').textContent+=` Aligned comparison: ${{m.period_start}} through ${{m.period_end}} · Reporting currency: ${{bc.reporting_currency}} · ${{m.observations}} common-date observations. Rebased to 100 at the first common observation; unmatched market dates are not filled.`;
 document.querySelector('#benchmark-metrics').innerHTML=items.map(metricCard).join('');
+renderRollingBenchmark(bc);
 draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}})
 }}
 }};
@@ -10498,6 +10656,8 @@ document.querySelector('#positions').textContent=s.current_positions;
 if(activeSection==='overview')await renderOverview(asOf,s);
 if(activeSection==='holdings'){{void renderSectors(asOf);renderConcentration(h)}}
 if(activeSection==='performance')void renderAnalytics(asOf);
+if(activeSection==='trades')void renderTradingActivity(asOf);
+if(activeSection==='risk')void renderCorrelation(asOf);
 document.querySelector('#holdings-asof').textContent=h.snapshot_date||'No snapshot';
 document.querySelector('#holdings-quantity-label').textContent=h.holdings.some(x=>x.holding_kind==='synthetic_exposure')?'Sleeve coefficient (not shares)':'Quantity';
 document.querySelector('#holdings-reporting-currency').textContent=h.reporting_currency||reportingCurrency;

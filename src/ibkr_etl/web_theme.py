@@ -504,4 +504,15 @@ table.sortable thead th[aria-sort="descending"]::after { content: "↓"; opacity
   .onboarding-case-head { align-items: flex-start; flex-direction: column; }
   .onboarding-check { grid-template-columns: 1fr; gap: 5px; }
 }
+.half-card { grid-column: span 2; }
+.half-card canvas { height: 240px; }
+#drawdown-chart { height: 260px; }
+table.monthly-returns { min-width: 860px; }
+table.monthly-returns th, table.monthly-returns td { padding: 9px 8px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.monthly-returns th.text-col { text-align: left; }
+.heat-cell { color: var(--ink); font-size: 12.5px; font-weight: 600; }
+.heat-cell sup { margin-left: 1px; color: var(--muted-strong); font-size: 9px; }
+.year-cell { border-left: 1px solid var(--line-strong); font-weight: 750; }
+.analytics-methodology { font-size: 12px; line-height: 1.6; }
+@media (max-width: 900px) { .half-card { grid-column: 1 / -1; } }
 """

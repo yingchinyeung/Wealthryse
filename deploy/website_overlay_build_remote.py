@@ -2,8 +2,8 @@
 
 The deploy-website workflow fills in CONFIG and runs this as root inside a
 private mount namespace (`unshare --mount`). It starts from the exact image
-the website runs today, replaces only src/ibkr_etl with the reviewed commit
-(after checking the live files are the commit the workflow expects), builds
+the website runs today, applies only the reviewed change to src/ibkr_etl on top
+of the live files (every hunk must apply exactly), builds
 with no network, and pushes one new tag over the registry's private endpoint.
 No application starts and no database is touched.
 """
@@ -100,20 +100,31 @@ def main():
             run(client + ['rm', container], 'live image cleanup', env=env)
         package = context / 'src' / 'ibkr_etl'
         live = tree_hashes(package)
-        if live != config['live_hashes']:
-            expected = config['live_hashes']
-            result['live_drift'] = {
-                'only_live': sorted(set(live) - set(expected)),
-                'only_expected': sorted(set(expected) - set(live)),
-                'different': sorted(n for n in set(live) & set(expected) if live[n] != expected[n]),
-            }
-            raise ValueError('Live website source is not the expected commit; nothing built')
+        expected, wanted = config['live_hashes'], config['new_hashes']
+        result['live_drift'] = {
+            'only_live': sorted(set(live) - set(expected)),
+            'only_expected': sorted(set(expected) - set(live)),
+            'different': sorted(n for n in set(live) & set(expected) if live[n] != expected[n]),
+        }
+        # The live source is not exactly the commit the change was made on, so the
+        # change is applied on top of whatever the live files are. Each file the
+        # change touches must be where the change expects it, and every hunk must
+        # apply exactly (no fuzz); otherwise nothing is built.
+        touched = sorted(n for n in set(expected) | set(wanted) if expected.get(n) != wanted.get(n))
+        for name in touched:
+            if (name in expected) != (name in live):
+                raise ValueError('Live website file ' + name + ' is not where the change expects it; nothing built')
         patch_file = root / 'change.patch'
         patch_file.write_bytes(gzip.decompress(base64.b64decode(config['patch'])))
-        run(['patch', '-p1', '--forward', '--no-backup-if-mismatch', '-i', str(patch_file)], 'source patch', cwd=str(context))
-        if tree_hashes(package) != config['new_hashes']:
-            raise ValueError('Patched source does not match the reviewed commit; nothing built')
-        removed = sorted(set(config['live_hashes']) - set(config['new_hashes']))
+        run(['patch', '-p1', '--forward', '--fuzz=0', '--no-backup-if-mismatch', '-i', str(patch_file)], 'source patch', cwd=str(context))
+        patched = tree_hashes(package)
+        for name in touched:
+            if live.get(name) == expected.get(name) and patched.get(name) != wanted.get(name):
+                raise ValueError('Patched ' + name + ' does not match the reviewed commit; nothing built')
+        if any(patched.get(n) != live[n] for n in live if n not in touched):
+            raise ValueError('The change altered files it should not have; nothing built')
+        result['touched_files'] = touched
+        removed = sorted(n for n in set(expected) - set(wanted) if n in live)
         lines = ['FROM ' + base, 'USER root',
                  'LABEL ai.wealthryse.source-commit="' + config['source_commit'] + '"',
                  'COPY src/ibkr_etl/ /app/src/ibkr_etl/']

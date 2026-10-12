@@ -559,11 +559,14 @@ def _trailing_twelve_month_return(
         target = end.replace(year=end.year - 1)
     except ValueError:
         target = end.replace(year=end.year - 1, day=28)
-    eligible = [row for row in normalized_nav if date.fromisoformat(row["date"]) >= target]
-    if not eligible or date.fromisoformat(normalized_nav[0]["date"]) > target:
+    # The window starts at the last close on or before the same day a year
+    # earlier (a month-end that fell on a weekend or holiday uses the prior
+    # close), matching the month-end rows in the factsheet's own NAV table.
+    eligible = [row for row in normalized_nav if date.fromisoformat(row["date"]) <= target]
+    if not eligible:
         return None
     # Use the flow-adjusted index so deposits and withdrawals are not returns.
-    start_value = float(eligible[0]["value"])
+    start_value = float(eligible[-1]["value"])
     end_value = float(normalized_nav[-1]["value"])
     return end_value / start_value - 1.0
 

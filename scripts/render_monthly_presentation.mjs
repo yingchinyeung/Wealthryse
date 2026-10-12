@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { FileBlob, PresentationFile } from "@oai/artifact-tool";
-import { cashActivityNote, monthlyCalendarNote, attributionResidualNote } from './report_content_labels.mjs';
+import { cashActivityNote, portfolioMonthlyNote, attributionResidualNote } from './report_content_labels.mjs';
 import { genericSummaryLabel, boundedGenericCommentary } from './report_summary_label.mjs';
 
 const [sourcePath, snapshotPath, finalPath, commentaryPath] = process.argv.slice(2);
@@ -29,6 +29,12 @@ if (!isMsHkd && (snapshot.sector_allocation?.currency !== snapshot.reporting_cur
 const msModel = isMsHkd ? JSON.parse(execFileSync(process.env.RUNTIME_PYTHON || process.env.PYTHON_BINARY || 'python',
   ['-m','ibkr_etl.alpha_world_ms_presentation',snapshotPath], {encoding:'utf8'})) : null;
 if (isMsHkd && msModel.version !== 'alpha-world-ms-presentation-hkd-hibor-v1') throw new Error('MS rendering model version differs');
+// Portfolio returns come from the full cash-flow-adjusted NAV history, as on
+// the factsheet. The benchmark comparison only covers dates both series share,
+// so a benchmark-market holiday must not shorten the portfolio's own returns.
+const portfolioModel = isMsHkd ? null : JSON.parse(execFileSync(process.env.RUNTIME_PYTHON || process.env.PYTHON_BINARY || 'python',
+  ['-m','ibkr_etl.presentation_portfolio_returns',snapshotPath], {encoding:'utf8'}));
+if (!isMsHkd && portfolioModel.version !== 'presentation-portfolio-returns-v1') throw new Error('Portfolio return model version differs');
 
 const presentation = await PresentationFile.importPptx(await FileBlob.load(sourcePath));
 const tableDimensions = isMsHkd ? new Map((await presentation.inspect({kind:'table',maxChars:1000000})).ndjson
@@ -158,6 +164,7 @@ if (!isMsHkd) {
   const labels = await presentation.inspect({kind:'textbox',maxChars:1000000});
   const replacements = new Map([
     ['EXCESS VS S&P 500', 'BENCHMARK EXCESS'],
+    ['Primary and secondary benchmarks selectable in the staging website', 'Primary and secondary benchmark comparison'],
     ['Growth of 100 — portfolio versus S&P 500 Price Index', `Growth of 100 — portfolio versus ${primaryBenchmarkName}`],
   ]);
   for (const line of labels.ndjson.split('\n').filter(Boolean)) {
@@ -181,8 +188,13 @@ const dataAsOf = snapshot.data_as_of;
 const reportMonth = monthName(periodEnd);
 const monthRows = isMsHkd ? msModel.month_rows : snapshot.month_end_performance;
 const latestMonth = monthRows.at(-1) ?? {};
-const monthReturn = latestMonth.portfolio_monthly_return;
-const benchmarkMonthReturn = latestMonth.benchmark_monthly_return;
+const portfolioMonthRows = isMsHkd ? monthRows : portfolioModel.month_rows;
+if (!isMsHkd && portfolioMonthRows.at(-1)?.date !== dataAsOf) throw new Error('Portfolio month-end history does not end on data_as_of');
+const monthReturn = portfolioMonthRows.at(-1)?.portfolio_monthly_return;
+// The benchmark month only counts when the comparison history reaches this month.
+const benchmarkMonthReturn = latestMonth.date?.slice(0, 7) === dataAsOf.slice(0, 7) ? latestMonth.benchmark_monthly_return : null;
+const portfolioTotalReturn = isMsHkd ? primary.portfolio_total_return : portfolioModel.total_return;
+const portfolioStart = isMsHkd ? primary.period_start : portfolioModel.period_start;
 const holdings = [...snapshot.holdings.holdings]
   .sort((a, b) => Math.abs(Number(b.market_value_text)) - Math.abs(Number(a.market_value_text)));
 const grossMarketValue = Number(sector.gross_market_value);
@@ -202,13 +214,13 @@ setText("sh/14ryd8fq", `Monthly portfolio review | ${subjectLabel} | ${longDate(
 setText("sh/sfix03y9", `${reportMonth.toUpperCase()} RETURN`);
 setText("sh/tgry9ofu", percent(monthReturn));
 setText("sh/a9kfadwn", `${primaryBenchmarkName}: ${percent(benchmarkMonthReturn)}`);
-setText("sh/z2d07mh4", percent(primary.portfolio_total_return));
-setText("sh/y14jehgj", `Since ${shortDate(primary.period_start)}`);
+setText("sh/z2d07mh4", percent(portfolioTotalReturn));
+setText("sh/y14jehgj", `Since ${shortDate(portfolioStart)}`);
 setText("sh/ax4zax0n", points(primary.excess_total_return));
 setText("sh/21szqxcb", decimal(risk.sharpe_ratio));
 setText("sh/32l0j2dw", `Risk-free rate: ${percent(risk.risk_free_annual_rate)}`);
 setTable("tb/fql4fa5s", [
-  ["Performance", `${monthPhrase} Since the common start date, the portfolio returned ${percent(primary.portfolio_total_return)}.`],
+  ["Performance", `${monthPhrase} Since ${shortDate(portfolioStart)}, the portfolio returned ${percent(portfolioTotalReturn)}.`],
   ["Relative result", isMsHkd ? 'Benchmark-relative results are unavailable in the qualified HKD history.' : `The portfolio ${relativePhrase} ${primaryBenchmarkName} by ${points(Math.abs(primary.excess_total_return))} cumulatively and differs from ${secondaryBenchmarkName} by ${points(Math.abs(secondary.excess_total_return))}.`],
   ["Portfolio shape", `${largestSector.sector} represents ${percent(largestSector.weight)} of gross market value. The five largest ${holdingNoun}s represent ${percent(top5)} of gross exposure.`],
   ["Risk", `Annualized volatility is ${percent(primary.portfolio_annualized_volatility)}, observed maximum drawdown is ${percent(primary.portfolio_max_drawdown)}, and daily expected tail loss is ${percent(risk.daily_expected_tail_loss)}.`],
@@ -216,8 +228,8 @@ setTable("tb/fql4fa5s", [
 
 setText("sh/l8bi9sjq", `${subjectLabel} | Reporting currency: ${snapshot.reporting_currency} | ${longDate(periodEnd)}${isMsHkd ? ' | NAV per inception 100' : ''}`);
 setText("sh/9cvidcjm", money(nav));
-setText("sh/v2p0bqdw", percent(primary.portfolio_total_return));
-setText("sh/8ze10be5", `${primary.period_start} to ${primary.period_end}`);
+setText("sh/v2p0bqdw", percent(portfolioTotalReturn));
+setText("sh/8ze10be5", isMsHkd ? `${primary.period_start} to ${primary.period_end}` : `${portfolioModel.period_start} to ${portfolioModel.period_end}`);
 setText("sh/kvehwre9", percent(primary.portfolio_annualized_return));
 setText("sh/lwni5wvu", `${primary.return_observations} daily returns`);
 setText("sh/oru1ory1", percent(primary.portfolio_annualized_volatility));
@@ -227,7 +239,7 @@ setText("sh/wv2l8rex", percent(primary.portfolio_max_drawdown));
 setText("sh/z29kr2x4", percent(risk.daily_expected_tail_loss));
 setText("sh/n650zydw", holdings.length);
 setText("sh/03eho3ul", `${Number(sector.classification_coverage_pct).toFixed(0)}% ${isComposite ? "component coverage" : "sector coverage"}`);
-setText("sh/14nyxovq", isMsHkd ? `HKD total return was ${percent(primary.portfolio_total_return)}. Volatility was ${percent(primary.portfolio_annualized_volatility)} and maximum drawdown was ${percent(primary.portfolio_max_drawdown)}. Benchmark-relative results are unavailable.` : `Portfolio return was ${percent(primary.portfolio_total_return)} for the reporting period, versus ${percent(primary.benchmark_total_return)} for ${primaryBenchmarkName}. Annualized volatility was ${percent(primary.portfolio_annualized_volatility)}, and the observed maximum drawdown was ${percent(primary.portfolio_max_drawdown)}. ${largestSector.sector} represented ${percent(largestSector.weight)} of gross market value.`);
+setText("sh/14nyxovq", isMsHkd ? `HKD total return was ${percent(primary.portfolio_total_return)}. Volatility was ${percent(primary.portfolio_annualized_volatility)} and maximum drawdown was ${percent(primary.portfolio_max_drawdown)}. Benchmark-relative results are unavailable.` : `Portfolio return was ${percent(portfolioTotalReturn)} since ${shortDate(portfolioStart)}. Annualized volatility was ${percent(primary.portfolio_annualized_volatility)}, and the observed maximum drawdown was ${percent(primary.portfolio_max_drawdown)}. ${largestSector.sector} represented ${percent(largestSector.weight)} of gross market value.`);
 
 setText("sh/ud0ne10b", `Top 10 ${isComposite ? "components by gross exposure" : "positions by gross market value"} | ${longDate(periodEnd)}`);
 setText("sh/4ji5kbid", isMsHkd ? `Gross sleeve exposure: ${money(grossMarketValue)} per initial NAV 100. Signed values in HKD.` : `Gross ${isComposite ? "sleeve exposure" : "market value"}: ${money(grossMarketValue)}  •  ${holdings.length} ${holdingNoun}s  •  Values shown in USD`);
@@ -593,7 +605,7 @@ setTable("tb/m1gj2xgb", [
 
 setTable("tb/3ets36l8", [
   ["Metric", snapshot.subject_id, primaryBenchmarkName, secondaryBenchmarkName],
-  ["Total return", percent(primary.portfolio_total_return), percent(primary.benchmark_total_return), percent(secondary.benchmark_total_return)],
+  [isMsHkd ? "Total return" : "Total return (common dates)", percent(primary.portfolio_total_return), percent(primary.benchmark_total_return), percent(secondary.benchmark_total_return)],
   ["Annualized return", percent(primary.portfolio_annualized_return), percent(primary.benchmark_annualized_return), percent(secondary.benchmark_annualized_return)],
   ["Annualized volatility", percent(primary.portfolio_annualized_volatility), percent(primary.benchmark_annualized_volatility), percent(secondary.benchmark_annualized_volatility)],
   ["Maximum drawdown", percent(primary.portfolio_max_drawdown), percent(primary.benchmark_max_drawdown), percent(secondary.benchmark_max_drawdown)],
@@ -622,7 +634,7 @@ setTable("tb/3mtobupc", [
 ]);
 
 const monthlyByYear = new Map();
-for (const row of monthRows) {
+for (const row of portfolioMonthRows) {
   const [year, month] = row.date.split("-").map(Number);
   if (!monthlyByYear.has(year)) monthlyByYear.set(year, Array(12).fill("—"));
   monthlyByYear.get(year)[month - 1] = row.portfolio_monthly_return == null ? "—" : percent(row.portfolio_monthly_return, 1);
@@ -632,8 +644,8 @@ setTable("tb/a9srud0n", [
   ["2025", ...(monthlyByYear.get(2025) ?? Array(12).fill("—"))],
   ["2026", ...(monthlyByYear.get(2026) ?? Array(12).fill("—"))],
 ]);
-setText("sh/361gvilk", `Total return ${percent(risk.total_return)}  •  Annualized return ${percent(risk.annualized_return)}  •  Win rate ${percent(risk.win_rate)}`);
-setText("sh/25sf2d4z", isMsHkd ? 'January 2025 is a partial month from inception on 20 January. Monthly returns use observed HKD NAV.' : monthlyCalendarNote(monthRows, snapshot.performance_comparison.series, shortDate));
+setText("sh/361gvilk", `Total return ${percent(isMsHkd ? risk.total_return : portfolioTotalReturn)}  •  Annualized return ${percent(risk.annualized_return)}  •  Win rate ${percent(risk.win_rate)}`);
+setText("sh/25sf2d4z", isMsHkd ? 'January 2025 is a partial month from inception on 20 January. Monthly returns use observed HKD NAV.' : portfolioMonthlyNote(portfolioModel, shortDate));
 
 setTable("tb/5kb2xwby", [
   ["Control", "Status", "Evidence"],
@@ -647,7 +659,7 @@ setTable("tb/5kb2xwby", [
 ]);
 
 setText("sh/ytc7a1gv", `• ${monthPhrase}`);
-setText("sh/d83q1wfa", `• The full-period total return is ${percent(primary.portfolio_total_return)}.`);
+setText("sh/d83q1wfa", `• The full-period total return is ${percent(portfolioTotalReturn)}.`);
 setText("sh/c7up8ryp", `• The portfolio's positive-day win rate is ${percent(risk.win_rate)}.`);
 setText("sh/2dsn2xwn", `• Upside capture versus ${primaryBenchmarkName} is ${percent(primary.upside_capture_pct / 100)}.`);
 setText("sh/e98nydwb", `• Cumulative return ${relativePhrase} ${primaryBenchmarkName} by ${points(Math.abs(primary.excess_total_return))}.`);

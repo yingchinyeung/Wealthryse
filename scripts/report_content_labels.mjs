@@ -27,6 +27,13 @@ export function monthlyCalendarNote(rows, series, formatDate) {
     : `Common history starts ${formatDate(start)}. Monthly returns use the frozen comparison series.`;
 }
 
+export function portfolioMonthlyNote(model, formatDate) {
+  if (!model?.month_rows?.length || !/^\d{4}-\d{2}-\d{2}$/.test(model.period_start ?? '')) {
+    throw new Error('Portfolio monthly history is required');
+  }
+  return `Monthly returns use cash-flow-adjusted portfolio NAV from ${formatDate(model.period_start)}, the same basis as the factsheet. The first month runs from that date.`;
+}
+
 export function attributionResidualNote(monthly, formatPoints) {
   if (!Number.isFinite(monthly.residual_contribution)) throw new Error('Finite residual required');
   const usual = `Security effects use prior-day units and price changes. The ${formatPoints(monthly.residual_contribution)} residual captures cash, fees, FX, trading and unmatched position effects.`;

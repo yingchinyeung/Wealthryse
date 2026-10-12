@@ -68,6 +68,23 @@ class FactsheetFlowAdjustedReturnTests(unittest.TestCase):
         ])
         self.assertAlmostEqual(_trailing_twelve_month_return(rows, "2026-01-31"), 0.10)
 
+    def test_trailing_twelve_months_starts_at_prior_close_when_month_end_is_closed(self):
+        # 31 May 2025 was a Saturday: the window starts at the 30 May close,
+        # not the first close after it.
+        rows = _normalize_nav([
+            {"date": "2025-05-30", "nav": 100.0},
+            {"date": "2025-06-02", "nav": 104.0},
+            {"date": "2026-05-29", "nav": 120.0},
+        ])
+        self.assertAlmostEqual(_trailing_twelve_month_return(rows, "2026-05-31"), 0.20)
+
+    def test_trailing_twelve_months_needs_a_full_year_of_history(self):
+        rows = _normalize_nav([
+            {"date": "2025-06-02", "nav": 100.0},
+            {"date": "2026-05-29", "nav": 120.0},
+        ])
+        self.assertIsNone(_trailing_twelve_month_return(rows, "2026-05-31"))
+
 
 class CompositeSleeveFlowTests(unittest.TestCase):
     def adjusted(self, values, flows):

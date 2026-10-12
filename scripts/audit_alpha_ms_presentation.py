@@ -100,8 +100,12 @@ def audit(path,snapshot_path):
             [abs(round(float(r['contribution']),6)) for r in rows],'0.00%',
             [f"{float(r['contribution'])*100:.2f}%" for r in rows])
         verify_chart(chart('Constant cash per initial NAV 100'),['Constant cash'],[model['constant_cash']],'"HKD "0')
-        for slide in (13,14,16):
+        for slide in (13,16):
             if 'N/A' not in texts[slide] and 'UNAVAILABLE' not in texts[slide]:raise ValueError('Unavailable result missing')
+        for key in ('expected_maximum_drawdown_1y','actual_maximum_drawdown_1y','tail_maximum_drawdown_1y'):
+            value=model['risk'][key]
+            if (f'{value*100:.2f}%' if value is not None else 'N/A') not in texts[14]:
+                raise ValueError('One-year drawdown result missing: '+key)
         if model['crisis_available']:
             expected=f"{model['risk']['crisis_maximum_drawdown']*100:.2f}%"
             if expected not in texts[14] or 'Hypothetical HKD stress' not in texts[14]:

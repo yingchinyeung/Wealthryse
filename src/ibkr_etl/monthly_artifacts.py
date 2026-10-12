@@ -253,7 +253,6 @@ def _factsheet_classification(
         "software",
         "software-infrastructure",
         "software-application",
-        "electronic gaming and multimedia",
         "information technology services",
         "packaged software",
         "internet software and services",
@@ -294,8 +293,11 @@ def _factsheet_classification(
         return "United States", "Industrials", "Capital Goods"
     if key == "aerospace and defense":
         return "United States", "Industrials", "Aerospace & Defense"
+    # Video-game publishers sit in Communication Services (Media &
+    # Entertainment) under GICS, as in the provider data the deck uses.
     if key in {
         "entertainment",
+        "electronic gaming and multimedia",
         "internet content and information",
         "broadcasting",
         "advertising agencies",

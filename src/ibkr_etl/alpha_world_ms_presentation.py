@@ -6,8 +6,9 @@ import math
 from pathlib import Path
 import sys
 from .alpha_world_ms_analytics import analyze
+from .alpha_world_t_presentation import extended_metrics
 
-VERSION='alpha-world-ms-presentation-hkd-hibor-v1'
+VERSION='alpha-world-ms-presentation-hkd-hibor-v2'
 
 def build_model(snapshot):
     if snapshot.get('subject_id')!='alpha-world-ms' or snapshot.get('reporting_currency')!='HKD':
@@ -64,6 +65,13 @@ def build_model(snapshot):
         'expected_maximum_drawdown_1y','actual_maximum_drawdown_1y','tail_maximum_drawdown_1y',
         'crisis_maximum_drawdown','drawdown_simulation_paths','drawdown_horizon_sessions',
         'drawdown_block_length','drawdown_tail_confidence')})
+    # One-year drawdown estimates use T's owner-approved bootstrap of observed
+    # daily returns, only when no return interval spans a missing session.
+    if not evidence['excluded_intervals']:
+        extended=extended_metrics(daily)
+        risk.update({name:extended[name] for name in ('expected_maximum_drawdown_1y',
+            'actual_maximum_drawdown_1y','tail_maximum_drawdown_1y','drawdown_simulation_paths',
+            'drawdown_horizon_sessions','drawdown_block_length','drawdown_tail_confidence')})
     if crisis:risk['crisis_maximum_drawdown']=crisis['maximum_drawdown']
     cash=[r for r in snapshot['holdings']['holdings'] if r.get('asset_category')=='cash']
     if len(cash)!=1 or cash[0].get('currency')!='HKD':raise ValueError('Qualified constant cash sleeve required')

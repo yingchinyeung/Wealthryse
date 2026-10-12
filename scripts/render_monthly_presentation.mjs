@@ -28,7 +28,7 @@ if (!isMsHkd && (snapshot.sector_allocation?.currency !== snapshot.reporting_cur
 }
 const msModel = isMsHkd ? JSON.parse(execFileSync(process.env.RUNTIME_PYTHON || process.env.PYTHON_BINARY || 'python',
   ['-m','ibkr_etl.alpha_world_ms_presentation',snapshotPath], {encoding:'utf8'})) : null;
-if (isMsHkd && msModel.version !== 'alpha-world-ms-presentation-hkd-hibor-v1') throw new Error('MS rendering model version differs');
+if (isMsHkd && msModel.version !== 'alpha-world-ms-presentation-hkd-hibor-v2') throw new Error('MS rendering model version differs');
 // Portfolio returns come from the full cash-flow-adjusted NAV history, as on
 // the factsheet. The benchmark comparison only covers dates both series share,
 // so a benchmark-market holiday must not shorten the portfolio's own returns.
@@ -618,20 +618,23 @@ setTable("tb/3ets36l8", [
   ["Relative win rate", "—", percent(primary.relative_win_rate), percent(secondary.relative_win_rate)],
 ]);
 
+// MS bootstrap estimates need 20 observed returns; the observed year needs 252.
+const hasDrawdownPaths = !isMsHkd || risk.drawdown_simulation_paths > 0;
+const msDrawdownNote = hasDrawdownPaths ? '5-session block bootstrap; estimates are not forecasts.' : 'Bootstrap needs 20 returns; observed 1-year drawdown needs 252.';
 setText("sh/2t4fyl8z", percent(risk.expected_maximum_drawdown_1y));
-setText("sh/d0fydk7m", isMsHkd ? 'Drawdown simulations unavailable' : `${Number(risk.drawdown_simulation_paths).toLocaleString("en-US")} simulations; ${risk.drawdown_horizon_sessions} sessions`);
+setText("sh/d0fydk7m", hasDrawdownPaths ? `${Number(risk.drawdown_simulation_paths).toLocaleString("en-US")} simulations; ${risk.drawdown_horizon_sessions} sessions` : 'N/A: fewer than 20 returns');
 setText("sh/cvylkn2d", percent(risk.actual_maximum_drawdown_1y));
 setText("sh/lkrmhsju", percent(risk.tail_maximum_drawdown_1y));
 setText("sh/h4nm5sba", percent(risk.crisis_maximum_drawdown));
-setText("sh/25w3excv", isMsHkd ? (msModel.crisis_available ? `Hypothetical HKD stress of components dated ${crisis.holdings_as_of}, using documented proxies and historical FX. HKD cash stays flat; no projected financing charge. Simulated drawdowns remain unavailable.` : 'Crisis replay and simulated drawdown results are unavailable for this HKD history. N/A indicates unavailable, not zero loss.') : `The crisis replay applies ${holdingNoun}s dated ${crisis.holdings_as_of} to the 15 September 2008 to 9 March 2009 period. It uses ${crisis.direct_components} direct histories and ${crisis.proxy_components} documented proxies. Cash remains flat.`);
+setText("sh/25w3excv", isMsHkd ? (msModel.crisis_available ? `Hypothetical HKD stress of components dated ${crisis.holdings_as_of}, using documented proxies and historical FX. HKD cash stays flat; no projected financing charge. ${msDrawdownNote}` : `Crisis replay is unavailable for this HKD history. ${msDrawdownNote} N/A indicates unavailable, not zero loss.`) : `The crisis replay applies ${holdingNoun}s dated ${crisis.holdings_as_of} to the 15 September 2008 to 9 March 2009 period. It uses ${crisis.direct_components} direct histories and ${crisis.proxy_components} documented proxies. Cash remains flat.`);
 setText("sh/p87m9cb6", `Observed full-period maximum drawdown: ${percent(risk.maximum_drawdown)}`);
 setTable("tb/3mtobupc", [
   ["Input / control", "Value"],
   ["Return observations", String(risk.return_observations)],
-  ["Block length", isMsHkd ? 'N/A' : `${risk.drawdown_block_length} sessions`],
-  ["Simulation paths", isMsHkd ? 'N/A' : Number(risk.drawdown_simulation_paths).toLocaleString("en-US")],
-  ["Tail confidence", percent(risk.drawdown_tail_confidence, 0)],
-  ["Horizon", isMsHkd ? 'N/A' : `${risk.drawdown_horizon_sessions} sessions`],
+  ["Block length", hasDrawdownPaths ? `${risk.drawdown_block_length} sessions` : 'N/A'],
+  ["Simulation paths", hasDrawdownPaths ? Number(risk.drawdown_simulation_paths).toLocaleString("en-US") : 'N/A'],
+  ["Tail confidence", hasDrawdownPaths ? percent(risk.drawdown_tail_confidence, 0) : 'N/A'],
+  ["Horizon", hasDrawdownPaths ? `${risk.drawdown_horizon_sessions} sessions` : 'N/A'],
 ]);
 
 const monthlyByYear = new Map();
@@ -683,7 +686,7 @@ if (isMsHkd) {
   setText('sh/2dsn2xwn','• Upside capture is unavailable without a qualified benchmark.');
   setText('sh/e98nydwb','• Benchmark excess return is unavailable.');
   setText('sh/ixsj690v','• Benchmark beta and correlation are unavailable.');
-  setText('sh/kza18ji1','• Simulated drawdown estimates are unavailable.');
+  setText('sh/kza18ji1',hasDrawdownPaths ? `• The 95% tail one-year drawdown estimate is ${percent(risk.tail_maximum_drawdown_1y)}.` : '• Too few returns for a one-year drawdown estimate.');
   setText('sh/vuhkbehk',msModel.crisis_available ? `• Hypothetical HKD crisis drawdown is ${percent(risk.crisis_maximum_drawdown)}; documented proxies are used.` : '• Crisis replay is unavailable for the HKD history.');
   // Replace fixed reference captions, without changing positions or typography.
   const fixed=await presentation.inspect({kind:'textbox',maxChars:1000000});
@@ -693,8 +696,9 @@ if (isMsHkd) {
     ['IBKR NAV','Composite NAV, inception 100'],
     ['Growth of 100 — portfolio versus S&P 500 Price Index','HKD NAV, inception 100. Benchmark unavailable.'],
     ['Primary and secondary benchmarks selectable in the staging website','Benchmark comparisons unavailable for qualified HKD history'],
-    ['Observed and simulated one-year loss severity',msModel.crisis_available ? 'Observed drawdown and hypothetical HKD crisis stress. Simulations unavailable.' : 'Observed drawdown. Simulated and crisis results unavailable.'],
-    ['Latest rolling 1-year window','Unavailable'],['95% tail of simulated outcomes','Unavailable'],
+    ['Observed and simulated one-year loss severity',msModel.crisis_available ? 'Observed drawdown, bootstrap estimates and hypothetical HKD crisis stress' : 'Observed drawdown and bootstrap estimates. Crisis replay unavailable.'],
+    ['Latest rolling 1-year window',risk.actual_maximum_drawdown_1y == null ? 'N/A: fewer than 252 returns' : 'Latest 252 observed returns'],
+    ['95% tail of simulated outcomes',hasDrawdownPaths ? 'Mean of worst 5% of paths' : 'N/A: fewer than 20 returns'],
     ['15 Sep 2008 to 9 Mar 2009 replay',msModel.crisis_available ? '15 Sep 2008 to 9 Mar 2009 HKD stress' : 'Unavailable'],
   ]);
   for (const line of fixed.ndjson.split('\n').filter(Boolean)) {

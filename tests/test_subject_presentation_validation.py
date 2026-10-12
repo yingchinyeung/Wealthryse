@@ -42,7 +42,7 @@ class SubjectPresentationGateTests(unittest.TestCase):
         return {'status': 'passed', 'financial_charts_verified': 6, 'risk_metrics_verified': 7,
                 'snapshot_sha256': hashlib.sha256(self.snapshot.read_bytes()).hexdigest(),
                 'generic_validation': {'slides': 20, 'performance_axis': {}},
-                'version': 'alpha-world-ms-presentation-hkd-hibor-v1'}
+                'version': 'alpha-world-ms-presentation-hkd-hibor-v2'}
 
     def run_gate(self, subject_id='alpha-world-ms', strategy='iStrategy: Alpha World MS'):
         return gate.validate_subject_presentation(self.output, self.snapshot,

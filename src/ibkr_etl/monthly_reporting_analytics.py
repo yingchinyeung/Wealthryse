@@ -37,6 +37,17 @@ def _external_cash_flow(transaction_type: Any, description: Any) -> bool:
     ) is not None
 
 
+def _derived_ledger_only(source_key: Any) -> bool:
+    """Derived-portfolio events that a physical account's cash report never has.
+
+    A filtered portfolio's ledger also holds its approved opening cash and the
+    cash legs of its trades. Physical accounts report only IBKR cash
+    transactions, so these are left out: the opening balance is not interest
+    income, and trade settlements are not listed cash activity.
+    """
+    return str(source_key or "").startswith(("opening:", "trade:"))
+
+
 def _cash_bucket(transaction_type: Any, description: Any, amount: float) -> str:
     text = f"{transaction_type or ''} {description or ''}".upper()
     if "DIVIDEND" in text:
@@ -503,7 +514,7 @@ def build_monthly_reporting_analytics(
     cash_rows = connection.execute(
         """
         SELECT c.effective_date, c.transaction_type, c.description,
-               c.amount_text, c.currency, c.conid, i.symbol
+               c.amount_text, c.currency, c.conid, c.source_key, i.symbol
         FROM {cash_relation} c
         LEFT JOIN instruments i ON i.conid = c.conid
         WHERE c.{cash_subject_column} = ? {cash_included_filter}
@@ -522,6 +533,8 @@ def build_monthly_reporting_analytics(
     for row in cash_rows:
         amount = _number(row["amount_text"])
         if amount is None or _external_cash_flow(row["transaction_type"], row["description"]):
+            continue
+        if _derived_ledger_only(row["source_key"]):
             continue
         row_currency = str(row["currency"] or currency).upper()
         rate = fx.rate(row_currency, currency, str(row["effective_date"]))

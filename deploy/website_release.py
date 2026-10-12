@@ -49,18 +49,23 @@ def change_set(state):
 
     Files copied from the live image into deploy/live-snapshot/ go to their merged
     version in deploy/live-merged/ (live code plus our changes); every other file
-    goes from the deployed commit to HEAD.
+    goes from the deployed commit to HEAD. Once a release from this repo is live,
+    those files on live are the deployed commit's deploy/live-merged copies.
     """
     before, after = package_files(state['deployed_commit']), package_files(state['head'])
     snapshot = SNAPSHOT / PACKAGE
     if snapshot.exists():
-        if (SNAPSHOT / 'IMAGE').read_text().strip() != state['live_image']:
+        from_repo = state['deployed_commit'] != BASELINE_COMMIT
+        if not from_repo and (SNAPSHOT / 'IMAGE').read_text().strip() != state['live_image']:
             raise SystemExit('deploy/live-snapshot was copied from a different live image; copy it again')
         for path in sorted(snapshot.glob('*.py')):
             merged = MERGED / PACKAGE / path.name
             if not merged.exists():
                 raise SystemExit('No merged version of live ' + path.name + ' in deploy/live-merged')
-            before[path.name] = path.read_bytes().replace(b'\r\n', b'\n')
+            if from_repo:
+                before[path.name] = git('show', state['deployed_commit'] + ':deploy/live-merged/' + PACKAGE + '/' + path.name, binary=True)
+            else:
+                before[path.name] = path.read_bytes().replace(b'\r\n', b'\n')
             after[path.name] = merged.read_bytes()
     changed = [n for n in set(before) | set(after) if before.get(n) != after.get(n)]
     with tempfile.TemporaryDirectory() as tmp:

@@ -51,6 +51,9 @@ for top in {src, site}:
         if '__pycache__' in dirs:
             shutil.rmtree(os.path.join(root, '__pycache__'))
             dirs.remove('__pycache__')
+        os.chmod(root, 0o755)
+        for f in files:
+            os.chmod(os.path.join(root, f), 0o644)
 spec = RUNTIME_USER
 user, _, group = spec.partition(':')
 uid = int(user) if user.isdigit() else pwd.getpwnam(user).pw_uid
@@ -127,7 +130,7 @@ def main():
     os.umask(0o077)
     if os.geteuid() != 0 or os.readlink('/proc/self/ns/mnt') == os.readlink('/proc/1/ns/mnt'):
         raise ValueError('A separate root mount namespace is mandatory')
-    for tool in ('dockerd', 'docker', 'mount', 'umount', 'patch'):
+    for tool in ('dockerd', 'containerd', 'docker', 'mount', 'umount', 'patch'):
         if not shutil.which(tool):
             raise ValueError('Required build tool missing: ' + tool)
     if shutil.disk_usage('/tmp').free < 12 * 1024 ** 3:
@@ -139,7 +142,7 @@ def main():
     env = {k: v for k, v in os.environ.items() if k.upper() not in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG')}
     env['DOCKER_CONFIG'] = str(root / 'credentials')
     Path(env['DOCKER_CONFIG']).mkdir(mode=0o700)
-    process = log = None
+    process = log = containerd = None
     detail = ''
     mounted = False
     result = {'base_image': base, 'target_image': target, 'source_commit': config['source_commit']}
@@ -160,9 +163,36 @@ def main():
         location.mkdir()
         log = (location / 'daemon.log').open('w')
         sock = str(location / 'docker.sock')
-        process = subprocess.Popen(['dockerd', '--host=unix://' + sock, '--data-root=' + str(location / 'data'), '--exec-root=' + str(location / 'exec'),
+        # The VM's own containerd lives in the host mount namespace, where this
+        # namespace's mounts are invisible, so containers it started saw an
+        # empty filesystem. Run a private containerd inside this namespace.
+        containerd_sock = str(location / 'containerd.sock')
+        (location / 'containerd.toml').write_text(
+            'version = 2\n'
+            'root = "' + str(location / 'containerd-root') + '"\n'
+            'state = "' + str(location / 'containerd-state') + '"\n'
+            'disabled_plugins = ["io.containerd.grpc.v1.cri"]\n'
+            '[grpc]\n  address = "' + containerd_sock + '"\n'
+            '[ttrpc]\n  address = "' + containerd_sock + '.ttrpc"\n')
+        # The build script's own umask (077) must not reach the daemons: layers
+        # unpacked under it leave parent folders like /usr/local unreadable to
+        # the image's non-root user.
+        def daemon_umask():
+            os.umask(0o022)
+        containerd = subprocess.Popen(['containerd', '--config', str(location / 'containerd.toml')], stdout=log, stderr=log, env=env,
+                                      preexec_fn=daemon_umask)
+        for _ in range(60):
+            if containerd.poll() is not None:
+                raise RuntimeError('Isolated containerd exited')
+            if os.path.exists(containerd_sock):
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError('Isolated containerd readiness timeout')
+        process = subprocess.Popen(['dockerd', '--host=unix://' + sock, '--containerd=' + containerd_sock,
+                                    '--data-root=' + str(location / 'data'), '--exec-root=' + str(location / 'exec'),
                                     '--pidfile=' + str(location / 'pid'), '--bridge=none', '--iptables=false', '--ip6tables=false'],
-                                   stdout=log, stderr=log, env=env)
+                                   stdout=log, stderr=log, env=env, preexec_fn=daemon_umask)
         client = ['docker', '--host', 'unix://' + sock]
         for _ in range(60):
             if process.poll() is not None:
@@ -265,6 +295,9 @@ def main():
         pass
     except Exception as error:
         result.update(passed=False, error=str(error)[-1500:])
+        if log is not None:
+            log.flush()
+            result['daemon_log_tail'] = (location / 'daemon.log').read_text(errors='replace')[-600:]
     finally:
         if process is not None and process.poll() is None:
             process.terminate()
@@ -273,6 +306,13 @@ def main():
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=10)
+        if containerd is not None and containerd.poll() is None:
+            containerd.terminate()
+            try:
+                containerd.wait(timeout=45)
+            except subprocess.TimeoutExpired:
+                containerd.kill()
+                containerd.wait(timeout=10)
         if log is not None:
             log.close()
         if mounted:

@@ -109,15 +109,15 @@ const renderOverview=async(asOf,s)=>{
   if(periods.status==='fulfilled'){
     const r=periods.value,by=Object.fromEntries((r.periods||[]).map(x=>[x.key,x])),ok=x=>x&&x.status!=='fail'&&x.status!=='empty',day=r.custom;
     document.querySelector('#overview-day').innerHTML=ok(day)&&day.twr!=null?`${toned(signedPct(day.twr),day.twr)} <span class="muted">day</span>`:'';
-    const tile=(label,value,raw,note)=>`<div class="metric"><div class="label">${esc(label)}</div><div class="value">${raw===undefined?value:toned(value,raw)}</div>${note?`<div class="muted">${note}</div>`:''}</div>`;
+    const tile=(label,value,raw,note,guide)=>{const body=`<div class="label">${esc(label)}${guide?' <span aria-hidden="true">↗</span>':''}</div><div class="value">${raw===undefined?value:toned(value,raw)}</div>${note?`<div class="muted">${note}</div>`:''}`;return guide?`<a class="metric metric-guide-card" href="/metrics-guide#${guide}" aria-label="Read the Metrics Guide explanation for ${esc(label)}">${body}</a>`:`<div class="metric">${body}</div>`};
     const twr=key=>ok(by[key])?signedPct(by[key].twr):'—',since=by.since_inception,ytd=by.ytd;
     returns.innerHTML=[
-      tile('Month to date',twr('mtd'),ok(by.mtd)?by.mtd.twr:null),
-      tile('Quarter to date',twr('qtd'),ok(by.qtd)?by.qtd.twr:null),
-      tile('Year to date',twr('ytd'),ok(ytd)?ytd.twr:null),
-      tile('Since inception',twr('since_inception'),ok(since)?since.twr:null,ok(since)&&since.start_date?`from ${esc(since.start_date)}`:''),
-      tile('IRR, annualised',ok(since)&&since.irr_annualized!=null?signedPct(since.irr_annualized):'—',ok(since)?since.irr_annualized:null,'since inception, money-weighted'),
-      tile('Net flows this year',ok(ytd)&&r.flows_applicable!==false?(Number(ytd.net_flows)>0?'+':'')+compactMoney(ytd.net_flows):'—',undefined,r.flows_applicable===false?'not applicable':esc(r.currency||''))
+      tile('Month to date',twr('mtd'),ok(by.mtd)?by.mtd.twr:null,'','metric-time-weighted-return-twr'),
+      tile('Quarter to date',twr('qtd'),ok(by.qtd)?by.qtd.twr:null,'','metric-time-weighted-return-twr'),
+      tile('Year to date',twr('ytd'),ok(ytd)?ytd.twr:null,'','metric-time-weighted-return-twr'),
+      tile('Since inception',twr('since_inception'),ok(since)?since.twr:null,ok(since)&&since.start_date?`from ${esc(since.start_date)}`:'','metric-time-weighted-return-twr'),
+      tile('IRR, annualised',ok(since)&&since.irr_annualized!=null?signedPct(since.irr_annualized):'—',ok(since)?since.irr_annualized:null,'since inception, money-weighted','metric-irr-annualised'),
+      tile('Net flows this year',ok(ytd)&&r.flows_applicable!==false?(Number(ytd.net_flows)>0?'+':'')+compactMoney(ytd.net_flows):'—',undefined,r.flows_applicable===false?'not applicable':esc(r.currency||''),'metric-net-external-flows')
     ].join('');
   }else returns.innerHTML='<div class="empty">Period returns are unavailable for this date.</div>';
   if(series.status==='fulfilled')sparkline(document.querySelector('#overview-spark'),series.value.series||[]);

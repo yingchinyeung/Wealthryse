@@ -1,0 +1,56 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.docker.example
+.venv
+.work
+.uv-cache
+.codex-finalizer
+.chart-data-*
+scripts/node_modules
+!scripts/node_modules/
+scripts/node_modules/*
+!scripts/node_modules/@oai/
+scripts/node_modules/@oai/*
+!scripts/node_modules/@oai/artifact-tool/
+!scripts/node_modules/@oai/artifact-tool/**
+__pycache__
+*.py[cod]
+*.db*
+*.sqlite
+*.sqlite3
+*.xml
+*.zip
+data
+raw
+reports
+logs
+backups
+tmp
+private-inputs
+!private-inputs/
+private-inputs/*
+!private-inputs/U16088571/
+private-inputs/U16088571/*
+!private-inputs/U16088571/presentation deck template.pptx
+!private-inputs/U16088571/monthly factsheet template.pdf
+!private-inputs/U16088606/
+private-inputs/U16088606/*
+!private-inputs/U16088606/monthly factsheet template.pdf
+!private-inputs/U16088606/monthly presentation deck template.pptx
+!private-inputs/U16088606/previously completed factsheet.pdf
+!private-inputs/U16088606/template-intake-manifest.json
+output
+!output/
+output/*
+!output/pptx/
+output/pptx/*
+!output/pptx/U16088571_Monthly_Presentation_2026-08-31_Enhanced_v24.pptx
+!output/pdf/
+output/pdf/*
+!output/pdf/U16088571_Factsheet_2026-08-31_Approved_v6.pdf
+.pytest_cache
+tests
+infra
+*.md

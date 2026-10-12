@@ -1,0 +1,175 @@
+targetScope = 'resourceGroup'
+
+param jobName string = 'ibkrv2stg-flex-discovery'
+param environmentName string = 'ibkrv2stg-env'
+param registryName string = 'ibkrv2stgauhecwc4itaoo'
+param applicationVaultName string = 'ibkrv2stg-auhecwc4itaoo'
+param flexTokenVaultName string
+param storageAccountName string = 'ibkrv2stgauhecwc4itaoo'
+param imageDigest string
+param tenantId string = '00000000-0000-0000-0000-000000000001'
+
+var tags = {
+  application: 'ibkr-portfolio-platform'
+  environment: 'internal-production'
+  component: 'flex-source-discovery'
+  dataClassification: 'restricted-credential'
+}
+
+resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' existing = {
+  name: environmentName
+}
+resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' existing = {
+  name: registryName
+}
+resource applicationVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: applicationVaultName
+}
+resource databaseSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
+  parent: applicationVault
+  name: 'database-app-url'
+}
+resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
+  name: storageAccountName
+}
+
+resource tokenVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
+  name: flexTokenVaultName
+  location: resourceGroup().location
+  tags: tags
+  properties: {
+    tenantId: subscription().tenantId
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
+    enableRbacAuthorization: true
+    enableSoftDelete: true
+    softDeleteRetentionInDays: 90
+    enablePurgeProtection: true
+    publicNetworkAccess: 'Enabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Allow'
+    }
+  }
+}
+
+resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: '${jobName}-identity'
+  location: resourceGroup().location
+  tags: tags
+}
+
+resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(registry.id, identity.id, 'acrpull')
+  scope: registry
+  properties: {
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
+  }
+}
+
+// The worker can read Flex tokens only from the dedicated token vault.
+resource flexSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(tokenVault.id, identity.id, 'flex-secret-reader')
+  scope: tokenVault
+  properties: {
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+  }
+}
+
+// The same worker can read only the application database URL secret, not the full application vault.
+resource databaseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(databaseSecret.id, identity.id, 'database-secret-reader')
+  scope: databaseSecret
+  properties: {
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
+  }
+}
+
+// Retain each validated Flex response in the immutable raw-data archive before import.
+resource rawArchiveWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, identity.id, 'flex-discovery-raw-writer')
+  scope: storage
+  properties: {
+    principalId: identity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+  }
+}
+
+resource job 'Microsoft.App/jobs@2024-03-01' = {
+  name: jobName
+  location: resourceGroup().location
+  tags: tags
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identity.id}': {}
+    }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 900
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        // The job remains idle unless an owner/operator explicitly queues a validation.
+        cronExpression: '*/5 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [
+        {
+          server: registry.properties.loginServer
+          identity: identity.id
+        }
+      ]
+      secrets: [
+        {
+          name: 'database-url'
+          keyVaultUrl: databaseSecret.properties.secretUri
+          identity: identity.id
+        }
+      ]
+    }
+    template: {
+      containers: [
+        {
+          name: 'flex-discovery'
+          image: '${registry.properties.loginServer}/ibkr-platform@${imageDigest}'
+          command: ['python']
+          args: ['scripts/discover_flex_sources.py']
+          env: [
+            { name: 'DATABASE_URL', secretRef: 'database-url' }
+            { name: 'DEPLOYMENT_ENVIRONMENT', value: 'internal-production' }
+            { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
+            { name: 'FLEX_TOKEN_VAULT_URI', value: tokenVault.properties.vaultUri }
+            { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
+            { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${storageAccountName}.blob.${environment().suffixes.storage}' }
+            { name: 'AZURE_RAW_CONTAINER', value: 'ibkr-raw' }
+          ]
+          resources: {
+            cpu: json('0.5')
+            memory: '1Gi'
+          }
+        }
+      ]
+    }
+  }
+  dependsOn: [acrPull, flexSecretReader, databaseSecretReader, rawArchiveWriter]
+}
+
+output tokenVaultName string = tokenVault.name
+output tokenVaultUri string = tokenVault.properties.vaultUri
+output discoveryIdentityId string = identity.id
+output discoveryIdentityClientId string = identity.properties.clientId
+output jobName string = job.name
+output schedule string = 'Every five minutes; idle unless one explicit validation is pending'

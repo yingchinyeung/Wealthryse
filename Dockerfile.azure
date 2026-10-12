@@ -1,0 +1,33 @@
+FROM python:3.12-slim
+# INGESTION ONLY. Web/report jobs must use Dockerfile, which contains the
+# approved templates, Node runtime and a report-runtime build acceptance test.
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    IBKR_PROJECT_ROOT=/app
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 10001 ibkr && \
+    useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin ibkr
+
+COPY pyproject.toml ./
+COPY requirements.lock ./
+COPY src ./src
+COPY migrations ./migrations
+COPY scripts ./scripts
+COPY queries ./queries
+
+RUN python -m pip install --require-hashes -r requirements.lock && \
+    python -m pip install --no-deps . && \
+    mkdir -p /app/data /app/raw /app/reports /app/logs && \
+    chown -R ibkr:ibkr /app
+
+USER 10001:10001
+
+CMD ["python", "scripts/run_cloud_job.py"]

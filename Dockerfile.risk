@@ -1,0 +1,25 @@
+# RISK ONLY: never use this image for the website or document-rendering jobs.
+FROM python:3.12-slim@sha256:44ff437bba879d4941b710a369a8f19266aea34b29002807f0c487fabc9eec9b
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    IBKR_PROJECT_ROOT=/app PYTHONPATH=/app/src
+WORKDIR /app
+# Verified stable-distribution security fixes. Keep versions explicit and fail
+# the build if signed repositories cannot provide them; never use Debian sid
+# or claim the remaining unfixed findings have passed the security gate.
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends --only-upgrade \
+        libpcre2-8-0=10.46-1~deb13u3 \
+        libssl3t64=3.5.7-1~deb13u3 \
+        openssl=3.5.7-1~deb13u3 \
+        openssl-provider-legacy=3.5.7-1~deb13u3 && \
+    dpkg-query --show libpcre2-8-0 libssl3t64 openssl openssl-provider-legacy && \
+    rm -rf /var/lib/apt/lists/*
+COPY requirements.lock ./
+RUN python -m pip install --require-hashes -r requirements.lock && python -m pip check
+COPY src ./src
+COPY scripts/build_risk_snapshots.py scripts/check_risk_runtime.py scripts/audit_risk_cache.py ./scripts/
+COPY SOURCE_MANIFEST.json ./
+RUN groupadd --gid 10001 ibkr && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin ibkr
+USER 10001:10001
+RUN python scripts/check_risk_runtime.py
+CMD ["python", "scripts/build_risk_snapshots.py"]

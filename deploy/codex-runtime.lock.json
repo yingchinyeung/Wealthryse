@@ -1,0 +1,14 @@
+{
+  "schema": "codex-synthetic-runtime-lock-v1",
+  "runtime_version": "0.160.0",
+  "package_version": "0.160.0-linux-x64",
+  "tarball": "https://registry.npmjs.org/@openai/codex/-/codex-0.160.0-linux-x64.tgz",
+  "integrity": "sha512-KI/73OqGrHmR18s7ya7E1NqV6rT0y3lxr0s8S1qR2m6zU6QRF/HlR529jALLh5vjdUnsRT4Ahoxt0axb4kY99g==",
+  "binary_member": "package/vendor/x86_64-unknown-linux-musl/bin/codex",
+  "code_mode_host_member": "package/vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host",
+  "base_image": "python:3.12-slim-bookworm@sha256:9901e0a8d75037d8242ed43155cbcb2d1f61be1356383d8054afb59fd50e39c4",
+  "deployment": "gpt-5-6-sol-apac",
+  "endpoint": "https://ibkrv2stg-ai-auhecwc4itaoo.openai.azure.com",
+  "api_version": "v1",
+  "purpose": "synthetic-staging-compatibility-only-not-an-authorized-owner-worker"
+}

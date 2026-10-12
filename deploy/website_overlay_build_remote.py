@@ -12,7 +12,6 @@ from pathlib import Path
 
 CONFIG = None  # replaced by the workflow
 PREFIX = 'WEBSITE_BUILD_RESULT '
-REJECTS_PREFIX = 'WEBSITE_BUILD_REJECTS '
 HOSTS = {'ibkrv2stgauhecwc4itaoo.azurecr.io': '10.50.10.5', 'ibkrv2stgauhecwc4itaoo.eastasia.data.azurecr.io': '10.50.10.4'}
 REG = 'ibkrv2stgauhecwc4itaoo.azurecr.io'
 
@@ -192,11 +191,16 @@ def main():
             subprocess.run(['umount', '/etc/hosts'], timeout=15)
         if root.parent == Path('/tmp') and root.name.startswith('wealthryse-website-build-'):
             shutil.rmtree(root, ignore_errors=True)
-    print(PREFIX + json.dumps(result), flush=True)
-    # Run Command keeps only the end of the output, so the conflict detail goes
-    # last, compressed, after the small result line.
+    # Run Command returns only 4 KB of output, so the conflict detail is left in
+    # a root-only file that the workflow reads in pieces and then removes.
     if rejects:
-        print(REJECTS_PREFIX + base64.b64encode(gzip.compress(json.dumps(rejects).encode(), 9)).decode(), flush=True)
+        encoded = base64.b64encode(gzip.compress(json.dumps(rejects).encode(), 9)).decode()
+        path = '/var/tmp/wealthryse-build-rejects-' + config['source_commit'][:12] + '.txt'
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(encoded)
+        result.update(rejects_file=path, rejects_size=len(encoded))
+    print(PREFIX + json.dumps(result), flush=True)
     if not result.get('passed'):
         raise SystemExit(1)
 

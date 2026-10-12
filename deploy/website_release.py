@@ -95,41 +95,59 @@ def build():
     state['vm_started_by_release'] = started
     STATE.write_text(json.dumps(state, indent=2))
     sub = az('account', 'show')['id']
-    name = 'website-build-' + state['head'][:12]
-    url = f'https://management.azure.com/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{VM}/runCommands/{name}?api-version=2024-07-01'
-    body = Path('run-command.json')
-    body.write_text(json.dumps({'location': vm['location'], 'properties': {
-        'source': {'script': command}, 'asyncExecution': True, 'timeoutInSeconds': 3000, 'treatFailureAsDeploymentFailure': False}}))
+    base = f'https://management.azure.com/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{VM}/runCommands/'
     try:
-        az('rest', '--method', 'put', '--url', url, '--body', '@' + str(body), parse=False)
-        deadline = time.time() + 3300
-        while True:
-            run = az('rest', '--method', 'get', '--url', url + '&$expand=instanceView')
-            view = run['properties'].get('instanceView') or {}
-            if view.get('executionState') in ('Succeeded', 'Failed', 'TimedOut', 'Canceled'):
-                break
-            if time.time() > deadline:
-                raise SystemExit('Build did not finish in time')
-            time.sleep(20)
+        view = vm_run(base, 'website-build-' + state['head'][:12], command, vm['location'], 3000)
         output = view.get('output') or ''
         lines = [l[len('WEBSITE_BUILD_RESULT '):] for l in output.splitlines() if l.startswith('WEBSITE_BUILD_RESULT ')]
         result = json.loads(lines[-1]) if lines else {'passed': False, 'error': (view.get('error') or '')[-1500:],
                                                       'output_length': len(output), 'output_tail': output[-800:]}
         print(json.dumps(result, indent=2))
-        for l in output.splitlines():
-            if l.startswith('WEBSITE_BUILD_REJECTS '):
-                for name, text in json.loads(gzip.decompress(base64.b64decode(l[len('WEBSITE_BUILD_REJECTS '):]))).items():
-                    print('Live code where the change to ' + name + ' does not apply:\n' + text)
+        if result.get('rejects_file'):
+            print_rejects(base, vm['location'], result['rejects_file'], result['rejects_size'])
         if not result.get('passed') or view.get('exitCode') != 0:
             raise SystemExit('Build failed; the website was not changed')
         state['pushed_image'] = result['pushed_image']
         STATE.write_text(json.dumps(state, indent=2))
     finally:
-        subprocess.run(['az', 'rest', '--method', 'delete', '--url', url], capture_output=True)
         if started:
             print('Stopping the build VM again')
             subprocess.run(['az', 'vm', 'deallocate', '-g', RG, '-n', VM, '--no-wait'], capture_output=True)
 
+
+def vm_run(base, name, script, location, timeout):
+    """Run a script on the build VM through Run Command and return its instance view."""
+    url = base + name + '?api-version=2024-07-01'
+    body = Path('run-command.json')
+    body.write_text(json.dumps({'location': location, 'properties': {
+        'source': {'script': script}, 'asyncExecution': True, 'timeoutInSeconds': timeout, 'treatFailureAsDeploymentFailure': False}}))
+    try:
+        az('rest', '--method', 'put', '--url', url, '--body', '@' + str(body), parse=False)
+        deadline = time.time() + timeout + 300
+        while True:
+            view = az('rest', '--method', 'get', '--url', url + '&$expand=instanceView')['properties'].get('instanceView') or {}
+            if view.get('executionState') in ('Succeeded', 'Failed', 'TimedOut', 'Canceled'):
+                return view
+            if time.time() > deadline:
+                raise SystemExit('Run Command did not finish in time')
+            time.sleep(10)
+    finally:
+        subprocess.run(['az', 'rest', '--method', 'delete', '--url', url], capture_output=True)
+
+
+def print_rejects(base, location, path, size):
+    """Run Command returns only 4 KB of output, so the conflict detail is read in pieces."""
+    if not path.startswith('/var/tmp/wealthryse-build-rejects-') or not path.endswith('.txt'):
+        raise SystemExit('Unexpected rejects file name')
+    encoded = ''
+    try:
+        for offset in range(0, size, 3000):
+            view = vm_run(base, f'website-rejects-{offset // 3000}', f"tail -c +{offset + 1} {path} | head -c 3000", location, 120)
+            encoded += (view.get('output') or '').strip()
+    finally:
+        vm_run(base, 'website-rejects-cleanup', 'rm -f ' + path, location, 120)
+    for name, text in json.loads(gzip.decompress(base64.b64decode(encoded))).items():
+        print('Live code where the change to ' + name + ' does not apply:\n' + text)
 
 def deploy():
     state = json.loads(STATE.read_text())

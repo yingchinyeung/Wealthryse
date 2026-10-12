@@ -702,6 +702,18 @@ if (isMsHkd) {
   }
 }
 
+// The template's disclaimer heading drops its first letter. Only that exact
+// heading is corrected; the disclaimer wording itself is left untouched.
+{
+  const headings = await presentation.inspect({kind:'textbox',maxChars:1000000});
+  for (const line of headings.ndjson.split('\n').filter(Boolean)) {
+    const item = JSON.parse(line);
+    if (String(item.text || item.textPreview || '').replace(/\s+/g, ' ').trim() === 'llustrative examples only') {
+      setText(item.id, 'Illustrative examples only');
+    }
+  }
+}
+
 if (snapshot.subject_id === "U16088606") {
   const identityCheck = await presentation.inspect({
     kind: "textbox,shape",

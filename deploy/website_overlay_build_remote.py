@@ -99,7 +99,14 @@ def main():
         finally:
             run(client + ['rm', container], 'live image cleanup', env=env)
         package = context / 'src' / 'ibkr_etl'
-        if tree_hashes(package) != config['live_hashes']:
+        live = tree_hashes(package)
+        if live != config['live_hashes']:
+            expected = config['live_hashes']
+            result['live_drift'] = {
+                'only_live': sorted(set(live) - set(expected)),
+                'only_expected': sorted(set(expected) - set(live)),
+                'different': sorted(n for n in set(live) & set(expected) if live[n] != expected[n]),
+            }
             raise ValueError('Live website source is not the expected commit; nothing built')
         patch_file = root / 'change.patch'
         patch_file.write_bytes(gzip.decompress(base64.b64decode(config['patch'])))

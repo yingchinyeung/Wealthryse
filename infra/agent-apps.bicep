@@ -185,11 +185,12 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
+// Container Apps job names must be 2 to 32 characters.
 var jobs = [
   // 08:30 HKT, after the morning account sync.
-  { name: 'ibkrv2stg-agent-holdings-explainer', job: 'holdings_explainer', cron: '30 0 * * *' }
+  { name: 'ibkrv2stg-agent-holdings', job: 'holdings_explainer', cron: '30 0 * * *' }
   // 10:00 HKT on the 2nd to 7th; skips accounts that already have this month's draft.
-  { name: 'ibkrv2stg-agent-month-end-drafter', job: 'month_end_drafter', cron: '0 2 2-7 * *' }
+  { name: 'ibkrv2stg-agent-month-end', job: 'month_end_drafter', cron: '0 2 2-7 * *' }
   // 09:00 HKT; also deletes chats older than the retention period.
   { name: 'ibkrv2stg-agent-data-quality', job: 'data_quality', cron: '0 1 * * *' }
 ]

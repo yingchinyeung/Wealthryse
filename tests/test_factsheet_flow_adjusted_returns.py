@@ -1,7 +1,11 @@
+import json
+import sqlite3
 import unittest
 from unittest.mock import patch
 
 from ibkr_etl.derived_portfolio import _flow_adjusted_nav
+from ibkr_etl.monthly_reporting_analytics import _external_cash_flow
+from ibkr_etl.provisional_benchmark import _external_flows
 from ibkr_etl.monthly_artifacts import (
     MonthlyArtifactError,
     _normalize_nav,
@@ -82,6 +86,61 @@ class CompositeSleeveFlowTests(unittest.TestCase):
         result = self.adjusted(values, {"2026-01-03": 50.0})
         self.assertAlmostEqual(result["2026-01-05"], 100.0)
         self.assertAlmostEqual(result["2026-01-06"], 110.0)
+
+
+class ExternalFlowSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.connection.executescript(
+            """
+            CREATE TABLE accounts (account_id TEXT, base_currency TEXT);
+            CREATE TABLE fx_rates (account_id TEXT, rate_date TEXT, from_currency TEXT,
+                                   to_currency TEXT, rate_text TEXT);
+            CREATE TABLE flex_rows (account_id TEXT, section TEXT, data_json TEXT);
+            INSERT INTO accounts VALUES ('U1', 'USD');
+            """
+        )
+
+    def add(self, section, **values):
+        self.connection.execute(
+            "INSERT INTO flex_rows VALUES ('U1', ?, ?)", (section, json.dumps(values))
+        )
+
+    def flows(self):
+        return _external_flows(self.connection, "U1", subject_type="account")
+
+    def test_bank_deposit_in_cash_transactions_without_type_is_a_flow(self):
+        self.add("CashTransactions", accountId="U1", currency="USD", reportDate="20260529",
+                 dateTime="20260528;230647", amount="25000",
+                 description="CASH RECEIPTS / ELECTRONIC FUND TRANSFERS")
+        self.assertEqual(self.flows(), {"2026-05-29": 25000.0})
+
+    def test_typed_withdrawal_is_a_flow(self):
+        self.add("CashTransactions", accountId="U1", currency="USD", reportDate="20260601",
+                 amount="-5000", type="Deposits/Withdrawals", description="DISBURSEMENT")
+        self.assertEqual(self.flows(), {"2026-06-01": -5000.0})
+
+    def test_consolidated_copy_and_income_are_not_flows(self):
+        self.add("CashTransactions", accountId="-", currency="USD", reportDate="20260529",
+                 amount="25000", description="CASH RECEIPTS / ELECTRONIC FUND TRANSFERS")
+        self.add("CashTransactions", accountId="U1", currency="USD", reportDate="20260529",
+                 amount="120", description="SWIRE PACIFIC CASH DIVIDEND")
+        self.add("CashTransactions", accountId="U1", currency="USD", reportDate="20260529",
+                 amount="3", description="BHP ADR (AMERICAN DEPOSITARY RECEIPT) DIVIDEND")
+        self.assertEqual(self.flows(), {})
+
+    def test_internal_cash_transfer_still_counts(self):
+        self.add("Transfers", accountId="U1", currency="USD", date="20260526",
+                 assetCategory="CASH", cashTransfer="25000", type="INTERNAL")
+        self.assertEqual(self.flows(), {"2026-05-26": 25000.0})
+
+
+class AttributionCashClassifierTests(unittest.TestCase):
+    def test_swire_dividend_is_not_an_external_wire(self):
+        self.assertFalse(_external_cash_flow("Dividends", "SWIRE PACIFIC LTD-CL A CASH DIVIDEND"))
+        self.assertTrue(_external_cash_flow("Deposits/Withdrawals", "WIRE IN"))
+        self.assertTrue(_external_cash_flow("", "CASH RECEIPTS / ELECTRONIC FUND TRANSFERS"))
 
 
 if __name__ == "__main__":

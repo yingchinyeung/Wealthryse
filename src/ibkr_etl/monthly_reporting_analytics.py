@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import calendar
 import bisect
 from collections import defaultdict
@@ -29,18 +30,11 @@ def _month_start(period_end: str) -> str:
 
 def _external_cash_flow(transaction_type: Any, description: Any) -> bool:
     text = f"{transaction_type or ''} {description or ''}".upper()
-    return any(
-        token in text
-        for token in (
-            "DEPOSIT",
-            "WITHDRAW",
-            "TRANSFER",
-            "WIRE",
-            "ACH",
-            "CONTRIBUTION",
-            "DISTRIBUTION",
-        )
-    )
+    # Whole words only: "SWIRE PACIFIC" dividends are not wires.
+    return re.search(
+        r"\b(DEPOSITS?|WITHDRAW\w*|TRANSFERS?|WIRE|ACH|CONTRIBUTIONS?|DISTRIBUTIONS?)\b",
+        text,
+    ) is not None
 
 
 def _cash_bucket(transaction_type: Any, description: Any, amount: float) -> str:

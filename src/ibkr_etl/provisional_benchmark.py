@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from bisect import bisect_right
@@ -402,7 +403,43 @@ def _external_flows(
                 amount = _convert(values.get("positionAmount"), rate)
         if amount is not None:
             flows[flow_date] += amount
+    # Bank deposits and withdrawals are reported as CashTransactions, not
+    # Transfers. Older Flex files carry no `type`, so fall back to IBKR's
+    # description. Consolidated copies (accountId "-") would double count.
+    for row in connection.execute(
+        "SELECT data_json FROM flex_rows WHERE account_id = ? AND section = 'CashTransactions'",
+        (account_id,),
+    ):
+        values = json.loads(row["data_json"])
+        if str(values.get("accountId") or account_id) != account_id:
+            continue
+        if not _is_external_cash_transaction(values):
+            continue
+        flow_date = _flex_date(
+            values.get("reportDate")
+            or values.get("settleDate")
+            or str(values.get("dateTime") or "")[:8]
+        )
+        if not flow_date:
+            continue
+        rate = converter.rate(account_id, values.get("currency"), flow_date)
+        amount = _convert(values.get("amount"), rate)
+        if amount is not None:
+            flows[flow_date] += amount
     return dict(flows)
+
+
+_EXTERNAL_CASH_DESCRIPTION = re.compile(
+    r"\b(ELECTRONIC FUND TRANSFERS?|CASH RECEIPTS|DISBURSEMENTS?|WIRE (?:IN|OUT|TRANSFER)|"
+    r"DEPOSITS?|WITHDRAWALS?)\b"
+)
+
+
+def _is_external_cash_transaction(values: dict[str, Any]) -> bool:
+    kind = str(values.get("type") or "").upper()
+    if kind:
+        return "DEPOSITS/WITHDRAWALS" in kind or "DEPOSITS & WITHDRAWALS" in kind
+    return bool(_EXTERNAL_CASH_DESCRIPTION.search(str(values.get("description") or "").upper()))
 
 
 def refresh_and_materialize(

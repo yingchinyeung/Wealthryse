@@ -26,7 +26,7 @@ param privateEndpointSubnetName string
 @description('Create the three private DNS zones and link them to the VNet. Leave false when the network owner provides them.')
 param createPrivateDns bool = false
 
-@description('Resource IDs of the existing privatelink zones for cognitiveservices, openai and services.ai, in that order. Required when createPrivateDns is false.')
+@description('Resource IDs of the existing privatelink zones for cognitiveservices, openai and services.ai, in that order. Leave empty to create the endpoint without a zone group; the zone owner then adds the records.')
 param privateDnsZoneIds array = []
 
 @description('Main analyst model (pinned version, Data Zone Standard).')
@@ -214,7 +214,7 @@ resource zoneLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-0
   }
 }]
 
-resource zoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = {
+resource zoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = if (createPrivateDns || !empty(privateDnsZoneIds)) {
   parent: privateEndpoint
   name: 'default'
   dependsOn: [zones]

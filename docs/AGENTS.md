@@ -67,7 +67,8 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
    resource, model deployments, private endpoint and three identities. The
    private network thread owns `ibkrv2stg-vnet` and the three privatelink DNS
    zones: get the endpoint subnet and the zone IDs from it and pass them as
-   `privateEndpointSubnetName` and `privateDnsZoneIds`.
+   `privateEndpointSubnetName` and `privateDnsZoneIds`. If the zones don't
+   exist yet, leave `privateDnsZoneIds` empty and that thread adds the records.
 2. **Entra apps.** Register two applications with app ID URIs
    `api://wealthryse-agent` and `api://wealthryse-agent-tools`. No secrets or
    app roles are needed; the services check the caller's object ID.

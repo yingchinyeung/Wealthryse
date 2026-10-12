@@ -19,10 +19,13 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # Identifiers of the wealthryse-github-deploy identity (not secrets). It can
+    # only sign in from this repo's main branch and only has the narrow
+    # "WealthRyse website release" role on the build VM and the website.
     env:
-      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      AZURE_CLIENT_ID: 17708c85-b855-4209-81dd-a613a91315d3
+      AZURE_TENANT_ID: 0578a50b-a7a1-40a4-905b-8b20dba84124
+      AZURE_SUBSCRIPTION_ID: 3956e821-cee4-403f-8708-e84e2ed490eb
     steps:
       - uses: actions/checkout@v4
         with:

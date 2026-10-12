@@ -12,9 +12,10 @@ import json
 import sys
 from typing import Any
 
+from .benchmark_analytics import _annualized_return
 from .monthly_artifacts import _normalize_nav
 
-VERSION = "presentation-portfolio-returns-v1"
+VERSION = "presentation-portfolio-returns-v2"
 
 
 def portfolio_return_model(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -36,11 +37,14 @@ def portfolio_return_model(snapshot: dict[str, Any]) -> dict[str, Any]:
             "portfolio_monthly_return": value / previous - 1.0,
         })
         previous = value
+    total_return = float(normalized[-1]["value"]) / 100.0 - 1.0
     return {
         "version": VERSION,
         "period_start": normalized[0]["date"],
         "period_end": normalized[-1]["date"],
-        "total_return": float(normalized[-1]["value"]) / 100.0 - 1.0,
+        "total_return": total_return,
+        # Same window and 365.25-day convention as the total return beside it.
+        "annualized_return": _annualized_return(total_return, normalized[0]["date"], normalized[-1]["date"]),
         "month_rows": month_rows,
     }
 

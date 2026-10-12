@@ -34,7 +34,7 @@ if (isMsHkd && msModel.version !== 'alpha-world-ms-presentation-hkd-hibor-v1') t
 // so a benchmark-market holiday must not shorten the portfolio's own returns.
 const portfolioModel = isMsHkd ? null : JSON.parse(execFileSync(process.env.RUNTIME_PYTHON || process.env.PYTHON_BINARY || 'python',
   ['-m','ibkr_etl.presentation_portfolio_returns',snapshotPath], {encoding:'utf8'}));
-if (!isMsHkd && portfolioModel.version !== 'presentation-portfolio-returns-v1') throw new Error('Portfolio return model version differs');
+if (!isMsHkd && portfolioModel.version !== 'presentation-portfolio-returns-v2') throw new Error('Portfolio return model version differs');
 
 const presentation = await PresentationFile.importPptx(await FileBlob.load(sourcePath));
 const tableDimensions = isMsHkd ? new Map((await presentation.inspect({kind:'table',maxChars:1000000})).ndjson
@@ -195,6 +195,7 @@ const monthReturn = portfolioMonthRows.at(-1)?.portfolio_monthly_return;
 const benchmarkMonthReturn = latestMonth.date?.slice(0, 7) === dataAsOf.slice(0, 7) ? latestMonth.benchmark_monthly_return : null;
 const portfolioTotalReturn = isMsHkd ? primary.portfolio_total_return : portfolioModel.total_return;
 const portfolioStart = isMsHkd ? primary.period_start : portfolioModel.period_start;
+const portfolioAnnualizedReturn = isMsHkd ? primary.portfolio_annualized_return : portfolioModel.annualized_return;
 const holdings = [...snapshot.holdings.holdings]
   .sort((a, b) => Math.abs(Number(b.market_value_text)) - Math.abs(Number(a.market_value_text)));
 const grossMarketValue = Number(sector.gross_market_value);
@@ -230,7 +231,7 @@ setText("sh/l8bi9sjq", `${subjectLabel} | Reporting currency: ${snapshot.reporti
 setText("sh/9cvidcjm", money(nav));
 setText("sh/v2p0bqdw", percent(portfolioTotalReturn));
 setText("sh/8ze10be5", isMsHkd ? `${primary.period_start} to ${primary.period_end}` : `${portfolioModel.period_start} to ${portfolioModel.period_end}`);
-setText("sh/kvehwre9", percent(primary.portfolio_annualized_return));
+setText("sh/kvehwre9", percent(portfolioAnnualizedReturn));
 setText("sh/lwni5wvu", `${primary.return_observations} daily returns`);
 setText("sh/oru1ory1", percent(primary.portfolio_annualized_volatility));
 setText("sh/jy5kn6ho", decimal(risk.sharpe_ratio));
@@ -593,7 +594,7 @@ presentation.resolve("sl/jetc3ut0").speakerNotes.textFrame.setText(
 
 setTable("tb/m1gj2xgb", [
   ["Metric", "Value", "Definition / source"],
-  ["Annualized return", percent(risk.annualized_return), isMsHkd ? 'NAV growth, 365.25 calendar days/year' : "Daily compound return, annualized"],
+  ["Annualized return", percent(isMsHkd ? risk.annualized_return : portfolioAnnualizedReturn), isMsHkd ? 'NAV growth, 365.25 calendar days/year' : 'Cash-flow-adjusted NAV growth, 365.25 calendar days/year'],
   ["Annualized volatility", percent(risk.annualized_volatility), "Daily return standard deviation, annualized"],
   ["Risk-free rate", percent(risk.risk_free_annual_rate), isMsHkd ? '1M HIBOR, inception-to-date average' : `UST 3-month par yield, ${snapshot.risk.risk_free.rate_date}`],
   ["Sharpe ratio", decimal(risk.sharpe_ratio), "Excess return / annualized volatility"],
@@ -644,7 +645,7 @@ setTable("tb/a9srud0n", [
   ["2025", ...(monthlyByYear.get(2025) ?? Array(12).fill("—"))],
   ["2026", ...(monthlyByYear.get(2026) ?? Array(12).fill("—"))],
 ]);
-setText("sh/361gvilk", `Total return ${percent(isMsHkd ? risk.total_return : portfolioTotalReturn)}  •  Annualized return ${percent(risk.annualized_return)}  •  Win rate ${percent(risk.win_rate)}`);
+setText("sh/361gvilk", `Total return ${percent(isMsHkd ? risk.total_return : portfolioTotalReturn)}  •  Annualized return ${percent(isMsHkd ? risk.annualized_return : portfolioAnnualizedReturn)}  •  Win rate ${percent(risk.win_rate)}`);
 setText("sh/25sf2d4z", isMsHkd ? 'January 2025 is a partial month from inception on 20 January. Monthly returns use observed HKD NAV.' : portfolioMonthlyNote(portfolioModel, shortDate));
 
 setTable("tb/5kb2xwby", [
@@ -702,22 +703,6 @@ if (isMsHkd) {
   }
 }
 
-// Owner-confirmed corrections to two fixed template texts: the disclaimer
-// heading dropped its first letter and the contact email had a stray "www.".
-// Only these exact texts change; the disclaimer wording itself is untouched.
-{
-  const corrections = new Map([
-    ['llustrative examples only', 'Illustrative examples only'],
-    ['inquiry@www.sprout-asset.com', 'inquiry@sprout-asset.com'],
-  ]);
-  const fixedText = await presentation.inspect({kind:'textbox',maxChars:1000000});
-  for (const line of fixedText.ndjson.split('\n').filter(Boolean)) {
-    const item = JSON.parse(line);
-    const text = String(item.text || item.textPreview || '').replace(/\s+/g, ' ').trim();
-    if (corrections.has(text)) setText(item.id, corrections.get(text));
-  }
-}
-
 if (snapshot.subject_id === "U16088606") {
   const identityCheck = await presentation.inspect({
     kind: "textbox,shape",
@@ -742,6 +727,18 @@ await fs.mkdir(stagingDir, { recursive: true });
 await fs.mkdir(outputDir, { recursive: true });
 let candidatePath = path.join(stagingDir, `${path.basename(finalPath, ".pptx")}.candidate.pptx`);
 await (await PresentationFile.exportPptx(presentation)).save(candidatePath);
+
+// Owner-confirmed corrections to two fixed template texts: the disclaimer
+// heading dropped its first letter and the contact email had a stray "www.".
+// Only the text inside those runs changes, so the template formatting is kept;
+// the disclaimer wording itself is untouched.
+{
+  const textPath = path.join(stagingDir, `${path.basename(finalPath, '.pptx')}.text.pptx`);
+  const receipt = JSON.parse(execFileSync(process.env.RUNTIME_PYTHON || process.env.PYTHON_BINARY || 'python',
+    ['-m', 'ibkr_etl.presentation_text_fixes', candidatePath, textPath], {encoding: 'utf8'}));
+  if (receipt.status !== 'passed') throw new Error('Template text corrections did not pass');
+  candidatePath = textPath;
+}
 
 if (isMsHkd) {
   const workbookPath = path.join(stagingDir, `${path.basename(finalPath, '.pptx')}.workbooks.pptx`);

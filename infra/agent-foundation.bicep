@@ -4,7 +4,8 @@ targetScope = 'resourceGroup'
 // Nothing here is deployed without Ying's typed approval naming each resource.
 // The private endpoint and DNS zones sit in ibkrv2stg-vnet, which the private
 // network thread owns: deploy this after that thread's current change and with
-// its agreement (createPrivateDns can be false if that thread creates the zones).
+// its agreement. That thread owns the privatelink zones; pass their IDs in
+// privateDnsZoneIds (createPrivateDns = true is only for a standalone setup).
 
 @description('Region for identities and the private endpoint (the VNet region).')
 param location string = resourceGroup().location
@@ -22,8 +23,11 @@ param vnetName string = 'ibkrv2stg-vnet'
 @description('Existing subnet in the VNet that holds private endpoints.')
 param privateEndpointSubnetName string
 
-@description('Create the three private DNS zones and link them to the VNet. Set false if they already exist.')
-param createPrivateDns bool = true
+@description('Create the three private DNS zones and link them to the VNet. Leave false when the network owner provides them.')
+param createPrivateDns bool = false
+
+@description('Resource IDs of the existing privatelink zones for cognitiveservices, openai and services.ai, in that order. Required when createPrivateDns is false.')
+param privateDnsZoneIds array = []
 
 @description('Main analyst model (pinned version, Data Zone Standard).')
 param modelName string = 'gpt-5.6-sol'
@@ -215,10 +219,10 @@ resource zoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023
   name: 'default'
   dependsOn: [zones]
   properties: {
-    privateDnsZoneConfigs: [for zone in dnsZones: {
+    privateDnsZoneConfigs: [for (zone, i) in dnsZones: {
       name: replace(zone, '.', '-')
       properties: {
-        privateDnsZoneId: resourceId('Microsoft.Network/privateDnsZones', zone)
+        privateDnsZoneId: createPrivateDns ? resourceId('Microsoft.Network/privateDnsZones', zone) : privateDnsZoneIds[i]
       }
     }]
   }

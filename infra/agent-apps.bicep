@@ -16,9 +16,9 @@ param jobsIdentityId string
 @description('Object (principal) ID of the website identity, the only caller of the agent API.')
 param webPrincipalId string
 
-@description('Entra app ID URIs used as token audiences.')
-param agentApiAudience string = 'api://wealthryse-agent'
-param toolsAudience string = 'api://wealthryse-agent-tools'
+@description('Entra app ID URIs used as token audiences. The tenant only accepts URIs that contain its ID.')
+param agentApiAudience string = 'api://${subscription().tenantId}/wealthryse-agent'
+param toolsAudience string = 'api://${subscription().tenantId}/wealthryse-agent-tools'
 
 param databaseHost string
 param databaseName string = 'ibkr'

@@ -73,7 +73,8 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
    only in Incremental mode, and pass the zone IDs so the template writes the
    same group.
 2. **Entra apps.** Register two applications with app ID URIs
-   `api://wealthryse-agent` and `api://wealthryse-agent-tools`. No secrets or
+   `api://<tenant ID>/wealthryse-agent` and `api://<tenant ID>/wealthryse-agent-tools`
+   (the tenant rejects URIs without its ID or a verified domain). No secrets or
    app roles are needed; the services check the caller's object ID.
 3. **Database** (`scripts/install_agent_schema.py`), run as the database
    administrator that owns the platform tables, from inside the private

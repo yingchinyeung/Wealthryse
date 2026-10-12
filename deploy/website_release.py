@@ -93,7 +93,12 @@ def prepare():
     if subprocess.run(['git', 'merge-base', '--is-ancestor', deployed, head], cwd=ROOT).returncode:
         raise SystemExit(f'Live website commit {deployed} is not in this branch history')
     changed = [p for p in git('diff', '--name-only', deployed, head).split() if p]
-    image_changes = [p for p in changed if not p.startswith(IGNORED_PREFIXES) and not p.endswith('.md')]
+    # The Node report renderers (scripts/*.mjs) are used by the reporting jobs,
+    # not the website, and this path only overlays src/ibkr_etl on live anyway.
+    skipped = [p for p in changed if p.startswith('scripts/') and p.endswith('.mjs')]
+    if skipped:
+        print('Not part of the website release (reporting scripts):\n  ' + '\n  '.join(skipped))
+    image_changes = [p for p in changed if not p.startswith(IGNORED_PREFIXES) and not p.endswith('.md') and p not in skipped]
     unsupported = [p for p in image_changes if not p.startswith(PACKAGE + '/')]
     if unsupported:
         raise SystemExit('This release path only ships src/ibkr_etl. Other image files changed:\n  ' + '\n  '.join(unsupported))

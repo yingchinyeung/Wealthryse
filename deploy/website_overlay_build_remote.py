@@ -51,6 +51,9 @@ for top in {src, site}:
         if '__pycache__' in dirs:
             shutil.rmtree(os.path.join(root, '__pycache__'))
             dirs.remove('__pycache__')
+        os.chmod(root, 0o755)
+        for f in files:
+            os.chmod(os.path.join(root, f), 0o644)
 spec = RUNTIME_USER
 user, _, group = spec.partition(':')
 uid = int(user) if user.isdigit() else pwd.getpwnam(user).pw_uid
@@ -171,7 +174,13 @@ def main():
             'disabled_plugins = ["io.containerd.grpc.v1.cri"]\n'
             '[grpc]\n  address = "' + containerd_sock + '"\n'
             '[ttrpc]\n  address = "' + containerd_sock + '.ttrpc"\n')
-        containerd = subprocess.Popen(['containerd', '--config', str(location / 'containerd.toml')], stdout=log, stderr=log, env=env)
+        # The build script's own umask (077) must not reach the daemons: layers
+        # unpacked under it leave parent folders like /usr/local unreadable to
+        # the image's non-root user.
+        def daemon_umask():
+            os.umask(0o022)
+        containerd = subprocess.Popen(['containerd', '--config', str(location / 'containerd.toml')], stdout=log, stderr=log, env=env,
+                                      preexec_fn=daemon_umask)
         for _ in range(60):
             if containerd.poll() is not None:
                 raise RuntimeError('Isolated containerd exited')
@@ -183,7 +192,7 @@ def main():
         process = subprocess.Popen(['dockerd', '--host=unix://' + sock, '--containerd=' + containerd_sock,
                                     '--data-root=' + str(location / 'data'), '--exec-root=' + str(location / 'exec'),
                                     '--pidfile=' + str(location / 'pid'), '--bridge=none', '--iptables=false', '--ip6tables=false'],
-                                   stdout=log, stderr=log, env=env)
+                                   stdout=log, stderr=log, env=env, preexec_fn=daemon_umask)
         client = ['docker', '--host', 'unix://' + sock]
         for _ in range(60):
             if process.poll() is not None:

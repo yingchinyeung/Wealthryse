@@ -1876,7 +1876,8 @@ def trade_history(
     user: dict[str, str] = Depends(_authorized_user),
 ) -> dict:
     access = _portfolio_access_context(account_id, user)
-    if access.get("subject_type", "physical_account") in {"filtered_portfolio", "composite_portfolio"}:
+    subject_type = access.get("subject_type", "physical_account")
+    if subject_type == "composite_portfolio":
         return {
             "account_id": account_id,
             "date_from": from_date or str(access["history_start_date"]),
@@ -1889,16 +1890,25 @@ def trade_history(
             "trades": [],
             "not_applicable": True,
             "message": (
-                "A derived portfolio has no independently executed trades. "
-                "Use its holdings, component exposures and reconstructed cash activity."
+                "A composite portfolio has no independently executed trades. "
+                "Use its component exposures and reconstructed cash activity."
             ),
             "viewer": user["email"],
         }
     requested_to = _parse_as_of(to_date)
     with _database() as connection:
+        if subject_type == "filtered_portfolio":
+            latest_sql, latest_params = (
+                "SELECT MAX(snapshot_date) AS latest FROM subject_nav_series WHERE tenant_id = %s AND subject_id = %s AND currency = %s",
+                (TENANT_ID, account_id, access["reporting_currency"]),
+            )
+        else:
+            latest_sql, latest_params = (
+                "SELECT MAX(snapshot_date) AS latest FROM nav_snapshots WHERE account_id = %s AND asset_class = 'TOTAL'",
+                (account_id,),
+            )
         effective_to = requested_to or connection.execute(
-            "SELECT MAX(snapshot_date) AS latest FROM nav_snapshots WHERE account_id = %s AND asset_class = 'TOTAL'",
-            (account_id,),
+            latest_sql, latest_params
         ).fetchone()["latest"]
         if effective_to is None:
             return {
@@ -1919,33 +1929,48 @@ def trade_history(
             symbol,
             side,
         )
-        records = connection.execute(
-            """
-            SELECT t.trade_date, t.trade_time, t.settle_date, t.execution_id,
-                   t.trade_id, t.conid, i.symbol, i.description, i.asset_category,
-                   t.buy_sell, t.quantity_text, t.trade_price_text, t.currency,
-                   t.proceeds_text, t.commission_text, t.commission_currency,
-                   t.net_cash_text, t.realized_pnl_text,
-                   COUNT(*) OVER() AS total_count
-            FROM trades AS t
-            LEFT JOIN instruments AS i ON i.conid = t.conid
-            WHERE t.account_id = %s
-              AND t.trade_date BETWEEN %s AND %s
-              AND (%s::text IS NULL OR POSITION(UPPER(%s) IN UPPER(COALESCE(i.symbol, ''))) > 0)
-              AND (%s::text IS NULL OR UPPER(COALESCE(t.buy_sell, '')) = %s)
-            ORDER BY t.trade_date DESC, t.trade_time DESC, t.source_key DESC
-            LIMIT 500
-            """,
-            (
-                account_id,
-                start,
-                end,
-                normalized_symbol,
-                normalized_symbol,
-                normalized_side,
-                normalized_side,
-            ),
-        ).fetchall()
+        if subject_type == "filtered_portfolio":
+            from .subject_exports import filtered_trade_query
+
+            sql, params = filtered_trade_query(
+                tenant_id=TENANT_ID,
+                subject_id=account_id,
+                start=start,
+                end=end,
+                symbol=normalized_symbol,
+                side=normalized_side,
+                latest_first=True,
+                limit=500,
+            )
+            records = connection.execute(sql, params).fetchall()
+        else:
+            records = connection.execute(
+                """
+                SELECT t.trade_date, t.trade_time, t.settle_date, t.execution_id,
+                       t.trade_id, t.conid, i.symbol, i.description, i.asset_category,
+                       t.buy_sell, t.quantity_text, t.trade_price_text, t.currency,
+                       t.proceeds_text, t.commission_text, t.commission_currency,
+                       t.net_cash_text, t.realized_pnl_text,
+                       COUNT(*) OVER() AS total_count
+                FROM trades AS t
+                LEFT JOIN instruments AS i ON i.conid = t.conid
+                WHERE t.account_id = %s
+                  AND t.trade_date BETWEEN %s AND %s
+                  AND (%s::text IS NULL OR POSITION(UPPER(%s) IN UPPER(COALESCE(i.symbol, ''))) > 0)
+                  AND (%s::text IS NULL OR UPPER(COALESCE(t.buy_sell, '')) = %s)
+                ORDER BY t.trade_date DESC, t.trade_time DESC, t.source_key DESC
+                LIMIT 500
+                """,
+                (
+                    account_id,
+                    start,
+                    end,
+                    normalized_symbol,
+                    normalized_symbol,
+                    normalized_side,
+                    normalized_side,
+                ),
+            ).fetchall()
     total_count = int(records[0]["total_count"]) if records else 0
     trades = [
         {key: value for key, value in dict(record).items() if key != "total_count"}
@@ -10198,6 +10223,11 @@ def _render_account_page(
         else '<a id="export-reporting-snapshot" class="button" '
         f'href="/api/reporting/snapshots/latest.json?download=true&amp;subject_id={account}">Owner-only frozen snapshot JSON</a>'
     )
+    trade_export_link = (
+        ""
+        if access.get("subject_type") == "composite_portfolio"
+        else '<a id="export-trades-csv" class="button" href="#">Trade history CSV</a>'
+    )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_title} · {account_display_name} · {PLATFORM_NAME}</title>
@@ -10215,7 +10245,7 @@ def _render_account_page(
 <div class="page-view{active['trades']}" data-section="trades"><div class="card wide"><div class="label">Trade history</div><div id="trade-source-title" class="value">Trade records</div><div id="trade-source-note" class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div id="trade-filter-controls" class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
 <div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
 <div class="page-view{active['reports']}" data-section="reports"><div class="card wide"><div class="label">Monthly factsheets and presentations</div><div class="value">Report centre</div><div id="report-note" class="muted">Loading frozen month-end reports…</div><div class="actions"><select id="report-month" aria-label="Monthly report period"></select><button id="report-prepare" class="button" type="button" disabled>Generate secure downloads</button></div><div id="report-status" class="muted" style="margin-top:14px"></div><div id="report-downloads" class="actions"></div><div id="report-owner-review" style="display:none;margin-top:22px"><h3>Review and release files</h3><p class="muted">Tick a file to make it available to authorized users. Untick it and submit to revoke its download access. The original file and approval history are retained. Review files before approving; client distribution remains prohibited.</p><div id="report-release-details" class="muted" style="margin-top:12px"></div><div id="report-release-list" style="display:grid;gap:12px;margin:16px 0"></div><button id="report-release" class="button" type="button" disabled>Submit approval changes</button><div id="report-release-status" class="muted" role="status" aria-live="polite"></div></div></div></div>
-<div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a><a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
+<div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a>{trade_export_link}<a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
 <div class="page-view{active['ai-analyst']}" data-section="ai-analyst"><div class="card wide ai-chat-card"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Saved chats</div><strong>AI Analyst</strong></div><button id="ai-new-chat" class="button" type="button">New chat</button></div><div id="ai-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="ai-chat-title">New conversation</strong><div id="agent-status" class="muted">Loading analyst…</div></div><div class="actions"><a id="ai-export-md" class="button" href="#" hidden>Save Markdown</a><a id="ai-export-json" class="button" href="#" hidden>Save JSON</a><button id="ai-archive-chat" class="button" type="button" hidden>Archive</button></div></div><div id="ai-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Live grounded analysis</div><div class="value">Ask about this portfolio</div><div id="agent-note" class="muted">The analyst uses validated portfolio tools for every figure and chart.</div><div class="ai-prompt-chips"><button class="ai-prompt-chip" type="button">Compare performance with the selected benchmark</button><button class="ai-prompt-chip" type="button">Explain the portfolio's main risks</button><button class="ai-prompt-chip" type="button">Show NAV history and key performance metrics</button></div></div></div><div class="ai-chat-composer"><textarea id="analysis-question" maxlength="1200" aria-label="Message the AI Portfolio Analyst" placeholder="Message the AI Portfolio Analyst…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Conversations save automatically</div><button id="analysis-run" class="button" type="button" disabled>Send</button></div></div></section></div></div></div>
 <div class="page-view{active['system-health']}" data-section="system-health"><div class="card wide"><div class="label">System health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Daily portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Stage 4 acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>
 <div class="page-view{active['administration']}" data-section="administration"><div class="admin-layout"><div class="card admin-overview"><div class="label">24/7 controlled autonomy</div><div id="autonomy-status" class="value">Loading…</div><div id="autonomy-note" class="muted"></div><div id="autonomy-summary" class="status-row"></div><div id="autonomy-incidents" class="muted"></div><div id="autonomy-reviews" class="muted"></div></div><div class="card admin-actions-panel"><div class="label">Owner-approved administrator actions</div><div id="admin-status" class="value">Loading…</div><div id="admin-note" class="muted"></div><div class="actions"><select id="admin-action" aria-label="Staging administrative action"></select><button id="admin-preview" class="button" type="button" disabled>Preview action</button></div><div id="admin-preview-result" class="muted" style="margin-top:14px"></div><div class="actions"><input id="admin-confirmation" type="text" maxlength="80" aria-label="Type the exact approval phrase" placeholder="Preview an action to obtain the approval phrase" disabled><button id="admin-execute" class="button" type="button" disabled>Approve and execute once</button></div><div id="admin-result" class="muted" style="margin-top:14px"></div></div></div></div></section></main>
@@ -10331,7 +10361,7 @@ if(account==='alpha-world-ms'&&!risk.runtime_version){{
   document.querySelector('#risk-metrics').innerHTML=msItems.map(metricCard).join('');
  }}
 }}
-[['#export-performance','performance'],['#export-holdings','holdings'],['#export-cash','cash-activity']].forEach(x=>document.querySelector(x[0]).href=`/api/portfolio/${{account}}/export/${{x[1]}}.csv?as_of=${{encodeURIComponent(asOf)}}`);
+[['#export-performance','performance'],['#export-holdings','holdings'],['#export-cash','cash-activity']].forEach(x=>document.querySelector(x[0]).href=`/api/portfolio/${{account}}/export/${{x[1]}}.csv?as_of=${{encodeURIComponent(asOf)}}`);const tradeCsv=document.querySelector('#export-trades-csv');if(tradeCsv)tradeCsv.href=`/api/portfolio/${{account}}/export/trades.csv?as_of=${{encodeURIComponent(asOf)}}`;
 const cashFrom=document.querySelector('#cash-from'),cashTo=document.querySelector('#cash-to');if(!cashFrom.value)cashFrom.value=historyStartDate;cashFrom.max=asOf;cashTo.max=asOf;cashTo.value=asOf;if(cashFrom.value>asOf)cashFrom.value=historyStartDate;if(activeSection==='cash')await loadCashActivity();
 const tradeFrom=document.querySelector('#trade-from'),tradeTo=document.querySelector('#trade-to');if(!tradeFrom.value)tradeFrom.value=historyStartDate;tradeTo.max=asOf;tradeTo.value=asOf;if(tradeFrom.value>asOf)tradeFrom.value=historyStartDate;if(activeSection==='trades')await loadTradeHistory();
 draw('#chart',p.series,[{{key:'nav',color:chartColors.portfolio,label:`${{accountDisplayName}} NAV`}}],{{yLabel:`NAV (${{reportingCurrency}})`,unit:reportingCurrency,niceYTicks:true,targetYIntervals:8}});

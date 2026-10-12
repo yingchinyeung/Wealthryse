@@ -702,22 +702,6 @@ if (isMsHkd) {
   }
 }
 
-// Owner-confirmed corrections to two fixed template texts: the disclaimer
-// heading dropped its first letter and the contact email had a stray "www.".
-// Only these exact texts change; the disclaimer wording itself is untouched.
-{
-  const corrections = new Map([
-    ['llustrative examples only', 'Illustrative examples only'],
-    ['inquiry@www.sprout-asset.com', 'inquiry@sprout-asset.com'],
-  ]);
-  const fixedText = await presentation.inspect({kind:'textbox',maxChars:1000000});
-  for (const line of fixedText.ndjson.split('\n').filter(Boolean)) {
-    const item = JSON.parse(line);
-    const text = String(item.text || item.textPreview || '').replace(/\s+/g, ' ').trim();
-    if (corrections.has(text)) setText(item.id, corrections.get(text));
-  }
-}
-
 if (snapshot.subject_id === "U16088606") {
   const identityCheck = await presentation.inspect({
     kind: "textbox,shape",
@@ -742,6 +726,18 @@ await fs.mkdir(stagingDir, { recursive: true });
 await fs.mkdir(outputDir, { recursive: true });
 let candidatePath = path.join(stagingDir, `${path.basename(finalPath, ".pptx")}.candidate.pptx`);
 await (await PresentationFile.exportPptx(presentation)).save(candidatePath);
+
+// Owner-confirmed corrections to two fixed template texts: the disclaimer
+// heading dropped its first letter and the contact email had a stray "www.".
+// Only the text inside those runs changes, so the template formatting is kept;
+// the disclaimer wording itself is untouched.
+{
+  const textPath = path.join(stagingDir, `${path.basename(finalPath, '.pptx')}.text.pptx`);
+  const receipt = JSON.parse(execFileSync(process.env.RUNTIME_PYTHON || process.env.PYTHON_BINARY || 'python',
+    ['-m', 'ibkr_etl.presentation_text_fixes', candidatePath, textPath], {encoding: 'utf8'}));
+  if (receipt.status !== 'passed') throw new Error('Template text corrections did not pass');
+  candidatePath = textPath;
+}
 
 if (isMsHkd) {
   const workbookPath = path.join(stagingDir, `${path.basename(finalPath, '.pptx')}.workbooks.pptx`);

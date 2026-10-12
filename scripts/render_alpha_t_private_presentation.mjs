@@ -5,7 +5,7 @@ import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {artifactToolUrl,bindTemplateObjectIds,bindTReportImports} from './alpha_t_presentation_runtime.mjs';
 const src=await fs.readFile(new URL('./render_monthly_presentation.mjs',import.meta.url),'utf8');
-if(createHash('sha256').update(src).digest('hex')!=='8b62a1dd498bfffccdb415dcc7999e92b79af402882082ccf9176bb9face6add')
+if(createHash('sha256').update(src).digest('hex')!=='c38e82edfb850c2bbda34ca22bb78ea9c37a7e11e73e302880f4f59c6e49d459')
   throw Error('Reference renderer changed; inspect before adapting');
 // Desktop finalization remains enabled when its complete environment is set.
 // Azure uses the installed, image-pinned package and the same financial audit.
@@ -83,8 +83,6 @@ const safeText=new Map([
  ['Rebalancing Explanations: Quarterly end','Constant cash: 58 per initial NAV 100'],
  ['Performance fees calculated as the delta versus the prior quarter and only deemed earned if higher than the prior quarter and is a positive return (no watermark).',
   'Underlying account NAV includes its cash and interest. No additional financing charge is added. T fee terms are not established by this model.'],
- ['inquiry@www.sprout-asset.com','inquiry@sprout-asset.com'],
- ['llustrative examples only','Illustrative examples only']
 ]);
 for(const line of templateText.ndjson.split('\\n').filter(Boolean)){
  const x=JSON.parse(line),old=String(x.text||x.textPreview||'').replace(/\\s+/g,' ').trim();

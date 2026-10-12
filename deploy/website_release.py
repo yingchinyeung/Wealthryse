@@ -20,7 +20,9 @@ REG = 'ibkrv2stgauhecwc4itaoo.azurecr.io'
 BASELINE_COMMIT = '59dbd295c32b8503aa9f66be5b9cf0e5b70562b2'
 PACKAGE = 'src/ibkr_etl'
 # Paths that are not part of the website image.
-IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azuredevops/')
+IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azuredevops/',
+                    # CI-only helper; the website never runs it.
+                    'scripts/ci_run_tests.py')
 STATE = Path('release-state.json')
 ROOT = Path(__file__).resolve().parents[1]
 

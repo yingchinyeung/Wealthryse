@@ -103,8 +103,10 @@ def build():
         result = json.loads(lines[-1]) if lines else {'passed': False, 'error': (view.get('error') or '')[-1500:],
                                                       'output_length': len(output), 'output_tail': output[-800:]}
         print(json.dumps(result, indent=2))
-        if result.get('rejects_file'):
-            print_rejects(base, vm['location'], result['rejects_file'], result['rejects_size'])
+        if result.get('detail_file'):
+            detail = read_detail(base, vm['location'], result['detail_file'], result['detail_size'])
+            for name, text in json.loads(gzip.decompress(base64.b64decode(detail))).items():
+                print('Live code where the change to ' + name + ' does not apply:\n' + text)
         if not result.get('passed') or view.get('exitCode') != 0:
             raise SystemExit('Build failed; the website was not changed')
         state['pushed_image'] = result['pushed_image']
@@ -135,19 +137,65 @@ def vm_run(base, name, script, location, timeout):
         subprocess.run(['az', 'rest', '--method', 'delete', '--url', url], capture_output=True)
 
 
-def print_rejects(base, location, path, size):
-    """Run Command returns only 4 KB of output, so the conflict detail is read in pieces."""
-    if not path.startswith('/var/tmp/wealthryse-build-rejects-') or not path.endswith('.txt'):
-        raise SystemExit('Unexpected rejects file name')
+def read_detail(base, location, path, size):
+    """Run Command returns only 4 KB of output, so larger detail is read in pieces."""
+    if not path.startswith('/var/tmp/wealthryse-build-detail-') or not path.endswith('.txt'):
+        raise SystemExit('Unexpected detail file name')
     encoded = ''
     try:
-        for offset in range(0, size, 3000):
-            view = vm_run(base, f'website-rejects-{offset // 3000}', f"tail -c +{offset + 1} {path} | head -c 3000", location, 120)
+        for offset in range(0, size, 4000):
+            view = vm_run(base, f'website-detail-{offset // 4000}', f"tail -c +{offset + 1} {path} | head -c 4000", location, 120)
             encoded += (view.get('output') or '').strip()
     finally:
-        vm_run(base, 'website-rejects-cleanup', 'rm -f ' + path, location, 120)
-    for name, text in json.loads(gzip.decompress(base64.b64decode(encoded))).items():
-        print('Live code where the change to ' + name + ' does not apply:\n' + text)
+        vm_run(base, 'website-detail-cleanup', 'rm -f ' + path, location, 120)
+    if len(encoded) != size:
+        raise SystemExit(f'Read {len(encoded)} of {size} bytes of build detail')
+    return encoded
+
+
+def capture():
+    """Copy named files out of the live website image into deploy/live-snapshot/ (read-only)."""
+    names = sys.argv[2:]
+    if not names or any('/' in n or not n.endswith('.py') for n in names):
+        raise SystemExit('Name the src/ibkr_etl/*.py files to copy')
+    head = git('rev-parse', 'HEAD').strip()
+    live = az('containerapp', 'show', '-n', APP, '-g', RG)['properties']['template']['containers'][0]['image']
+    config = {'capture': names, 'base_image': live, 'target_image': f'{REG}/ibkr-platform:web-capture',
+              'source_commit': head, 'live_hashes': {}, 'new_hashes': {}, 'patch': ''}
+    code = (ROOT / 'deploy' / 'website_overlay_build_remote.py').read_text()
+    code = code.replace('CONFIG = None  # replaced by the workflow', 'CONFIG = json.loads(' + repr(json.dumps(config)) + ')')
+    command = "cat > /tmp/wealthryse-website-build.py <<'WEALTHRYSE_EOF'\n" + code + "\nWEALTHRYSE_EOF\n" \
+              "unshare --mount --propagation private python3 /tmp/wealthryse-website-build.py; status=$?; rm -f /tmp/wealthryse-website-build.py; exit $status"
+    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    started = vm.get('powerState') != 'VM running'
+    if started:
+        az('vm', 'start', '-g', RG, '-n', VM, parse=False)
+    sub = az('account', 'show')['id']
+    base = f'https://management.azure.com/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{VM}/runCommands/'
+    try:
+        view = vm_run(base, 'website-capture', command, vm['location'], 1800)
+        lines = [l[len('WEBSITE_BUILD_RESULT '):] for l in (view.get('output') or '').splitlines() if l.startswith('WEBSITE_BUILD_RESULT ')]
+        result = json.loads(lines[-1]) if lines else {'passed': False}
+        print(json.dumps({k: v for k, v in result.items() if k != 'captured'}, indent=2))
+        if not result.get('passed'):
+            raise SystemExit('Capture failed')
+        archive = base64.b64decode(read_detail(base, vm['location'], result['detail_file'], result['detail_size']))
+    finally:
+        if started:
+            subprocess.run(['az', 'vm', 'deallocate', '-g', RG, '-n', VM, '--no-wait'], capture_output=True)
+    import io, tarfile
+    target = ROOT / 'deploy' / 'live-snapshot' / PACKAGE
+    target.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode='r:xz') as tar:
+        for member in tar.getmembers():
+            if member.name not in names or not member.isfile():
+                raise SystemExit('Unexpected file in capture: ' + member.name)
+            data = tar.extractfile(member).read()
+            if hashlib.sha256(data).hexdigest() != result['captured'][member.name]:
+                raise SystemExit('Captured file damaged in transfer: ' + member.name)
+            (target / member.name).write_bytes(data)
+    (target.parent.parent / 'IMAGE').write_text(live + '\n')
+    print('Copied', ', '.join(names), 'from', live)
 
 def deploy():
     state = json.loads(STATE.read_text())
@@ -207,4 +255,4 @@ def rollback():
 
 
 if __name__ == '__main__':
-    {'prepare': prepare, 'build': build, 'deploy': deploy, 'verify': verify, 'rollback': rollback}[sys.argv[1]]()
+    {'prepare': prepare, 'build': build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback}[sys.argv[1]]()

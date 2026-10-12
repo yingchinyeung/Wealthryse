@@ -7,7 +7,7 @@ of the live files (every hunk must apply exactly), builds
 with no network, and pushes one new tag over the registry's private endpoint.
 No application starts and no database is touched.
 """
-import base64, gzip, hashlib, json, os, re, shutil, socket, ssl, subprocess, tempfile, time, urllib.error, urllib.parse, urllib.request
+import base64, gzip, hashlib, io, json, os, re, shutil, tarfile, socket, ssl, subprocess, tempfile, time, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 CONFIG = None  # replaced by the workflow
@@ -28,6 +28,10 @@ def request(url, data=None, headers=None):
     body = None if data is None else urllib.parse.urlencode(data).encode()
     with opener.open(urllib.request.Request(url, data=body, headers=headers or {}), timeout=30) as r:
         return json.load(r)
+
+
+class Captured(Exception):
+    """Capture finished; skip the build."""
 
 
 def tree_hashes(folder):
@@ -70,7 +74,7 @@ def main():
     env['DOCKER_CONFIG'] = str(root / 'credentials')
     Path(env['DOCKER_CONFIG']).mkdir(mode=0o700)
     process = log = None
-    rejects = {}
+    detail = ''
     mounted = False
     result = {'base_image': base, 'target_image': target, 'source_commit': config['source_commit']}
     try:
@@ -115,6 +119,19 @@ def main():
             run(client + ['rm', container], 'live image cleanup', env=env)
         package = context / 'src' / 'ibkr_etl'
         live = tree_hashes(package)
+        if config.get('capture'):
+            # Read-only: hand back exact copies of the named live files; nothing is built.
+            names = config['capture']
+            missing = [n for n in names if n not in live]
+            if missing:
+                raise ValueError('Not in the live image: ' + ', '.join(missing))
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode='w:xz', preset=9) as tar:
+                for name in names:
+                    tar.add(str(package / name), arcname=name)
+            detail = base64.b64encode(buffer.getvalue()).decode()
+            result.update(passed=True, captured={n: live[n] for n in names})
+            raise Captured()
         expected, wanted = config['live_hashes'], config['new_hashes']
         # Counts only: the full lists were reported by earlier runs and the
         # Run Command output is small.
@@ -146,8 +163,8 @@ def main():
         applied = subprocess.run(['patch', '-p1', '--forward', '--fuzz=0', '--no-backup-if-mismatch', '-i', str(patch_file)],
                                  capture_output=True, text=True, timeout=300, cwd=str(context))
         if applied.returncode:
-            rejects = rejected_context(package)
-            raise ValueError('Some of the change does not apply to the live files; nothing built: ' + ', '.join(sorted(rejects)))
+            detail = base64.b64encode(gzip.compress(json.dumps(rejected_context(package)).encode(), 9)).decode()
+            raise ValueError('Some of the change does not apply to the live files; nothing built')
         patched = tree_hashes(package)
         for name in touched:
             if live.get(name) == expected.get(name) and patched.get(name) != wanted.get(name):
@@ -175,6 +192,8 @@ def main():
         if len(pushed) != 1:
             raise ValueError('Pushed digest missing')
         result.update(passed=True, pushed_image=pushed[0], removed_files=removed)
+    except Captured:
+        pass
     except Exception as error:
         result.update(passed=False, error=str(error)[-1500:])
     finally:
@@ -191,15 +210,15 @@ def main():
             subprocess.run(['umount', '/etc/hosts'], timeout=15)
         if root.parent == Path('/tmp') and root.name.startswith('wealthryse-website-build-'):
             shutil.rmtree(root, ignore_errors=True)
-    # Run Command returns only 4 KB of output, so the conflict detail is left in
-    # a root-only file that the workflow reads in pieces and then removes.
-    if rejects:
-        encoded = base64.b64encode(gzip.compress(json.dumps(rejects).encode(), 9)).decode()
-        path = '/var/tmp/wealthryse-build-rejects-' + config['source_commit'][:12] + '.txt'
+    # Run Command returns only 4 KB of output, so larger detail (conflicts or
+    # captured files) is left in a root-only file the workflow reads in pieces
+    # and then removes.
+    if detail:
+        path = '/var/tmp/wealthryse-build-detail-' + config['source_commit'][:12] + '.txt'
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w') as f:
-            f.write(encoded)
-        result.update(rejects_file=path, rejects_size=len(encoded))
+            f.write(detail)
+        result.update(detail_file=path, detail_size=len(detail))
     print(PREFIX + json.dumps(result), flush=True)
     if not result.get('passed'):
         raise SystemExit(1)

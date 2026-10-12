@@ -141,6 +141,8 @@ from .authorization import (
 from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_guide
 from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS
+from .holdings_view import combine_holdings, enrich_holdings
+from .sector_classification import YAHOO_PROVIDER as HOLDINGS_SECTOR_PROVIDER
 
 
 TENANT_ID = os.environ.get(
@@ -1538,6 +1540,121 @@ def external_flows_statement(
     }
 
 
+def _latest_subject_holdings(
+    connection, subject_id: str, requested_as_of: str | None
+) -> list[dict]:
+    """Latest non-zero physical or filtered positions with sector labels."""
+    return [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT p.snapshot_date, p.conid, i.symbol, i.description, p.currency,
+                   p.quantity_text, p.mark_price_text, p.market_value_text,
+                   p.cost_basis_text, p.unrealized_pnl_text,
+                   COALESCE(ic.sector, 'Unclassified') AS sector
+            FROM subject_position_series p
+            LEFT JOIN instruments i ON i.conid = p.conid
+            LEFT JOIN instrument_classifications ic
+              ON ic.conid = p.conid AND ic.provider = %s
+            WHERE p.tenant_id = %s AND p.subject_id = %s
+              AND p.snapshot_date = (
+                  SELECT MAX(snapshot_date) FROM subject_position_series
+                  WHERE tenant_id = %s AND subject_id = %s
+                    AND (%s::text IS NULL OR snapshot_date <= %s)
+              )
+              AND COALESCE(NULLIF(p.quantity_text, ''), '0')::numeric <> 0
+            ORDER BY ABS(COALESCE(NULLIF(p.market_value_text, ''), '0')::numeric) DESC
+            """,
+            (
+                HOLDINGS_SECTOR_PROVIDER,
+                TENANT_ID,
+                subject_id,
+                TENANT_ID,
+                subject_id,
+                requested_as_of,
+                requested_as_of,
+            ),
+        ).fetchall()
+    ]
+
+
+def _holdings_fx_account(connection, subject_id: str, subject_type: str) -> str | None:
+    """Apply the reporting FX source-account rule to a holdings subject.
+
+    Physical accounts use their own FX history; filtered portfolios use their
+    approved source account, matching normalize_collected_report_holdings.
+    """
+    if subject_type != "filtered_portfolio":
+        return subject_id
+    subject = connection.execute(
+        "SELECT source_account_id FROM platform_subjects "
+        "WHERE tenant_id = %s AND subject_id = %s",
+        (TENANT_ID, subject_id),
+    ).fetchone()
+    if subject and subject["source_account_id"]:
+        return str(subject["source_account_id"])
+    definition = connection.execute(
+        "SELECT configuration_json ->> 'source_account_id' AS source_account_id "
+        "FROM subject_calculation_definitions WHERE subject_id = %s "
+        "AND subject_type = 'filtered_portfolio' "
+        "AND approval_status IN ('validated', 'approved') "
+        "ORDER BY definition_version DESC, created_at DESC LIMIT 1",
+        (subject_id,),
+    ).fetchone()
+    return str(definition["source_account_id"]) if definition and definition["source_account_id"] else None
+
+
+def _enrich_subject_holdings(
+    connection,
+    subject_id: str,
+    rows: list[dict],
+    *,
+    subject_type: str,
+    reporting_currency: str,
+    nav_currency: str | None,
+) -> dict:
+    """Add cost, P&L, reporting values, weights and sector to holdings rows.
+
+    ``nav_currency`` selects the NAV used as the weight denominator; pass None
+    to weight on gross holdings (the combined view, where NAV is not summed).
+    """
+    if not rows:
+        return enrich_holdings([], reporting_currency=reporting_currency)
+    snapshot_date = str(rows[0]["snapshot_date"])
+    fx_account = _holdings_fx_account(connection, subject_id, subject_type)
+    fx_rows = []
+    if fx_account is not None:
+        fx_rows = connection.execute(
+            """
+            SELECT rate_date, from_currency, to_currency, rate_text
+            FROM fx_rates
+            WHERE account_id = %s AND rate_date <= %s
+            ORDER BY from_currency, to_currency, rate_date
+            """,
+            (fx_account, snapshot_date),
+        ).fetchall()
+    nav_total = None
+    if nav_currency is not None:
+        nav = connection.execute(
+            """
+            SELECT total_text FROM subject_nav_series
+            WHERE tenant_id = %s AND subject_id = %s AND snapshot_date = %s
+              AND currency = %s
+            """,
+            (TENANT_ID, subject_id, snapshot_date, nav_currency),
+        ).fetchone()
+        nav_total = nav["total_text"] if nav else None
+    view = enrich_holdings(
+        rows,
+        reporting_currency=reporting_currency,
+        fx_rows=fx_rows,
+        nav_total=nav_total,
+        fx_unavailable_reason=None if fx_account is not None else "fx_source_unavailable",
+    )
+    view["fx_account_id"] = fx_account
+    return view
+
+
 @app.get("/api/portfolio/{account_id}/holdings")
 def holdings(
     account_id: str,
@@ -1575,28 +1692,92 @@ def holdings(
             except ValueError as error:
                 raise HTTPException(status_code=409,detail=str(error)) from error
         else:
-            rows = connection.execute(
-            """
-            SELECT p.snapshot_date, p.conid, i.symbol, i.description, p.currency,
-                   p.quantity_text, p.mark_price_text, p.market_value_text
-            FROM subject_position_series p
-            LEFT JOIN instruments i ON i.conid = p.conid
-            WHERE p.tenant_id = %s AND p.subject_id = %s
-              AND p.snapshot_date = (
-                  SELECT MAX(snapshot_date) FROM subject_position_series
-                  WHERE tenant_id = %s AND subject_id = %s
-                    AND (%s::text IS NULL OR snapshot_date <= %s)
-              )
-              AND COALESCE(NULLIF(p.quantity_text, ''), '0')::numeric <> 0
-            ORDER BY ABS(COALESCE(NULLIF(p.market_value_text, ''), '0')::numeric) DESC
-            """,
-            (TENANT_ID, account_id, TENANT_ID, account_id, requested_as_of, requested_as_of),
-            ).fetchall()
+            rows = _latest_subject_holdings(connection, account_id, requested_as_of)
+            view = _enrich_subject_holdings(
+                connection,
+                account_id,
+                rows,
+                subject_type=str(access.get("subject_type") or "physical_account"),
+                reporting_currency=str(access["reporting_currency"]),
+                nav_currency=str(access["reporting_currency"]),
+            )
+            return {
+                "account_id": account_id,
+                "requested_as_of": requested_as_of,
+                "snapshot_date": rows[0]["snapshot_date"] if rows else None,
+                **view,
+            }
     return {
         "account_id": account_id,
         "requested_as_of": requested_as_of,
         "snapshot_date": rows[0]["snapshot_date"] if rows else None,
         "holdings": rows,
+    }
+
+
+@app.get("/api/holdings/combined")
+def combined_holdings(
+    currency: str = "USD",
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Aggregate the signed-in colleague's physical accounts by instrument.
+
+    Only physical accounts are combined: filtered and composite portfolios are
+    built from those accounts and would double count. Each account is
+    converted with its own dated FX history, and an account is included only
+    when the same access check as its own holdings page passes.
+    """
+    target = (currency or "").strip().upper()
+    if len(target) != 3 or not target.isalpha():
+        raise HTTPException(status_code=400, detail="currency must be a three-letter ISO code")
+    requested_as_of = _parse_as_of(as_of)
+    accounts = []
+    skipped: list[dict[str, str]] = []
+    for subject in _account_directory(user):
+        subject_id = str(subject["subject_id"])
+        try:
+            access = _portfolio_access_context(subject_id, user)
+        except HTTPException as error:
+            if error.status_code == 404:
+                continue
+            if error.status_code == 409:
+                skipped.append({"account_id": subject_id, "reason": str(error.detail)})
+                continue
+            raise
+        if access.get("subject_type", "physical_account") != "physical_account":
+            continue
+        with _database() as connection:
+            rows = _latest_subject_holdings(connection, subject_id, requested_as_of)
+            view = _enrich_subject_holdings(
+                connection,
+                subject_id,
+                rows,
+                subject_type="physical_account",
+                reporting_currency=target,
+                nav_currency=None,
+            )
+        accounts.append(
+            {
+                "account_id": subject_id,
+                "display_name": str(
+                    subject.get("display_name") or access.get("display_name") or subject_id
+                ),
+                "snapshot_date": rows[0]["snapshot_date"] if rows else None,
+                "holdings_count": len(rows),
+                "fx_missing_conids": view["fx_missing_conids"],
+                "holdings": view["holdings"],
+            }
+        )
+    combined = combine_holdings(accounts, currency=target)
+    return {
+        "requested_as_of": requested_as_of,
+        "accounts": [
+            {key: value for key, value in account.items() if key != "holdings"}
+            for account in accounts
+        ],
+        "skipped_accounts": skipped,
+        **combined,
     }
 
 
@@ -4318,6 +4499,7 @@ ONBOARDING_PREVIEW_SECTIONS = {
 }
 
 PLATFORM_SECTIONS = {
+    "combined-holdings": "Combined holdings",
     "system-health": "System health",
     "metrics-guide": "Metrics guide",
     "ibkr-connections": "IBKR connections",
@@ -4331,6 +4513,7 @@ ALL_PAGE_SECTIONS = ACCOUNT_SECTIONS | PLATFORM_SECTIONS
 def _platform_navigation(user: dict[str, object], *, active: str | None = None) -> str:
     links = [
         ("accounts", "Accounts", "/"),
+        ("combined-holdings", "Combined holdings", "/combined-holdings"),
         ("system-health", "System health", "/system-health"),
         ("metrics-guide", "Metrics guide", "/metrics-guide"),
     ]
@@ -4387,8 +4570,32 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
 <title>Accounts · {PLATFORM_NAME}</title>
 <style>{HOME_THEME_CSS}</style></head><body>
 <header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
-<main><section class="home-hero"><div class="eyebrow">Portfolio intelligence</div><h1>Accounts</h1><div class="lead">Select an account to open its portfolio workspace. Each workspace brings validated data, risk analytics and reporting into one institutional view.</div></section><div class="accounts">{cards_html}</div></main>
+<main><section class="home-hero"><div class="eyebrow">Portfolio intelligence</div><h1>Accounts</h1><div class="lead">Select an account to open its portfolio workspace. Each workspace brings validated data, risk analytics and reporting into one institutional view.</div><div class="actions"><a class="button" href="/combined-holdings">Combined holdings</a></div></section><div class="accounts">{cards_html}</div></main>
 </body></html>"""
+
+
+COMBINED_HOLDINGS_PAGE_SCRIPT = r"""
+<script>
+const esc=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
+const json=async response=>{const payload=await response.json();if(!response.ok)throw new Error(payload.detail||`http_${response.status}`);return payload};
+const fmt=n=>n==null||n===''?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(n));
+const pct=n=>n==null?'—':new Intl.NumberFormat('en-US',{style:'percent',maximumFractionDigits:2}).format(Number(n));
+const combinedForm=document.querySelector('#combined-form');
+const loadCombined=()=>{
+  const currency=document.querySelector('#combined-currency').value.trim().toUpperCase()||'USD',asOf=document.querySelector('#combined-asof').value,params=new URLSearchParams({currency});
+  if(asOf)params.set('as_of',asOf);
+  document.querySelector('#combined-note').textContent='Loading…';
+  fetch(`/api/holdings/combined?${params}`).then(json).then(data=>{
+    document.querySelector('#combined-currency-label').textContent=data.currency;
+    document.querySelector('#combined-accounts').innerHTML=data.accounts.map(item=>`<div class="status-item"><span class="label">${esc(item.display_name)}</span><strong>${esc(item.snapshot_date||'No snapshot')}</strong><span class="muted">${esc(item.holdings_count)} holdings${item.fx_missing_conids.length?` · ${esc(item.fx_missing_conids.length)} without FX`:''}</span></div>`).join('');
+    document.querySelector('#combined-holdings').innerHTML=data.holdings.map(x=>`<tr><td>${esc(x.symbol||x.conid)}</td><td>${esc(x.description||'')}</td><td>${esc(x.sector||'')}</td><td><details><summary>${esc(x.account_count)}</summary>${x.accounts.map(a=>`<div class="muted">${esc(a.display_name)}: ${fmt(a.quantity_text)} · ${a.fx_missing?'FX unavailable':esc(fmt(a.reporting_market_value_text))}</div>`).join('')}</details></td><td>${fmt(x.quantity_text)}</td><td>${fmt(x.reporting_market_value_text)}${x.incomplete?' <span class="muted" title="At least one account has no usable FX rate for this holding">(partial)</span>':''}</td><td>${fmt(x.reporting_cost_basis_text)}</td><td>${fmt(x.reporting_unrealized_pnl_text)}</td><td>${pct(x.unrealized_pnl_pct)}</td><td>${pct(x.weight)}</td></tr>`).join('')||'<tr><td colspan="10">No holdings are available for your accounts on or before this date.</td></tr>';
+    document.querySelector('#combined-note').textContent=`${data.accounts.length} physical account(s) combined in ${data.currency}. Filtered and composite portfolios are excluded because they are built from these accounts. Each account uses its own latest snapshot and dated FX history. Weights are shares of gross combined holdings value (cash excluded).${data.incomplete?' Some holdings have no usable FX rate; their values are partial.':''}${data.skipped_accounts.length?` ${data.skipped_accounts.length} account(s) could not be included.`:''}`;
+  }).catch(error=>{document.querySelector('#combined-note').textContent=`Combined holdings are unavailable: ${error.message}`;document.querySelector('#combined-holdings').innerHTML=''});
+};
+combinedForm.addEventListener('submit',event=>{event.preventDefault();loadCombined()});
+loadCombined();
+</script>
+"""
 
 
 SYSTEM_HEALTH_PAGE_SCRIPT = r"""
@@ -4558,6 +4765,13 @@ render().catch(error=>{list.innerHTML='<div class="warning">Connections could no
 })();
 </script>
 """
+
+
+@app.get("/combined-holdings", response_class=HTMLResponse)
+def combined_holdings_page(
+    request: Request, user: dict[str, str] = Depends(_authorized_user)
+) -> str:
+    return _render_platform_page(user, section="combined-holdings")
 
 
 @app.get("/system-health", response_class=HTMLResponse)
@@ -9902,7 +10116,11 @@ def _render_platform_page(user: dict[str, str], *, section: str) -> str:
     role_label = escape(user.get("role", "owner").title())
     page_title = escape(PLATFORM_SECTIONS[section])
     platform_navigation = _platform_navigation(user, active=section)
-    if section == "system-health":
+    if section == "combined-holdings":
+        description = "Latest holdings across every physical account you can view, converted into one currency with each account's own dated FX history and aggregated by instrument."
+        content = """<div class="page-view active" data-section="combined-holdings"><div class="card wide"><div class="label">Combined holdings</div><form id="combined-form" class="actions"><label><span class="label">Currency</span> <input id="combined-currency" name="currency" value="USD" maxlength="3" pattern="[A-Za-z]{3}" required size="4"></label><label><span class="label">As of</span> <input id="combined-asof" name="as_of" type="date"></label><button class="button" type="submit">Update</button></form><div id="combined-note" class="muted" aria-live="polite">Loading…</div><div id="combined-accounts" class="status-row"></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Accounts</th><th>Quantity</th><th>Value (<span id="combined-currency-label">USD</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="combined-holdings"></tbody></table></div></div></div>"""
+        script = COMBINED_HOLDINGS_PAGE_SCRIPT
+    elif section == "system-health":
         description = "Platform-wide data freshness, ingestion, benchmark, assurance and reporting status across every account and portfolio."
         content = """<div class="page-view active" data-section="system-health"><div class="card wide"><div class="label">Platform health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Benchmark coverage</div><div id="benchmark-health" class="status-row"></div></div><div class="card wide"><div class="label">Latest portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Platform acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>"""
         content = content.replace('<div id="health-note" class="muted"></div>',
@@ -9967,6 +10185,8 @@ def account_page(
         raise HTTPException(status_code=404, detail="Account page not found")
     if section == "system-health":
         return RedirectResponse(url="/system-health", status_code=307)
+    if section == "combined-holdings":
+        return RedirectResponse(url="/combined-holdings", status_code=307)
     if section == "metrics-guide":
         return RedirectResponse(url="/metrics-guide", status_code=307)
     if section == "ibkr-connections":
@@ -10064,7 +10284,7 @@ def _render_account_page(
 <div class="page-view{active['risk']}" data-section="risk"><div class="card wide"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div></div>
 <div class="page-view{active['cash']}" data-section="cash"><div class="card wide"><div class="label">Cash balances as of <span id="cash-asof">—</span></div><div id="cash-balances" class="metrics"></div><div class="label" style="margin-top:18px">Cash activity history</div><div class="muted">Choose a custom date range to view every matching IBKR cash activity. The CSV download contains the same complete filtered result.</div><div class="filter-grid"><label><span class="label">From</span><input id="cash-from" type="date" min="{history_start_date}" aria-label="Cash activity start date"></label><label><span class="label">To</span><input id="cash-to" type="date" min="{history_start_date}" aria-label="Cash activity end date"></label></div><div class="actions"><button id="cash-apply" class="button" type="button">Apply cash filters</button><a id="cash-export" class="button" href="#">Download cash activity CSV</a></div><div id="cash-note" class="muted" style="margin-top:12px">Loading cash activity…</div><div class="table-scroll"><table><thead><tr><th>Date</th><th>Time</th><th>Type</th><th>Description</th><th>Currency</th><th>Amount</th></tr></thead><tbody id="cash-activity"></tbody></table></div></div></div>
 <div class="page-view{active['trades']}" data-section="trades"><div class="card wide"><div class="label">Trade history</div><div class="value">IBKR executions</div><div class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
-<div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><table><thead><tr><th>Symbol</th><th>Description</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th></tr></thead><tbody id="holdings"></tbody></table></div></div>
+<div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
 <div class="page-view{active['reports']}" data-section="reports"><div class="card wide"><div class="label">Monthly factsheets and presentations</div><div class="value">Report centre</div><div id="report-note" class="muted">Loading frozen month-end reports…</div><div class="actions"><select id="report-month" aria-label="Monthly report period"></select><button id="report-prepare" class="button" type="button" disabled>Generate secure downloads</button></div><div id="report-status" class="muted" style="margin-top:14px"></div><div id="report-downloads" class="actions"></div><div id="report-owner-review" style="display:none;margin-top:22px"><h3>Review and release files</h3><p class="muted">Tick a file to make it available to authorized users. Untick it and submit to revoke its download access. A newly approved replacement becomes the current download and withdraws the older version. The original file and approval history are retained. Review files before approving; client distribution remains prohibited.</p><div id="report-release-details" class="muted" style="margin-top:12px"></div><div id="report-release-list" style="display:grid;gap:12px;margin:16px 0"></div><button id="report-release" class="button" type="button" disabled>Submit approval changes</button><div id="report-release-status" class="muted" role="status" aria-live="polite"></div></div>{design_controls_html}</div></div>
 <div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a><a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
 <div class="page-view{active['ai-analyst']}" data-section="ai-analyst"><div class="card wide ai-chat-card"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Saved chats</div><strong>AI Analyst</strong></div><button id="ai-new-chat" class="button" type="button">New chat</button></div><div id="ai-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="ai-chat-title">New conversation</strong><div id="agent-status" class="muted">Loading analyst…</div></div><div class="actions"><a id="ai-export-md" class="button" href="#" hidden>Save Markdown</a><a id="ai-export-json" class="button" href="#" hidden>Save JSON</a><button id="ai-archive-chat" class="button" type="button" hidden>Archive</button></div></div><div id="ai-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Live grounded analysis</div><div class="value">Ask about this portfolio</div><div id="agent-note" class="muted">The analyst uses validated portfolio tools for every figure and chart.</div><div class="ai-prompt-chips"><button class="ai-prompt-chip" type="button">Compare performance with the selected benchmark</button><button class="ai-prompt-chip" type="button">Explain the portfolio's main risks</button><button class="ai-prompt-chip" type="button">Show NAV history and key performance metrics</button></div></div></div><div class="ai-chat-composer"><textarea id="analysis-question" maxlength="1200" aria-label="Message the AI Portfolio Analyst" placeholder="Message the AI Portfolio Analyst…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Conversations save automatically</div><button id="analysis-run" class="button" type="button" disabled>Send</button></div></div></section></div></div></div>
@@ -10156,7 +10376,9 @@ document.querySelector('#obs').textContent=s.nav_coverage.observations;
 document.querySelector('#positions').textContent=s.current_positions;
 document.querySelector('#holdings-asof').textContent=h.snapshot_date||'No snapshot';
 document.querySelector('#holdings-quantity-label').textContent=h.holdings.some(x=>x.holding_kind==='synthetic_exposure')?'Sleeve coefficient (not shares)':'Quantity';
-document.querySelector('#holdings').innerHTML=h.holdings.map(x=>`<tr><td>${{esc(x.symbol||x.conid)}}</td><td>${{esc(x.description||'')}}</td><td>${{esc(x.currency||'')}}</td><td>${{fmt(x.holding_kind==='synthetic_exposure'?x.coefficient:x.quantity_text)}}</td><td>${{fmt(x.market_value_text)}}</td></tr>`).join('')||'<tr><td colspan="5">No holdings snapshot is available on or before this date.</td></tr>';
+document.querySelector('#holdings-reporting-currency').textContent=h.reporting_currency||reportingCurrency;
+document.querySelector('#holdings').innerHTML=h.holdings.map(x=>`<tr><td>${{esc(x.symbol||x.conid)}}</td><td>${{esc(x.description||'')}}</td><td>${{esc(x.sector||'')}}</td><td>${{esc(x.currency||'')}}</td><td>${{fmt(x.holding_kind==='synthetic_exposure'?x.coefficient:x.quantity_text)}}</td><td>${{fmt(x.market_value_text)}}</td><td>${{x.fx_missing?'<span class="muted" title="No dated FX rate is available for this currency">FX unavailable</span>':fmt(x.reporting_market_value_text)}}</td><td>${{fmt(x.cost_basis_text)}}</td><td>${{fmt(x.unrealized_pnl_text)}}</td><td>${{pct(x.unrealized_pnl_pct)}}</td><td>${{pct(x.weight)}}</td></tr>`).join('')||'<tr><td colspan="11">No holdings snapshot is available on or before this date.</td></tr>';
+document.querySelector('#holdings-note').textContent=h.weight_basis?`Cost basis and unrealized P&L are in each holding's own currency. Value is converted to ${{h.reporting_currency}} with the dated FX rate on or before the holdings date. Weight basis: ${{h.weight_basis==='nav'?'net asset value':'gross holdings value (NAV unavailable for this date)'}}.${{(h.fx_missing_conids||[]).length?` ${{h.fx_missing_conids.length}} holding(s) have no usable FX rate and are excluded from weights.`:''}}`:'';
 const rm=risk.metrics||{{}},riskItems=[['Total return',pct(rm.total_return)],['Annualized return',pct(rm.annualized_return)],['Annualized volatility',pct(rm.annualized_volatility)],['Risk-free rate',rm.risk_free_annual_rate==null?'Unavailable':pct(rm.risk_free_annual_rate)],['Sharpe ratio',rm.sharpe_ratio==null?'Unavailable':fmt(rm.sharpe_ratio)],['Expected maximum drawdown (1 year)',rm.expected_maximum_drawdown_1y==null?'Unavailable':pct(rm.expected_maximum_drawdown_1y)],['Actual maximum drawdown (1 year)',rm.actual_maximum_drawdown_1y==null?'Unavailable':pct(rm.actual_maximum_drawdown_1y)],['Tail maximum drawdown (1 year)',rm.tail_maximum_drawdown_1y==null?'Unavailable':pct(rm.tail_maximum_drawdown_1y)],['Crisis maximum drawdown (15/9/2008–9/3/2009)',rm.crisis_maximum_drawdown==null?'Unavailable':pct(rm.crisis_maximum_drawdown)],['VaR 95% — daily',pct(rm.var_95_daily)],['Daily Expected Tail Loss (95%)',pct(rm.daily_expected_tail_loss)],['Win rate',pct(rm.win_rate)],['BLUE mean daily return',pct(rm.blue_mean_daily_return)]];
 document.querySelector('#risk-asof').textContent=rm.period_end||risk.as_of||'—';document.querySelector('#risk-metrics').innerHTML=riskItems.map(metricCard).join('');const etl=risk.expected_tail_loss_contributors||{{}},contributorRows=items=>items.map(x=>`<tr><td><strong>${{esc(x.symbol||x.conid)}}</strong><div class="muted">${{esc(x.description||'')}}</div></td><td>${{pct(x.expected_tail_loss_contribution)}}</td></tr>`).join('')||'<tr><td colspan="2">Unavailable</td></tr>';document.querySelector('#etl-top').innerHTML=contributorRows(etl.top||[]);document.querySelector('#etl-bottom').innerHTML=contributorRows(etl.bottom||[]);document.querySelector('#etl-note').innerHTML=`ETL contributors use unchanged carried USD positions on ${{etl.tail_observations||0}} portfolio tail days. Positive values added to loss; negative values offset loss. Residual from cash, fees, FX, trades and unmatched positions: ${{pct(etl.residual_contribution)}}. <a class="metric-guide-inline" href="${{esc(metricGuideHref('ETL residual contribution'))}}">Read the residual-contribution explanation <span aria-hidden="true">↗</span></a>`;const rf=risk.risk_free,cr=risk.crisis_replay;const crisisNote=cr?` Crisis drawdown is a hypothetical fixed-unit replay of holdings as of ${{cr.holdings_as_of}} from 15 September 2008 through 9 March 2009 using adjusted closes: ${{cr.direct_components}} direct holdings and ${{cr.proxy_components}} recorded sector or broad-market proxies; cash weight ${{pct(cr.cash_weight)}} remains flat and there is no rebalancing. Provider: ${{cr.provider}}; approved for internal and shareholder analysis, but not client distribution.`:' Crisis drawdown is unavailable until the current-holdings replay and its proxy data pass validation.';document.querySelector('#risk-note').textContent=risk.message+` Validated return intervals: ${{rm.return_observations||0}} from ${{rm.observations||0}} aligned valuations (the first valuation is a starting point, not a return) · Daily ETL is historical 95% expected shortfall. One-year expected and tail maximum drawdown use ${{rm.drawdown_simulation_paths||0}} deterministic five-day moving-block bootstrap paths of ${{rm.drawdown_horizon_sessions||252}} sessions.`+crisisNote+` · Calculation: benchmark-comparison-v1.`+(rf?` Risk-free source: ${{rf.provider}} · ${{rf.tenor}} · observation ${{rf.rate_date}}.`:'');
 const run=health.latest_run||{{}},portfolio=health.portfolio||{{}},assurance=health.portfolio_analyst_assurance||{{}},assuranceResult=assurance.result_json||{{}},burnIn=health.burn_in||{{}},burnResults=health.burn_in_recent_results||[];document.querySelector('#health-status').innerHTML=[['Environment',health.environment],['Status',health.status],['Latest portfolio date',portfolio.latest_date||'—'],['Latest successful run',run.completed_at||'—']].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1]||'—')}}</strong></div>`).join('');document.querySelector('#health-note').textContent=health.message;document.querySelector('#assurance-status').textContent=assurance.status?assurance.status.toUpperCase():'Awaiting first run';document.querySelector('#assurance-summary').innerHTML=[['Assurance date',assurance.assurance_date||'—'],['Portfolio as of',assurance.as_of_date||'—'],['Checks passed',assurance.checks_passed??0],['Warnings / failures',`${{assurance.checks_warned??0}} / ${{assurance.checks_failed??0}}`]].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1])}}</strong></div>`).join('');document.querySelector('#assurance-note').textContent=assuranceResult.model_review?.summary||'The daily assurance job independently reconciles portfolio data, analytics, report integrity and the approved August layouts.';document.querySelector('#burn-in-status').textContent=burnIn.status?burnIn.status.toUpperCase():'Not started';document.querySelector('#burn-in-summary').innerHTML=[['Start date',burnIn.start_date||'—'],['Consecutive passing days',`${{burnIn.consecutive_pass_days??0}} / ${{burnIn.required_consecutive_days??14}}`],['Earliest completion',burnIn.earliest_completion_date||'—'],['Last result',burnIn.last_result_date||'Awaiting Day 1'],['Last failure',burnIn.last_failure_date||'None']].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1])}}</strong></div>`).join('');document.querySelector('#burn-in-results').innerHTML=burnResults.length?'<h3>Recent daily acceptance results</h3>'+burnResults.map(x=>`<p><strong>${{esc(x.result_date)}} — ${{esc(x.status.toUpperCase())}}</strong><br><span class="muted">Checked ${{esc(x.checked_at)}}</span></p>`).join(''):'<p>No formal Stage 4 result has been recorded yet.</p>';

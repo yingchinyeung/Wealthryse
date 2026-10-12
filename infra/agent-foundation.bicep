@@ -4,7 +4,8 @@ targetScope = 'resourceGroup'
 // Nothing here is deployed without Ying's typed approval naming each resource.
 // The private endpoint and DNS zones sit in ibkrv2stg-vnet, which the private
 // network thread owns: deploy this after that thread's current change and with
-// its agreement (createPrivateDns can be false if that thread creates the zones).
+// its agreement. That thread owns the privatelink zones; pass their IDs in
+// privateDnsZoneIds (createPrivateDns = true is only for a standalone setup).
 
 @description('Region for identities and the private endpoint (the VNet region).')
 param location string = resourceGroup().location
@@ -22,8 +23,11 @@ param vnetName string = 'ibkrv2stg-vnet'
 @description('Existing subnet in the VNet that holds private endpoints.')
 param privateEndpointSubnetName string
 
-@description('Create the three private DNS zones and link them to the VNet. Set false if they already exist.')
-param createPrivateDns bool = true
+@description('Create the three private DNS zones and link them to the VNet. Leave false when the network owner provides them.')
+param createPrivateDns bool = false
+
+@description('Resource IDs of the existing privatelink zones for cognitiveservices, openai and services.ai, in that order. Leave empty to create the endpoint without a zone group; the zone owner then adds the records.')
+param privateDnsZoneIds array = []
 
 @description('Main analyst model (pinned version, Data Zone Standard).')
 param modelName string = 'gpt-5.6-sol'
@@ -103,9 +107,12 @@ resource foundry 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
   }
 }
 
+// The account accepts one change at a time: create the project and the
+// endpoint only after the model deployment, when the account has settled.
 resource project 'Microsoft.CognitiveServices/accounts/projects@2025-06-01' = {
   parent: foundry
   name: projectName
+  dependsOn: [analystDeployment]
   location: aiLocation
   tags: tags
   identity: {
@@ -137,7 +144,7 @@ resource analystDeployment 'Microsoft.CognitiveServices/accounts/deployments@202
 resource routerDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = if (!empty(routerModelName)) {
   parent: foundry
   name: routerDeploymentName
-  dependsOn: [analystDeployment]
+  dependsOn: [project]
   sku: {
     name: 'DataZoneStandard'
     capacity: routerCapacity
@@ -175,6 +182,7 @@ resource jobsInference 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 resource privateEndpoint 'Microsoft.Network/privateEndpoints@2023-11-01' = {
   name: '${foundryName}-pe'
   location: location
+  dependsOn: [project]
   tags: tags
   properties: {
     subnet: {
@@ -210,15 +218,15 @@ resource zoneLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-0
   }
 }]
 
-resource zoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = {
+resource zoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2023-11-01' = if (createPrivateDns || !empty(privateDnsZoneIds)) {
   parent: privateEndpoint
   name: 'default'
   dependsOn: [zones]
   properties: {
-    privateDnsZoneConfigs: [for zone in dnsZones: {
+    privateDnsZoneConfigs: [for (zone, i) in dnsZones: {
       name: replace(zone, '.', '-')
       properties: {
-        privateDnsZoneId: resourceId('Microsoft.Network/privateDnsZones', zone)
+        privateDnsZoneId: createPrivateDns ? resourceId('Microsoft.Network/privateDnsZones', zone) : privateDnsZoneIds[?i]
       }
     }]
   }

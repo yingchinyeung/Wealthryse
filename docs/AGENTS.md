@@ -64,9 +64,14 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
 ## Turning it on (each Azure step needs Ying's typed approval)
 
 1. **Model and network** (`infra/agent-foundation.bicep`). Creates the Foundry
-   resource, model deployments, private endpoint, three private DNS zones and
-   three identities. Coordinate with the private network thread, which owns
-   `ibkrv2stg-vnet`.
+   resource, model deployments, private endpoint and three identities. The
+   private network thread owns `ibkrv2stg-vnet` and the three privatelink DNS
+   zones: get the endpoint subnet and the zone IDs from it and pass them as
+   `privateEndpointSubnetName` and `privateDnsZoneIds`. If the zones don't
+   exist yet, leave `privateDnsZoneIds` empty and that thread adds the records.
+   Once that thread has added the endpoint's `default` zone group, redeploy
+   only in Incremental mode, and pass the zone IDs so the template writes the
+   same group.
 2. **Entra apps.** Register two applications with app ID URIs
    `api://wealthryse-agent` and `api://wealthryse-agent-tools`. No secrets or
    app roles are needed; the services check the caller's object ID.

@@ -12,6 +12,7 @@ from pathlib import Path
 
 CONFIG = None  # replaced by the workflow
 PREFIX = 'WEBSITE_BUILD_RESULT '
+REJECTS_PREFIX = 'WEBSITE_BUILD_REJECTS '
 HOSTS = {'ibkrv2stgauhecwc4itaoo.azurecr.io': '10.50.10.5', 'ibkrv2stgauhecwc4itaoo.eastasia.data.azurecr.io': '10.50.10.4'}
 REG = 'ibkrv2stgauhecwc4itaoo.azurecr.io'
 
@@ -36,7 +37,7 @@ def tree_hashes(folder):
 
 
 def rejected_context(package):
-    """For each hunk patch rejected, the live lines it was aimed at (gzip+base64)."""
+    """For each hunk patch rejected, the live lines it was aimed at."""
     out = {}
     for rej in sorted(package.rglob('*.rej')):
         name = rej.relative_to(package).as_posix()[:-len('.rej')]
@@ -44,12 +45,10 @@ def rejected_context(package):
         parts = []
         for header in re.findall(r'^@@ -(\d+)(?:,(\d+))? ', rej.read_text(errors='replace'), re.M):
             start, count = int(header[0]), int(header[1] or 1)
-            lo, hi = max(start - 40, 1), min(start + count + 40, len(lines))
+            lo, hi = max(start - 25, 1), min(start + count + 25, len(lines))
             parts.append('--- live lines %d-%d\n' % (lo, hi) + '\n'.join(lines[lo - 1:hi]))
-        text = rej.read_text(errors='replace') + '\n' + '\n'.join(parts)
-        out[name] = base64.b64encode(gzip.compress(text.encode(), 9)).decode()
+        out[name] = '\n'.join(parts)
     return out
-
 
 def main():
     config = CONFIG
@@ -72,6 +71,7 @@ def main():
     env['DOCKER_CONFIG'] = str(root / 'credentials')
     Path(env['DOCKER_CONFIG']).mkdir(mode=0o700)
     process = log = None
+    rejects = {}
     mounted = False
     result = {'base_image': base, 'target_image': target, 'source_commit': config['source_commit']}
     try:
@@ -147,9 +147,8 @@ def main():
         applied = subprocess.run(['patch', '-p1', '--forward', '--fuzz=0', '--no-backup-if-mismatch', '-i', str(patch_file)],
                                  capture_output=True, text=True, timeout=300, cwd=str(context))
         if applied.returncode:
-            result['rejects'] = rejected_context(package)
-            raise ValueError('Some of the change does not apply to the live files; nothing built: ' +
-                             ', '.join(sorted(n for n in result['rejects'])))
+            rejects = rejected_context(package)
+            raise ValueError('Some of the change does not apply to the live files; nothing built: ' + ', '.join(sorted(rejects)))
         patched = tree_hashes(package)
         for name in touched:
             if live.get(name) == expected.get(name) and patched.get(name) != wanted.get(name):
@@ -194,6 +193,10 @@ def main():
         if root.parent == Path('/tmp') and root.name.startswith('wealthryse-website-build-'):
             shutil.rmtree(root, ignore_errors=True)
     print(PREFIX + json.dumps(result), flush=True)
+    # Run Command keeps only the end of the output, so the conflict detail goes
+    # last, compressed, after the small result line.
+    if rejects:
+        print(REJECTS_PREFIX + base64.b64encode(gzip.compress(json.dumps(rejects).encode(), 9)).decode(), flush=True)
     if not result.get('passed'):
         raise SystemExit(1)
 

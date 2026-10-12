@@ -23,7 +23,10 @@ PACKAGE = 'src/ibkr_etl'
 # Paths that are not part of the website image.
 IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azuredevops/',
                     # CI-only helper; the website never runs it.
-                    'scripts/ci_run_tests.py')
+                    'scripts/ci_run_tests.py',
+                    # Agent services ship in their own image (Dockerfile.agent).
+                    'src/wealthryse_agent/', 'migrations/agent/', 'Dockerfile.agent',
+                    'scripts/install_agent_schema.py')
 STATE = Path('release-state.json')
 SNAPSHOT = Path(__file__).resolve().parent / 'live-snapshot'
 MERGED = Path(__file__).resolve().parent / 'live-merged'

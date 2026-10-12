@@ -1,0 +1,188 @@
+"""Conversation, run and inbox storage (the agent_writer role).
+
+This role cannot read portfolio data; it only stores what agents produced.
+"""
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any, Sequence
+
+from ibkr_etl.db import PostgresConnection
+
+INBOX_DECISIONS = frozenset({"read", "approved", "dismissed"})
+
+
+class Store:
+    def __init__(self, connection: PostgresConnection, tenant_id: str) -> None:
+        self.db = connection
+        self.tenant_id = tenant_id
+
+    def _commit(self) -> None:
+        self.db.commit()
+
+    # Conversations ---------------------------------------------------------
+
+    def create_conversation(self, user: str, account_id: str, title: str) -> str:
+        conversation_id = str(uuid.uuid4())
+        self.db.execute(
+            "INSERT INTO agent.conversations(conversation_id, tenant_id, user_object_id, subject_id, title) "
+            "VALUES (?::uuid, ?::uuid, ?, ?, ?)",
+            (conversation_id, self.tenant_id, user.lower(), account_id, title[:120] or "New conversation"),
+        )
+        self._commit()
+        return conversation_id
+
+    def conversation(self, conversation_id: str, user: str) -> dict[str, Any] | None:
+        try:
+            uuid.UUID(conversation_id)
+        except ValueError:
+            return None
+        row = self.db.execute(
+            "SELECT conversation_id::text AS conversation_id, subject_id, title, created_at, updated_at "
+            "FROM agent.conversations WHERE conversation_id = ?::uuid AND tenant_id = ?::uuid "
+            "AND user_object_id = ? AND archived_at IS NULL",
+            (conversation_id, self.tenant_id, user.lower()),
+        ).fetchone()
+        self.db.rollback()
+        return dict(row) if row else None
+
+    def conversations(self, user: str, account_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT conversation_id::text AS conversation_id, title, updated_at FROM agent.conversations "
+            "WHERE tenant_id = ?::uuid AND user_object_id = ? AND subject_id = ? AND archived_at IS NULL "
+            "ORDER BY updated_at DESC LIMIT 50",
+            (self.tenant_id, user.lower(), account_id),
+        ).fetchall()
+        self.db.rollback()
+        return [dict(r) for r in rows]
+
+    def messages(self, conversation_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT message_id, role, content, citations, status, created_at FROM agent.messages "
+            "WHERE conversation_id = ?::uuid ORDER BY message_id", (conversation_id,),
+        ).fetchall()
+        self.db.rollback()
+        return [dict(r) for r in rows]
+
+    def add_message(self, conversation_id: str, role: str, content: str, *, citations: Sequence[Any] = (),
+                    status: str = "ok", correlation_id: str | None = None,
+                    usage: dict[str, int] | None = None) -> int:
+        row = self.db.execute(
+            "INSERT INTO agent.messages(conversation_id, role, content, citations, status, correlation_id, usage) "
+            "VALUES (?::uuid, ?, ?, ?::jsonb, ?, ?, ?::jsonb) RETURNING message_id",
+            (conversation_id, role, content, json.dumps(list(citations), default=str), status, correlation_id,
+             json.dumps(usage or {})),
+        ).fetchone()
+        self.db.execute("UPDATE agent.conversations SET updated_at = now() WHERE conversation_id = ?::uuid",
+                        (conversation_id,))
+        self._commit()
+        return int(row["message_id"])
+
+    def archive(self, conversation_id: str, user: str) -> bool:
+        cursor = self.db.execute(
+            "UPDATE agent.conversations SET archived_at = now() WHERE conversation_id = ?::uuid "
+            "AND tenant_id = ?::uuid AND user_object_id = ? AND archived_at IS NULL RETURNING conversation_id",
+            (conversation_id, self.tenant_id, user.lower()),
+        )
+        changed = cursor.fetchone() is not None
+        self._commit()
+        return changed
+
+    def feedback(self, message_id: int, user: str, rating: int, comment: str | None) -> bool:
+        owned = self.db.execute(
+            "SELECT 1 FROM agent.messages m JOIN agent.conversations c ON c.conversation_id = m.conversation_id "
+            "WHERE m.message_id = ? AND m.role = 'assistant' AND c.user_object_id = ? AND c.tenant_id = ?::uuid",
+            (message_id, user.lower(), self.tenant_id),
+        ).fetchone()
+        if not owned:
+            self.db.rollback()
+            return False
+        self.db.execute(
+            "INSERT INTO agent.feedback(message_id, user_object_id, rating, comment) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (message_id, user_object_id) DO UPDATE SET rating = excluded.rating, comment = excluded.comment",
+            (message_id, user.lower(), rating, (comment or "")[:1000] or None),
+        )
+        self._commit()
+        return True
+
+    # Budget ----------------------------------------------------------------
+
+    def tokens_used_today(self) -> int:
+        row = self.db.execute(
+            """
+            SELECT COALESCE(SUM((m.usage->>'input_tokens')::bigint + (m.usage->>'output_tokens')::bigint), 0)
+                 + COALESCE((SELECT SUM((r.usage->>'input_tokens')::bigint + (r.usage->>'output_tokens')::bigint)
+                             FROM agent.runs r WHERE r.tenant_id = ?::uuid AND r.started_at >= date_trunc('day', now())), 0)
+                   AS used
+            FROM agent.messages m JOIN agent.conversations c ON c.conversation_id = m.conversation_id
+            WHERE c.tenant_id = ?::uuid AND m.created_at >= date_trunc('day', now()) AND (m.usage->>'input_tokens') IS NOT NULL
+            """,
+            (self.tenant_id, self.tenant_id),
+        ).fetchone()
+        self.db.rollback()
+        return int(row["used"] or 0)
+
+    # Runs and inbox --------------------------------------------------------
+
+    def start_run(self, job_name: str, correlation_id: str) -> int:
+        row = self.db.execute(
+            "INSERT INTO agent.runs(tenant_id, job_name, correlation_id, status) VALUES (?::uuid, ?, ?, 'running') "
+            "RETURNING run_id", (self.tenant_id, job_name, correlation_id),
+        ).fetchone()
+        self._commit()
+        return int(row["run_id"])
+
+    def finish_run(self, run_id: int, *, status: str, items: int, usage: dict[str, int], error_code: str | None = None) -> None:
+        self.db.execute(
+            "UPDATE agent.runs SET status = ?, completed_at = now(), items_written = ?, usage = ?::jsonb, error_code = ? "
+            "WHERE run_id = ?", (status, items, json.dumps(usage), error_code, run_id),
+        )
+        self._commit()
+
+    def inbox_exists(self, kind: str, account_id: str, period_key: str) -> bool:
+        row = self.db.execute(
+            "SELECT 1 FROM agent.inbox WHERE tenant_id = ?::uuid AND kind = ? AND subject_id = ? AND period_key = ?",
+            (self.tenant_id, kind, account_id, period_key),
+        ).fetchone()
+        self.db.rollback()
+        return row is not None
+
+    def add_inbox(self, *, kind: str, account_id: str, period_key: str, title: str, body: str,
+                  citations: Sequence[Any], run_id: int | None) -> bool:
+        row = self.db.execute(
+            "INSERT INTO agent.inbox(tenant_id, kind, subject_id, period_key, title, body, citations, run_id) "
+            "VALUES (?::uuid, ?, ?, ?, ?, ?, ?::jsonb, ?) ON CONFLICT (tenant_id, kind, subject_id, period_key) DO NOTHING "
+            "RETURNING item_id",
+            (self.tenant_id, kind, account_id, period_key, title[:200], body, json.dumps(list(citations), default=str), run_id),
+        ).fetchone()
+        self._commit()
+        return row is not None
+
+    def inbox(self, accounts: Sequence[str], status: str | None = None) -> list[dict[str, Any]]:
+        if not accounts:
+            return []
+        rows = self.db.execute(
+            "SELECT item_id, kind, subject_id, period_key, title, body, citations, status, created_at, decided_at "
+            "FROM agent.inbox WHERE tenant_id = ?::uuid AND subject_id = ANY(?) AND (?::text IS NULL OR status = ?) "
+            "ORDER BY created_at DESC LIMIT 100",
+            (self.tenant_id, list(accounts), status, status),
+        ).fetchall()
+        self.db.rollback()
+        return [dict(r) for r in rows]
+
+    def decide(self, item_id: int, accounts: Sequence[str], decision: str, user_sha256: str) -> bool:
+        if decision not in INBOX_DECISIONS:
+            return False
+        row = self.db.execute(
+            "UPDATE agent.inbox SET status = ?, decided_at = now(), decided_by_sha256 = ? "
+            "WHERE item_id = ? AND tenant_id = ?::uuid AND subject_id = ANY(?) RETURNING item_id",
+            (decision, user_sha256, item_id, self.tenant_id, list(accounts)),
+        ).fetchone()
+        self._commit()
+        return row is not None
+
+    def purge(self, days: int) -> int:
+        row = self.db.execute("SELECT agent.purge_conversations(?) AS removed", (days,)).fetchone()
+        self._commit()
+        return int(row["removed"])

@@ -10607,3 +10607,15 @@ if(!previewMode){{const savedConversations=await refreshConversations(null);if(s
 await renderAsOf(asOfSelect.value)
 }}).catch(()=>{{document.querySelector('main').insertAdjacentHTML('afterbegin','<div class="card">Unable to load validated portfolio data.</div>')}});
 </script>{design_controls_script}</body></html>"""
+
+
+# WealthRyse agents: chat panel, Explain buttons and inbox. Off unless
+# AGENT_UI_MODE is "owner" or "all"; see agent_web.py.
+from .agent_web import install as _install_agent_web
+
+_install_agent_web(
+    app,
+    _authorized_user,
+    lambda user: _authorized_subject_ids(user, feature_key="viewer_access"),
+    ACCOUNT_THEME_CSS,
+)

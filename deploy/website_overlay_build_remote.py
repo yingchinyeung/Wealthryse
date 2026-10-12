@@ -62,26 +62,38 @@ for root, dirs, files in os.walk('/app/src'):
 
 
 def find_python(client, base, env):
-    """Absolute path of the live image's Python, tried from its entrypoint and the usual names."""
+    """Absolute path of the live image's Python, read from the image's files without running it."""
     config = json.loads(run(client + ['image', 'inspect', base, '--format', '{{json .Config}}'], 'live image config', env=env))
-    path_env = [e for e in config.get('Env') or [] if e.split('=', 1)[0] in ('PATH', 'PYTHONPATH', 'VIRTUAL_ENV', 'PYTHONHOME')]
-    command = (config.get('Entrypoint') or []) + (config.get('Cmd') or [])
-    candidates = [c for c in command if os.path.basename(c).startswith('python')]
-    candidates += [os.path.join(os.path.dirname(c), 'python') for c in command if c.startswith('/') and '/bin/' in c]
-    candidates += ['python3', 'python', '/usr/local/bin/python3', '/usr/local/bin/python', '/usr/bin/python3',
-                   '/opt/venv/bin/python', '/app/.venv/bin/python', '/venv/bin/python']
-    tried = {}
-    for candidate in dict.fromkeys(candidates):
-        r = subprocess.run(client + ['run', '--rm', '--network=none', '--user', '0:0', '--entrypoint', candidate, base,
-                                     '-c', 'import sys, ibkr_etl; print(sys.executable)'],
-                           capture_output=True, text=True, timeout=120, env=env)
-        found = r.stdout.strip().splitlines()[-1:] if r.returncode == 0 else []
-        if found and found[0].startswith('/'):
-            return found[0]
-        tried[candidate] = (r.stderr or r.stdout).strip().splitlines()[-1:] or ['exit ' + str(r.returncode)]
-    raise ValueError('No Python that can import ibkr_etl found in the live image: ' + json.dumps({
-        'tried': {k: v[0][-120:] for k, v in tried.items()},
-        'entrypoint': config.get('Entrypoint'), 'cmd': config.get('Cmd'), 'workdir': config.get('WorkingDir'), 'env': path_env}))
+    path = next((e.split('=', 1)[1] for e in config.get('Env') or [] if e.startswith('PATH=')), '')
+    container = run(client + ['create', base], 'inspect container', env=env).strip()
+    entries = {}
+    try:
+        export = subprocess.Popen(client + ['export', container], stdout=subprocess.PIPE, env=env)
+        with tarfile.open(fileobj=export.stdout, mode='r|') as archive:
+            for member in archive:
+                name = '/' + member.name.lstrip('./')
+                if os.path.dirname(name).endswith('/bin') and (member.isfile() or member.issym()):
+                    entries[name] = member.linkname if member.issym() else None
+        export.wait(timeout=600)
+    finally:
+        subprocess.run(client + ['rm', '-f', container], capture_output=True, timeout=120, env=env)
+
+    def resolve(name, depth=0):
+        if name not in entries or depth > 8:
+            return None
+        link = entries[name]
+        if link is None:
+            return name
+        return resolve(os.path.normpath(os.path.join(os.path.dirname(name), link)), depth + 1)
+
+    dirs = [d for d in path.split(':') if d] + ['/usr/local/bin', '/usr/bin', '/opt/venv/bin', '/app/.venv/bin', '/venv/bin']
+    names = ['python3', 'python'] + sorted({os.path.basename(n) for n in entries if re.fullmatch(r'python3\.\d+', os.path.basename(n))}, reverse=True)
+    for folder in dict.fromkeys(dirs):
+        for name in names:
+            if resolve(folder + '/' + name):
+                return folder + '/' + name
+    raise ValueError('No Python found in the live image: ' + json.dumps({
+        'found': sorted(n for n in entries if 'python' in os.path.basename(n))[:20], 'path': path}))
 
 
 class Captured(Exception):

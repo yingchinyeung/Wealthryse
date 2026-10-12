@@ -34,13 +34,16 @@ def _dsn(base: str, database: str, user: str | None = None) -> str:
     return make_conninfo(**params)
 
 
+TOLERATED_MIGRATIONS = {"027_legacy_external_market_data_approval.sql", "056_specialist_audit_ledger.sql"}
+
+
 @unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
 class AgentDatabaseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import psycopg
 
-        from ibkr_etl.db import POSTGRES_MIGRATIONS_DIR, PostgresConnection
+        from ibkr_etl.db import PostgresConnection
 
         cls.database = "agent_test_" + uuid.uuid4().hex[:8]
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
@@ -61,12 +64,15 @@ class AgentDatabaseTests(unittest.TestCase):
         connection.commit()
         # Two historical migrations correct production rows that a fresh database
         # does not have; their failure leaves the schema these tests need intact.
-        for path in sorted(POSTGRES_MIGRATIONS_DIR.glob("*.sql")):
+        # Read from the checkout: an installed package resolves elsewhere.
+        for path in sorted((ROOT / "migrations" / "postgres").glob("*.sql")):
             try:
                 connection.execute(path.read_text(encoding="utf-8"))
                 connection.commit()
             except Exception:
                 connection.rollback()
+                if path.name not in TOLERATED_MIGRATIONS:
+                    raise
             if connection.execute("SELECT to_regclass('public.tenants')").fetchone()[0] and \
                     connection.execute("SELECT 1 FROM tenants").fetchone() is None:
                 connection.execute("INSERT INTO tenants(tenant_id, name, status, created_at) "

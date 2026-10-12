@@ -27,6 +27,12 @@ TAIWAN_COUNTRY_NAMES = {
 TAIWAN_EXCHANGES = {"TWSE", "TWO", "TPEX", "ROCO", "TAIFEX"}
 ALLOWED_DERIVED_CASH_CURRENCIES = {"HKD", "USD"}
 OPENING_CASH = {"HKD": 484_300.0, "USD": 0.0}
+# Ledger reasons that mean a source trade is outside the filtered portfolio
+# itself, as opposed to cash-policy reasons such as a non-permitted currency.
+# The website's filtered trade history keys on these exact strings.
+DUPLICATE_TRADE_REASON = "duplicate logical trade"
+EXCLUDED_INSTRUMENT_TRADE_REASON_PREFIX = "trade belongs to excluded Taiwan instrument: "
+EXCLUDED_CURRENCY_TRADE_REASON = "all legs of an excluded-currency trade are excluded"
 _SOURCE_ACCOUNT_SUFFIX = re.compile(r"\s+from\s+U\d+\s*$", re.IGNORECASE)
 _EXTERNAL_FLOW_PATTERN = re.compile(
     r"\b(DEPOSIT|WITHDRAW(?:AL)?|TRANSFER|WIRE|ACH|FPS|CONTRIBUTION|DISTRIBUTION)\b",
@@ -477,11 +483,11 @@ def _build_cash_ledger(
         )
         common_reason: str | None = None
         if duplicate:
-            common_reason = "duplicate logical trade"
+            common_reason = DUPLICATE_TRADE_REASON
         elif instrument_reason:
-            common_reason = f"trade belongs to excluded Taiwan instrument: {instrument_reason}"
+            common_reason = EXCLUDED_INSTRUMENT_TRADE_REASON_PREFIX + instrument_reason
         elif excluded_pair:
-            common_reason = "all legs of an excluded-currency trade are excluded"
+            common_reason = EXCLUDED_CURRENCY_TRADE_REASON
 
         if asset == "CASH" and "." in symbol:
             base_code, quote_code = symbol.split(".", 1)

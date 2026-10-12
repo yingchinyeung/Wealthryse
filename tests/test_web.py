@@ -972,6 +972,56 @@ class PortfolioWebTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.status_code, 404)
 
+    def test_filtered_portfolio_trade_history_uses_kept_source_trades(self) -> None:
+        access = {
+            "subject_id": "hong-kong-china",
+            "subject_type": "filtered_portfolio",
+            "reporting_currency": "USD",
+            "history_start_date": "2025-01-20",
+        }
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = {"latest": "2026-10-07"}
+        connection.execute.return_value.fetchall.return_value = [
+            {"trade_date": "2026-10-06", "symbol": "700", "currency": "HKD", "total_count": 1}
+        ]
+        database = MagicMock()
+        database.__enter__.return_value = connection
+        with patch.object(web, "_portfolio_access_context", return_value=access), patch.object(
+            web, "_database", return_value=database
+        ):
+            result = trade_history(
+                "hong-kong-china",
+                user={"email": "analyst@example.com", "object_id": "object-123"},
+            )
+        self.assertNotIn("not_applicable", result)
+        self.assertEqual(result["total_count"], 1)
+        self.assertEqual(result["trades"][0]["symbol"], "700")
+        latest_sql, latest_params = connection.execute.call_args_list[0].args
+        self.assertIn("subject_nav_series", latest_sql)
+        self.assertEqual(latest_params, (web.TENANT_ID, "hong-kong-china", "USD"))
+        trade_sql, trade_params = connection.execute.call_args_list[1].args
+        self.assertIn("derived_portfolio_cash_ledger", trade_sql)
+        self.assertIn("LIMIT 500", trade_sql)
+        self.assertIn("t.trade_date DESC", trade_sql)
+        self.assertEqual(trade_params[:2], (web.TENANT_ID, "hong-kong-china"))
+        self.assertEqual(trade_params[6:8], ("2025-01-20", "2026-10-07"))
+
+    def test_composite_portfolio_trade_history_is_not_applicable(self) -> None:
+        access = {
+            "subject_id": "alpha-world-ms",
+            "subject_type": "composite_portfolio",
+            "reporting_currency": "HKD",
+            "history_start_date": "2025-01-20",
+        }
+        with patch.object(web, "_portfolio_access_context", return_value=access), patch.object(
+            web, "_database", side_effect=AssertionError("database must not be opened")
+        ):
+            result = trade_history(
+                "alpha-world-ms",
+                user={"email": "analyst@example.com", "object_id": "object-123"},
+            )
+        self.assertTrue(result["not_applicable"])
+
     def test_home_is_account_directory(self) -> None:
         page = home(None, {"email": "analyst@example.com"})
         self.assertIn("<h1>Accounts</h1>", page)

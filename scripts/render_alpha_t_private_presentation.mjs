@@ -5,7 +5,7 @@ import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {artifactToolUrl,bindTemplateObjectIds,bindTReportImports} from './alpha_t_presentation_runtime.mjs';
 const src=await fs.readFile(new URL('./render_monthly_presentation.mjs',import.meta.url),'utf8');
-if(createHash('sha256').update(src).digest('hex')!=='7beb470735441d3955b1c18c5e53a19f23480788aea22aa498b5f998efe50f0a')
+if(createHash('sha256').update(src).digest('hex')!=='8b62a1dd498bfffccdb415dcc7999e92b79af402882082ccf9176bb9face6add')
   throw Error('Reference renderer changed; inspect before adapting');
 // Desktop finalization remains enabled when its complete environment is set.
 // Azure uses the installed, image-pinned package and the same financial audit.

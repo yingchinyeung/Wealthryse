@@ -18,6 +18,7 @@ class Cursor:
         row=self.cursor.fetchone()
         return dict(row) if row is not None else None
     def fetchall(self):return [dict(r) for r in self.cursor.fetchall()]
+    def __iter__(self):return iter(self.fetchall())
 
 
 class Fixture:
@@ -28,6 +29,7 @@ class Fixture:
             CREATE TABLE platform_subjects(tenant_id,subject_id,subject_type,base_currency,reporting_currency,
                 history_start_date,display_name,updated_at);
             CREATE TABLE derived_portfolios(tenant_id,portfolio_id,base_currency);
+            CREATE TABLE derived_portfolio_cash_ledger(portfolio_id,event_date,amount_base,included,external_flow);
             CREATE TABLE subject_calculation_definitions(tenant_id,subject_id,configuration_json,
                 configuration_sha256,approval_status,effective_to);
             CREATE TABLE subject_nav_series(tenant_id,subject_id,snapshot_date,currency,total_text);

@@ -48,6 +48,8 @@ class MonthlyReportingAnalyticsTests(unittest.TestCase):
                 conid TEXT,
                 source_key TEXT
             );
+            CREATE TABLE accounts (account_id TEXT, base_currency TEXT);
+            CREATE TABLE flex_rows (account_id TEXT, section TEXT, data_json TEXT);
             CREATE TABLE fx_rates (
                 account_id TEXT,
                 rate_date TEXT,
@@ -65,6 +67,7 @@ class MonthlyReportingAnalyticsTests(unittest.TestCase):
             "INSERT INTO instrument_classifications VALUES (?, ?, ?)",
             ("1", "Yahoo Finance search profile", "Technology"),
         )
+        self.connection.execute("INSERT INTO accounts VALUES ('U16088571', 'USD')")
         for day, nav, price in (
             ("2026-07-31", "100", "5.00"),
             ("2026-08-03", "102", "5.10"),
@@ -122,6 +125,26 @@ class MonthlyReportingAnalyticsTests(unittest.TestCase):
         self.assertEqual(cash["interest_paid"], -2.0)
         self.assertEqual(cash["net_listed_cash_activity"], 8.0)
         self.assertEqual(cash["dividends_by_symbol"], [{"symbol": "TEST", "amount": 10.0}])
+
+    def test_deposit_is_not_counted_as_portfolio_return(self) -> None:
+        self.connection.execute(
+            "UPDATE nav_snapshots SET total_text = '203' WHERE snapshot_date = '2026-08-31'"
+        )
+        self.connection.execute(
+            "INSERT INTO flex_rows VALUES ('U16088571', 'Transfers', ?)",
+            (json.dumps({"date": "20260821", "assetCategory": "CASH",
+                         "currency": "USD", "cashTransfer": "100"}),),
+        )
+        result = build_monthly_reporting_analytics(
+            self.connection,
+            subject_id="U16088571",
+            period_end="2026-08-31",
+            reporting_currency="USD",
+        )
+        data = result["data"]
+        # 2026-08-03: 102 / 100. 2026-08-31: (203 - 102 - 100) / (102 + 50).
+        expected = 1.02 * (1.0 + 1.0 / 152.0) - 1.0
+        self.assertAlmostEqual(data["portfolio_monthly_return"], expected)
 
     def test_non_month_end_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "calendar month end"):
@@ -257,6 +280,10 @@ class MonthlyReportingAnalyticsTests(unittest.TestCase):
             );
             CREATE TABLE instrument_classifications (
                 conid TEXT, provider TEXT, sector TEXT
+            );
+            CREATE TABLE derived_portfolio_cash_ledger (
+                portfolio_id TEXT, event_date TEXT, amount_base REAL,
+                included INTEGER, external_flow INTEGER
             );
             CREATE TABLE fx_rates (
                 account_id TEXT, rate_date TEXT, from_currency TEXT,

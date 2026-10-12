@@ -195,6 +195,24 @@ def _summary(connection, subject_id: str, as_of: str | None, arguments: Mapping[
     )
 
 
+def _attach_external_flows(connection, subject_id: str, series: list[dict[str, Any]]) -> None:
+    """Add each row's net external flow since the previous row, as the website does."""
+    if not series:
+        return
+    series[0]["flow"] = 0.0
+    if len(series) < 2:
+        return
+    from .provisional_benchmark import _external_flows
+
+    flows = _external_flows(connection, subject_id)
+    for previous, current in zip(series, series[1:]):
+        current["flow"] = sum(
+            amount
+            for flow_day, amount in flows.items()
+            if str(previous["date"]) < flow_day <= str(current["date"])
+        )
+
+
 def _performance(connection, subject_id: str, as_of: str | None, arguments: Mapping[str, Any]) -> AgentToolResult:
     effective = _effective_as_of(connection, subject_id, as_of)
     records = connection.execute(
@@ -215,6 +233,7 @@ def _performance(connection, subject_id: str, as_of: str | None, arguments: Mapp
         for row in records
         if row["total_text"] not in (None, "")
     ]
+    _attach_external_flows(connection, subject_id, series)
     return AgentToolResult(
         "get_performance_series",
         subject_id,

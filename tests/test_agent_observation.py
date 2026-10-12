@@ -129,7 +129,7 @@ class AgentObservationTests(unittest.TestCase):
         result = self.run_call(tool="get_performance_series")
         self.assertEqual(result["subject_id"], "account-a")
         self.assertEqual(result["quality_status"], "pass")
-        self.assertEqual(result["data"]["series"], [{"date": "2026-09-30", "currency": "USD", "nav": 100.25}])
+        self.assertEqual(result["data"]["series"], [{"date": "2026-09-30", "currency": "USD", "nav": 100.25, "flow": 0.0}])
         self.assertTrue(all(sql.strip().startswith("SELECT") for sql, _ in self.reader.queries))
 
     def test_agent_revocation_between_calls_is_not_cached(self):

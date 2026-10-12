@@ -195,7 +195,7 @@ class GatewayTests(unittest.TestCase):
     def test_signed_request_through_real_broker_and_deterministic_tool(self):
         reader,authority,audit,body=self.integrated_broker()
         result=self.gateway.invoke(self.token(),body)
-        self.assertEqual(result['data']['series'],[dict(date='2026-09-30',currency='USD',nav=100.25)])
+        self.assertEqual(result['data']['series'],[dict(date='2026-09-30',currency='USD',nav=100.25,flow=0.0)])
         self.assertEqual([call.args[0]['phase'] for call in audit.record.call_args_list],['started','succeeded'])
         self.assertEqual(authority.load_current.call_count,5)
         self.assertTrue(all(sql.strip().startswith('SELECT') for sql,_ in reader.queries))

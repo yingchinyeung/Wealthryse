@@ -342,14 +342,18 @@ def _portfolio_values(connection: Any, account_id: str, start_date: str,
     }
 
 
-def _external_flows(connection: Any, account_id: str) -> dict[str, float]:
-    subject = connection.execute(
-        "SELECT subject_type FROM platform_subjects WHERE subject_id = ?",
-        (account_id,),
-    ).fetchone()
-    if subject is None:
-        raise RuntimeError(f"Unknown subject: {account_id}")
-    if str(subject["subject_type"]) in {"filtered_portfolio", "composite_portfolio"}:
+def _external_flows(
+    connection: Any, account_id: str, *, subject_type: str | None = None
+) -> dict[str, float]:
+    if subject_type is None:
+        subject = connection.execute(
+            "SELECT subject_type FROM platform_subjects WHERE subject_id = ?",
+            (account_id,),
+        ).fetchone()
+        if subject is None:
+            raise RuntimeError(f"Unknown subject: {account_id}")
+        subject_type = str(subject["subject_type"])
+    if subject_type in {"filtered_portfolio", "composite_portfolio"}:
         return {
             str(row["event_date"]): float(row["amount_base"])
             for row in connection.execute(

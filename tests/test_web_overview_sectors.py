@@ -245,5 +245,22 @@ class PerformanceRiskLayoutTests(unittest.TestCase):
         self.assertNotIn("Platform workspace", live)
 
 
+class FailureStateTests(unittest.TestCase):
+    OWNER = {"email": "o@example.com", "role": "owner"}
+
+    def test_failures_stay_in_their_card(self):
+        for source in (web._render_account_page(self.OWNER, account_id="U16088571", section="risk"),
+                       Path("deploy/live-merged/src/ibkr_etl/web.py").read_text(encoding="utf-8")):
+            self.assertNotIn("Unable to load validated portfolio data", source)
+            self.assertIn("loadFailure(error,", source)
+            self.assertIn("/risk${suffix}`).then(json).catch(", source.replace("{{", "{").replace("}}", "}"))
+            self.assertIn("benchmark-status`).then(json).catch(", source)
+            self.assertIn("emptyMessage:p.failed?", source)
+            self.assertIn("state.options.emptyMessage", source)
+        page = web._render_account_page(self.OWNER, account_id="U16088571", section="risk")
+        self.assertIn("const pageError=message=>", page)
+        self.assertIn("emptyMessage:'Drawdowns need at least two NAV dates.'", page)
+
+
 if __name__ == "__main__":
     unittest.main()

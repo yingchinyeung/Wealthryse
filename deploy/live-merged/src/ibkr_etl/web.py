@@ -10738,3 +10738,15 @@ await renderAsOf(asOfSelect.value)
 </script></body></html>"""
 
 from .website_benchmarks import website_comparison_version, MS_HKD_COMPARISON_VERSION, T_HKD_COMPARISON_VERSION
+
+
+# WealthRyse agents: chat panel, Explain buttons and inbox. Off unless
+# AGENT_UI_MODE is "owner" or "all"; see agent_web.py.
+from .agent_web import install as _install_agent_web
+
+_install_agent_web(
+    app,
+    _authorized_user,
+    lambda user: _authorized_subject_ids(user, feature_key="viewer_access"),
+    ACCOUNT_THEME_CSS,
+)

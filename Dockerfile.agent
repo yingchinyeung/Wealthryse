@@ -1,0 +1,30 @@
+FROM python:3.12-slim
+# WealthRyse agents: tool server, agent runtime and scheduled jobs (one image,
+# the command picks the role; see infra/agent-apps.bicep). No templates or
+# report runtime. Reuses ibkr_etl's calculation code from src/.
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    IBKR_PROJECT_ROOT=/app
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 10001 agent && \
+    useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin agent
+
+COPY pyproject.toml requirements.lock ./
+COPY src ./src
+
+RUN python -m pip install --require-hashes -r requirements.lock && \
+    python -m pip install --no-deps . && \
+    chown -R agent:agent /app
+
+USER 10001:10001
+EXPOSE 8080
+
+CMD ["uvicorn", "wealthryse_agent.agent_server:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]

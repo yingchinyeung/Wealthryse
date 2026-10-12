@@ -107,9 +107,12 @@ resource foundry 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
   }
 }
 
+// The account accepts one change at a time: create the project and the
+// endpoint only after the model deployment, when the account has settled.
 resource project 'Microsoft.CognitiveServices/accounts/projects@2025-06-01' = {
   parent: foundry
   name: projectName
+  dependsOn: [analystDeployment]
   location: aiLocation
   tags: tags
   identity: {
@@ -141,7 +144,7 @@ resource analystDeployment 'Microsoft.CognitiveServices/accounts/deployments@202
 resource routerDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = if (!empty(routerModelName)) {
   parent: foundry
   name: routerDeploymentName
-  dependsOn: [analystDeployment]
+  dependsOn: [project]
   sku: {
     name: 'DataZoneStandard'
     capacity: routerCapacity
@@ -179,6 +182,7 @@ resource jobsInference 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 resource privateEndpoint 'Microsoft.Network/privateEndpoints@2023-11-01' = {
   name: '${foundryName}-pe'
   location: location
+  dependsOn: [project]
   tags: tags
   properties: {
     subnet: {

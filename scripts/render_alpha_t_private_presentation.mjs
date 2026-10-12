@@ -83,7 +83,8 @@ const safeText=new Map([
  ['Rebalancing Explanations: Quarterly end','Constant cash: 58 per initial NAV 100'],
  ['Performance fees calculated as the delta versus the prior quarter and only deemed earned if higher than the prior quarter and is a positive return (no watermark).',
   'Underlying account NAV includes its cash and interest. No additional financing charge is added. T fee terms are not established by this model.'],
- ['inquiry@www.sprout-asset.com','Contact details under review']
+ ['inquiry@www.sprout-asset.com','inquiry@sprout-asset.com'],
+ ['llustrative examples only','Illustrative examples only']
 ]);
 for(const line of templateText.ndjson.split('\\n').filter(Boolean)){
  const x=JSON.parse(line),old=String(x.text||x.textPreview||'').replace(/\\s+/g,' ').trim();

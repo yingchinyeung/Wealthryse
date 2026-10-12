@@ -158,6 +158,21 @@ const showFreshness=latest=>{
 };
 wrTable('#holdings',{filter:'#holdings-filter',count:'#holdings-filter-count'});
 wrTable('#sector-detail',{stack:false});wrTable('#trade-history');wrTable('#cash-activity');wrTable('#flows-statement',{stack:false});
+const asOfLabel=value=>{const d=new Date(String(value).slice(0,10)+'T00:00:00Z');return Number.isNaN(d.getTime())?String(value):d.toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short',year:'numeric',timeZone:'UTC'})};
+document.querySelectorAll('.chart-mode').forEach(group=>group.addEventListener('click',event=>{
+  const button=event.target.closest('button[data-mode]');if(!button)return;
+  const card=group.closest('.card');
+  group.querySelectorAll('button[data-mode]').forEach(b=>{b.classList.toggle('active',b===button);b.setAttribute('aria-pressed',String(b===button))});
+  card.querySelectorAll('.chart-view').forEach(view=>{view.hidden=view.dataset.view!==button.dataset.mode});
+  const title=card.querySelector('.chart-title');if(title)title.textContent=button.dataset.title;
+  card.querySelectorAll('.chart-view:not([hidden]) canvas').forEach(c=>{if(chartState.has('#'+c.id))renderChart('#'+c.id)});
+}));
+(()=>{
+  const links=[...document.querySelectorAll('.section-jumps a')];if(!links.length||!('IntersectionObserver' in window))return;
+  const byId=new Map(links.map(a=>[a.getAttribute('href').slice(1),a]));
+  const observer=new IntersectionObserver(entries=>entries.forEach(entry=>{if(entry.isIntersecting)links.forEach(a=>a.classList.toggle('active',a===byId.get(entry.target.id)))}),{rootMargin:'-200px 0px -55% 0px'});
+  byId.forEach((_,id)=>{const target=document.getElementById(id);if(target)observer.observe(target)});
+})();
 """
 
 # Account directory cards: fills in NAV and returns after the page loads.

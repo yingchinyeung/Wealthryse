@@ -198,5 +198,52 @@ class PhoneLayoutTests(unittest.TestCase):
         self.assertIn("cell.dataset.label=names[i]", TABLE_SCRIPT)
         self.assertIn("position: sticky; top: 76px", ACCOUNT_THEME_CSS)
 
+
+class PerformanceRiskLayoutTests(unittest.TestCase):
+    OWNER = {"email": "o@example.com", "role": "owner"}
+
+    @staticmethod
+    def view(page, section):
+        start = page.index(f'data-section="{section}"')
+        return page[start:page.index('<div class="page-view', start)]
+
+    def test_performance_leads_with_the_chart_and_risk_holds_the_risk_cards(self):
+        page = web._render_account_page(self.OWNER, account_id="U16088571", section="performance")
+        performance, risk = self.view(page, "performance"), self.view(page, "risk")
+        order = [performance.index(marker) for marker in ('id="perf-chart"', 'id="perf-returns"', 'id="perf-calendar"',
+                                                          'id="perf-attribution"', 'id="perf-benchmark"', 'id="perf-flows"')]
+        self.assertEqual(order, sorted(order))
+        self.assertIn('data-mode="benchmark"', performance)
+        self.assertIn('<canvas id="benchmark-chart"', performance)
+        for marker in ('id="analytics-statistics"', 'id="drawdown-chart"', 'id="rolling-volatility-chart"',
+                       'id="rolling-beta-chart"', 'id="correlation-body"'):
+            self.assertIn(marker, risk)
+            self.assertNotIn(marker, performance)
+        self.assertIn("activeSection==='performance'||activeSection==='risk')void renderAnalytics(asOf)", page)
+        self.assertIn("if(activeSection==='risk'){if(selected)fetch(", page)
+
+    def test_section_jumps_and_no_repeated_header(self):
+        performance = web._render_account_page(self.OWNER, account_id="U16088571", section="performance")
+        self.assertIn('<a href="#perf-chart">NAV chart</a>', performance)
+        self.assertIn('<h2 class="sr-only">Performance</h2>', performance)
+        self.assertNotIn("Account workspace", performance)
+        self.assertLess(performance.index('id="asof-select"'), performance.index('class="account-sticky"'))
+        risk = web._render_account_page(self.OWNER, account_id="U16088571", section="risk")
+        self.assertIn('<a href="#risk-drawdowns">Drawdowns</a>', risk)
+        cash = web._render_account_page(self.OWNER, account_id="U16088571", section="cash")
+        self.assertNotIn('class="section-jumps"', cash)
+        guide = web._render_platform_page(self.OWNER, section="metrics-guide")
+        self.assertNotIn("Platform workspace", guide)
+
+    def test_live_merged_copy_has_the_layout(self):
+        live = Path("deploy/live-merged/src/ibkr_etl/web.py").read_text(encoding="utf-8")
+        for marker in ('class="account-hero-controls"', "{section_jumps}</div>", 'id="perf-chart"',
+                       "{RISK_ANALYTICS_CARDS}{CORRELATION_CARD}</div>", "esc(asOfLabel(x))",
+                       "activeSection==='performance'||activeSection==='risk'"):
+            self.assertIn(marker, live)
+        self.assertNotIn("Account workspace", live)
+        self.assertNotIn("Platform workspace", live)
+
+
 if __name__ == "__main__":
     unittest.main()

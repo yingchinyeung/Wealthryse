@@ -320,7 +320,7 @@ class EndpointAndPageTests(unittest.TestCase):
                      "holdings_correlation_view", "benchmark_comparison"):
             self.assertEqual(function(LIVE_WEB, name), function(SRC_WEB, name), name)
         live = LIVE_WEB.read_text(encoding="utf-8")
-        for marker in ("from .web_analytics_ui import (\n    ANALYTICS_SCRIPT,", "{PERFORMANCE_ANALYTICS_CARDS}</div>",
+        for marker in ("from .web_analytics_ui import (\n    ANALYTICS_SCRIPT,", "\n{PERFORMANCE_ANALYTICS_CARDS}\n", "{RISK_ANALYTICS_CARDS}{CORRELATION_CARD}</div>",
                        "{HOLDINGS_CONCENTRATION_CARD}", "{ACCOUNT_UI_SCRIPT}\n{ANALYTICS_SCRIPT}",
                        '"concentration": holdings_concentration(view)', "void renderAnalytics(asOf)",
                        "{CORRELATION_CARD}</div>", 'data-section="trades">{TRADING_ACTIVITY_CARD}',

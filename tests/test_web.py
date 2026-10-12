@@ -1062,7 +1062,7 @@ class PortfolioWebTests(unittest.TestCase):
         }
         health_page = web.system_health_page(None, owner)
         self.assertIn("Platform-wide data freshness", health_page)
-        self.assertIn("All accounts and portfolios", health_page)
+        self.assertNotIn("Platform workspace", health_page)
         self.assertIn('aria-current="page">System health</a>', health_page)
         self.assertNotIn('aria-label="U16088571 sections"', health_page)
 
@@ -1328,7 +1328,7 @@ class PortfolioWebTests(unittest.TestCase):
             {"email": "analyst@example.com"},
         )
         self.assertIn('class="page-view active" data-section="risk"', risk_page)
-        self.assertIn('<h2>Risk analytics</h2>', risk_page)
+        self.assertIn('<h2 class="sr-only">Risk analytics</h2>', risk_page)
         self.assertEqual(risk_page.count('class="page-view active"'), 1)
 
     def test_account_subpages_reject_unknown_accounts_and_sections(self) -> None:

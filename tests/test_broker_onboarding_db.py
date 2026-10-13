@@ -1,4 +1,4 @@
-"""Database rules for the new account onboarding (migration 063).
+"""Database rules for the new account onboarding (migration 064).
 
 Needs a disposable PostgreSQL server: set AGENT_TEST_PG_ADMIN_DSN to a
 superuser DSN (CI starts one). Skipped otherwise. Creates and drops its own
@@ -253,6 +253,14 @@ class BrokerOnboardingSchemaTests(_MigratedDatabase):
                             "VALUES ('krx_code', 'SAMSUNG', 'KRX:005930', 'owner')")
         self.assertRejected("INSERT INTO security_master (security_key, display_name, asset_class, currency, "
                             "status) VALUES ('NASDAQ:AAPL', 'Bad key', 'STK', 'USD', 'active')")
+        self.db.execute("INSERT INTO security_master (security_key, display_name, asset_class, currency, status) "
+                        "VALUES ('US:BRK.B', 'Synthetic US share', 'STK', 'USD', 'active')")
+        self.db.execute("INSERT INTO security_identifiers (scheme, identifier, security_key, source) "
+                        "VALUES ('us_ticker', 'BRK.B', 'US:BRK.B', 'kiwoom_rest')")
+        self.assertRejected("INSERT INTO security_identifiers (scheme, identifier, security_key, source) "
+                            "VALUES ('us_ticker', 'BRK B', 'US:BRK.B', 'owner')")
+        self.assertRejected("INSERT INTO security_master (security_key, display_name, asset_class, currency, "
+                            "status) VALUES ('US:brk', 'Bad key', 'STK', 'USD', 'active')")
 
 
 @unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")

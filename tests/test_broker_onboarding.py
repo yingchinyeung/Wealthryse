@@ -32,6 +32,7 @@ from ibkr_etl.security_master import (
     SecurityConflict,
     SecurityIdentifier,
     SecurityMaster,
+    ibkr_identifiers,
     isin_is_valid,
     new_security_key,
     unmapped_holdings,
@@ -264,6 +265,26 @@ class SecurityMasterTests(unittest.TestCase):
         self.assertEqual(new_security_key([SecurityIdentifier("krx_code", "000660")]), "KRX:000660")
         master = SecurityMaster()
         self.assertEqual(master.register([SecurityIdentifier("krx_code", "000660")])[0], "KRX:000660")
+
+    def test_us_tickers_are_normalized_and_namespaced(self) -> None:
+        self.assertEqual(SecurityIdentifier("us_ticker", " aapl ").value, "AAPL")
+        for spelling in ("BRK B", "BRK/B", "BRK-B", "brk.b"):
+            self.assertEqual(SecurityIdentifier("us_ticker", spelling).value, "BRK.B", spelling)
+        for bad in ("", "1ABC", "AAPL$", "TOOLONGX", "BRK.ABCDE"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                SecurityIdentifier("us_ticker", bad)
+        self.assertEqual(new_security_key([SecurityIdentifier("us_ticker", "BRK B")]), "US:BRK.B")
+        self.assertEqual(SecurityMaster().register([SecurityIdentifier("us_ticker", "AMGN")])[0], "US:AMGN")
+
+    def test_a_us_stock_at_ibkr_and_kiwoom_is_one_security(self) -> None:
+        master = SecurityMaster()
+        ibkr = ibkr_identifiers(conid=265598, isin="US0378331005", symbol="AAPL", listing_exchange="NASDAQ")
+        self.assertEqual([item.scheme for item in ibkr], ["ibkr_conid", "isin", "us_ticker"])
+        self.assertEqual(master.register(ibkr)[0], "265598")
+        self.assertEqual(master.resolve([SecurityIdentifier("us_ticker", "AAPL")]), "265598")
+        # The same symbol on another exchange is a different company, so it is not registered.
+        hk = ibkr_identifiers(conid=12345, isin="bad", symbol="AAPL", listing_exchange="SEHK")
+        self.assertEqual(hk, [SecurityIdentifier("ibkr_conid", "12345")])
 
     def test_conflicts_block_instead_of_guessing(self) -> None:
         master = SecurityMaster([

@@ -225,9 +225,11 @@ CREATE POLICY broker_onboarding_events_tenant_policy ON broker_onboarding_events
     USING (tenant_id = app_tenant_id()) WITH CHECK (tenant_id = app_tenant_id());
 
 -- Security identity is reference data shared by every tenant, like instruments.
+-- The migration runner rewrites every question mark as a placeholder, so these
+-- patterns spell an optional part as {0,1}.
 CREATE TABLE security_master (
     security_key TEXT PRIMARY KEY CHECK (security_key ~ (
-        '^([0-9]{1,12}|KRX:[0-9A-Z]{6}|ISIN:[A-Z]{2}[A-Z0-9]{9}[0-9])$'
+        '^([0-9]{1,12}|KRX:[0-9A-Z]{6}|ISIN:[A-Z]{2}[A-Z0-9]{9}[0-9]|US:[A-Z][A-Z0-9]{0,5}(\.[A-Z0-9]{1,4}){0,1})$'
     )),
     display_name TEXT NOT NULL CHECK (length(trim(display_name)) BETWEEN 1 AND 200),
     asset_class TEXT NOT NULL,
@@ -239,7 +241,7 @@ CREATE TABLE security_master (
 );
 
 CREATE TABLE security_identifiers (
-    scheme TEXT NOT NULL CHECK (scheme IN ('ibkr_conid', 'isin', 'krx_code')),
+    scheme TEXT NOT NULL CHECK (scheme IN ('ibkr_conid', 'isin', 'krx_code', 'us_ticker')),
     identifier TEXT NOT NULL,
     security_key TEXT NOT NULL REFERENCES security_master(security_key),
     source TEXT NOT NULL CHECK (source IN ('ibkr_flex', 'kiwoom_rest', 'owner')),
@@ -249,10 +251,11 @@ CREATE TABLE security_identifiers (
         (scheme = 'ibkr_conid' AND identifier ~ '^[0-9]{1,12}$')
         OR (scheme = 'isin' AND identifier ~ '^[A-Z]{2}[A-Z0-9]{9}[0-9]$')
         OR (scheme = 'krx_code' AND identifier ~ '^[0-9A-Z]{6}$')
+        OR (scheme = 'us_ticker' AND identifier ~ '^[A-Z][A-Z0-9]{0,5}(\.[A-Z0-9]{1,4}){0,1}$')
     )
 );
 
 CREATE INDEX security_identifiers_key_idx ON security_identifiers(security_key);
 
 COMMENT ON TABLE security_master IS
-    'One identity per security across brokers. IBKR securities keep their conid as the key; others use a namespaced key such as KRX:005930.';
+    'One identity per security across brokers. IBKR securities keep their conid as the key; others use a namespaced key such as KRX:005930 or US:AAPL.';

@@ -358,7 +358,7 @@ def _refresh_analytics_if_approved(
 
 
 def _has_onboarding_cases(connection) -> bool:
-    """The new onboarding's tables exist once migration 063 is applied."""
+    """The new onboarding's tables exist once migration 064 is applied."""
 
     return connection.execute(
         "SELECT to_regclass('public.broker_onboarding_cases')"
@@ -380,7 +380,7 @@ def _record_history_build(connection, tenant_id: str, subject_id: str, error: st
 def _dry_run_portfolio_cases(connection, tenant_id: str, reference_path: Path, reference) -> list[dict]:
     """Stage 2 of each new-onboarding portfolio case: calculate, measure, roll back.
 
-    Nothing runs until migration 063 exists, and nothing is kept for a
+    Nothing runs until migration 064 exists, and nothing is kept for a
     portfolio the owner has not approved.
     """
 

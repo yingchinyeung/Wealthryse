@@ -6,14 +6,18 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from ibkr_etl.kiwoom_client import (
+    ACCOUNT_PATH,
     HOSTS,
     INQUIRY_APIS,
+    US_ACCOUNT_PATH,
     KiwoomClient,
     KiwoomError,
     kiwoom_number,
     krx_code,
+    reconcile_us_valuation,
     reconcile_valuation,
 )
+from ibkr_etl.security_master import SecurityIdentifier
 
 APP_KEY = "synthetic-app-key"
 APP_SECRET = "synthetic-app-secret"
@@ -85,13 +89,16 @@ class KiwoomClientTests(unittest.TestCase):
     def test_only_inquiries_are_reachable(self) -> None:
         fake = FakeKiwoom()
         client = _client(fake)
-        for api_id in ("kt10000", "kt10001", "kt10002", "kt10003", "au10001"):
+        # Korean orders, US orders and the US currency exchange application.
+        for api_id in ("kt10000", "kt10001", "kt10002", "kt10003", "au10001",
+                       "ust20000", "ust20001", "ust20002", "ust20003", "ust31302"):
             with self.subTest(api_id=api_id), self.assertRaisesRegex(KiwoomError, "not an allowed"):
                 client.inquire(api_id, {})
-        with self.assertRaisesRegex(KiwoomError, "inquiry calls"):
-            client._post("/api/dostk/ordr", {}, {})
+        for path in ("/api/dostk/ordr", "/api/us/ordr", "/api/us/exchange"):
+            with self.subTest(path=path), self.assertRaisesRegex(KiwoomError, "inquiry calls"):
+                client._post(path, {}, {})
         self.assertEqual(fake.requests, [])
-        self.assertTrue(all(path == "/api/dostk/acnt" for path in INQUIRY_APIS.values()))
+        self.assertEqual(set(INQUIRY_APIS.values()), {ACCOUNT_PATH, US_ACCOUNT_PATH})
 
     def test_mock_and_live_hosts_only(self) -> None:
         self.assertEqual(set(HOSTS), {"live", "mock"})
@@ -104,7 +111,8 @@ class KiwoomClientTests(unittest.TestCase):
     def test_valuation_follows_pages_and_reuses_the_token(self) -> None:
         fake = FakeKiwoom({"kt00004": [ACCOUNT], "kt00018": [HOLDINGS_PAGE_1, HOLDINGS_PAGE_2]})
         valuation = _client(fake).valuation()
-        self.assertEqual([h.krx_code for h in valuation.holdings], ["005930", "000660"])
+        self.assertEqual([h.code for h in valuation.holdings], ["005930", "000660"])
+        self.assertEqual(valuation.holdings[0].identifiers, [SecurityIdentifier("krx_code", "005930")])
         self.assertEqual(valuation.holdings[0].price, Decimal("71500"))
         self.assertEqual(valuation.deposit, Decimal("500000"))
         token_calls = [r for r in fake.requests if r[0].endswith("/oauth2/token")]
@@ -151,8 +159,8 @@ class KiwoomClientTests(unittest.TestCase):
         client = _client(fake)
         movements = client.transactions(date(2026, 1, 1), date(2026, 1, 31))
         self.assertEqual([m.trade_date for m in movements], ["2026-01-02", "2026-01-05"])
-        self.assertEqual((movements[0].krx_code, movements[0].amount), ("005930", Decimal("-600000")))
-        self.assertEqual((movements[1].krx_code, movements[1].currency), (None, "KRW"))
+        self.assertEqual((movements[0].security.value, movements[0].amount), ("005930", Decimal("-600000")))
+        self.assertEqual((movements[1].security, movements[1].currency), (None, "KRW"))
         self.assertEqual(fake.requests[-1][2]["strt_dt"], "20260101")
         client.revoke()
         self.assertTrue(fake.requests[-1][0].endswith("/oauth2/revoke"))
@@ -172,6 +180,87 @@ class ReconciliationTests(unittest.TestCase):
         result = reconcile_valuation(_client(fake).valuation())
         self.assertEqual(result["status"], "fail")
         self.assertIn("-10,000 KRW", result["message"])
+
+
+US_HOLDINGS = {"return_code": 0, "crnc_code": "USD", "result_list": [
+    {"stex_nm": "NASDAQ", "crnc_code": "USD", "stk_cd": "AMGN", "frgn_stk_nm": "Synthetic Biotech",
+     "poss_qty": "000000000010", "frgn_stk_book_uv": "250.10", "now_pric": "+300.25",
+     "evlt_amt": "3002.50", "evlt_amt_krw": "000004203500"},
+    {"stex_nm": "NYSE", "crnc_code": "USD", "stk_cd": "BRK B", "frgn_stk_nm": "Synthetic Holdings B",
+     "poss_qty": "000000000004", "frgn_stk_book_uv": "400.00", "now_pric": "-450.00",
+     "evlt_amt": "1800.00", "evlt_amt_krw": "000002520000"},
+]}
+US_BALANCES = {"return_code": 0, "won_entr": "000000100000", "result_list": [
+    {"crnc_code": "USD", "fx_entr": "1250.75", "evlt_amt": "4802.50", "crnc_rt": "1400.00"},
+]}
+
+
+class KiwoomUsTests(unittest.TestCase):
+    def test_us_valuation_reads_holdings_and_balances(self) -> None:
+        fake = FakeKiwoom({"ust21070": [US_HOLDINGS], "ust21120": [US_BALANCES]})
+        valuation = _client(fake).us_valuation()
+        self.assertEqual([h.code for h in valuation.holdings], ["AMGN", "BRK.B"])
+        first = valuation.holdings[0]
+        self.assertEqual((first.currency, first.exchange, first.price, first.market_value_krw),
+                         ("USD", "NASDAQ", Decimal("300.25"), Decimal("4203500")))
+        self.assertEqual(valuation.holdings[1].identifiers, [SecurityIdentifier("us_ticker", "BRK.B")])
+        self.assertEqual(valuation.balances[0].deposit, Decimal("1250.75"))
+        urls = [url for url, _, _ in fake.requests if "/oauth2/" not in url]
+        self.assertEqual(urls, ["https://mockapi.kiwoom.com/api/us/acnt"] * 2)
+        self.assertEqual(fake.requests[1][2], {"stex_tp": "", "stk_cd": ""})
+        result = reconcile_us_valuation(valuation)
+        self.assertEqual(result["status"], "pass", result["message"])
+        self.assertEqual(result["evidence"]["currencies"]["USD"]["holdings_value"], "4802.50")
+
+    def test_us_reconciliation_fails_on_a_missing_holding_or_wrong_unit(self) -> None:
+        missing = dict(US_HOLDINGS, result_list=US_HOLDINGS["result_list"][:1])
+        fake = FakeKiwoom({"ust21070": [missing], "ust21120": [US_BALANCES]})
+        result = reconcile_us_valuation(_client(fake).us_valuation())
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("-1,800.00 USD away", result["message"])
+        # A price read as whole cents instead of dollars.
+        cents = [dict(row) for row in US_HOLDINGS["result_list"]]
+        cents[0]["now_pric"] = "30025"
+        fake = FakeKiwoom({"ust21070": [dict(US_HOLDINGS, result_list=cents)], "ust21120": [US_BALANCES]})
+        result = reconcile_us_valuation(_client(fake).us_valuation())
+        self.assertEqual((result["status"], result["evidence"]["mispriced"]), ("fail", ["AMGN"]))
+        # Securities Kiwoom values with no holdings listed, and no total at all.
+        fake = FakeKiwoom({"ust21070": [dict(US_HOLDINGS, result_list=[])], "ust21120": [US_BALANCES]})
+        self.assertEqual(reconcile_us_valuation(_client(fake).us_valuation())["status"], "fail")
+        fake = FakeKiwoom({"ust21070": [US_HOLDINGS], "ust21120": [dict(US_BALANCES, result_list=[])]})
+        result = reconcile_us_valuation(_client(fake).us_valuation())
+        self.assertIn("no USD total", result["message"])
+
+    def test_a_currency_listed_twice_is_refused(self) -> None:
+        twice = dict(US_BALANCES, result_list=US_BALANCES["result_list"] * 2)
+        fake = FakeKiwoom({"ust21070": [US_HOLDINGS], "ust21120": [twice]})
+        with self.assertRaisesRegex(KiwoomError, "currency twice"):
+            _client(fake).us_valuation()
+
+    def test_balances_on_a_past_date(self) -> None:
+        fake = FakeKiwoom({"ust21132": [US_BALANCES]})
+        balances = _client(fake).us_balances_on(date(2026, 9, 30))
+        self.assertEqual((balances[0].currency, balances[0].securities_value), ("USD", Decimal("4802.50")))
+        self.assertEqual(fake.requests[-1][2], {"base_dt": "20260930"})
+
+    def test_us_transactions_keep_both_currencies(self) -> None:
+        page = {"return_code": 0, "result_list": [
+            {"deal_dt": "20260105", "deal_kind_nm": "Buy", "rmrk_nm": "Buy", "stk_cd": "AMGN",
+             "deal_qty": "10", "crnc_code": "USD", "fc_exct_amt": "-2501.00", "exct_amt": "-000003501400"},
+            {"deal_dt": "20260102", "deal_kind_nm": "Deposit", "rmrk_nm": "KRW deposit", "stk_cd": "",
+             "deal_qty": "", "crnc_code": "", "fc_exct_amt": "0", "exct_amt": "000005000000"},
+        ]}
+        fake = FakeKiwoom({"ust21100": [page]})
+        movements = _client(fake).us_transactions(date(2026, 1, 1), date(2026, 1, 31))
+        buy, deposit = movements
+        self.assertEqual((buy.security, buy.amount, buy.currency, buy.amount_krw),
+                         (SecurityIdentifier("us_ticker", "AMGN"), Decimal("-2501.00"), "USD", Decimal("-3501400")))
+        self.assertEqual((deposit.security, deposit.amount, deposit.currency, deposit.amount_krw),
+                         (None, Decimal("5000000"), "KRW", None))
+        self.assertEqual(fake.requests[-1][2]["tp"], "0")
+        missing = {"return_code": 0, "result_list": [{"deal_dt": "20260105", "crnc_code": "USD", "exct_amt": "1"}]}
+        with self.assertRaisesRegex(KiwoomError, "missing fc_exct_amt"):
+            _client(FakeKiwoom({"ust21100": [missing]})).us_transactions(date(2026, 1, 1), date(2026, 1, 31))
 
 
 if __name__ == "__main__":

@@ -3,10 +3,16 @@
 Kiwoom issues one app key and secret per account, with no read-only scope, so
 this client is read-only by construction: it knows only the inquiry API IDs
 listed in ``INQUIRY_APIS`` and the two OAuth paths, and refuses anything else
-before a request is built. Order APIs are not reachable from this module.
+before a request is built. Order APIs, and the US currency exchange
+application, are not reachable from this module.
+
+One account holds Korean and US stocks. Korean holdings, cash and transactions
+come from the domestic account API; US ones from the US account API, in their
+own currency with Kiwoom's KRW conversion alongside.
 
 Kiwoom answers only from IP addresses registered to the app key, so calls must
-come from the platform's fixed outbound address. The mock host serves KRX only.
+come from the platform's fixed outbound address. The mock host lists both
+account APIs.
 
 Field names follow Kiwoom's published REST API guide and are checked against
 the mock server before any live use; anything missing fails loudly instead of
@@ -31,6 +37,7 @@ HOSTS = {"live": "https://api.kiwoom.com", "mock": "https://mockapi.kiwoom.com"}
 TOKEN_PATH = "/oauth2/token"
 REVOKE_PATH = "/oauth2/revoke"
 ACCOUNT_PATH = "/api/dostk/acnt"
+US_ACCOUNT_PATH = "/api/us/acnt"
 INQUIRY_APIS: Mapping[str, str] = {
     "kt00001": ACCOUNT_PATH,  # deposit detail
     "kt00004": ACCOUNT_PATH,  # account valuation
@@ -39,6 +46,10 @@ INQUIRY_APIS: Mapping[str, str] = {
     "kt00018": ACCOUNT_PATH,  # holdings valuation detail
     "ka01690": ACCOUNT_PATH,  # daily balance return
     "ka10074": ACCOUNT_PATH,  # realised profit by day
+    "ust21070": US_ACCOUNT_PATH,  # US holdings
+    "ust21100": US_ACCOUNT_PATH,  # US transaction history
+    "ust21120": US_ACCOUNT_PATH,  # deposits and securities value by currency
+    "ust21132": US_ACCOUNT_PATH,  # the same, on a past date
 }
 MAX_PAGES = 50
 TOKEN_MARGIN = timedelta(minutes=5)
@@ -91,19 +102,32 @@ def krx_code(value: object) -> str:
     return SecurityIdentifier("krx_code", text).value
 
 
+def _currency(value: object, default: str) -> str:
+    text = str(value or "").strip().upper() or default
+    if len(text) != 3 or not text.isalpha():
+        raise KiwoomError(f"Kiwoom returned a malformed currency code: {text!r}")
+    return text
+
+
 @dataclass(frozen=True)
 class Holding:
-    krx_code: str
+    security: SecurityIdentifier
     name: str
     quantity: Decimal
     average_price: Decimal
     price: Decimal
     market_value: Decimal
     currency: str = "KRW"
+    exchange: str | None = None
+    market_value_krw: Decimal | None = None
+
+    @property
+    def code(self) -> str:
+        return self.security.value
 
     @property
     def identifiers(self) -> list[SecurityIdentifier]:
-        return [SecurityIdentifier("krx_code", self.krx_code)]
+        return [self.security]
 
 
 @dataclass(frozen=True)
@@ -117,14 +141,32 @@ class AccountValuation:
 
 
 @dataclass(frozen=True)
+class CurrencyBalance:
+    """One currency's cash and securities value in the US account API."""
+
+    currency: str
+    deposit: Decimal
+    securities_value: Decimal
+    krw_rate: Decimal
+
+
+@dataclass(frozen=True)
+class UsValuation:
+    holdings: tuple[Holding, ...]
+    balances: tuple[CurrencyBalance, ...]
+
+
+@dataclass(frozen=True)
 class CashMovement:
     trade_date: str
     description: str
     kind: str
-    krx_code: str | None
+    security: SecurityIdentifier | None
     quantity: Decimal
     amount: Decimal
     currency: str
+    # Kiwoom's KRW settlement for a movement in another currency.
+    amount_krw: Decimal | None = None
 
 
 def _field(row: Mapping[str, object], name: str) -> object:
@@ -245,7 +287,7 @@ class KiwoomClient:
         for page in self.inquire("kt00018", {"qry_tp": "1", "dmst_stex_tp": "KRX"}):
             for row in page.get("acnt_evlt_remn_indv_tot") or []:
                 holdings.append(Holding(
-                    krx_code=krx_code(_field(row, "stk_cd")),
+                    security=SecurityIdentifier("krx_code", krx_code(_field(row, "stk_cd"))),
                     name=str(_field(row, "stk_nm")).strip(),
                     quantity=kiwoom_number(_field(row, "rmnd_qty")),
                     average_price=kiwoom_number(_field(row, "pur_pric"), unsigned=True),
@@ -274,10 +316,76 @@ class KiwoomClient:
                     trade_date=datetime.strptime(str(_field(row, "trde_dt")), "%Y%m%d").date().isoformat(),
                     description=str(row.get("rmrk_nm") or "").strip(),
                     kind=str(row.get("io_tp_nm") or row.get("trde_kind_nm") or "").strip(),
-                    krx_code=krx_code(code) if code else None,
+                    security=SecurityIdentifier("krx_code", krx_code(code)) if code else None,
                     quantity=kiwoom_number(row.get("trde_qty_jwa_cnt") or "0"),
                     amount=kiwoom_number(_field(row, "exct_amt")),
                     currency=str(row.get("crnc_cd") or "KRW").strip() or "KRW",
+                ))
+        return movements
+
+    def us_valuation(self) -> UsValuation:
+        """US holdings (ust21070) and each currency's cash and securities value (ust21120)."""
+
+        holdings: list[Holding] = []
+        for page in self.inquire("ust21070", {"stex_tp": "", "stk_cd": ""}):
+            for row in page.get("result_list") or []:
+                holdings.append(Holding(
+                    security=SecurityIdentifier("us_ticker", _field(row, "stk_cd")),
+                    name=str(_field(row, "frgn_stk_nm")).strip(),
+                    quantity=kiwoom_number(_field(row, "poss_qty")),
+                    average_price=kiwoom_number(_field(row, "frgn_stk_book_uv"), unsigned=True),
+                    price=kiwoom_number(_field(row, "now_pric"), unsigned=True),
+                    market_value=kiwoom_number(_field(row, "evlt_amt")),
+                    currency=_currency(_field(row, "crnc_code"), "USD"),
+                    exchange=str(row.get("stex_nm") or "").strip() or None,
+                    market_value_krw=kiwoom_number(_field(row, "evlt_amt_krw")),
+                ))
+        balances = self._balances(self.inquire("ust21120", {"cmsn_incl_tp": "0", "exrt_tp": "0"}))
+        return UsValuation(holdings=tuple(holdings), balances=balances)
+
+    def us_balances_on(self, day: date) -> tuple[CurrencyBalance, ...]:
+        """Each currency's cash and securities value at the close of a past date (ust21132)."""
+
+        return self._balances(self.inquire("ust21132", {"base_dt": _yyyymmdd(day)}))
+
+    @staticmethod
+    def _balances(pages: list[Mapping[str, object]]) -> tuple[CurrencyBalance, ...]:
+        balances: list[CurrencyBalance] = []
+        for page in pages:
+            for row in page.get("result_list") or []:
+                balances.append(CurrencyBalance(
+                    currency=_currency(_field(row, "crnc_code"), ""),
+                    deposit=kiwoom_number(_field(row, "fx_entr")),
+                    securities_value=kiwoom_number(_field(row, "evlt_amt")),
+                    krw_rate=kiwoom_number(_field(row, "crnc_rt"), unsigned=True),
+                ))
+        currencies = [item.currency for item in balances]
+        if len(set(currencies)) != len(currencies):
+            raise KiwoomError("Kiwoom listed a currency twice")
+        return tuple(balances)
+
+    def us_transactions(self, start: date, end: date) -> list[CashMovement]:
+        """Every US trade, deposit, currency exchange and dividend between two dates (ust21100)."""
+
+        if end < start:
+            raise ValueError("End date is before start date")
+        movements: list[CashMovement] = []
+        body = {"strt_dt": _yyyymmdd(start), "end_dt": _yyyymmdd(end), "tp": "0", "stex_tp": "",
+                "stk_cd": "", "krw_repl_skip_yn": "N"}
+        for page in self.inquire("ust21100", body):
+            for row in page.get("result_list") or []:
+                code = str(row.get("stk_cd") or "").strip()
+                currency = _currency(row.get("crnc_code"), "KRW")
+                foreign = currency != "KRW"
+                movements.append(CashMovement(
+                    trade_date=datetime.strptime(str(_field(row, "deal_dt")), "%Y%m%d").date().isoformat(),
+                    description=str(row.get("rmrk_nm") or "").strip(),
+                    kind=str(row.get("deal_kind_nm") or "").strip(),
+                    security=SecurityIdentifier("us_ticker", code) if code else None,
+                    quantity=kiwoom_number(row.get("deal_qty") or "0"),
+                    amount=kiwoom_number(_field(row, "fc_exct_amt" if foreign else "exct_amt")),
+                    currency=currency,
+                    amount_krw=kiwoom_number(_field(row, "exct_amt")) if foreign else None,
                 ))
         return movements
 
@@ -309,3 +417,51 @@ def reconcile_valuation(valuation: AccountValuation, *, tolerance: Decimal = Dec
             "holdings": len(valuation.holdings),
         },
     }
+
+
+def reconcile_us_valuation(valuation: UsValuation, *, cent: Decimal = Decimal("0.01")) -> dict[str, object]:
+    """US holdings should add up to Kiwoom's own securities value in each currency.
+
+    Each holding's quantity times price must also match its value, which
+    catches a field read in the wrong unit. Rounding allows one cent per
+    holding. Returns the check record for ``nav_reconciled``.
+    """
+
+    balances = {item.currency: item for item in valuation.balances}
+    by_currency: dict[str, list[Holding]] = {}
+    for holding in valuation.holdings:
+        by_currency.setdefault(holding.currency, []).append(holding)
+    problems: list[str] = []
+    currencies: dict[str, dict[str, str | int]] = {}
+    for currency in sorted(set(by_currency) | {c for c, b in balances.items() if b.securities_value}):
+        held = by_currency.get(currency, [])
+        holdings_value = sum((item.market_value for item in held), Decimal("0"))
+        balance = balances.get(currency)
+        if balance is None:
+            problems.append(f"Kiwoom gave no {currency} total to check {len(held)} holdings against.")
+            continue
+        gap = holdings_value - balance.securities_value
+        currencies[currency] = {
+            "holdings_value": str(holdings_value),
+            "broker_securities_value": str(balance.securities_value),
+            "deposit": str(balance.deposit),
+            "gap": str(gap),
+            "holdings": len(held),
+        }
+        if abs(gap) > cent * max(1, len(held)):
+            problems.append(f"{currency} holdings are {gap:+,} {currency} away from Kiwoom's total.")
+    mispriced = [
+        item.code for item in valuation.holdings
+        if abs(item.quantity * item.price - item.market_value) > max(cent, abs(item.market_value) / 200)
+    ]
+    if mispriced:
+        problems.append("Quantity times price does not match the value for " + ", ".join(mispriced) + ".")
+    status = "fail" if problems else "pass"
+    message = (
+        " ".join(problems) + " The platform will not guess why."
+        if problems
+        else "US holdings match Kiwoom's securities value in "
+        + (", ".join(currencies) if currencies else "every currency") + "."
+    )
+    return {"status": status, "message": message,
+            "evidence": {"currencies": currencies, "mispriced": mispriced}}

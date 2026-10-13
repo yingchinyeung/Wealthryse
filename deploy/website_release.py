@@ -304,14 +304,14 @@ AGENT_SETTINGS = {
 
 
 def chat():
-    """Set AGENT_UI_MODE (off or owner) on the website; leaves the image alone."""
+    """Set AGENT_UI_MODE (off, owner or all) on the website; leaves the image alone."""
     mode = sys.argv[2]
-    if mode not in ('off', 'owner'):
-        raise SystemExit('Mode must be off or owner')
+    if mode not in ('off', 'owner', 'all'):
+        raise SystemExit('Mode must be off, owner or all')
     app = az('containerapp', 'show', '-n', APP, '-g', RG)
     env = {e['name']: e.get('value') for e in app['properties']['template']['containers'][0].get('env', [])}
     print('AGENT_UI_MODE was', env.get('AGENT_UI_MODE', 'unset'))
-    settings = {**AGENT_SETTINGS, 'AGENT_UI_MODE': mode} if mode == 'owner' else {'AGENT_UI_MODE': 'off'}
+    settings = {**AGENT_SETTINGS, 'AGENT_UI_MODE': mode} if mode != 'off' else {'AGENT_UI_MODE': 'off'}
     suffix = 'chat-' + mode + '-' + str(int(time.time()))[-6:]
     az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
        '--set-env-vars', *[k + '=' + v for k, v in settings.items()], parse=False)

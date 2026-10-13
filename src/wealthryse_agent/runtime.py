@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
@@ -85,6 +86,19 @@ MAX_QUESTION_CHARS = 2000
 
 LOGGER = logging.getLogger("wealthryse_agent.runtime")
 
+# Questions that need analysis rather than a lookup. Anything matching runs at the
+# full reasoning effort; plain lookups ("what is my cash balance?") run at the quick one.
+_DEEP = re.compile(
+    r"\b(chart|graph|plot|visual|table|compar|versus|vs\b|benchmark|risk|volatil|drawdown|beta|correl|sharpe"
+    r"|tracking|attribut|contribut|why|explain|analy|trend|scenario|stress|rebalanc|concentrat|diversif"
+    r"|outperform|underperform|rolling|annuali|monthly returns|best|worst|recover|over time|history|since"
+    r"|calculat|breakdown|driver)", re.IGNORECASE)
+
+
+def needs_depth(question: str) -> bool:
+    """True when a question asks for analysis, a visual or an explanation, not a single figure."""
+    return len(question) > 160 or question.count("?") > 1 or bool(_DEEP.search(question))
+
 
 def _model_error(error: Exception) -> tuple[int | None, str | None, str | None]:
     """Status, code and parameter of a model API error; never its message, which can quote the prompt."""
@@ -109,6 +123,7 @@ class Turn:
     visuals: list[dict[str, Any]] = field(default_factory=list)
     status: str = "ok"
     tool_calls: int = 0
+    effort: str = ""
     usage: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
 
 
@@ -201,13 +216,16 @@ class Agent:
         conversation.append({"role": "user", "content": question})
         results: dict[str, Any] = {}
         retried = False
+        quick = self.settings.quick_reasoning_effort
+        turn.effort = (quick if quick and instructions is None and not needs_depth(question)
+                       else self.settings.reasoning_effort)
 
         while True:
             if self.clock() - started > self.settings.timeout_seconds:
                 raise AgentError("timeout", "The analysis took too long. Try a narrower question.")
             response = self._create(
                 model=self.settings.deployment, instructions=system, input=conversation, tools=function_tools,
-                store=False, include=["reasoning.encrypted_content"], reasoning={"effort": self.settings.reasoning_effort},
+                store=False, include=["reasoning.encrypted_content"], reasoning={"effort": turn.effort},
                 max_output_tokens=self.settings.max_output_tokens, parallel_tool_calls=True,
                 text={"format": {"type": "json_schema", "name": "answer", "strict": True, "schema": ANSWER_SCHEMA}},
             )
@@ -250,6 +268,7 @@ class Agent:
                 yield {"type": "rejected", "answer": UNVERIFIED, "reason": check.feedback(), "turn": turn}
                 return
             retried = True
+            turn.effort = self.settings.reasoning_effort  # a failed quick draft gets the full effort on retry
             yield {"type": "status", "text": "Double-checking figures"}
             conversation.extend(_item(o) for o in response.output)
             conversation.append({"role": "user", "content": "Your draft failed the figure check. " + check.feedback()

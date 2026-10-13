@@ -81,6 +81,7 @@ class ModelSettings:
     max_output_tokens: int = 2500
     timeout_seconds: int = 60
     reasoning_effort: str = "low"
+    quick_reasoning_effort: str = ""
 
     @classmethod
     def from_env(cls) -> "ModelSettings":
@@ -95,6 +96,7 @@ class ModelSettings:
             max_output_tokens=_int("AGENT_MAX_OUTPUT_TOKENS", 2500, 500, 64000),
             timeout_seconds=_int("AGENT_TIMEOUT_SECONDS", 60, 10, 600),
             reasoning_effort=(_env("AGENT_REASONING_EFFORT") or "low").lower(),
+            quick_reasoning_effort=_env("AGENT_QUICK_REASONING_EFFORT").lower(),
         )
 
     def validate(self) -> None:
@@ -106,6 +108,8 @@ class ModelSettings:
             raise ValueError("The model endpoint or deployment is not configured")
         if self.reasoning_effort not in REASONING_EFFORTS:
             raise ValueError("The reasoning effort is not one the model accepts")
+        if self.quick_reasoning_effort and self.quick_reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("The quick reasoning effort is not one the model accepts")
 
 
 @dataclass(frozen=True)

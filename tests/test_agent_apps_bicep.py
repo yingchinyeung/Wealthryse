@@ -29,6 +29,8 @@ class AgentAppsBicepTest(unittest.TestCase):
         apps = BICEP.read_text()
         self.assertIn("param chatReasoningEffort string = 'xhigh'", apps)
         self.assertEqual(apps.count("AGENT_REASONING_EFFORT"), 1)  # set on the chat app only
+        self.assertIn("param chatQuickReasoningEffort string = 'low'", apps)
+        self.assertEqual(apps.count("AGENT_QUICK_REASONING_EFFORT"), 1)
         timeout = int(re.search(r"param chatTimeoutSeconds int = (\d+)", apps).group(1))
         self.assertLess(timeout, 240)
 

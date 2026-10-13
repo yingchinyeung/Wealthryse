@@ -34,6 +34,9 @@ param dailyTokenBudget int = 6000000
 @description('Reasoning effort for owner chat. The scheduled jobs keep the runtime default (low).')
 @allowed(['low', 'medium', 'high', 'xhigh'])
 param chatReasoningEffort string = 'xhigh'
+@description('Reasoning effort for plain lookups in chat (one figure, no chart or analysis). Analysis questions use chatReasoningEffort.')
+@allowed(['low', 'medium', 'high', 'xhigh'])
+param chatQuickReasoningEffort string = 'low'
 @description('Per-question limit. Stays under the 240-second Container Apps ingress request timeout.')
 @maxValue(220)
 param chatTimeoutSeconds int = 210
@@ -189,6 +192,7 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AGENT_API_AUDIENCE', value: agentApiAudience }
             { name: 'AGENT_API_ALLOWED_CALLERS', value: webPrincipalId }
             { name: 'AGENT_REASONING_EFFORT', value: chatReasoningEffort }
+            { name: 'AGENT_QUICK_REASONING_EFFORT', value: chatQuickReasoningEffort }
             { name: 'AGENT_TIMEOUT_SECONDS', value: string(chatTimeoutSeconds) }
             { name: 'AGENT_MAX_OUTPUT_TOKENS', value: string(chatMaxOutputTokens) }
             { name: 'AGENT_MAX_TOOL_CALLS', value: string(chatMaxToolCalls) }

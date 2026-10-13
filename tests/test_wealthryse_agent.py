@@ -248,6 +248,39 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Agent(ModelSettings(**{**SETTINGS.__dict__, "reasoning_effort": "maximum"}), model_client=object())
 
+    def test_plain_lookups_use_the_quick_effort(self):
+        settings = ModelSettings(**{**SETTINGS.__dict__, "reasoning_effort": "xhigh", "quick_reasoning_effort": "low"})
+
+        def effort(question, **kwargs):
+            model = _FakeModel([_final("Nothing to report.", [])])
+            list(Agent(settings, model_client=model).run(question=question, account_id="U1", tools=_FakeTools(),
+                                                         **kwargs))
+            return model.requests[0]["reasoning"]["effort"]
+
+        self.assertEqual(effort("What is my cash balance?"), "low")
+        self.assertEqual(effort("Chart my value over the last year"), "xhigh")
+        self.assertEqual(effort("Why did the account fall in March?"), "xhigh")
+        self.assertEqual(effort("How risky is this account compared with the S&P 500?"), "xhigh")
+        self.assertEqual(effort("What is my cash balance?", instructions="Job prompt"), "xhigh")  # jobs keep theirs
+
+    def test_failed_quick_draft_retries_at_full_effort(self):
+        settings = ModelSettings(**{**SETTINGS.__dict__, "reasoning_effort": "xhigh", "quick_reasoning_effort": "low"})
+        model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})),
+                            _final("Up 9% [T1].", ["T1"]), _final("Up 5.12% [T1].", ["T1"])])
+        events = list(Agent(settings, model_client=model).run(question="What was my return?", account_id="U1",
+                                                              tools=_FakeTools({"get_performance": PERF})))
+        self.assertEqual(events[-1]["type"], "answer")
+        self.assertEqual([r["reasoning"]["effort"] for r in model.requests], ["low", "low", "xhigh"])
+        self.assertEqual(events[-1]["turn"].effort, "xhigh")
+
+    def test_quick_effort_is_off_unless_set(self):
+        settings = ModelSettings(**{**SETTINGS.__dict__, "reasoning_effort": "high"})
+        model = _FakeModel([_final("Nothing to report.", [])])
+        list(Agent(settings, model_client=model).run(question="Cash?", account_id="U1", tools=_FakeTools()))
+        self.assertEqual(model.requests[0]["reasoning"]["effort"], "high")
+        with self.assertRaises(ValueError):
+            Agent(ModelSettings(**{**SETTINGS.__dict__, "quick_reasoning_effort": "tiny"}), model_client=object())
+
     def test_calculation_on_tool_figures_can_be_quoted(self):
         model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})),
                             _step(_call("calculate", {"label": "doubled", "expression": "0.0512 * 2"}, "c2")),
@@ -507,6 +540,19 @@ class DataQualityTests(unittest.TestCase):
         self.assertEqual(len(found), 3)
         self.assertEqual(data_quality_findings({"latest_valuation_date": "2026-10-10", "latest_holdings_date": "2026-10-10",
                                                 "benchmarks": []}, date(2026, 10, 12)), [])
+
+
+class BudgetWarningTests(unittest.TestCase):
+    def test_warns_once_a_day_at_eighty_percent(self):
+        from wealthryse_agent import agent_server
+        agent_server._budget_warned.clear()
+        with self.assertNoLogs("wealthryse_agent.runtime", level="WARNING"):
+            agent_server._warn_budget(799, 1000)
+        with self.assertLogs("wealthryse_agent.runtime", level="WARNING") as logs:
+            agent_server._warn_budget(800, 1000)
+            agent_server._warn_budget(900, 1000)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("AGENT_BUDGET_WARNING", logs.output[0])
 
 
 if __name__ == "__main__":

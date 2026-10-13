@@ -71,7 +71,10 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
   `gpt-6-astra` on Global Standard, so prompts may be processed in any Azure
   region (see `docs/AI_DATA_PROCESSING_APPROVAL_2026-09-22.md`). The older AI
   pieces still use the APAC Data Zone deployment.
-- **Bounded.** Owner chat runs at extra-high reasoning with at most 16 tool
+- **Bounded.** Chat runs analysis questions (charts, comparisons, risk,
+  "why") at extra-high reasoning and plain lookups at low
+  (`AGENT_QUICK_REASONING_EFFORT`); a quick draft that fails the figure check
+  is retried at extra-high. Chat allows at most 16 tool
   calls, 32,000 output tokens per model call and 210 seconds per question
   (under the 240-second ingress limit; the service sends a keepalive every 15
   seconds while the model thinks). The scheduled jobs stay at low reasoning,
@@ -132,8 +135,10 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
 
 - Model tokens: each question is a few model calls, each resending tool
   results. Extra-high reasoning can use roughly ten times the tokens of low
-  on the same question. The daily budget caps it (`AGENT_DAILY_TOKEN_BUDGET`);
-  the reasoning level is `chatReasoningEffort` in `infra/agent-apps.bicep`.
+  on the same question. The daily budget caps it (`AGENT_DAILY_TOKEN_BUDGET`),
+  and the agent logs `AGENT_BUDGET_WARNING` once a day at 80% of it. The
+  reasoning levels are `chatReasoningEffort` and `chatQuickReasoningEffort`
+  in `infra/agent-apps.bicep`.
 - One private endpoint.
 - Two Container Apps that scale to zero, and three short jobs.
 - No new database server.

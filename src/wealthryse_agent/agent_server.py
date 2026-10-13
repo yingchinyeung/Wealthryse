@@ -16,6 +16,7 @@ import os
 import queue
 import threading
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -30,6 +31,17 @@ from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
 
 LOGGER = logging.getLogger("wealthryse_agent.runtime")
+BUDGET_WARNING_SHARE = 0.8
+_budget_warned: set[str] = set()
+
+
+def _warn_budget(used: int, budget: int) -> None:
+    """Log one warning per day once 80% of the daily token budget is used, for the budget alert."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    if used >= budget * BUDGET_WARNING_SHARE and today not in _budget_warned:
+        _budget_warned.add(today)
+        LOGGER.warning("AGENT_BUDGET_WARNING daily token budget %d%% used (%d of %d)",
+                       int(100 * used / budget), used, budget)
 USER_ID = r"^[0-9a-fA-F-]{36}$"
 # Deep reasoning can think for minutes without an event; a comment line keeps the website's read open.
 KEEPALIVE_SECONDS = 15.0
@@ -175,8 +187,10 @@ def create_app(services: Services) -> FastAPI:
         if body.account_id not in accounts_for(user, correlation_id):
             raise HTTPException(status_code=403, detail="You do not have access to that account.")
         store = services.store()
-        if store.tokens_used_today() >= services.runtime.daily_token_budget:
+        used, budget = store.tokens_used_today(), services.runtime.daily_token_budget
+        if used >= budget:
             raise HTTPException(status_code=429, detail="Today's analysis budget is used up. Try again tomorrow.")
+        _warn_budget(used, budget)
         if body.conversation_id:
             conversation = store.conversation(body.conversation_id, user)
             if conversation is None or conversation["subject_id"] != body.account_id:

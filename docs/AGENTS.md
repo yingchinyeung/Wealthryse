@@ -95,9 +95,19 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
 6. **Website.** Set `AGENT_API_URL`, `AGENT_API_AUDIENCE` and
    `AGENT_UI_MODE=owner` on `ibkrv2stg-web`. This goes out through the release
    process.
-7. **Evaluate before widening.** Put about 50 real questions in
-   `agent.eval_cases`. Check there are no rejected answers and no
-   cross-account answers before setting `AGENT_UI_MODE=all`.
+7. **Evaluate before widening.** Run the evaluation inside the agent app,
+   acting for the owner:
+   ```
+   az containerapp exec -n ibkrv2stg-agent -g rg-ibkr-database-v11 \
+     --command "python -m wealthryse_agent.evaluate --user <owner's Entra object ID>"
+   ```
+   It asks 50 built-in questions (holdings, changes, performance, benchmark,
+   sectors, cash flows, freshness, refusals and questions naming another
+   account), or the rows of `agent.eval_cases` once it has some, and prints
+   only case IDs, pass or fail and reasons. Widen to `AGENT_UI_MODE=all` only
+   when it prints `READY to widen`: no rejected answers, nothing touching
+   another account, and at least 90% passing. Its token use counts against the
+   daily budget.
 
 ## Cost drivers
 

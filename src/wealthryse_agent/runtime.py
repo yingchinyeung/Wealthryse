@@ -222,7 +222,7 @@ class Agent:
                     if turn.tool_calls > self.settings.max_tool_calls:
                         raise AgentError("too_many_steps", "That needed too many lookups. Try a narrower question.")
                     yield {"type": "status", "text": TOOL_LABELS.get(call.name, "Looking up data")}
-                    output = self._call_tool(tools, call.name, call.arguments, allowed_names, results)
+                    output = self._call_tool(tools, call.name, call.arguments, allowed_names, results, account_id)
                     conversation.append({"type": "function_call_output", "call_id": call.call_id,
                                          "output": json.dumps(output)})
                 continue
@@ -257,7 +257,7 @@ class Agent:
 
     @staticmethod
     def _call_tool(tools: ToolClient, name: str, raw_arguments: str, allowed: set[str],
-                   results: dict[str, Any]) -> dict[str, Any]:
+                   results: dict[str, Any], account_id: str | None = None) -> dict[str, Any]:
         if name not in allowed:
             return {"error": {"code": "unknown_tool", "message": "That tool is not available here."}}
         try:
@@ -266,6 +266,11 @@ class Agent:
                 raise ValueError
         except ValueError:
             return {"error": {"code": "invalid_arguments", "message": "Arguments must be a JSON object."}}
+        # A conversation is about one account, even when the person may see others.
+        if account_id and "account_id" in arguments and arguments["account_id"] != account_id:
+            return {"error": {"code": "other_account", "message": (
+                f"This conversation is about account {account_id} only. Tell the person to open the other "
+                "account's page and ask there.")}}
         try:
             if name == calculator.NAME:
                 result = calculator.calculate(arguments, results)

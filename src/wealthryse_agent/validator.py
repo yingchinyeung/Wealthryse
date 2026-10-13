@@ -19,7 +19,9 @@ _NUMBER = re.compile(
     re.IGNORECASE,
 )
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_TIME = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 _CITATION = re.compile(r"\[T\d+\]")
+_NAMED_NUMBER = re.compile(r"[A-Za-z].*\d|\d.*[A-Za-z]")
 _SCALE = {"k": 1e3, "thousand": 1e3, "m": 1e6, "million": 1e6, "bn": 1e9, "billion": 1e9}
 SMALL_COUNT_LIMIT = 10
 
@@ -182,6 +184,14 @@ def validate_answer(answer: str, citations: list[str], results: Mapping[str, Any
         if not any(day in s for s in known_strings):
             report.bad_dates.append(day)
     text = _CITATION.sub(" ", _DATE.sub(" ", answer))
+    # Names that contain digits ("S&P 500", "FTSE 100") are quoted text, not figures.
+    for name in sorted((x for x in known_strings if _NAMED_NUMBER.search(x) and len(x) <= 80), key=len, reverse=True):
+        if name in text:
+            text = re.sub(r"(?<!\w)" + re.escape(name) + r"(?!\w)", " ", text)
+    # A clock time is fine when a tool returned it (for example in an import timestamp).
+    for clock in _TIME.findall(text):
+        if any(clock.zfill(5) in x or clock in x for x in known_strings):
+            text = re.sub(r"(?<![\w:])" + re.escape(clock) + r"(?![\w:])", " ", text)
 
     checked = 0
     for match in _NUMBER.finditer(text):

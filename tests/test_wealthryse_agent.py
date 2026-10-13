@@ -184,6 +184,12 @@ class RuntimeTests(unittest.TestCase):
         events = list(Agent(settings, model_client=model).run(question="Buy 100 AAPL", account_id="U1", tools=_FakeTools()))
         self.assertEqual(events[-1]["answer"], OUT_OF_SCOPE)
 
+    def test_processing_scope_is_enforced(self):
+        for scope in ("global", "apac-data-zone"):
+            Agent(ModelSettings(**{**SETTINGS.__dict__, "processing_scope": scope}), model_client=object())
+        with self.assertRaises(ValueError):
+            Agent(ModelSettings(**{**SETTINGS.__dict__, "processing_scope": "us-data-zone"}), model_client=object())
+
     def test_region_is_enforced(self):
         with self.assertRaises(ValueError):
             Agent(ModelSettings(**{**SETTINGS.__dict__, "region": "eastus"}), model_client=object())

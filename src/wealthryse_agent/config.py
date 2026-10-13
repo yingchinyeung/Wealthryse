@@ -8,6 +8,7 @@ APPROVED_REGION = "southeastasia"
 # Global processing for the agent model was approved on 13 October 2026; see
 # docs/AI_DATA_PROCESSING_APPROVAL_2026-09-22.md.
 APPROVED_PROCESSING_SCOPES = frozenset({"apac-data-zone", "global"})
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
@@ -79,6 +80,7 @@ class ModelSettings:
     max_tool_calls: int = 8
     max_output_tokens: int = 2500
     timeout_seconds: int = 60
+    reasoning_effort: str = "low"
 
     @classmethod
     def from_env(cls) -> "ModelSettings":
@@ -89,9 +91,10 @@ class ModelSettings:
             region=_env("AGENT_MODEL_REGION"),
             processing_scope=_env("AGENT_MODEL_PROCESSING_SCOPE"),
             managed_identity_client_id=_env("AZURE_CLIENT_ID"),
-            max_tool_calls=_int("AGENT_MAX_TOOL_CALLS", 8, 1, 12),
-            max_output_tokens=_int("AGENT_MAX_OUTPUT_TOKENS", 2500, 500, 8000),
-            timeout_seconds=_int("AGENT_TIMEOUT_SECONDS", 60, 10, 120),
+            max_tool_calls=_int("AGENT_MAX_TOOL_CALLS", 8, 1, 24),
+            max_output_tokens=_int("AGENT_MAX_OUTPUT_TOKENS", 2500, 500, 64000),
+            timeout_seconds=_int("AGENT_TIMEOUT_SECONDS", 60, 10, 600),
+            reasoning_effort=(_env("AGENT_REASONING_EFFORT") or "low").lower(),
         )
 
     def validate(self) -> None:
@@ -101,6 +104,8 @@ class ModelSettings:
             raise ValueError("The model processing scope is not an approved one")
         if not self.endpoint.startswith("https://") or not self.deployment:
             raise ValueError("The model endpoint or deployment is not configured")
+        if self.reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError("The reasoning effort is not one the model accepts")
 
 
 @dataclass(frozen=True)

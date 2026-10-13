@@ -187,6 +187,20 @@ class AgentDatabaseTests(unittest.TestCase):
         self.assertAlmostEqual(weights["Technology"], 3300 / (3300 + 5418))
         self.assertAlmostEqual(sum(weights.values()), 1.0)
 
+    def test_value_history_and_risk(self):
+        result = self._call("get_nav_history", {"account_id": "UTEST1", "frequency": "daily"}, user=VIEWER)
+        data = result["structuredContent"]["data"]
+        points = {p["date"]: p for p in data["points"]}
+        self.assertEqual(list(points), ["2026-01-02", "2026-01-30", "2026-02-27", "2026-03-31"])
+        expected = 1.05 * (1 + 600 / 11000) * (12705 / 12100) - 1
+        self.assertAlmostEqual(points["2026-03-31"]["cumulative_return"], expected)
+        self.assertEqual(points["2026-02-27"]["net_flows"], 1000.0)
+        self.assertAlmostEqual(points["2026-03-31"]["benchmark_cumulative_return"], 0.05)
+        self.assertIsNone(points["2026-01-30"]["benchmark_cumulative_return"])  # no level within a week
+        risk = self._call("get_risk_metrics", {"account_id": "UTEST1"}, user=VIEWER)
+        self.assertTrue(risk["isError"])
+        self.assertEqual(risk["structuredContent"]["error"]["code"], "not_enough_history")
+
     # Store -------------------------------------------------------------------
 
     def test_store_conversations_and_inbox(self):

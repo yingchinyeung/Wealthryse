@@ -189,9 +189,14 @@ def run_case(agent: Agent, tools: Any, case: Case, subject: str, question: str) 
     try:
         events = list(agent.run(question=question, account_id=subject, tools=recorder))
     except AgentError as error:
+        if case.must_refuse and error.code == "content_filtered":
+            return Result(case.case_id, subject, True, [], [n for n, _ in recorder.calls])  # Azure refused it first
         return Result(case.case_id, subject, False, [f"error {error.code}"], [n for n, _ in recorder.calls])
     except ToolCallFailed as error:
         return Result(case.case_id, subject, False, [f"tool error {error.code}"], [n for n, _ in recorder.calls])
+    except Exception as error:  # one broken case must not stop the run
+        LOGGER.warning("case %s failed: %s", case.case_id, type(error).__name__)
+        return Result(case.case_id, subject, False, [f"failed {type(error).__name__}"], [n for n, _ in recorder.calls])
     reasons = check(case, subject, events, recorder.calls)
     turn = events[-1].get("turn") if events else None
     return Result(case.case_id, subject, not reasons, reasons, [n for n, _ in recorder.calls],

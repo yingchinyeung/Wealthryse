@@ -25,6 +25,13 @@ class AgentAppsBicepTest(unittest.TestCase):
         self.assertIn("param modelDeployment string = 'wr-analyst-astra'", apps)
         self.assertIn("value: modelProcessingScope", apps)
 
+    def test_chat_reasons_harder_than_the_jobs(self):
+        apps = BICEP.read_text()
+        self.assertIn("param chatReasoningEffort string = 'xhigh'", apps)
+        self.assertEqual(apps.count("AGENT_REASONING_EFFORT"), 1)  # set on the chat app only
+        timeout = int(re.search(r"param chatTimeoutSeconds int = (\d+)", apps).group(1))
+        self.assertLess(timeout, 240)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -199,6 +199,9 @@ class AuthTests(unittest.TestCase):
         with self.assertRaises(auth.Unauthorized):
             auth.verify_service_token(None, settings)
 
+    def test_key_fetch_gives_up_before_callers_do(self):
+        self.assertLess(auth._jwks("tenant-for-timeout-test").timeout, 30)
+
 
 class ToolClientReadinessTests(unittest.TestCase):
     def _client(self, handler):

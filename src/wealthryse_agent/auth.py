@@ -27,7 +27,8 @@ class ServiceCaller:
 @lru_cache(maxsize=4)
 def _jwks(tenant_id: str) -> jwt.PyJWKClient:
     return jwt.PyJWKClient(
-        f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys", cache_keys=True, lifespan=3600
+        f"https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys", cache_keys=True, lifespan=3600,
+        timeout=10,  # well under the callers' 30-second timeout, so a key-fetch failure reads as a 401
     )
 
 

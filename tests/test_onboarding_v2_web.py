@@ -37,6 +37,16 @@ class _RecordingConnection:
         return _Rows()
 
 
+class _SourceConnection:
+    """Answers every query with one row: the Studio's lookup of its source account."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def execute(self, statement, parameters=()):
+        return _Rows(self.row)
+
+
 @contextmanager
 def _database(connection):
     yield connection
@@ -66,6 +76,7 @@ class OnboardingV2WebTests(unittest.TestCase):
             self.assertEqual(response.status_code, 404)
             page = web.account_onboarding_page(None, OWNER)
             self.assertIn("Guided onboarding wizard", page)
+            self.assertIn("Creation starts only a private nine-page onboarding case", page)
             self.assertIn('href="/ibkr-connections">IBKR connections</a>', page)
             self.assertNotIn("Broker connections", page)
             classic = self.client.get("/account-onboarding/classic", follow_redirects=False)
@@ -83,6 +94,8 @@ class OnboardingV2WebTests(unittest.TestCase):
             classic = self.client.get("/account-onboarding/classic")
             self.assertEqual(classic.status_code, 200)
             self.assertIn("Derived Portfolio Studio", classic.text)
+            self.assertIn("Creation starts a private case in the new onboarding", classic.text)
+            self.assertNotIn("nine-page onboarding case", classic.text)
             connections = self.client.get("/broker-connections").text
             self.assertIn('aria-current="page">Broker connections</a>', connections)
             self.assertIn("Show the Flex query recipe", connections)
@@ -100,6 +113,32 @@ class OnboardingV2WebTests(unittest.TestCase):
             self.assertEqual(self.client.get("/api/onboarding-v2/overview").json(), {"cases": []})
         self.assertIs(overview.call_args.args[0], connection)
         self.assertEqual(overview.call_args.kwargs["platform_ip"], "20.6.1.10")
+
+    def test_the_studio_form_opens_a_new_case_only_when_switched_on(self):
+        source = {"subject_id": "U0000501", "subject_type": "physical_account", "lifecycle_status": "active",
+                  "currency": "USD", "history_start_date": None}
+        body = {"subject_id": "synthetic-ex-taiwan", "display_name": "Synthetic ex Taiwan",
+                "source_account_id": "U0000501", "base_currency": "USD", "history_start_date": "2025-01-20",
+                "excluded_countries": ["Taiwan"], "opening_cash": {"USD": 0}, "allowed_cash_currencies": ["USD"]}
+        url = "/api/onboarding/derived-studio/filtered/start"
+        opened = {"case_id": "c1", "next_page": "/account-onboarding/cases/c1"}
+
+        def studio(switch, **patches):
+            with patch.dict(os.environ, switch), \
+                    patch.object(web, "_approval_database", return_value=_database(_SourceConnection(source))), \
+                    patch.object(onboarding_v2_web, "start_derived_case", **patches.pop("v2")) as v2, \
+                    patch.object(web, "_create_derived_studio_case", **patches.pop("classic")):
+                return self.client.post(url, json=body), v2
+
+        response, v2 = studio(ON, v2={"return_value": opened}, classic={"side_effect": AssertionError("classic")})
+        self.assertEqual((response.status_code, response.json()), (200, opened))
+        self.assertEqual(v2.call_args.kwargs["definition"]["subject_type"], "filtered_portfolio")
+        refusal = onboarding_v2_web.OnboardingError("Every sleeve must be live before this portfolio can start")
+        response, _ = studio(ON, v2={"side_effect": refusal}, classic={"side_effect": AssertionError("classic")})
+        self.assertEqual((response.status_code, response.json()["detail"]), (409, str(refusal)))
+        response, _ = studio(OFF, v2={"side_effect": AssertionError("new case")},
+                             classic={"return_value": ("c2", "d" * 64)})
+        self.assertEqual(response.json()["next_page"], "/account-onboarding/synthetic-ex-taiwan/steps/financial-contract")
 
     def test_operators_can_start_but_only_the_owner_approves_or_adds_keys(self):
         self.user = OPERATOR

@@ -133,9 +133,9 @@ def _case(**changes) -> OnboardingCase:
 
 
 def _pass_all(case: OnboardingCase) -> OnboardingCase:
-    from ibkr_etl.onboarding_cases import STAGE_CHECKS
+    from ibkr_etl.onboarding_cases import checks_for
 
-    for check_id in STAGE_CHECKS[case.stage]:
+    for check_id in checks_for(case.source_kind, case.stage):
         case = record_check(case, check_id, "pass")
     return case
 
@@ -203,6 +203,28 @@ class OnboardingCaseTests(unittest.TestCase):
             assert_can_start(broker="kiwoom_rest", broker_account_id="50123456", open_cases=[live])
         cancelled = _case(case_id="c", broker_account_id="50999999", cancelled=True)
         assert_can_start(broker="kiwoom_rest", broker_account_id="50999999", open_cases=[cancelled])
+
+    def test_a_derived_portfolio_dry_runs_instead_of_loading(self) -> None:
+        composite = _case(broker=None, broker_account_id=None, source_kind="composite_portfolio",
+                          target_subject_id="synthetic-long-short")
+        case, _ = advance(_pass_all(composite))
+        self.assertEqual(case.stage, "load_and_reconcile")
+        with self.assertRaisesRegex(ValueError, "not a check"):
+            record_check(case, "nav_reconciled", "pass")
+        case = _pass_all(case)
+        self.assertEqual(next_owner_action(case), "Approve the portfolio definition and terms.")
+        case, _ = approve(case, "account_terms")
+        self.assertEqual(advance(case)[0].stage, "build_history")
+
+        with self.assertRaisesRegex(ValueError, "portfolio ID already has"):
+            assert_can_start(target_subject_id="synthetic-long-short", open_cases=[composite])
+        with self.assertRaisesRegex(ValueError, "still being onboarded"):
+            assert_can_start(broker="kiwoom_rest", broker_account_id="50123456",
+                             target_subject_id="KIWOOM-50123456", open_cases=[composite])
+        with self.assertRaisesRegex(ValueError, "broker account case"):
+            _case(source_kind="composite_portfolio", target_subject_id="synthetic-long-short")
+        with self.assertRaisesRegex(ValueError, "broker account case"):
+            _case(broker=None)
 
     def test_cancel_only_before_go_live(self) -> None:
         case, event = cancel(_case(stage="build_history"), reason="Wrong account")

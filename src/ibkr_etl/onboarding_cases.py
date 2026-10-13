@@ -1,11 +1,16 @@
 """The four-stage case behind the new account onboarding.
 
-One broker account becomes one case. The platform does the work in each
-stage and records checks; the owner makes three decisions:
+One broker account, or one derived portfolio (a filtered account like China &
+Hong Kong, or a fixed-unit composite like Alpha World MS and T), becomes one
+case. The platform does the work in each stage and records checks; the owner
+makes three decisions:
 
-1. Request: the owner picks one discovered account and adds it.
+1. Request: the owner picks one discovered account and adds it, or describes
+   a derived portfolio whose sleeves are all live.
 2. Load and reconcile: holdings, cash and history load, every security is
-   mapped, NAV reconciles. Owner approval 1: the account terms.
+   mapped, NAV reconciles. A derived portfolio instead gets a dry run of its
+   calculation over the full history. Owner approval 1: the account terms
+   (for a derived portfolio, its exact definition).
 3. Build history: historical reports are built and reviewed. Owner approval 2:
    the historical reports. Owner approval 3: go live, after the website
    preview, by typing the confirmation phrase.
@@ -35,6 +40,13 @@ STAGE_LABELS = {
 # other case has gone live (or was cancelled).
 PRE_LIVE_STAGES = ("request", "load_and_reconcile", "build_history")
 
+SOURCE_KINDS = ("broker_account", "filtered_portfolio", "composite_portfolio")
+DERIVED_SOURCE_KINDS = ("filtered_portfolio", "composite_portfolio")
+SOURCE_LABELS = {
+    "filtered_portfolio": "Filtered portfolio",
+    "composite_portfolio": "Fixed-unit composite",
+}
+
 STAGE_CHECKS: Mapping[str, tuple[str, ...]] = {
     "request": ("connection_sees_account", "account_not_already_onboarded"),
     "load_and_reconcile": (
@@ -47,6 +59,13 @@ STAGE_CHECKS: Mapping[str, tuple[str, ...]] = {
     "first_month_end": ("first_month_end_released",),
     "closed": (),
 }
+# A derived portfolio has no broker to load from; its first two stages check
+# its sleeves and dry-run the calculation instead.
+DERIVED_STAGE_CHECKS: Mapping[str, tuple[str, ...]] = {
+    **STAGE_CHECKS,
+    "request": ("sleeves_are_live", "subject_id_is_free"),
+    "load_and_reconcile": ("sleeves_cover_history", "calculation_dry_run"),
+}
 CHECK_LABELS = {
     "connection_sees_account": "Connection can see the account",
     "account_not_already_onboarded": "Account is not already on the platform",
@@ -58,6 +77,10 @@ CHECK_LABELS = {
     "reports_rendered": "Monthly reports rendered",
     "agent_review_complete": "Agent team review",
     "first_month_end_released": "First month-end released",
+    "sleeves_are_live": "Every sleeve is live",
+    "subject_id_is_free": "Portfolio ID is not already used",
+    "sleeves_cover_history": "Sleeves and prices cover the history",
+    "calculation_dry_run": "Calculation dry run",
 }
 STAGE_EXIT_APPROVALS: Mapping[str, tuple[str, ...]] = {
     "request": (),
@@ -78,17 +101,23 @@ CHECK_STATES = ("pending", "pass", "warn", "fail")
 @dataclass(frozen=True)
 class OnboardingCase:
     case_id: str
-    broker: str
-    broker_account_id: str
+    broker: str | None
+    broker_account_id: str | None
     stage: str = "request"
     cancelled: bool = False
     checks: Mapping[str, str] = field(default_factory=dict)
     approvals: frozenset[str] = frozenset()
     acknowledged_warnings: frozenset[str] = frozenset()
+    source_kind: str = "broker_account"
+    target_subject_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.stage not in STAGES:
             raise ValueError(f"Unknown onboarding stage: {self.stage}")
+        if self.source_kind not in SOURCE_KINDS:
+            raise ValueError(f"Unknown onboarding source: {self.source_kind}")
+        if (self.source_kind == "broker_account") != bool(self.broker and self.broker_account_id):
+            raise ValueError("A broker account case needs its broker and account, and only it has them")
         unknown = set(self.approvals) - set(APPROVALS)
         if unknown:
             raise ValueError(f"Unknown approvals: {sorted(unknown)}")
@@ -105,8 +134,13 @@ class CaseEvent:
     detail: Mapping[str, object] = field(default_factory=dict)
 
 
+def checks_for(source_kind: str, stage: str) -> tuple[str, ...]:
+    table = DERIVED_STAGE_CHECKS if source_kind in DERIVED_SOURCE_KINDS else STAGE_CHECKS
+    return table[stage]
+
+
 def stage_check_states(case: OnboardingCase) -> dict[str, str]:
-    return {check_id: case.checks.get(check_id, "pending") for check_id in STAGE_CHECKS[case.stage]}
+    return {check_id: case.checks.get(check_id, "pending") for check_id in checks_for(case.source_kind, case.stage)}
 
 
 def case_status(case: OnboardingCase) -> str:
@@ -148,6 +182,8 @@ def next_owner_action(case: OnboardingCase) -> str | None:
         failed = [CHECK_LABELS[c] for c, s in stage_check_states(case).items() if s == "fail"]
         return f"Look at the failed check: {failed[0]}."
     pending = missing_approvals(case)[0]
+    if pending == "account_terms" and case.source_kind in DERIVED_SOURCE_KINDS:
+        return "Approve the portfolio definition and terms."
     return {
         "account_terms": "Approve the account terms.",
         "historical_reports": "Approve the historical reports in the Monthly reports tab.",
@@ -169,7 +205,7 @@ def terms_digest(terms: Mapping[str, object]) -> str:
 def record_check(case: OnboardingCase, check_id: str, state: str) -> OnboardingCase:
     if case.cancelled or case.stage == "closed":
         raise ValueError("The case is no longer open")
-    if check_id not in STAGE_CHECKS[case.stage]:
+    if check_id not in checks_for(case.source_kind, case.stage):
         raise ValueError(f"{check_id} is not a check for the {STAGE_LABELS[case.stage]} stage")
     if state not in CHECK_STATES:
         raise ValueError(f"Invalid check state: {state}")
@@ -244,17 +280,20 @@ def cancel(case: OnboardingCase, *, reason: str) -> tuple[OnboardingCase, CaseEv
 
 def assert_can_start(
     *,
-    broker: str,
-    broker_account_id: str,
     open_cases: Iterable[OnboardingCase],
+    broker: str | None = None,
+    broker_account_id: str | None = None,
+    target_subject_id: str | None = None,
 ) -> None:
-    """One account at a time, and never the same account twice."""
+    """One account at a time, and never the same account or portfolio twice."""
 
     for other in open_cases:
         if other.cancelled:
             continue
-        if other.broker == broker and other.broker_account_id == broker_account_id:
+        if broker and other.broker == broker and other.broker_account_id == broker_account_id:
             raise ValueError("This account already has an onboarding case")
+        if target_subject_id and other.target_subject_id == target_subject_id:
+            raise ValueError("This portfolio ID already has an onboarding case")
         if other.stage in PRE_LIVE_STAGES:
             raise ValueError(
                 "Another account is still being onboarded; it must go live or be cancelled first"

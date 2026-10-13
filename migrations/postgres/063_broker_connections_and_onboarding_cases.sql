@@ -1,5 +1,5 @@
--- New account onboarding: broker connections, one case per broker account,
--- and one security identity across brokers.
+-- New account onboarding: broker connections, one case per broker account
+-- or derived portfolio, and one security identity across brokers.
 --
 -- Additive only. No existing table, constraint or row changes, and nothing
 -- reads these tables until ONBOARDING_V2_ENABLED is set to true.
@@ -60,9 +60,18 @@ CREATE TABLE broker_connection_accounts (
 CREATE TABLE broker_onboarding_cases (
     case_id UUID PRIMARY KEY,
     tenant_id UUID NOT NULL DEFAULT app_tenant_id() REFERENCES tenants(tenant_id),
-    connection_id UUID NOT NULL,
-    broker TEXT NOT NULL CHECK (broker IN ('ibkr_flex', 'kiwoom_rest')),
-    broker_account_id TEXT NOT NULL,
+    -- A broker account comes from a connection; a filtered or composite
+    -- portfolio is calculated from live subjects by a typed definition.
+    source_kind TEXT NOT NULL DEFAULT 'broker_account' CHECK (source_kind IN (
+        'broker_account', 'filtered_portfolio', 'composite_portfolio'
+    )),
+    connection_id UUID,
+    broker TEXT CHECK (broker IN ('ibkr_flex', 'kiwoom_rest')),
+    broker_account_id TEXT,
+    definition_json JSONB,
+    definition_sha256 TEXT CHECK (definition_sha256 ~ '^[0-9a-f]{64}$'),
+    -- The platform subject this case creates, reserved from the start.
+    target_subject_id TEXT NOT NULL CHECK (target_subject_id ~ '^[A-Za-z0-9][A-Za-z0-9-]{2,63}$'),
     display_name TEXT NOT NULL CHECK (length(trim(display_name)) BETWEEN 1 AND 160),
     reporting_currency TEXT NOT NULL CHECK (reporting_currency ~ '^[A-Z]{3}$'),
     history_start_date DATE NOT NULL,
@@ -86,6 +95,15 @@ CREATE TABLE broker_onboarding_cases (
         REFERENCES broker_connection_accounts(tenant_id, connection_id, broker_account_id),
     FOREIGN KEY (tenant_id, subject_id)
         REFERENCES platform_subjects(tenant_id, subject_id),
+    CHECK (
+        (source_kind = 'broker_account'
+         AND connection_id IS NOT NULL AND broker IS NOT NULL AND broker_account_id IS NOT NULL
+         AND definition_json IS NULL AND definition_sha256 IS NULL)
+        OR (source_kind <> 'broker_account'
+         AND connection_id IS NULL AND broker IS NULL AND broker_account_id IS NULL
+         AND definition_json IS NOT NULL AND definition_sha256 IS NOT NULL)
+    ),
+    CHECK (subject_id IS NULL OR subject_id = target_subject_id),
     CHECK ((stage = 'closed') = (status = 'closed')),
     CHECK (stage IN ('request', 'load_and_reconcile') OR status = 'cancelled' OR subject_id IS NOT NULL),
     CHECK (went_live_at IS NOT NULL OR stage NOT IN ('first_month_end', 'closed')),
@@ -100,10 +118,18 @@ CREATE UNIQUE INDEX broker_onboarding_one_pre_live_case_idx
 -- Never the same broker account twice, whichever connection found it.
 CREATE UNIQUE INDEX broker_onboarding_one_case_per_account_idx
     ON broker_onboarding_cases(tenant_id, broker, broker_account_id)
+    WHERE status <> 'cancelled' AND source_kind = 'broker_account';
+
+-- Never two cases for the same platform subject.
+CREATE UNIQUE INDEX broker_onboarding_one_case_per_subject_idx
+    ON broker_onboarding_cases(tenant_id, target_subject_id)
     WHERE status <> 'cancelled';
 
 CREATE INDEX broker_onboarding_cases_status_idx
     ON broker_onboarding_cases(tenant_id, status, stage, updated_at DESC);
+
+COMMENT ON TABLE broker_onboarding_cases IS
+    'One onboarding case per broker account or derived portfolio, four stages, three owner approvals.';
 
 CREATE TABLE broker_onboarding_checks (
     tenant_id UUID NOT NULL DEFAULT app_tenant_id() REFERENCES tenants(tenant_id),

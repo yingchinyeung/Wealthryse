@@ -5431,6 +5431,17 @@ def account_onboarding_summary(
     }
 
 
+def _start_v2_derived_case(connection, *, definition: dict, actor: str) -> dict:
+    """With the new onboarding switched on, the Studio form opens a four-stage case."""
+
+    try:
+        return onboarding_v2_web.start_derived_case(
+            connection, TENANT_ID, definition=definition, actor=actor, today=date.today()
+        )
+    except onboarding_v2_web.OnboardingError as error:
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+
+
 def _create_derived_studio_case(
     connection,
     *,
@@ -5678,6 +5689,8 @@ def start_studio_filtered_portfolio(
             )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        if onboarding_v2_enabled():
+            return _start_v2_derived_case(connection, definition=definition, actor=actor)
         case_id, digest = _create_derived_studio_case(
             connection, definition=definition, actor=actor
         )
@@ -5791,6 +5804,8 @@ def start_studio_fixed_unit_composite(
             )
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        if onboarding_v2_enabled():
+            return _start_v2_derived_case(connection, definition=definition, actor=actor)
         case_id, digest = _create_derived_studio_case(
             connection, definition=definition, actor=actor
         )
@@ -8592,7 +8607,19 @@ def account_onboarding_classic_page(
 
     if not onboarding_v2_enabled():
         return RedirectResponse(url="/account-onboarding", status_code=307)
-    return HTMLResponse(_render_platform_page(user, section="account-onboarding"))
+    page = _render_platform_page(user, section="account-onboarding")
+    return HTMLResponse(page.replace(_STUDIO_CLASSIC_NOTE, _STUDIO_V2_NOTE))
+
+
+# With the new onboarding on, the Studio form starts a four-stage case instead.
+_STUDIO_CLASSIC_NOTE = (
+    "<span>Creation starts only a private nine-page onboarding case. The owner must separately "
+    "approve the immutable definition, external-data scope, reports, preview and activation.</span>"
+)
+_STUDIO_V2_NOTE = (
+    "<span>Creation starts a private case in the new onboarding. You approve the exact definition, "
+    "then the historical reports, then go live. Nothing reaches viewers before that.</span>"
+)
 
 
 def _reconciliation_prerequisite_status(checks: list[dict]) -> dict:

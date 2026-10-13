@@ -4,6 +4,10 @@ Pages: Account onboarding (cases in progress, accounts available to onboard,
 live accounts), one page per case, and Broker connections. When the switch is
 off every route here answers 404 and the existing pages are unchanged.
 
+A derived portfolio (filtered or fixed-unit composite) is described with the
+existing Derived Portfolio Studio form; with the switch on, that form opens a
+case here through start_derived_case instead of the earlier nine-page case.
+
 Database work goes through the functions below, which take a psycopg
 connection with dict rows; the routes only check who is asking. Secrets reach
 Key Vault through the existing write-only credential broker and are never
@@ -14,6 +18,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from datetime import date
 from typing import Any, Callable, Iterable, Literal, Mapping
 
@@ -37,8 +42,9 @@ from .flex_recipe import RECIPE_STEPS
 from .onboarding_cases import (
     APPROVAL_LABELS,
     CHECK_LABELS,
+    DERIVED_SOURCE_KINDS,
     PRE_LIVE_STAGES,
-    STAGE_CHECKS,
+    SOURCE_LABELS,
     STAGE_LABELS,
     OnboardingCase,
     advance,
@@ -46,6 +52,7 @@ from .onboarding_cases import (
     assert_can_start,
     cancel,
     case_status,
+    checks_for,
     go_live_phrase,
     missing_approvals,
     next_owner_action,
@@ -54,6 +61,7 @@ from .onboarding_cases import (
     stage_check_states,
     terms_digest,
 )
+from .subject_onboarding import configuration_sha256, dependencies_for_definition
 
 # IBKR connection status as the existing Flex validation records it.
 _FLEX_STATUS = {
@@ -80,6 +88,19 @@ def subject_id_for(broker: str, account_id: str) -> str:
     return account_id if broker == "ibkr_flex" else f"KIWOOM-{account_id}"
 
 
+def _display(case: OnboardingCase) -> str:
+    """The account number as the broker writes it, or the portfolio ID."""
+
+    if case.source_kind in DERIVED_SOURCE_KINDS:
+        return str(case.target_subject_id)
+    return display_account_id(str(case.broker), str(case.broker_account_id))
+
+
+def _definition(row: Mapping[str, Any]) -> dict[str, Any]:
+    value = row["definition_json"]
+    return json.loads(value) if isinstance(value, str) else dict(value)
+
+
 def _json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -92,8 +113,10 @@ def _case_from_rows(row: Mapping[str, Any], checks: Iterable[Mapping[str, Any]],
     check_rows = list(checks)
     return OnboardingCase(
         case_id=str(row["case_id"]),
-        broker=str(row["broker"]),
-        broker_account_id=str(row["broker_account_id"]),
+        broker=row.get("broker"),
+        broker_account_id=row.get("broker_account_id"),
+        source_kind=str(row.get("source_kind") or "broker_account"),
+        target_subject_id=row.get("target_subject_id"),
         stage=str(row["stage"]),
         cancelled=row["status"] == "cancelled",
         checks={str(item["check_id"]): str(item["status"]) for item in check_rows},
@@ -154,15 +177,63 @@ def _save_progress(connection, tenant_id: str, case: OnboardingCase, actor: str 
 
 
 def _account_terms(row: Mapping[str, Any]) -> dict[str, object]:
-    broker = str(row["broker"])
-    return {
-        "broker": broker,
-        "broker_account_id": str(row["broker_account_id"]),
-        "subject_id": subject_id_for(broker, str(row["broker_account_id"])),
+    common = {
+        "subject_id": str(row["target_subject_id"]),
         "display_name": str(row["display_name"]),
         "reporting_currency": str(row["reporting_currency"]),
         "history_start_date": str(row["history_start_date"]),
     }
+    kind = str(row.get("source_kind") or "broker_account")
+    if kind in DERIVED_SOURCE_KINDS:
+        # The owner approves the exact typed definition, not a description of it.
+        return {"source_kind": kind, **common, "definition_sha256": str(row["definition_sha256"]),
+                "definition": _definition(row)}
+    return {"broker": str(row["broker"]), "broker_account_id": str(row["broker_account_id"]), **common}
+
+
+def _definition_summary(definition: Mapping[str, Any]) -> list[dict[str, str]]:
+    """The definition in plain rows for the approval form."""
+
+    def listed(values: Iterable[object]) -> str:
+        return ", ".join(str(value) for value in values) or "None"
+
+    if definition.get("subject_type") == "composite_portfolio":
+        rows = [("Constant cash", f"{float(definition.get('constant_cash') or 0):g}")]
+        for item in definition.get("components", []):
+            coefficient = float(item["coefficient"])
+            rows.append((f"{'Long' if coefficient > 0 else 'Short'} sleeve",
+                         f"{abs(coefficient):g} × {item['component_name']} ({item['source_currency']})"))
+        exposure = dict(definition.get("initial_exposure") or {})
+        rows += [("Normalised to 100 on", str(definition.get("normalization_date"))),
+                 ("Starting exposure", f"long {float(exposure.get('long_risky') or 0):g}, "
+                                       f"short {float(exposure.get('short_risky') or 0):g}, "
+                                       f"NAV {float(exposure.get('nav') or 0):g}")]
+    else:
+        position_filter = dict(definition.get("position_filter") or {})
+        cash_policy = dict(definition.get("cash_policy") or {})
+        opening = dict(cash_policy.get("opening_cash") or {})
+        rows = [("Source account", str(definition.get("source_account_id"))),
+                ("Excluded countries", listed(position_filter.get("excluded_countries") or [])),
+                ("Excluded exchanges", listed(position_filter.get("excluded_exchanges") or [])),
+                ("Excluded currencies", listed(position_filter.get("excluded_currencies") or [])),
+                ("Cash currencies", listed(cash_policy.get("allowed_currencies") or [])),
+                ("Opening cash", listed(f"{key} {float(value):g}" for key, value in sorted(opening.items())))]
+    return [{"label": label, "value": value} for label, value in rows]
+
+
+def _subject_taken(connection, tenant_id: str, subject_id: str) -> bool:
+    """A live or onboarding subject, or an earlier wizard case, already uses this ID."""
+
+    if connection.execute(
+        "SELECT 1 FROM platform_subjects WHERE tenant_id = %s AND subject_id = %s",
+        (tenant_id, subject_id),
+    ).fetchone() is not None:
+        return True
+    return connection.execute(
+        "SELECT 1 FROM account_onboarding_cases WHERE tenant_id = %s AND target_subject_id = %s "
+        "AND status <> 'cancelled'",
+        (tenant_id, subject_id),
+    ).fetchone() is not None
 
 
 def _already_onboarded(connection, tenant_id: str, broker: str, account_id: str) -> bool:
@@ -211,25 +282,20 @@ def start_case(connection, tenant_id: str, *, connection_id: str, broker_account
     seen = _connection_account(connection, tenant_id, source, account_id)
     if seen is None:
         raise OnboardingError("This connection has not found that account", 404)
-    open_rows = connection.execute(
-        "SELECT case_id, broker, broker_account_id, stage, status FROM broker_onboarding_cases "
-        "WHERE tenant_id = %s AND status <> 'cancelled' FOR UPDATE",
-        (tenant_id,),
-    ).fetchall()
-    open_cases = [_case_from_rows(row, (), ()) for row in open_rows]
-    try:
-        assert_can_start(broker=broker, broker_account_id=account_id, open_cases=open_cases)
-    except ValueError as error:
-        raise OnboardingError(str(error)) from error
+    subject_id = subject_id_for(broker, account_id)
+    _assert_can_start(connection, tenant_id, broker=broker, broker_account_id=account_id,
+                      target_subject_id=subject_id)
     if _already_onboarded(connection, tenant_id, broker, account_id):
         raise OnboardingError("This account is already on the platform")
 
     case_id = str(uuid.uuid4())
     connection.execute(
-        "INSERT INTO broker_onboarding_cases (case_id, tenant_id, connection_id, broker, broker_account_id, "
-        "display_name, reporting_currency, history_start_date, stage, status, created_by_identity_sha256) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'request', 'platform_working', %s)",
-        (case_id, tenant_id, connection_id, broker, account_id, name, currency, history_start_date, actor),
+        "INSERT INTO broker_onboarding_cases (case_id, tenant_id, source_kind, connection_id, broker, "
+        "broker_account_id, target_subject_id, display_name, reporting_currency, history_start_date, stage, "
+        "status, created_by_identity_sha256) "
+        "VALUES (%s, %s, 'broker_account', %s, %s, %s, %s, %s, %s, %s, 'request', 'platform_working', %s)",
+        (case_id, tenant_id, connection_id, broker, account_id, subject_id, name, currency, history_start_date,
+         actor),
     )
     _event(connection, tenant_id, case_id, "created", "request", "request", actor,
            {"broker": broker, "connection_id": str(connection_id)})
@@ -238,7 +304,8 @@ def start_case(connection, tenant_id: str, *, connection_id: str, broker_account
         "WHERE tenant_id = %s AND connection_id = %s AND broker_account_id = %s",
         (tenant_id, connection_id, account_id),
     )
-    case = OnboardingCase(case_id=case_id, broker=broker, broker_account_id=account_id)
+    case = OnboardingCase(case_id=case_id, broker=broker, broker_account_id=account_id,
+                          target_subject_id=subject_id)
     # IBKR accounts come from a statement the connection already downloaded;
     # a Kiwoom account is confirmed by the collector's first call.
     seen_message = ("Found in this login's Flex statement." if broker == "ibkr_flex"
@@ -250,6 +317,80 @@ def start_case(connection, tenant_id: str, *, connection_id: str, broker_account
     case = _save_progress(connection, tenant_id, case, actor)
     return {"case_id": case_id, "stage": case.stage, "status": case_status(case),
             "next_page": f"/account-onboarding/cases/{case_id}"}
+
+
+def _assert_can_start(connection, tenant_id: str, **candidate: str | None) -> None:
+    open_rows = connection.execute(
+        "SELECT case_id, source_kind, broker, broker_account_id, target_subject_id, stage, status "
+        "FROM broker_onboarding_cases WHERE tenant_id = %s AND status <> 'cancelled' FOR UPDATE",
+        (tenant_id,),
+    ).fetchall()
+    try:
+        assert_can_start(open_cases=[_case_from_rows(row, (), ()) for row in open_rows], **candidate)
+    except ValueError as error:
+        raise OnboardingError(str(error)) from error
+
+
+def _sleeve_states(connection, tenant_id: str, definition: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """The live subjects a derived portfolio is built from, and any that are not live.
+
+    Benchmark sleeves are market prices, not platform subjects; the Studio form
+    already limits them to the approved catalogue with history on the start date.
+    """
+
+    try:
+        dependencies = dependencies_for_definition(definition)
+    except ValueError as error:
+        raise OnboardingError(str(error), 400) from error
+    required = sorted({item.depends_on_subject_id for item in dependencies if item.dependency_type != "benchmark"})
+    rows = connection.execute(
+        "SELECT subject_id, lifecycle_status FROM platform_subjects WHERE tenant_id = %s AND subject_id = ANY(%s) "
+        "FOR SHARE",
+        (tenant_id, required),
+    ).fetchall()
+    active = {str(row["subject_id"]) for row in rows if str(row["lifecycle_status"]) == "active"}
+    return required, [item for item in required if item not in active]
+
+
+def start_derived_case(connection, tenant_id: str, *, definition: Mapping[str, Any], actor: str | None,
+                       today: date) -> dict:
+    """Open a case for a filtered or composite portfolio the Studio form already validated."""
+
+    kind = str(definition.get("subject_type") or "")
+    if kind not in DERIVED_SOURCE_KINDS:
+        raise OnboardingError("Only filtered portfolios and fixed-unit composites are supported", 400)
+    subject_id = str(definition["subject_id"])
+    starts = date.fromisoformat(str(definition.get("history_start_date") or definition["normalization_date"]))
+    if starts > today:
+        raise OnboardingError("History cannot start in the future", 400)
+    _assert_can_start(connection, tenant_id, target_subject_id=subject_id)
+    if _subject_taken(connection, tenant_id, subject_id):
+        raise OnboardingError("This portfolio ID is already used on the platform")
+    sleeves, not_live = _sleeve_states(connection, tenant_id, definition)
+    if not_live:
+        raise OnboardingError("Every sleeve must be live before this portfolio can start: " + ", ".join(not_live))
+
+    digest = configuration_sha256(definition)
+    case_id = str(uuid.uuid4())
+    connection.execute(
+        "INSERT INTO broker_onboarding_cases (case_id, tenant_id, source_kind, definition_json, definition_sha256, "
+        "target_subject_id, display_name, reporting_currency, history_start_date, stage, status, "
+        "created_by_identity_sha256) "
+        "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, 'request', 'platform_working', %s)",
+        (case_id, tenant_id, kind, _json(definition), digest, subject_id, str(definition["display_name"]),
+         str(definition["base_currency"]), starts, actor),
+    )
+    _event(connection, tenant_id, case_id, "created", "request", "request", actor,
+           {"source_kind": kind, "definition_sha256": digest})
+    case = OnboardingCase(case_id=case_id, broker=None, broker_account_id=None, source_kind=kind,
+                          target_subject_id=subject_id)
+    case = _write_check(connection, tenant_id, case, "sleeves_are_live", "pass",
+                        "Live: " + ", ".join(sleeves) + ".", {"sleeves": sleeves}, actor)
+    case = _write_check(connection, tenant_id, case, "subject_id_is_free", "pass",
+                        "No live subject or earlier case uses this ID.", {}, actor)
+    case = _save_progress(connection, tenant_id, case, actor)
+    return {"case_id": case_id, "subject_id": subject_id, "definition_sha256": digest, "stage": case.stage,
+            "status": case_status(case), "next_page": f"/account-onboarding/cases/{case_id}"}
 
 
 def _write_check(connection, tenant_id: str, case: OnboardingCase, check_id: str, status: str, message: str,
@@ -265,8 +406,7 @@ def _write_check(connection, tenant_id: str, case: OnboardingCase, check_id: str
     _event(connection, tenant_id, case.case_id, "check_recorded", case.stage, case.stage, actor,
            {"check_id": check_id, "status": status})
     # A re-recorded check needs a fresh acknowledgement if it warns again.
-    return OnboardingCase(case.case_id, case.broker, case.broker_account_id, case.stage, case.cancelled,
-                          case.checks, case.approvals, case.acknowledged_warnings - {check_id})
+    return replace(case, acknowledged_warnings=case.acknowledged_warnings - {check_id})
 
 
 def record_platform_check(connection, tenant_id: str, case_id: str, check_id: str, status: str, message: str,
@@ -290,10 +430,10 @@ def approve_case(connection, tenant_id: str, case_id: str, *, approval: str, ter
     terms = _account_terms(row)
     if terms_digest(terms) != terms_sha256:
         raise OnboardingError("The terms changed after this page loaded; reload and review them again")
-    acknowledged = [item for item in acknowledge_warnings if item in STAGE_CHECKS[case.stage]]
+    acknowledged = [item for item in acknowledge_warnings if item in checks_for(case.source_kind, case.stage)]
     try:
         case, event = approve(case, approval, acknowledge_warnings=acknowledged, confirmation=confirmation,
-                              broker_account_display=display_account_id(case.broker, case.broker_account_id))
+                              broker_account_display=_display(case))
     except ValueError as error:
         raise OnboardingError(str(error)) from error
     for check_id in acknowledged:
@@ -304,7 +444,9 @@ def approve_case(connection, tenant_id: str, case_id: str, *, approval: str, ter
         )
         _event(connection, tenant_id, case_id, "warning_acknowledged", case.stage, case.stage, actor,
                {"check_id": check_id})
-    if approval == "account_terms":
+    if approval == "account_terms" and case.source_kind in DERIVED_SOURCE_KINDS:
+        _register_derived_subject(connection, tenant_id, row, terms, actor)
+    elif approval == "account_terms":
         _register_subject(connection, tenant_id, row, terms)
     connection.execute(
         "INSERT INTO broker_onboarding_approvals (tenant_id, case_id, approval_kind, terms_json, terms_sha256, "
@@ -341,6 +483,50 @@ def _register_subject(connection, tenant_id: str, row: Mapping[str, Any], terms:
     )
 
 
+def _register_derived_subject(connection, tenant_id: str, row: Mapping[str, Any], terms: Mapping[str, object],
+                              actor: str) -> None:
+    """Approval 1 registers the portfolio privately with the exact definition the owner approved."""
+
+    definition = _definition(row)
+    digest = configuration_sha256(definition)
+    if digest != row["definition_sha256"]:
+        raise OnboardingError("The stored definition no longer matches what was reviewed; cancel and start again")
+    _, not_live = _sleeve_states(connection, tenant_id, definition)
+    if not_live:
+        raise OnboardingError("A sleeve stopped being live: " + ", ".join(not_live))
+    subject_id = str(terms["subject_id"])
+    connection.execute(
+        "INSERT INTO platform_subjects (tenant_id, subject_id, subject_type, display_name, source_account_id, "
+        "base_currency, reporting_currency, history_start_date, inception_date, lifecycle_status, metadata_json) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'onboarding', %s::jsonb)",
+        (tenant_id, subject_id, definition["subject_type"], terms["display_name"],
+         definition.get("source_account_id"), definition["base_currency"], terms["reporting_currency"],
+         terms["history_start_date"], terms["history_start_date"],
+         _json({"onboarding": "broker_onboarding_v2", "case_id": str(row["case_id"]),
+                "source_system": "derived_definition", "definition_origin": "website_derived_portfolio_studio",
+                "definition_sha256": digest})),
+    )
+    connection.execute(
+        "INSERT INTO subject_calculation_definitions (definition_id, tenant_id, subject_id, subject_type, "
+        "calculation_kind, definition_version, configuration_json, configuration_sha256, approval_status, "
+        "effective_from, created_by_identity_sha256, approved_by_identity_sha256, approved_at) "
+        "VALUES (%s, %s, %s, %s, %s, 1, %s::jsonb, %s, 'approved', %s, %s, %s, now())",
+        (uuid.uuid4(), tenant_id, subject_id, definition["subject_type"], definition["calculation_kind"],
+         _json(definition), digest, terms["history_start_date"], row.get("created_by_identity_sha256"), actor),
+    )
+    for dependency in dependencies_for_definition(definition):
+        connection.execute(
+            "INSERT INTO subject_dependencies (tenant_id, subject_id, depends_on_subject_id, dependency_type, "
+            "effective_from, configuration_json) VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
+            (tenant_id, subject_id, dependency.depends_on_subject_id, dependency.dependency_type,
+             dependency.effective_from, _json(dict(dependency.configuration))),
+        )
+    connection.execute(
+        "UPDATE broker_onboarding_cases SET subject_id = %s WHERE tenant_id = %s AND case_id = %s",
+        (subject_id, tenant_id, row["case_id"]),
+    )
+
+
 def cancel_case(connection, tenant_id: str, case_id: str, *, reason: str, actor: str) -> dict:
     row, _, _, case = _load_case(connection, tenant_id, case_id, lock=True)
     try:
@@ -352,15 +538,22 @@ def cancel_case(connection, tenant_id: str, case_id: str, *, reason: str, actor:
         "WHERE tenant_id = %s AND case_id = %s",
         (tenant_id, case_id),
     )
-    connection.execute(
-        "UPDATE broker_connection_accounts SET discovery_status = 'discovered' "
-        "WHERE tenant_id = %s AND connection_id = %s AND broker_account_id = %s",
-        (tenant_id, row["connection_id"], row["broker_account_id"]),
-    )
+    if case.source_kind == "broker_account":
+        connection.execute(
+            "UPDATE broker_connection_accounts SET discovery_status = 'discovered' "
+            "WHERE tenant_id = %s AND connection_id = %s AND broker_account_id = %s",
+            (tenant_id, row["connection_id"], row["broker_account_id"]),
+        )
     if row["subject_id"]:
         connection.execute(
             "UPDATE platform_subjects SET lifecycle_status = 'archived', updated_at = now() "
             "WHERE tenant_id = %s AND subject_id = %s AND lifecycle_status = 'onboarding'",
+            (tenant_id, row["subject_id"]),
+        )
+        # No calculation may run from a definition whose case was stopped.
+        connection.execute(
+            "UPDATE subject_calculation_definitions SET approval_status = 'rejected' "
+            "WHERE tenant_id = %s AND subject_id = %s AND approval_status IN ('validated', 'approved')",
             (tenant_id, row["subject_id"]),
         )
     _event(connection, tenant_id, case_id, "cancelled", event.from_stage, event.to_stage, actor, event.detail)
@@ -370,14 +563,17 @@ def cancel_case(connection, tenant_id: str, case_id: str, *, reason: str, actor:
 def case_detail(connection, tenant_id: str, case_id: str) -> dict:
     row, checks, approvals, case = _load_case(connection, tenant_id, case_id)
     by_id = {str(item["check_id"]): item for item in checks}
-    account_display = display_account_id(case.broker, case.broker_account_id)
+    account_display = _display(case)
     terms = _account_terms(row)
+    derived = case.source_kind in DERIVED_SOURCE_KINDS
     stage_number = min(list(STAGE_LABELS).index(case.stage) + 1, 4)
     return {
         "case_id": case.case_id,
+        "source_kind": case.source_kind,
         "broker": case.broker,
-        "broker_label": BROKERS[case.broker].label,
+        "broker_label": SOURCE_LABELS[case.source_kind] if derived else BROKERS[str(case.broker)].label,
         "account": account_display,
+        "definition_summary": _definition_summary(terms["definition"]) if derived else [],
         "display_name": row["display_name"],
         "reporting_currency": row["reporting_currency"],
         "history_start_date": str(row["history_start_date"]),
@@ -820,7 +1016,7 @@ def install(
 # Pages ---------------------------------------------------------------------
 
 ONBOARDING_DESCRIPTION = "Pick one account at a time. Nothing is imported or shown to viewers until you start its case."
-CASE_DESCRIPTION = "One account, four stages, three decisions from you."
+CASE_DESCRIPTION = "One account or portfolio, four stages, three decisions from you."
 CONNECTIONS_DESCRIPTION = "One connection per broker login. Keys go straight to Key Vault and are never shown again."
 
 ONBOARDING_CONTENT = """<div class="page-view active" data-section="account-onboarding">
@@ -891,7 +1087,7 @@ const render=c=>{
   document.querySelector('#case-approvals').innerHTML=c.approvals.map((a,i)=>`<div class="status-item"><div class="label">Approval ${i+1}</div><strong>${esc(a.label)}</strong>${a.approved?pill('Approved','active'):pill(a.available?'Not yet':'Comes with the history build','blocked')}</div>`).join('');
   const ready=c.may_approve&&c.awaiting_approval==='account_terms';
   const form=document.querySelector('#case-approval-form');
-  if(ready){const t=c.account_terms,warns=c.checks.filter(k=>k.status==='warn');form.innerHTML=`<form id="terms-form"><h3>Approve the account terms</h3><div class="status-row">${[['Account',c.account],['Display name',t.display_name],['Reporting currency',t.reporting_currency],['History from',t.history_start_date]].map(([k,v])=>`<div class="status-item"><div class="label">${esc(k)}</div><strong>${esc(v)}</strong></div>`).join('')}</div>${warns.map(k=>`<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="ack" value="${esc(k.check_id)}" required> <span>I have read the warning on ${esc(k.label)}.</span></label>`).join('')}<div class="actions"><button class="button" type="submit">Approve account terms</button></div></form>`;
+  if(ready){const t=c.account_terms,derived=c.source_kind!=='broker_account',warns=c.checks.filter(k=>k.status==='warn'),facts=[[derived?'Portfolio ID':'Account',c.account],['Display name',t.display_name],['Reporting currency',t.reporting_currency],['History from',t.history_start_date],...(c.definition_summary||[]).map(r=>[r.label,r.value])];form.innerHTML=`<form id="terms-form"><h3>${derived?'Approve the portfolio definition':'Approve the account terms'}</h3><div class="status-row">${facts.map(([k,v])=>`<div class="status-item"><div class="label">${esc(k)}</div><strong>${esc(v)}</strong></div>`).join('')}</div>${warns.map(k=>`<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="ack" value="${esc(k.check_id)}" required> <span>I have read the warning on ${esc(k.label)}.</span></label>`).join('')}<div class="actions"><button class="button" type="submit">${derived?'Approve definition and terms':'Approve account terms'}</button></div></form>`;
     form.querySelector('form').addEventListener('submit',async event=>{event.preventDefault();const button=event.currentTarget.querySelector('button');button.disabled=true;result.textContent='Recording your approval…';try{await post(`/api/onboarding-v2/cases/${caseId}/approvals/account_terms`,{terms_sha256:c.account_terms_sha256,acknowledge_warnings:[...event.currentTarget.querySelectorAll('input[name=ack]:checked')].map(x=>x.value)});result.textContent='Approved.';load()}catch(error){result.textContent=`Not approved: ${error.message}`;button.disabled=false}})}
   else form.innerHTML='';
   document.querySelector('#case-cancel-card').hidden=!(c.can_cancel&&c.may_approve);

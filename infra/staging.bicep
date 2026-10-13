@@ -20,9 +20,6 @@ param databaseName string = 'ibkr_staging'
 param postgresSkuName string = 'Standard_B1ms'
 param postgresSkuTier string = 'Burstable'
 param postgresVersion string = '16'
-param budgetAmount int = 120000
-param budgetStartDate string
-param budgetContactEmail string = 'anthony.ying@wealthryse.ai'
 
 param tags object = {
   application: 'ibkr-portfolio-platform'
@@ -459,62 +456,6 @@ resource databaseAppPasswordSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01
   }
 }
 
-resource stagingBudget 'Microsoft.Consumption/budgets@2024-08-01' = {
-  name: '${prefix}-monthly-budget'
-  properties: {
-    amount: budgetAmount
-    category: 'Cost'
-    timeGrain: 'Monthly'
-    timePeriod: {
-      startDate: budgetStartDate
-    }
-    filter: {
-      tags: {
-        name: 'environment'
-        operator: 'In'
-        values: [
-          'staging'
-        ]
-      }
-    }
-    notifications: {
-      warning75k: {
-        enabled: true
-        operator: 'GreaterThan'
-        threshold: json('62.5')
-        thresholdType: 'Actual'
-        contactEmails: [
-          budgetContactEmail
-        ]
-        contactGroups: []
-        contactRoles: []
-      }
-      warning100k: {
-        enabled: true
-        operator: 'GreaterThan'
-        threshold: json('83.33')
-        thresholdType: 'Actual'
-        contactEmails: [
-          budgetContactEmail
-        ]
-        contactGroups: []
-        contactRoles: []
-      }
-      review120k: {
-        enabled: true
-        operator: 'GreaterThan'
-        threshold: 100
-        thresholdType: 'Forecasted'
-        contactEmails: [
-          budgetContactEmail
-        ]
-        contactGroups: []
-        contactRoles: []
-      }
-    }
-  }
-}
-
 output registryName string = registry.name
 output registryLoginServer string = registry.properties.loginServer
 output storageAccountName string = storage.name
@@ -528,4 +469,3 @@ output ingestionIdentityResourceId string = ingestionIdentity.id
 output publisherIdentityResourceId string = publisherIdentity.id
 output diagnosticsIdentityResourceId string = diagnosticsIdentity.id
 output approvedActionsIdentityResourceId string = approvedActionsIdentity.id
-output monthlyBudgetAmount int = budgetAmount

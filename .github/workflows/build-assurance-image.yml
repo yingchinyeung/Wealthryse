@@ -1,0 +1,37 @@
+name: Build assurance image
+
+# Manual: builds the analyst-assurance image on the private build VM and pushes
+# it to the registry. It starts from the exact image the assurance job ran on
+# 13 Oct 2026 and changes only the report layout names it expects (see
+# ASSURANCE_REPLACEMENTS in deploy/website_release.py). The assurance job, the
+# website and the database are not changed; switching the job to the new image
+# is a separate, owner-approved step.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-website
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AZURE_CLIENT_ID: 17708c85-b855-4209-81dd-a613a91315d3
+      AZURE_TENANT_ID: 0578a50b-a7a1-40a4-905b-8b20dba84124
+      AZURE_SUBSCRIPTION_ID: 3956e821-cee4-403f-8708-e84e2ed490eb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      - name: Build and push the assurance image
+        run: python deploy/website_release.py assurance-build

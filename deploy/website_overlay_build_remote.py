@@ -1,5 +1,9 @@
 """Build a website image on the private build VM. Run only via Azure Run Command.
 
+With CONFIG['replacements'] it instead builds the analyst-assurance image: the
+exact image the assurance job runs, with only the named strings replaced (each
+must appear exactly once where expected) and a check of the result.
+
 The deploy-website workflow fills in CONFIG and runs this as root inside a
 private mount namespace (`unshare --mount`). It starts from the exact image
 the website runs today, applies only the reviewed change to src/ibkr_etl on top
@@ -99,8 +103,40 @@ def find_python(client, base, env):
         'found': sorted(n for n in entries if 'python' in os.path.basename(n))[:20], 'path': path}))
 
 
+def apply_replacements(package, replacements):
+    """Replace each old string exactly once; refuse anything ambiguous or missing.
+
+    Each entry is {'file': name or None, 'old': text, 'new': text}. With a file
+    the old text must appear exactly once in that file; without one, exactly
+    once across the whole package. Returns {file: count} and any other files
+    that also mention an old string (reported, never changed).
+    """
+    files = {p.relative_to(package).as_posix(): p for p in sorted(package.rglob('*.py')) if '__pycache__' not in p.parts}
+    texts = {name: path.read_text() for name, path in files.items()}
+    touched, elsewhere = {}, {}
+    for item in replacements:
+        old, new, wanted = item['old'], item['new'], item.get('file')
+        found = {name: text.count(old) for name, text in texts.items() if old in text}
+        if wanted is not None:
+            if found.get(wanted) != 1:
+                raise ValueError(old + ' appears ' + str(found.get(wanted, 0)) + ' times in ' + wanted + '; nothing built')
+            name = wanted
+        else:
+            if sum(found.values()) != 1:
+                raise ValueError(old + ' appears ' + str(sum(found.values())) + ' times in the package; nothing built')
+            name = next(iter(found))
+        texts[name] = texts[name].replace(old, new)
+        touched[name] = touched.get(name, 0) + 1
+        others = sorted(n for n in found if n != name)
+        if others:
+            elsewhere[old] = others
+    for name in touched:
+        files[name].write_text(texts[name])
+    return touched, elsewhere
+
+
 class Captured(Exception):
-    """Capture finished; skip the build."""
+    """Finished early (a capture or the assurance build); skip the website build."""
 
 
 def tree_hashes(folder):
@@ -125,7 +161,8 @@ def rejected_context(package):
 def main():
     config = CONFIG
     base, target = config['base_image'], config['target_image']
-    if not base.startswith(REG + '/') or not target.startswith(REG + '/ibkr-platform:web-'):
+    prefix = '/ibkr-platform:assurance-' if config.get('replacements') else '/ibkr-platform:web-'
+    if not base.startswith(REG + '/') or not target.startswith(REG + prefix):
         raise ValueError('Unexpected image names')
     os.umask(0o077)
     if os.geteuid() != 0 or os.readlink('/proc/self/ns/mnt') == os.readlink('/proc/1/ns/mnt'):
@@ -227,6 +264,31 @@ def main():
                     tar.add(str(package / name), arcname=name)
             detail = base64.b64encode(buffer.getvalue()).decode()
             result.update(passed=True, captured={n: live[n] for n in names})
+            raise Captured()
+        if config.get('replacements'):
+            touched, elsewhere = apply_replacements(package, config['replacements'])
+            changed = sorted(n for n, h in tree_hashes(package).items() if live.get(n) != h)
+            if changed != sorted(touched):
+                raise ValueError('The replacements changed files they should not have; nothing built')
+            result.update(touched_files=touched, also_mentioned_in=elsewhere)
+            user = run(client + ['image', 'inspect', base, '--format', '{{.Config.User}}'], 'image user', env=env).strip() or '0'
+            python = find_python(client, base, env)
+            install = (INSTALL_SCRIPT.replace('REMOVED', repr([])).replace('RUNTIME_USER', repr(user)))
+            lines = ['FROM ' + base, 'USER 0:0',
+                     'LABEL ai.wealthryse.source-commit="' + config['source_commit'] + '"',
+                     'COPY src/ibkr_etl/ /app/src/ibkr_etl/',
+                     'RUN ' + json.dumps([python, '-c', install]),
+                     'USER ' + user,
+                     'RUN ' + json.dumps([python, '-c', config['check']])]
+            result.update(runtime_user=user, python=python)
+            (context / 'Dockerfile').write_text('\n'.join(lines) + '\n')
+            run(client + ['build', '--network=none', '--pull=false', '-t', target, str(context)], 'assurance image build', timeout=1800, env=env)
+            run(client + ['push', target], 'assurance image push', env=env)
+            digests = json.loads(run(client + ['image', 'inspect', target, '--format', '{{json .RepoDigests}}'], 'pushed digest', env=env))
+            pushed = [d for d in digests if d.startswith(REG + '/ibkr-platform@sha256:')]
+            if len(pushed) != 1:
+                raise ValueError('Pushed digest missing')
+            result.update(passed=True, pushed_image=pushed[0])
             raise Captured()
         expected, wanted = config['live_hashes'], config['new_hashes']
         # Counts only: the full lists were reported by earlier runs and the

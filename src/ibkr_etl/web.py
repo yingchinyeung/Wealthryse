@@ -161,6 +161,8 @@ from .portfolio_analytics import (
     trading_activity as calculate_trading_activity,
 )
 from .holdings_view import combine_holdings, enrich_holdings
+from .live_ui import live_assets
+from .live_view import live_view_allowed, read_positions, read_summary, read_trades
 from .sector_classification import YAHOO_PROVIDER as HOLDINGS_SECTOR_PROVIDER
 
 
@@ -1907,6 +1909,41 @@ def holdings(
         "snapshot_date": rows[0]["snapshot_date"] if rows else None,
         "holdings": rows,
     }
+
+
+def _live_access(account_id: str, user: dict[str, object]) -> dict[str, object]:
+    """Live data needs view access to the account and its live_view switch."""
+    access = _portfolio_access_context(account_id, user)
+    if not live_view_allowed(access, user):
+        raise HTTPException(status_code=404, detail="Live data not available")
+    return access
+
+
+@app.get("/api/portfolio/{account_id}/live")
+def live_summary(
+    account_id: str, user: dict[str, object] = Depends(_authorized_user)
+) -> dict:
+    _live_access(account_id, user)
+    with _database() as connection:
+        return read_summary(connection, TENANT_ID, account_id, datetime.now(timezone.utc))
+
+
+@app.get("/api/portfolio/{account_id}/live/positions")
+def live_positions(
+    account_id: str, user: dict[str, object] = Depends(_authorized_user)
+) -> dict:
+    _live_access(account_id, user)
+    with _database() as connection:
+        return read_positions(connection, TENANT_ID, account_id)
+
+
+@app.get("/api/portfolio/{account_id}/live/trades")
+def live_trades(
+    account_id: str, user: dict[str, object] = Depends(_authorized_user)
+) -> dict:
+    _live_access(account_id, user)
+    with _database() as connection:
+        return read_trades(connection, TENANT_ID, account_id, datetime.now(timezone.utc))
 
 
 @app.get("/api/portfolio/{account_id}/sectors")
@@ -10577,6 +10614,9 @@ def _render_account_page(
     preview_mode = bool(access["preview_mode"])
     design_controls_html = report_design_controls(account_id) if is_owner and not preview_mode else ''
     design_controls_script = REPORT_DESIGN_SCRIPT if design_controls_html else ''
+    live_page_assets = (
+        live_assets(account_id, section) if live_view_allowed(access, user) else ""
+    )
     visible_sections = (
         ONBOARDING_PREVIEW_SECTIONS if preview_mode else set(ACCOUNT_SECTIONS)
     )
@@ -10865,7 +10905,7 @@ asOfSelect.addEventListener('change',()=>(rememberAsOf(asOfSelect.value),renderA
 if(!previewMode){{const savedConversations=await refreshConversations(null);if(savedConversations.length)await openConversation(savedConversations[0].conversation_id);else{{updateChatHeader(null);emptyChat()}}}}else{{updateChatHeader(null);emptyChat()}}analysisRun.disabled=!a.ai_model.enabled;
 await renderAsOf(asOfSelect.value)
 }}).catch(error=>loadFailure(error,'The figures for this account could not be loaded. Refresh the page. If this keeps happening, the daily data refresh may have failed.'));
-</script>{design_controls_script}</body></html>"""
+</script>{live_page_assets}{design_controls_script}</body></html>"""
 
 
 # WealthRyse agents: chat panel, Explain buttons and inbox. Off unless

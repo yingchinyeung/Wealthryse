@@ -18,7 +18,7 @@ Browser → ibkrv2stg-web (chat panel, Explain buttons, /agent-inbox)
             │ MCP over internal HTTPS            │ private endpoint
             ▼                                    ▼
          ibkrv2stg-agent-tools               Foundry model deployments
-         (8 read-only tools)                 (gpt-6-astra, Global Standard)
+         (10 read-only tools)                (gpt-6-astra, Global Standard)
             │ Entra login, agent_reader role
             ▼
          PostgreSQL: agent schema (scoped views + agent tables)
@@ -31,7 +31,7 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
 |---|---|
 | Database schema | `migrations/agent/001_agent_schema.sql`, installed by `scripts/install_agent_schema.py` |
 | Tool server | `src/wealthryse_agent/tool_server.py`, `tools.py`, `access.py` |
-| Agent runtime | `src/wealthryse_agent/agent_server.py`, `runtime.py`, `validator.py`, `store.py` |
+| Agent runtime | `src/wealthryse_agent/agent_server.py`, `runtime.py`, `validator.py`, `calculator.py`, `store.py` |
 | Jobs | `src/wealthryse_agent/jobs.py` |
 | Website | `src/ibkr_etl/agent_web.py` and a hook at the end of `web.py` |
 | Azure | `infra/agent-foundation.bicep`, `infra/agent-apps.bicep`, `Dockerfile.agent` |
@@ -52,6 +52,16 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
 - **No invented numbers.** `validator.py` rejects any answer containing a
   figure, date or citation that no tool returned. The model gets one retry,
   then the person sees a plain "couldn't verify" message.
+- **Arithmetic by code.** When an answer needs a derived figure (a sum,
+  ratio, weighted or compounded return), the model calls `calculate`, which
+  runs inside the agent service and accepts only numbers that tools already
+  returned plus a few fixed constants (100, 252, 365 and so on). Its result
+  gets a citation id like any tool result.
+- **Charts and tables are data, not pictures.** Answers may carry up to four
+  tables or line, bar or pie charts. Every value in them goes through the same
+  figure check, every date must be one a tool returned, and the website draws
+  them itself. They are saved with the message's citations, so no schema change
+  was needed.
 - **Private.** The model resource has public access and key sign-in turned
   off and is reached through a private endpoint. Azure keeps no conversation
   state (`store=False`). Chats stay in your Postgres and are deleted after 90
@@ -61,8 +71,12 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
   `gpt-6-astra` on Global Standard, so prompts may be processed in any Azure
   region (see `docs/AI_DATA_PROCESSING_APPROVAL_2026-09-22.md`). The older AI
   pieces still use the APAC Data Zone deployment.
-- **Bounded.** At most 8 tool calls and 60 seconds per question, a daily token
-  budget, and questions up to 2,000 characters.
+- **Bounded.** Owner chat runs at extra-high reasoning with at most 16 tool
+  calls, 32,000 output tokens per model call and 210 seconds per question
+  (under the 240-second ingress limit; the service sends a keepalive every 15
+  seconds while the model thinks). The scheduled jobs stay at low reasoning,
+  8 tool calls and 60 seconds. A daily token budget and 2,000-character
+  questions apply to both.
 - **Off by default.** `AGENT_UI_MODE=off` on the website. `owner` shows it to
   owners only; `all` to everyone with account access.
 
@@ -117,7 +131,9 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool
-  results. The daily budget caps it (`AGENT_DAILY_TOKEN_BUDGET`).
+  results. Extra-high reasoning can use roughly ten times the tokens of low
+  on the same question. The daily budget caps it (`AGENT_DAILY_TOKEN_BUDGET`);
+  the reasoning level is `chatReasoningEffort` in `infra/agent-apps.bicep`.
 - One private endpoint.
 - Two Container Apps that scale to zero, and three short jobs.
 - No new database server.

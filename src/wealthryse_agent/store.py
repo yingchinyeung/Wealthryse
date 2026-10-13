@@ -63,7 +63,7 @@ class Store:
             "WHERE conversation_id = ?::uuid ORDER BY message_id", (conversation_id,),
         ).fetchall()
         self.db.rollback()
-        return [dict(r) for r in rows]
+        return [_split_visuals(dict(r)) for r in rows]
 
     def add_message(self, conversation_id: str, role: str, content: str, *, citations: Sequence[Any] = (),
                     status: str = "ok", correlation_id: str | None = None,
@@ -195,3 +195,13 @@ class Store:
         row = self.db.execute("SELECT agent.purge_conversations(?) AS removed", (days,)).fetchone()
         self._commit()
         return int(row["removed"])
+
+
+def _split_visuals(message: dict[str, Any]) -> dict[str, Any]:
+    """Charts and tables are saved alongside citations as {"visual": ...} entries."""
+    entries = message.get("citations") or []
+    if isinstance(entries, str):
+        entries = json.loads(entries)
+    message["citations"] = [c for c in entries if not (isinstance(c, dict) and "visual" in c)]
+    message["visuals"] = [c["visual"] for c in entries if isinstance(c, dict) and "visual" in c]
+    return message

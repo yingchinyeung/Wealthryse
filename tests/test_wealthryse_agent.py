@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import unittest
 from datetime import date
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ from wealthryse_agent.runtime import OUT_OF_SCOPE, UNVERIFIED, Agent, AgentError
 from wealthryse_agent.tool_client import ToolCallFailed  # noqa: E402
 from wealthryse_agent.tools import REGISTRY, ToolError, validate_arguments  # noqa: E402
 from wealthryse_agent.validator import validate_answer  # noqa: E402
-from wealthryse_agent import auth, evaluate  # noqa: E402
+from wealthryse_agent import auth, calculator, evaluate  # noqa: E402
 
 RESULTS = {
     "T1": {"tool": "get_performance", "account_id": "U1", "as_of": "2026-03-31",
@@ -106,6 +107,12 @@ def _final(answer, citations):
                            output_text=json.dumps({"answer": answer, "citations": citations}))
 
 
+def _final_v(answer, citations, visuals):
+    response = _final(answer, citations)
+    response.output_text = json.dumps({"answer": answer, "citations": citations, "visuals": visuals})
+    return response
+
+
 def _step(*calls):
     return SimpleNamespace(status="completed", output=list(calls), usage=SimpleNamespace(input_tokens=10, output_tokens=5),
                            output_text="")
@@ -193,6 +200,145 @@ class RuntimeTests(unittest.TestCase):
     def test_region_is_enforced(self):
         with self.assertRaises(ValueError):
             Agent(ModelSettings(**{**SETTINGS.__dict__, "region": "eastus"}), model_client=object())
+
+    def test_reasoning_effort_comes_from_settings(self):
+        settings = ModelSettings(**{**SETTINGS.__dict__, "reasoning_effort": "xhigh"})
+        model = _FakeModel([_final("Nothing to report.", [])])
+        list(Agent(settings, model_client=model).run(question="Hi", account_id="U1", tools=_FakeTools()))
+        self.assertEqual(model.requests[0]["reasoning"], {"effort": "xhigh"})
+        with self.assertRaises(ValueError):
+            Agent(ModelSettings(**{**SETTINGS.__dict__, "reasoning_effort": "maximum"}), model_client=object())
+
+    def test_calculation_on_tool_figures_can_be_quoted(self):
+        model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})),
+                            _step(_call("calculate", {"label": "doubled", "expression": "0.0512 * 2"}, "c2")),
+                            _final("Twice the return is 10.24% [T2].", ["T2"])])
+        tools = _FakeTools({"get_performance": PERF})
+        events = self._run(model, tools)
+        self.assertEqual(events[-1]["type"], "answer")
+        self.assertEqual(events[-1]["citations"][0]["tool"], "calculate")
+        self.assertEqual([c[0] for c in tools.calls], ["get_performance"])  # calculation never leaves the runtime
+        self.assertIn("calculate", [t["name"] for t in model.requests[0]["tools"]])
+
+    def test_calculation_with_invented_numbers_goes_back_to_the_model(self):
+        model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})),
+                            _step(_call("calculate", {"label": "x", "expression": "0.0512 * 1.37"}, "c2")),
+                            _final("I could not work that out.", [])])
+        self._run(model, _FakeTools({"get_performance": PERF}))
+        output = [i for i in model.requests[2]["input"] if i.get("type") == "function_call_output"][-1]
+        self.assertEqual(json.loads(output["output"])["error"]["code"], "invalid_calculation")
+
+    def test_checked_visuals_are_sent_and_invented_ones_rejected(self):
+        chart = {"kind": "bar", "title": "Return", "x_label": "", "currency": "", "labels": ["YTD"],
+                 "series": [{"name": "Portfolio", "unit": "percent", "values": [0.0512]}], "sources": ["T1"]}
+        model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})),
+                            _final_v("Up 5.1% [T1].", ["T1"], [chart])])
+        events = self._run(model, _FakeTools({"get_performance": PERF}))
+        self.assertEqual(events[-1]["visuals"], [chart])
+        self.assertEqual(events[-1]["turn"].visuals, [chart])
+        wrong = {**chart, "series": [{"name": "Portfolio", "unit": "percent", "values": [0.09]}]}
+        model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})),
+                            _final_v("Up 5.1% [T1].", ["T1"], [wrong]), _final_v("Up 5.1% [T1].", ["T1"], [wrong])])
+        self.assertEqual(self._run(model, _FakeTools({"get_performance": PERF}))[-1]["type"], "rejected")
+
+
+class CalculatorTests(unittest.TestCase):
+    RESULTS = {"T1": {"tool": "get_performance", "data": {"twr": 0.0512, "nav": 1234567.89, "flows": [1000, -250.5]}}}
+
+    def test_known_figures_and_constants(self):
+        result = calculator.calculate({"label": "a", "expression": "(1 + 0.0512) ** (365 / 100) - 1"}, self.RESULTS)
+        self.assertAlmostEqual(result["data"]["value"], 1.0512 ** 3.65 - 1)
+        total = calculator.calculate({"label": "net", "expression": "sum([1000, -250.5]) / 1234567.89"}, self.RESULTS)
+        self.assertAlmostEqual(total["data"]["value"], 749.5 / 1234567.89)
+
+    def test_invented_numbers_and_code_are_refused(self):
+        for expression in ("0.0512 * 1.37", "__import__('os').system('x')", "nav * 2", "1e999", "2 ** 5000", ""):
+            with self.assertRaises(calculator.CalculationError, msg=expression):
+                calculator.calculate({"label": "x", "expression": expression}, self.RESULTS)
+
+
+class VisualValidationTests(unittest.TestCase):
+    RESULTS = {"T1": {"tool": "get_nav_history", "data": {"points": [
+        {"date": "2026-01-31", "cumulative_return": 0.0123},
+        {"date": "2026-02-28", "cumulative_return": -0.0045}], "weight_pct": 12.5}}}
+
+    def _check(self, **changes):
+        visual = {"kind": "line", "title": "t", "x_label": "", "currency": "", "labels": ["2026-01-31", "2026-02-28"],
+                  "series": [{"name": "p", "unit": "percent", "values": [0.0123, -0.0045]}], "sources": ["T1"], **changes}
+        return validate_answer("See the chart [T1].", ["T1"], self.RESULTS, visuals=[visual])
+
+    def test_values_from_tools_pass(self):
+        self.assertTrue(self._check().ok)
+        self.assertTrue(self._check(series=[{"name": "w", "unit": "percent", "values": [0.125, None]}]).ok)
+
+    def test_problems_are_rejected(self):
+        bad = [
+            {"series": [{"name": "p", "unit": "percent", "values": [0.0123, 0.0045]}]},   # sign flipped
+            {"series": [{"name": "p", "unit": "percent", "values": [1.23, -0.45]}]},      # percent not as fraction
+            {"series": [{"name": "p", "unit": "percent", "values": [0.0123]}]},           # one value short
+            {"labels": ["2026-01-30", "2026-02-28"]},                                       # date no tool returned
+            {"sources": ["T9"]},
+            {"kind": "pie", "series": [{"name": "a", "unit": "percent", "values": [0.0123, 0.0045]}] * 2},
+        ]
+        for change in bad:
+            self.assertFalse(self._check(**change).ok, change)
+
+
+class RiskHelperTests(unittest.TestCase):
+    def test_daily_returns_remove_flows_like_get_performance(self):
+        from wealthryse_agent.tools import daily_returns
+
+        nav = {"2026-01-01": 100.0, "2026-01-02": 160.0, "2026-01-03": 150.0}
+        returns = daily_returns(nav, {"2026-01-02": 50.0}, list(nav))
+        self.assertAlmostEqual(returns[0][1], (160 - 100 - 50) / (100 + 25))
+        self.assertAlmostEqual(returns[1][1], 150 / 160 - 1)
+
+    def test_drawdown_months_and_sampling(self):
+        from wealthryse_agent.tools import _sample, drawdown, monthly_returns
+
+        index = [("2026-01-01", 1.0), ("2026-01-02", 1.2), ("2026-01-03", 0.9), ("2026-02-01", 1.25)]
+        result = drawdown(index)
+        self.assertAlmostEqual(result["max_drawdown"], 0.9 / 1.2 - 1)
+        self.assertEqual((result["peak_date"], result["trough_date"], result["recovery_date"]),
+                         ("2026-01-02", "2026-01-03", "2026-02-01"))
+        months = monthly_returns([("2026-01-02", 0.1), ("2026-01-03", -0.1), ("2026-02-01", 0.05)])
+        self.assertAlmostEqual(months[0]["return"], 1.1 * 0.9 - 1)
+        self.assertEqual(_sample(["2026-01-01", "2026-01-15", "2026-01-31", "2026-02-10"], "monthly"),
+                         ["2026-01-01", "2026-01-31", "2026-02-10"])
+
+    def test_risk_metrics_over_a_synthetic_year(self):
+        from datetime import date, timedelta
+        from unittest import mock
+
+        from wealthryse_agent import tools as t
+
+        days = [(date(2025, 3, 31) + timedelta(days=i)).isoformat() for i in range(0, 366, 7)]
+        nav = {d: 100.0 * (1.01 if i % 2 else 0.995) ** i for i, d in enumerate(days)}
+        bench = {d: 50.0 * (1.005 if i % 2 else 0.999) ** i for i, d in enumerate(days)}
+
+        class Levels:
+            def __init__(self, *args):
+                pass
+
+            def level(self, day):
+                return bench.get(day)
+
+        subject = {"subject_id": "U1", "reporting_currency": "USD", "base_currency": "USD"}
+        with mock.patch.object(t, "_subject", return_value=subject), \
+                mock.patch.object(t, "_latest_nav_date", return_value=days[-1]), \
+                mock.patch.object(t, "_series_inputs", return_value=(nav, {})), \
+                mock.patch.object(t, "_benchmark_for", return_value={"benchmark_id": "B", "name": "Bench"}), \
+                mock.patch.object(t, "_BenchmarkLevels", Levels):
+            result = t.get_risk_metrics(None, {"account_id": "U1"})
+        data = result["data"]
+        self.assertEqual(data["from_date"], days[0])
+        self.assertAlmostEqual(data["total_return"], nav[days[-1]] / nav[days[0]] - 1)
+        self.assertGreater(data["annualized_volatility"], 0)
+        self.assertLess(data["max_drawdown"], 0)
+        self.assertEqual(data["benchmark"]["matched_observations"], len(days) - 1)
+        self.assertGreater(data["benchmark"]["correlation"], 0.9)  # both alternate up and down together
+        self.assertAlmostEqual(data["benchmark"]["total_return"], bench[days[-1]] / bench[days[0]] - 1)
+        json.dumps(result)  # plain JSON for the tool server
 
 
 class EvaluationTests(unittest.TestCase):
@@ -334,6 +480,7 @@ class _FakeStore:
 
     def add_message(self, conversation_id, role, content, **kwargs):
         self.messages_saved.append((role, content, kwargs.get("status", "ok")))
+        self.last_citations = kwargs.get("citations")
         return len(self.messages_saved)
 
 
@@ -355,14 +502,19 @@ class AgentServerTests(unittest.TestCase):
         class FakeAgent:
             def run(self, **kwargs):
                 for event in events:
+                    if event["type"] == "pause":
+                        time.sleep(event["seconds"])
+                        continue
                     if event["type"] in ("answer", "rejected"):
-                        event = {**event, "turn": Turn(answer=event["answer"], status="ok")}
+                        event = {**event, "turn": Turn(answer=event["answer"], status="ok",
+                                                       visuals=event.get("visuals", []))}
                     yield event
 
         services = Services(auth=ServiceAuthSettings("", "", frozenset(), disabled_for_local_tests=True),
                             runtime=RuntimeSettings("", "", "", 1000, 90), tenant_id="t",
                             store_factory=lambda: store, agent_factory=FakeAgent, tools_factory=lambda u, c: Tools())
         services._store = store  # bypass the connection lock wrapper in tests
+        services.keepalive_seconds = 0.05
         return TestClient(create_app(services))
 
     def test_chat_streams_and_saves_only_validated_answer(self):
@@ -375,6 +527,34 @@ class AgentServerTests(unittest.TestCase):
         events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
         self.assertEqual([e["type"] for e in events], ["start", "status", "answer", "done"])
         self.assertEqual(store.messages_saved, [("user", "How did I do?", "ok"), ("assistant", "Up 5% [T1].", "ok")])
+
+    def test_long_thinking_sends_keepalives_and_visuals_are_saved(self):
+        store = _FakeStore()
+        chart = {"kind": "table", "title": "t", "labels": ["a"], "series": []}
+        client = self._client(store, [{"type": "pause", "seconds": 0.2},
+                                      {"type": "answer", "answer": "Done.", "citations": [], "visuals": [chart]}])
+        response = client.post("/v1/chat", json={"user_object_id": "22222222-2222-2222-2222-222222222222",
+                                                 "account_id": "U1", "message": "Chart it"})
+        self.assertIn(": keepalive", response.text)
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        self.assertEqual([e["type"] for e in events], ["start", "answer", "done"])
+        self.assertEqual(store.last_citations, [{"visual": chart}])
+        from wealthryse_agent.store import _split_visuals
+
+        split = _split_visuals({"citations": json.dumps([{"id": "T1"}, {"visual": chart}])})
+        self.assertEqual((split["citations"], split["visuals"]), ([{"id": "T1"}], [chart]))
+
+    def test_agent_errors_still_reach_the_person(self):
+        from wealthryse_agent.agent_server import _with_keepalive
+
+        def boom():
+            yield {"type": "status", "text": "x"}
+            raise AgentError("timeout", "Too long.")
+
+        stream = _with_keepalive(boom(), 0.05)
+        self.assertEqual(next(stream)["type"], "status")
+        with self.assertRaises(AgentError):
+            list(stream)
 
     def test_chat_refuses_accounts_the_person_cannot_see(self):
         store = _FakeStore()

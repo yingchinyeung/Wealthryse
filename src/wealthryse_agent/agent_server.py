@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import threading
 import uuid
 from typing import Any, Callable, Iterator
@@ -30,6 +31,35 @@ from .tool_client import ToolCallFailed, ToolClient
 
 LOGGER = logging.getLogger("wealthryse_agent.runtime")
 USER_ID = r"^[0-9a-fA-F-]{36}$"
+# Deep reasoning can think for minutes without an event; a comment line keeps the website's read open.
+KEEPALIVE_SECONDS = 15.0
+
+
+def _with_keepalive(events: Iterator[dict[str, Any]], interval: float) -> Iterator[dict[str, Any] | None]:
+    """Yield the agent's events as they come, and None whenever ``interval`` passes without one."""
+    box: queue.Queue = queue.Queue()
+
+    def pump() -> None:
+        try:
+            for event in events:
+                box.put(("event", event))
+        except BaseException as error:  # handed to the caller's thread
+            box.put(("error", error))
+        finally:
+            box.put(("done", None))
+
+    threading.Thread(target=pump, daemon=True, name="agent-run").start()
+    while True:
+        try:
+            kind, item = box.get(timeout=interval)
+        except queue.Empty:
+            yield None
+            continue
+        if kind == "done":
+            return
+        if kind == "error":
+            raise item
+        yield item
 
 
 class ChatRequest(BaseModel):
@@ -97,6 +127,7 @@ class Services:
         self._store: _LockedStore | None = None
         self._store_lock = threading.Lock()
         self._agent: Agent | None = None
+        self.keepalive_seconds = KEEPALIVE_SECONDS
 
     def store(self) -> Store:
         with self._store_lock:
@@ -162,12 +193,17 @@ def create_app(services: Services) -> FastAPI:
             yield _sse({"type": "start", "conversation_id": conversation_id, "correlation_id": correlation_id})
             tools = services.tools_for(user, correlation_id)
             try:
-                for event in services.agent().run(question=body.message, account_id=body.account_id,
-                                                  tools=tools, history=history):
+                run = services.agent().run(question=body.message, account_id=body.account_id, tools=tools, history=history)
+                for event in _with_keepalive(run, services.keepalive_seconds):
+                    if event is None:
+                        yield ": keepalive\n\n"
+                        continue
                     if event["type"] in ("answer", "rejected"):
                         turn = event.pop("turn")
+                        # Charts and tables ride in the citations column, so no schema change is needed.
                         message_id = store.add_message(
-                            conversation_id, "assistant", turn.answer, citations=turn.citations,
+                            conversation_id, "assistant", turn.answer,
+                            citations=list(turn.citations) + [{"visual": v} for v in turn.visuals],
                             status="ok" if event["type"] == "answer" else "rejected",
                             correlation_id=correlation_id, usage=turn.usage)
                         event.pop("reason", None)  # validator detail stays in logs

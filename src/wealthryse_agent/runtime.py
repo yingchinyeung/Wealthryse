@@ -13,18 +13,47 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from . import calculator
 from .config import ModelSettings
 from .prompts import ANALYST, ROUTER
 from .tool_client import ToolCallFailed, ToolClient
 from .validator import validate_answer
 
+VISUAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string", "enum": ["table", "bar", "line", "pie"]},
+        "title": {"type": "string"},
+        "x_label": {"type": "string", "description": "Axis or first-column heading; empty if none."},
+        "currency": {"type": "string", "description": "ISO code for currency series, else empty."},
+        "labels": {"type": "array", "items": {"type": "string"},
+                   "description": "Categories, dates (YYYY-MM-DD) or table row names."},
+        "series": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "unit": {"type": "string", "enum": ["percent", "currency", "number"],
+                         "description": "percent values are fractions as tools return them (0.05 = 5%)."},
+                "values": {"type": "array", "items": {"type": ["number", "null"]},
+                           "description": "One per label, copied exactly from tool or calculate results."},
+            },
+            "required": ["name", "unit", "values"],
+            "additionalProperties": False,
+        }},
+        "sources": {"type": "array", "items": {"type": "string"}, "description": "Citation ids, e.g. T1."},
+    },
+    "required": ["kind", "title", "x_label", "currency", "labels", "series", "sources"],
+    "additionalProperties": False,
+}
 ANSWER_SCHEMA = {
     "type": "object",
     "properties": {
         "answer": {"type": "string", "description": "Markdown answer with inline [T#] citations."},
         "citations": {"type": "array", "items": {"type": "string"}},
+        "visuals": {"type": "array", "items": VISUAL_SCHEMA,
+                    "description": "Charts and tables, only when asked for or clearly helpful; else empty."},
     },
-    "required": ["answer", "citations"],
+    "required": ["answer", "citations", "visuals"],
     "additionalProperties": False,
 }
 ROUTER_SCHEMA = {
@@ -42,6 +71,9 @@ TOOL_LABELS = {
     "get_sector_allocation": "Reading sector allocation",
     "get_cash_flows": "Reading deposits and withdrawals",
     "get_data_freshness": "Checking how recent the data is",
+    "get_nav_history": "Reading the value history",
+    "get_risk_metrics": "Measuring risk",
+    calculator.NAME: "Calculating",
 }
 OUT_OF_SCOPE = ("I can explain your holdings and performance, but I can't recommend trades, rebalancing "
                 "or personal investment advice. Ask me what changed or how an account has performed.")
@@ -62,6 +94,7 @@ class Turn:
     """Everything the store needs after a run."""
     answer: str = ""
     citations: list[dict[str, Any]] = field(default_factory=list)
+    visuals: list[dict[str, Any]] = field(default_factory=list)
     status: str = "ok"
     tool_calls: int = 0
     usage: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
@@ -131,7 +164,10 @@ class Agent:
             catalog = [t for t in catalog if t["name"] in set(allowed_tools)]
         function_tools = [{"type": "function", "name": t["name"], "description": t["description"],
                            "parameters": t["inputSchema"], "strict": False} for t in catalog]
-        allowed_names = {t["name"] for t in catalog}
+        if allowed_tools is None or calculator.NAME in allowed_tools:
+            function_tools.append({"type": "function", "name": calculator.NAME, "description": calculator.DESCRIPTION,
+                                   "parameters": calculator.SCHEMA, "strict": False})
+        allowed_names = {t["name"] for t in function_tools}
         system = instructions or ANALYST.format(account_id=account_id, today=date.today().isoformat())
         conversation: list[dict[str, Any]] = [
             {"role": m["role"], "content": str(m["content"])[:4000]}
@@ -146,7 +182,7 @@ class Agent:
                 raise AgentError("timeout", "The analysis took too long. Try a narrower question.")
             response = self.client.responses.create(
                 model=self.settings.deployment, instructions=system, input=conversation, tools=function_tools,
-                store=False, include=["reasoning.encrypted_content"], reasoning={"effort": "low"},
+                store=False, include=["reasoning.encrypted_content"], reasoning={"effort": self.settings.reasoning_effort},
                 max_output_tokens=self.settings.max_output_tokens, parallel_tool_calls=True,
                 text={"format": {"type": "json_schema", "name": "answer", "strict": True, "schema": ANSWER_SCHEMA}},
             )
@@ -172,15 +208,17 @@ class Agent:
             try:
                 parsed = json.loads(response.output_text)
                 answer, cited = str(parsed["answer"]).strip(), [str(c) for c in parsed["citations"]]
-            except (ValueError, KeyError, TypeError) as error:
+                visuals = [v for v in parsed.get("visuals") or [] if isinstance(v, dict)]
+            except (ValueError, KeyError, TypeError, AttributeError) as error:
                 raise AgentError("invalid_model_output", "The model did not return a usable answer.") from error
-            check = validate_answer(answer, cited, results, question)
+            check = validate_answer(answer, cited, results, question, visuals)
             if check.ok:
-                turn.answer = answer
+                turn.answer, turn.visuals = answer, visuals
                 turn.citations = [{"id": c, "tool": results[c]["tool"], "account_id": results[c].get("account_id"),
                                    "as_of": results[c].get("as_of"), "sources": results[c].get("citations", [])}
                                   for c in dict.fromkeys(cited) if c in results]
-                yield {"type": "answer", "answer": answer, "citations": turn.citations, "turn": turn}
+                yield {"type": "answer", "answer": answer, "citations": turn.citations, "visuals": visuals,
+                       "turn": turn}
                 return
             if retried:
                 turn.answer, turn.status = UNVERIFIED, "rejected"
@@ -204,7 +242,12 @@ class Agent:
         except ValueError:
             return {"error": {"code": "invalid_arguments", "message": "Arguments must be a JSON object."}}
         try:
-            result = tools.call(name, arguments)
+            if name == calculator.NAME:
+                result = calculator.calculate(arguments, results)
+            else:
+                result = tools.call(name, arguments)
+        except calculator.CalculationError as error:
+            return {"error": {"code": "invalid_calculation", "message": str(error)}}
         except ToolCallFailed as error:
             return {"error": {"code": error.code, "message": error.message}}
         citation_id = f"T{len(results) + 1}"

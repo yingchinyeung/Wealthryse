@@ -31,6 +31,15 @@ param modelDeployment string = 'wr-analyst-astra'
 param modelProcessingScope string = 'global'
 param routerDeployment string = ''
 param dailyTokenBudget int = 2000000
+@description('Reasoning effort for owner chat. The scheduled jobs keep the runtime default (low).')
+@allowed(['low', 'medium', 'high', 'xhigh'])
+param chatReasoningEffort string = 'xhigh'
+@description('Per-question limit. Stays under the 240-second Container Apps ingress request timeout.')
+@maxValue(220)
+param chatTimeoutSeconds int = 210
+@description('Output allowance per model call; reasoning tokens count against it.')
+param chatMaxOutputTokens int = 32000
+param chatMaxToolCalls int = 16
 param retentionDays int = 90
 
 param agentAppName string = 'ibkrv2stg-agent'
@@ -179,6 +188,10 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AGENT_DB_USER', value: agentIdentity.name }
             { name: 'AGENT_API_AUDIENCE', value: agentApiAudience }
             { name: 'AGENT_API_ALLOWED_CALLERS', value: webPrincipalId }
+            { name: 'AGENT_REASONING_EFFORT', value: chatReasoningEffort }
+            { name: 'AGENT_TIMEOUT_SECONDS', value: string(chatTimeoutSeconds) }
+            { name: 'AGENT_MAX_OUTPUT_TOKENS', value: string(chatMaxOutputTokens) }
+            { name: 'AGENT_MAX_TOOL_CALLS', value: string(chatMaxToolCalls) }
           ])
           resources: { cpu: json('0.5'), memory: '1Gi' }
           probes: probes

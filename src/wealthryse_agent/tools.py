@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Mapping
 
@@ -372,6 +372,19 @@ def _benchmark_level(connection, benchmark_id: str, day: str) -> tuple[str, floa
 BENCHMARK_GAP_DAYS = 7
 
 
+def _benchmark_mapping(connection, account_id: str, as_of: str, requested: str | None = None) -> Mapping[str, Any] | None:
+    return connection.execute(
+        """
+        SELECT b.benchmark_id, b.name, b.symbol, b.currency, m.mapping_type, m.reporting_currency
+        FROM portfolio_benchmark_mapping m JOIN benchmark_master b ON b.benchmark_id = m.benchmark_id
+        WHERE m.subject_id = ? AND b.active AND m.effective_from <= ? AND (m.effective_to IS NULL OR m.effective_to >= ?)
+          AND (?::text IS NULL OR b.benchmark_id = ?)
+        ORDER BY CASE m.mapping_type WHEN 'primary' THEN 0 ELSE 1 END, b.name LIMIT 1
+        """,
+        (account_id, as_of, as_of, requested, requested),
+    ).fetchone()
+
+
 def _days_between(a: str, b: str) -> int:
     return abs((date.fromisoformat(b) - date.fromisoformat(a)).days)
 
@@ -382,16 +395,7 @@ def compare_to_benchmark(connection, arguments: Mapping[str, Any]) -> dict[str, 
     currency = _reporting_currency(subject)
     as_of = _latest_nav_date(connection, account_id, arguments.get("as_of") and _day(arguments["as_of"], "as_of"))
     requested = arguments.get("benchmark_id")
-    mapping = connection.execute(
-        """
-        SELECT b.benchmark_id, b.name, b.symbol, b.currency, m.mapping_type, m.reporting_currency
-        FROM portfolio_benchmark_mapping m JOIN benchmark_master b ON b.benchmark_id = m.benchmark_id
-        WHERE m.subject_id = ? AND b.active AND m.effective_from <= ? AND (m.effective_to IS NULL OR m.effective_to >= ?)
-          AND (?::text IS NULL OR b.benchmark_id = ?)
-        ORDER BY CASE m.mapping_type WHEN 'primary' THEN 0 ELSE 1 END, b.name LIMIT 1
-        """,
-        (account_id, as_of, as_of, requested, requested),
-    ).fetchone()
+    mapping = _benchmark_mapping(connection, account_id, as_of, requested)
     if mapping is None:
         raise ToolError("benchmark_unavailable", "No benchmark is configured for this account on that date.", 404)
     if str(mapping["currency"] or "").upper() != currency:
@@ -499,6 +503,235 @@ def get_data_freshness(connection, arguments: Mapping[str, Any]) -> dict[str, An
     }
 
 
+# Time series and risk ---------------------------------------------------------
+
+MAX_SERIES_POINTS = 400
+MIN_RISK_OBSERVATIONS = 20
+
+
+def _series_inputs(connection, subject: Mapping[str, Any], through: str) -> tuple[dict[str, float], dict[str, float]]:
+    from ibkr_etl.performance_periods import validated_flows, validated_nav
+
+    nav, flows = _nav_and_flows(connection, subject, through)
+    try:
+        return validated_nav(nav), validated_flows(flows or {})
+    except PerformanceInputError as error:
+        raise ToolError("performance_unavailable", "The recorded values could not be read as a series.") from error
+
+
+def daily_returns(nav: Mapping[str, float], flows: Mapping[str, float], dates: list[str]) -> list[tuple[str, float]]:
+    """Modified Dietz return between consecutive observations, as the website and get_performance use."""
+    from bisect import bisect_right
+
+    flow_days = sorted(flows)
+    out = []
+    for previous, current in zip(dates, dates[1:]):
+        external = sum(flows[d] for d in flow_days[bisect_right(flow_days, previous):bisect_right(flow_days, current)])
+        denominator = nav[previous] + 0.5 * external
+        daily = (nav[current] - nav[previous] - external) / denominator if denominator > 0 else float("nan")
+        if not math.isfinite(daily) or daily <= -1:
+            raise ToolError("performance_unavailable", f"The return on {current} could not be calculated.")
+        out.append((current, daily))
+    return out
+
+
+def _window(nav: Mapping[str, float], start: str | None, end: str) -> list[str]:
+    """Observation dates from the last one before ``start`` (the base) through ``end``."""
+    dates = [d for d in nav if d <= end]
+    if start:
+        before = [d for d in dates if d < start]
+        dates = before[-1:] + [d for d in dates if d >= start]
+    if len(dates) < 2:
+        raise ToolError("no_valuation", "There are not enough valuations in that period.", 404)
+    return dates
+
+
+def _growth(returns: list[tuple[str, float]], base_day: str) -> list[tuple[str, float]]:
+    growth, out = 1.0, [(base_day, 1.0)]
+    for day, r in returns:
+        growth *= 1.0 + r
+        out.append((day, growth))
+    return out
+
+
+def drawdown(index: list[tuple[str, float]]) -> dict[str, Any]:
+    peak_day, peak, worst = index[0][0], index[0][1], {"max_drawdown": 0.0, "peak_date": None, "trough_date": None}
+    for day, level in index:
+        if level > peak:
+            peak_day, peak = day, level
+        fall = level / peak - 1.0
+        if fall < worst["max_drawdown"]:
+            worst = {"max_drawdown": fall, "peak_date": peak_day, "trough_date": day}
+    recovery = None
+    if worst["trough_date"]:
+        peak_level = dict(index)[worst["peak_date"]]
+        recovery = next((d for d, level in index if d > worst["trough_date"] and level >= peak_level), None)
+    return {**worst, "recovery_date": recovery}
+
+
+def monthly_returns(returns: list[tuple[str, float]]) -> list[dict[str, Any]]:
+    months: dict[str, float] = {}
+    for day, r in returns:
+        months[day[:7]] = (1.0 + months.get(day[:7], 0.0)) * (1.0 + r) - 1.0
+    return [{"month": m, "return": v} for m, v in months.items()]
+
+
+def _sample(dates: list[str], frequency: str) -> list[str]:
+    if frequency == "daily":
+        return dates
+    key = (lambda d: d[:7]) if frequency == "monthly" else (lambda d: date.fromisoformat(d).isocalendar()[:2])
+    last: dict[Any, str] = {}
+    for d in dates:
+        last[key(d)] = d
+    return sorted(set(last.values()) | {dates[0], dates[-1]})
+
+
+class _BenchmarkLevels:
+    def __init__(self, connection, benchmark_id: str, start: str, end: str) -> None:
+        rows = connection.execute(
+            "SELECT observation_date, level FROM benchmark_prices WHERE benchmark_id = ? AND observation_date <= ? "
+            "AND observation_date >= ? AND COALESCE(quality_status, 'pass') <> 'fail' ORDER BY observation_date",
+            (benchmark_id, end, (date.fromisoformat(start) - timedelta(days=BENCHMARK_GAP_DAYS)).isoformat()),
+        ).fetchall()
+        points = [(str(r["observation_date"]), _float(r["level"])) for r in rows]
+        self.points = [(d, v) for d, v in points if v is not None and v > 0]
+        self.days = [d for d, _ in self.points]
+
+    def level(self, day: str) -> float | None:
+        from bisect import bisect_right
+
+        i = bisect_right(self.days, day) - 1
+        if i < 0 or _days_between(self.days[i], day) > BENCHMARK_GAP_DAYS:
+            return None
+        return self.points[i][1]
+
+
+def _benchmark_for(connection, subject: Mapping[str, Any], as_of: str, requested: str | None = None):
+    mapping = _benchmark_mapping(connection, str(subject["subject_id"]), as_of, requested)
+    if mapping is None or str(mapping["currency"] or "").upper() != _reporting_currency(subject):
+        return None
+    return mapping
+
+
+def get_nav_history(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    account_id = str(arguments["account_id"])
+    subject = _subject(connection, account_id)
+    end = _latest_nav_date(connection, account_id, arguments.get("to_date") and _day(arguments["to_date"], "to_date"))
+    start = arguments.get("from_date") and _day(arguments["from_date"], "from_date")
+    frequency = str(arguments.get("frequency") or "monthly")
+    if frequency not in ("daily", "weekly", "monthly"):
+        raise ToolError("invalid_arguments", "frequency must be daily, weekly or monthly.", 400)
+    nav, flows = _series_inputs(connection, subject, end)
+    dates = _window(nav, start, end)
+    index = dict(_growth(daily_returns(nav, flows, dates), dates[0]))
+    for candidate in ("daily", "weekly", "monthly"):
+        if ("daily", "weekly", "monthly").index(candidate) < ("daily", "weekly", "monthly").index(frequency):
+            continue
+        sampled = _sample(dates, candidate)
+        if len(sampled) <= MAX_SERIES_POINTS:
+            frequency = candidate
+            break
+    else:
+        raise ToolError("too_many_points", "That period is too long to return; choose a shorter one.", 400)
+    mapping = _benchmark_for(connection, subject, end)
+    levels = _BenchmarkLevels(connection, str(mapping["benchmark_id"]), dates[0], end) if mapping else None
+    base_level = levels.level(dates[0]) if levels else None
+    flow_days = sorted(flows)
+    points, previous = [], None
+    for d in sampled:
+        level = levels.level(d) if levels and base_level else None
+        points.append({
+            "date": d, "value": nav[d], "cumulative_return": index[d] - 1.0,
+            "net_flows": round(sum(v for f, v in flows.items() if (previous is None or f > previous) and f <= d
+                                   and (previous is not None or f > dates[0])), 2) if flow_days else 0.0,
+            "benchmark_cumulative_return": (level / base_level - 1.0) if level else None,
+        })
+        previous = d
+    return {
+        "as_of": end,
+        "data": {"currency": _reporting_currency(subject), "from_date": dates[0], "to_date": end, "frequency": frequency,
+                 "benchmark": {"id": mapping["benchmark_id"], "name": mapping["name"]} if mapping else None,
+                 "points": points,
+                 "method": "value is the recorded NAV; cumulative_return is time-weighted from the first date "
+                           "(flows removed); benchmark_cumulative_return is its price return; fractions"},
+        "citations": [_citation("subject_nav_series", account_id, from_date=dates[0], to_date=end)]
+                     + ([_citation("benchmark_prices", None, benchmark_id=mapping["benchmark_id"], through=end)] if mapping else []),
+    }
+
+
+def _stats(values: list[float]) -> tuple[float, float]:
+    mean = math.fsum(values) / len(values)
+    return mean, math.sqrt(math.fsum((v - mean) ** 2 for v in values) / (len(values) - 1))
+
+
+def get_risk_metrics(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    account_id = str(arguments["account_id"])
+    subject = _subject(connection, account_id)
+    end = _latest_nav_date(connection, account_id, arguments.get("to_date") and _day(arguments["to_date"], "to_date"))
+    start = (arguments.get("from_date") and _day(arguments["from_date"], "from_date")) or \
+        (date.fromisoformat(end).replace(year=date.fromisoformat(end).year - 1)
+         if not end.endswith("02-29") else date.fromisoformat(end).replace(day=28, year=date.fromisoformat(end).year - 1)).isoformat()
+    nav, flows = _series_inputs(connection, subject, end)
+    dates = _window(nav, start, end)
+    returns = daily_returns(nav, flows, dates)
+    if len(returns) < MIN_RISK_OBSERVATIONS:
+        raise ToolError("not_enough_history", f"Risk measures need at least {MIN_RISK_OBSERVATIONS} valuations in the period.", 404)
+    years = max(_days_between(dates[0], dates[-1]) / 365.25, 1 / 365.25)
+    per_year = len(returns) / years
+    values = [r for _, r in returns]
+    mean, sd = _stats(values)
+    index = _growth(returns, dates[0])
+    total = index[-1][1] - 1.0
+    months = monthly_returns(returns)
+    best_day, worst_day = max(returns, key=lambda x: x[1]), min(returns, key=lambda x: x[1])
+    data: dict[str, Any] = {
+        "currency": _reporting_currency(subject), "from_date": dates[0], "to_date": dates[-1],
+        "observations": len(returns), "observations_per_year": per_year,
+        "total_return": total,
+        "annualized_return": (1.0 + total) ** (1.0 / years) - 1.0 if years >= 1 else None,
+        "annualized_volatility": sd * math.sqrt(per_year),
+        "downside_deviation": math.sqrt(math.fsum(min(v, 0.0) ** 2 for v in values) / len(values)) * math.sqrt(per_year),
+        **drawdown(index),
+        "best_day": {"date": best_day[0], "return": best_day[1]},
+        "worst_day": {"date": worst_day[0], "return": worst_day[1]},
+        "positive_days": sum(1 for v in values if v > 0),
+        "monthly_returns": months[-60:],
+        "best_month": max(months, key=lambda m: m["return"]),
+        "worst_month": min(months, key=lambda m: m["return"]),
+        "positive_months": sum(1 for m in months if m["return"] > 0),
+        "benchmark": None,
+        "method": "returns between valuations (Modified Dietz, flows removed); volatility and tracking error "
+                  "annualised by valuations per year; the first and last month may be partial; fractions",
+    }
+    mapping = _benchmark_for(connection, subject, end, arguments.get("benchmark_id"))
+    citations = [_citation("subject_nav_series", account_id, from_date=dates[0], to_date=dates[-1])]
+    if mapping:
+        levels = _BenchmarkLevels(connection, str(mapping["benchmark_id"]), dates[0], dates[-1])
+        pairs = []
+        for (previous, current), (_, r) in zip(zip(dates, dates[1:]), returns):
+            a, b = levels.level(previous), levels.level(current)
+            if a and b:
+                pairs.append((r, b / a - 1.0))
+        bench: dict[str, Any] = {"id": mapping["benchmark_id"], "name": mapping["name"], "matched_observations": len(pairs)}
+        first, last = levels.level(dates[0]), levels.level(dates[-1])
+        bench["total_return"] = last / first - 1.0 if first and last else None
+        if len(pairs) >= MIN_RISK_OBSERVATIONS:
+            p, b = [x for x, _ in pairs], [y for _, y in pairs]
+            pm, ps = _stats(p)
+            bm, bs = _stats(b)
+            cov = math.fsum((x - pm) * (y - bm) for x, y in pairs) / (len(pairs) - 1)
+            _, te = _stats([x - y for x, y in pairs])
+            bench.update({"annualized_volatility": bs * math.sqrt(per_year),
+                          "beta": cov / bs ** 2 if bs > 0 else None,
+                          "correlation": cov / (ps * bs) if ps > 0 and bs > 0 else None,
+                          "tracking_error": te * math.sqrt(per_year)})
+        else:
+            bench["note"] = "Too few matching benchmark prices for beta, correlation or tracking error."
+        data["benchmark"] = bench
+        citations.append(_citation("benchmark_prices", None, benchmark_id=mapping["benchmark_id"], through=dates[-1]))
+    return {"as_of": dates[-1], "data": data, "citations": citations}
+
+
 # Registry ------------------------------------------------------------------
 
 def _schema(properties: Mapping[str, Any], required: list[str]) -> dict[str, Any]:
@@ -530,6 +763,16 @@ TOOLS: tuple[ToolSpec, ...] = (
              get_cash_flows),
     ToolSpec("get_data_freshness", "How recent the account's valuation, holdings, benchmark and import data are.",
              _schema({"account_id": _ACCOUNT}, ["account_id"]), get_data_freshness),
+    ToolSpec("get_nav_history", "Account value and cumulative time-weighted return over time, with the benchmark's "
+             "cumulative return, for charts. Up to 400 points; long periods are thinned to weekly or monthly.",
+             _schema({"account_id": _ACCOUNT, "from_date": {**_DATE, "description": "YYYY-MM-DD; omit for inception"},
+                      "to_date": _AS_OF, "frequency": {"type": "string", "description": "daily, weekly or monthly (default)"}},
+                     ["account_id"]), get_nav_history),
+    ToolSpec("get_risk_metrics", "Risk and return statistics for a period (default the last year): volatility, "
+             "downside deviation, maximum drawdown with dates, best and worst day and month, monthly returns, and "
+             "beta, correlation and tracking error against the benchmark.",
+             _schema({"account_id": _ACCOUNT, "from_date": {**_DATE, "description": "YYYY-MM-DD; omit for one year"},
+                      "to_date": _AS_OF, "benchmark_id": {"type": "string"}}, ["account_id"]), get_risk_metrics),
 )
 REGISTRY = {tool.name: tool for tool in TOOLS}
 

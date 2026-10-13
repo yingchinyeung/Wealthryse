@@ -15,6 +15,15 @@ OWNER = {"email": "owner@example.com", "object_id": "owner-oid", "role": "owner"
 OPERATOR = {"email": "operator@example.com", "object_id": "operator-oid", "role": "onboarding_operator"}
 ON = {"ONBOARDING_V2_ENABLED": "true"}
 OFF = {"ONBOARDING_V2_ENABLED": "false"}
+MS_LIKE = {
+    "kind": "composite_portfolio", "subject_id": "alpha-world-asia", "display_name": "Alpha World Asia",
+    "description": "Alpha World MS sleeves, reported under its own name.", "reporting_currency": "HKD",
+    "start_date": "2025-01-20",
+    "sleeves": [{"component_id": "hong-kong-china", "direction": "long", "exposure_percent": 91},
+                {"component_id": "U16088571", "direction": "long", "exposure_percent": 45},
+                {"component_id": "hang-seng-price-index", "direction": "short", "exposure_percent": 49},
+                {"component_id": "spy-settlement", "direction": "short", "exposure_percent": 45}],
+}
 
 
 class _Rows:
@@ -70,10 +79,14 @@ class OnboardingV2WebTests(unittest.TestCase):
     def test_switched_off_everything_new_is_hidden(self):
         with patch.dict(os.environ, OFF):
             for path in ("/broker-connections", "/api/onboarding-v2/overview", "/api/broker-connections",
-                         "/account-onboarding/cases/00000000-0000-0000-0000-000000000001"):
+                         "/account-onboarding/cases/00000000-0000-0000-0000-000000000001",
+                         "/account-onboarding/new-portfolio", "/api/onboarding-v2/portfolio-builder"):
                 self.assertEqual(self.client.get(path).status_code, 404, path)
             response = self.client.post("/api/broker-connections", json={"broker": "kiwoom_rest", "display_name": "x"})
             self.assertEqual(response.status_code, 404)
+            for path in ("/api/onboarding-v2/portfolios", "/api/onboarding-v2/portfolios/check",
+                         "/api/onboarding-v2/portfolios/preview"):
+                self.assertEqual(self.client.post(path, json=MS_LIKE).status_code, 404, path)
             page = web.account_onboarding_page(None, OWNER)
             self.assertIn("Guided onboarding wizard", page)
             self.assertIn("Creation starts only a private nine-page onboarding case", page)
@@ -89,13 +102,18 @@ class OnboardingV2WebTests(unittest.TestCase):
             self.assertIn("Available to onboard", page)
             self.assertIn("/api/onboarding-v2/overview", page)
             self.assertIn('href="/broker-connections">Broker connections</a>', page)
+            self.assertIn('href="/account-onboarding/new-portfolio">New portfolio</a>', page)
             self.assertNotIn("IBKR connections</a>", page)
             self.assertNotIn("Guided onboarding wizard", page)
             classic = self.client.get("/account-onboarding/classic")
             self.assertEqual(classic.status_code, 200)
-            self.assertIn("Derived Portfolio Studio", classic.text)
-            self.assertIn("Creation starts a private case in the new onboarding", classic.text)
-            self.assertNotIn("nine-page onboarding case", classic.text)
+            self.assertIn("Portfolios now start in the portfolio builder", classic.text)
+            self.assertIn('id="derived-portfolio-studio" style="display:none" aria-hidden="true"', classic.text)
+            self.assertEqual(classic.text.count('id="derived-portfolio-studio"'), 1)
+            builder = self.client.get("/account-onboarding/new-portfolio").text
+            self.assertIn("Start from", builder)
+            self.assertIn("/api/onboarding-v2/portfolio-builder", builder)
+            self.assertIn('aria-current="page">Account onboarding</a>', builder)
             connections = self.client.get("/broker-connections").text
             self.assertIn('aria-current="page">Broker connections</a>', connections)
             self.assertIn("Show the Flex query recipe", connections)
@@ -103,6 +121,7 @@ class OnboardingV2WebTests(unittest.TestCase):
             case_page = self.client.get("/account-onboarding/cases/00000000-0000-0000-0000-000000000001").text
             self.assertIn('data-case-id="00000000-0000-0000-0000-000000000001"', case_page)
             self.assertIn("Your three approvals", case_page)
+            self.assertIn('id="case-portfolio"', case_page)
             self.assertEqual(self.client.get("/account-onboarding/cases/not-a-uuid").status_code, 422)
 
     def test_overview_and_case_read_through_the_read_only_database(self):
@@ -114,31 +133,84 @@ class OnboardingV2WebTests(unittest.TestCase):
         self.assertIs(overview.call_args.args[0], connection)
         self.assertEqual(overview.call_args.kwargs["platform_ip"], "20.6.1.10")
 
-    def test_the_studio_form_opens_a_new_case_only_when_switched_on(self):
+    def test_the_studio_is_replaced_by_the_builder_when_switched_on(self):
         source = {"subject_id": "U0000501", "subject_type": "physical_account", "lifecycle_status": "active",
                   "currency": "USD", "history_start_date": None}
         body = {"subject_id": "synthetic-ex-taiwan", "display_name": "Synthetic ex Taiwan",
                 "source_account_id": "U0000501", "base_currency": "USD", "history_start_date": "2025-01-20",
                 "excluded_countries": ["Taiwan"], "opening_cash": {"USD": 0}, "allowed_cash_currencies": ["USD"]}
-        url = "/api/onboarding/derived-studio/filtered/start"
-        opened = {"case_id": "c1", "next_page": "/account-onboarding/cases/c1"}
 
-        def studio(switch, **patches):
+        def studio(switch, url="/api/onboarding/derived-studio/filtered/start", json_body=body):
             with patch.dict(os.environ, switch), \
                     patch.object(web, "_approval_database", return_value=_database(_SourceConnection(source))), \
-                    patch.object(onboarding_v2_web, "start_derived_case", **patches.pop("v2")) as v2, \
-                    patch.object(web, "_create_derived_studio_case", **patches.pop("classic")):
-                return self.client.post(url, json=body), v2
+                    patch.object(web, "_create_derived_studio_case", return_value=("c2", "d" * 64)) as classic:
+                return self.client.post(url, json=json_body), classic
 
-        response, v2 = studio(ON, v2={"return_value": opened}, classic={"side_effect": AssertionError("classic")})
-        self.assertEqual((response.status_code, response.json()), (200, opened))
-        self.assertEqual(v2.call_args.kwargs["definition"]["subject_type"], "filtered_portfolio")
-        refusal = onboarding_v2_web.OnboardingError("Every sleeve must be live before this portfolio can start")
-        response, _ = studio(ON, v2={"side_effect": refusal}, classic={"side_effect": AssertionError("classic")})
-        self.assertEqual((response.status_code, response.json()["detail"]), (409, str(refusal)))
-        response, _ = studio(OFF, v2={"side_effect": AssertionError("new case")},
-                             classic={"return_value": ("c2", "d" * 64)})
+        response, classic = studio(ON)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("replaced by the portfolio builder", response.json()["detail"])
+        classic.assert_not_called()
+        response, classic = studio(ON, "/api/onboarding/derived-studio/composite/start", {
+            "subject_id": "synthetic-long-short", "display_name": "Synthetic long short", "base_currency": "HKD",
+            "normalization_date": "2025-01-20", "constant_cash": 58,
+            "components": [{"component_id": "U0000501", "coefficient": 0.42}]})
+        self.assertEqual(response.status_code, 409)
+        response, classic = studio(OFF)
         self.assertEqual(response.json()["next_page"], "/account-onboarding/synthetic-ex-taiwan/steps/financial-contract")
+        self.assertEqual(classic.call_args.kwargs["definition"]["subject_type"], "filtered_portfolio")
+
+    def test_the_builder_runs_the_studio_rules_then_opens_a_case(self):
+        captured = {}
+
+        def composite(connection, submission, subject):
+            captured["submission"], captured["subject"] = submission, subject
+            return {"subject_type": "composite_portfolio", "subject_id": subject}
+
+        opened = {"case_id": "c1", "next_page": "/account-onboarding/cases/c1"}
+        with patch.dict(os.environ, ON), \
+                patch.object(web, "_approval_database", side_effect=lambda: _database(_RecordingConnection())), \
+                patch.object(web, "_studio_composite_definition", side_effect=composite), \
+                patch.object(onboarding_v2_web, "start_derived_case", return_value=opened) as start:
+            response = self.client.post("/api/onboarding-v2/portfolios", json=MS_LIKE)
+            self.assertEqual((response.status_code, response.json()), (200, opened), response.text)
+            submission = captured["submission"]
+            self.assertEqual((captured["subject"], submission.base_currency, submission.constant_cash),
+                             ("alpha-world-asia", "HKD", 58.0))
+            self.assertEqual([(c.component_id, c.coefficient) for c in submission.components],
+                             [("hong-kong-china", 0.91), ("U16088571", 0.45), ("hang-seng-price-index", -0.49),
+                              ("spy-settlement", -0.45)])
+            self.assertEqual(start.call_args.kwargs["description"], MS_LIKE["description"])
+            self.assertEqual(start.call_args.kwargs["definition"]["subject_id"], "alpha-world-asia")
+            for bad in ("ab", "alpha_world_asia"):
+                refused = self.client.post("/api/onboarding-v2/portfolios", json={**MS_LIKE, "subject_id": bad})
+                self.assertEqual(refused.status_code, 400)
+                self.assertIn("letters, digits and hyphens", refused.json()["detail"])
+            no_name = self.client.post("/api/onboarding-v2/portfolios", json={**MS_LIKE, "display_name": "A"})
+            self.assertEqual(no_name.status_code, 400)
+            self.assertTrue(no_name.json()["detail"].startswith("Check the name:"), no_name.text)
+            no_sleeves = self.client.post("/api/onboarding-v2/portfolios", json={**MS_LIKE, "sleeves": []})
+            self.assertEqual((no_sleeves.status_code, no_sleeves.json()["detail"]), (400, "Add at least one sleeve"))
+        self.user = OPERATOR
+        with patch.dict(os.environ, ON), \
+                patch.object(web, "_approval_database", side_effect=lambda: _database(_RecordingConnection())), \
+                patch.object(web, "_studio_composite_definition", side_effect=composite), \
+                patch.object(onboarding_v2_web, "check_portfolio", return_value={"ok": True}) as check:
+            self.assertEqual(self.client.post("/api/onboarding-v2/portfolios/check", json=MS_LIKE).json(),
+                             {"ok": True})
+        self.assertEqual(check.call_args.kwargs["description"], MS_LIKE["description"])
+
+    def test_the_builder_previews_the_tree_from_the_read_only_database(self):
+        connection = _RecordingConnection()
+        with patch.dict(os.environ, ON), patch.object(web, "_database", side_effect=lambda: _database(connection)):
+            preview = self.client.post("/api/onboarding-v2/portfolios/preview", json=MS_LIKE)
+            catalogue = self.client.get("/api/onboarding-v2/portfolio-builder")
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["totals"]["cash"], 58.0)
+        self.assertIn("Composition of Alpha World Asia", preview.json()["svg"])
+        self.assertIn("Hang Seng", preview.json()["svg"])
+        self.assertEqual(catalogue.status_code, 200, catalogue.text)
+        self.assertIn("hang-seng-price-index", [item["component_id"] for item in catalogue.json()["indices"]])
+        self.assertFalse(any("INSERT" in sql or "UPDATE" in sql for sql, _ in connection.statements))
 
     def test_operators_can_start_but_only_the_owner_approves_or_adds_keys(self):
         self.user = OPERATOR

@@ -184,15 +184,18 @@ class BrokerOnboardingSchemaTests(_MigratedDatabase):
         connection_id = self._connection()
         self._account(connection_id, "50000011")
         derived = ("INSERT INTO broker_onboarding_cases (case_id, source_kind, connection_id, broker, "
-                   "broker_account_id, definition_json, definition_sha256, target_subject_id, display_name, "
-                   "reporting_currency, history_start_date, stage, status) VALUES (gen_random_uuid(), "
-                   "'composite_portfolio', %s, %s, %s, %s, %s, %s, 'Synthetic', 'HKD', '2025-01-20', 'request', "
-                   "'platform_working')")
-        self.assertRejected(derived, (None, None, None, None, None, "synthetic-long-short"))  # no definition
+                   "broker_account_id, definition_json, definition_sha256, target_subject_id, description, "
+                   "display_name, reporting_currency, history_start_date, stage, status) VALUES "
+                   "(gen_random_uuid(), 'composite_portfolio', %s, %s, %s, %s, %s, %s, %s, 'Synthetic', 'HKD', "
+                   "'2025-01-20', 'request', 'platform_working')")
+        about = "A synthetic long short portfolio."
+        self.assertRejected(derived, (None, None, None, None, None, "synthetic-long-short", about))  # no definition
         self.assertRejected(derived, (connection_id, "kiwoom_rest", "50000011", "{}", "d" * 64,
-                                      "synthetic-long-short"))  # a broker account is not a portfolio
-        self.assertRejected(derived, (None, None, None, "{}", "d" * 64, "has spaces"))
-        self.db.execute(derived, (None, None, None, "{}", "d" * 64, "synthetic-long-short"))
+                                      "synthetic-long-short", about))  # a broker account is not a portfolio
+        self.assertRejected(derived, (None, None, None, "{}", "d" * 64, "has spaces", about))
+        self.assertRejected(derived, (None, None, None, "{}", "d" * 64, "synthetic-long-short", None))
+        self.assertRejected(derived, (None, None, None, "{}", "d" * 64, "synthetic-long-short", "Too short"))
+        self.db.execute(derived, (None, None, None, "{}", "d" * 64, "synthetic-long-short", about))
         self._subject("other-portfolio")
         self.assertRejected("UPDATE broker_onboarding_cases SET subject_id = 'other-portfolio'")
 
@@ -200,7 +203,7 @@ class BrokerOnboardingSchemaTests(_MigratedDatabase):
         self.db.execute("UPDATE broker_onboarding_cases SET stage = 'first_month_end', status = 'live', "
                         "went_live_at = now(), subject_id = target_subject_id")
         with self.assertRaises(psycopg.errors.UniqueViolation), self.db.transaction():
-            self.db.execute(derived, (None, None, None, "{}", "e" * 64, "synthetic-long-short"))
+            self.db.execute(derived, (None, None, None, "{}", "e" * 64, "synthetic-long-short", about))
         self._case(connection_id, "50000011")  # the one-at-a-time slot is free again
 
     def test_connections_hold_no_secret_and_ibkr_needs_expiry(self):
@@ -374,7 +377,8 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
         from datetime import date
 
         from ibkr_etl.onboarding_v2_web import (
-            OnboardingError, approve_case, cancel_case, case_detail, record_platform_check, start_derived_case)
+            OnboardingError, approve_case, cancel_case, case_detail, check_portfolio, record_platform_check,
+            start_derived_case)
         from ibkr_etl.subject_onboarding import fixed_unit_composite_definition
 
         self.db.execute("INSERT INTO platform_subjects (subject_id, subject_type, display_name, base_currency, "
@@ -392,17 +396,35 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
             ])
         today = date(2026, 10, 13)
 
-        def start():
-            return start_derived_case(self.db, TENANT, definition=definition, actor=IDENTITY, today=today)
+        about = "Long synthetic tech, short the Hang Seng Index."
 
+        def start(**changes):
+            return start_derived_case(self.db, TENANT, **{"definition": definition, "description": about,
+                                                          "actor": IDENTITY, "today": today, **changes})
+
+        def check():
+            return check_portfolio(self.db, TENANT, definition=definition, description=about, today=today)
+
+        self.assertEqual(check()["problems"], ["Not live yet: U0000501."])
         with self.assertRaisesRegex(OnboardingError, "Every sleeve must be live.*U0000501"):
             start()
         self.db.execute("UPDATE platform_subjects SET lifecycle_status = 'active' WHERE subject_id = 'U0000501'")
+        checked = check()
+        self.assertTrue(checked["ok"], checked["problems"])
+        self.assertIn("Sleeves in USD are converted to HKD every day.", checked["notes"])
+        self.assertIn("Composition of Synthetic long short", checked["svg"])
+        with self.assertRaisesRegex(OnboardingError, "10 to 600 characters"):
+            start(description="Short")
+        with self.assertRaisesRegex(OnboardingError, "letters, digits and hyphens"):
+            start(definition={**definition, "subject_id": "synthetic_long_short"})
+        with self.assertRaisesRegex(OnboardingError, "future"):
+            start(today=date(2025, 1, 19))
         started = start()
         case_id = started["case_id"]
         self.assertEqual((started["stage"], started["status"]), ("load_and_reconcile", "platform_working"))
         with self.assertRaisesRegex(OnboardingError, "portfolio ID already has"):
             start()
+        self.assertIn("This portfolio ID already has an onboarding case.", check()["problems"])
         with self.assertRaisesRegex(OnboardingError, "not a check"):
             record_platform_check(self.db, TENANT, case_id, "nav_reconciled", "pass", "Not for portfolios.")
         record_platform_check(self.db, TENANT, case_id, "sleeves_cover_history", "pass", "Covered.")
@@ -415,6 +437,8 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
         self.assertIn({"label": "Short sleeve", "value": "0.49 × Hang Seng Index (HKD)"},
                       detail["definition_summary"])
         self.assertEqual(detail["account_terms"]["definition"], definition)
+        self.assertEqual((detail["description"], detail["account_terms"]["description"]), (about, about))
+        self.assertIn("Composition of Synthetic long short", detail["composition_svg"])
         approve_case(self.db, TENANT, case_id, approval="account_terms", terms_sha256=detail["account_terms_sha256"],
                      acknowledge_warnings=[], confirmation=None, actor=IDENTITY)
         subject = self.db.execute("SELECT subject_type, lifecycle_status, reporting_currency FROM platform_subjects "
@@ -465,6 +489,76 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
                                   "WHERE connection_id = %s", (credential,)).fetchone()
         self.assertEqual(dict(tracked), {"broker": "ibkr_flex", "credential_fingerprint": "a" * 16})
 
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class PortfolioDryRunTests(_MigratedDatabase):
+    """The daily job's stage 2 dry run commits, so it gets a database of its own."""
+
+    def test_the_dry_run_records_stage_two_and_keeps_nothing(self):
+        from datetime import date
+
+        import psycopg
+        from psycopg.rows import dict_row
+
+        from ibkr_etl.db import PostgresConnection, transaction
+        from ibkr_etl.onboarding_dry_run import run_portfolio_dry_runs
+        from ibkr_etl.onboarding_v2_web import case_detail, start_derived_case
+        from ibkr_etl.subject_onboarding import fixed_unit_composite_definition
+
+        db = PostgresConnection(psycopg.connect(_dsn(ADMIN_DSN, self.database, OWNER_ROLE), row_factory=dict_row,
+                                                options=f"-c app.tenant_id={TENANT}"))
+        self.addCleanup(db.close)
+        db.execute("INSERT INTO platform_subjects (subject_id, subject_type, display_name, base_currency, "
+                   "lifecycle_status) VALUES ('U0000501', 'physical_account', 'Synthetic tech', 'USD', 'active')")
+        definition = fixed_unit_composite_definition(
+            subject_id="synthetic-long-short", display_name="Synthetic long short", base_currency="HKD",
+            normalization_date="2025-01-20", constant_cash=58.0,
+            components=[{"component_id": "U0000501", "component_name": "Synthetic tech",
+                         "component_type": "account", "coefficient": 0.42, "source_currency": "USD"}])
+        case_id = start_derived_case(db, TENANT, definition=definition, description="A synthetic long short case.",
+                                     actor=IDENTITY, today=date(2025, 3, 3))["case_id"]
+        db.commit()
+        calls = []
+
+        def calculate(dry, contract):
+            calls.append(contract["subject_id"])
+            if len(calls) == 1:
+                raise RuntimeError("Composite account sleeve does not exist: U0000501")
+            with transaction(dry):  # the real refresh commits like this
+                dry.execute("INSERT INTO accounts (account_id, first_seen_at, last_seen_at, source_json) "
+                            "VALUES ('composite-source', 'x', 'x', '{}')")
+                dry.execute("INSERT INTO derived_portfolios (portfolio_id, name, source_account_id, base_currency, "
+                            "exclusion_rule_json, calculation_version, status, created_at, updated_at) "
+                            "VALUES (?, 'Synthetic', 'composite-source', 'HKD', '{}', 'v1', 'active', 'x', 'x')",
+                            (contract["subject_id"],))
+                for day, nav in (("2025-01-20", 100.0), ("2025-01-21", 99.1), ("2025-02-28", 103.4)):
+                    dry.execute("INSERT INTO derived_portfolio_nav (portfolio_id, snapshot_date, currency, total_nav, "
+                                "excluded_market_value_base, source_position_count, included_position_count, "
+                                "excluded_position_count, generated_at) VALUES (?, ?, 'HKD', ?, 0, 2, 2, 0, 'x')",
+                                (contract["subject_id"], day, nav))
+            return {"nav_dates": 3}
+
+        failed, = run_portfolio_dry_runs(db, TENANT, calculate=calculate, today=date(2025, 3, 3))
+        self.assertEqual((failed["checks"], failed["status"]),
+                         ({"sleeves_cover_history": "fail", "calculation_dry_run": "fail"}, "blocked"))
+        checks = {k["check_id"]: k["message"] for k in case_detail(db, TENANT, case_id)["checks"]}
+        self.assertIn("Composite account sleeve does not exist: U0000501", checks["calculation_dry_run"])
+
+        passed, = run_portfolio_dry_runs(db, TENANT, calculate=calculate, today=date(2025, 3, 3))
+        self.assertEqual((passed["checks"], passed["status"]),
+                         ({"sleeves_cover_history": "pass", "calculation_dry_run": "pass"}, "waiting_on_owner"))
+        detail = case_detail(db, TENANT, case_id)
+        self.assertEqual(detail["awaiting_approval"], "account_terms")
+        self.assertIn("3 daily values from 2025-01-20 to 2025-02-28", {k["check_id"]: k["message"] for k in
+                                                                       detail["checks"]}["calculation_dry_run"])
+        for table, column in (("derived_portfolio_nav", "portfolio_id"), ("derived_portfolios", "portfolio_id"),
+                              ("accounts", "account_id")):
+            kept = db.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE {column} IN "
+                              "('synthetic-long-short', 'composite-source')").fetchone()["n"]
+            self.assertEqual(kept, 0, table)
+        self.assertEqual(run_portfolio_dry_runs(db, TENANT, calculate=calculate, today=date(2025, 3, 3)), [])
+        self.assertEqual(calls, ["synthetic-long-short", "synthetic-long-short"])
 
 if __name__ == "__main__":
     unittest.main()

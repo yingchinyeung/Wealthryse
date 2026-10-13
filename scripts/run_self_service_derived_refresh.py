@@ -26,6 +26,7 @@ from ibkr_etl.derived_portfolio import (  # noqa: E402
     refresh_fixed_unit_composite,
 )
 from ibkr_etl.market_data import refresh_alpha_world_market_data  # noqa: E402
+from ibkr_etl.onboarding_dry_run import run_portfolio_dry_runs  # noqa: E402
 from ibkr_etl.provisional_benchmark import refresh_and_materialize  # noqa: E402
 from ibkr_etl.risk_snapshots import build_risk_snapshot  # noqa: E402
 from ibkr_etl.sector_classification import (  # noqa: E402
@@ -356,6 +357,31 @@ def _refresh_analytics_if_approved(
     return evidence
 
 
+def _dry_run_portfolio_cases(connection, tenant_id: str, reference_path: Path, reference) -> list[dict]:
+    """Stage 2 of each new-onboarding portfolio case: calculate, measure, roll back.
+
+    Nothing runs until migration 063 exists, and nothing is kept for a
+    portfolio the owner has not approved.
+    """
+
+    if connection.execute(
+        "SELECT to_regclass('public.broker_onboarding_cases')"
+    ).fetchone()[0] is None:
+        return []
+
+    def calculate(dry_connection, definition: dict) -> dict:
+        if definition["subject_type"] == "filtered_portfolio":
+            return refresh_filtered_portfolio(
+                dry_connection, reference_path, contract=definition,
+                expected_reference_sha256=reference()["content_sha256"],
+            )
+        return refresh_fixed_unit_composite(dry_connection, definition)
+
+    return run_portfolio_dry_runs(
+        connection, tenant_id, calculate=calculate, today=datetime.now(timezone.utc).date()
+    )
+
+
 def main() -> int:
     settings = load_settings()
     if not settings.database_url:
@@ -381,6 +407,15 @@ def main() -> int:
         # validate normalization-date coverage while a portfolio is still in
         # onboarding; waiting until activation would create a circular gate.
         market_data = refresh_alpha_world_market_data(connection)
+        reference_path = PROJECT_ROOT / "data" / "reference_data.json"
+        downloaded: dict = {}
+
+        def reference() -> dict:
+            if "source" not in downloaded:
+                downloaded["source"] = _download_reference_data(settings, reference_path)
+            return downloaded["source"]
+
+        portfolio_cases = _dry_run_portfolio_cases(connection, settings.tenant_id, reference_path, reference)
         targets = _ordered_targets(_approved_targets(connection))
         if not targets:
             print(
@@ -389,14 +424,14 @@ def main() -> int:
                         "status": "success",
                         "subjects": [],
                         "market_data": market_data,
+                        "portfolio_cases": portfolio_cases,
                     }
                 )
             )
             return 0
-        reference_path = PROJECT_ROOT / "data" / "reference_data.json"
         reference_source = None
         if any(row["subject_type"] == "filtered_portfolio" for row in targets):
-            reference_source = _download_reference_data(settings, reference_path)
+            reference_source = reference()
         results: list[dict] = []
         failures: list[dict] = []
         requested_to = datetime.now(timezone.utc).date().isoformat()
@@ -565,6 +600,7 @@ def main() -> int:
                     "failures": failures,
                     "reference_data": reference_source,
                     "market_data": market_data,
+                    "portfolio_cases": portfolio_cases,
                 }
             )
         )

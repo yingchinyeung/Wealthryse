@@ -73,6 +73,8 @@ CREATE TABLE broker_onboarding_cases (
     -- The platform subject this case creates, reserved from the start.
     target_subject_id TEXT NOT NULL CHECK (target_subject_id ~ '^[A-Za-z0-9][A-Za-z0-9-]{2,63}$'),
     display_name TEXT NOT NULL CHECK (length(trim(display_name)) BETWEEN 1 AND 160),
+    -- What a derived portfolio's reports and website say it is.
+    description TEXT CHECK (description IS NULL OR length(trim(description)) BETWEEN 10 AND 600),
     reporting_currency TEXT NOT NULL CHECK (reporting_currency ~ '^[A-Z]{3}$'),
     history_start_date DATE NOT NULL,
     -- Registered in platform_subjects at approval 1, not before.
@@ -104,6 +106,7 @@ CREATE TABLE broker_onboarding_cases (
          AND definition_json IS NOT NULL AND definition_sha256 IS NOT NULL)
     ),
     CHECK (subject_id IS NULL OR subject_id = target_subject_id),
+    CHECK (source_kind = 'broker_account' OR description IS NOT NULL),
     CHECK ((stage = 'closed') = (status = 'closed')),
     CHECK (stage IN ('request', 'load_and_reconcile') OR status = 'cancelled' OR subject_id IS NOT NULL),
     CHECK (went_live_at IS NOT NULL OR stage NOT IN ('first_month_end', 'closed')),

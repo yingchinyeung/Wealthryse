@@ -252,18 +252,37 @@ def main():
             run(client + ['rm', container], 'live image cleanup', env=env)
         package = context / 'src' / 'ibkr_etl'
         live = tree_hashes(package)
+        if config.get('inventory') or config.get('capture'):
+            # Read-only. Repo-style paths (src/ibkr_etl/..., scripts/...) cover the
+            # job entry points too; a bare name means src/ibkr_etl/<name>.
+            container = run(client + ['create', base], 'image unpack', env=env).strip()
+            try:
+                copied = subprocess.run(client + ['cp', container + ':/app/scripts', str(context)],
+                                        capture_output=True, text=True, timeout=600, env=env)
+            finally:
+                run(client + ['rm', container], 'image cleanup', env=env)
+            roots = {'src/ibkr_etl/': package}
+            if copied.returncode == 0:
+                roots['scripts/'] = context / 'scripts'
+            files = {prefix + name: folder / name for prefix, folder in roots.items() for name in tree_hashes(folder)}
+            hashes = {prefix + name: digest for prefix, folder in roots.items() for name, digest in tree_hashes(folder).items()}
+        if config.get('inventory'):
+            detail = base64.b64encode(gzip.compress(json.dumps(hashes, sort_keys=True).encode(), 9)).decode()
+            result.update(passed=True, files=len(hashes), has_scripts='scripts/' in roots)
+            raise Captured()
         if config.get('capture'):
             # Read-only: hand back exact copies of the named live files; nothing is built.
             names = config['capture']
-            missing = [n for n in names if n not in live]
+            paths = {n: (n if '/' in n else 'src/ibkr_etl/' + n) for n in names}
+            missing = [n for n, path in paths.items() if path not in files]
             if missing:
                 raise ValueError('Not in the live image: ' + ', '.join(missing))
             buffer = io.BytesIO()
             with tarfile.open(fileobj=buffer, mode='w:xz', preset=9) as tar:
                 for name in names:
-                    tar.add(str(package / name), arcname=name)
+                    tar.add(str(files[paths[name]]), arcname=name)
             detail = base64.b64encode(buffer.getvalue()).decode()
-            result.update(passed=True, captured={n: live[n] for n in names})
+            result.update(passed=True, captured={n: hashes[paths[n]] for n in names})
             raise Captured()
         if config.get('replacements'):
             touched, elsewhere = apply_replacements(package, config['replacements'])

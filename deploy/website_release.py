@@ -203,19 +203,21 @@ def read_detail(base, location, path, size):
     return encoded
 
 
-def capture():
-    """Copy named files out of the live website image into deploy/live-snapshot/ (read-only)."""
-    names = sys.argv[2:]
-    if not names or any('/' in n or not n.endswith('.py') for n in names):
-        raise SystemExit('Name the src/ibkr_etl/*.py files to copy')
-    head = git('rev-parse', 'HEAD').strip()
-    live = az('containerapp', 'show', '-n', APP, '-g', RG)['properties']['template']['containers'][0]['image']
-    config = {'capture': names, 'base_image': live, 'target_image': f'{REG}/ibkr-platform:web-capture',
-              'source_commit': head, 'live_hashes': {}, 'new_hashes': {}, 'patch': ''}
+IMAGE_PREFIX = REG + '/ibkr-platform@sha256:'
+
+
+def remote_script(config):
     code = (ROOT / 'deploy' / 'website_overlay_build_remote.py').read_text()
-    code = code.replace('CONFIG = None  # replaced by the workflow', 'CONFIG = json.loads(' + repr(json.dumps(config)) + ')')
-    command = "cat > /tmp/wealthryse-website-build.py <<'WEALTHRYSE_EOF'\n" + code + "\nWEALTHRYSE_EOF\n" \
-              "unshare --mount --propagation private python3 /tmp/wealthryse-website-build.py; status=$?; rm -f /tmp/wealthryse-website-build.py; exit $status"
+    marker = 'CONFIG = None  # replaced by the workflow'
+    if code.count(marker) != 1:
+        raise SystemExit('Build script placeholder missing')
+    code = code.replace(marker, 'CONFIG = json.loads(' + repr(json.dumps(config)) + ')')
+    return "cat > /tmp/wealthryse-website-build.py <<'WEALTHRYSE_EOF'\n" + code + "\nWEALTHRYSE_EOF\n" \
+           "unshare --mount --propagation private python3 /tmp/wealthryse-website-build.py; status=$?; rm -f /tmp/wealthryse-website-build.py; exit $status"
+
+
+def read_only_on_vm(config, run_name):
+    """Run a read-only capture or inventory on the build VM; return its result and detail."""
     vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
     started = vm.get('powerState') != 'VM running'
     if started:
@@ -223,19 +225,51 @@ def capture():
     sub = az('account', 'show')['id']
     base = f'https://management.azure.com/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{VM}/runCommands/'
     try:
-        view = vm_run(base, 'website-capture', command, vm['location'], 1800)
+        view = vm_run(base, run_name, remote_script(config), vm['location'], 1800)
         lines = [l[len('WEBSITE_BUILD_RESULT '):] for l in (view.get('output') or '').splitlines() if l.startswith('WEBSITE_BUILD_RESULT ')]
         result = json.loads(lines[-1]) if lines else {'passed': False}
         print(json.dumps({k: v for k, v in result.items() if k != 'captured'}, indent=2))
         if not result.get('passed'):
-            raise SystemExit('Capture failed')
-        archive = base64.b64decode(read_detail(base, vm['location'], result['detail_file'], result['detail_size']))
+            raise SystemExit('Read-only copy failed; nothing was changed')
+        return result, read_detail(base, vm['location'], result['detail_file'], result['detail_size'])
     finally:
         if started:
             subprocess.run(['az', 'vm', 'deallocate', '-g', RG, '-n', VM, '--no-wait'], capture_output=True)
+
+
+def image_argument(args):
+    """--image <registry image by digest> selects another deployed image; default is the website."""
+    if args[:1] == ['--image']:
+        if len(args) < 2 or not args[1].startswith(IMAGE_PREFIX) or len(args[1]) != len(IMAGE_PREFIX) + 64:
+            raise SystemExit('Give --image as ' + IMAGE_PREFIX + '<64 hex digits>')
+        return args[1], args[2:]
+    return None, args
+
+
+def capture():
+    """Copy named files out of a deployed image (read-only).
+
+    With no --image, the files come from the live website image into deploy/live-snapshot/
+    (bare names, src/ibkr_etl only). With --image they go to deploy/image-captures/<digest>/
+    under their repository paths (src/ibkr_etl/... or scripts/...).
+    """
+    image, names = image_argument(sys.argv[2:])
+    if image is None:
+        if not names or any('/' in n or not n.endswith('.py') for n in names):
+            raise SystemExit('Name the src/ibkr_etl/*.py files to copy')
+    elif not names or any(not n.endswith('.py') or '..' in n or not n.startswith(('src/ibkr_etl/', 'scripts/')) for n in names):
+        raise SystemExit('Name src/ibkr_etl/... or scripts/... .py files to copy')
+    head = git('rev-parse', 'HEAD').strip()
+    live = image or az('containerapp', 'show', '-n', APP, '-g', RG)['properties']['template']['containers'][0]['image']
+    config = {'capture': names, 'base_image': live, 'target_image': f'{REG}/ibkr-platform:web-capture',
+              'source_commit': head, 'live_hashes': {}, 'new_hashes': {}, 'patch': ''}
+    result, detail = read_only_on_vm(config, 'website-capture')
+    archive = base64.b64decode(detail)
     import io, tarfile
-    target = ROOT / 'deploy' / 'live-snapshot' / PACKAGE
-    target.mkdir(parents=True, exist_ok=True)
+    if image is None:
+        target = ROOT / 'deploy' / 'live-snapshot' / PACKAGE
+    else:
+        target = ROOT / 'deploy' / 'image-captures' / image[len(IMAGE_PREFIX):][:12]
     with tarfile.open(fileobj=io.BytesIO(archive), mode='r:xz') as tar:
         for member in tar.getmembers():
             if member.name not in names or not member.isfile():
@@ -243,9 +277,51 @@ def capture():
             data = tar.extractfile(member).read()
             if hashlib.sha256(data).hexdigest() != result['captured'][member.name]:
                 raise SystemExit('Captured file damaged in transfer: ' + member.name)
+            (target / member.name).parent.mkdir(parents=True, exist_ok=True)
             (target / member.name).write_bytes(data)
-    (target.parent.parent / 'IMAGE').write_text(live + '\n')
+    if image is None:
+        (target.parent.parent / 'IMAGE').write_text(live + '\n')
+    else:
+        (target / 'IMAGE').write_text(live + '\n')
     print('Copied', ', '.join(names), 'from', live)
+
+
+def compare_with_repo(hashes, head):
+    """Compare an image's file hashes with the repository at head."""
+    repo = {}
+    for prefix in ('src/ibkr_etl/', 'scripts/'):
+        for path in git('ls-tree', '-r', '--name-only', head, prefix).split():
+            if path.endswith('.py'):
+                repo[path] = hashlib.sha256(git('show', head + ':' + path, binary=True)).hexdigest()
+    scripts = any(p.startswith('scripts/') for p in hashes)
+    repo = {p: h for p, h in repo.items() if scripts or not p.startswith('scripts/')}
+    return {'same': sorted(p for p in hashes if repo.get(p) == hashes[p]),
+            'different': sorted(p for p in hashes if p in repo and repo[p] != hashes[p]),
+            'only_image': sorted(p for p in hashes if p not in repo),
+            'only_repo': sorted(p for p in repo if p not in hashes)}
+
+
+def inventory():
+    """Read-only: hash every .py file in deployed images and compare them with the repository.
+
+    Writes deploy/image-inventory/<digest>.json per image; nothing in Azure changes.
+    """
+    images = sys.argv[2:]
+    if not images or any(not i.startswith(IMAGE_PREFIX) or len(i) != len(IMAGE_PREFIX) + 64 for i in images):
+        raise SystemExit('Give one or more images as ' + IMAGE_PREFIX + '<64 hex digits>')
+    head = git('rev-parse', 'HEAD').strip()
+    folder = ROOT / 'deploy' / 'image-inventory'
+    folder.mkdir(parents=True, exist_ok=True)
+    for image in dict.fromkeys(images):
+        config = {'inventory': True, 'base_image': image, 'target_image': f'{REG}/ibkr-platform:web-capture',
+                  'source_commit': head, 'live_hashes': {}, 'new_hashes': {}, 'patch': ''}
+        _, detail = read_only_on_vm(config, 'image-inventory-' + image[len(IMAGE_PREFIX):][:12])
+        hashes = json.loads(gzip.decompress(base64.b64decode(detail)))
+        comparison = compare_with_repo(hashes, head)
+        (folder / (image[len(IMAGE_PREFIX):][:12] + '.json')).write_text(json.dumps(
+            {'image': image, 'repo_commit': head, 'hashes': hashes, **comparison}, indent=1, sort_keys=True) + '\n')
+        print(image, {k: len(v) for k, v in comparison.items()})
+
 
 # The image ibkrv2stg-analyst-assurance ran on 13 Oct 2026. It passes MS and T,
 # but expects the layout names of the reports it replaced; the reviewed reports
@@ -400,4 +476,4 @@ def rollback():
 
 if __name__ == '__main__':
     {'prepare': prepare, 'build': build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat,
-     'assurance-build': assurance_build}[sys.argv[1]]()
+     'assurance-build': assurance_build, 'inventory': inventory}[sys.argv[1]]()

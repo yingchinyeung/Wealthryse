@@ -295,12 +295,44 @@ def verify():
         raise SystemExit('Verification failed')
 
 
+# Website chat settings (not secrets). The agent service is internal to the
+# same Container Apps environment; the website signs in with its own identity.
+AGENT_SETTINGS = {
+    'AGENT_API_URL': 'https://ibkrv2stg-agent.internal.purplerock-8cff24a2.eastasia.azurecontainerapps.io',
+    'AGENT_API_AUDIENCE': 'api://0578a50b-a7a1-40a4-905b-8b20dba84124/wealthryse-agent',
+}
+
+
+def chat():
+    """Set AGENT_UI_MODE (off or owner) on the website; leaves the image alone."""
+    mode = sys.argv[2]
+    if mode not in ('off', 'owner'):
+        raise SystemExit('Mode must be off or owner')
+    app = az('containerapp', 'show', '-n', APP, '-g', RG)
+    env = {e['name']: e.get('value') for e in app['properties']['template']['containers'][0].get('env', [])}
+    print('AGENT_UI_MODE was', env.get('AGENT_UI_MODE', 'unset'))
+    settings = {**AGENT_SETTINGS, 'AGENT_UI_MODE': mode} if mode == 'owner' else {'AGENT_UI_MODE': 'off'}
+    suffix = 'chat-' + mode + '-' + str(int(time.time()))[-6:]
+    az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
+       '--set-env-vars', *[k + '=' + v for k, v in settings.items()], parse=False)
+    STATE.write_text(json.dumps({'changed_files': ['AGENT_UI_MODE'], 'revision': APP + '--' + suffix,
+                                 'fqdn': app['properties']['configuration']['ingress']['fqdn'],
+                                 'previous_mode': env.get('AGENT_UI_MODE', 'off')}, indent=2))
+    print('Website chat set to', mode)
+
+
 def rollback():
     state = json.loads(STATE.read_text())
+    if 'previous_mode' in state:
+        suffix = 'chat-rollback-' + str(int(time.time()))[-6:]
+        az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
+           '--set-env-vars', 'AGENT_UI_MODE=' + state['previous_mode'], parse=False)
+        print('Website chat set back to', state['previous_mode'])
+        return
     suffix = 'rollback-' + str(int(time.time()))[-6:]
     az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--image', state['live_image'], '--revision-suffix', suffix, parse=False)
     print('Website switched back to', state['live_image'])
 
 
 if __name__ == '__main__':
-    {'prepare': prepare, 'build': build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback}[sys.argv[1]]()
+    {'prepare': prepare, 'build': build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat}[sys.argv[1]]()

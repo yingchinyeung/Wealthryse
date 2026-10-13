@@ -3450,10 +3450,10 @@ def prepare_subject_monthly_report_downloads(
 def _validate_release_factsheet(connection, content: bytes, *, subject_id: str,
                                period_end: str, snapshot_id: str) -> None:
     """Apply the subject's governed contract; never use another account's panel."""
-    if subject_id != "alpha-world-ms":
+    if subject_id not in ("alpha-world-ms", "alpha-world-t"):
         validate_factsheet_return_typography(content)
         return
-    from .ms_factsheet_release import validate_ms_factsheet_release
+    label = "MS" if subject_id == "alpha-world-ms" else "T"
     row = connection.execute(
         """
         SELECT snapshot_payload_json, data_sha256, subject_id, period_end
@@ -3464,11 +3464,16 @@ def _validate_release_factsheet(connection, content: bytes, *, subject_id: str,
         (TENANT_ID, snapshot_id, subject_id, period_end),
     ).fetchone()
     if row is None or row["subject_id"] != subject_id or str(row["period_end"]) != period_end:
-        raise MonthlyArtifactError("MS release snapshot identity is unavailable")
+        raise MonthlyArtifactError(label + " release snapshot identity is unavailable")
     raw = row["snapshot_payload_json"]
     if not isinstance(raw, str) or hashlib.sha256(raw.encode("utf-8")).hexdigest() != row["data_sha256"]:
-        raise MonthlyArtifactError("MS release snapshot integrity check failed")
+        raise MonthlyArtifactError(label + " release snapshot integrity check failed")
     snapshot = json.loads(raw)
+    if subject_id == "alpha-world-t":
+        from .t_factsheet_release import validate_t_factsheet_release
+        validate_t_factsheet_release(content, snapshot, period_end=period_end)
+        return
+    from .ms_factsheet_release import validate_ms_factsheet_release
     validate_ms_factsheet_release(content, snapshot, period_end=period_end)
 
 
@@ -3908,7 +3913,11 @@ def _monthly_download_filename(
             raise MonthlyReportError("Unsupported monthly report type")
         label, extension = definitions[kind]
         return f"{prefixes[subject_id]}_{label}_{period}{extension}"
-    return PurePosixPath(str(artifact["filename"])).name
+    name = PurePosixPath(str(artifact["filename"])).name
+    # Stored files are content-addressed as "<sha256>-<name>" (twice once released);
+    # readers get the plain name.
+    readable = re.sub(r"^(?:[0-9a-f]{64}-)+", "", name)
+    return readable if readable and not readable.startswith(".") else name
 
 
 def _download_monthly_report(

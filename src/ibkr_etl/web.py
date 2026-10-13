@@ -139,6 +139,8 @@ from .authorization import (
     subject_access_levels,
 )
 from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_guide
+from . import onboarding_v2_web
+from .broker_connections import onboarding_v2_enabled
 from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS
 from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
@@ -4830,7 +4832,9 @@ def _platform_navigation(user: dict[str, object], *, active: str | None = None) 
         "onboarding_operator",
     }:
         operations.append(
-            ("ibkr-connections", "IBKR connections", "/ibkr-connections")
+            ("broker-connections", "Broker connections", "/broker-connections")
+            if onboarding_v2_enabled()
+            else ("ibkr-connections", "IBKR connections", "/ibkr-connections")
         )
         operations.append(
             ("account-onboarding", "Account onboarding", "/account-onboarding")
@@ -8571,7 +8575,24 @@ def account_onboarding_step_page(
 def account_onboarding_page(
     request: Request, user: dict[str, str] = Depends(_onboarding_user)
 ) -> str:
+    if onboarding_v2_enabled():
+        return _platform_shell(
+            user, active="account-onboarding", title="Account onboarding",
+            description=onboarding_v2_web.ONBOARDING_DESCRIPTION,
+            content=onboarding_v2_web.ONBOARDING_CONTENT, script=onboarding_v2_web.ONBOARDING_SCRIPT,
+        )
     return _render_platform_page(user, section="account-onboarding")
+
+
+@app.get("/account-onboarding/classic", response_class=HTMLResponse)
+def account_onboarding_classic_page(
+    request: Request, user: dict[str, str] = Depends(_onboarding_user)
+) -> Response:
+    """The earlier onboarding page, kept for derived and master portfolios."""
+
+    if not onboarding_v2_enabled():
+        return RedirectResponse(url="/account-onboarding", status_code=307)
+    return HTMLResponse(_render_platform_page(user, section="account-onboarding"))
 
 
 def _reconciliation_prerequisite_status(checks: list[dict]) -> dict:
@@ -10438,10 +10459,6 @@ def metrics_guide_page(
 def _render_platform_page(user: dict[str, str], *, section: str) -> str:
     if section not in PLATFORM_SECTIONS:
         raise HTTPException(status_code=404, detail="Platform page not found")
-    viewer = escape(user["email"] or "authorized user")
-    role_label = escape(user.get("role", "owner").title())
-    page_title = escape(PLATFORM_SECTIONS[section])
-    platform_navigation = _platform_navigation(user, active=section)
     if section == "combined-holdings":
         description = "Latest holdings across every physical account you can view, converted into one currency with each account's own dated FX history and aggregated by instrument."
         content = """<div class="page-view active" data-section="combined-holdings"><div class="card wide"><div class="label">Combined holdings</div><form id="combined-form" class="actions"><label><span class="label">Currency</span> <input id="combined-currency" name="currency" value="USD" maxlength="3" pattern="[A-Za-z]{3}" required size="4"></label><label><span class="label">As of</span> <input id="combined-asof" name="as_of" type="date"></label><button class="button" type="submit">Update</button></form><div id="combined-note" class="muted" aria-live="polite">Loading…</div><div id="combined-accounts" class="status-row"></div><div class="table-tools"><input id="combined-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter combined holdings"><span id="combined-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Accounts</th><th>Quantity</th><th>Value (<span id="combined-currency-label">USD</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="combined-holdings"></tbody></table></div></div></div>"""
@@ -10478,6 +10495,19 @@ def _render_platform_page(user: dict[str, str], *, section: str) -> str:
         description = "Live owner communication with the controlled AI system administrator, plus platform-wide autonomy, incidents, reviews and audited maintenance actions."
         content = """<div class="page-view active" data-section="administration"><div class="card wide ai-chat-card admin-live-chat"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Administrator chats</div><strong>System operations</strong></div><button id="admin-new-chat" class="button" type="button">New chat</button></div><div id="admin-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="admin-chat-title">System administrator updates</strong><div class="muted">Owner-only · Monitored continuously · Changes remain approval-controlled</div></div><div class="actions"><a id="admin-chat-export-md" class="button" href="#" hidden>Save Markdown</a><a id="admin-chat-export-json" class="button" href="#" hidden>Save JSON</a><button id="admin-chat-archive" class="button" type="button" hidden>Archive</button></div></div><div id="admin-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Controlled system administration</div><div class="value">Connecting to the administrator…</div></div></div><div class="ai-chat-composer"><textarea id="admin-chat-input" maxlength="1200" aria-label="Message the AI System Administrator" placeholder="Ask about health or give a maintenance order…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Supported changes require an exact approval</div><button id="admin-chat-send" class="button" type="button">Send</button></div></div></section></div></div><div class="card wide"><div class="label">Institutional onboarding control plane</div><div id="control-plane-status" class="value">Loading…</div><div id="control-plane-note" class="muted"></div><div id="control-plane-summary" class="status-row"></div></div><div class="admin-layout"><div class="card admin-overview"><div class="label">24/7 controlled autonomy</div><div id="autonomy-status" class="value">Loading…</div><div id="autonomy-note" class="muted"></div><div id="autonomy-summary" class="status-row"></div><div id="autonomy-incidents" class="muted"></div><div id="autonomy-reviews" class="muted"></div></div><div class="card admin-actions-panel"><div class="label">Direct owner-approved actions</div><div id="admin-status" class="value">Loading…</div><div id="admin-note" class="muted"></div><div class="actions"><select id="admin-action" aria-label="Administrative action"></select><button id="admin-preview" class="button" type="button" disabled>Preview action</button></div><div id="admin-preview-result" class="muted" style="margin-top:14px"></div><div class="actions"><input id="admin-confirmation" type="text" maxlength="80" aria-label="Type the exact approval phrase" placeholder="Preview an action to obtain the approval phrase" disabled><button id="admin-execute" class="button" type="button" disabled>Approve and execute once</button></div><div id="admin-result" class="muted" style="margin-top:14px"></div></div></div></div>"""
         script = ADMINISTRATION_PAGE_SCRIPT + ADMIN_LIVE_CHAT_SCRIPT
+    return _platform_shell(
+        user, active=section, title=PLATFORM_SECTIONS[section], description=description,
+        content=content, script=script,
+    )
+
+
+def _platform_shell(
+    user: dict[str, str], *, active: str, title: str, description: str, content: str, script: str
+) -> str:
+    viewer = escape(user["email"] or "authorized user")
+    role_label = escape(user.get("role", "owner").title())
+    page_title = escape(title)
+    platform_navigation = _platform_navigation(user, active=active)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_title} · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body>
@@ -10847,4 +10877,20 @@ _install_agent_web(
     _authorized_user,
     lambda user: _authorized_subject_ids(user, feature_key="viewer_access"),
     ACCOUNT_THEME_CSS,
+)
+
+
+# New account onboarding (broker connections and four-stage cases). Every
+# route answers 404 unless ONBOARDING_V2_ENABLED is true; see onboarding_v2_web.py.
+onboarding_v2_web.install(
+    app,
+    onboarding_user=_onboarding_user,
+    owner_user=_owner_user,
+    read_database=lambda: _database(),
+    write_database=lambda: _approval_database(),
+    render_page=_platform_shell,
+    identity_digest=_identity_digest,
+    store_secret=lambda name, value: _store_flex_token_via_broker(name, value),
+    tenant_id=TENANT_ID,
+    platform_ip=lambda: os.environ.get("BROKER_EGRESS_IP", "").strip() or None,
 )

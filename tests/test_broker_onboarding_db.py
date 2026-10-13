@@ -32,8 +32,9 @@ def _dsn(base: str, database: str, user: str | None = None) -> str:
     return make_conninfo(**params)
 
 
-@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
-class BrokerOnboardingSchemaTests(unittest.TestCase):
+class _MigratedDatabase(unittest.TestCase):
+    """A fresh database with every migration applied, dropped afterwards."""
+
     @classmethod
     def setUpClass(cls):
         import psycopg
@@ -76,6 +77,9 @@ class BrokerOnboardingSchemaTests(unittest.TestCase):
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
             admin.execute(f'DROP DATABASE IF EXISTS "{cls.database}" WITH (FORCE)')
 
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class BrokerOnboardingSchemaTests(_MigratedDatabase):
     def setUp(self):
         import psycopg
 
@@ -219,6 +223,151 @@ class BrokerOnboardingSchemaTests(unittest.TestCase):
                             "VALUES ('krx_code', 'SAMSUNG', 'KRX:005930', 'owner')")
         self.assertRejected("INSERT INTO security_master (security_key, display_name, asset_class, currency, "
                             "status) VALUES ('NASDAQ:AAPL', 'Bad key', 'STK', 'USD', 'active')")
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class BrokerOnboardingFlowTests(_MigratedDatabase):
+    """The website's database functions, end to end on synthetic accounts."""
+
+    def setUp(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        self.db = psycopg.connect(_dsn(ADMIN_DSN, self.database, OWNER_ROLE), row_factory=dict_row,
+                                  options=f"-c app.tenant_id={TENANT}")
+        self.addCleanup(self.db.close)
+        self.addCleanup(self.db.rollback)
+
+    def _kiwoom(self, account="5012345610"):
+        from datetime import date
+
+        from ibkr_etl.broker_connections import new_connection_record
+        from ibkr_etl.onboarding_v2_web import register_connection
+
+        record = new_connection_record(
+            broker="kiwoom_rest", display_name=f"Kiwoom {uuid.uuid4().hex[:6]}", environment="mock",
+            credentials={"app_key": "k", "app_secret": "s"}, expires_on=None, ip_locked_to=None,
+            today=date(2026, 10, 13))
+        register_connection(self.db, TENANT, record=record, stored_fingerprint="0" * 16, query_id=None,
+                            account_id=account, actor=IDENTITY)
+        return record.connection_id
+
+    def _start(self, connection_id, account="5012345610"):
+        from datetime import date
+
+        from ibkr_etl.onboarding_v2_web import start_case
+
+        return start_case(self.db, TENANT, connection_id=connection_id, broker_account_id=account,
+                          display_name="Synthetic Korea", reporting_currency="KRW",
+                          history_start_date=date(2025, 1, 2), actor=IDENTITY, today=date(2026, 10, 13))
+
+    def test_kiwoom_case_runs_to_approval_one(self):
+        from datetime import date
+
+        from ibkr_etl.onboarding_v2_web import (
+            OnboardingError, approve_case, case_detail, onboarding_overview, record_platform_check)
+
+        started = self._start(self._kiwoom())
+        case_id = started["case_id"]
+        self.assertEqual((started["stage"], started["status"]), ("request", "platform_working"))
+        with self.assertRaisesRegex(OnboardingError, "still being onboarded"):
+            self._start(self._kiwoom("50999999"), "50999999")
+
+        record_platform_check(self.db, TENANT, case_id, "connection_sees_account", "pass", "Answered.")
+        for check_id in ("holdings_and_cash_loaded", "securities_mapped", "nav_reconciled"):
+            record_platform_check(self.db, TENANT, case_id, check_id, "pass", "Fine.")
+        result = record_platform_check(self.db, TENANT, case_id, "transactions_loaded", "warn",
+                                       "History starts later than requested.")
+        self.assertEqual((result["stage"], result["status"]), ("load_and_reconcile", "waiting_on_owner"))
+
+        detail = case_detail(self.db, TENANT, case_id)
+        self.assertEqual(detail["awaiting_approval"], "account_terms")
+        self.assertEqual(detail["account"], "5012-3456-10")
+        self.assertEqual(detail["go_live_phrase"], "GO LIVE 5012-3456-10")
+        with self.assertRaisesRegex(OnboardingError, "terms changed"):
+            approve_case(self.db, TENANT, case_id, approval="account_terms", terms_sha256="f" * 64,
+                         acknowledge_warnings=[], confirmation=None, actor=IDENTITY)
+        with self.assertRaisesRegex(OnboardingError, "Acknowledge"):
+            approve_case(self.db, TENANT, case_id, approval="account_terms",
+                         terms_sha256=detail["account_terms_sha256"], acknowledge_warnings=[],
+                         confirmation=None, actor=IDENTITY)
+        approved = approve_case(self.db, TENANT, case_id, approval="account_terms",
+                                terms_sha256=detail["account_terms_sha256"],
+                                acknowledge_warnings=["transactions_loaded"], confirmation=None, actor=IDENTITY)
+        self.assertEqual((approved["stage"], approved["status"]), ("build_history", "platform_working"))
+        subject = self.db.execute("SELECT lifecycle_status, reporting_currency FROM platform_subjects "
+                                  "WHERE subject_id = 'KIWOOM-5012345610'").fetchone()
+        self.assertEqual(dict(subject), {"lifecycle_status": "onboarding", "reporting_currency": "KRW"})
+        with self.assertRaisesRegex(OnboardingError, "history build"):
+            approve_case(self.db, TENANT, case_id, approval="historical_reports",
+                         terms_sha256=detail["account_terms_sha256"], acknowledge_warnings=[],
+                         confirmation=None, actor=IDENTITY)
+        events = [row["event_type"] for row in self.db.execute(
+            "SELECT event_type FROM broker_onboarding_events WHERE case_id = %s ORDER BY created_at, event_type",
+            (case_id,)).fetchall()]
+        self.assertIn("approved", events)
+        self.assertIn("warning_acknowledged", events)
+        overview = onboarding_overview(self.db, TENANT, today=date(2026, 10, 13), platform_ip=None)
+        self.assertEqual([c["case_id"] for c in overview["cases"]], [case_id])
+        self.assertFalse(overview["can_start"])
+
+    def test_ibkr_account_from_flex_discovery_goes_straight_to_loading(self):
+        from datetime import date
+
+        from ibkr_etl.broker_connections import new_connection_record
+        from ibkr_etl.onboarding_v2_web import (
+            connections_overview, onboarding_overview, register_connection, start_case)
+
+        record = new_connection_record(
+            broker="ibkr_flex", display_name="Second login", environment="live",
+            credentials={"flex_token": "123"}, expires_on=date(2027, 9, 1), ip_locked_to="20.6.1.10",
+            today=date(2026, 10, 13))
+        register_connection(self.db, TENANT, record=record, stored_fingerprint="0" * 16, query_id="987",
+                            account_id=None, actor=IDENTITY)
+        source = self.db.execute("SELECT flex_source_id FROM ibkr_flex_queries WHERE credential_id = %s",
+                                 (record.connection_id,)).fetchone()["flex_source_id"]
+        self.db.execute("INSERT INTO ibkr_flex_source_accounts (flex_source_id, source_account_id, base_currency, "
+                        "account_name, discovery_status) VALUES (%s, 'U0000077', 'USD', 'Synthetic', 'discovered')",
+                        (source,))
+        today = date(2026, 10, 13)
+        listed = connections_overview(self.db, TENANT, today=today, platform_ip="20.6.1.10")
+        mine = next(c for c in listed["connections"] if c["connection_id"] == record.connection_id)
+        self.assertEqual((mine["health"], mine["ip_lock"], mine["flex_source_id"]),
+                         ("not_checked", "locked", str(source)))
+        available = onboarding_overview(self.db, TENANT, today=today, platform_ip=None)["available"]
+        self.assertIn("U0000077", [a["broker_account_id"] for a in available])
+        started = start_case(self.db, TENANT, connection_id=record.connection_id, broker_account_id="u0000077",
+                             display_name="Synthetic USD", reporting_currency="usd",
+                             history_start_date=date(2025, 1, 20), actor=IDENTITY, today=today)
+        self.assertEqual(started["stage"], "load_and_reconcile")
+        available = onboarding_overview(self.db, TENANT, today=today, platform_ip=None)["available"]
+        self.assertNotIn("U0000077", [a["broker_account_id"] for a in available])
+
+    def test_cancel_frees_the_account_and_existing_logins_can_be_tracked(self):
+        from datetime import date
+
+        from ibkr_etl.onboarding_v2_web import OnboardingError, cancel_case, track_existing_login
+
+        connection_id = self._kiwoom("50000123")
+        case_id = self._start(connection_id, "50000123")["case_id"]
+        cancel_case(self.db, TENANT, case_id, reason="Picked the wrong account", actor=IDENTITY)
+        status = self.db.execute("SELECT discovery_status FROM broker_connection_accounts WHERE "
+                                 "broker_account_id = '50000123'").fetchone()["discovery_status"]
+        self.assertEqual(status, "discovered")
+        self._start(connection_id, "50000123")
+
+        credential = uuid.uuid4()
+        self.db.execute("INSERT INTO ibkr_flex_credentials (credential_id, display_name, key_vault_secret_name, "
+                        "token_fingerprint, status) VALUES (%s, 'Main login', %s, %s, 'active')",
+                        (credential, "ibkr-flex-source-" + credential.hex, "a" * 16))
+        with self.assertRaisesRegex(OnboardingError, "expiry"):
+            track_existing_login(self.db, TENANT, credential_id=str(credential), expires_on=None,
+                                 ip_locked_to=None, actor=IDENTITY, today=date(2026, 10, 13))
+        track_existing_login(self.db, TENANT, credential_id=str(credential), expires_on=date(2027, 6, 30),
+                             ip_locked_to=None, actor=IDENTITY, today=date(2026, 10, 13))
+        tracked = self.db.execute("SELECT broker, credential_fingerprint FROM broker_connections "
+                                  "WHERE connection_id = %s", (credential,)).fetchone()
+        self.assertEqual(dict(tracked), {"broker": "ibkr_flex", "credential_fingerprint": "a" * 16})
 
 
 if __name__ == "__main__":

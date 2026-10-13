@@ -66,6 +66,21 @@ class CompareWithRepoTest(unittest.TestCase):
         self.assertNotIn("scripts/run.py", result["only_repo"])
 
 
+class ListingTest(unittest.TestCase):
+    def test_listing_marks_differing_files_and_reuses_repo_hashes_for_the_rest(self):
+        repo = {"src/ibkr_etl/web.py": sha("web"), "src/ibkr_etl/agent_tools.py": sha("repo tools"),
+                "src/ibkr_etl/only_repo.py": sha("x")}
+        listing = {"files": ["src/ibkr_etl/agent_tools.py", "src/ibkr_etl/qualified_agent_risk.py", "src/ibkr_etl/web.py"],
+                   "differ": [0, 1]}
+        hashes = release.listing_hashes(listing, repo)
+        with mock.patch.object(release, "git", side_effect=AssertionError("repo hashes are passed in")):
+            result = release.compare_with_repo(hashes, "abc", repo)
+        self.assertEqual(result, {"same": ["src/ibkr_etl/web.py"],
+                                  "different": ["src/ibkr_etl/agent_tools.py"],
+                                  "only_image": ["src/ibkr_etl/qualified_agent_risk.py"],
+                                  "only_repo": ["src/ibkr_etl/only_repo.py"]})
+
+
 class InventoryArgumentsTest(unittest.TestCase):
     def test_requires_images_by_digest(self):
         for args in ([], [release.REG + "/ibkr-platform:web-x"]):
@@ -77,18 +92,19 @@ class InventoryArgumentsTest(unittest.TestCase):
     def test_one_failed_image_does_not_stop_the_others(self):
         good = release.IMAGE_PREFIX + "b" * 64
         bad = release.IMAGE_PREFIX + "a" * 64
-        detail = base64.b64encode(gzip.compress(json.dumps({"src/ibkr_etl/web.py": sha("web")}).encode())).decode()
+        listing = base64.b64encode(gzip.compress(json.dumps({"files": ["src/ibkr_etl/web.py"], "differ": [0]}).encode())).decode()
 
         def run(config, name):
+            self.assertIn("repo_hashes", config)
             if config["base_image"] == bad:
                 raise SystemExit("Run Command did not finish in time")
-            return {}, detail
+            return {"listing": listing}, ""
 
         with tempfile.TemporaryDirectory() as root, \
                 mock.patch.object(release, "ROOT", Path(root)), \
                 mock.patch.object(release, "git", return_value="abc\n"), \
                 mock.patch.object(release, "read_only_on_vm", side_effect=run), \
-                mock.patch.object(release, "compare_with_repo", return_value={"same": [], "different": [], "only_image": [], "only_repo": []}), \
+                mock.patch.object(release, "repo_hashes", return_value={"src/ibkr_etl/web.py": sha("repo web")}), \
                 mock.patch.object(sys, "argv", ["website_release.py", "inventory", bad, good]):
             with self.assertRaises(SystemExit) as stop:
                 release.inventory()

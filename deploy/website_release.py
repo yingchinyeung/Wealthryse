@@ -6,6 +6,8 @@ Steps, each a subcommand so the workflow can show and stop at each one:
   deploy   point the website at the new image
   verify   wait for the new revision, check health and that sign-in is still required
   rollback point the website back at the image recorded by prepare
+  assurance-build  build the analyst-assurance image (see build-assurance-image.yml);
+                   the assurance job itself is not changed
 State passes between steps in release-state.json.
 """
 import base64, gzip, hashlib, json, subprocess, sys, tempfile, time, urllib.request, urllib.error
@@ -245,6 +247,68 @@ def capture():
     (target.parent.parent / 'IMAGE').write_text(live + '\n')
     print('Copied', ', '.join(names), 'from', live)
 
+# The image ibkrv2stg-analyst-assurance ran on 13 Oct 2026. It passes MS and T,
+# but expects the layout names of the reports it replaced; the reviewed reports
+# released on 13 Oct carry the names below.
+ASSURANCE_BASE = REG + '/ibkr-platform@sha256:0a5788c04f0202cb2fcdc84cd08c591043fd0ab633549e6858de95b400c3071f'
+ASSURANCE_REPLACEMENTS = [
+    {'file': 'monthly_artifacts.py', 'old': 'approved-august-2026-v8-return-panel-typography',
+     'new': 'approved-august-2026-v9-full-portfolio-history'},
+    {'file': 'monthly_artifacts.py', 'old': 'subject-completed-factsheet-model-v7-alpha-world-ms-authority',
+     'new': 'subject-completed-factsheet-model-v8-full-portfolio-history'},
+    {'file': None, 'old': 'platform-standard-v24-security-name-evidence-v7',
+     'new': 'platform-standard-v24-reporting-currency-full-nav-v9'},
+]
+# Run inside the new image: the assurance check must expect the new names.
+ASSURANCE_CHECK = """
+import ibkr_etl.portfolio_assurance as a
+want = {'U16088571': 'approved-august-2026-v9-full-portfolio-history',
+        'U16088606': 'subject-completed-factsheet-model-v8-full-portfolio-history',
+        'hong-kong-china': 'subject-completed-factsheet-model-v8-full-portfolio-history'}
+for subject, layout in want.items():
+    assert a.factsheet_layout_version(subject) == layout, subject
+    assert a.presentation_content_contract_version(subject) == 'platform-standard-v24-reporting-currency-full-nav-v9', subject
+print('assurance layouts checked')
+"""
+
+
+def assurance_config(head):
+    return {'base_image': ASSURANCE_BASE, 'target_image': f'{REG}/ibkr-platform:assurance-layout-{head[:12]}',
+            'source_commit': head, 'replacements': ASSURANCE_REPLACEMENTS, 'check': ASSURANCE_CHECK,
+            'live_hashes': {}, 'new_hashes': {}, 'patch': ''}
+
+
+def assurance_build():
+    """Build and push the assurance image on the build VM. Nothing else changes."""
+    head = git('rev-parse', 'HEAD').strip()
+    code = (ROOT / 'deploy' / 'website_overlay_build_remote.py').read_text()
+    marker = 'CONFIG = None  # replaced by the workflow'
+    if code.count(marker) != 1:
+        raise SystemExit('Build script placeholder missing')
+    code = code.replace(marker, 'CONFIG = json.loads(' + repr(json.dumps(assurance_config(head))) + ')')
+    command = "cat > /tmp/wealthryse-website-build.py <<'WEALTHRYSE_EOF'\n" + code + "\nWEALTHRYSE_EOF\n" \
+              "unshare --mount --propagation private python3 /tmp/wealthryse-website-build.py; status=$?; rm -f /tmp/wealthryse-website-build.py; exit $status"
+    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    started = vm.get('powerState') != 'VM running'
+    if started:
+        az('vm', 'start', '-g', RG, '-n', VM, parse=False)
+    sub = az('account', 'show')['id']
+    base = f'https://management.azure.com/subscriptions/{sub}/resourceGroups/{RG}/providers/Microsoft.Compute/virtualMachines/{VM}/runCommands/'
+    try:
+        view = vm_run(base, 'assurance-build-' + head[:12], command, vm['location'], 3000)
+        output = view.get('output') or ''
+        lines = [l[len('WEBSITE_BUILD_RESULT '):] for l in output.splitlines() if l.startswith('WEBSITE_BUILD_RESULT ')]
+        result = json.loads(lines[-1]) if lines else {'passed': False, 'error': (view.get('error') or '')[-1500:],
+                                                      'output_tail': output[-800:]}
+        print(json.dumps(result, indent=2))
+        if not result.get('passed') or view.get('exitCode') != 0:
+            raise SystemExit('Assurance image build failed; nothing was changed')
+        print('ASSURANCE IMAGE ' + result['pushed_image'])
+    finally:
+        if started:
+            subprocess.run(['az', 'vm', 'deallocate', '-g', RG, '-n', VM, '--no-wait'], capture_output=True)
+
+
 def deploy():
     state = json.loads(STATE.read_text())
     if not state['changed_files']:
@@ -335,4 +399,5 @@ def rollback():
 
 
 if __name__ == '__main__':
-    {'prepare': prepare, 'build': build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat}[sys.argv[1]]()
+    {'prepare': prepare, 'build': build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat,
+     'assurance-build': assurance_build}[sys.argv[1]]()

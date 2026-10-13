@@ -3839,7 +3839,11 @@ def _monthly_download_filename(
             raise MonthlyReportError("Unsupported monthly report type")
         label, extension = definitions[kind]
         return f"{prefixes[subject_id]}_{label}_{period}{extension}"
-    return PurePosixPath(str(artifact["filename"])).name
+    name = PurePosixPath(str(artifact["filename"])).name
+    # Stored files are content-addressed as "<sha256>-<name>" (twice once released);
+    # readers get the plain name.
+    readable = re.sub(r"^(?:[0-9a-f]{64}-)+", "", name)
+    return readable if readable and not readable.startswith(".") else name
 
 
 def _download_monthly_report(

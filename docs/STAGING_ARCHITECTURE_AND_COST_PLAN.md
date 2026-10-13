@@ -11,6 +11,10 @@ are separately approved.
 
 The KRW 120,000 staging ceiling was approved on 22 September 2026.
 
+On 13 October 2026 the owner removed the budget limit. The
+`ibkrv2stg-monthly-budget` resource and its three cost alerts are removed from
+`infra/staging.bicep`, so a redeploy no longer creates them.
+
 ## Read-only production inspection — 22 September 2026
 
 The Azure portal inspection used the signed-in account

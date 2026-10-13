@@ -8,6 +8,7 @@ encrypted between steps. The loop yields progress events and ends with one
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date
@@ -82,6 +83,17 @@ UNVERIFIED = ("I couldn't produce an answer whose figures all match the data, so
 MAX_QUESTION_CHARS = 2000
 
 
+LOGGER = logging.getLogger("wealthryse_agent.runtime")
+
+
+def _model_error(error: Exception) -> tuple[int | None, str | None, str | None]:
+    """Status, code and parameter of a model API error; never its message, which can quote the prompt."""
+    body = getattr(error, "body", None)
+    body = body.get("error", body) if isinstance(body, dict) else {}
+    body = body if isinstance(body, dict) else {}
+    return getattr(error, "status_code", None), body.get("code"), body.get("param")
+
+
 class AgentError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -132,10 +144,23 @@ class Agent:
         self.client = model_client or default_model_client(settings)
         self.clock = clock
 
+    def _create(self, **request: Any) -> Any:
+        try:
+            return self.client.responses.create(**request)
+        except Exception as error:
+            status, code, param = _model_error(error)
+            if status != 400:
+                raise
+            # Azure's content filter (including prompt shields) refuses some prompts outright.
+            if code == "content_filter":
+                raise AgentError("content_filtered", OUT_OF_SCOPE) from error
+            LOGGER.warning("model rejected the request: code=%s param=%s", code, param)
+            raise AgentError("model_rejected", "The analyst couldn't process that question. Try rephrasing it.") from error
+
     def in_scope(self, question: str, turn: Turn) -> bool:
         if not self.settings.router_deployment:
             return True
-        response = self.client.responses.create(
+        response = self._create(
             model=self.settings.router_deployment, instructions=ROUTER, input=question, store=False,
             max_output_tokens=200,
             text={"format": {"type": "json_schema", "name": "scope", "strict": True, "schema": ROUTER_SCHEMA}},
@@ -180,7 +205,7 @@ class Agent:
         while True:
             if self.clock() - started > self.settings.timeout_seconds:
                 raise AgentError("timeout", "The analysis took too long. Try a narrower question.")
-            response = self.client.responses.create(
+            response = self._create(
                 model=self.settings.deployment, instructions=system, input=conversation, tools=function_tools,
                 store=False, include=["reasoning.encrypted_content"], reasoning={"effort": self.settings.reasoning_effort},
                 max_output_tokens=self.settings.max_output_tokens, parallel_tool_calls=True,

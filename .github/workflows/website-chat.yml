@@ -1,16 +1,16 @@
 name: Website chat setting
 
-# Manual: switches the owner-only website chat on or off by setting
+# Manual: switches the website chat off, on for owners, or on for all users, by setting
 # AGENT_UI_MODE (and the agent address and audience) on ibkrv2stg-web. The
 # image is left as it is. Rolls back to the previous mode if checks fail.
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: off or owner
+        description: off, owner or all
         required: true
         type: choice
-        options: [owner, 'off']
+        options: [owner, all, 'off']
 
 permissions:
   contents: read

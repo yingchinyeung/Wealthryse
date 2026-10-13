@@ -30,7 +30,7 @@ param modelDeployment string = 'wr-analyst-astra'
 @allowed(['global', 'apac-data-zone'])
 param modelProcessingScope string = 'global'
 param routerDeployment string = ''
-param dailyTokenBudget int = 2000000
+param dailyTokenBudget int = 6000000
 @description('Reasoning effort for owner chat. The scheduled jobs keep the runtime default (low).')
 @allowed(['low', 'medium', 'high', 'xhigh'])
 param chatReasoningEffort string = 'xhigh'

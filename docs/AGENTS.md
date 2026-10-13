@@ -18,7 +18,7 @@ Browser → ibkrv2stg-web (chat panel, Explain buttons, /agent-inbox)
             │ MCP over internal HTTPS            │ private endpoint
             ▼                                    ▼
          ibkrv2stg-agent-tools               Foundry model deployments
-         (8 read-only tools)                 (Southeast Asia, APAC Data Zone)
+         (8 read-only tools)                 (gpt-6-astra, Global Standard)
             │ Entra login, agent_reader role
             ▼
          PostgreSQL: agent schema (scoped views + agent tables)
@@ -56,6 +56,11 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
   off and is reached through a private endpoint. Azure keeps no conversation
   state (`store=False`). Chats stay in your Postgres and are deleted after 90
   days by the data-quality job.
+- **Where the model runs.** The Foundry resource and its data at rest are in
+  Southeast Asia. Since 13 October 2026 the analyst deployment is
+  `gpt-6-astra` on Global Standard, so prompts may be processed in any Azure
+  region (see `docs/AI_DATA_PROCESSING_APPROVAL_2026-09-22.md`). The older AI
+  pieces still use the APAC Data Zone deployment.
 - **Bounded.** At most 8 tool calls and 60 seconds per question, a daily token
   budget, and questions up to 2,000 characters.
 - **Off by default.** `AGENT_UI_MODE=off` on the website. `owner` shows it to
@@ -95,9 +100,19 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
 6. **Website.** Set `AGENT_API_URL`, `AGENT_API_AUDIENCE` and
    `AGENT_UI_MODE=owner` on `ibkrv2stg-web`. This goes out through the release
    process.
-7. **Evaluate before widening.** Put about 50 real questions in
-   `agent.eval_cases`. Check there are no rejected answers and no
-   cross-account answers before setting `AGENT_UI_MODE=all`.
+7. **Evaluate before widening.** Run the evaluation inside the agent app,
+   acting for the owner:
+   ```
+   az containerapp exec -n ibkrv2stg-agent -g rg-ibkr-database-v11 \
+     --command "python -m wealthryse_agent.evaluate --user <owner's Entra object ID>"
+   ```
+   It asks 50 built-in questions (holdings, changes, performance, benchmark,
+   sectors, cash flows, freshness, refusals and questions naming another
+   account), or the rows of `agent.eval_cases` once it has some, and prints
+   only case IDs, pass or fail and reasons. Widen to `AGENT_UI_MODE=all` only
+   when it prints `READY to widen`: no rejected answers, nothing touching
+   another account, and at least 90% passing. Its token use counts against the
+   daily budget.
 
 ## Cost drivers
 

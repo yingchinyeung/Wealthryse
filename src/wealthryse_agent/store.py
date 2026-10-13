@@ -123,6 +123,15 @@ class Store:
         self.db.rollback()
         return int(row["used"] or 0)
 
+    # Evaluation ------------------------------------------------------------
+
+    def eval_cases(self) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT case_id, subject_id, question, expected_tools, must_refuse FROM agent.eval_cases ORDER BY case_id"
+        ).fetchall()
+        self.db.rollback()
+        return [dict(r) for r in rows]
+
     # Runs and inbox --------------------------------------------------------
 
     def start_run(self, job_name: str, correlation_id: str) -> int:

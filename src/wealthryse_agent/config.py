@@ -5,7 +5,9 @@ import os
 from dataclasses import dataclass, field
 
 APPROVED_REGION = "southeastasia"
-APPROVED_PROCESSING_SCOPE = "apac-data-zone"
+# Global processing for the agent model was approved on 13 October 2026; see
+# docs/AI_DATA_PROCESSING_APPROVAL_2026-09-22.md.
+APPROVED_PROCESSING_SCOPES = frozenset({"apac-data-zone", "global"})
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
@@ -95,8 +97,8 @@ class ModelSettings:
     def validate(self) -> None:
         if self.region.lower() != APPROVED_REGION:
             raise ValueError("The model region is outside the approved Southeast Asia boundary")
-        if self.processing_scope.lower() != APPROVED_PROCESSING_SCOPE:
-            raise ValueError("The model processing scope is outside the approved APAC data zone")
+        if self.processing_scope.lower() not in APPROVED_PROCESSING_SCOPES:
+            raise ValueError("The model processing scope is not an approved one")
         if not self.endpoint.startswith("https://") or not self.deployment:
             raise ValueError("The model endpoint or deployment is not configured")
 

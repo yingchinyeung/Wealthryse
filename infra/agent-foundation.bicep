@@ -10,7 +10,7 @@ targetScope = 'resourceGroup'
 @description('Region for identities and the private endpoint (the VNet region).')
 param location string = resourceGroup().location
 
-@description('Region of the model resource. Southeast Asia with APAC Data Zone processing is the approved boundary.')
+@description('Region of the model resource. Data at rest stays in Southeast Asia; see modelSku for where prompts are processed.')
 @allowed(['southeastasia'])
 param aiLocation string = 'southeastasia'
 
@@ -29,10 +29,12 @@ param createPrivateDns bool = false
 @description('Resource IDs of the existing privatelink zones for cognitiveservices, openai and services.ai, in that order. Leave empty to create the endpoint without a zone group; the zone owner then adds the records.')
 param privateDnsZoneIds array = []
 
-@description('Main analyst model (pinned version, Data Zone Standard).')
-param modelName string = 'gpt-5.6-sol'
-param modelVersion string = '2026-07-09'
-param modelDeploymentName string = 'wr-analyst'
+@description('Main analyst model (pinned version). Global Standard processing was approved on 13 October 2026.')
+param modelName string = 'gpt-6-astra'
+param modelVersion string = '2026-09-03'
+param modelDeploymentName string = 'wr-analyst-astra'
+@allowed(['DataZoneStandard', 'GlobalStandard'])
+param modelSku string = 'GlobalStandard'
 @minValue(1)
 @maxValue(200)
 param modelCapacity int = 20
@@ -128,7 +130,7 @@ resource analystDeployment 'Microsoft.CognitiveServices/accounts/deployments@202
   parent: foundry
   name: modelDeploymentName
   sku: {
-    name: 'DataZoneStandard'
+    name: modelSku
     capacity: modelCapacity
   }
   properties: {

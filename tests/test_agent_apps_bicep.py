@@ -12,6 +12,10 @@ class AgentAppsBicepTest(unittest.TestCase):
         for name in names:
             self.assertTrue(2 <= len(name) <= 32, f"{name} is {len(name)} characters")
 
+    def test_apps_stay_awake(self):
+        replicas = re.findall(r"minReplicas:\s*(\d+)", BICEP.read_text())
+        self.assertEqual(replicas, ["1", "1"])
+
 
 if __name__ == "__main__":
     unittest.main()

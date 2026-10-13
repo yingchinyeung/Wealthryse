@@ -137,7 +137,8 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
           probes: probes
         }
       ]
-      scale: { minReplicas: 0, maxReplicas: 2 }
+      // Kept awake so the first chat question doesn't wait for a cold start.
+      scale: { minReplicas: 1, maxReplicas: 2 }
     }
   }
 }
@@ -180,7 +181,8 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
           probes: probes
         }
       ]
-      scale: { minReplicas: 0, maxReplicas: 2 }
+      // Kept awake so the first chat question doesn't wait for a cold start.
+      scale: { minReplicas: 1, maxReplicas: 2 }
     }
   }
 }

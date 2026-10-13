@@ -1,6 +1,10 @@
+import base64
+import gzip
 import hashlib
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,6 +72,29 @@ class InventoryArgumentsTest(unittest.TestCase):
             with mock.patch.object(sys, "argv", ["website_release.py", "inventory", *args]):
                 with self.assertRaises(SystemExit):
                     release.inventory()
+
+
+    def test_one_failed_image_does_not_stop_the_others(self):
+        good = release.IMAGE_PREFIX + "b" * 64
+        bad = release.IMAGE_PREFIX + "a" * 64
+        detail = base64.b64encode(gzip.compress(json.dumps({"src/ibkr_etl/web.py": sha("web")}).encode())).decode()
+
+        def run(config, name):
+            if config["base_image"] == bad:
+                raise SystemExit("Run Command did not finish in time")
+            return {}, detail
+
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(release, "ROOT", Path(root)), \
+                mock.patch.object(release, "git", return_value="abc\n"), \
+                mock.patch.object(release, "read_only_on_vm", side_effect=run), \
+                mock.patch.object(release, "compare_with_repo", return_value={"same": [], "different": [], "only_image": [], "only_repo": []}), \
+                mock.patch.object(sys, "argv", ["website_release.py", "inventory", bad, good]):
+            with self.assertRaises(SystemExit) as stop:
+                release.inventory()
+            self.assertIn(bad, str(stop.exception))
+            self.assertTrue((Path(root) / "deploy" / "image-inventory" / ("b" * 12 + ".json")).exists())
+            self.assertFalse((Path(root) / "deploy" / "image-inventory" / ("a" * 12 + ".json")).exists())
 
 
 if __name__ == "__main__":

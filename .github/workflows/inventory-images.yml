@@ -23,7 +23,7 @@ jobs:
   inventory:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 300
     env:
       AZURE_CLIENT_ID: 17708c85-b855-4209-81dd-a613a91315d3
       AZURE_TENANT_ID: 0578a50b-a7a1-40a4-905b-8b20dba84124
@@ -41,7 +41,9 @@ jobs:
       - name: Hash and compare the images
         run: python deploy/website_release.py inventory $IMAGES
       - name: Push the inventory to a branch
+        if: always()
         run: |
+          if [ -z "$(ls deploy/image-inventory 2>/dev/null)" ]; then echo "No inventory to push"; exit 0; fi
           branch="image-inventory-${GITHUB_RUN_ID}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

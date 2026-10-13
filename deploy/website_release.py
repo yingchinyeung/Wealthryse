@@ -192,12 +192,14 @@ def read_detail(base, location, path, size):
     if not path.startswith('/var/tmp/wealthryse-build-detail-') or not path.endswith('.txt'):
         raise SystemExit('Unexpected detail file name')
     encoded = ''
+    # Each Run Command can wait several minutes for the VM agent, so a short command still
+    # gets a long deadline (a 7-minute one ran out on 13 Oct while reading an inventory).
     try:
         for offset in range(0, size, 4000):
-            view = vm_run(base, f'website-detail-{offset // 4000}', f"tail -c +{offset + 1} {path} | head -c 4000", location, 120)
+            view = vm_run(base, f'website-detail-{offset // 4000}', f"tail -c +{offset + 1} {path} | head -c 4000", location, 900)
             encoded += (view.get('output') or '').strip()
     finally:
-        vm_run(base, 'website-detail-cleanup', 'rm -f ' + path, location, 120)
+        vm_run(base, 'website-detail-cleanup', 'rm -f ' + path, location, 900)
     if len(encoded) != size:
         raise SystemExit(f'Read {len(encoded)} of {size} bytes of build detail')
     return encoded
@@ -312,15 +314,24 @@ def inventory():
     head = git('rev-parse', 'HEAD').strip()
     folder = ROOT / 'deploy' / 'image-inventory'
     folder.mkdir(parents=True, exist_ok=True)
+    failed = []
     for image in dict.fromkeys(images):
         config = {'inventory': True, 'base_image': image, 'target_image': f'{REG}/ibkr-platform:web-capture',
                   'source_commit': head, 'live_hashes': {}, 'new_hashes': {}, 'patch': ''}
-        _, detail = read_only_on_vm(config, 'image-inventory-' + image[len(IMAGE_PREFIX):][:12])
+        try:
+            _, detail = read_only_on_vm(config, 'image-inventory-' + image[len(IMAGE_PREFIX):][:12])
+        except SystemExit as error:
+            # One image failing still leaves the others worth keeping.
+            print(image, 'FAILED:', error)
+            failed.append(image)
+            continue
         hashes = json.loads(gzip.decompress(base64.b64decode(detail)))
         comparison = compare_with_repo(hashes, head)
         (folder / (image[len(IMAGE_PREFIX):][:12] + '.json')).write_text(json.dumps(
             {'image': image, 'repo_commit': head, 'hashes': hashes, **comparison}, indent=1, sort_keys=True) + '\n')
         print(image, {k: len(v) for k, v in comparison.items()})
+    if failed:
+        raise SystemExit('Inventory failed for ' + ' '.join(failed))
 
 
 # The image ibkrv2stg-analyst-assurance ran on 13 Oct 2026. It passes MS and T,

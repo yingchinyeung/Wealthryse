@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
+import time
 from typing import Any
 
 import httpx
 
 from .auth import TokenSource
+
+LOGGER = logging.getLogger("wealthryse_agent.tool_client")
 
 
 class ToolCallFailed(Exception):
@@ -41,6 +45,19 @@ class ToolClient:
         if "error" in body:
             raise ToolCallFailed("tool_protocol_error", str(body["error"].get("message")))
         return body["result"]
+
+    def wait_until_ready(self, *, attempts: int = 6, pause_seconds: float = 10.0, sleep=time.sleep) -> None:
+        """Wake the tool server, which scales to zero, before the first real call."""
+        for attempt in range(1, attempts + 1):
+            try:
+                self._rpc("ping", {})
+                return
+            except (httpx.TransportError, httpx.HTTPStatusError) as error:
+                retryable = isinstance(error, httpx.TransportError) or error.response.status_code >= 500
+                if not retryable or attempt == attempts:
+                    raise
+                LOGGER.info("tool server not ready (attempt %s of %s): %s", attempt, attempts, type(error).__name__)
+                sleep(pause_seconds)
 
     def list_tools(self) -> list[dict[str, Any]]:
         return self._rpc("tools/list", {})["tools"]

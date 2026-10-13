@@ -141,6 +141,7 @@ def main(argv: list[str] | None = None) -> int:
     run_id = store.start_run(args.job, correlation_id)
     usage: dict[str, int] = {}
     try:
+        tools.wait_until_ready()
         accounts = [a["account_id"] for a in tools.call("list_accounts", {})["data"]["accounts"]]
         if args.job == "data_quality":
             written = data_quality(store, tools, accounts, runtime.retention_days)

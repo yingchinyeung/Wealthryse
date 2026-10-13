@@ -154,7 +154,8 @@ def create_app(service: ToolService) -> FastAPI:
     async def mcp(request: Request) -> JSONResponse:
         try:
             caller = verify_service_token(request.headers.get("authorization"), service.auth)
-        except Unauthorized:
+        except Unauthorized as error:
+            LOGGER.warning("service token rejected: %s (%s)", error, type(error.__cause__).__name__)
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         try:
             message = await request.json()

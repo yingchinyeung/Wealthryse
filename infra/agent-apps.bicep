@@ -25,7 +25,10 @@ param databaseName string = 'ibkr'
 param tenantId string = '00000000-0000-0000-0000-000000000001'
 
 param modelEndpoint string
-param modelDeployment string = 'wr-analyst'
+param modelDeployment string = 'wr-analyst-astra'
+@description('Where the model processes prompts: global (Global Standard) or apac-data-zone (Data Zone Standard).')
+@allowed(['global', 'apac-data-zone'])
+param modelProcessingScope string = 'global'
 param routerDeployment string = ''
 param dailyTokenBudget int = 2000000
 param retentionDays int = 90
@@ -79,7 +82,7 @@ var modelEnv = [
   { name: 'AGENT_MODEL_DEPLOYMENT', value: modelDeployment }
   { name: 'AGENT_ROUTER_DEPLOYMENT', value: routerDeployment }
   { name: 'AGENT_MODEL_REGION', value: 'southeastasia' }
-  { name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }
+  { name: 'AGENT_MODEL_PROCESSING_SCOPE', value: modelProcessingScope }
   { name: 'AGENT_TOOL_SERVER_URL', value: 'https://${toolsAppName}.internal.${managedEnvironment.properties.defaultDomain}' }
   { name: 'AGENT_TOOL_SERVER_AUDIENCE', value: toolsAudience }
   { name: 'AGENT_DAILY_TOKEN_BUDGET', value: string(dailyTokenBudget) }
@@ -137,7 +140,8 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
           probes: probes
         }
       ]
-      scale: { minReplicas: 0, maxReplicas: 2 }
+      // Kept awake so the first chat question doesn't wait for a cold start.
+      scale: { minReplicas: 1, maxReplicas: 2 }
     }
   }
 }
@@ -180,7 +184,8 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
           probes: probes
         }
       ]
-      scale: { minReplicas: 0, maxReplicas: 2 }
+      // Kept awake so the first chat question doesn't wait for a cold start.
+      scale: { minReplicas: 1, maxReplicas: 2 }
     }
   }
 }

@@ -294,6 +294,7 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
     def test_kiwoom_case_runs_to_approval_one(self):
         from datetime import date
 
+        from ibkr_etl.onboarding_cases import terms_digest
         from ibkr_etl.onboarding_v2_web import (
             OnboardingError, approve_case, case_detail, onboarding_overview, record_platform_check)
 
@@ -314,7 +315,7 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
         self.assertEqual(detail["awaiting_approval"], "account_terms")
         self.assertEqual(detail["account"], "5012-3456-10")
         self.assertEqual(detail["go_live_phrase"], "GO LIVE 5012-3456-10")
-        with self.assertRaisesRegex(OnboardingError, "terms changed"):
+        with self.assertRaisesRegex(OnboardingError, "changed after this page loaded"):
             approve_case(self.db, TENANT, case_id, approval="account_terms", terms_sha256="f" * 64,
                          acknowledge_warnings=[], confirmation=None, actor=IDENTITY)
         with self.assertRaisesRegex(OnboardingError, "Acknowledge"):
@@ -328,10 +329,14 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
         subject = self.db.execute("SELECT lifecycle_status, reporting_currency FROM platform_subjects "
                                   "WHERE subject_id = 'KIWOOM-5012345610'").fetchone()
         self.assertEqual(dict(subject), {"lifecycle_status": "onboarding", "reporting_currency": "KRW"})
-        with self.assertRaisesRegex(OnboardingError, "history build"):
-            approve_case(self.db, TENANT, case_id, approval="historical_reports",
-                         terms_sha256=detail["account_terms_sha256"], acknowledge_warnings=[],
-                         confirmation=None, actor=IDENTITY)
+        preview = self.db.execute("SELECT feature_state FROM subject_feature_states WHERE subject_id = "
+                                  "'KIWOOM-5012345610' AND feature_key = 'data_ingestion'").fetchone()
+        self.assertEqual(preview["feature_state"], "preview")
+        nothing_built = terms_digest({"subject_id": "KIWOOM-5012345610", "display_name": "Synthetic Korea",
+                                      "checks": {}})
+        with self.assertRaisesRegex(OnboardingError, "must finish without failing"):
+            approve_case(self.db, TENANT, case_id, approval="historical_reports", terms_sha256=nothing_built,
+                         acknowledge_warnings=[], confirmation=None, actor=IDENTITY)
         events = [row["event_type"] for row in self.db.execute(
             "SELECT event_type FROM broker_onboarding_events WHERE case_id = %s ORDER BY created_at, event_type",
             (case_id,)).fetchall()]
@@ -493,17 +498,19 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
 
 @unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
 class PortfolioDryRunTests(_MigratedDatabase):
-    """The daily job's stage 2 dry run commits, so it gets a database of its own."""
+    """The daily job's checks commit, so they get a database of their own."""
 
-    def test_the_dry_run_records_stage_two_and_keeps_nothing(self):
+    def test_a_portfolio_runs_from_its_dry_run_to_go_live(self):
         from datetime import date
 
         import psycopg
         from psycopg.rows import dict_row
 
         from ibkr_etl.db import PostgresConnection, transaction
-        from ibkr_etl.onboarding_dry_run import run_portfolio_dry_runs
-        from ibkr_etl.onboarding_v2_web import case_detail, start_derived_case
+        from ibkr_etl.onboarding import FEATURE_KEYS
+        from ibkr_etl.onboarding_dry_run import record_history_build, run_portfolio_dry_runs
+        from ibkr_etl.onboarding_v2_web import (
+            OnboardingError, approve_case, case_detail, record_platform_check, start_derived_case)
         from ibkr_etl.subject_onboarding import fixed_unit_composite_definition
 
         db = PostgresConnection(psycopg.connect(_dsn(ADMIN_DSN, self.database, OWNER_ROLE), row_factory=dict_row,
@@ -521,22 +528,27 @@ class PortfolioDryRunTests(_MigratedDatabase):
         db.commit()
         calls = []
 
+        def write_history(connection, subject_id):
+            with transaction(connection):  # the real refresh commits like this
+                connection.execute("INSERT INTO accounts (account_id, first_seen_at, last_seen_at, source_json) "
+                                   "VALUES ('composite-source', 'x', 'x', '{}')")
+                connection.execute(
+                    "INSERT INTO derived_portfolios (portfolio_id, name, source_account_id, base_currency, "
+                    "exclusion_rule_json, calculation_version, status, created_at, updated_at) "
+                    "VALUES (?, 'Synthetic', 'composite-source', 'HKD', '{}', 'v1', 'active', 'x', 'x')",
+                    (subject_id,))
+                for day, nav in (("2025-01-20", 100.0), ("2025-01-21", 99.1), ("2025-02-28", 103.4)):
+                    connection.execute(
+                        "INSERT INTO derived_portfolio_nav (portfolio_id, snapshot_date, currency, total_nav, "
+                        "excluded_market_value_base, source_position_count, included_position_count, "
+                        "excluded_position_count, generated_at) VALUES (?, ?, 'HKD', ?, 0, 2, 2, 0, 'x')",
+                        (subject_id, day, nav))
+
         def calculate(dry, contract):
             calls.append(contract["subject_id"])
             if len(calls) == 1:
                 raise RuntimeError("Composite account sleeve does not exist: U0000501")
-            with transaction(dry):  # the real refresh commits like this
-                dry.execute("INSERT INTO accounts (account_id, first_seen_at, last_seen_at, source_json) "
-                            "VALUES ('composite-source', 'x', 'x', '{}')")
-                dry.execute("INSERT INTO derived_portfolios (portfolio_id, name, source_account_id, base_currency, "
-                            "exclusion_rule_json, calculation_version, status, created_at, updated_at) "
-                            "VALUES (?, 'Synthetic', 'composite-source', 'HKD', '{}', 'v1', 'active', 'x', 'x')",
-                            (contract["subject_id"],))
-                for day, nav in (("2025-01-20", 100.0), ("2025-01-21", 99.1), ("2025-02-28", 103.4)):
-                    dry.execute("INSERT INTO derived_portfolio_nav (portfolio_id, snapshot_date, currency, total_nav, "
-                                "excluded_market_value_base, source_position_count, included_position_count, "
-                                "excluded_position_count, generated_at) VALUES (?, ?, 'HKD', ?, 0, 2, 2, 0, 'x')",
-                                (contract["subject_id"], day, nav))
+            write_history(dry, contract["subject_id"])
             return {"nav_dates": 3}
 
         failed, = run_portfolio_dry_runs(db, TENANT, calculate=calculate, today=date(2025, 3, 3))
@@ -559,6 +571,96 @@ class PortfolioDryRunTests(_MigratedDatabase):
             self.assertEqual(kept, 0, table)
         self.assertEqual(run_portfolio_dry_runs(db, TENANT, calculate=calculate, today=date(2025, 3, 3)), [])
         self.assertEqual(calls, ["synthetic-long-short", "synthetic-long-short"])
+
+        # Approval 1 registers the portfolio with only the owner's private preview switched on.
+        approve_case(db, TENANT, case_id, approval="account_terms", terms_sha256=detail["awaiting_terms_sha256"],
+                     acknowledge_warnings=[], confirmation=None, actor=IDENTITY)
+        db.commit()
+
+        def features():
+            return {row["feature_key"]: row["feature_state"] for row in db.execute(
+                "SELECT feature_key, feature_state FROM subject_feature_states "
+                "WHERE subject_id = 'synthetic-long-short'").fetchall()}
+
+        self.assertEqual(features(), {key: "preview" if key == "data_ingestion" else "disabled"
+                                      for key in FEATURE_KEYS})
+        detail = case_detail(db, TENANT, case_id)
+        self.assertEqual((detail["stage"], detail["status"], detail["preview_page"]),
+                         ("build_history", "platform_working", "/accounts/synthetic-long-short/overview"))
+
+        # Stage 3: the daily refresh now keeps the history and records it once.
+        write_history(db, "synthetic-long-short")
+
+        def history(error=None):
+            return record_history_build(db, TENANT, "synthetic-long-short", error=error, today=date(2025, 3, 3))
+
+        self.assertEqual(history(), {"case_id": case_id, "check": "pass", "recorded": True})
+        self.assertEqual(history()["recorded"], False)
+        self.assertEqual(history("Every account and portfolio sleeve must have NAV on 2025-01-20")["check"], "fail")
+        self.assertEqual(case_detail(db, TENANT, case_id)["status"], "blocked")
+        self.assertEqual(history()["check"], "pass")
+        reports = [
+            {"period_end": "2025-01-31", "report_type": "factsheet", "file_name": "jan.pdf", "sha256": "1" * 64,
+             "download_path": "/api/onboarding-v2/reports/jan.pdf"},
+            {"period_end": "2025-02-28", "report_type": "presentation", "file_name": "feb.pptx",
+             "sha256": "2" * 64, "download_path": "https://example.com/feb.pptx"},
+            {"period_end": "2025-02-28", "report_type": "factsheet", "file_name": "feb.pdf",
+             "sha256": "3" * 64, "download_path": "/\\example.com/feb.pdf"},
+        ]
+        record_platform_check(db, TENANT, case_id, "reports_rendered", "pass", "3 reports rendered.",
+                              {"reports": reports})
+        record_platform_check(db, TENANT, case_id, "agent_review_complete", "warn", "One note on February.",
+                              {"review_id": "first"})
+        db.commit()
+        detail = case_detail(db, TENANT, case_id)
+        self.assertEqual(detail["awaiting_approval"], "historical_reports")
+        self.assertEqual([(r["period_end"], r["report_type"], r["download_path"]) for r in detail["reports"]],
+                         [("2025-02-28", "presentation", ""), ("2025-02-28", "factsheet", ""),
+                          ("2025-01-31", "factsheet", "/api/onboarding-v2/reports/jan.pdf")])
+
+        def approve(approval, terms, **extra):
+            return approve_case(db, TENANT, case_id, approval=approval, terms_sha256=terms,
+                                **{"acknowledge_warnings": [], "confirmation": None, "actor": IDENTITY, **extra})
+
+        with self.assertRaisesRegex(OnboardingError, "Acknowledge each warning"):
+            approve("historical_reports", detail["awaiting_terms_sha256"])
+        db.rollback()
+        record_platform_check(db, TENANT, case_id, "agent_review_complete", "pass", "No findings.",
+                              {"review_id": "second"})
+        with self.assertRaisesRegex(OnboardingError, "changed after this page loaded"):
+            approve("historical_reports", detail["awaiting_terms_sha256"])
+        db.rollback()
+        record_platform_check(db, TENANT, case_id, "agent_review_complete", "pass", "No findings.",
+                              {"review_id": "second"})
+        approve("historical_reports", case_detail(db, TENANT, case_id)["awaiting_terms_sha256"])
+        db.commit()
+
+        # Approval 3 needs the typed phrase, then publishes the portfolio and starts its daily jobs.
+        detail = case_detail(db, TENANT, case_id)
+        self.assertEqual((detail["awaiting_approval"], detail["go_live_phrase"]),
+                         ("go_live", "GO LIVE SYNTHETIC-LONG-SHORT"))
+        with self.assertRaisesRegex(OnboardingError, "exact confirmation phrase"):
+            approve("go_live", detail["awaiting_terms_sha256"], confirmation="GO LIVE")
+        db.rollback()
+        done = approve("go_live", detail["awaiting_terms_sha256"], confirmation="GO LIVE SYNTHETIC-LONG-SHORT")
+        db.commit()
+        self.assertEqual(done, {"case_id": case_id, "stage": "first_month_end", "status": "live",
+                                "next_page": "/accounts/synthetic-long-short/overview"})
+        lifecycle = db.execute("SELECT lifecycle_status FROM platform_subjects "
+                               "WHERE subject_id = 'synthetic-long-short'").fetchone()["lifecycle_status"]
+        self.assertEqual(lifecycle, "active")
+        self.assertEqual(set(features().values()), {"active"})
+        registered = {row["capability"]: (row["operating_state"], row["configuration_json"]) for row in db.execute(
+            "SELECT capability, operating_state, configuration_json FROM subject_operating_registrations "
+            "WHERE subject_id = 'synthetic-long-short'").fetchall()}
+        self.assertEqual(set(registered), {"daily_ingestion", "benchmark_refresh", "sector_refresh",
+                                           "month_end_reporting", "analyst_assurance", "viewer_directory"})
+        self.assertEqual(registered["daily_ingestion"],
+                         ("active", {"source": "derived_calculation", "start_date": "2025-01-20"}))
+        self.assertIsNone(history())
+        went_live = db.execute("SELECT went_live_at IS NOT NULL AS live FROM broker_onboarding_cases "
+                               "WHERE case_id = %s", (case_id,)).fetchone()["live"]
+        self.assertTrue(went_live)
 
 if __name__ == "__main__":
     unittest.main()

@@ -186,8 +186,8 @@ def next_owner_action(case: OnboardingCase) -> str | None:
         return "Approve the portfolio definition and terms."
     return {
         "account_terms": "Approve the account terms.",
-        "historical_reports": "Approve the historical reports in the Monthly reports tab.",
-        "go_live": "Preview the account on the website, then type the confirmation phrase to go live.",
+        "historical_reports": "Open the historical reports listed below, then approve them.",
+        "go_live": "Preview it on the website, then type the confirmation phrase to go live.",
     }[pending]
 
 

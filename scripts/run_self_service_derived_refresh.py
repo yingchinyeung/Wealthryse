@@ -26,7 +26,7 @@ from ibkr_etl.derived_portfolio import (  # noqa: E402
     refresh_fixed_unit_composite,
 )
 from ibkr_etl.market_data import refresh_alpha_world_market_data  # noqa: E402
-from ibkr_etl.onboarding_dry_run import run_portfolio_dry_runs  # noqa: E402
+from ibkr_etl.onboarding_dry_run import record_history_build, run_portfolio_dry_runs  # noqa: E402
 from ibkr_etl.provisional_benchmark import refresh_and_materialize  # noqa: E402
 from ibkr_etl.risk_snapshots import build_risk_snapshot  # noqa: E402
 from ibkr_etl.sector_classification import (  # noqa: E402
@@ -357,6 +357,26 @@ def _refresh_analytics_if_approved(
     return evidence
 
 
+def _has_onboarding_cases(connection) -> bool:
+    """The new onboarding's tables exist once migration 063 is applied."""
+
+    return connection.execute(
+        "SELECT to_regclass('public.broker_onboarding_cases')"
+    ).fetchone()[0] is not None
+
+
+def _record_history_build(connection, tenant_id: str, subject_id: str, error: str | None) -> dict | None:
+    """Stage 3's history check on a new-onboarding portfolio case; never fails the refresh."""
+
+    try:
+        return record_history_build(
+            connection, tenant_id, subject_id, error=error, today=datetime.now(timezone.utc).date()
+        )
+    except Exception as failure:  # the subject's own refresh result stands either way
+        connection.rollback()
+        return {"error_type": type(failure).__name__, "error": str(failure)[:400]}
+
+
 def _dry_run_portfolio_cases(connection, tenant_id: str, reference_path: Path, reference) -> list[dict]:
     """Stage 2 of each new-onboarding portfolio case: calculate, measure, roll back.
 
@@ -364,9 +384,7 @@ def _dry_run_portfolio_cases(connection, tenant_id: str, reference_path: Path, r
     portfolio the owner has not approved.
     """
 
-    if connection.execute(
-        "SELECT to_regclass('public.broker_onboarding_cases')"
-    ).fetchone()[0] is None:
+    if not _has_onboarding_cases(connection):
         return []
 
     def calculate(dry_connection, definition: dict) -> dict:
@@ -416,6 +434,7 @@ def main() -> int:
             return downloaded["source"]
 
         portfolio_cases = _dry_run_portfolio_cases(connection, settings.tenant_id, reference_path, reference)
+        onboarding_cases = _has_onboarding_cases(connection)
         targets = _ordered_targets(_approved_targets(connection))
         if not targets:
             print(
@@ -467,6 +486,10 @@ def main() -> int:
                 # benchmark-provider problem cannot falsely invalidate the
                 # deterministic portfolio calculation.
                 connection.commit()
+                if onboarding_cases:
+                    validation["onboarding_case"] = _record_history_build(
+                        connection, settings.tenant_id, str(row["subject_id"]), None
+                    )
             except Exception as error:
                 connection.rollback()
                 connection.execute(
@@ -531,6 +554,10 @@ def main() -> int:
                     "error_type": type(error).__name__,
                     "error": str(error),
                 }
+                if onboarding_cases:
+                    failure["onboarding_case"] = _record_history_build(
+                        connection, settings.tenant_id, str(row["subject_id"]), str(error)
+                    )
                 failures.append(failure)
                 results.append({**failure, "status": "failed"})
                 continue

@@ -103,6 +103,7 @@ from .template_upload import (
     validate_pptx_upload,
     validate_subject_id,
 )
+from .subject_activation import activate_subject
 from .subject_onboarding import (
     POST_WAVE0_ONBOARDING_SEQUENCE,
     approved_reference_definitions,
@@ -9768,50 +9769,6 @@ def approve_onboarding_activation(
             """,
             (TENANT_ID, subject),
         )
-        connection.execute(
-            """
-            UPDATE subject_feature_states
-            SET feature_state = CASE
-                    WHEN %s = 'master_account'
-                     AND %s = 'administrative_only'
-                     AND feature_key <> 'viewer_access' THEN 'disabled'
-                    ELSE 'active'
-                END,
-                reason = CASE
-                    WHEN %s = 'master_account'
-                     AND %s = 'administrative_only'
-                     AND feature_key <> 'viewer_access'
-                    THEN 'This administrative-only master does not publish investment analytics or reports.'
-                    ELSE 'Every account-specific onboarding gate passed and the owner activated the subject.'
-                END,
-                updated_at = now()
-            WHERE tenant_id = %s AND subject_id = %s
-            """,
-            (
-                str(case["subject_type"]),
-                (
-                    (case.get("metadata_json") or {}).get("reporting_mode")
-                    if isinstance(case.get("metadata_json"), dict)
-                    else ""
-                ),
-                str(case["subject_type"]),
-                (
-                    (case.get("metadata_json") or {}).get("reporting_mode")
-                    if isinstance(case.get("metadata_json"), dict)
-                    else ""
-                ),
-                TENANT_ID,
-                subject,
-            ),
-        )
-        connection.execute(
-            """
-            UPDATE subject_flex_source_bindings
-            SET status = 'active', updated_at = now()
-            WHERE tenant_id = %s AND subject_id = %s AND status = 'pending'
-            """,
-            (TENANT_ID, subject),
-        )
         metadata = case.get("metadata_json") or {}
         if isinstance(metadata, str):
             try:
@@ -9819,67 +9776,20 @@ def approve_onboarding_activation(
             except json.JSONDecodeError:
                 metadata = {}
         subject_type = str(case["subject_type"])
-        administrative_master = bool(
-            subject_type == "master_account"
-            and isinstance(metadata, dict)
-            and metadata.get("reporting_mode") == "administrative_only"
-        )
-        if administrative_master:
-            capabilities = (("viewer_directory", {}),)
-        else:
-            source_name = (
-                "derived_calculation"
-                if subject_type in {"filtered_portfolio", "composite_portfolio"}
-                else str(case["source_system"])
-            )
-            capabilities = (
-                ("daily_ingestion", {"start_date": str(case["history_start_date"]), "source": source_name}),
-                ("benchmark_refresh", {"start_date": str(case["history_start_date"])}),
-                ("sector_refresh", {"external_approval_required": True}),
-                ("month_end_reporting", {"approval_required": True}),
-                ("analyst_assurance", {}),
-                ("viewer_directory", {}),
-            )
-        for capability, configuration in capabilities:
-            configuration_json = canonical_json(configuration)
-            connection.execute(
-                """
-                INSERT INTO subject_operating_registrations(
-                    registration_id, tenant_id, subject_id, capability,
-                    operating_state, effective_from, configuration_json,
-                    configuration_sha256, activation_approval_id,
-                    changed_by_identity_sha256, created_at, updated_at
-                ) VALUES (
-                    %s, %s, %s, %s, 'active', %s, %s::jsonb, %s,
-                    %s, %s, now(), now()
-                )
-                ON CONFLICT (tenant_id, subject_id, capability, effective_from)
-                DO UPDATE SET operating_state = 'active', effective_to = NULL,
-                              configuration_json = EXCLUDED.configuration_json,
-                              configuration_sha256 = EXCLUDED.configuration_sha256,
-                              activation_approval_id = EXCLUDED.activation_approval_id,
-                              changed_by_identity_sha256 = EXCLUDED.changed_by_identity_sha256,
-                              updated_at = now()
-                """,
-                (
-                    uuid.uuid4(), TENANT_ID, subject, capability,
-                    case["history_start_date"], configuration_json,
-                    sha256_text(configuration_json), approval_id, actor,
-                ),
-            )
-        connection.execute(
-            """
-            UPDATE ibkr_flex_queries q
-            SET schedule_enabled = true, status = 'active', updated_at = now()
-            WHERE q.tenant_id = %s
-              AND EXISTS (
-                  SELECT 1 FROM subject_flex_source_bindings b
-                  WHERE b.tenant_id = q.tenant_id
-                    AND b.flex_source_id = q.flex_source_id
-                    AND b.subject_id = %s AND b.status = 'active'
-              )
-            """,
-            (TENANT_ID, subject),
+        activate_subject(
+            connection,
+            tenant_id=TENANT_ID,
+            subject_id=subject,
+            subject_type=subject_type,
+            source_name=str(case["source_system"]),
+            history_start_date=str(case["history_start_date"]),
+            administrative_master=bool(
+                subject_type == "master_account"
+                and isinstance(metadata, dict)
+                and metadata.get("reporting_mode") == "administrative_only"
+            ),
+            approval_id=approval_id,
+            actor=actor,
         )
     return {
         "status": "active",

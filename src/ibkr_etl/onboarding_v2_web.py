@@ -42,8 +42,10 @@ from .broker_connections import (
 from .composition_tree import composite_tree, filtered_tree, tree_for_definition, tree_svg
 from .flex_recipe import RECIPE_STEPS
 from .market_data import ALPHA_WORLD_MARKET_INSTRUMENTS
+from .onboarding import FEATURE_KEYS
 from .onboarding_cases import (
     APPROVAL_LABELS,
+    APPROVALS,
     CHECK_LABELS,
     DERIVED_SOURCE_KINDS,
     PRE_LIVE_STAGES,
@@ -64,6 +66,7 @@ from .onboarding_cases import (
     stage_check_states,
     terms_digest,
 )
+from .subject_activation import activate_subject
 from .subject_onboarding import configuration_sha256, dependencies_for_definition
 
 # IBKR connection status as the existing Flex validation records it.
@@ -75,10 +78,16 @@ _FLEX_STATUS = {
     "expired": "failing",
     "revoked": "retired",
 }
-# Approvals 2 and 3 arrive with the history build; until then they are refused.
-AVAILABLE_APPROVALS = frozenset({"account_terms"})
+# Stage 3's checks are recorded by the jobs that do the work: the daily refresh
+# records history_built; the historical report run records reports_rendered with
+# evidence {"reports": [{"period_end", "report_type", "file_name", "sha256",
+# "download_path"}]}; the agent team records agent_review_complete. Approval 2 is
+# bound to exactly that evidence, so a re-render or a new review needs a new look.
+BUILD_HISTORY_EVIDENCE = ("history_built", "reports_rendered", "agent_review_complete")
 # The same rule broker_onboarding_cases.target_subject_id enforces.
 _PORTFOLIO_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{2,63}")
+# A link within this website: no scheme, host, backslash or quote.
+_LOCAL_PATH = re.compile(r"/(?![/])[A-Za-z0-9._~/%?=&+-]*")
 
 
 class OnboardingError(ValueError):
@@ -479,14 +488,87 @@ def record_platform_check(connection, tenant_id: str, case_id: str, check_id: st
     return {"case_id": case_id, "stage": case.stage, "status": case_status(case)}
 
 
+def _evidence(check: Mapping[str, Any]) -> dict:
+    value = check.get("evidence_json") or {}
+    return json.loads(value) if isinstance(value, str) else dict(value)
+
+
+def _approval_terms(row: Mapping[str, Any], checks: Iterable[Mapping[str, Any]],
+                    approvals: Iterable[Mapping[str, Any]], approval: str) -> dict[str, object]:
+    """Exactly what the owner reviews for one approval; its digest is stored with it."""
+
+    if approval == "account_terms":
+        return _account_terms(row)
+    common = {"subject_id": str(row["target_subject_id"]), "display_name": str(row["display_name"])}
+    if approval == "historical_reports":
+        by_id = {str(item["check_id"]): item for item in checks}
+        return {**common, "checks": {
+            check_id: {"status": str(by_id[check_id]["status"]), "message": str(by_id[check_id]["message"]),
+                       "evidence": _evidence(by_id[check_id])}
+            for check_id in BUILD_HISTORY_EVIDENCE if check_id in by_id
+        }}
+    return {**common, "reporting_currency": str(row["reporting_currency"]),
+            "approved": {str(item["approval_kind"]): str(item["terms_sha256"]) for item in approvals}}
+
+
+def _reports(checks: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """The rendered historical reports listed for approval 2, newest month first."""
+
+    rendered = next((item for item in checks if str(item["check_id"]) == "reports_rendered"), None)
+    reports = _evidence(rendered).get("reports") if rendered else None
+    listed = []
+    for item in reports if isinstance(reports, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        path = str(item.get("download_path") or "")
+        listed.append({
+            "period_end": str(item.get("period_end") or ""),
+            "report_type": str(item.get("report_type") or ""),
+            "file_name": str(item.get("file_name") or ""),
+            # Only links within this website are shown.
+            "download_path": path if _LOCAL_PATH.fullmatch(path) else "",
+        })
+    return sorted(listed, key=lambda item: (item["period_end"], item["report_type"]), reverse=True)
+
+
+def _go_live(connection, tenant_id: str, row: Mapping[str, Any], case: OnboardingCase, actor: str) -> None:
+    """Approval 3: publish the subject and start its daily jobs, as the wizard's activation does."""
+
+    subject_id = str(row["subject_id"] or "")
+    subject = connection.execute(
+        "SELECT subject_type, history_start_date FROM platform_subjects "
+        "WHERE tenant_id = %s AND subject_id = %s AND lifecycle_status = 'onboarding' FOR UPDATE",
+        (tenant_id, subject_id),
+    ).fetchone() if subject_id else None
+    if subject is None:
+        raise OnboardingError("The account is no longer waiting to go live; reload the case")
+    connection.execute(
+        "UPDATE platform_subjects SET lifecycle_status = 'active', updated_at = now() "
+        "WHERE tenant_id = %s AND subject_id = %s AND lifecycle_status = 'onboarding'",
+        (tenant_id, subject_id),
+    )
+    activate_subject(
+        connection, tenant_id=tenant_id, subject_id=subject_id, subject_type=str(subject["subject_type"]),
+        source_name=str(case.broker or "derived_calculation"),
+        history_start_date=str(subject["history_start_date"]), administrative_master=False,
+        approval_id=None, actor=actor,
+    )
+    if case.source_kind == "broker_account":
+        connection.execute(
+            "UPDATE broker_connection_accounts SET discovery_status = 'live' "
+            "WHERE tenant_id = %s AND connection_id = %s AND broker_account_id = %s",
+            (tenant_id, row["connection_id"], row["broker_account_id"]),
+        )
+
+
 def approve_case(connection, tenant_id: str, case_id: str, *, approval: str, terms_sha256: str,
                  acknowledge_warnings: Iterable[str], confirmation: str | None, actor: str) -> dict:
-    if approval not in AVAILABLE_APPROVALS:
-        raise OnboardingError(f"{APPROVAL_LABELS.get(approval, approval)} arrives with the history build")
-    row, _, _, case = _load_case(connection, tenant_id, case_id, lock=True)
-    terms = _account_terms(row)
+    if approval not in APPROVALS:
+        raise OnboardingError("Unknown approval", 404)
+    row, checks, approvals, case = _load_case(connection, tenant_id, case_id, lock=True)
+    terms = _approval_terms(row, checks, approvals, approval)
     if terms_digest(terms) != terms_sha256:
-        raise OnboardingError("The terms changed after this page loaded; reload and review them again")
+        raise OnboardingError("What you reviewed changed after this page loaded; reload and review it again")
     acknowledged = [item for item in acknowledge_warnings if item in checks_for(case.source_kind, case.stage)]
     try:
         case, event = approve(case, approval, acknowledge_warnings=acknowledged, confirmation=confirmation,
@@ -501,19 +583,24 @@ def approve_case(connection, tenant_id: str, case_id: str, *, approval: str, ter
         )
         _event(connection, tenant_id, case_id, "warning_acknowledged", case.stage, case.stage, actor,
                {"check_id": check_id})
+    detail: dict[str, object] = {"approval": approval, "terms_sha256": terms_sha256}
     if approval == "account_terms" and case.source_kind in DERIVED_SOURCE_KINDS:
         _register_derived_subject(connection, tenant_id, row, terms, actor)
     elif approval == "account_terms":
         _register_subject(connection, tenant_id, row, terms)
+    elif approval == "go_live":
+        _go_live(connection, tenant_id, row, case, actor)
     connection.execute(
         "INSERT INTO broker_onboarding_approvals (tenant_id, case_id, approval_kind, terms_json, terms_sha256, "
         "approved_by_identity_sha256) VALUES (%s, %s, %s, %s::jsonb, %s, %s)",
         (tenant_id, case_id, approval, _json(terms), terms_sha256, actor),
     )
-    _event(connection, tenant_id, case_id, "approved", event.from_stage, event.to_stage, actor,
-           {"approval": approval, "terms_sha256": terms_sha256})
+    _event(connection, tenant_id, case_id, "approved", event.from_stage, event.to_stage, actor, detail)
     case = _save_progress(connection, tenant_id, case, actor)
-    return {"case_id": case_id, "stage": case.stage, "status": case_status(case)}
+    result = {"case_id": case_id, "stage": case.stage, "status": case_status(case)}
+    if approval == "go_live":
+        result["next_page"] = f"/accounts/{row['subject_id']}/overview"
+    return result
 
 
 def _register_subject(connection, tenant_id: str, row: Mapping[str, Any], terms: Mapping[str, object]) -> None:
@@ -534,10 +621,23 @@ def _register_subject(connection, tenant_id: str, row: Mapping[str, Any], terms:
          terms["history_start_date"], terms["history_start_date"],
          _json({"onboarding": "broker_onboarding_v2", "broker": row["broker"], "case_id": str(row["case_id"])})),
     )
+    _private_feature_states(connection, tenant_id, subject_id)
     connection.execute(
         "UPDATE broker_onboarding_cases SET subject_id = %s WHERE tenant_id = %s AND case_id = %s",
         (subject_id, tenant_id, row["case_id"]),
     )
+
+
+def _private_feature_states(connection, tenant_id: str, subject_id: str) -> None:
+    """Only the owner's private website preview is on until go-live."""
+
+    for feature_key in FEATURE_KEYS:
+        connection.execute(
+            "INSERT INTO subject_feature_states (tenant_id, subject_id, feature_key, feature_state, reason, "
+            "updated_at) VALUES (%s, %s, %s, %s, %s, now())",
+            (tenant_id, subject_id, feature_key, "preview" if feature_key == "data_ingestion" else "disabled",
+             "Private until the owner approves go-live."),
+        )
 
 
 def _register_derived_subject(connection, tenant_id: str, row: Mapping[str, Any], terms: Mapping[str, object],
@@ -578,6 +678,7 @@ def _register_derived_subject(connection, tenant_id: str, row: Mapping[str, Any]
             (tenant_id, subject_id, dependency.depends_on_subject_id, dependency.dependency_type,
              dependency.effective_from, _json(dict(dependency.configuration))),
         )
+    _private_feature_states(connection, tenant_id, subject_id)
     connection.execute(
         "UPDATE broker_onboarding_cases SET subject_id = %s WHERE tenant_id = %s AND case_id = %s",
         (subject_id, tenant_id, row["case_id"]),
@@ -622,6 +723,8 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
     by_id = {str(item["check_id"]): item for item in checks}
     account_display = _display(case)
     terms = _account_terms(row)
+    awaiting = missing_approvals(case)[0] if case_status(case) == "waiting_on_owner" else None
+    awaiting_terms = _approval_terms(row, checks, approvals, awaiting) if awaiting else None
     derived = case.source_kind in DERIVED_SOURCE_KINDS
     stage_number = min(list(STAGE_LABELS).index(case.stage) + 1, 4)
     return {
@@ -642,7 +745,10 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
         "stage_number": stage_number,
         "status": case_status(case),
         "next_owner_action": next_owner_action(case),
-        "awaiting_approval": missing_approvals(case)[0] if case_status(case) == "waiting_on_owner" else None,
+        "awaiting_approval": awaiting,
+        "awaiting_terms_sha256": terms_digest(awaiting_terms) if awaiting_terms is not None else None,
+        "reports": _reports(checks) if case.stage == "build_history" else [],
+        "preview_page": f"/accounts/{row['subject_id']}/overview" if row["subject_id"] else None,
         "progress": progress(case),
         "checks": [
             {
@@ -655,12 +761,7 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
             for check_id, state in stage_check_states(case).items()
         ],
         "approvals": [
-            {
-                "kind": kind,
-                "label": label,
-                "approved": kind in case.approvals,
-                "available": kind in AVAILABLE_APPROVALS,
-            }
+            {"kind": kind, "label": label, "approved": kind in case.approvals}
             for kind, label in APPROVAL_LABELS.items()
         ],
         "account_terms": terms,
@@ -1428,10 +1529,21 @@ const render=c=>{
   document.querySelector('#case-next').textContent=c.next_owner_action||(c.status==='cancelled'?'This case was cancelled.':'Nothing needs you right now.');
   document.querySelector('#case-progress').innerHTML=c.progress.map(t=>{const [text,cls]=tileState[t.state];return `<div class="status-item"><div class="label">${esc(t.number)} · ${esc(t.label)}</div>${pill(text,cls)}</div>`}).join('');
   document.querySelector('#case-checks').innerHTML=c.checks.map(k=>`<div class="onboarding-check ${esc(k.status==='pending'?'':k.status)}"><strong>${esc(k.label)}</strong><span>${esc(k.message)}${k.status==='warn'&&k.acknowledged?' Acknowledged.':''}</span></div>`).join('')||'<div class="muted">No checks in this stage.</div>';
-  document.querySelector('#case-approvals').innerHTML=c.approvals.map((a,i)=>`<div class="status-item"><div class="label">Approval ${i+1}</div><strong>${esc(a.label)}</strong>${a.approved?pill('Approved','active'):pill(a.available?'Not yet':'Comes with the history build','blocked')}</div>`).join('');
+  document.querySelector('#case-approvals').innerHTML=c.approvals.map((a,i)=>`<div class="status-item"><div class="label">Approval ${i+1}</div><strong>${esc(a.label)}</strong>${a.approved?pill('Approved','active'):c.awaiting_approval===a.kind?pill('Waiting on you',''):pill('Not yet','blocked')}</div>`).join('');
   const ready=c.may_approve&&c.awaiting_approval==='account_terms';
   const form=document.querySelector('#case-approval-form');
-  if(ready){const t=c.account_terms,derived=c.source_kind!=='broker_account',warns=c.checks.filter(k=>k.status==='warn'),facts=[[derived?'Portfolio ID':'Account',c.account],['Display name',t.display_name],['Reporting currency',t.reporting_currency],['History from',t.history_start_date],...(c.definition_summary||[]).map(r=>[r.label,r.value])];form.innerHTML=`<form id="terms-form"><h3>${derived?'Approve the portfolio definition':'Approve the account terms'}</h3><div class="status-row">${facts.map(([k,v])=>`<div class="status-item"><div class="label">${esc(k)}</div><strong>${esc(v)}</strong></div>`).join('')}</div>${warns.map(k=>`<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="ack" value="${esc(k.check_id)}" required> <span>I have read the warning on ${esc(k.label)}.</span></label>`).join('')}<div class="actions"><button class="button" type="submit">${derived?'Approve definition and terms':'Approve account terms'}</button></div></form>`;
+  const acks=()=>c.checks.filter(k=>k.status==='warn').map(k=>`<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="ack" value="${esc(k.check_id)}" required> <span>I have read the warning on ${esc(k.label)}.</span></label>`).join('');
+  const acked=f=>[...f.querySelectorAll('input[name=ack]:checked')].map(x=>x.value);
+  if(c.may_approve&&c.awaiting_approval==='historical_reports'){
+    const reports=c.reports.length?c.reports.map(r=>`<div class="onboarding-row"><div><strong>${esc(r.period_end)} · ${esc(r.report_type)}</strong><div class="muted">${esc(r.file_name)}</div></div><div class="actions">${r.download_path?`<a class="button" href="${esc(r.download_path)}">Open</a>`:''}</div></div>`).join(''):'<p class="muted">The report run listed no files.</p>';
+    form.innerHTML=`<form id="reports-form"><h3>Approve the historical reports</h3><p class="muted">Open each month's reports. Nothing is shown to viewers until you go live.</p>${reports}${acks()}<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="reviewed" required> <span>I opened and reviewed these reports.</span></label><div class="actions"><button class="button" type="submit">Approve historical reports</button></div></form>`;
+    form.querySelector('form').addEventListener('submit',async event=>{event.preventDefault();const f=event.currentTarget,button=f.querySelector('button');button.disabled=true;result.textContent='Recording your approval…';try{await post(`/api/onboarding-v2/cases/${caseId}/approvals/historical_reports`,{terms_sha256:c.awaiting_terms_sha256,acknowledge_warnings:acked(f)});result.textContent='Approved.';load()}catch(error){result.textContent=`Not approved: ${error.message}`;button.disabled=false}})}
+  else if(c.may_approve&&c.awaiting_approval==='go_live'){
+    form.innerHTML=`<form id="live-form"><h3>Go live</h3><p class="muted">Going live shows ${esc(c.display_name)} to the viewers you give access to and starts its daily updates and month-end reports.</p><div class="actions"><a class="button" href="${esc(c.preview_page)}" target="_blank" rel="noopener">Preview it on the website</a></div>${acks()}<label style="display:block;margin-top:16px"><span class="label">Type ${esc(c.go_live_phrase)} to confirm</span><input type="text" name="confirmation" autocomplete="off" spellcheck="false" style="display:block;width:100%;max-width:440px;min-width:0"></label><div class="actions"><button class="button" type="submit" disabled>Go live</button></div></form>`;
+    const f=form.querySelector('form'),input=f.querySelector('input[name=confirmation]'),button=f.querySelector('button[type=submit]');
+    input.addEventListener('input',()=>{button.disabled=input.value.trim()!==c.go_live_phrase});
+    f.addEventListener('submit',async event=>{event.preventDefault();button.disabled=true;result.textContent='Going live…';try{const done=await post(`/api/onboarding-v2/cases/${caseId}/approvals/go_live`,{terms_sha256:c.awaiting_terms_sha256,acknowledge_warnings:acked(f),confirmation:input.value.trim()});result.textContent='Live. Opening its page…';window.location.href=done.next_page}catch(error){result.textContent=`Not live: ${error.message}`;button.disabled=false}})}
+  else if(ready){const t=c.account_terms,derived=c.source_kind!=='broker_account',warns=c.checks.filter(k=>k.status==='warn'),facts=[[derived?'Portfolio ID':'Account',c.account],['Display name',t.display_name],['Reporting currency',t.reporting_currency],['History from',t.history_start_date],...(c.definition_summary||[]).map(r=>[r.label,r.value])];form.innerHTML=`<form id="terms-form"><h3>${derived?'Approve the portfolio definition':'Approve the account terms'}</h3><div class="status-row">${facts.map(([k,v])=>`<div class="status-item"><div class="label">${esc(k)}</div><strong>${esc(v)}</strong></div>`).join('')}</div>${warns.map(k=>`<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="ack" value="${esc(k.check_id)}" required> <span>I have read the warning on ${esc(k.label)}.</span></label>`).join('')}<div class="actions"><button class="button" type="submit">${derived?'Approve definition and terms':'Approve account terms'}</button></div></form>`;
     form.querySelector('form').addEventListener('submit',async event=>{event.preventDefault();const button=event.currentTarget.querySelector('button');button.disabled=true;result.textContent='Recording your approval…';try{await post(`/api/onboarding-v2/cases/${caseId}/approvals/account_terms`,{terms_sha256:c.account_terms_sha256,acknowledge_warnings:[...event.currentTarget.querySelectorAll('input[name=ack]:checked')].map(x=>x.value)});result.textContent='Approved.';load()}catch(error){result.textContent=`Not approved: ${error.message}`;button.disabled=false}})}
   else form.innerHTML='';
   document.querySelector('#case-cancel-card').hidden=!(c.can_cancel&&c.may_approve);

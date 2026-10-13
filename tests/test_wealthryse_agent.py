@@ -199,6 +199,51 @@ class AuthTests(unittest.TestCase):
         with self.assertRaises(auth.Unauthorized):
             auth.verify_service_token(None, settings)
 
+    def test_key_fetch_gives_up_before_callers_do(self):
+        self.assertLess(auth._jwks("tenant-for-timeout-test").timeout, 30)
+
+
+class ToolClientReadinessTests(unittest.TestCase):
+    def _client(self, handler):
+        import httpx
+        from wealthryse_agent.tool_client import ToolClient
+
+        tokens = SimpleNamespace(header=lambda: {"Authorization": "Bearer test"})
+        return ToolClient("https://tools.internal", tokens, job="data_quality", correlation_id="c1",
+                          transport=httpx.MockTransport(handler))
+
+    def test_waits_for_a_cold_tool_server(self):
+        import httpx
+
+        calls, pauses = [], []
+
+        def handler(request):
+            calls.append(json.loads(request.content)["method"])
+            if len(calls) < 3:
+                raise httpx.ReadTimeout("cold start", request=request)
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+
+        self._client(handler).wait_until_ready(sleep=pauses.append)
+        self.assertEqual(calls, ["ping", "ping", "ping"])
+        self.assertEqual(len(pauses), 2)
+
+    def test_gives_up_after_the_last_attempt(self):
+        import httpx
+
+        def handler(request):
+            return httpx.Response(503)
+
+        with self.assertRaises(httpx.HTTPStatusError):
+            self._client(handler).wait_until_ready(attempts=3, sleep=lambda _: None)
+
+    def test_does_not_retry_a_refused_caller(self):
+        import httpx
+
+        pauses = []
+        with self.assertRaises(ToolCallFailed):
+            self._client(lambda request: httpx.Response(403)).wait_until_ready(sleep=pauses.append)
+        self.assertEqual(pauses, [])
+
 
 class DataQualityTests(unittest.TestCase):
     def test_findings(self):

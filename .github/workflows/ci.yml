@@ -27,7 +27,7 @@ jobs:
       - name: Test
         run: python scripts/ci_run_tests.py
 
-  # Agent schema, account isolation and tool figures against a real
+  # Agent schema, account isolation, tool figures and onboarding schema rules against a real
   # PostgreSQL (synthetic data only). The main test job skips these.
   agent-database:
     runs-on: ubuntu-latest
@@ -54,7 +54,7 @@ jobs:
       - name: Test
         env:
           AGENT_TEST_PG_ADMIN_DSN: "host=localhost port=5432 user=postgres password=ci-only dbname=postgres"
-        run: python -m unittest discover -s tests -p "test_wealthryse_agent_db.py" -v
+        run: python -m unittest discover -s tests -p "test_*_db.py" -v
 
   ingestion-image:
     runs-on: ubuntu-latest

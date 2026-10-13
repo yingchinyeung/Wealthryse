@@ -230,9 +230,11 @@ def read_only_on_vm(config, run_name):
         view = vm_run(base, run_name, remote_script(config), vm['location'], 1800)
         lines = [l[len('WEBSITE_BUILD_RESULT '):] for l in (view.get('output') or '').splitlines() if l.startswith('WEBSITE_BUILD_RESULT ')]
         result = json.loads(lines[-1]) if lines else {'passed': False}
-        print(json.dumps({k: v for k, v in result.items() if k != 'captured'}, indent=2))
+        print(json.dumps({k: v for k, v in result.items() if k not in ('captured', 'listing')}, indent=2))
         if not result.get('passed'):
             raise SystemExit('Read-only copy failed; nothing was changed')
+        if not result.get('detail_file'):
+            return result, ''
         return result, read_detail(base, vm['location'], result['detail_file'], result['detail_size'])
     finally:
         if started:
@@ -288,19 +290,32 @@ def capture():
     print('Copied', ', '.join(names), 'from', live)
 
 
-def compare_with_repo(hashes, head):
-    """Compare an image's file hashes with the repository at head."""
+def repo_hashes(head):
+    """SHA-256 of every .py file under src/ibkr_etl and scripts at head."""
     repo = {}
     for prefix in ('src/ibkr_etl/', 'scripts/'):
         for path in git('ls-tree', '-r', '--name-only', head, prefix).split():
             if path.endswith('.py'):
                 repo[path] = hashlib.sha256(git('show', head + ':' + path, binary=True)).hexdigest()
+    return repo
+
+
+def compare_with_repo(hashes, head, repo=None):
+    """Compare an image's file hashes with the repository at head."""
+    repo = repo_hashes(head) if repo is None else repo
     scripts = any(p.startswith('scripts/') for p in hashes)
     repo = {p: h for p, h in repo.items() if scripts or not p.startswith('scripts/')}
     return {'same': sorted(p for p in hashes if repo.get(p) == hashes[p]),
             'different': sorted(p for p in hashes if p in repo and repo[p] != hashes[p]),
             'only_image': sorted(p for p in hashes if p not in repo),
             'only_repo': sorted(p for p in repo if p not in hashes)}
+
+
+def listing_hashes(listing, repo):
+    """Hashes for compare_with_repo from the VM's listing: the repository's own hash for
+    files the VM found identical, and a marker for files that differ or are not in the repo."""
+    differ = {listing['files'][i] for i in listing['differ']}
+    return {name: 'differs' if name in differ else repo[name] for name in listing['files']}
 
 
 def inventory():
@@ -314,21 +329,25 @@ def inventory():
     head = git('rev-parse', 'HEAD').strip()
     folder = ROOT / 'deploy' / 'image-inventory'
     folder.mkdir(parents=True, exist_ok=True)
+    repo = repo_hashes(head)
+    # The VM compares against these, so one Run Command per image is enough (the
+    # follow-up reads of a detail file waited 20 minutes each on 13 Oct).
+    short = base64.b64encode(gzip.compress(json.dumps({p: h[:16] for p, h in repo.items()}).encode(), 9)).decode()
     failed = []
     for image in dict.fromkeys(images):
         config = {'inventory': True, 'base_image': image, 'target_image': f'{REG}/ibkr-platform:web-capture',
-                  'source_commit': head, 'live_hashes': {}, 'new_hashes': {}, 'patch': ''}
+                  'source_commit': head, 'live_hashes': {}, 'new_hashes': {}, 'patch': '', 'repo_hashes': short}
         try:
-            _, detail = read_only_on_vm(config, 'image-inventory-' + image[len(IMAGE_PREFIX):][:12])
+            result, detail = read_only_on_vm(config, 'image-inventory-' + image[len(IMAGE_PREFIX):][:12])
         except SystemExit as error:
             # One image failing still leaves the others worth keeping.
             print(image, 'FAILED:', error)
             failed.append(image)
             continue
-        hashes = json.loads(gzip.decompress(base64.b64decode(detail)))
-        comparison = compare_with_repo(hashes, head)
+        listing = json.loads(gzip.decompress(base64.b64decode(result.get('listing') or detail)))
+        comparison = compare_with_repo(listing_hashes(listing, repo), head, repo)
         (folder / (image[len(IMAGE_PREFIX):][:12] + '.json')).write_text(json.dumps(
-            {'image': image, 'repo_commit': head, 'hashes': hashes, **comparison}, indent=1, sort_keys=True) + '\n')
+            {'image': image, 'repo_commit': head, 'files': listing['files'], **comparison}, indent=1, sort_keys=True) + '\n')
         print(image, {k: len(v) for k, v in comparison.items()})
     if failed:
         raise SystemExit('Inventory failed for ' + ' '.join(failed))

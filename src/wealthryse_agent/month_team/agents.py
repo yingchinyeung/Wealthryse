@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any, Callable, Mapping, Sequence
@@ -35,6 +36,11 @@ class TeamModelError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+# The cap counts reasoning as well as the answer; at the old 2,000 to 3,000 some replies were cut off
+# ("model_incomplete"). Only tokens actually used are billed and counted against the budget.
+OUTPUT_TOKENS = {"writer": 8000, "review": 6000, "deck_review": 6000, "visual": 8000}
 
 
 class BudgetExhausted(Exception):
@@ -220,6 +226,17 @@ def plain_commentary(draft: Mapping[str, Any]) -> dict[str, Any]:
             "risk_observations": [s["text"] for s in draft["risk_observations"]]}
 
 
+_NUMERIC = re.compile(r"[0-9%$]")
+
+
+def _has_shape(draft: Mapping[str, Any]) -> bool:
+    try:
+        commentary_items(draft)
+    except (KeyError, TypeError):
+        return False
+    return True
+
+
 class Writer:
     def __init__(self, model: TeamModel) -> None:
         self.model = model
@@ -236,7 +253,7 @@ class Writer:
             if feedback:
                 payload["format_problem"] = feedback
             draft, used = self.model.ask(name="month_end_commentary", instructions=WRITER, payload=payload,
-                                         schema=WRITER_SCHEMA, max_output_tokens=3000)
+                                         schema=WRITER_SCHEMA, max_output_tokens=OUTPUT_TOKENS["writer"])
             for key in usage:
                 usage[key] += used[key]
             feedback = self._format_problem(draft, figure_set)
@@ -249,6 +266,14 @@ class Writer:
 
     @staticmethod
     def _format_problem(draft: Mapping[str, Any], figure_set: Mapping[str, Any]) -> str | None:
+        # Say which sentence holds a digit, % or $, so the second draft can fix it rather than guess.
+        for item in commentary_items(draft) if _has_shape(draft) else []:
+            found = sorted(set(_NUMERIC.findall(item["text"])))
+            if found:
+                return (f"{item['field']} {item['index']} contains {', '.join(repr(c) for c in found)}, and the "
+                        "commentary may hold no digit, % or $. Describe figures in words, write \"the benchmark\" "
+                        "for a benchmark whose name has digits, and call a holding whose symbol has digits by its "
+                        "place (\"the largest contributor\").")
         try:
             _validate_output(plain_commentary(draft))
         except (MonthEndAgentError, KeyError, TypeError) as error:
@@ -293,7 +318,7 @@ class Reviewer:
                    "commentary": [{**i, "cited": [lookup[f]["label"] + ": " + lookup[f]["display"]
                                                   for f in i["figures"] if f in lookup]} for i in items]}
         result, usage = self.model.ask(name="commentary_review", instructions=REVIEWER_COMMENTARY, payload=payload,
-                                       schema=REVIEW_SCHEMA, max_output_tokens=2500)
+                                       schema=REVIEW_SCHEMA, max_output_tokens=OUTPUT_TOKENS["review"])
         valid = {(i["field"], i["index"]) for i in items}
         seen = {(o["field"], o["index"]) for o in objections}
         for objection in result.get("objections", []):
@@ -337,7 +362,7 @@ class Reviewer:
                            "figures": [{k: f[k] for k in ("id", "label", "display")} for f in figure_set["figures"]],
                            "unavailable": figure_set.get("unavailable", []), "deck_lines": lines}
                 result, usage = self.model.ask(name="deck_review", instructions=REVIEWER_DECK, payload=payload,
-                                               schema=DECK_REVIEW_SCHEMA, max_output_tokens=2000)
+                                               schema=DECK_REVIEW_SCHEMA, max_output_tokens=OUTPUT_TOKENS["deck_review"])
                 slides = {line["slide"] for line in lines}
                 objections += [{"target": "presentation", "page": int(o["slide"]),
                                 "message": "Narrative: " + str(o["message"]).strip()[:500]}
@@ -385,7 +410,7 @@ class VisualQA:
                                       "axis labels and gridlines"]}][:len(images)]}
         try:
             result, usage = self.model.ask(name="visual_qa", instructions=VISUAL_QA, payload=note, schema=VISUAL_SCHEMA,
-                                           images=images, max_output_tokens=3000)
+                                           images=images, max_output_tokens=OUTPUT_TOKENS["visual"])
         except TeamModelError as error:
             if error.code == "model_rejected":
                 return Outcome("skipped", "The report model did not accept page images, so the pages were not "

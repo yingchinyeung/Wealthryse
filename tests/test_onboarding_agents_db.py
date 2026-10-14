@@ -153,6 +153,47 @@ class OnboardingAgentsDatabaseTests(unittest.TestCase):
         self.assertEqual(limited["agents"]["term_draft"], None)
         self.assertEqual(limited["display_name"], "Synthetic agents")
 
+    def _website(self, role=OWNER_ROLE):
+        """A raw psycopg connection with dict rows, as the website's read-only database gives."""
+        import psycopg
+        from psycopg.rows import dict_row
+
+        db = psycopg.connect(_dsn(ADMIN_DSN, self.database, role), row_factory=dict_row,
+                             options=f"-c app.tenant_id={TENANT}")
+        self.addCleanup(db.close)
+        return db
+
+    def test_the_readiness_pack_and_connection_reports_on_a_real_database(self):
+        from ibkr_etl.onboarding_agents import case_readiness, connection_reports
+
+        db = self._platform()
+        # One case at a time: reuse the one the other test opened when it ran first.
+        open_case = db.execute("SELECT case_id FROM broker_onboarding_cases WHERE status <> 'cancelled' "
+                               "AND stage IN ('request', 'load_and_reconcile') LIMIT 1").fetchone()
+        case_id = str(open_case["case_id"]) if open_case else self._composite_before_approval_one(db, "synthetic-agents")
+        connection_id = uuid.uuid4()
+        for n, state in ((1, "queued"), (2, "found_accounts")):
+            db.execute("INSERT INTO agent.connection_reports (tenant_id, connection_id, flex_source_id, report_key, "
+                       "state, title, body, owner_steps) VALUES (?, ?, ?, ?, ?, ?, ?, ?::jsonb)",
+                       (TENANT, connection_id, uuid.uuid4(), f"report-{n}", state, f"Report {n}",
+                        "The login sees one account.", json.dumps(["Nothing to do."])))
+        db.commit()
+
+        website = self._website()
+        pack = case_readiness(website, TENANT, case_id, "go_live", environ=ON)
+        self.assertFalse(pack["ready"])
+        self.assertEqual(len(pack["pack_sha256"]), 64)
+        self.assertIn("Account terms is not approved yet.", " ".join(pack["blockers"]))
+        self.assertIsNone(case_readiness(website, TENANT, case_id, "account_terms", environ=ON))
+        reports = connection_reports(website, TENANT, environ=ON)
+        self.assertEqual(reports[str(connection_id)]["state"], "found_accounts")
+        self.assertEqual(reports[str(connection_id)]["owner_steps"], ["Nothing to do."])
+        # The case page still reads after both, in the same read-only transaction.
+        self.assertEqual(website.execute("SELECT 1 AS one").fetchone()["one"], 1)
+
+        # A website role never given the agents' results sees no reports, not an error.
+        self.assertEqual(connection_reports(self._website(READER), TENANT, environ=ON), {})
+
     def test_the_recorders_run_on_a_real_database(self):
         from ibkr_etl.onboarding_agents import run_reconciliations, run_reviews
 

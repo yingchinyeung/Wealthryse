@@ -13,7 +13,10 @@ is what the platform does with them:
   proposes for the security master (case_agent_view);
 - the owner uploads the client's documents (mandate, fee terms, side letters)
   to the private intake container, where the intake agent reads them
-  (document_blob_name, validate_document).
+  (document_blob_name, validate_document);
+- the case page shows the go-live readiness pack above the GO LIVE box
+  (case_readiness), and the Broker connections page shows what the connection
+  agent found when it checked each IBKR login (connection_reports).
 
 While the switch is off nothing here reads the agent schema, records a check
 or accepts a document. With it on, a missing agent table or a platform role
@@ -23,6 +26,7 @@ that cannot read it is treated as "no agent results yet", never an error.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import posixpath
 import re
@@ -45,6 +49,7 @@ MAX_DOCUMENTS = 20
 DOCUMENT_STAGES = ("request", "load_and_reconcile")
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._ -]+")
 _MAX_PROPOSALS = 200
+LOG = logging.getLogger(__name__)
 
 
 def agents_enabled(environ: Mapping[str, str] | None = None) -> bool:
@@ -151,6 +156,47 @@ def case_agent_view(connection, tenant_id: str, case_id: str, checks: Iterable[M
                    for check_id, evidence in recorded.items()},
         "term_draft": draft,
         "security_proposals": proposals,
+    }
+
+
+def case_readiness(connection, tenant_id: str, case_id: str, awaiting: str | None,
+                   *, environ: Mapping[str, str] | None = None) -> dict | None:
+    """The go-live readiness pack while the case waits for GO LIVE, or None (switch off, or another stage)."""
+
+    if not agents_enabled(environ) or awaiting != "go_live":
+        return None
+    from .onboarding_readiness import readiness_pack
+
+    try:
+        # A savepoint, so a pack that cannot be built never spoils the rest of the case page's reads.
+        with connection.transaction():
+            return readiness_pack(connection, tenant_id, case_id)
+    except Exception:
+        LOG.exception("The readiness pack for case %s could not be built", case_id)
+        return {"unavailable": True}
+
+
+def connection_reports(connection, tenant_id: str, *, environ: Mapping[str, str] | None = None) -> dict | None:
+    """The connection agent's latest report for each broker connection, by connection ID; None while off."""
+
+    if not agents_enabled(environ):
+        return None
+    if not _readable(connection, "agent.connection_reports", "%s"):
+        return {}
+    rows = connection.execute(
+        "SELECT DISTINCT ON (connection_id) connection_id, state, title, body, owner_steps, created_at "
+        "FROM agent.connection_reports WHERE tenant_id = %s ORDER BY connection_id, report_id DESC",
+        (tenant_id,),
+    ).fetchall()
+    return {
+        str(row["connection_id"]): {
+            "state": str(row["state"]),
+            "title": str(row["title"]),
+            "body": str(row["body"]),
+            "owner_steps": [str(step) for step in _json(row["owner_steps"], []) or [] if str(step).strip()],
+            "reported_at": str(row["created_at"]),
+        }
+        for row in rows
     }
 
 

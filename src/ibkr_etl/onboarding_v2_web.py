@@ -841,6 +841,7 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
         # The onboarding agents' part (None while ONBOARDING_AGENTS_ENABLED is off); see onboarding_agents.py.
         "agents": onboarding_agents.case_agent_view(connection, tenant_id, case.case_id, checks),
         "documents_open": onboarding_agents.agents_enabled() and onboarding_agents.documents_open(row, approvals),
+        "readiness": onboarding_agents.case_readiness(connection, tenant_id, case.case_id, awaiting),
     }
 
 
@@ -1152,6 +1153,8 @@ def connections_overview(connection, tenant_id: str, *, today: date, platform_ip
     ]
     return {
         "connections": connections,
+        # What the connection agent found for each login (None while ONBOARDING_AGENTS_ENABLED is off).
+        "agent_reports": onboarding_agents.connection_reports(connection, tenant_id),
         "existing_ibkr_logins": untracked,
         "platform_ip": platform_ip,
         "recipe_steps": list(RECIPE_STEPS),
@@ -1648,7 +1651,7 @@ CASE_CONTENT = """<div class="page-view active" data-section="account-onboarding
 <div class="card wide"><div class="label">Checks for this stage</div><div id="case-checks" class="onboarding-checks"></div></div>
 <div class="card wide" id="case-proposals" hidden><div class="label">Proposed security master entries</div><p class="muted">Securities in this account that the security master does not have yet, as the agent proposes them. Nothing is added until you approve the account terms.</p><div id="case-proposal-list"></div></div>
 <div class="card wide" id="case-documents" hidden><div class="label">Client documents</div><p class="muted">The mandate, fee terms and side letters. The agent drafts the account terms from them, quoting each clause, for you to compare before approval 1.</p><div id="case-document-list"></div><form id="case-document-form" hidden><div class="actions"><input type="file" name="document" accept=".pdf,.docx,.txt,.md" required aria-label="Client document"><button class="button" type="submit">Add document</button></div><div class="muted" role="status"></div></form></div>
-<div class="card wide"><div class="label">Your three approvals</div><div id="case-approvals" class="status-row"></div><div id="case-term-draft" hidden></div><div id="case-approval-form"></div><div id="case-result" class="muted" role="status" aria-live="polite"></div></div>
+<div class="card wide"><div class="label">Your three approvals</div><div id="case-approvals" class="status-row"></div><div id="case-term-draft" hidden></div><div id="case-readiness" hidden></div><div id="case-approval-form"></div><div id="case-result" class="muted" role="status" aria-live="polite"></div></div>
 <div class="card wide" id="case-cancel-card" hidden><div class="label">Stop this case</div><p class="muted">Cancelling frees the account or portfolio ID to be added again later. Nothing reached viewers.</p><div class="actions"><input id="case-cancel-reason" type="text" maxlength="500" placeholder="Reason" aria-label="Reason for cancelling"><button id="case-cancel" class="button" type="button">Cancel this case</button></div></div>
 </div>"""
 
@@ -1708,6 +1711,13 @@ const renderDraft=(c,d)=>{const box=document.querySelector('#case-term-draft');c
   const terms=Object.values(d.terms||{}).filter(t=>t.status!=='not_found'||t.value);
   const source=s=>`${esc(s.document)} p.${esc(s.page)}: “${esc(s.quote)}”`;
   box.innerHTML=`<div class="onboarding-row" style="display:block;margin-top:14px"><strong>Terms drafted by the agent from the client's documents</strong> ${pill(text,cls)}<p class="muted">${esc(d.summary)} Compare them with the terms below before you approve; the agent does not change the case.</p>${terms.map(t=>`<div class="status-item" style="min-width:0;margin-top:8px"><div class="label">${esc(t.label)}${t.status==='conflict'?' · documents disagree':''}</div><strong>${esc(t.status==='conflict'?(t.values||[]).join(' / '):t.value)}</strong><details><summary>Sources</summary>${(t.sources||[]).map(s=>`<div class="muted">${source(s)}</div>`).join('')}</details></div>`).join('')}${(d.findings||[]).length?`<div class="warning" style="margin-top:10px">${d.findings.map(f=>`<div>${esc(f.message)}</div>`).join('')}</div>`:''}<div class="muted">Read from ${esc((d.documents||[]).map(x=>x.document).join(', ')||'no documents')} · drafted ${esc(d.drafted_at)}</div></div>`};
+const termState={matches:['Matches','active'],differs:['Differs','blocked'],not_in_documents:['Not in the documents',''],no_draft:['No draft yet','']};
+const renderReadiness=r=>{const box=document.querySelector('#case-readiness');box.hidden=!r;if(!r){box.innerHTML='';return}
+  if(r.unavailable){box.innerHTML='<div class="warning" style="margin-top:14px">The readiness summary could not be built. The checks and approvals above are still current.</div>';return}
+  const quote=s=>s?`<div class="muted">${esc(s.document)} p.${esc(s.page)}: “${esc(s.quote)}”</div>`:'';
+  const terms=r.terms_vs_documents.map(t=>{const [text,cls]=termState[t.state]||[t.state,''];return `<div class="status-item" style="min-width:0"><div class="label">${esc(t.label)}</div><strong>${esc(t.approved)}</strong> ${pill(text,cls)}${t.state==='differs'?`<div>Documents: ${esc(t.documents)}</div>`:''}${quote(t.source)}</div>`}).join('');
+  const stages=r.stages.map(s=>`<div style="margin-top:8px"><div class="label">${esc(s.label)}</div>${s.checks.map(k=>`<div class="muted">${esc(k.label)}: ${esc(k.status)}${k.warning_acknowledged?' (acknowledged)':''} · ${k.recorded_by==='agent'?'checked by agent':'checked by platform'}</div>`).join('')||'<div class="muted">No checks.</div>'}</div>`).join('');
+  box.innerHTML=`<div class="onboarding-row" style="display:block;margin-top:14px"><strong>Ready to go live?</strong> ${r.ready?pill('Nothing stands in the way','active'):pill('Not yet','blocked')}${r.blockers.length?`<div class="warning" style="margin-top:10px">${r.blockers.map(b=>`<div>${esc(b)}</div>`).join('')}</div>`:''}${r.notes.map(n=>`<div class="warning" style="margin-top:10px">${esc(n)}</div>`).join('')}<div class="label" style="margin-top:14px">Approved terms against the client's documents</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;margin-top:6px">${terms}</div><div class="label" style="margin-top:14px">Typing GO LIVE switches on</div><ul style="margin:6px 0 0 18px">${r.go_live_switches_on.map(e=>`<li>${esc(e)}</li>`).join('')}</ul><details style="margin-top:12px"><summary>Every check so far</summary>${stages}${r.acknowledged_warnings.length?`<div class="muted" style="margin-top:8px">Warnings acknowledged: ${esc(r.acknowledged_warnings.join(', '))}</div>`:''}</details><p class="muted">${esc(r.after_go_live)} Pack ${esc(String(r.pack_sha256).slice(0,12))}.</p></div>`};
 const renderDocuments=c=>{const card=document.querySelector('#case-documents');card.hidden=!c.agents;if(!c.agents)return;const form=document.querySelector('#case-document-form');form.hidden=!c.documents_open;
   fetch(`/api/onboarding-v2/cases/${caseId}/documents`).then(json).then(data=>{document.querySelector('#case-document-list').innerHTML=data.documents.length?data.documents.map(d=>row(d.name,`${Math.max(1,Math.round(d.byte_count/1024))} KB`,'')).join(''):'<p class="muted">No documents yet.</p>'}).catch(error=>{document.querySelector('#case-document-list').innerHTML=`<div class="warning">The documents could not be listed: ${esc(error.message)}</div>`})};
 document.querySelector('#case-document-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget,note=form.querySelector('[role=status]'),button=form.querySelector('button');button.disabled=true;note.textContent='Uploading…';try{const done=await fetch(`/api/onboarding-v2/cases/${caseId}/documents`,{method:'POST',body:new FormData(form)}).then(json);note.textContent=`Added ${done.name}. The agent drafts the terms on its next run.`;form.reset();load()}catch(error){note.textContent=`Not added: ${error.message}`}finally{button.disabled=false}});
@@ -1723,6 +1733,7 @@ const render=c=>{
   renderProposals(agent.security_proposals||[]);
   renderDraft(c,agent.term_draft);
   renderDocuments(c);
+  renderReadiness(c.readiness);
   document.querySelector('#case-approvals').innerHTML=c.approvals.map((a,i)=>`<div class="status-item"><div class="label">Approval ${i+1}</div><strong>${esc(a.label)}</strong>${a.approved?pill('Approved','active'):c.awaiting_approval===a.kind?pill('Waiting on you',''):pill('Not yet','blocked')}</div>`).join('');
   const ready=c.may_approve&&c.awaiting_approval==='account_terms';
   const form=document.querySelector('#case-approval-form');
@@ -1751,11 +1762,13 @@ load();
 CONNECTIONS_SCRIPT = "<script>\n(()=>{" + _COMMON_SCRIPT + r"""
 const form=document.querySelector('#bc-form'),status=document.querySelector('#bc-status'),broker=document.querySelector('#bc-broker');
 const healthClass={healthy:'active',renew_soon:'blocked',expired:'blocked',failing:'blocked',not_checked:'',suspended:'blocked'};
+const reportState={queued:['Check queued',''],found_accounts:['Accounts found','active'],failed:['Check failed','blocked'],blocked:['Check blocked','blocked'],stuck:['Check stuck','blocked'],waiting:['Waiting','']};
+const agentReport=r=>{if(!r)return '';const [text,cls]=reportState[r.state]||[r.state,''];return `<div class="onboarding-row" style="display:block;margin:-6px 0 10px 16px"><span class="label">Checked by agent</span> ${pill(text,cls)} <strong>${esc(r.title)}</strong><div class="muted">${esc(r.body)}</div>${r.owner_steps.length?`<ol style="margin:6px 0 0 18px">${r.owner_steps.map(s=>`<li>${esc(s)}</li>`).join('')}</ol>`:''}<div class="muted">${esc(r.reported_at)}</div></div>`};
 const lockText={locked:'locked to the platform address',not_locked:'not IP-locked',mismatch:'locked to a different address',unknown_platform_ip:'IP lock recorded'};
 const showFields=()=>form.querySelectorAll('[data-broker]').forEach(node=>{node.hidden=node.dataset.broker!==broker.value});
 broker.addEventListener('change',showFields);showFields();
 const load=()=>fetch('/api/broker-connections').then(json).then(data=>{
-  document.querySelector('#bc-list').innerHTML=data.connections.length?data.connections.map(c=>row(`${c.broker_label} · ${c.display_name}`,[c.environment==='mock'?'Mock environment':null,c.expires_on?`expires ${c.expires_on}`:null,lockText[c.ip_lock]].filter(Boolean).join(' · '),pill(c.health_label,healthClass[c.health])+(c.flex_source_id?`<button class="button" type="button" data-check="${esc(c.flex_source_id)}">Check now</button>`:''))).join(''):'<p class="muted">No connections yet.</p>';
+  document.querySelector('#bc-list').innerHTML=data.connections.length?data.connections.map(c=>row(`${c.broker_label} · ${c.display_name}`,[c.environment==='mock'?'Mock environment':null,c.expires_on?`expires ${c.expires_on}`:null,lockText[c.ip_lock]].filter(Boolean).join(' · '),pill(c.health_label,healthClass[c.health])+(c.flex_source_id?`<button class="button" type="button" data-check="${esc(c.flex_source_id)}">Check now</button>`:''))+agentReport((data.agent_reports||{})[c.connection_id])).join(''):'<p class="muted">No connections yet.</p>';
   document.querySelector('#bc-existing').innerHTML=data.existing_ibkr_logins.length?`<h3>IBKR logins already on the platform</h3><p class="muted">Add each token's expiry date so the platform can warn you before it lapses. The token itself stays where it is.</p>`+data.existing_ibkr_logins.map(l=>`<form class="onboarding-row" data-track="${esc(l.credential_id)}"><div><strong>${esc(l.display_name)}</strong></div><div class="actions"><input type="date" name="expires_on" required aria-label="Token expiry"><button class="button" type="submit">Track this login</button></div></form>`).join(''):'';
   document.querySelector('#bc-recipe-steps').innerHTML=data.recipe_steps.map(s=>`<li>${esc(s)}</li>`).join('');
   const ip=document.querySelector('#bc-ip');if(data.platform_ip){ip.value=data.platform_ip;ip.placeholder=data.platform_ip}

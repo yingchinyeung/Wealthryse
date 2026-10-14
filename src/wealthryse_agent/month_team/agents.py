@@ -185,13 +185,15 @@ class Analyst:
 
 # Writer ----------------------------------------------------------------------
 
+# The deck prints "Portfolio analyst: <summary>" in at most 240 characters (scripts/report_summary_label.mjs).
+SUMMARY_LIMIT = 240 - len("Portfolio analyst: ")
 _CITED = {"type": "array", "items": {"type": "string"}}
 _SENTENCE = {"type": "object", "properties": {"text": {"type": "string", "maxLength": 180}, "figures": _CITED},
              "required": ["text", "figures"], "additionalProperties": False}
 WRITER_SCHEMA = {
     "type": "object",
     "properties": {
-        "executive_summary": {"type": "string", "maxLength": 420},
+        "executive_summary": {"type": "string", "maxLength": SUMMARY_LIMIT},
         "executive_summary_figures": _CITED,
         "performance_observations": {"type": "array", "items": _SENTENCE, "minItems": 2, "maxItems": 4},
         "risk_observations": {"type": "array", "items": _SENTENCE, "minItems": 2, "maxItems": 4},
@@ -251,6 +253,9 @@ class Writer:
             _validate_output(plain_commentary(draft))
         except (MonthEndAgentError, KeyError, TypeError) as error:
             return str(error)
+        if len(draft["executive_summary"].strip()) > SUMMARY_LIMIT:
+            return (f"The executive summary is {len(draft['executive_summary'].strip())} characters; the deck prints "
+                    f"at most {SUMMARY_LIMIT}.")
         known = set(fig.figure_lookup(figure_set))
         for item in commentary_items(draft):
             unknown = [i for i in item["figures"] if i not in known]

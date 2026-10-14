@@ -12,9 +12,10 @@ from typing import Any, Sequence
 from ibkr_etl.db import PostgresConnection
 
 JSON_COLUMNS = frozenset({"figures", "commentary", "package", "verdicts", "usage"})
-RUN_COLUMNS = JSON_COLUMNS | {"stage", "data_verdict", "commentary_rounds", "commentary_status", "attempts", "last_error"}
+RUN_COLUMNS = JSON_COLUMNS | {"stage", "live", "data_verdict", "commentary_rounds", "commentary_status", "attempts",
+                               "last_error"}
 _RUN_SELECT = (
-    "SELECT month_run_id, subject_id, period_end::text AS period_end, mode, stage, data_verdict, figures, commentary, "
+    "SELECT month_run_id, subject_id, period_end::text AS period_end, mode, live, stage, data_verdict, figures, commentary, "
     "commentary_rounds, commentary_status, package, verdicts, usage, attempts, last_error, created_at, updated_at "
     "FROM agent.month_runs"
 )
@@ -81,7 +82,7 @@ class MonthStore:
         """Last month's agreed text, for tone only."""
         row = self.db.execute(
             "SELECT commentary FROM agent.month_runs WHERE tenant_id = ?::uuid AND subject_id = ? AND period_end < ?::date "
-            "AND mode = 'shadow' AND commentary_status IN ('agreed', 'writer_upheld') AND commentary IS NOT NULL "
+            "AND mode = 'month' AND commentary_status IN ('agreed', 'writer_upheld') AND commentary IS NOT NULL "
             "ORDER BY period_end DESC LIMIT 1",
             (self.tenant_id, account_id, period_end),
         ).fetchone()
@@ -170,7 +171,7 @@ class MonthStore:
 
     # Website reads ---------------------------------------------------------
 
-    def runs(self, accounts: Sequence[str], period_end: str | None = None, mode: str = "shadow") -> list[dict[str, Any]]:
+    def runs(self, accounts: Sequence[str], period_end: str | None = None, mode: str = "month") -> list[dict[str, Any]]:
         if not accounts:
             return []
         rows = self.db.execute(
@@ -193,7 +194,7 @@ class MonthStore:
                    "verdicts": run["verdicts"], "files": (run["package"] or {}).get("files", [])})
         return listed
 
-    def run_detail(self, account_id: str, period_end: str, mode: str = "shadow") -> dict[str, Any] | None:
+    def run_detail(self, account_id: str, period_end: str, mode: str = "month") -> dict[str, Any] | None:
         row = self.db.execute(
             _RUN_SELECT + " WHERE tenant_id = ?::uuid AND subject_id = ? AND period_end = ?::date AND mode = ?",
             (self.tenant_id, account_id, period_end, mode),

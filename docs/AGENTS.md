@@ -133,15 +133,17 @@ internal-reports, writes agent.month_* tables and agent.inbox only
 
 ## Month-end team
 
-Six agents check each month's reports next to today's process. They run in
-shadow: they change no file, release nothing, and the release steps on the
-Reports tab stay exactly as they are.
+Six agents check each month's reports and write their commentary. Until the
+go-live switch is on they run in shadow: their commentary is shown, never
+used. Once live, the factsheet job puts the team's agreed commentary into the
+reports and Release asks for confirmation while the team has an open
+objection. The team itself never changes a file or releases anything.
 
 | Agent | What it does | Model |
 |---|---|---|
 | Data | Is the month's data complete? Month-end valuation present, no price gap over 5 days, no one-day move over 20%, exchange rates available. Clean, fixable (waits up to 3 days for the next sync) or blocked (asks Ying). | none |
 | Analyst | Builds the figure set from the tools: month, year-to-date and since-inception returns against the benchmark, risk, contributors, sectors. Every figure has an id and a source. | none |
-| Writer | Drafts the commentary from the figure set only. Every sentence cites figure ids, and the text makes no numerical claim of its own, as with today's drafter. | `wr-reports-apac` |
+| Writer | Drafts the commentary from the figure set only. Every sentence cites figure ids, and the text makes no numerical claim of its own, as with today's drafter. The summary fits the deck's line (221 characters). | `wr-reports-apac` |
 | Reviewer | Reads the draft cold and objects sentence by sentence; a code check also catches wording that goes against the cited figure ("rose" on a negative return). Once the package is built, it re-derives every printed factsheet figure from the frozen snapshot with the renderer's own inputs, compares the snapshot with today's database (10 bp), and checks the deck's date and narrative. | `wr-reports-apac` and code |
 | Visual QA | Looks at the factsheet pages as images for clipped text, overlaps, blank areas and wrong dates. Each finding carries a page and a region. | `wr-reports-apac` |
 | Coordinator | One stage machine per account and month: data, held, words, package, checking, ready. Runs up to two writer and reviewer rounds, sends a dispute to Ying, and checks again when the package is rebuilt. | none |
@@ -159,39 +161,56 @@ Reports tab stay exactly as they are.
   pauses without skipping a check.
 - An account that fails three times in a row stops and the others carry on;
   `--retry` restarts it. One account gets at most 15 minutes per run.
+- Once live, the reviewer checks that the deck prints the team's agreed
+  summary; a deck built with the standard commentary is an objection.
 
 **Where Ying sees it** (`MONTH_TEAM_UI=owner` on the website; owners only):
 
-- the "Agent review (Shadow)" panel on each account's Reports tab, above the
-  release checklist: verdicts, objections with a page map, the team's
-  commentary with its figure chips, sources and every step;
+- the "Agent review" panel on each account's Reports tab, above the release
+  checklist (marked Shadow until live): verdicts, objections with a page map,
+  the team's commentary with its figure chips, sources and every step. Once
+  live, Release asks for confirmation when it would release files the team
+  still has an open objection to; it never blocks;
 - the Month-end page (`/month-end`): each account's stage for a month, a
-  "Needs you" filter, the budget, and the replay results;
+  "Needs you" filter, the budget, the replay results, and batch release;
 - three inbox cards: the month's report, "Hold or proceed" for a blocked
   account, and "Agents disagree" for a dispute. Answers apply on the next run.
 
 **Running it.**
 
 ```
-python -m wealthryse_agent.jobs month_team                        # shadow, last month
+python -m wealthryse_agent.jobs month_team                        # last month
 python -m wealthryse_agent.jobs month_team --period 2026-09-30
 python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
 python -m wealthryse_agent.jobs month_team --retry                # restart stopped accounts
 ```
 
 Replay re-checks months whose factsheet was already released and shows the
-results on the Month-end page only, with no inbox cards. If its objections on
-months that went out are real, the team is worth a month of shadow.
+results on the Month-end page only, with no inbox cards. It does not train the
+model: it shows where the team is wrong, its instructions and checks are
+tuned, and a second replay shows whether that helped.
 
-**Decisions taken by default.** The design's five open questions were not
-answered, so this build follows the recommended options; any of them can
-change in review.
+**Batch release.** For a live month, the Month-end page offers to release
+every report the team passed with nothing open: clean data, agreed
+commentary that the deck carries, printed figures and pages passed, and a
+file not yet released. Ying's browser then runs each account through the
+Reports tab's own release preview and release, so every server-side check
+still applies; an account whose files changed after the team checked them is
+left for Ying. The page lists what was released and what was not.
 
-- Release: when the team takes over, the Release button warns about open
-  objections rather than blocking. In shadow it does neither.
-- One month of shadow before take-over.
-- A historical replay first.
-- More capacity for `wr-reports-apac` (an Azure step, below).
+**Decisions (Ying, 14 October 2026).**
+
+- No shadow month: the team goes live from November's close once the replay
+  of the 105 released reports looks right. Ying still releases every report.
+- Release warns on an open objection rather than blocking.
+- `wr-reports-apac` goes to about 50,000 tokens a minute (an Azure step, below).
+- Batch release of clean reports is ready for November.
+
+**Which commentary goes into a live report** (the rule for the factsheet job
+change). The team's, when the writer and reviewer agreed or Ying kept the
+writer's text. The standard commentary when Ying agreed with the reviewer,
+held the account, or the team has not settled the text when the factsheet job
+builds the package.
 
 **Turning it on** (each step needs Ying's typed approval naming the resources):
 
@@ -206,8 +225,11 @@ change in review.
    access to the `internal-reports` container only.
 5. **Website.** Set `MONTH_TEAM_UI=owner` on `ibkrv2stg-web` through the
    release process.
-6. **Replay, then shadow.** Run a replay of the released months, then let the
-   job shadow the next month end.
+6. **Replay.** Run a replay of the 105 released reports and review the results
+   on the Month-end page.
+7. **Go live.** Set `monthTeamLive=true` on the team job together with the
+   factsheet job's team-commentary setting. The factsheet job change is
+   separate and waits until the assurance image work is finished.
 
 **Not covered yet.**
 
@@ -216,8 +238,8 @@ change in review.
 - The analyst-assurance job's findings are not read.
 - No reconciliation against the broker's statements.
 - `month_end_drafter` stays until the team's commentary has proven itself.
-- Take-over: the team's commentary going into the real package and the
-  Release button reading the team's verdict.
+- The month-end factsheet job does not read the team's commentary yet (see
+  "Go live" above).
 
 ## Cost drivers
 

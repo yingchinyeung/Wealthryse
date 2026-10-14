@@ -17,7 +17,7 @@ from datetime import date
 from typing import Any, Callable, Mapping, Sequence
 
 from ..tool_client import ToolCallFailed
-from . import documents
+from . import documents, figures
 from .agents import (Analyst, BudgetExhausted, DataAgent, Outcome, Reviewer, TeamModel, VisualQA, Writer,
                      commentary_items)
 from .settings import MAX_REVIEW_ROUNDS, MAX_STEP_ATTEMPTS, TeamSettings
@@ -45,10 +45,12 @@ class Context:
     period_end: str
     mode: str
     started: float
+    live: bool = False
 
     @property
-    def shadow(self) -> bool:
-        return self.mode == "shadow"
+    def month(self) -> bool:
+        """The month being reported now, as opposed to a replay of a released one."""
+        return self.mode == "month"
 
 
 class Coordinator:
@@ -77,7 +79,7 @@ class Coordinator:
 
     # Driving ---------------------------------------------------------------
 
-    def run_month(self, accounts: Sequence[str], period_end: str, mode: str = "shadow") -> dict[str, int]:
+    def run_month(self, accounts: Sequence[str], period_end: str, mode: str = "month") -> dict[str, int]:
         """Advance every account once. Stops at once, for every account, when the budget runs out."""
         counts: dict[str, int] = {}
         for account_id in accounts:
@@ -89,7 +91,10 @@ class Coordinator:
         run = self.store.run(account_id, period_end, mode)
         if run["attempts"] >= MAX_STEP_ATTEMPTS:
             return "stopped"
-        ctx = Context(account_id, period_end, mode, self.clock())
+        ctx = Context(account_id, period_end, mode, self.clock(), live=mode == "month" and self.settings.live)
+        if run.get("live", False) != ctx.live:
+            self.store.update_run(run["month_run_id"], live=ctx.live)
+            run["live"] = ctx.live
         handlers = {"data": self._data, "held": self._held, "words": self._words, "package": self._package,
                     "checking": self._checking, "ready": self._ready}
         while True:
@@ -143,11 +148,11 @@ class Coordinator:
     # Stages ----------------------------------------------------------------
 
     def _data(self, run: dict[str, Any], ctx: Context) -> str | None:
-        result = self.data.check(self.call, ctx.account_id, ctx.period_end, today=self.today, replay=not ctx.shadow)
+        result = self.data.check(self.call, ctx.account_id, ctx.period_end, today=self.today, replay=not ctx.month)
         self._record(run, "data", result, outcome=DATA_STEP[result.outcome])
         self.store.update_run(run["month_run_id"], data_verdict=result.outcome)
         run["data_verdict"] = result.outcome
-        if result.outcome == "clean" or (result.outcome == "blocked" and not ctx.shadow):
+        if result.outcome == "clean" or (result.outcome == "blocked" and not ctx.month):
             return "words"
         if result.outcome == "fixable":
             return None
@@ -155,9 +160,12 @@ class Coordinator:
         self.store.put_card(
             kind="month_end_hold", account_id=ctx.account_id, period_key=ctx.period_end,
             title=f"Hold or proceed with {ctx.account_id} for {month_label(ctx.period_end)}?",
-            body=(f"The data agent found a problem it cannot wait out:\n\n{findings}\n\nProceed lets the team "
-                  "carry on with the data as it is. Hold stops the team for this account this month. Today's "
-                  "report process is unchanged either way."),
+            body=(f"The data agent found a problem it cannot wait out:\n\n{findings}\n\n" + (
+                "Proceed lets the team write this account's commentary from the data as it is. Hold leaves this "
+                "account's report on the standard commentary. Either way, the problem above is still there when "
+                "you release." if ctx.live else
+                "Proceed lets the team carry on with the data as it is. Hold stops the team for this account this "
+                "month. Today's report process is unchanged either way.")),
             citations=[{"link": f"/accounts/{ctx.account_id}/reports", "period_end": ctx.period_end}])
         return "held"
 
@@ -183,7 +191,7 @@ class Coordinator:
         figure_set = analysis.evidence["figure_set"]
         self.store.update_run(run["month_run_id"], figures=figure_set)
         run["figures"] = figure_set
-        previous = self.store.previous_commentary(ctx.account_id, ctx.period_end) if ctx.shadow else None
+        previous = self.store.previous_commentary(ctx.account_id, ctx.period_end) if ctx.month else None
         writer, reviewer = Writer(self.model), Reviewer(self.model)
         objections: list[dict[str, Any]] = []
         draft = None
@@ -210,7 +218,7 @@ class Coordinator:
         self.store.update_run(run["month_run_id"], commentary=commentary, commentary_rounds=round,
                               commentary_status=status)
         run.update(commentary=commentary, commentary_status=status)
-        if status == "disputed" and ctx.shadow:
+        if status == "disputed" and ctx.month:
             points = "\n".join(f"- {o['message']}" for o in review.objections)
             text = written.evidence["commentary"]
             self.store.put_card(
@@ -219,7 +227,9 @@ class Coordinator:
                 body=(f"After {round} rounds the reviewer still objects:\n\n{points}\n\nThe writer's text:\n\n"
                       f"{text['executive_summary']}\n\n" + "\n".join(f"- {s}" for s in
                       text["performance_observations"] + text["risk_observations"])
-                      + "\n\nThis is a shadow run, so today's report is unchanged whichever you choose."),
+                      + ("\n\nKeep the writer's text and it goes into the report. Agree with the reviewer and the "
+                         "report uses the standard commentary instead." if ctx.live else
+                         "\n\nThis is a shadow run, so today's report is unchanged whichever you choose.")),
                 citations=[{"link": f"/accounts/{ctx.account_id}/reports", "period_end": ctx.period_end}])
         return "package"
 
@@ -258,6 +268,11 @@ class Coordinator:
 
         pages = documents.pdf_text(fetched["factsheet"].content) if "factsheet" in fetched else None
         slides = documents.pptx_text(fetched["presentation"].content) if "presentation" in fetched else None
+        in_report = _carries_commentary(run, slides) if ctx.month else None
+        if ctx.live and in_report is False:
+            integrity.append({"target": "presentation", "page": None,
+                              "message": "The deck does not carry the team's agreed commentary; it was probably built "
+                                         "with the standard commentary."})
         review = Reviewer(self.model).check_files(
             account_id=ctx.account_id, period_end=ctx.period_end, snapshot=snapshot, factsheet_pages=pages,
             deck_slides=slides, figure_set=run.get("figures") or {}, inception_date=(run.get("figures") or {}).get("inception_date"))
@@ -280,10 +295,11 @@ class Coordinator:
                        round=package_round)
         verdicts = {"package_round": package_round, "reviewer": review.outcome, "visual_qa": visual.outcome,
                     "reviewer_summary": review.summary, "visual_qa_summary": visual.summary,
-                    "checked_generation_ids": sorted(int(f["generation_run_id"]) for f in files.values())}
+                    "checked_generation_ids": sorted(int(f["generation_run_id"]) for f in files.values()),
+                    "commentary_in_report": in_report}
         self.store.update_run(run["month_run_id"], verdicts=verdicts)
         run["verdicts"] = verdicts
-        if ctx.shadow:
+        if ctx.month:
             self._report_card(run, ctx, reopen=package_round > 1)
         return "ready"
 
@@ -316,14 +332,14 @@ class Coordinator:
         files = [f for f in package["files"] if f.get("output_reference")]
         if not any(f["report_type"] == "factsheet" for f in files):
             return None
-        if not ctx.shadow and any(f["status"] not in RELEASED for f in files):
+        if not ctx.month and any(f["status"] not in RELEASED for f in files):
             return None
         return {"snapshot_id": package["snapshot_id"], "snapshot_sha256": package["snapshot_sha256"],
                 "quality_status": package["quality_status"], "files": files}
 
     def _settle_decisions(self, run: dict[str, Any], ctx: Context) -> None:
         """Apply Ying's answer on a disputed commentary, whatever stage the run has reached."""
-        if run.get("commentary_status") != "disputed" or not ctx.shadow:
+        if run.get("commentary_status") != "disputed" or not ctx.month:
             return
         decision = self.store.card_status("month_end_dispute", ctx.account_id, ctx.period_end)
         if decision not in ("approved", "dismissed"):
@@ -344,8 +360,10 @@ class Coordinator:
                       "disputed": "the writer and reviewer disagree (see the separate card)",
                       "writer_upheld": "you kept the writer's text", "reviewer_upheld": "you agreed with the reviewer",
                       }.get(str(run.get("commentary_status")), "not drafted")
+        carried = {True: "; the report carries it", False: "; the report does not carry it"}.get(
+            verdicts.get("commentary_in_report"), "") if ctx.live else ""
         lines = [f"- Data: {run.get('data_verdict') or 'not checked'}",
-                 f"- Commentary: {commentary}",
+                 f"- Commentary: {commentary}{carried}",
                  f"- Printed figures and deck: {verdicts['reviewer_summary']}",
                  f"- Pages: {verdicts['visual_qa_summary']}"]
         if open_items:
@@ -354,13 +372,24 @@ class Coordinator:
                       for o in open_items[:8]]
             if len(open_items) > 8:
                 lines.append(f"- and {len(open_items) - 8} more on the Reports tab.")
-        lines.append("\nThis is a shadow run: today's files and release process are unchanged. Review the evidence "
+        lines.append("\nReview the evidence on the account's Reports tab and release there as usual. Release warns "
+                     "while an objection is open." if ctx.live else
+                     "\nThis is a shadow run: today's files and release process are unchanged. Review the evidence "
                      "on the account's Reports tab and release there as usual.")
         verdict = f"{len(open_items)} objection(s) to review" if open_items else "checks passed"
         self.store.put_card(kind="month_end_report", account_id=ctx.account_id, period_key=ctx.period_end,
                             title=f"{ctx.account_id}, {month_label(ctx.period_end)}: {verdict}", body="\n".join(lines),
                             citations=[{"link": f"/accounts/{ctx.account_id}/reports", "period_end": ctx.period_end}],
                             reopen=reopen)
+
+
+def _carries_commentary(run: Mapping[str, Any], slides: Sequence[str] | None) -> bool | None:
+    """Whether the deck prints the team's settled executive summary; None when there is nothing to compare."""
+    text = ((run.get("commentary") or {}).get("text") or {}).get("executive_summary")
+    if slides is None or not text or run.get("commentary_status") not in ("agreed", "writer_upheld"):
+        return None
+    printed = " ".join(c["text"] for c in figures.deck_commentary(slides))
+    return " ".join(text.split()) in " ".join(printed.split())
 
 
 def _identity(package: Mapping[str, Any] | None) -> list[tuple[str, int, str]]:

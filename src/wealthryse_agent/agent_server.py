@@ -34,7 +34,7 @@ from .tool_client import ToolCallFailed, ToolClient
 LOGGER = logging.getLogger("wealthryse_agent.runtime")
 USER_ID = r"^[0-9a-fA-F-]{36}$"
 PERIOD = r"^\d{4}-\d{2}-\d{2}$"
-MONTH_MODE = r"^(shadow|replay)$"
+MONTH_MODE = r"^(month|replay)$"
 # Deep reasoning can think for minutes without an event; a comment line keeps the website's read open.
 KEEPALIVE_SECONDS = 15.0
 
@@ -278,7 +278,7 @@ def create_app(services: Services) -> FastAPI:
 
     @app.get("/v1/month-end/runs")
     def month_runs(user_object_id: str, period_end: str | None = Query(default=None, pattern=PERIOD),
-                   mode: str = Query(default="shadow", pattern=MONTH_MODE),
+                   mode: str = Query(default="month", pattern=MONTH_MODE),
                    _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
         accounts = accounts_for(user_object_id.lower(), str(uuid.uuid4()))
         store = services.month_store()
@@ -286,7 +286,7 @@ def create_app(services: Services) -> FastAPI:
 
     @app.get("/v1/month-end/runs/{account_id}/{period_end}")
     def month_run(account_id: str, period_end: str, user_object_id: str,
-                  mode: str = Query(default="shadow", pattern=MONTH_MODE),
+                  mode: str = Query(default="month", pattern=MONTH_MODE),
                   _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
         if not re.match(PERIOD, period_end):
             raise HTTPException(status_code=400, detail="period_end must be YYYY-MM-DD.")

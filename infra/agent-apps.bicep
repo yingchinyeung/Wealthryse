@@ -53,6 +53,8 @@ param deployMonthTeam bool = false
 param reportModelDeployment string = 'wr-reports-apac'
 param reportStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
 param reportContainerName string = 'internal-reports'
+@description('On only together with the month-end factsheet job\'s team-commentary setting: the team\'s agreed commentary then goes into the reports.')
+param monthTeamLive bool = false
 @description('Tokens per calendar month for the month-end team, separate from the daily chat budget.')
 param monthTeamTokenBudget int = 20000000
 
@@ -326,6 +328,7 @@ resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
             { name: 'AGENT_TOOL_SERVER_URL', value: 'https://${toolsAppName}.internal.${managedEnvironment.properties.defaultDomain}' }
             { name: 'AGENT_TOOL_SERVER_AUDIENCE', value: toolsAudience }
             { name: 'AGENT_MONTH_TEAM_TOKEN_BUDGET', value: string(monthTeamTokenBudget) }
+            { name: 'AGENT_MONTH_TEAM_LIVE', value: monthTeamLive ? 'true' : 'false' }
             { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${reportStorageAccountName}.blob.${environment().suffixes.storage}' }
             { name: 'INTERNAL_REPORT_CONTAINER', value: reportContainerName }
             { name: 'AZURE_CLIENT_ID', value: jobsIdentity.properties.clientId }

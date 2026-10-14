@@ -56,15 +56,17 @@ CREATE OR REPLACE VIEW agent.month_end_snapshots AS SELECT * FROM agent.scoped_m
 
 -- Team tables (agent writer) -------------------------------------------------
 
--- One row per account, month and mode. ``mode`` is shadow (the live month,
--- beside today's process) or replay (an already released month, shown on the
--- Month-end page only). ``stage`` is where the coordinator is:
+-- One row per account, month and mode. ``mode`` is month (the month being
+-- reported now) or replay (an already released month, shown on the Month-end
+-- page only). ``live`` says whether the factsheet job puts the team's agreed
+-- commentary into this month's reports; until it does, the team runs in shadow
+-- beside today's process. ``stage`` is where the coordinator is:
 --   data      -> the data agent is checking, or waiting for the next sync
 --   held      -> blocked; waiting for Ying to choose hold or proceed
 --   words     -> analyst figures and writer commentary, with reviewer rounds
 --   package   -> waiting for the month-end factsheet job's package
 --   checking  -> reviewer and visual QA are checking the package files
---   ready     -> checked; one report-ready inbox item written (shadow only)
+--   ready     -> checked; one report-ready inbox item written (month runs only)
 -- A failed step keeps the stage and counts an attempt, so the next wake retries
 -- it; after three failures in a row the coordinator stops and the Month-end
 -- page shows the run as stopped until it is retried.
@@ -75,7 +77,8 @@ CREATE TABLE IF NOT EXISTS agent.month_runs (
     tenant_id uuid NOT NULL,
     subject_id text NOT NULL,
     period_end date NOT NULL,
-    mode text NOT NULL DEFAULT 'shadow' CHECK (mode IN ('shadow', 'replay')),
+    mode text NOT NULL DEFAULT 'month' CHECK (mode IN ('month', 'replay')),
+    live boolean NOT NULL DEFAULT false,
     stage text NOT NULL DEFAULT 'data'
         CHECK (stage IN ('data', 'held', 'words', 'package', 'checking', 'ready')),
     data_verdict text CHECK (data_verdict IN ('clean', 'fixable', 'blocked')),

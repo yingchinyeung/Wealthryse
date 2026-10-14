@@ -17,6 +17,9 @@ class TeamSettings:
     monthly_token_budget: int
     report_time_limit_seconds: int
     page_image_dpi: int = 110
+    # On only together with the factsheet job's team-commentary setting: the
+    # team's agreed commentary then goes into the month's reports.
+    live: bool = False
 
     @classmethod
     def from_env(cls) -> "TeamSettings":
@@ -26,6 +29,7 @@ class TeamSettings:
             monthly_token_budget=_int("AGENT_MONTH_TEAM_TOKEN_BUDGET", 20_000_000, 100_000, 500_000_000),
             report_time_limit_seconds=_int("AGENT_MONTH_TEAM_REPORT_SECONDS", 900, 60, 3600),
             page_image_dpi=_int("AGENT_MONTH_TEAM_PAGE_DPI", 110, 50, 200),
+            live=_env("AGENT_MONTH_TEAM_LIVE", "false").lower() in ("1", "true", "yes"),
         )
 
     def validate(self) -> None:

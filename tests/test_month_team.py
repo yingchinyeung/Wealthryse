@@ -8,6 +8,7 @@ the team (tables, grants, tools) is covered in test_wealthryse_agent_db.py.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import io
 import json
@@ -226,7 +227,8 @@ class FakeStore:
         key = (account_id, period_end, mode)
         if key not in self.runs_by_key:
             self.runs_by_key[key] = {"month_run_id": len(self.runs_by_key) + 1, "subject_id": account_id,
-                                     "period_end": period_end, "mode": mode, "stage": "data", "data_verdict": None,
+                                     "period_end": period_end, "mode": mode, "live": False, "stage": "data",
+                                     "data_verdict": None,
                                      "figures": {}, "commentary": None, "commentary_rounds": 0,
                                      "commentary_status": None, "package": None, "verdicts": {}, "usage": {},
                                      "attempts": 0, "last_error": None}
@@ -274,7 +276,7 @@ class FakeStore:
         if reopen:
             card["status"] = "new"
 
-    def stage(self, mode="shadow"):
+    def stage(self, mode="month"):
         return self.runs_by_key[(ACCOUNT, PERIOD, mode)]["stage"]
 
 
@@ -284,10 +286,11 @@ def fake_pages(content: bytes, dpi: int) -> list[bytes]:
 
 
 def team(tools: FakeTools, model: FakeModel, store: FakeStore | None = None, *, today=date(2026, 2, 2),
-         budget: int = 1_000_000) -> tuple[Coordinator, FakeStore]:
+         budget: int = 1_000_000, live: bool = False) -> tuple[Coordinator, FakeStore]:
     store = store or FakeStore()
+    settings = dataclasses.replace(SETTINGS, live=live)
     coordinator = Coordinator(store, tools, lambda: TeamModel(APAC, tokens_left=budget, client=model),
-                              SETTINGS, today=today, download=tools.download, render_pages=fake_pages)
+                              settings, today=today, download=tools.download, render_pages=fake_pages)
     return coordinator, store
 
 
@@ -442,6 +445,15 @@ class WriterReviewerTests(unittest.TestCase):
         self.assertEqual(failed.outcome, "failed")
         self.assertIn("F99", failed.summary)
 
+    def test_the_summary_fits_the_decks_line(self):
+        long = copy.deepcopy(GOOD_DRAFT)
+        long["executive_summary"] = "The portfolio rose over the month and finished well ahead of the benchmark. " * 3
+        model = FakeModel(drafts=[long, GOOD_DRAFT])
+        result = Writer(TeamModel(APAC, tokens_left=10**6, client=model)).draft(self.figures, account_id=ACCOUNT)
+        self.assertEqual(result.outcome, "pass")
+        problem = json.loads(model.requests[1]["input"][0]["content"][0]["text"])["format_problem"]
+        self.assertIn("the deck prints at most 221", problem)
+
     def test_reviewer_catches_a_planted_direction_error_even_when_the_model_does_not(self):
         reviewer = Reviewer(TeamModel(APAC, tokens_left=10**6, client=FakeModel(reviews=[[]])))
         result = reviewer.review_commentary(BAD_DIRECTION, self.figures, round=1)
@@ -496,21 +508,21 @@ class WriterReviewerTests(unittest.TestCase):
 
 
 class CoordinatorTests(unittest.TestCase):
-    def test_a_shadow_month_end_to_end(self):
+    def test_a_month_end_to_end_in_shadow(self):
         tools = FakeTools(package=False)
         model = FakeModel(drafts=[BAD_DIRECTION, GOOD_DRAFT], reviews=[[]])
         coordinator, store = team(tools, model)
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "package")
-        run = store.runs_by_key[(ACCOUNT, PERIOD, "shadow")]
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "package")
+        run = store.runs_by_key[(ACCOUNT, PERIOD, "month")]
         self.assertEqual((run["data_verdict"], run["commentary_status"], run["commentary_rounds"]), ("clean", "agreed", 2))
         self.assertEqual([o["status"] for o in store.objection_rows], ["resolved"])
         self.assertEqual(store.cards, {})
         steps_before = len(store.steps)
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "package")  # waiting writes nothing
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "package")  # waiting writes nothing
         self.assertEqual(len(store.steps), steps_before)
 
         tools.package = True
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "ready")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
         self.assertEqual(tools.downloaded, (STORAGE, "internal-reports"))
         card = store.cards[("month_end_report", ACCOUNT, PERIOD)]
         self.assertIn("checks passed", card["title"])
@@ -531,7 +543,7 @@ class CoordinatorTests(unittest.TestCase):
         model = FakeModel(visual=[{"page": 1, "severity": "medium", "kind": "clipped_text",
                                    "description": "A company name is cut off.", "region": {"x": 0.04, "y": 0.27, "w": 0.3, "h": 0.03}}])
         coordinator, store = team(FakeTools(factsheet=render(planted)), model)
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "ready")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
         open_items = store.objections(1, "open")
         self.assertEqual({o["raised_by"] for o in open_items}, {"reviewer", "visual_qa"})
         clipped = next(o for o in open_items if o["raised_by"] == "visual_qa")
@@ -545,7 +557,7 @@ class CoordinatorTests(unittest.TestCase):
         original = tools.download
         tools.download = lambda url, container, name: original(url, container, name) + (b"x" if "factsheet" in name else b"")
         coordinator, store = team(tools, FakeModel())
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "ready")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
         self.assertIn("does not match the hash", store.objections(1, "open")[0]["message"])
         self.assertEqual(store.objections(1, "open")[0]["target"], "factsheet")
 
@@ -553,51 +565,51 @@ class CoordinatorTests(unittest.TestCase):
         model = FakeModel(drafts=[GOOD_DRAFT], reviews=[[{"field": "executive_summary", "index": 0,
                                                           "message": "The benchmark is named wrongly."}]])
         coordinator, store = team(FakeTools(package=False), model)
-        coordinator.advance(ACCOUNT, PERIOD, "shadow")
-        run = store.runs_by_key[(ACCOUNT, PERIOD, "shadow")]
+        coordinator.advance(ACCOUNT, PERIOD, "month")
+        run = store.runs_by_key[(ACCOUNT, PERIOD, "month")]
         self.assertEqual((run["commentary_status"], run["commentary_rounds"]), ("disputed", 2))
         card = store.cards[("month_end_dispute", ACCOUNT, PERIOD)]
         self.assertIn("named wrongly", card["body"])
         self.assertEqual([o["status"] for o in store.objection_rows], ["resolved", "open"])
         card["status"] = "approved"
-        coordinator.advance(ACCOUNT, PERIOD, "shadow")
+        coordinator.advance(ACCOUNT, PERIOD, "month")
         self.assertEqual(run["commentary_status"], "writer_upheld")
         self.assertEqual(store.objection_rows[-1]["status"], "overruled")
 
     def test_a_blocked_account_waits_for_ying(self):
         tools = FakeTools(jump_on="2026-01-15")
         coordinator, store = team(tools, FakeModel())
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "held")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "held")
         card = store.cards[("month_end_hold", ACCOUNT, PERIOD)]
         self.assertIn("Hold or proceed", card["title"])
         card["status"] = "dismissed"
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "held")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "held")
         card["status"] = "approved"
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "ready")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
         self.assertIn("Ying chose to proceed", " ".join(s["summary"] for s in store.steps))
 
     def test_a_late_price_waits_for_the_next_sync(self):
         tools = FakeTools(valuation="2026-01-29")
         coordinator, store = team(tools, FakeModel())
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "data")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "data")
         self.assertEqual(store.steps[-1]["outcome"], "waiting")
         tools.valuation = "2026-01-30"
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "ready")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
 
     def test_a_rebuild_is_checked_again_but_a_release_is_not(self):
         tools = FakeTools()
         coordinator, store = team(tools, FakeModel())
-        coordinator.advance(ACCOUNT, PERIOD, "shadow")
+        coordinator.advance(ACCOUNT, PERIOD, "month")
         store.cards[("month_end_report", ACCOUNT, PERIOD)]["status"] = "read"
         checks = len([s for s in store.steps if s["agent"] == "visual_qa"])
         tools.status = "released_internal"
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "ready")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
         self.assertEqual(len([s for s in store.steps if s["agent"] == "visual_qa"]), checks)
-        self.assertEqual(store.runs_by_key[(ACCOUNT, PERIOD, "shadow")]["package"]["files"][0]["status"], "released_internal")
+        self.assertEqual(store.runs_by_key[(ACCOUNT, PERIOD, "month")]["package"]["files"][0]["status"], "released_internal")
         tools.generation = 21
-        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "shadow"), "ready")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
         self.assertEqual(len([s for s in store.steps if s["agent"] == "visual_qa"]), checks * 2)
-        self.assertEqual(store.runs_by_key[(ACCOUNT, PERIOD, "shadow")]["verdicts"]["package_round"], 2)
+        self.assertEqual(store.runs_by_key[(ACCOUNT, PERIOD, "month")]["verdicts"]["package_round"], 2)
         self.assertEqual(store.cards[("month_end_report", ACCOUNT, PERIOD)]["status"], "new")
 
     def test_repeated_failures_stop_the_account_not_the_month(self):
@@ -605,18 +617,48 @@ class CoordinatorTests(unittest.TestCase):
         tools.fail["get_performance"] = ToolCallFailed("performance_unavailable", "x")
         tools.fail["compare_to_benchmark"] = ToolCallFailed("benchmark_unavailable", "x")
         coordinator, store = team(tools, FakeModel())
-        store.runs_by_key[(ACCOUNT, PERIOD, "shadow")] = {**store.run(ACCOUNT, PERIOD, "shadow"), "stage": "words"}
-        results = [coordinator.advance(ACCOUNT, PERIOD, "shadow") for _ in range(4)]
+        store.runs_by_key[(ACCOUNT, PERIOD, "month")] = {**store.run(ACCOUNT, PERIOD, "month"), "stage": "words"}
+        results = [coordinator.advance(ACCOUNT, PERIOD, "month") for _ in range(4)]
         self.assertEqual(results, ["words", "words", "stopped", "stopped"])
-        self.assertEqual(store.runs_by_key[(ACCOUNT, PERIOD, "shadow")]["last_error"], "performance_unavailable")
+        self.assertEqual(store.runs_by_key[(ACCOUNT, PERIOD, "month")]["last_error"], "performance_unavailable")
         self.assertEqual(coordinator.run_month([ACCOUNT, "U2"], PERIOD)["stopped"], 1)
 
     def test_running_out_of_budget_pauses_without_skipping(self):
         coordinator, store = team(FakeTools(), FakeModel(), budget=100)
         with self.assertRaises(BudgetExhausted):
-            coordinator.advance(ACCOUNT, PERIOD, "shadow")
+            coordinator.advance(ACCOUNT, PERIOD, "month")
         self.assertIn("budget", store.steps[-1]["summary"])
         self.assertEqual(store.stage(), "words")
+
+    def test_live_reports_must_carry_the_teams_commentary(self):
+        carried = deck(["Monthly portfolio review | 31 January 2026"],
+                       ["Portfolio analyst: " + GOOD_DRAFT["executive_summary"]])
+        coordinator, store = team(FakeTools(presentation=carried), FakeModel(), live=True)
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
+        run = store.runs_by_key[(ACCOUNT, PERIOD, "month")]
+        self.assertTrue(run["live"])
+        self.assertTrue(run["verdicts"]["commentary_in_report"])
+        self.assertEqual(store.objections(1, "open"), [])
+        card = store.cards[("month_end_report", ACCOUNT, PERIOD)]
+        self.assertIn("the report carries it", card["body"])
+        self.assertIn("Release warns", card["body"])
+        self.assertNotIn("shadow", card["body"])
+
+        coordinator, store = team(FakeTools(), FakeModel(), live=True)  # built with the standard commentary
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
+        self.assertFalse(store.runs_by_key[(ACCOUNT, PERIOD, "month")]["verdicts"]["commentary_in_report"])
+        self.assertIn("does not carry the team's agreed commentary", store.objections(1, "open")[0]["message"])
+
+    def test_live_cards_say_what_each_choice_does_to_the_report(self):
+        coordinator, store = team(FakeTools(jump_on="2026-01-15"), FakeModel(), live=True)
+        coordinator.advance(ACCOUNT, PERIOD, "month")
+        self.assertIn("standard commentary", store.cards[("month_end_hold", ACCOUNT, PERIOD)]["body"])
+        model = FakeModel(reviews=[[{"field": "executive_summary", "index": 0, "message": "Wrong benchmark."}]])
+        coordinator, store = team(FakeTools(package=False), model, live=True)
+        coordinator.advance(ACCOUNT, PERIOD, "month")
+        body = store.cards[("month_end_dispute", ACCOUNT, PERIOD)]["body"]
+        self.assertIn("goes into the report", body)
+        self.assertNotIn("shadow", body)
 
     def test_replay_checks_released_months_and_writes_no_cards(self):
         tools = FakeTools(status="awaiting_approval", jump_on="2026-01-15")
@@ -684,7 +726,7 @@ class AgentServerMonthEndTests(unittest.TestCase):
         user = "11111111-1111-1111-1111-111111111111"
         response = client.get("/v1/month-end/runs", params={"user_object_id": user, "period_end": PERIOD})
         self.assertEqual(response.json()["runs"], [{"subject_id": "U1"}])
-        self.assertEqual(stub.asked, (["U1"], PERIOD, "shadow"))
+        self.assertEqual(stub.asked, (["U1"], PERIOD, "month"))
         self.assertEqual(client.get(f"/v1/month-end/runs/U2/{PERIOD}", params={"user_object_id": user}).status_code, 403)
         self.assertEqual(client.get(f"/v1/month-end/runs/U1/{PERIOD}", params={"user_object_id": user}).status_code, 200)
         self.assertEqual(client.get("/v1/month-end/runs/U1/2026-02-28", params={"user_object_id": user}).status_code, 404)

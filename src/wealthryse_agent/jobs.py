@@ -4,7 +4,7 @@ records); nothing is sent, published or released.
     python -m wealthryse_agent.jobs holdings_explainer   # daily, after the account sync
     python -m wealthryse_agent.jobs month_end_drafter    # 1st–7th of each month
     python -m wealthryse_agent.jobs data_quality         # daily; also applies chat retention
-    python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team, in shadow
+    python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
                                                          # re-check months already released
 
@@ -160,7 +160,7 @@ def month_team(store: Store, tools: ToolClient, accounts: list[str], usage: dict
     tokens_left = settings.monthly_token_budget - team_store.tokens_used_this_month()
     if tokens_left <= 0:
         raise BudgetExhausted
-    mode = "replay" if args.replay else "shadow"
+    mode = "replay" if args.replay else "month"
     holder: dict[str, TeamModel] = {}
 
     def model() -> TeamModel:
@@ -173,8 +173,8 @@ def month_team(store: Store, tools: ToolClient, accounts: list[str], usage: dict
         first, last = (args.from_period, args.to_period) if args.replay else (period, period)
         LOGGER.info("retrying %s stopped runs", team_store.retry_stopped(mode, first, last))
     try:
-        if mode == "shadow":
-            counts = coordinator.run_month(accounts, period, "shadow")
+        if mode == "month":
+            counts = coordinator.run_month(accounts, period, "month")
         else:
             counts = {}
             for account_id, period in replay_targets(tools, accounts, args.from_period, args.to_period):

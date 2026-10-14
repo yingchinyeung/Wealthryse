@@ -295,11 +295,11 @@ class AgentDatabaseTests(unittest.TestCase):
 
         connection = connect(self.writer_settings, search_path="agent")
         store = MonthStore(connection, TENANT)
-        run = store.run("UTEST1", "2026-03-31", "shadow")
-        self.assertEqual((run["stage"], run["attempts"]), ("data", 0))
-        self.assertEqual(store.run("UTEST1", "2026-03-31", "shadow")["month_run_id"], run["month_run_id"])
+        run = store.run("UTEST1", "2026-03-31", "month")
+        self.assertEqual((run["stage"], run["attempts"], run["live"]), ("data", 0, False))
+        self.assertEqual(store.run("UTEST1", "2026-03-31", "month")["month_run_id"], run["month_run_id"])
         self.assertNotEqual(store.run("UTEST1", "2026-03-31", "replay")["month_run_id"], run["month_run_id"])
-        store.update_run(run["month_run_id"], stage="ready", figures={"figures": [{"id": "F1"}]},
+        store.update_run(run["month_run_id"], stage="ready", live=True, figures={"figures": [{"id": "F1"}]},
                          commentary_status="agreed", verdicts={"reviewer": "objection"}, attempts=3, last_error="x")
         step = store.add_step(run["month_run_id"], "reviewer", "objection", "One objection.", evidence={"n": 1})
         store.add_objection(run["month_run_id"], step, raised_by="visual_qa", target="factsheet", message="Clipped",
@@ -309,11 +309,11 @@ class AgentDatabaseTests(unittest.TestCase):
         listed = store.runs(["UTEST1", "UTEST2"], "2026-03-31")
         self.assertEqual([(r["subject_id"], r["open_objections"]) for r in listed], [("UTEST1", 1)])
         detail = store.run_detail("UTEST1", "2026-03-31")
-        self.assertEqual(detail["figures"]["figures"][0]["id"], "F1")
+        self.assertEqual((detail["figures"]["figures"][0]["id"], detail["live"]), ("F1", True))
         self.assertEqual(detail["objections"][0]["region"]["w"], 0.3)
         self.assertEqual([s["agent_name"] for s in detail["steps"]], ["reviewer"])
         self.assertIsNone(store.run_detail("UTEST2", "2026-03-31"))
-        self.assertEqual(store.retry_stopped("shadow", "2026-03-31", "2026-03-31"), 1)
+        self.assertEqual(store.retry_stopped("month", "2026-03-31", "2026-03-31"), 1)
         # Cards: one per kind, account and month; a refresh can reopen it.
         store.put_card(kind="month_end_report", account_id="UTEST1", period_key="2026-03-31", title="t", body="b")
         self.assertEqual(store.card_status("month_end_report", "UTEST1", "2026-03-31"), "new")

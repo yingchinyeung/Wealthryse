@@ -10,8 +10,10 @@ month-end package:
 - reviewer (``agents.Reviewer``): checks the commentary and every printed figure, cold;
 - visual QA (``agents.VisualQA``): looks at each rendered page with the vision model.
 
-The team runs in shadow: it reads through the tool server and the review
-files, and writes only its own run tables and inbox cards. It has no route
-to a release, a rebuild or any platform table. Every model call uses the
-APAC Data Zone deployment.
+The team reads through the tool server and the review files, and writes
+only its own run tables and inbox cards. It has no route to a release, a
+rebuild or any platform table. Every model call uses the APAC Data Zone
+deployment. Until AGENT_MONTH_TEAM_LIVE is on (together with the factsheet
+job's team-commentary setting) it runs in shadow: its commentary is shown,
+never used.
 """

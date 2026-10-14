@@ -98,7 +98,7 @@ class MonthTeamWebTests(unittest.TestCase):
             client.get("/api/agents/month-end/runs", params={"period_end": "2026-09-30"})
             client.get("/api/agents/month-end/runs/U1/2026-09-30")
         self.assertEqual(request.call_args_list[0].kwargs["params"],
-                         {"user_object_id": OWNER["object_id"], "mode": "shadow", "period_end": "2026-09-30"})
+                         {"user_object_id": OWNER["object_id"], "mode": "month", "period_end": "2026-09-30"})
         self.assertEqual(request.call_args_list[1].args[1], "/v1/month-end/runs/U1/2026-09-30")
 
     def test_owner_cannot_read_another_accounts_run(self):

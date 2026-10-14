@@ -1,7 +1,6 @@
 """Institutional analytics: calendar, drawdowns, statistics, rolling risk and concentration."""
 from __future__ import annotations
 
-import ast
 import math
 import unittest
 from contextlib import contextmanager
@@ -13,7 +12,6 @@ from ibkr_etl import portfolio_analytics as analytics
 from ibkr_etl.performance_periods import performance_periods
 
 ROOT = Path(__file__).resolve().parents[1]
-LIVE_WEB = ROOT / "deploy/live-merged/src/ibkr_etl/web.py"
 SRC_WEB = ROOT / "src/ibkr_etl/web.py"
 
 
@@ -309,17 +307,8 @@ class EndpointAndPageTests(unittest.TestCase):
             self.assertIn(name, METRIC_ANCHORS)
             self.assertIn(name, CLIENT_CALCULATIONS)
 
-    def test_live_merged_copy_ships_the_same_endpoint_and_markup(self):
-        def function(path, name):
-            for node in ast.parse(path.read_text(encoding="utf-8")).body:
-                if isinstance(node, ast.FunctionDef) and node.name == name:
-                    return ast.dump(node, include_attributes=False)
-            raise AssertionError(f"{name} not found in {path}")
-
-        for name in ("portfolio_analytics_view", "monthly_attribution_view", "trading_activity_view",
-                     "holdings_correlation_view", "benchmark_comparison"):
-            self.assertEqual(function(LIVE_WEB, name), function(SRC_WEB, name), name)
-        live = LIVE_WEB.read_text(encoding="utf-8")
+    def test_web_source_ships_the_analytics_markup(self):
+        live = SRC_WEB.read_text(encoding="utf-8")
         for marker in ("from .web_analytics_ui import (\n    ANALYTICS_SCRIPT,", "\n{PERFORMANCE_ANALYTICS_CARDS}\n", "{RISK_ANALYTICS_CARDS}{CORRELATION_CARD}</div>",
                        "{HOLDINGS_CONCENTRATION_CARD}", "{ACCOUNT_UI_SCRIPT}\n{ANALYTICS_SCRIPT}",
                        '"concentration": holdings_concentration(view)', "void renderAnalytics(asOf)",

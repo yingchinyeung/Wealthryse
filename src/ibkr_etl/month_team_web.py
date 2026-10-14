@@ -136,7 +136,7 @@ function render(run){
  let h='';
  if(run.attempts>=3)h+=`<div class="mt-warn">Stopped at “${esc(STAGES[run.stage]||run.stage)}” after repeated failures (${esc(run.last_error||'unknown')}). It resumes when retried.</div>`;
  h+=`<dl class="mt-grid"><dt>Stage</dt><dd>${esc(stage(run))}</dd><dt>Data</dt><dd>${esc(VERDICT[run.data_verdict]||'Not checked')}</dd>`+
-  `<dt>Figures</dt><dd>${figs.length?figs.length+' cited figures':'Not built'}</dd><dt>Commentary</dt><dd>${esc(COMMENTARY[run.commentary_status]||'Not drafted')}${run.commentary_rounds?' · '+run.commentary_rounds+' round(s)':''}</dd>`+
+  `<dt>Figures</dt><dd>${figs.length?figs.length+' cited figures':'Not built'}</dd><dt>Commentary</dt><dd>${esc(COMMENTARY[run.commentary_status]||(v.deck_has_commentary===false?'None: this deck has no commentary line':'Not drafted'))}${run.commentary_rounds?' · '+run.commentary_rounds+' round(s)':''}</dd>`+
   `<dt>Printed figures</dt><dd>${esc(v.reviewer_summary||'Not checked yet')}</dd><dt>Pages</dt><dd>${esc(v.visual_qa_summary||'Not checked yet')}</dd></dl>`;
  const obj=(run.objections||[]).slice().sort((a,b)=>(a.status==='open'?0:1)-(b.status==='open'?0:1));
  if(obj.length){h+=`<h4>Objections (${obj.filter(o=>o.status==='open').length} open)</h4>`+obj.map(o=>{const r=o.region,link=o.target==='factsheet'||o.target==='presentation'?fileLink(run,o.target):'';
@@ -146,7 +146,7 @@ function render(run){
  if(c&&c.sentences){const chips=s=>(s.figures||[]).map(id=>byId[id]?`<span class="mt-fig" title="${esc(byId[id].label+' · from '+src(byId[id]))}">${esc(id)} ${esc(byId[id].display)}</span>`:'').join('');
   const group=(name,title)=>{const items=c.sentences.filter(s=>s.field===name);return items.length?`<p><strong>${title}</strong></p><ul>${items.map(s=>`<li>${esc(s.text)} ${chips(s)}</li>`).join('')}</ul>`:''};
   const summary=c.sentences.find(s=>s.field==='executive_summary');
-  const used=!run.live?' (not used during shadow)':v.commentary_in_report===true?' (in this report)':v.commentary_in_report===false?' (not in this report)':'';
+  const used=!run.live?' (not used during shadow)':v.commentary_in_report===true?' (in the deck)':v.commentary_in_report===false?' (not in the deck)':'';
   h+=`<details><summary>The team's commentary${used}</summary>${summary?`<p>${esc(summary.text)} ${chips(summary)}</p>`:''}${group('performance_observations','Performance')}${group('risk_observations','Risk')}</details>`}
  if(figs.length)h+=`<details><summary>Figures and sources</summary><table><thead><tr><th>Id</th><th>Figure</th><th>Value</th><th>Source</th></tr></thead><tbody>${figs.map(f=>`<tr><td>${esc(f.id)}</td><td>${esc(f.label)}</td><td>${esc(f.display)}</td><td>${esc(src(f))}</td></tr>`).join('')}</tbody></table>${((run.figures||{}).unavailable||[]).length?`<p class="muted">Unavailable: ${esc(run.figures.unavailable.join(', '))}</p>`:''}</details>`;
  const steps=run.steps||[];
@@ -167,10 +167,11 @@ MONTH_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><met
 """ + _SHARED_JS + r"""
 const needs=r=>r.attempts>=3||r.stage==='held'||r.commentary_status==='disputed'||r.open_objections>0;
 const RELEASED=['released_internal','published'],done=new Set();
-// Clean: live, checked, nothing open, every check passed, the team's commentary in the report, a file not yet released.
+// Clean: live, checked, nothing open, every check passed, the team's commentary in the deck (unless the deck has no
+// commentary line), a file not yet released.
 const clean=r=>{const v=r.verdicts||{},files=(r.package||{}).files||[];return r.mode==='month'&&r.live&&r.stage==='ready'&&r.attempts<3&&!r.open_objections
- &&r.data_verdict==='clean'&&['agreed','writer_upheld'].includes(r.commentary_status)&&v.reviewer==='pass'&&v.visual_qa==='pass'
- &&v.commentary_in_report===true&&files.some(f=>!RELEASED.includes(f.status))&&!done.has(r.subject_id+'|'+r.period_end)};
+ &&r.data_verdict==='clean'&&v.reviewer==='pass'&&v.visual_qa==='pass'
+ &&(v.deck_has_commentary===false||(['agreed','writer_upheld'].includes(r.commentary_status)&&v.commentary_in_report===true))&&files.some(f=>!RELEASED.includes(f.status))&&!done.has(r.subject_id+'|'+r.period_end)};
 const fingerprint=list=>list.map(f=>f.report_type+':'+String(f.sha256||f.output_sha256||'').toLowerCase()).sort().join(',');
 // One account through the Reports tab's own endpoints, released only if its files are the ones the team checked.
 async function releaseOne(r){
@@ -197,7 +198,7 @@ async function load(period){const mode=document.querySelector('#mode').value;con
  const r=await fetch('/api/agents/month-end/runs?'+q,{credentials:'same-origin'});if(!r.ok){document.querySelector('#summary').textContent='The month-end runs could not be loaded.';return}
  const data=await r.json();all=data.runs;const job=(data.team||{}).latest_job;const banner=document.querySelector('#banner');
  banner.innerHTML=(job&&job.status==='failed'?`<div class="mt-banner">${job.error_code==='budget_exhausted'?"Paused: the team's monthly token budget is used up. No check was skipped; it resumes when budget is added.":'The last team run failed ('+esc(job.error_code||'unknown')+'). The next scheduled run will try again.'}</div>`:'')
-  +(all.some(r=>r.mode==='month'&&!r.live)?`<div class="mt-banner">Shadow: the team's commentary is shown on each Reports tab but not used in the reports.</div>`:'');
+  +(all.some(r=>r.mode==='month'&&!r.live)?`<div class="mt-banner">Shadow: the team's commentary is shown on each Reports tab but not used in the decks.</div>`:'');
  if(!period){const periods=[...new Set(all.map(x=>x.period_end))];const sel=document.querySelector('#period');sel.innerHTML=periods.map(p=>`<option>${esc(p)}</option>`).join('');if(periods.length)return load(periods[0])}
  render()}
 function render(){const f=document.querySelector('#filter').value,rows=all.filter(r=>!f||(f==='need'?needs(r):clean(r)));const n=all.filter(needs).length,c=all.filter(clean).length;

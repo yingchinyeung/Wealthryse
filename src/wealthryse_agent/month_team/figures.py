@@ -284,6 +284,22 @@ def check_deck_text(subject_id: str, period_end: str, slides: Sequence[str]) -> 
     return []
 
 
+# Commentary goes in the deck only; the factsheet never carries it (Ying, 14 October 2026). This subject's
+# deck is built by scripts/render_alpha_t_presentation.mjs, which has no commentary line either.
+DECKS_WITHOUT_COMMENTARY = frozenset({"alpha-world-t"})
+
+
+def factsheet_commentary(pages: Sequence[str], sentences: Sequence[str]) -> list[int]:
+    """The factsheet pages that print commentary: the deck's prefix or any of the team's sentences."""
+    wanted = [" ".join(s.split()) for s in sentences if s and s.strip()]
+    found = []
+    for number, text in enumerate(pages, 1):
+        flat = " ".join(text.split())
+        if "Portfolio analyst:" in flat or any(s in flat for s in wanted):
+            found.append(number)
+    return found
+
+
 def deck_commentary(slides: Sequence[str]) -> list[dict[str, Any]]:
     """The model-written lines in the deck, which today's process prefixes with 'Portfolio analyst:'."""
     found = []

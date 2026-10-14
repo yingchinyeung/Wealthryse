@@ -214,7 +214,7 @@ def commentary_items(draft: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def plain_commentary(draft: Mapping[str, Any]) -> dict[str, Any]:
-    """The report's commentary shape (MONTH_END_OUTPUT_SCHEMA), as the factsheet job would print it."""
+    """The commentary shape (MONTH_END_OUTPUT_SCHEMA) the package job passes to the deck renderer, never the factsheet's."""
     return {"executive_summary": draft["executive_summary"],
             "performance_observations": [s["text"] for s in draft["performance_observations"]],
             "risk_observations": [s["text"] for s in draft["risk_observations"]]}

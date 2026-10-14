@@ -53,7 +53,7 @@ param deployMonthTeam bool = false
 param reportModelDeployment string = 'wr-reports-apac'
 param reportStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
 param reportContainerName string = 'internal-reports'
-@description('On only together with the month-end factsheet job\'s team-commentary setting: the team\'s agreed commentary then goes into the reports.')
+@description('On only together with the month-end package job\'s team-commentary setting: the team\'s agreed commentary then goes into the decks, never the factsheets.')
 param monthTeamLive bool = false
 @description('Tokens per calendar month for the month-end team, separate from the daily chat budget.')
 param monthTeamTokenBudget int = 20000000

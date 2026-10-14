@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,7 @@ ACCOUNT = "U0000001"  # synthetic
 PERIOD = "2026-01-31"
 STORAGE = "https://reports.blob.core.windows.net"
 SPECIAL = sorted(ALPHA_WORLD_SUBJECT_IDS)[0]  # a subject with its own report layout
+NO_LINE = sorted(fig.DECKS_WITHOUT_COMMENTARY)[0]  # a subject whose deck has no commentary line
 APAC = ModelSettings(endpoint="https://wr-agents-sea.services.ai.azure.com", deployment="wr-reports-apac",
                      router_deployment="", region="southeastasia", processing_scope="apac-data-zone",
                      managed_identity_client_id="x")
@@ -346,6 +348,13 @@ class PrintedFigureTests(unittest.TestCase):
         self.assertIn("skipped", fig.factsheet_expectations(special))
         self.assertEqual(fig.check_deck_text(SPECIAL, PERIOD, []), [])
 
+    def test_commentary_printed_on_a_factsheet_is_found(self):
+        summary = GOOD_DRAFT["executive_summary"]
+        self.assertEqual(fig.factsheet_commentary(documents.pdf_text(FACTSHEET), [summary]), [])
+        wrapped = ["Top 5 Holdings", "Historical Performance\nThe portfolio rose over the month and finished\nahead of the benchmark."]
+        self.assertEqual(fig.factsheet_commentary(wrapped, [summary]), [2])
+        self.assertEqual(fig.factsheet_commentary(["Portfolio analyst: Steady month.", "Page two"], []), [1])
+
     def test_deck_date_and_narrative_lines(self):
         slides = documents.pptx_text(DECK)
         self.assertEqual(fig.check_deck_text(ACCOUNT, PERIOD, slides), [])
@@ -640,7 +649,7 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(run["verdicts"]["commentary_in_report"])
         self.assertEqual(store.objections(1, "open"), [])
         card = store.cards[("month_end_report", ACCOUNT, PERIOD)]
-        self.assertIn("the report carries it", card["body"])
+        self.assertIn("the deck carries it", card["body"])
         self.assertIn("Release warns", card["body"])
         self.assertNotIn("shadow", card["body"])
 
@@ -648,6 +657,34 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
         self.assertFalse(store.runs_by_key[(ACCOUNT, PERIOD, "month")]["verdicts"]["commentary_in_report"])
         self.assertIn("does not carry the team's agreed commentary", store.objections(1, "open")[0]["message"])
+
+    def test_commentary_on_the_factsheet_is_an_objection(self):
+        real = documents.pdf_text
+
+        def with_commentary(content):
+            pages = real(content)
+            return pages[:-1] + [pages[-1] + "\nPortfolio analyst: " + GOOD_DRAFT["executive_summary"]]
+
+        carried = deck(["Monthly portfolio review | 31 January 2026"],
+                       ["Portfolio analyst: " + GOOD_DRAFT["executive_summary"]])
+        coordinator, store = team(FakeTools(presentation=carried), FakeModel(), live=True)
+        with mock.patch.object(documents, "pdf_text", with_commentary):
+            self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
+        [objection] = store.objections(1, "open")
+        self.assertEqual((objection["target"], objection["page"]), ("factsheet", 2))
+        self.assertIn("belongs in the deck only", objection["message"])
+
+    def test_a_deck_without_a_commentary_line_gets_no_commentary(self):
+        model = FakeModel()
+        plain = deck(["Monthly portfolio review | 31 January 2026"], ["What is working"])
+        coordinator, store = team(FakeTools(presentation=plain), model, live=True)
+        self.assertEqual(coordinator.advance(NO_LINE, PERIOD, "month"), "ready")
+        run = store.runs_by_key[(NO_LINE, PERIOD, "month")]
+        self.assertIsNone(run["commentary_status"])
+        self.assertEqual(model.named("month_end_commentary"), [])
+        self.assertEqual((run["verdicts"]["commentary_in_report"], run["verdicts"]["deck_has_commentary"]), (None, False))
+        self.assertEqual(store.objections(1, "open"), [])
+        self.assertIn("deck has no commentary line", store.cards[("month_end_report", NO_LINE, PERIOD)]["body"])
 
     def test_live_cards_say_what_each_choice_does_to_the_report(self):
         coordinator, store = team(FakeTools(jump_on="2026-01-15"), FakeModel(), live=True)
@@ -657,7 +694,8 @@ class CoordinatorTests(unittest.TestCase):
         coordinator, store = team(FakeTools(package=False), model, live=True)
         coordinator.advance(ACCOUNT, PERIOD, "month")
         body = store.cards[("month_end_dispute", ACCOUNT, PERIOD)]["body"]
-        self.assertIn("goes into the report", body)
+        self.assertIn("goes into the deck", body)
+        self.assertIn("factsheet carries no commentary", body)
         self.assertNotIn("shadow", body)
 
     def test_replay_checks_released_months_and_writes_no_cards(self):

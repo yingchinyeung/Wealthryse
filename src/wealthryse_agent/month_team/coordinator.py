@@ -5,7 +5,7 @@ Each hourly wake picks up every account where it left off:
     data -> (held) -> words -> package -> checking -> ready
 
 A stage either moves on, or waits for something outside the team (the next
-sync, Ying's decision, the factsheet job's package). Waiting writes nothing,
+sync, Ying's decision, the month-end package job's files). Waiting writes nothing,
 so the run record shows what happened, not how often the team looked.
 """
 from __future__ import annotations
@@ -51,6 +51,11 @@ class Context:
     def month(self) -> bool:
         """The month being reported now, as opposed to a replay of a released one."""
         return self.mode == "month"
+
+    @property
+    def deck_line(self) -> bool:
+        """Whether this account's deck has a commentary line. The factsheet never carries commentary."""
+        return self.account_id not in figures.DECKS_WITHOUT_COMMENTARY
 
 
 class Coordinator:
@@ -161,9 +166,9 @@ class Coordinator:
             kind="month_end_hold", account_id=ctx.account_id, period_key=ctx.period_end,
             title=f"Hold or proceed with {ctx.account_id} for {month_label(ctx.period_end)}?",
             body=(f"The data agent found a problem it cannot wait out:\n\n{findings}\n\n" + (
-                "Proceed lets the team write this account's commentary from the data as it is. Hold leaves this "
-                "account's report on the standard commentary. Either way, the problem above is still there when "
-                "you release." if ctx.live else
+                "Proceed lets the team write this account's deck commentary from the data as it is. Hold leaves "
+                "this account's deck on the standard commentary. Either way, the problem above is still there when "
+                "you release." if ctx.live and ctx.deck_line else
                 "Proceed lets the team carry on with the data as it is. Hold stops the team for this account this "
                 "month. Today's report process is unchanged either way.")),
             citations=[{"link": f"/accounts/{ctx.account_id}/reports", "period_end": ctx.period_end}])
@@ -191,6 +196,10 @@ class Coordinator:
         figure_set = analysis.evidence["figure_set"]
         self.store.update_run(run["month_run_id"], figures=figure_set)
         run["figures"] = figure_set
+        if not ctx.deck_line:
+            self._step(run, "writer", "skipped", "No commentary written: this account's deck has no commentary "
+                                                 "line, and the factsheet never carries commentary.")
+            return "package"
         previous = self.store.previous_commentary(ctx.account_id, ctx.period_end) if ctx.month else None
         writer, reviewer = Writer(self.model), Reviewer(self.model)
         objections: list[dict[str, Any]] = []
@@ -227,8 +236,9 @@ class Coordinator:
                 body=(f"After {round} rounds the reviewer still objects:\n\n{points}\n\nThe writer's text:\n\n"
                       f"{text['executive_summary']}\n\n" + "\n".join(f"- {s}" for s in
                       text["performance_observations"] + text["risk_observations"])
-                      + ("\n\nKeep the writer's text and it goes into the report. Agree with the reviewer and the "
-                         "report uses the standard commentary instead." if ctx.live else
+                      + ("\n\nKeep the writer's text and its summary goes into the deck. Agree with the reviewer and "
+                         "the deck uses the standard commentary instead. The factsheet carries no commentary either way."
+                         if ctx.live else
                          "\n\nThis is a shadow run, so today's report is unchanged whichever you choose.")),
                 citations=[{"link": f"/accounts/{ctx.account_id}/reports", "period_end": ctx.period_end}])
         return "package"
@@ -268,11 +278,15 @@ class Coordinator:
 
         pages = documents.pdf_text(fetched["factsheet"].content) if "factsheet" in fetched else None
         slides = documents.pptx_text(fetched["presentation"].content) if "presentation" in fetched else None
-        in_report = _carries_commentary(run, slides) if ctx.month else None
+        in_report = _carries_commentary(run, slides) if ctx.month and ctx.deck_line else None
         if ctx.live and in_report is False:
             integrity.append({"target": "presentation", "page": None,
                               "message": "The deck does not carry the team's agreed commentary; it was probably built "
                                          "with the standard commentary."})
+        sentences = [item["text"] for item in (run.get("commentary") or {}).get("sentences") or []]
+        for page in figures.factsheet_commentary(pages or [], sentences):
+            integrity.append({"target": "factsheet", "page": page,
+                              "message": "The factsheet prints commentary; commentary belongs in the deck only."})
         review = Reviewer(self.model).check_files(
             account_id=ctx.account_id, period_end=ctx.period_end, snapshot=snapshot, factsheet_pages=pages,
             deck_slides=slides, figure_set=run.get("figures") or {}, inception_date=(run.get("figures") or {}).get("inception_date"))
@@ -290,13 +304,13 @@ class Coordinator:
             visual = Outcome("skipped", "There is no factsheet in the package to look at.")
         self._record(run, "visual_qa", visual, round=package_round)
         if "presentation" in fetched:
-            self._step(run, "visual_qa", "skipped", "Slides were not looked at: the factsheet job does not save slide "
+            self._step(run, "visual_qa", "skipped", "Slides were not looked at: the package job does not save slide "
                                                     "images yet. The deck's text was checked by the reviewer.",
                        round=package_round)
         verdicts = {"package_round": package_round, "reviewer": review.outcome, "visual_qa": visual.outcome,
                     "reviewer_summary": review.summary, "visual_qa_summary": visual.summary,
                     "checked_generation_ids": sorted(int(f["generation_run_id"]) for f in files.values()),
-                    "commentary_in_report": in_report}
+                    "commentary_in_report": in_report, "deck_has_commentary": ctx.deck_line}
         self.store.update_run(run["month_run_id"], verdicts=verdicts)
         run["verdicts"] = verdicts
         if ctx.month:
@@ -359,8 +373,9 @@ class Coordinator:
         commentary = {"agreed": f"agreed after {run.get('commentary_rounds') or 1} round(s)",
                       "disputed": "the writer and reviewer disagree (see the separate card)",
                       "writer_upheld": "you kept the writer's text", "reviewer_upheld": "you agreed with the reviewer",
-                      }.get(str(run.get("commentary_status")), "not drafted")
-        carried = {True: "; the report carries it", False: "; the report does not carry it"}.get(
+                      }.get(str(run.get("commentary_status")),
+                            "not drafted" if ctx.deck_line else "none, as this account's deck has no commentary line")
+        carried = {True: "; the deck carries it", False: "; the deck does not carry it"}.get(
             verdicts.get("commentary_in_report"), "") if ctx.live else ""
         lines = [f"- Data: {run.get('data_verdict') or 'not checked'}",
                  f"- Commentary: {commentary}{carried}",
@@ -368,7 +383,7 @@ class Coordinator:
                  f"- Pages: {verdicts['visual_qa_summary']}"]
         if open_items:
             lines.append("\nObjections:")
-            lines += [f"- {o['target'].capitalize()}{f', page {o['page']}' if o.get('page') else ''}: {o['message']}"
+            lines += [f"- {o['target'].capitalize()}{', page ' + str(o['page']) if o.get('page') else ''}: {o['message']}"
                       for o in open_items[:8]]
             if len(open_items) > 8:
                 lines.append(f"- and {len(open_items) - 8} more on the Reports tab.")

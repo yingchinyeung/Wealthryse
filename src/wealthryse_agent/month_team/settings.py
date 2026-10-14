@@ -17,8 +17,9 @@ class TeamSettings:
     monthly_token_budget: int
     report_time_limit_seconds: int
     page_image_dpi: int = 110
-    # On only together with the factsheet job's team-commentary setting: the
-    # team's agreed commentary then goes into the month's reports.
+    # On only together with the package job's team-commentary setting: the
+    # team's agreed commentary then goes into the month's decks (never the
+    # factsheets).
     live: bool = False
 
     @classmethod

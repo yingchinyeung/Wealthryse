@@ -133,17 +133,19 @@ internal-reports, writes agent.month_* tables and agent.inbox only
 
 ## Month-end team
 
-Six agents check each month's reports and write their commentary. Until the
-go-live switch is on they run in shadow: their commentary is shown, never
-used. Once live, the factsheet job puts the team's agreed commentary into the
-reports and Release asks for confirmation while the team has an open
-objection. The team itself never changes a file or releases anything.
+Six agents check each month's reports and write the deck's commentary. Until
+the go-live switch is on they run in shadow: their commentary is shown, never
+used. Once live, the month-end package job (`ibkrv2stg-month-end-factsheet`,
+which builds both the factsheet and the deck) puts the team's agreed
+commentary into the deck, and Release asks for confirmation while the team has
+an open objection. Commentary goes in the deck only: the factsheet never
+carries it. The team itself never changes a file or releases anything.
 
 | Agent | What it does | Model |
 |---|---|---|
 | Data | Is the month's data complete? Month-end valuation present, no price gap over 5 days, no one-day move over 20%, exchange rates available. Clean, fixable (waits up to 3 days for the next sync) or blocked (asks Ying). | none |
 | Analyst | Builds the figure set from the tools: month, year-to-date and since-inception returns against the benchmark, risk, contributors, sectors. Every figure has an id and a source. | none |
-| Writer | Drafts the commentary from the figure set only. Every sentence cites figure ids, and the text makes no numerical claim of its own, as with today's drafter. The summary fits the deck's line (221 characters). | `wr-reports-apac` |
+| Writer | Drafts the deck's commentary from the figure set only. Every sentence cites figure ids, and the text makes no numerical claim of its own, as with today's drafter. The summary fits the deck's line (221 characters). Accounts whose deck has no commentary line (Alpha World T) get none. | `wr-reports-apac` |
 | Reviewer | Reads the draft cold and objects sentence by sentence; a code check also catches wording that goes against the cited figure ("rose" on a negative return). Once the package is built, it re-derives every printed factsheet figure from the frozen snapshot with the renderer's own inputs, compares the snapshot with today's database (10 bp), and checks the deck's date and narrative. | `wr-reports-apac` and code |
 | Visual QA | Looks at the factsheet pages as images for clipped text, overlaps, blank areas and wrong dates. Each finding carries a page and a region. | `wr-reports-apac` |
 | Coordinator | One stage machine per account and month: data, held, words, package, checking, ready. Runs up to two writer and reviewer rounds, sends a dispute to Ying, and checks again when the package is rebuilt. | none |
@@ -151,7 +153,7 @@ objection. The team itself never changes a file or releases anything.
 **Proof, not trust.**
 
 - Files are read only from `internal-reports/review/` and must match the
-  sha256 the factsheet job recorded. The snapshot must match its recorded hash.
+  sha256 the package job recorded. The snapshot must match its recorded hash.
 - The model never sees the snapshot or a file's bytes; visual QA sees page
   images only. The writer sees figure labels and display values only.
 - Report content goes only to `wr-reports-apac` (APAC Data Zone); the team
@@ -163,6 +165,8 @@ objection. The team itself never changes a file or releases anything.
   `--retry` restarts it. One account gets at most 15 minutes per run.
 - Once live, the reviewer checks that the deck prints the team's agreed
   summary; a deck built with the standard commentary is an objection.
+- A factsheet that prints commentary (a "Portfolio analyst:" line or any of
+  the team's sentences) is an objection, live or not.
 
 **Where Ying sees it** (`MONTH_TEAM_UI=owner` on the website; owners only):
 
@@ -192,8 +196,8 @@ tuned, and a second replay shows whether that helped.
 
 **Batch release.** For a live month, the Month-end page offers to release
 every report the team passed with nothing open: clean data, agreed
-commentary that the deck carries, printed figures and pages passed, and a
-file not yet released. Ying's browser then runs each account through the
+commentary that the deck carries (unless the deck has no commentary line),
+printed figures and pages passed, and a file not yet released. Ying's browser then runs each account through the
 Reports tab's own release preview and release, so every server-side check
 still applies; an account whose files changed after the team checked them is
 left for Ying. The page lists what was released and what was not.
@@ -205,12 +209,14 @@ left for Ying. The page lists what was released and what was not.
 - Release warns on an open objection rather than blocking.
 - `wr-reports-apac` goes to about 50,000 tokens a minute (an Azure step, below).
 - Batch release of clean reports is ready for November.
+- Commentary goes in the deck only. The factsheet never carries commentary.
 
-**Which commentary goes into a live report** (the rule for the factsheet job
+**Which commentary goes into a live deck** (the rule for the package job
 change). The team's, when the writer and reviewer agreed or Ying kept the
 writer's text. The standard commentary when Ying agreed with the reviewer,
-held the account, or the team has not settled the text when the factsheet job
-builds the package.
+held the account, or the team has not settled the text when the package job
+builds the files. Either way the job passes commentary to the deck renderer
+only, as it does today; the factsheet renderer never receives it.
 
 **Turning it on** (each step needs Ying's typed approval naming the resources):
 
@@ -228,17 +234,17 @@ builds the package.
 6. **Replay.** Run a replay of the 105 released reports and review the results
    on the Month-end page.
 7. **Go live.** Set `monthTeamLive=true` on the team job together with the
-   factsheet job's team-commentary setting. The factsheet job change is
+   package job's team-commentary setting. The package job change is
    separate and waits until the assurance image work is finished.
 
 **Not covered yet.**
 
-- Slides are not looked at as images until the factsheet job saves slide
+- Slides are not looked at as images until the package job saves slide
   images; the deck's text is checked meanwhile.
 - The analyst-assurance job's findings are not read.
 - No reconciliation against the broker's statements.
 - `month_end_drafter` stays until the team's commentary has proven itself.
-- The month-end factsheet job does not read the team's commentary yet (see
+- The month-end package job does not read the team's commentary yet (see
   "Go live" above).
 
 ## Cost drivers
@@ -255,7 +261,7 @@ builds the package.
 
 ## Not yet done
 
-- The month-end drafts are not wired into the factsheet renderer. Approving a
+- The month-end drafts are not wired into the deck renderer. Approving a
   draft marks it ready for the existing report release process.
 - The old AI pieces (`ai_analyst.py`, `agent_tools.py` and related modules,
   and the `ibkrv2stg-ai-…` account) stay in place. `agent_tools.py` still feeds

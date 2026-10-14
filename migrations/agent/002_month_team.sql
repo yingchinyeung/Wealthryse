@@ -58,13 +58,13 @@ CREATE OR REPLACE VIEW agent.month_end_snapshots AS SELECT * FROM agent.scoped_m
 
 -- One row per account, month and mode. ``mode`` is month (the month being
 -- reported now) or replay (an already released month, shown on the Month-end
--- page only). ``live`` says whether the factsheet job puts the team's agreed
--- commentary into this month's reports; until it does, the team runs in shadow
--- beside today's process. ``stage`` is where the coordinator is:
+-- page only). ``live`` says whether the month-end package job puts the team's
+-- agreed commentary into this month's decks (never the factsheets); until it
+-- does, the team runs in shadow beside today's process. ``stage`` is where the coordinator is:
 --   data      -> the data agent is checking, or waiting for the next sync
 --   held      -> blocked; waiting for Ying to choose hold or proceed
 --   words     -> analyst figures and writer commentary, with reviewer rounds
---   package   -> waiting for the month-end factsheet job's package
+--   package   -> waiting for the month-end package job's files
 --   checking  -> reviewer and visual QA are checking the package files
 --   ready     -> checked; one report-ready inbox item written (month runs only)
 -- A failed step keeps the stage and counts an attempt, so the next wake retries

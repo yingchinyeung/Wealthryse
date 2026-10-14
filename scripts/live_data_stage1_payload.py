@@ -7,7 +7,9 @@ names. It needs only the standard library and psycopg, which the bootstrap
 image already has, so no image is built.
 
 It refuses, changing nothing, unless every migration the database has applied
-matches main's checksum and 063 is the only one pending. Then, in separate
+matches main's checksum and nothing is pending except 063 and the migrations
+the bundle lists as held back (installed separately, or deliberately not yet,
+and independent of 063). Then, in separate
 transactions, it applies 063 and records it exactly as bootstrap_postgres.py
 does, and creates the ibkr_live_collector login with its grants, rolled back
 unless the grants are least-privilege. The login's password arrives as a
@@ -64,11 +66,15 @@ def run(connection, bundle: dict, verifier: str) -> dict:
     changed = sorted(name for name, digest in applied.items() if name in expected and expected[name] != digest)
     unknown = sorted(name for name in applied if name not in expected)
     pending = sorted(name for name in expected if name not in applied)
-    record = {"target": target, "changed": changed, "not_on_main": unknown, "pending": pending}
-    if changed or unknown or pending not in ([], [target]):
+    held = set(bundle.get("held_back", ()))
+    unexpected = [name for name in pending if name != target and name not in held]
+    record = {"target": target, "changed": changed, "not_on_main": unknown, "pending": pending,
+              "held_back_pending": [name for name in pending if name in held]}
+    if changed or unknown or unexpected:
         return dict(record, status="refused", reason="The database's migrations do not match main")
 
-    if pending:
+    apply = target in pending
+    if apply:
         with connection.transaction():
             connection.execute(target_sql)
             connection.execute(
@@ -97,7 +103,7 @@ def run(connection, bundle: dict, verifier: str) -> dict:
     return dict(
         record,
         status="pass" if passed else "fail",
-        migration_applied=bool(pending),
+        migration_applied=apply,
         migration_sha256=expected[target],
         migrations_matched=len(applied),
         role=role,
@@ -109,9 +115,9 @@ def run(connection, bundle: dict, verifier: str) -> dict:
 
 
 def main() -> int:
-    import psycopg
-
     try:
+        import psycopg
+
         with psycopg.connect(os.environ["DATABASE_ADMIN_URL"], autocommit=True, connect_timeout=20,
                              options="-c statement_timeout=120000 -c lock_timeout=10000") as connection:
             record = run(connection, decode(BUNDLE), os.environ["LIVE_COLLECTOR_VERIFIER"])

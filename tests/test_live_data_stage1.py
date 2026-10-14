@@ -63,6 +63,8 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(value["expected"][rollout.TARGET], hashlib.sha256(text.encode()).hexdigest())
         self.assertEqual((value["role"], value["web_role"], value["database"]),
                          ("ibkr_live_collector", "ibkr_stg_web", "ibkr_staging"))
+        self.assertTrue(set(value["held_back"]) <= set(names))
+        self.assertNotIn(rollout.TARGET, value["held_back"])
 
     def test_command_is_deterministic_and_runs_the_payload(self):
         value = rollout.bundle()
@@ -147,6 +149,23 @@ class SecretHandlingTests(unittest.TestCase):
         with mock.patch.object(rollout, "request", fake), mock.patch.object(rollout, "preflight", return_value=state), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(rollout.main(["start"]), 0)
+
+
+class AzureErrorTests(unittest.TestCase):
+    def test_failures_name_the_azure_error_code_but_not_the_message(self):
+        response = mock.Mock(ok=False, status_code=409, content=b"x")
+        response.json.return_value = {"error": {"code": "Conflict", "message": "do not print this",
+                                                "innererror": {"code": "ObjectIsDeletedButRecoverable"}}}
+        credential = mock.Mock()
+        credential.return_value.get_token.return_value.token = "token"
+        with mock.patch("requests.request", return_value=response), \
+                mock.patch("azure.identity.AzureCliCredential", credential), \
+                self.assertRaises(SystemExit) as raised:
+            rollout.request("PUT", rollout.secret_url(), data={"value": "x"}, audience=rollout.VAULT_AUDIENCE)
+        message = str(raised.exception)
+        self.assertIn("HTTP 409 (Conflict, ObjectIsDeletedButRecoverable)", message)
+        self.assertNotIn("do not print this", message)
+        self.assertNotIn("api-version", message)
 
 
 class JobValidationTests(unittest.TestCase):

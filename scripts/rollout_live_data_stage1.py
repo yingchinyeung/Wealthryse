@@ -49,6 +49,12 @@ DATABASE = "ibkr_staging"
 ROLE = "ibkr_live_collector"
 WEB_ROLE = "ibkr_stg_web"
 TARGET = "063_live_ibkr_data.sql"
+# Migrations production is known not to have applied: 054/055 were skipped when
+# 056-058 were installed on their own, and 059-061 are deliberately kept off.
+# 063 does not depend on any of them, so they may stay pending; any other gap
+# makes the payload refuse.
+HELD_BACK = ("054_shadow_workflow_evidence.sql", "055_fx_evidence_versions.sql", "059_owner_codex_tasks.sql",
+             "060_shadow_workflow_date_policies.sql", "061_shadow_workflow_leases.sql")
 WORKSPACE = "5264a124-10cd-45f6-93a5-6d65c37e9bfb"
 PREFIX = "LIVE_DATA_STAGE1 "
 PAYLOAD = "scripts/live_data_stage1_payload.py"
@@ -65,10 +71,11 @@ def bundle(commit: str = "HEAD") -> dict:
     names = subprocess.run(["git", "ls-tree", "--name-only", commit, "migrations/postgres/"], cwd=ROOT,
                            capture_output=True, text=True, check=True).stdout.split()
     texts = {Path(name).name: git_text(name, commit) for name in names if name.endswith(".sql")}
-    if TARGET not in texts:
-        raise SystemExit(f"{TARGET} is not in {commit}; run this from main")
+    if TARGET not in texts or not set(HELD_BACK) <= set(texts):
+        raise SystemExit(f"{TARGET} or a held-back migration is not in {commit}; run this from main")
     return {
         "expected": {name: hashlib.sha256(text.encode("utf-8")).hexdigest() for name, text in sorted(texts.items())},
+        "held_back": list(HELD_BACK),
         "target": TARGET,
         "target_sql": texts[TARGET],
         "access_source": git_text(ACCESS, commit),
@@ -179,7 +186,15 @@ def request(method: str, url: str, *, data=None, audience: str = MANAGEMENT, mis
     if missing and response.status_code == 404:
         return None
     if not response.ok:
-        raise SystemExit(f"Azure {method} {url.split('?')[0]} failed with HTTP {response.status_code}")
+        # Only Azure's fixed error codes (e.g. ObjectIsDeletedButRecoverable), never the message or body.
+        try:
+            error = response.json().get("error") or {}
+        except ValueError:
+            error = {}
+        codes = [code for code in (error.get("code"), (error.get("innererror") or {}).get("code"))
+                 if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.]{1,80}", code)]
+        raise SystemExit(f"Azure {method} {url.split('?')[0]} failed with HTTP {response.status_code}"
+                         + (f" ({', '.join(codes)})" if codes else ""))
     return response.json() if response.content else {}
 
 
@@ -222,7 +237,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"execution": args.execution, "status": run["properties"]["status"],
                           "records": records}, indent=2, sort_keys=True))
         if not records:
-            print("No result line yet; Log Analytics can take a few minutes. Run result again.")
+            if run["properties"]["status"] in ("Succeeded", "Failed", "Stopped"):
+                print("The execution has ended but no result line has arrived. Log Analytics can lag a few "
+                      "minutes; if it is still missing after that, the payload never reported (see its console logs).")
+            else:
+                print("No result line yet; Log Analytics can take a few minutes. Run result again.")
             return 2
         return 0 if records[-1].get("status") == "pass" else 1
 

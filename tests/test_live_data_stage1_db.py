@@ -154,6 +154,36 @@ class Stage1PayloadDatabaseTests(unittest.TestCase):
             self.assertIsNone(owner.execute("SELECT to_regclass('public.live_quotes')").fetchone()[0])
             self.assertIsNone(owner.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (COLLECTOR,)).fetchone())
 
+    def _forget(self, *names):
+        import psycopg
+
+        with psycopg.connect(_dsn(self.database, OWNER)) as owner:
+            owner.execute("DELETE FROM schema_migrations WHERE version = ANY(%s)", (list(names),))
+
+    def test_applies_063_while_the_held_back_migrations_stay_pending(self):
+        # Production never recorded 054, 055 or 059-061.
+        held = self.bundle["held_back"]
+        self._forget(*held)
+        result = self._run()
+        self.assertEqual(result["status"], "pass", result)
+        self.assertTrue(result["migration_applied"])
+        self.assertEqual(result["held_back_pending"], sorted(held))
+        ledger = self._migrations()
+        self.assertIn(self.bundle["target"], ledger)
+        self.assertFalse(set(held) & set(ledger))
+
+    def test_refuses_when_a_migration_outside_the_held_back_list_is_missing(self):
+        import psycopg
+
+        missing = "058_specialist_observation_authority.sql"
+        self._forget(*self.bundle["held_back"], missing)
+        result = self._run()
+        self.assertEqual(result["status"], "refused")
+        self.assertIn(missing, result["pending"])
+        with psycopg.connect(_dsn(self.database, OWNER)) as owner:
+            self.assertIsNone(owner.execute("SELECT to_regclass('public.live_quotes')").fetchone()[0])
+            self.assertIsNone(owner.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (COLLECTOR,)).fetchone())
+
     def test_reports_when_the_website_role_cannot_read_the_new_tables(self):
         import psycopg
 

@@ -30,7 +30,9 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
                     'src/wealthryse_agent/', 'migrations/agent/', 'Dockerfile.agent',
                     'scripts/install_agent_schema.py',
                     # The live IBKR collector ships in its own image on the gateway VM.
-                    'Dockerfile.live-collector', 'requirements-live.lock')
+                    'Dockerfile.live-collector', 'requirements-live.lock',
+                    # Repository metadata, not copied into any image.
+                    'LICENSE')
 STATE = Path('release-state.json')
 ROOT = Path(__file__).resolve().parents[1]
 

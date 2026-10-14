@@ -78,5 +78,15 @@ class AssuranceConfigTest(unittest.TestCase):
         compile(release.ASSURANCE_CHECK, "check", "exec")
 
 
+class RunFailureTest(unittest.TestCase):
+    def test_failure_keeps_the_failing_step_output_after_warnings(self):
+        import sys
+        script = "import sys; sys.stderr.write('DEPRECATED: legacy builder\\n'); print('ModuleNotFoundError: No module named x'); sys.exit(1)"
+        with self.assertRaises(RuntimeError) as caught:
+            remote.run([sys.executable, "-c", script], "website image build")
+        self.assertIn("DEPRECATED", str(caught.exception))
+        self.assertIn("No module named x", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

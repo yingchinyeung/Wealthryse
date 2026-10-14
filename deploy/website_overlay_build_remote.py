@@ -23,7 +23,10 @@ REG = 'ibkrv2stgauhecwc4itaoo.azurecr.io'
 def run(args, operation, *, timeout=900, input=None, env=None, cwd=None):
     r = subprocess.run(args, input=input, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
     if r.returncode:
-        raise RuntimeError(operation + ' failed with exit ' + str(r.returncode) + ': ' + (r.stderr or r.stdout)[-1500:])
+        # Both streams: docker build writes warnings to stderr but a failing
+        # step's own output (such as an import traceback) to stdout.
+        output = '\n'.join(part for part in (r.stderr.strip(), r.stdout.strip()) if part)
+        raise RuntimeError(operation + ' failed with exit ' + str(r.returncode) + ': ' + output[-1500:])
     return r.stdout
 
 

@@ -47,6 +47,7 @@ unittest.loader._FailedTest.test_ms_runtime_probe_controller
 unittest.loader._FailedTest.test_ms_tenant_deployment_20261009
 unittest.loader._FailedTest.test_ms_web_alignment
 unittest.loader._FailedTest.test_ms_website_cutover_deployment
+unittest.loader._FailedTest.test_ms_website_downloads
 unittest.loader._FailedTest.test_ms_website_fresh_release_runtime
 unittest.loader._FailedTest.test_ms_website_metric_oracle
 unittest.loader._FailedTest.test_ms_website_rehearsal_transport

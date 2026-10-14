@@ -18,8 +18,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ..tool_client import ToolCallFailed
 from . import documents, figures
-from .agents import (Analyst, BudgetExhausted, DataAgent, Outcome, Reviewer, TeamModel, VisualQA, Writer,
-                     commentary_items)
+from .agents import (ALPHA_WORLD_FACTSHEETS, Analyst, BudgetExhausted, DataAgent, Outcome, Reviewer, TeamModel,
+                     VisualQA, Writer, commentary_items)
 from .settings import MAX_REVIEW_ROUNDS, MAX_STEP_ATTEMPTS, TeamSettings
 from .store import MonthStore
 
@@ -311,7 +311,8 @@ class Coordinator:
         verdicts = {"package_round": package_round, "reviewer": review.outcome, "visual_qa": visual.outcome,
                     "reviewer_summary": review.summary, "visual_qa_summary": visual.summary,
                     "checked_generation_ids": sorted(int(f["generation_run_id"]) for f in files.values()),
-                    "commentary_in_report": in_report, "deck_has_commentary": ctx.deck_line}
+                    "commentary_in_report": in_report, "deck_has_commentary": ctx.deck_line,
+                    "owner_layout_checked": ctx.account_id in ALPHA_WORLD_FACTSHEETS}
         self.store.update_run(run["month_run_id"], verdicts=verdicts)
         run["verdicts"] = verdicts
         if ctx.month:
@@ -319,6 +320,13 @@ class Coordinator:
         return "ready"
 
     def _ready(self, run: dict[str, Any], ctx: Context) -> str | None:
+        if (ctx.account_id in ALPHA_WORLD_FACTSHEETS and not (run.get("verdicts") or {}).get("owner_layout_checked")
+                and self.store.objections(run["month_run_id"], "open")):
+            # Checked before visual QA knew the Alpha World layout, so its "missing table" objections were false alarms.
+            self._step(run, "coordinator", "pass", "Checking the files again against the Alpha World factsheet layout.")
+            self.store.settle_objections(run["month_run_id"], ["factsheet", "presentation", "data"], "resolved",
+                                         "Replaced by a check against the Alpha World factsheet layout.")
+            return "checking"
         package = self._current_package(ctx)
         if package is None or package == run.get("package"):
             return None

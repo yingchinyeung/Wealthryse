@@ -181,3 +181,101 @@ class PrepareTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# The shape of presentation_design.py on 14 Oct: live had dropped the USD check
+# the deployed commit has, and the change edits the line just above it.
+BASE = b"def f(payload):\n    ms = payload.get('ms')\n    if ms:\n        build(payload)\n    else:\n        check(payload)\n    holdings = sorted(payload)\n    return holdings\n"
+LIVE = b"def f(payload):\n    ms = payload.get('ms')\n    if ms:\n        build(payload)\n    holdings = sorted(payload)\n    return holdings\n"
+NEW = BASE.replace(b"    if ms:\n", b"    if composite(payload):\n        ms = True\n    elif ms:\n")
+
+
+class MergeWithLiveTest(unittest.TestCase):
+    def apply(self, folder, before, after, live):
+        import tempfile
+        pkg = Path(folder) / "src" / "ibkr_etl"
+        pkg.mkdir(parents=True, exist_ok=True)
+        (pkg / "p.py").write_bytes(live)
+        with tempfile.TemporaryDirectory() as tmp:
+            for side, data in (("a", before), ("b", after)):
+                (Path(tmp) / side / "src" / "ibkr_etl").mkdir(parents=True)
+                (Path(tmp) / side / "src" / "ibkr_etl" / "p.py").write_bytes(data)
+            diff = subprocess.run(["git", "diff", "--no-index", "--no-prefix", "a", "b"], cwd=tmp, capture_output=True).stdout
+        (Path(folder) / "change.patch").write_bytes(diff)
+        return subprocess.run(["patch", "-p1", "--forward", "--fuzz=0", "--no-backup-if-mismatch", "-i", "change.patch"],
+                              cwd=folder, capture_output=True, text=True), pkg / "p.py"
+
+    def test_the_change_next_to_a_live_edit_is_merged_and_the_live_edit_kept(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            applied, _ = self.apply(tmp, BASE, NEW, LIVE)
+            self.assertNotEqual(applied.returncode, 0)  # what run 26 hit
+        merged = release.merge_live("p.py", LIVE, BASE, NEW)
+        self.assertIn(b"if composite(payload):", merged)
+        self.assertNotIn(b"check(payload)", merged)
+        self.assertIn("-    else:\n-        check(payload)\n", release.kept_live_edits("p.py", merged, NEW))
+        # The second build starts from the exact live copy, so its patch applies cleanly.
+        with tempfile.TemporaryDirectory() as tmp:
+            applied, path = self.apply(tmp, LIVE, merged, LIVE)
+            self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+            self.assertEqual(path.read_bytes(), merged)
+
+    def test_a_live_copy_that_already_has_the_change_merges_to_the_reviewed_file(self):
+        self.assertEqual(release.merge_live("p.py", NEW, BASE, NEW), NEW)
+
+    def test_a_conflict_with_a_live_edit_stops_the_release(self):
+        live = BASE.replace(b"    if ms:\n", b"    if ms and payload:\n")
+        with self.assertRaises(SystemExit) as stopped:
+            release.merge_live("p.py", live, BASE, NEW)
+        self.assertIn("conflicts with a live-only edit", str(stopped.exception))
+
+    def test_the_build_merges_rejected_files_and_builds_once_more(self):
+        import json, tempfile, os
+        state = {"head": HEAD, "deployed_commit": DEPLOYED, "changed_files": ["src/ibkr_etl/p.py"],
+                 "live_image": release.REG + "/ibkr-platform:web-" + DEPLOYED}
+        calls = []
+
+        def overlay(state, merged=None):
+            calls.append(merged)
+            return ["p.py"] if merged is None else []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                Path("release-state.json").write_text(json.dumps(state))
+                with mock.patch.object(release, "overlay_build", side_effect=overlay), \
+                        mock.patch.object(release, "sides", return_value=({"p.py": BASE}, {"p.py": NEW})), \
+                        mock.patch.object(release, "capture_files", return_value={"src/ibkr_etl/p.py": LIVE}) as capture:
+                    release.build()
+                saved = json.loads(Path("release-state.json").read_text())
+            finally:
+                os.chdir(cwd)
+        capture.assert_called_once_with(state["live_image"], ["src/ibkr_etl/p.py"])
+        self.assertEqual(calls[0], None)
+        self.assertEqual(calls[1]["p.py"], (LIVE, release.merge_live("p.py", LIVE, BASE, NEW)))
+        self.assertEqual(saved["merged_with_live"], ["p.py"])
+
+    def test_a_second_refusal_stops_the_release(self):
+        import json, tempfile, os
+        state = {"head": HEAD, "deployed_commit": DEPLOYED, "changed_files": ["src/ibkr_etl/p.py"],
+                 "live_image": release.REG + "/ibkr-platform:web-" + DEPLOYED}
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                Path("release-state.json").write_text(json.dumps(state))
+                with mock.patch.object(release, "overlay_build", return_value=["p.py"]), \
+                        mock.patch.object(release, "sides", return_value=({"p.py": BASE}, {"p.py": NEW})), \
+                        mock.patch.object(release, "capture_files", return_value={"src/ibkr_etl/p.py": LIVE}), \
+                        self.assertRaises(SystemExit):
+                    release.build()
+            finally:
+                os.chdir(cwd)
+
+    def test_change_set_uses_the_live_copy_and_the_merge_for_merged_files(self):
+        merged = release.merge_live("p.py", LIVE, BASE, NEW)
+        with mock.patch.object(release, "sides", return_value=({"p.py": BASE}, {"p.py": NEW})):
+            patch, before, after = release.change_set({}, {"p.py": (LIVE, merged)})
+        self.assertEqual(before["p.py"], sha(LIVE))
+        self.assertEqual(after["p.py"], sha(merged))

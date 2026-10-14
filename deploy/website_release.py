@@ -11,7 +11,7 @@ Steps, each a subcommand so the workflow can show and stop at each one:
                    the assurance job itself is not changed
 State passes between steps in release-state.json.
 """
-import ast, base64, gzip, hashlib, json, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import ast, base64, difflib, gzip, hashlib, json, subprocess, sys, tempfile, time, urllib.request, urllib.error
 from pathlib import Path
 
 RG = 'rg-ibkr-database-v11'
@@ -100,15 +100,19 @@ def first_imported(before, after):
     return sorted(n for n in website_modules(after) - website_modules(before) if before.get(n) == after[n])
 
 
-def change_set(state):
+def change_set(state, merged=None):
     """The patch from what is live to what should be live, with before/after hashes.
 
     Every file goes from the deployed commit to HEAD's src/ibkr_etl. Releases made
     before the repo caught up with the live site shipped merged copies of a few
     files from deploy/live-merged/ (since removed); when the deployed commit has
-    those copies, they are what is live, so they are the "before" side.
+    those copies, they are what is live, so they are the "before" side. merged
+    maps a file to (its exact live copy, that copy merged with the change); see
+    merge_live.
     """
     before, after = sides(state)
+    for name, (live, result) in (merged or {}).items():
+        before[name], after[name] = live, result
     changed = [n for n in set(before) | set(after) if before.get(n) != after.get(n)]
     with tempfile.TemporaryDirectory() as tmp:
         for side, files in (('a', before), ('b', after)):
@@ -172,25 +176,84 @@ def prepare():
         print('No website source changes since the live image; nothing to release.')
 
 
+def merge_live(name, live, base, new):
+    """Three-way merge of the change (base -> new) into a live file that drifted from base.
+
+    The live website has hand edits the repo never had. When the change touches
+    lines next to one, its patch does not apply exactly, so the build merges the
+    change into the exact live copy instead and keeps the live edit. Any
+    conflict stops the release; nothing is guessed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = [Path(tmp) / side for side in ('live', 'base', 'new')]
+        for path, data in zip(paths, (live, base, new)):
+            path.write_bytes(data)
+        merged = subprocess.run(['git', 'merge-file', '-p', '-L', 'live', '-L', 'deployed commit', '-L', 'reviewed',
+                                 *map(str, paths)], capture_output=True)
+    if merged.returncode:
+        raise SystemExit(f'The change to {name} conflicts with a live-only edit; nothing built:\n'
+                         + merged.stdout.decode(errors='replace')[-3000:])
+    return merged.stdout
+
+
+def kept_live_edits(name, merged, new):
+    """What the built file keeps from live that the reviewed commit does not have."""
+    return ''.join(difflib.unified_diff(new.decode().splitlines(True), merged.decode().splitlines(True),
+                                        'reviewed/' + name, 'built/' + name, n=1))
+
+
+def capture_files(live, names):
+    """Exact copies of named files from a deployed image, read-only, checked against the image's hashes."""
+    import io, tarfile
+    config = {'capture': names, 'base_image': live, 'target_image': f'{REG}/ibkr-platform:web-capture',
+              'source_commit': git('rev-parse', 'HEAD').strip(), 'live_hashes': {}, 'new_hashes': {}, 'patch': ''}
+    result, detail = read_only_on_vm(config, 'website-capture')
+    files = {}
+    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(detail)), mode='r:xz') as tar:
+        for member in tar.getmembers():
+            if member.name not in names or not member.isfile():
+                raise SystemExit('Unexpected file in capture: ' + member.name)
+            data = tar.extractfile(member).read()
+            if hashlib.sha256(data).hexdigest() != result['captured'][member.name]:
+                raise SystemExit('Captured file damaged in transfer: ' + member.name)
+            files[member.name] = data
+    return files
+
+
 def build():
     state = json.loads(STATE.read_text())
     if not state['changed_files']:
         return
-    patch, live_hashes, new_hashes = change_set(state)
+    rejected = overlay_build(state)
+    if rejected:
+        # Merge the change into exact copies of the files it did not apply to, then build once more.
+        before, after = sides(state)
+        live = capture_files(state['live_image'], [PACKAGE + '/' + n for n in rejected])
+        merged = {}
+        for name in rejected:
+            copy = live[PACKAGE + '/' + name]
+            merged[name] = (copy, merge_live(name, copy, before[name], after[name]))
+            print('Merged the change into live ' + name + '; live-only lines kept in the build:\n'
+                  + kept_live_edits(name, merged[name][1], after[name]))
+        state['merged_with_live'] = sorted(merged)
+        STATE.write_text(json.dumps(state, indent=2))
+        if overlay_build(state, merged):
+            raise SystemExit('Build failed; the website was not changed')
+
+
+def overlay_build(state, merged=None):
+    """Build on the build VM. Returns the files the change did not apply to, for one merge retry."""
+    patch, live_hashes, new_hashes = change_set(state, merged)
     before, after = sides(state)
+    for name, (copy, result) in (merged or {}).items():
+        before[name], after[name] = copy, result
     config = {
         'imported': {n: base64.b64encode(gzip.compress(after[n], 9)).decode() for n in first_imported(before, after)},
         'base_image': state['live_image'], 'target_image': state['target_image'], 'source_commit': state['head'],
         'live_hashes': live_hashes, 'new_hashes': new_hashes,
         'patch': base64.b64encode(gzip.compress(patch, 9)).decode(),
     }
-    code = (ROOT / 'deploy' / 'website_overlay_build_remote.py').read_text()
-    marker = 'CONFIG = None  # replaced by the workflow'
-    if code.count(marker) != 1:
-        raise SystemExit('Build script placeholder missing')
-    code = code.replace(marker, 'CONFIG = json.loads(' + repr(json.dumps(config)) + ')')
-    command = "cat > /tmp/wealthryse-website-build.py <<'WEALTHRYSE_EOF'\n" + code + "\nWEALTHRYSE_EOF\n" \
-              "unshare --mount --propagation private python3 /tmp/wealthryse-website-build.py; status=$?; rm -f /tmp/wealthryse-website-build.py; exit $status"
+    command = remote_script(config)
     vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
     started = vm.get('powerState') != 'VM running'
     if started:
@@ -207,14 +270,19 @@ def build():
         result = json.loads(lines[-1]) if lines else {'passed': False, 'error': (view.get('error') or '')[-1500:],
                                                       'output_length': len(output), 'output_tail': output[-800:]}
         print(json.dumps(result, indent=2))
+        rejected = []
         if result.get('detail_file'):
             detail = read_detail(base, vm['location'], result['detail_file'], result['detail_size'])
             for name, text in json.loads(gzip.decompress(base64.b64decode(detail))).items():
                 print('Live code where the change to ' + name + ' does not apply:\n' + text)
+                rejected.append(name)
         if not result.get('passed') or view.get('exitCode') != 0:
+            if merged is None and rejected and result.get('error', '').startswith('Some of the change does not apply'):
+                return sorted(rejected)
             raise SystemExit('Build failed; the website was not changed')
         state['pushed_image'] = result['pushed_image']
         STATE.write_text(json.dumps(state, indent=2))
+        return []
     finally:
         if started:
             print('Stopping the build VM again')
@@ -386,24 +454,12 @@ def capture():
     names = [n if '/' in n else PACKAGE + '/' + n for n in names]
     if not names or any(not n.endswith('.py') or '..' in n or not n.startswith(('src/ibkr_etl/', 'scripts/')) for n in names):
         raise SystemExit('Name src/ibkr_etl/... or scripts/... .py files to copy')
-    head = git('rev-parse', 'HEAD').strip()
     live = image or az('containerapp', 'show', '-n', APP, '-g', RG)['properties']['template']['containers'][0]['image']
-    config = {'capture': names, 'base_image': live, 'target_image': f'{REG}/ibkr-platform:web-capture',
-              'source_commit': head, 'live_hashes': {}, 'new_hashes': {}, 'patch': ''}
-    result, detail = read_only_on_vm(config, 'website-capture')
-    archive = base64.b64decode(detail)
-    import io, tarfile
     folder = live.split('@sha256:')[1][:12] if '@sha256:' in live else live.rsplit(':', 1)[-1][:16]
     target = ROOT / 'deploy' / 'image-captures' / folder
-    with tarfile.open(fileobj=io.BytesIO(archive), mode='r:xz') as tar:
-        for member in tar.getmembers():
-            if member.name not in names or not member.isfile():
-                raise SystemExit('Unexpected file in capture: ' + member.name)
-            data = tar.extractfile(member).read()
-            if hashlib.sha256(data).hexdigest() != result['captured'][member.name]:
-                raise SystemExit('Captured file damaged in transfer: ' + member.name)
-            (target / member.name).parent.mkdir(parents=True, exist_ok=True)
-            (target / member.name).write_bytes(data)
+    for name, data in capture_files(live, names).items():
+        (target / name).parent.mkdir(parents=True, exist_ok=True)
+        (target / name).write_bytes(data)
     (target / 'IMAGE').write_text(live + '\n')
     print('Copied', ', '.join(names), 'from', live)
 

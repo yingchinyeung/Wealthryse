@@ -13,6 +13,30 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from ibkr_etl.db import connect  # noqa: E402
+from ibkr_etl.onboarding_agents import agents_enabled, run_reviews  # noqa: E402
+
+
+def record_agent_reviews(database_url: str, tenant_id: str) -> dict:
+    """Stage 3's agent_review_complete check on composite cases, from the history reviewer's reviews.
+
+    Runs after the composite reports, so a re-render puts the check back to
+    pending at once. Does nothing while ONBOARDING_AGENTS_ENABLED is off and
+    never changes the month-end packages' result.
+    """
+
+    if not agents_enabled():
+        return {"status": "switched_off"}
+    try:
+        connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
+    except Exception as failure:
+        return {"status": "failed", "error_type": type(failure).__name__, "error": str(failure)[:400]}
+    try:
+        return run_reviews(connection, tenant_id)
+    except Exception as failure:
+        connection.rollback()
+        return {"status": "failed", "error_type": type(failure).__name__, "error": str(failure)[:400]}
+    finally:
+        connection.close()
 
 
 def main() -> int:
@@ -99,6 +123,7 @@ def main() -> int:
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(json.dumps({"onboarding_composite_reports": "failed", "reason": str(error)}, sort_keys=True))
+    print(json.dumps({"onboarding_agent_reviews": record_agent_reviews(database_url, tenant_id)}, sort_keys=True))
     return 1 if failed else 0
 
 

@@ -240,6 +240,8 @@ var jobs = [
   { name: 'ibkrv2stg-agent-month-end', job: 'month_end_drafter', cron: '0 2 2-7 * *' }
   // 09:00 HKT; also deletes chats older than the retention period.
   { name: 'ibkrv2stg-agent-data-quality', job: 'data_quality', cron: '0 1 * * *' }
+  // 09:30 HKT on Saturdays: each granted account's weekly brief, in the website inbox only.
+  { name: 'ibkrv2stg-agent-weekly-brief', job: 'weekly_brief', cron: '30 1 * * 6' }
 ]
 
 resource agentJobs 'Microsoft.App/jobs@2024-03-01' = [for j in jobs: {

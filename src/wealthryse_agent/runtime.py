@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from . import calculator
 from .config import ModelSettings
+from .memory import MEMORY_SCHEMA
 from .prompts import ANALYST, ROUTER
 from .tool_client import ToolCallFailed, ToolClient
 from .validator import validate_answer
@@ -53,8 +54,9 @@ ANSWER_SCHEMA = {
         "citations": {"type": "array", "items": {"type": "string"}},
         "visuals": {"type": "array", "items": VISUAL_SCHEMA,
                     "description": "Charts and tables, only when asked for or clearly helpful; else empty."},
+        "remember": MEMORY_SCHEMA,
     },
-    "required": ["answer", "citations", "visuals"],
+    "required": ["answer", "citations", "visuals", "remember"],
     "additionalProperties": False,
 }
 ROUTER_SCHEMA = {
@@ -107,6 +109,8 @@ class Turn:
     answer: str = ""
     citations: list[dict[str, Any]] = field(default_factory=list)
     visuals: list[dict[str, Any]] = field(default_factory=list)
+    # Preferences the person asked to be remembered; the server checks and saves them.
+    remember: list[dict[str, Any]] = field(default_factory=list)
     status: str = "ok"
     tool_calls: int = 0
     usage: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
@@ -234,11 +238,12 @@ class Agent:
                 parsed = json.loads(response.output_text)
                 answer, cited = str(parsed["answer"]).strip(), [str(c) for c in parsed["citations"]]
                 visuals = [v for v in parsed.get("visuals") or [] if isinstance(v, dict)]
+                remember = [m for m in parsed.get("remember") or [] if isinstance(m, dict)][:4]
             except (ValueError, KeyError, TypeError, AttributeError) as error:
                 raise AgentError("invalid_model_output", "The model did not return a usable answer.") from error
             check = validate_answer(answer, cited, results, question, visuals)
             if check.ok:
-                turn.answer, turn.visuals = answer, visuals
+                turn.answer, turn.visuals, turn.remember = answer, visuals, remember
                 turn.citations = [{"id": c, "tool": results[c]["tool"], "account_id": results[c].get("account_id"),
                                    "as_of": results[c].get("as_of"), "sources": results[c].get("citations", [])}
                                   for c in dict.fromkeys(cited) if c in results]

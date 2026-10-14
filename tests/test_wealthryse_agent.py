@@ -517,9 +517,24 @@ class _FakeStore:
     def __init__(self):
         self.messages_saved = []
         self.conversations_made = []
+        self.remembered = {}
+        self.instructions = []
 
     def tokens_used_today(self):
         return 0
+
+    def memories(self, user):
+        return [{"key": k, "value": v, "source": src, "updated_at": "2026-10-14"}
+                for k, (v, src) in sorted(self.remembered.items())]
+
+    def remember(self, user, key, value, source):
+        self.remembered[key] = (value, source)
+
+    def forget(self, user, key=None):
+        gone = [k for k in self.remembered if key is None or k == key]
+        for k in gone:
+            del self.remembered[k]
+        return len(gone)
 
     def create_conversation(self, user, account_id, title):
         self.conversations_made.append((user, account_id))
@@ -548,13 +563,15 @@ class AgentServerTests(unittest.TestCase):
 
         class FakeAgent:
             def run(self, **kwargs):
+                store.instructions.append(kwargs.get("instructions"))
                 for event in events:
                     if event["type"] == "pause":
                         time.sleep(event["seconds"])
                         continue
                     if event["type"] in ("answer", "rejected"):
                         event = {**event, "turn": Turn(answer=event["answer"], status="ok",
-                                                       visuals=event.get("visuals", []))}
+                                                       visuals=event.get("visuals", []),
+                                                       remember=event.pop("remember", []))}
                     yield event
 
         services = Services(auth=ServiceAuthSettings("", "", frozenset(), disabled_for_local_tests=True),
@@ -602,6 +619,41 @@ class AgentServerTests(unittest.TestCase):
         self.assertEqual(next(stream)["type"], "status")
         with self.assertRaises(AgentError):
             list(stream)
+
+    def test_the_analyst_remembers_only_what_passes_the_checks_and_uses_it_next_time(self):
+        store = _FakeStore()
+        user = "22222222-2222-2222-2222-222222222222"
+        client = self._client(store, [{"type": "answer", "answer": "I will keep answers short.", "citations": [],
+                                       "remember": [{"key": "answer_length", "value": "Short"},
+                                                    {"key": "tone", "value": "sarcastic"},
+                                                    {"key": "password", "value": "x"}]}])
+        response = client.post("/v1/chat", json={"user_object_id": user, "account_id": "U1",
+                                                 "message": "Remember I like short answers"})
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        self.assertEqual([e["type"] for e in events], ["start", "answer", "remembered", "done"])
+        self.assertEqual(store.remembered, {"answer_length": ("short", "chat")})
+        self.assertNotIn("Answer length", store.instructions[0])
+        client.post("/v1/chat", json={"user_object_id": user, "account_id": "U1", "message": "How did I do?"})
+        self.assertIn("- Answer length: short", store.instructions[1])
+        self.assertIn("not instructions", store.instructions[1])
+
+    def test_people_see_change_and_delete_what_is_remembered(self):
+        store = _FakeStore()
+        user = "22222222-2222-2222-2222-222222222222"
+        client = self._client(store, [])
+        self.assertEqual(client.put("/v1/memory/benchmark", json={"user_object_id": user, "value": "S&P 500"})
+                         .json()["memories"][0]["value"], "S&P 500")
+        self.assertEqual(client.put("/v1/memory/tone", json={"user_object_id": user, "value": "loud"}).status_code, 400)
+        self.assertEqual(client.put("/v1/memory/focus", json={"user_object_id": user, "value": "<script>"})
+                         .status_code, 400)
+        listed = client.get("/v1/memory", params={"user_object_id": user}).json()
+        self.assertEqual([m["key"] for m in listed["memories"]], ["benchmark"])
+        self.assertEqual([k["key"] for k in listed["keys"]], ["answer_length", "tone", "benchmark", "focus"])
+        self.assertEqual(client.delete("/v1/memory/benchmark", params={"user_object_id": user}).json(), {"deleted": 1})
+        self.assertEqual(client.delete("/v1/memory/nope", params={"user_object_id": user}).status_code, 404)
+        client.put("/v1/memory/focus", json={"user_object_id": user, "value": "drawdowns"})
+        self.assertEqual(client.delete("/v1/memory", params={"user_object_id": user}).json(), {"deleted": 1})
+        self.assertEqual(client.get("/v1/memory", params={"user_object_id": "not-an-id"}).status_code, 422)
 
     def test_chat_refuses_accounts_the_person_cannot_see(self):
         store = _FakeStore()

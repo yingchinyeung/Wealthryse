@@ -65,6 +65,35 @@ class Store:
         self.db.rollback()
         return [_split_visuals(dict(r)) for r in rows]
 
+    # Memory ----------------------------------------------------------------
+
+    def memories(self, user: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT key, value, source, updated_at FROM agent.memories WHERE tenant_id = ?::uuid "
+            "AND user_object_id = ? ORDER BY key", (self.tenant_id, user.lower()),
+        ).fetchall()
+        self.db.rollback()
+        return [dict(r) for r in rows]
+
+    def remember(self, user: str, key: str, value: str, source: str) -> None:
+        self.db.execute(
+            "INSERT INTO agent.memories(tenant_id, user_object_id, key, value, source) VALUES (?::uuid, ?, ?, ?, ?) "
+            "ON CONFLICT (tenant_id, user_object_id, key) DO UPDATE SET value = EXCLUDED.value, "
+            "source = EXCLUDED.source, updated_at = now()",
+            (self.tenant_id, user.lower(), key, value, source),
+        )
+        self._commit()
+
+    def forget(self, user: str, key: str | None = None) -> int:
+        """Delete one preference, or all of them when key is None."""
+        row = self.db.execute(
+            "WITH gone AS (DELETE FROM agent.memories WHERE tenant_id = ?::uuid AND user_object_id = ? "
+            "AND (?::text IS NULL OR key = ?) RETURNING 1) SELECT COUNT(*) AS n FROM gone",
+            (self.tenant_id, user.lower(), key, key),
+        ).fetchone()
+        self._commit()
+        return int(row["n"])
+
     def add_message(self, conversation_id: str, role: str, content: str, *, citations: Sequence[Any] = (),
                     status: str = "ok", correlation_id: str | None = None,
                     usage: dict[str, int] | None = None) -> int:

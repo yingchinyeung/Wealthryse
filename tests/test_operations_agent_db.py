@@ -278,6 +278,30 @@ class OperationsAgentDatabaseTests(unittest.TestCase):
         self.assertEqual({r["state"] for r in pack["terms_vs_documents"]}, {"no_draft"})
         self.assertRegex(pack["pack_sha256"], "^[0-9a-f]{64}$")
 
+    def test_6_memory_belongs_to_each_person_and_briefs_reach_the_inbox(self):
+        import psycopg
+
+        from wealthryse_agent.database import connect
+        from wealthryse_agent.store import Store
+
+        store = Store(connect(self.writer, search_path="agent"), TENANT)
+        self.addCleanup(store.db.close)
+        me, other = "33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444"
+        store.remember(me, "tone", "plain", "settings")
+        store.remember(me, "tone", "technical", "chat")
+        store.remember(other, "focus", "drawdowns", "settings")
+        self.assertEqual([(m["key"], m["value"], m["source"]) for m in store.memories(me)],
+                         [("tone", "technical", "chat")])
+        self.assertEqual(store.forget(me, "focus"), 0)
+        self.assertEqual(store.forget(me), 1)
+        self.assertEqual(store.memories(me), [])
+        self.assertEqual(len(store.memories(other)), 1)
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            store.remember(me, "password", "x", "chat")
+        store.db.rollback()
+        self.assertTrue(store.add_inbox(kind="weekly_brief", account_id="U0000901", period_key="2026-W42",
+                                        title="Your week", body="Synthetic.", citations=[], run_id=None))
+
 
 if __name__ == "__main__":
     unittest.main()

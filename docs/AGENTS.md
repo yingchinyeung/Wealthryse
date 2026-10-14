@@ -443,6 +443,38 @@ agent's table, both simply show nothing from the agent.
    and redeploy with `opsGithubTokenSecretUri`. Without it the agent diagnoses
    but never opens a pull request.
 
+## Personal analyst: memory and weekly briefs
+
+**Memory.** Chat remembers only the current conversation. Memory adds four
+preferences per person: answer length (short or detailed), tone (plain or
+technical), the benchmark they compare with, and what they care about. A
+person sets them under "What I remember" in the chat panel, or by asking the
+analyst to remember something; the analyst then confirms it in the chat. Code
+checks each value (fixed choices, or up to 60 or 200 characters of plain
+text) before saving it to `agent.memories`. Each person sees, changes and
+deletes only their own, and retention does not delete them. They go to the
+model after the rules, marked as data about how to write, so they never change
+the rules, the figures or which account it answers about.
+
+**Weekly brief.** On Saturdays at 09:30 HKT, `weekly_brief` writes four to
+eight sentences per account on its latest week of data: the value and
+return against the benchmark, the holdings that moved it most, deposits and
+withdrawals, and any data gaps. It uses the same tools, model
+(`wr-analyst-astra`) and figure check as chat, and it skips a brief that
+fails the check. Briefs appear only in the website inbox, to the people who
+can see that account. Nothing is emailed. Like the other scheduled jobs, it
+covers only the accounts granted to it (`--grant weekly_brief=<account>`).
+
+**Turning it on** (each step needs Ying's typed approval naming the resources):
+
+1. **Database.** Rerun `scripts/install_agent_schema.py`. It applies
+   `008_chat_memory_and_briefs.sql`.
+2. **Image.** Rebuild `Dockerfile.agent` and the platform image (the chat
+   panel's "What I remember" view).
+3. **Job.** Deploy `infra/agent-apps.bicep`. This adds
+   `ibkrv2stg-agent-weekly-brief`, and grant the accounts that should get
+   briefs.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool
@@ -458,6 +490,8 @@ agent's table, both simply show nothing from the agent.
   (`onboardingTokenBudget`).
 - The operations agent, when deployed: a job every 5 minutes that calls the
   model only for a new incident, with its own monthly budget (`opsTokenBudget`).
+- Weekly briefs: one model run per granted account per week, within the
+  daily token budget.
 - No new database server.
 
 ## Not yet done

@@ -4,6 +4,7 @@ records); nothing is sent, published or released.
     python -m wealthryse_agent.jobs holdings_explainer   # daily, after the account sync
     python -m wealthryse_agent.jobs month_end_drafter    # 1st–7th of each month
     python -m wealthryse_agent.jobs data_quality         # daily; also applies chat retention
+    python -m wealthryse_agent.jobs weekly_brief         # Saturdays: each account's weekly brief
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
                                                          # re-check months already released
@@ -32,7 +33,7 @@ from .auth import TokenSource
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings
 from .database import connect
 from .month_team.agents import BudgetExhausted
-from .prompts import HOLDINGS_EXPLAINER, MONTH_END_DRAFTER
+from .prompts import HOLDINGS_EXPLAINER, MONTH_END_DRAFTER, WEEKLY_BRIEF
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -93,6 +94,29 @@ def month_end_drafter(store: Store, tools: ToolClient, agent: Agent, accounts: l
         if ok and store.add_inbox(kind="month_end_draft", account_id=account_id, period_key=period,
                                   title=f"Draft commentary for {account_id}, {period}", body=answer,
                                   citations=citations, run_id=None):
+            written += 1
+    return written
+
+
+def weekly_brief(store: Store, tools: ToolClient, agent: Agent, accounts: list[str], usage: dict) -> int:
+    """One brief per account per week of data, in the website inbox for the people who can see the account."""
+    written = 0
+    for account_id in accounts:
+        end = tools.call("get_data_freshness", {"account_id": account_id})["data"].get("latest_holdings_date")
+        if not end:
+            continue
+        year, week, _ = date.fromisoformat(end).isocalendar()
+        period = f"{year}-W{week:02d}"
+        if store.inbox_exists("weekly_brief", account_id, period):
+            continue
+        start = (date.fromisoformat(end) - timedelta(days=7)).isoformat()
+        task = WEEKLY_BRIEF.format(account_id=account_id, from_date=start, to_date=end)
+        answer, citations, used, ok = _run_agent(
+            agent, tools, account_id, task,
+            ["get_performance", "compare_to_benchmark", "get_holdings_changes", "get_cash_flows", "get_data_freshness"])
+        _sum_usage(usage, used)
+        if ok and store.add_inbox(kind="weekly_brief", account_id=account_id, period_key=period,
+                                  title=f"Your week to {end}", body=answer, citations=citations, run_id=None):
             written += 1
     return written
 
@@ -256,7 +280,7 @@ def operations(store: Store, tools: ToolClient, usage: dict, correlation_id: str
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team",
-                                                  "onboarding", "operations"])
+                                                  "onboarding", "operations", "weekly_brief"])
     parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
@@ -295,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
                 store.finish_run(run_id, status="failed", items=0, usage=usage, error_code="budget_exhausted")
                 return 1
             agent = Agent(ModelSettings.from_env())
-            job = holdings_explainer if args.job == "holdings_explainer" else month_end_drafter
+            job = {"holdings_explainer": holdings_explainer, "weekly_brief": weekly_brief}.get(args.job, month_end_drafter)
             written = job(store, tools, agent, accounts, usage)
         store.finish_run(run_id, status="succeeded", items=written, usage=usage)
         LOGGER.info("%s wrote %s inbox items", args.job, written)

@@ -7,7 +7,7 @@ from ibkr_etl.db import PostgresConnection
 
 OBJECT_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 JOBS = frozenset({"holdings_explainer", "month_end_drafter", "data_quality", "month_team", "onboarding",
-                  "operations"})
+                  "operations", "weekly_brief"})
 
 
 def user_accounts(connection: PostgresConnection, user_object_id: str) -> list[str]:

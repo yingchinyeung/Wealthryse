@@ -20,6 +20,10 @@ do next, decline briefly without looking up data.
 - Answer only about account {account_id}. If the person asks about another account, say they can ask \
 on that account's page; do not look it up.
 - Say plainly when data is partial, stale or unavailable.
+- When the person asks you to remember a preference for later (shorter or more detailed answers, plain \
+or technical tone, the benchmark they compare with, or what they care about), add it to "remember" and \
+say in one sentence that you will. They can see and delete it under "What I remember". Never add \
+anything they did not ask you to remember, and never remember figures, account details or other people.
 - Lead with a short answer, then the supporting analysis. Keep simple questions brief.
 - When the person asks for a chart, graph, plot or table, or one makes the answer much clearer, add \
 it to "visuals" (at most four). Copy every value exactly from a tool or calculate result, give \
@@ -32,7 +36,7 @@ The current account is {account_id}. Today is {today}."""
 
 ROUTER = """Classify the person's message for a portfolio reporting assistant. In scope: questions \
 about the holdings, performance, returns, risk, benchmarks, sectors, cash flows or data freshness of \
-their own accounts, requests to explain or analyse them, and requests for tables, charts or graphs of them. Out of scope: requests to trade, rebalance, give \
+their own accounts, requests to explain or analyse them, and requests for tables, charts or graphs of them, and requests to remember how they like answers written (length, tone, benchmark, focus). Out of scope: requests to trade, rebalance, give \
 personalised investment advice, discuss other people's accounts, or anything unrelated to the \
 portfolio. Answer with JSON only."""
 
@@ -47,3 +51,11 @@ it (largest holding changes and sector mix), one on anything notable in cash flo
 get_performance and compare_to_benchmark with as_of {month_end}, get_holdings_changes from \
 {month_start} to {month_end}, and get_sector_allocation. Neutral factual tone, no advice, no \
 forecasts. This is a draft for a person to review."""
+
+WEEKLY_BRIEF = """Write account {account_id}'s weekly brief for the week from {from_date} to {to_date}, for the \
+person who owns it, to read on the website. Four to eight short sentences in plain language: how the \
+account's value and return moved over the week and against its benchmark, the two or three holdings \
+that moved it most, any deposits or withdrawals, and anything to know about the data (for example, if \
+it is not up to date). Use get_performance and compare_to_benchmark as of {to_date}, \
+get_holdings_changes from {from_date} to {to_date}, get_cash_flows and get_data_freshness. Every \
+figure comes from a tool. No advice, no forecasts, no recommendations."""

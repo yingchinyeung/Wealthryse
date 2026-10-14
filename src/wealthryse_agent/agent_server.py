@@ -17,16 +17,19 @@ import queue
 import re
 import threading
 import uuid
+from datetime import date
 from typing import Any, Callable, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import memory
 from .auth import ServiceCaller, TokenSource, Unauthorized, verify_service_token
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings, ServiceAuthSettings
 from .database import connect
 from .month_team.store import MonthStore
+from .prompts import ANALYST
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -77,6 +80,11 @@ class FeedbackRequest(BaseModel):
     user_object_id: str = Field(pattern=USER_ID)
     rating: int = Field(ge=-1, le=1)
     comment: str | None = Field(default=None, max_length=1000)
+
+
+class MemoryRequest(BaseModel):
+    user_object_id: str = Field(pattern=USER_ID)
+    value: str = Field(min_length=1, max_length=200)
 
 
 class ArchiveRequest(BaseModel):
@@ -160,6 +168,19 @@ def _sse(event: dict[str, Any]) -> str:
     return "data: " + json.dumps(event, default=str) + "\n\n"
 
 
+def _remember(store: Store, user: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Save what the person asked the analyst to remember; anything that fails the checks is dropped."""
+    saved = []
+    for item in items:
+        try:
+            value = memory.clean(str(item.get("key")), item.get("value"))
+        except memory.MemoryError:
+            continue
+        store.remember(user, str(item["key"]), value, "chat")
+        saved.append({"key": item["key"], "label": memory.KEYS[str(item["key"])][0], "value": value})
+    return saved
+
+
 def create_app(services: Services) -> FastAPI:
     app = FastAPI(title="WealthRyse agent", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -204,11 +225,15 @@ def create_app(services: Services) -> FastAPI:
             history = []
         store.add_message(conversation_id, "user", body.message.strip(), correlation_id=correlation_id)
 
+        instructions = ANALYST.format(account_id=body.account_id, today=date.today().isoformat()) \
+            + memory.prompt_block(store.memories(user))
+
         def events() -> Iterator[str]:
             yield _sse({"type": "start", "conversation_id": conversation_id, "correlation_id": correlation_id})
             tools = services.tools_for(user, correlation_id)
             try:
-                run = services.agent().run(question=body.message, account_id=body.account_id, tools=tools, history=history)
+                run = services.agent().run(question=body.message, account_id=body.account_id, tools=tools, history=history,
+                                           instructions=instructions)
                 for event in _with_keepalive(run, services.keepalive_seconds):
                     if event is None:
                         yield ": keepalive\n\n"
@@ -223,6 +248,11 @@ def create_app(services: Services) -> FastAPI:
                             correlation_id=correlation_id, usage=turn.usage)
                         event.pop("reason", None)  # validator detail stays in logs
                         event["message_id"] = message_id
+                        remembered = _remember(store, user, turn.remember) if event["type"] == "answer" else []
+                        yield _sse(event)
+                        if remembered:
+                            yield _sse({"type": "remembered", "memories": remembered})
+                        continue
                     yield _sse(event)
             except AgentError as error:
                 store.add_message(conversation_id, "assistant", error.message, status="failed",
@@ -238,6 +268,32 @@ def create_app(services: Services) -> FastAPI:
 
         return StreamingResponse(events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+    @app.get("/v1/memory")
+    def memories(user_object_id: str = Query(pattern=USER_ID), _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        return {"memories": memory.listed(services.store().memories(user_object_id)),
+                "keys": [{"key": k, "label": label, "choices": list(choices) if choices else None, "max_length": limit}
+                         for k, (label, choices, limit) in memory.KEYS.items()]}
+
+    @app.put("/v1/memory/{key}")
+    def set_memory(key: str, body: MemoryRequest, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        try:
+            value = memory.clean(key, body.value)
+        except memory.MemoryError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        store = services.store()
+        store.remember(body.user_object_id, key, value, "settings")
+        return {"memories": memory.listed(store.memories(body.user_object_id))}
+
+    @app.delete("/v1/memory")
+    def forget_all(user_object_id: str = Query(pattern=USER_ID), _: ServiceCaller = Depends(caller)) -> dict[str, int]:
+        return {"deleted": services.store().forget(user_object_id)}
+
+    @app.delete("/v1/memory/{key}")
+    def forget(key: str, user_object_id: str = Query(pattern=USER_ID), _: ServiceCaller = Depends(caller)) -> dict[str, int]:
+        if key not in memory.KEYS:
+            raise HTTPException(status_code=404, detail="Unknown preference.")
+        return {"deleted": services.store().forget(user_object_id, key)}
 
     @app.get("/v1/conversations")
     def conversations(user_object_id: str, account_id: str, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:

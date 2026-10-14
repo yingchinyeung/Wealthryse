@@ -1,0 +1,17 @@
+{
+ "note": "Postgres migrations confirmed applied in production, with the bootstrap execution that reported it. The release workflow cannot reach the database, so a website switch whose code needs a migration (SWITCHES_NEEDING_MIGRATIONS in deploy/website_release.py) is released only when the migration is recorded here with the sha256 of the file on main. Add an entry in a PR after the execution reports status pass.",
+ "migrations": {
+  "063_live_ibkr_data.sql": {
+   "sha256": "cc08cb45b3a0f0f4a0c1b90bf0903e20d82a4beb7f99fc27405218b20a15df42",
+   "evidence": "ibkrv2stg-bootstrap-268urdk, status pass, 2026-10-14 (live data stage 1)"
+  },
+  "064_broker_connections_and_onboarding_cases.sql": {
+   "sha256": "2cf51768d9de55dc920068afde3f4ea0f4a2214d5037906398b1077ba918a235",
+   "evidence": "ibkrv2stg-bootstrap-l23sdw8, status pass, 2026-10-14 about 10:25 UTC"
+  },
+  "065_onboarding_report_style.sql": {
+   "sha256": "8e3b7a84cfea989d961cd07d2de16a79148b944cce3acb7a52c91171312f7c44",
+   "evidence": "ibkrv2stg-bootstrap-l23sdw8, status pass, 2026-10-14 about 10:25 UTC"
+  }
+ }
+}

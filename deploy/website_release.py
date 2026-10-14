@@ -36,8 +36,10 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
                     'LICENSE')
 # Website switches whose code reads tables from these migrations.
 SWITCHES_NEEDING_MIGRATIONS = {
-    'ONBOARDING_V2_ENABLED': '064_broker_connections_and_onboarding_cases.sql and 065_onboarding_report_style.sql',
+    'ONBOARDING_V2_ENABLED': ('064_broker_connections_and_onboarding_cases.sql', '065_onboarding_report_style.sql'),
 }
+# Migrations confirmed applied in production (this workflow cannot reach the database).
+APPLIED_MIGRATIONS = Path(__file__).resolve().parent / 'applied-migrations.json'
 STATE = Path('release-state.json')
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -127,6 +129,16 @@ def change_set(state, merged=None):
     return diff.stdout, digest(before), digest(after)
 
 
+def unapplied_migrations(switches, commit):
+    """Migrations the switched-on code needs that are not recorded as applied, as on main at commit."""
+    needed = sorted({m for name in switches for m in SWITCHES_NEEDING_MIGRATIONS[name]})
+    if not needed:
+        return []
+    recorded = json.loads(APPLIED_MIGRATIONS.read_text())['migrations']
+    return [m for m in needed if (recorded.get(m) or {}).get('sha256')
+            != hashlib.sha256(git('show', f'{commit}:migrations/postgres/{m}', binary=True)).hexdigest()]
+
+
 def prepare():
     head = git('rev-parse', 'HEAD').strip()
     app = az('containerapp', 'show', '-n', APP, '-g', RG)
@@ -138,10 +150,12 @@ def prepare():
     # created yet stops the release; with the switch off that code stays dark.
     switched_on = [e['name'] for e in containers[0].get('env') or []
                    if e.get('name') in SWITCHES_NEEDING_MIGRATIONS and str(e.get('value', '')).strip().lower() == 'true']
-    if switched_on:
-        raise SystemExit('Switched on for the website: ' + ', '.join(switched_on) + '. Apply '
-                         + ', '.join(SWITCHES_NEEDING_MIGRATIONS[n] for n in switched_on)
-                         + ' with the bootstrap job before releasing, or turn the switch off.')
+    missing = unapplied_migrations(switched_on, head)
+    if missing:
+        raise SystemExit('Switched on for the website: ' + ', '.join(switched_on) + '. Not recorded as applied '
+                         'in deploy/applied-migrations.json (with the sha256 of the file on main): '
+                         + ', '.join(missing) + '. Apply them with the bootstrap job and record them, '
+                         'or turn the switch off.')
     tag = live.split(':')[-1] if '@' not in live else ''
     deployed = tag[len('web-'):] if tag.startswith('web-') and len(tag) == 44 else BASELINE_COMMIT
     if subprocess.run(['git', 'merge-base', '--is-ancestor', deployed, head], cwd=ROOT).returncode:

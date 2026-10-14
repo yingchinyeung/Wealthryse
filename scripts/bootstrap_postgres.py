@@ -275,6 +275,15 @@ def main() -> int:
                     "report_release_decisions, report_artifact_releases TO {}"
                 ).format(sql.Identifier(approval_role))
             )
+            # The new account onboarding pages (064/065) read through the website role and
+            # write through this one; their event history only reads and appends.
+            connection.execute(sql.SQL(
+                "GRANT SELECT, INSERT, UPDATE ON TABLE broker_connections, broker_connection_accounts, "
+                "broker_onboarding_cases, broker_onboarding_checks, broker_onboarding_approvals TO {}"
+            ).format(sql.Identifier(approval_role)))
+            connection.execute(sql.SQL(
+                "GRANT SELECT, INSERT ON TABLE broker_onboarding_events TO {}"
+            ).format(sql.Identifier(approval_role)))
             connection.execute(sql.SQL(
                 "GRANT SELECT ON TABLE qualified_report_designs, active_report_designs TO {}"
             ).format(sql.Identifier(approval_role)))

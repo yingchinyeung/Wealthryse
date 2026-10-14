@@ -291,7 +291,7 @@ const css=`.wr-fab{position:fixed;right:20px;bottom:20px;z-index:50;border:0;bor
 .wr-rate{margin-top:6px;display:flex;gap:6px}.wr-rate button{border:1px solid var(--border,#ccc);background:none;border-radius:6px;cursor:pointer;padding:1px 6px;color:inherit}
 .wr-form{display:flex;gap:8px;padding:10px;border-top:1px solid var(--border,#ddd)}.wr-form textarea{flex:1;resize:none;height:44px;font:inherit;font-size:14px;padding:8px;border-radius:8px;border:1px solid var(--border,#ccc);background:transparent;color:inherit}
 .wr-form button{border:0;border-radius:8px;padding:0 14px;font:inherit;font-weight:600;cursor:pointer;background:var(--accent,#1f6feb);color:#fff}
-.wr-explain{margin-left:8px;font-size:12px;border:1px solid var(--border,#ccc);background:none;border-radius:999px;padding:1px 8px;cursor:pointer;color:inherit;vertical-align:middle}
+.wr-alert{text-decoration:none;color:#8a5a00;border-color:rgba(194,137,0,.4)}.wr-explain{margin-left:8px;font-size:12px;border:1px solid var(--border,#ccc);background:none;border-radius:999px;padding:1px 8px;cursor:pointer;color:inherit;vertical-align:middle}
 .wr-panel.wide{width:min(760px,calc(100vw - 32px));height:min(780px,calc(100vh - 120px))}
 .wr-visual{margin:8px 0 4px;padding:0}.wr-visual figcaption{font-weight:600;font-size:13px;margin-bottom:4px}.wr-chart{width:100%;height:auto;display:block;overflow:visible}
 .wr-chart .wr-tick{font-size:10px;fill:currentColor;opacity:.75}.wr-chart .wr-grid{stroke:currentColor;opacity:.12}.wr-chart .wr-axis{stroke:currentColor;opacity:.45}
@@ -354,8 +354,13 @@ function init(){
  input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
  const explain=()=>{document.querySelectorAll('.page-view.active .card > .label').forEach((label,n)=>{if(n>=6||label.querySelector('.wr-explain'))return;
   const topic=label.textContent.replace(/[·—].*$/,'').trim();if(!topic)return;const b=document.createElement('button');b.type='button';b.className='wr-explain';b.textContent='Explain';
-  b.setAttribute('aria-label','Explain '+topic);b.addEventListener('click',()=>{open();ask(`Explain the ${topic.toLowerCase()} for this account as of the latest data.`)});label.appendChild(b)})};
- explain();new MutationObserver(()=>explain()).observe(document.querySelector('main')||document.body,{childList:true,subtree:false});
+  const live=label.closest('.live-card');const question=live?'Explain what moved this account today, using the live data.':`Explain the ${topic.toLowerCase()} for this account as of the latest data.`;
+  b.setAttribute('aria-label','Explain '+topic);b.addEventListener('click',()=>{open();ask(question)});label.appendChild(b)})};
+ const alerts=()=>{const label=document.querySelector('.live-card > .label');if(!label||label.querySelector('.wr-alert'))return;
+  fetch('/api/agents/inbox',{credentials:'same-origin'}).then(r=>r.ok?r.json():{items:[]}).then(d=>{const today=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Hong_Kong'});
+   const n=(d.items||[]).filter(x=>x.kind==='live_alert'&&x.subject_id===account&&x.status==='new'&&String(x.period_key).startsWith(today)).length;
+   if(!n||label.querySelector('.wr-alert'))return;const a=document.createElement('a');a.className='wr-explain wr-alert';a.href='/agent-inbox';a.textContent=n===1?'1 alert today':n+' alerts today';label.appendChild(a)}).catch(()=>{})};
+ explain();alerts();new MutationObserver(()=>explain()).observe(document.querySelector('main')||document.body,{childList:true,subtree:false});
 }
 })();"""
 

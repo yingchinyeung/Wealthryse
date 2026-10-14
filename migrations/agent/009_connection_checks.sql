@@ -23,13 +23,8 @@
 --   2. agent.queue_first_connection_check(), the only write the agent makes
 --      outside its own schema;
 --   3. agent.connection_reports, what the agent found, which the platform
---      posts to the administrator's system updates;
---   4. the final, validated lists of jobs and inbox kinds.
---
--- The installer applies every file again on each run, and the earlier files
--- each set a shorter list. Those now add their lists NOT VALID, so rows of a
--- later job or kind do not stop a re-run; the last file sets the full list and
--- validates it. A later file that adds a job or kind does the same.
+--      posts to the administrator's system updates.
+
 
 CREATE OR REPLACE FUNCTION agent.scoped_broker_logins()
 RETURNS TABLE (
@@ -126,17 +121,6 @@ CREATE TABLE IF NOT EXISTS agent.connection_reports (
     created_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE (tenant_id, flex_source_id, report_key)
 );
-
-ALTER TABLE agent.service_grants DROP CONSTRAINT IF EXISTS service_grants_job_name_check;
-ALTER TABLE agent.service_grants ADD CONSTRAINT service_grants_job_name_check
-    CHECK (job_name IN ('holdings_explainer', 'month_end_drafter', 'data_quality', 'month_team', 'onboarding',
-                        'operations', 'weekly_brief'));
-
-ALTER TABLE agent.inbox DROP CONSTRAINT IF EXISTS inbox_kind_check;
-ALTER TABLE agent.inbox ADD CONSTRAINT inbox_kind_check CHECK (kind IN (
-    'holdings_explainer', 'month_end_draft', 'data_quality',
-    'month_end_report', 'month_end_hold', 'month_end_dispute',
-    'onboarding_watch', 'weekly_brief'));
 
 REVOKE ALL ON agent.broker_logins, agent.connection_reports FROM PUBLIC;
 REVOKE ALL ON FUNCTION agent.scoped_broker_logins(), agent.queue_first_connection_check(uuid) FROM PUBLIC;

@@ -206,6 +206,60 @@ class AgentDatabaseTests(unittest.TestCase):
         self.assertAlmostEqual(data["from_trades"], 5 * 220)
         self.assertAlmostEqual(data["from_fx"], 40000 * 0.001)
 
+    def test_stress_test_revalues_the_latest_holdings(self):
+        def run(shocks):
+            result = self._call("run_stress_test", {"account_id": "UTEST1", "shocks": shocks}, user=VIEWER)
+            return result["structuredContent"]["data"]
+
+        hk = run([{"kind": "market", "match": "hong kong", "change": -0.1}])
+        self.assertAlmostEqual(hk["total_impact"], -541.8)
+        self.assertAlmostEqual(hk["impact_of_nav"], -541.8 / 12705)
+        self.assertEqual([r["symbol"] for r in hk["largest_impacts"]], ["700"])
+        both = run([{"kind": "market", "match": "hong kong", "change": -0.1},
+                    {"kind": "currency", "match": "HKD", "change": -0.05},
+                    {"kind": "symbol", "match": "MSFT", "change": 0.2}])
+        self.assertAlmostEqual(both["total_impact"], 5418 * (0.9 * 0.95 - 1))
+        self.assertEqual(both["shocks_matching_nothing"], [{"kind": "symbol", "match": "MSFT", "change": 0.2}])
+        self.assertAlmostEqual(run([{"kind": "currency", "match": "USD", "change": -0.5}])["total_impact"], 0.0)
+        refused = self._call("run_stress_test", {"account_id": "UTEST1", "shocks": [
+            {"kind": "market", "match": "atlantis", "change": -0.1}]}, user=VIEWER)
+        self.assertTrue(refused["isError"])
+
+    def test_live_snapshot_only_when_the_live_view_is_active(self):
+        import psycopg
+
+        def snapshot():
+            return self._call("get_live_snapshot", {"account_id": "UTEST1"}, user=VIEWER)["structuredContent"]["data"]
+
+        self.assertFalse(snapshot()["available"])
+        with psycopg.connect(_dsn(ADMIN_DSN, self.database, "agent_test_owner"),
+                             options=f"-c app.tenant_id={TENANT}") as owner:
+            owner.execute("INSERT INTO live_gateway_status(tenant_id, observed_at, gateway_state, collector_version) "
+                          "VALUES (%s, now(), 'connected', 'test')", (TENANT,))
+            owner.execute("INSERT INTO live_account_values(tenant_id, account_id, observed_at, base_currency, "
+                          "net_liquidation, total_cash, daily_pnl) VALUES (%s, 'UTEST1', now(), 'USD', 10200, 500, 200)",
+                          (TENANT,))
+            owner.execute("INSERT INTO live_positions(tenant_id, account_id, observed_at, conid, symbol, sec_type, "
+                          "currency, quantity, market_value, daily_pnl) SELECT %s, 'UTEST1', observed_at, '265598', "
+                          "'AAPL', 'STK', 'USD', 15, 3300, 180 FROM live_account_values WHERE account_id = 'UTEST1'",
+                          (TENANT,))
+            owner.execute("INSERT INTO live_quotes(tenant_id, conid, observed_at, symbol, currency, last_price, "
+                          "prior_close, market_data_type) VALUES (%s, '265598', now(), 'AAPL', 'USD', 220, 200, 1)",
+                          (TENANT,))
+            self.assertFalse(snapshot()["available"])  # stored, but the switch is off
+            owner.execute("INSERT INTO subject_feature_states(tenant_id, subject_id, feature_key, feature_state, reason) "
+                          "VALUES (%s, 'UTEST1', 'live_view', 'preview', 'test')", (TENANT,))
+            owner.commit()
+            self.assertFalse(snapshot()["available"])  # the pilot stays the owner's own website view
+            owner.execute("UPDATE subject_feature_states SET feature_state = 'active' WHERE subject_id = 'UTEST1' "
+                          "AND feature_key = 'live_view'")
+            owner.commit()
+        data = snapshot()
+        self.assertTrue(data["available"])
+        self.assertAlmostEqual(data["daily_return"], 200 / 10000)
+        self.assertEqual(data["largest_movers"][0]["symbol"], "AAPL")
+        self.assertAlmostEqual(data["largest_movers"][0]["change_since_prior_close"], 0.1)
+
     def test_performance_uses_the_deposit(self):
         data = self._call("get_performance", {"account_id": "UTEST1"}, user=VIEWER)["structuredContent"]["data"]
         mtd = next(p for p in data["periods"] if p["key"] == "mtd")

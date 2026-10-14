@@ -958,6 +958,157 @@ def list_live_onboarding_cases(connection, arguments: Mapping[str, Any]) -> dict
     return {"as_of": None, "data": {"cases": cases}, "citations": [_citation("broker_onboarding_cases", None)]}
 
 
+# Live market data and stress tests -------------------------------------------------------
+
+_MARKETS = {
+    "hong kong": {"SEHK", "HKFE"},
+    "china": {"SEHKNTL", "SEHKSZSE", "SSE", "SZSE"},
+    "united states": {"NYSE", "NASDAQ", "ARCA", "AMEX", "BATS", "IEX", "PINK", "NMS", "ISLAND", "CBOE"},
+    "japan": {"TSE", "TSEJ", "OSE.JPN"},
+    "korea": {"KSE", "KOSDAQ"},
+    "singapore": {"SGX"},
+    "taiwan": {"TWSE", "TPEX"},
+    "united kingdom": {"LSE", "LSEETF"},
+    "europe": {"IBIS", "XETRA", "SBF", "AEB", "EBS", "BVME", "BM", "FWB"},
+    "australia": {"ASX"},
+}
+_SHOCK_KINDS = ("all", "market", "currency", "sector", "asset_class", "symbol")
+MAX_SHOCK = 0.9
+
+
+def _market(exchange: Any) -> str | None:
+    code = str(exchange or "").upper()
+    return next((name for name, codes in _MARKETS.items() if code in codes), None)
+
+
+def _shocks(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 10:
+        raise ToolError("invalid_arguments", "shocks must list 1 to 10 shocks.", 400)
+    clean = []
+    for shock in value:
+        if not isinstance(shock, Mapping) or set(shock) - {"kind", "match", "change"}:
+            raise ToolError("invalid_arguments", "Each shock has kind, match and change only.", 400)
+        kind, match, change = shock.get("kind"), str(shock.get("match") or "").strip(), shock.get("change")
+        if kind not in _SHOCK_KINDS:
+            raise ToolError("invalid_arguments", "kind must be one of: " + ", ".join(_SHOCK_KINDS) + ".", 400)
+        if kind != "all" and not 1 <= len(match) <= 40:
+            raise ToolError("invalid_arguments", "match names the market, currency, sector, asset class or symbol.", 400)
+        if kind == "market" and match.lower() not in _MARKETS:
+            raise ToolError("invalid_arguments", "market must be one of: " + ", ".join(sorted(_MARKETS)) + ".", 400)
+        if isinstance(change, bool) or not isinstance(change, (int, float)) or not -MAX_SHOCK <= change <= MAX_SHOCK:
+            raise ToolError("invalid_arguments", "change is a fraction between -0.9 and 0.9 (-0.1 means a 10% fall).", 400)
+        clean.append({"kind": kind, "match": match, "change": float(change)})
+    return clean
+
+
+def _hit(shock: Mapping[str, Any], row: Mapping[str, Any]) -> bool:
+    match = str(shock["match"]).lower()
+    return {
+        "all": lambda: True,
+        "market": lambda: _market(row.get("listing_exchange") or row.get("exchange")) == match,
+        "currency": lambda: str(row.get("native_currency") or "").lower() == match,
+        "sector": lambda: str(row.get("sector") or "").lower() == match,
+        "asset_class": lambda: str(row.get("asset_category") or "").lower() == match,
+        "symbol": lambda: str(row.get("symbol") or "").lower() == match,
+    }[shock["kind"]]()
+
+
+def run_stress_test(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Revalue the latest statement holdings under hypothetical price and currency moves."""
+    account_id = str(arguments["account_id"])
+    shocks = _shocks(arguments.get("shocks"))
+    subject = _subject(connection, account_id)
+    if str(subject["subject_type"]) == "composite_portfolio":
+        raise ToolError("not_supported", "Stress tests need traded positions; model portfolios have none.")
+    as_of = _latest_nav_date(connection, account_id, None)
+    snapshot, holdings, _, _ = _valued_holdings(connection, subject, as_of)
+    if snapshot is None or not holdings:
+        raise ToolError("no_holdings", "No holdings are recorded for this account.", 404)
+    currency = _reporting_currency(subject)
+    nav = connection.execute(
+        f"SELECT total_text FROM subject_nav_series WHERE subject_id = ? AND snapshot_date = ? "
+        f"AND currency = {ACTIVE_NAV_CURRENCY_SQL}", (account_id, snapshot)).fetchone()
+    total, rows, unmatched = 0.0, [], [i for i, _ in enumerate(shocks)]
+    for h in holdings:
+        value = float(h["market_value_text"])
+        factor = 1.0
+        for i, shock in enumerate(shocks):
+            if shock["kind"] != "currency" and _hit(shock, h):
+                factor *= 1 + shock["change"]
+                unmatched = [u for u in unmatched if u != i]
+        for i, shock in enumerate(shocks):
+            # A currency move changes the reporting-currency value of holdings priced in that currency.
+            if shock["kind"] == "currency" and _hit(shock, h) and shock["match"].upper() != currency:
+                factor *= 1 + shock["change"]
+                unmatched = [u for u in unmatched if u != i]
+        impact = value * (factor - 1)
+        total += impact
+        if impact:
+            rows.append({"symbol": h.get("symbol") or h.get("conid"), "market": _market(h.get("listing_exchange")),
+                         "native_currency": h.get("native_currency"), "sector": h.get("sector"),
+                         "market_value": value, "impact": impact})
+    rows.sort(key=lambda r: abs(r["impact"]), reverse=True)
+    nav_value = float(nav["total_text"]) if nav and nav["total_text"] not in (None, "") else None
+    return {
+        "as_of": snapshot,
+        "data": {"currency": currency, "holdings_date": snapshot, "shocks": shocks, "total_impact": total,
+                 "impact_of_nav": total / nav_value if nav_value else None, "nav": nav_value,
+                 "positions_affected": len(rows), "largest_impacts": rows[:15],
+                 "shocks_matching_nothing": [shocks[i] for i in unmatched],
+                 "method": "Each holding's reporting-currency value times the product of (1 + change) for every "
+                           "shock that matches it. Cash, derivatives' leverage and correlations are not modelled."},
+        "citations": [_citation("subject_position_series", account_id, date=snapshot),
+                      _citation("fx_rates", account_id, date=snapshot)],
+    }
+
+
+def get_live_snapshot(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """The collector's latest live snapshot for an account whose live view is switched on."""
+    from ibkr_etl.live_view import freshness
+
+    account_id = str(arguments["account_id"])
+    summary = connection.execute(
+        "SELECT observed_at, base_currency, net_liquidation, total_cash, daily_pnl, unrealized_pnl, realized_pnl "
+        "FROM live_summary WHERE subject_id = ?", (account_id,)).fetchone()
+    citations = [_citation("live_account_values", account_id)]
+    if summary is None:
+        return {"as_of": None, "citations": citations, "data": {
+            "available": False,
+            "reason": "Live data is not switched on for this account, or the collector has not stored any yet. "
+                      "Figures from the daily statement are still available."}}
+    gateway = connection.execute("SELECT observed_at, gateway_state FROM live_gateway").fetchone()
+    positions = [dict(r) for r in connection.execute(
+        "SELECT symbol, description, sec_type, currency, primary_exchange, industry, quantity, market_price, "
+        "market_value, unrealized_pnl, daily_pnl, last_price, prior_close, market_data_type FROM live_positions "
+        "WHERE subject_id = ? ORDER BY abs(COALESCE(daily_pnl, 0)) DESC, abs(COALESCE(market_value, 0)) DESC",
+        (account_id,)).fetchall()]
+    for p in positions:
+        last, prior = p.get("last_price"), p.get("prior_close")
+        p["change_since_prior_close"] = (float(last) / float(prior) - 1) if last and prior else None
+        p["delayed"] = p.pop("market_data_type") in (3, 4)
+    trades = connection.execute("SELECT count(*) AS n FROM live_executions WHERE subject_id = ?",
+                                (account_id,)).fetchone()
+    observed = summary["observed_at"]
+    state = freshness(datetime.now(timezone.utc), dict(gateway) if gateway else None,
+                      observed if isinstance(observed, datetime) else None,
+                      sum(1 for p in positions if p["delayed"]))
+    nav, daily = summary["net_liquidation"], summary["daily_pnl"]
+    start = float(nav) - float(daily) if nav is not None and daily is not None else None
+    return {
+        "as_of": str(observed),
+        "data": {"available": True, "state": state["state"], "markets_open": state["markets_open"],
+                 "observed_at": str(observed), "base_currency": summary["base_currency"],
+                 "net_liquidation": summary["net_liquidation"], "total_cash": summary["total_cash"],
+                 "daily_pnl": daily, "daily_return": float(daily) / start if start else None,
+                 "unrealized_pnl": summary["unrealized_pnl"], "realized_pnl": summary["realized_pnl"],
+                 "positions": len(positions), "largest_movers": positions[:10],
+                 "executions_last_24h": int(trades["n"]) if trades else 0,
+                 "note": "Live figures come from IBKR's gateway and are not the book of record; position values "
+                         "are in each position's own currency. The daily statement is the book of record."},
+        "citations": citations + [_citation("live_positions", account_id), _citation("live_quotes", account_id)],
+    }
+
+
 def list_broker_logins(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
     """The tenant's IBKR logins with their latest check: statuses, dates and counts, never the token."""
     rows = connection.execute(
@@ -1083,6 +1234,22 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("list_live_onboarding_cases", "Onboarding cases that went live and wait for their first month-end, "
              "with the go-live time, latest data and assurance dates, and whether the month-end team has access.",
              _schema({}, []), list_live_onboarding_cases, False, only_jobs=ONBOARDING),
+    ToolSpec("get_live_snapshot", "The latest live snapshot from IBKR for an account whose live view is on: net "
+             "liquidation value, today's P&L and return, cash, the biggest movers today with their change since the "
+             "prior close, and today's executions count. Says when live data is not available.",
+             _schema({"account_id": _ACCOUNT}, ["account_id"]), get_live_snapshot),
+    ToolSpec("run_stress_test", "Revalue the latest statement holdings under hypothetical moves, such as Hong Kong "
+             "falling 10% or the yen falling 5% against the reporting currency. Returns the total impact, the impact "
+             "as a share of NAV and the holdings most affected.",
+             _schema({"account_id": _ACCOUNT, "shocks": {
+                 "type": "array", "minItems": 1, "maxItems": 10, "items": {
+                     "type": "object", "additionalProperties": False, "required": ["kind", "match", "change"],
+                     "properties": {
+                         "kind": {"type": "string", "enum": list(_SHOCK_KINDS)},
+                         "match": {"type": "string", "description": "market (" + ", ".join(sorted(_MARKETS)) + "), "
+                                   "currency code, sector, asset class or symbol; ignored for all"},
+                         "change": {"type": "number", "description": "fraction, -0.1 means a 10% fall"}}}}},
+                     ["account_id", "shocks"]), run_stress_test),
     ToolSpec("list_broker_logins", "The IBKR logins added for onboarding, with the latest check of each: its "
              "status, IBKR's error code if it failed, and how many accounts it found.", _schema({}, []),
              list_broker_logins, False, only_jobs=ONBOARDING),

@@ -491,6 +491,42 @@ covers only the accounts granted to it (`--grant weekly_brief=<account>`).
    `ibkrv2stg-agent-weekly-brief`, and grant the accounts that should get
    briefs.
 
+## Live market agent
+
+It builds on PR 58's read-only IBKR data: the collector on the gateway VM
+stores live account values, positions, quotes and executions. The agent reads
+only those stored rows (`010_live_market.sql`): it never runs on the VM and
+never connects to the gateway, so it has no route to an order. Like the
+website, it shows an account's live data only when that account's
+`live_view` switch is `active`; the `preview` pilot stays the owner's own
+website view.
+
+- **Chat.** Two new tools for website chat. `get_live_snapshot` gives today's
+  net liquidation value, P&L and return, cash, the biggest movers with their
+  change since the prior close, and today's executions count, or says live
+  data is not available. `run_stress_test` revalues the latest statement
+  holdings under hypothetical moves ("Hong Kong falls 10%", "the yen falls 5%")
+  by market, currency, sector, asset class or symbol, and returns the total
+  impact, its share of NAV and the holdings most affected. Arithmetic runs in
+  code, and the answer's figures pass the same check as every chat answer.
+  Live positions and chat use `wr-analyst-astra`, as decided.
+- **Alerts.** The `live_market` job (`ibkrv2stg-agent-live-market`) runs every
+  15 minutes on weekdays in Hong Kong and US trading hours. For each account
+  granted to it with its live view on, it posts an inbox card, once a day per
+  rule, when the account is up or down 2% today or one position adds or takes
+  0.75% of its value. The analyst writes a short explanation from the live
+  tools; if the explanation fails the figure check, the card says what moved
+  and leaves the explanation out. Nothing is sent outside the website.
+- **Website.** The "Live now" card gets an Explain button that asks the
+  analyst what moved the account today, and a badge linking to the inbox when
+  today has alerts for that account.
+
+**Turning it on** (each step needs Ying's typed approval naming the resources):
+PR 58's gateway VM and collector first, per `docs/LIVE_IBKR_DATA.md`; then
+rerun `scripts/install_agent_schema.py` (applies `010_live_market.sql`), rebuild
+the agent and platform images, deploy `infra/agent-apps.bicep`, and grant
+accounts to the job with `--grant live_market=<account>`.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool
@@ -508,6 +544,9 @@ covers only the accounts granted to it (`--grant weekly_brief=<account>`).
   model only for a new incident, with its own monthly budget (`opsTokenBudget`).
 - Weekly briefs: one model run per granted account per week, within the
   daily token budget.
+- Live market alerts: a short job every 15 minutes in trading hours that
+  reads stored rows only and calls the model once per alert (at most one per
+  rule, account and day), within the daily token budget.
 - No new database server.
 
 ## Not yet done

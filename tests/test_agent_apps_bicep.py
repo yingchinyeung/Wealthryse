@@ -9,7 +9,7 @@ FOUNDATION = BICEP.with_name("agent-foundation.bicep")
 class AgentAppsBicepTest(unittest.TestCase):
     def test_job_names_fit_container_apps_limit(self):
         names = re.findall(r"\{\s*name:\s*'([^']+)',\s*job:", BICEP.read_text())
-        self.assertEqual(len(names), 4)
+        self.assertEqual(len(names), 5)
         for name in names:
             self.assertTrue(2 <= len(name) <= 32, f"{name} is {len(name)} characters")
 

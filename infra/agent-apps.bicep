@@ -242,6 +242,10 @@ var jobs = [
   { name: 'ibkrv2stg-agent-data-quality', job: 'data_quality', cron: '0 1 * * *' }
   // 09:30 HKT on Saturdays: each granted account's weekly brief, in the website inbox only.
   { name: 'ibkrv2stg-agent-weekly-brief', job: 'weekly_brief', cron: '30 1 * * 6' }
+  // Every 15 minutes on weekdays across Hong Kong and US trading hours (the job itself checks the
+  // market is open): alerts on big live moves of granted accounts whose live view is on. Reads only
+  // what PR 58's collector stored; never the gateway.
+  { name: 'ibkrv2stg-agent-live-market', job: 'live_market', cron: '*/15 1-8,13-21 * * 1-5' }
 ]
 
 resource agentJobs 'Microsoft.App/jobs@2024-03-01' = [for j in jobs: {

@@ -5,6 +5,8 @@ records); nothing is sent, published or released.
     python -m wealthryse_agent.jobs month_end_drafter    # 1st–7th of each month
     python -m wealthryse_agent.jobs data_quality         # daily; also applies chat retention
     python -m wealthryse_agent.jobs weekly_brief         # Saturdays: each account's weekly brief
+    python -m wealthryse_agent.jobs live_market          # every 15 minutes in trading hours: alert on big
+                                                         # live moves, with an explanation
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
                                                          # re-check months already released
@@ -26,14 +28,15 @@ import argparse
 import logging
 import sys
 import uuid
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from .auth import TokenSource
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings
 from .database import connect
 from .month_team.agents import BudgetExhausted
-from .prompts import HOLDINGS_EXPLAINER, MONTH_END_DRAFTER, WEEKLY_BRIEF
+from .prompts import HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, WEEKLY_BRIEF
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -118,6 +121,68 @@ def weekly_brief(store: Store, tools: ToolClient, agent: Agent, accounts: list[s
         if ok and store.add_inbox(kind="weekly_brief", account_id=account_id, period_key=period,
                                   title=f"Your week to {end}", body=answer, citations=citations, run_id=None):
             written += 1
+    return written
+
+
+LIVE_ACCOUNT_MOVE = 0.02     # the account up or down 2% today
+LIVE_POSITION_PNL = 0.0075   # one position adding or taking 0.75% of the account's value today
+HONG_KONG = ZoneInfo("Asia/Hong_Kong")
+
+
+def live_triggers(snapshot: dict[str, Any], account_move: float = LIVE_ACCOUNT_MOVE,
+                  position_pnl: float = LIVE_POSITION_PNL) -> list[tuple[str, str, str]]:
+    """(key, title, trigger in words) for each alert today's live snapshot warrants. Deterministic; no model."""
+    if not snapshot.get("available") or snapshot.get("state") not in ("live", "delayed"):
+        return []
+    out = []
+    currency, daily_return = snapshot.get("base_currency"), snapshot.get("daily_return")
+    if daily_return is not None and abs(daily_return) >= account_move:
+        way = "up" if daily_return > 0 else "down"
+        out.append((f"account:{way}", f"{snapshot['account_label']} is {way} {abs(daily_return):.1%} today",
+                    f"the account is {way} {abs(daily_return):.1%} today ({snapshot.get('daily_pnl'):,.0f} {currency})"))
+    start = None
+    if snapshot.get("net_liquidation") is not None and snapshot.get("daily_pnl") is not None:
+        start = float(snapshot["net_liquidation"]) - float(snapshot["daily_pnl"])
+    for mover in snapshot.get("largest_movers") or []:
+        pnl = mover.get("daily_pnl")
+        if start and pnl is not None and abs(float(pnl)) / start >= position_pnl:
+            way = "added" if float(pnl) > 0 else "took"
+            share = abs(float(pnl)) / start
+            out.append((f"position:{mover['symbol']}:{'up' if float(pnl) > 0 else 'down'}",
+                        f"{mover['symbol']} {way} {share:.1%} {'to' if float(pnl) > 0 else 'from'} "
+                        f"{snapshot['account_label']} today",
+                        f"{mover['symbol']} {way} {abs(float(pnl)):,.0f} {currency} ({share:.1%} of the account) today"))
+    return out
+
+
+def live_market(store: Store, tools: ToolClient, agent: Agent, accounts: list[str], usage: dict,
+                now: datetime | None = None) -> int:
+    """Alert, once a day per rule, on big live moves of accounts whose live view is on, with an explanation."""
+    from ibkr_etl.live_collector import markets_open
+
+    now = now or datetime.now(timezone.utc)
+    if not markets_open(now):
+        return 0
+    today = now.astimezone(HONG_KONG).date().isoformat()
+    written = 0
+    for account_id in accounts:
+        snapshot = tools.call("get_live_snapshot", {"account_id": account_id})["data"]
+        snapshot["account_label"] = account_id
+        for key, title, trigger in live_triggers(snapshot):
+            period = f"{today}:{key}"
+            if store.inbox_exists("live_alert", account_id, period):
+                continue
+            answer, citations, used, ok = _run_agent(
+                agent, tools, account_id, LIVE_ALERT.format(account_id=account_id, trigger=trigger),
+                ["get_live_snapshot", "get_sector_allocation", "get_holdings"])
+            _sum_usage(usage, used)
+            body = answer if ok else (f"Live data shows {trigger}. The explanation could not be checked against "
+                                      "the figures, so it is left out; open the account's Live now panel for detail. "
+                                      "Live figures are not the book of record.")
+            if store.add_inbox(kind="live_alert", account_id=account_id, period_key=period, title=title, body=body,
+                               citations=citations if ok else [{"source": "live_account_values",
+                                                                "account_id": account_id}], run_id=None):
+                written += 1
     return written
 
 
@@ -282,7 +347,7 @@ def operations(store: Store, tools: ToolClient, usage: dict, correlation_id: str
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team",
-                                                  "onboarding", "operations", "weekly_brief"])
+                                                  "onboarding", "operations", "weekly_brief", "live_market"])
     parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
@@ -321,7 +386,8 @@ def main(argv: list[str] | None = None) -> int:
                 store.finish_run(run_id, status="failed", items=0, usage=usage, error_code="budget_exhausted")
                 return 1
             agent = Agent(ModelSettings.from_env())
-            job = {"holdings_explainer": holdings_explainer, "weekly_brief": weekly_brief}.get(args.job, month_end_drafter)
+            job = {"holdings_explainer": holdings_explainer, "weekly_brief": weekly_brief,
+                   "live_market": live_market}.get(args.job, month_end_drafter)
             written = job(store, tools, agent, accounts, usage)
         store.finish_run(run_id, status="succeeded", items=written, usage=usage)
         LOGGER.info("%s wrote %s inbox items", args.job, written)

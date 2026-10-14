@@ -26,7 +26,12 @@
 --      posts to the administrator's system updates.
 
 
-CREATE OR REPLACE FUNCTION agent.scoped_broker_logins()
+-- Dropped first: 011_connection_recipe.sql widens this view, and the installer
+-- applies every file again on each run.
+DROP VIEW IF EXISTS agent.broker_logins;
+DROP FUNCTION IF EXISTS agent.scoped_broker_logins();
+
+CREATE FUNCTION agent.scoped_broker_logins()
 RETURNS TABLE (
     connection_id uuid, display_name text, connection_status text, credential_expires_on date,
     flex_source_id uuid, source_status text, credential_status text,

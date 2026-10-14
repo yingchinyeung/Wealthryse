@@ -1116,7 +1116,7 @@ def list_broker_logins(connection, arguments: Mapping[str, Any]) -> dict[str, An
         "flex_source_id::text AS flex_source_id, source_status, credential_status, blocked_until, "
         "requires_manual_reset, checks_requested, latest_request_id::text AS latest_request_id, latest_status, "
         "latest_error_phase, latest_error_code, latest_created_at, latest_completed_at, latest_account_count, "
-        "accounts_found FROM broker_logins ORDER BY display_name, connection_id"
+        "accounts_found, latest_recipe FROM broker_logins ORDER BY display_name, connection_id"
     ).fetchall()
     stamps = ("credential_expires_on", "blocked_until", "latest_created_at", "latest_completed_at")
     logins = [{key: (str(value) if key in stamps and value is not None else value)
@@ -1251,7 +1251,7 @@ TOOLS: tuple[ToolSpec, ...] = (
                          "change": {"type": "number", "description": "fraction, -0.1 means a 10% fall"}}}}},
                      ["account_id", "shocks"]), run_stress_test),
     ToolSpec("list_broker_logins", "The IBKR logins added for onboarding, with the latest check of each: its "
-             "status, IBKR's error code if it failed, and how many accounts it found.", _schema({}, []),
+             "status, IBKR's error code if it failed, how many accounts it found, and what its Flex query lacks.", _schema({}, []),
              list_broker_logins, False, only_jobs=ONBOARDING),
     ToolSpec("list_open_incidents", "The autonomous administrator's open and acknowledged incidents, with its "
              "evidence, for the operations agent to investigate.", _schema({}, []), list_open_incidents, False,

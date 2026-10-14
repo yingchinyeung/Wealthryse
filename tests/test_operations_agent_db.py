@@ -353,6 +353,12 @@ class OperationsAgentDatabaseTests(unittest.TestCase):
         self.assertEqual([r["state"] for r in reports], ["queued", "blocked"])
         self.assertIn("the token has expired (IBKR error 1012)", reports[1]["body"])
         self.assertNotIn(secret, str(reports))
+        owner.execute("UPDATE ibkr_flex_source_validation_requests SET result_json = "
+                      "'{\"recipe\": {\"status\": \"warn\", \"problems\": []}}'::jsonb WHERE flex_source_id = %s",
+                      (source,))
+        owner.commit()
+        self.assertEqual(call("list_broker_logins", {})["data"]["logins"][0]["latest_recipe"],
+                         {"status": "warn", "problems": []})
 
         # The writer can queue checks only through the function, and cannot read the platform tables.
         with self.assertRaises(psycopg.errors.InsufficientPrivilege):

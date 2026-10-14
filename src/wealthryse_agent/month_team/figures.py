@@ -75,6 +75,9 @@ class FigureSet:
                 "unavailable": self.unavailable}
 
 
+RANKS = {1: "largest", 2: "second-largest", 3: "third-largest"}
+
+
 def build_figure_set(call: ToolCall, account_id: str, period_end: str) -> dict[str, Any]:
     """Month, year-to-date and since-inception returns, the benchmark difference, risk and contributors."""
     from ..tool_client import ToolCallFailed
@@ -132,12 +135,13 @@ def build_figure_set(call: ToolCall, account_id: str, period_end: str) -> dict[s
                                                  "to_date": period_end})
         source = figures.source(changes)
         moves = sorted(changes["data"]["changes"], key=lambda c: c.get("from_price") or 0.0)
+        # Ranks in words: the writer copies labels, and the deck's commentary may not hold a digit.
         for n, row in enumerate([m for m in reversed(moves) if (m.get("from_price") or 0) > 0][:3], 1):
-            figures.add(f"contributor.{n}", f"Price gain from {row['symbol']} (contributor {n})", row["from_price"],
-                        "currency", source)
+            figures.add(f"contributor.{n}", f"Price gain from {row['symbol']}, the {RANKS[n]} contributor",
+                        row["from_price"], "currency", source)
         for n, row in enumerate([m for m in moves if (m.get("from_price") or 0) < 0][:3], 1):
-            figures.add(f"detractor.{n}", f"Price loss from {row['symbol']} (detractor {n})", row["from_price"],
-                        "currency", source)
+            figures.add(f"detractor.{n}", f"Price loss from {row['symbol']}, the {RANKS[n]} detractor",
+                        row["from_price"], "currency", source)
         figures.add("month.price_effect", "Change in holdings value from prices", changes["data"].get("from_price"),
                     "currency", source)
         figures.add("month.fx_effect", "Change in holdings value from currencies", changes["data"].get("from_fx"),

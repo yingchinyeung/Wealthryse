@@ -94,6 +94,10 @@ class MonthTeamWebTests(unittest.TestCase):
         self.assertNotIn("month-team.js", holdings)
         self.assertEqual(client.get("/agents/month-team.js").headers["content-type"].split(";")[0], "application/javascript")
         self.assertIn("<title>Month-end</title>", client.get("/month-end").text)
+        self.assertIn("data-why=", client.get("/month-end").text)
+        with mock.patch.object(agent_web._AgentApi, "request", return_value={"objections": []}) as request:
+            client.get("/api/agents/month-end/runs/U1/2026-09-30", params={"mode": "replay"})
+        self.assertEqual(request.call_args.kwargs["params"]["mode"], "replay")
         with mock.patch.object(agent_web._AgentApi, "request", return_value={"runs": []}) as request:
             client.get("/api/agents/month-end/runs", params={"period_end": "2026-09-30"})
             client.get("/api/agents/month-end/runs/U1/2026-09-30")

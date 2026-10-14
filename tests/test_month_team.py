@@ -441,7 +441,7 @@ class WriterReviewerTests(unittest.TestCase):
         result = Writer(TeamModel(APAC, tokens_left=10**6, client=model)).draft(self.figures, account_id=ACCOUNT)
         self.assertEqual(result.outcome, "pass")
         self.assertEqual(len(model.requests), 2)
-        self.assertIn("numerical claim", json.loads(model.requests[1]["input"][0]["content"][0]["text"])["format_problem"])
+        self.assertIn("executive_summary 0 contains '%', '1'", json.loads(model.requests[1]["input"][0]["content"][0]["text"])["format_problem"])
         sent = json.loads(model.requests[0]["input"][0]["content"][0]["text"])
         self.assertEqual(set(sent["figures"][0]), {"id", "label", "display"})
         self.assertNotIn("payload", json.dumps(sent))
@@ -453,6 +453,22 @@ class WriterReviewerTests(unittest.TestCase):
             self.figures, account_id=ACCOUNT)
         self.assertEqual(failed.outcome, "failed")
         self.assertIn("F99", failed.summary)
+
+    def test_the_writer_is_told_which_sentence_holds_a_digit(self):
+        named = copy.deepcopy(GOOD_DRAFT)
+        named["performance_observations"][1]["text"] = "The holding 700 was the largest contributor."
+        model = FakeModel(drafts=[named, GOOD_DRAFT])
+        result = Writer(TeamModel(APAC, tokens_left=10**6, client=model)).draft(self.figures, account_id=ACCOUNT)
+        self.assertEqual(result.outcome, "pass")
+        problem = json.loads(model.requests[1]["input"][0]["content"][0]["text"])["format_problem"]
+        self.assertIn("performance_observations 1 contains '0', '7'", problem)
+        self.assertIn("the largest contributor", problem)
+        self.assertNotIn("700", problem)
+        self.assertEqual(model.requests[0]["max_output_tokens"], 8000)
+        labels = [f["label"] for f in self.figures["figures"] if f["key"].startswith(("contributor.", "detractor."))]
+        self.assertTrue(labels)
+        self.assertTrue(all("contributor" in l or "detractor" in l for l in labels))
+        self.assertFalse(any(c.isdigit() for l in labels for c in l.split(",", 1)[1]))
 
     def test_the_summary_fits_the_decks_line(self):
         long = copy.deepcopy(GOOD_DRAFT)
@@ -495,6 +511,19 @@ class WriterReviewerTests(unittest.TestCase):
         self.assertEqual(result.evidence["cosmetic_notes"][0]["page"], 2)
         images = [c for c in model.requests[0]["input"][0]["content"] if c["type"] == "input_image"]
         self.assertEqual(len(images), 2)
+
+    def test_visual_qa_checks_alpha_world_factsheets_against_their_own_layout(self):
+        from ibkr_etl.monthly_artifacts import ALPHA_WORLD_SUBJECT_IDS
+        from wealthryse_agent.month_team.agents import ALPHA_WORLD_FACTSHEETS
+
+        self.assertEqual(ALPHA_WORLD_FACTSHEETS, ALPHA_WORLD_SUBJECT_IDS)
+        model = FakeModel(visual=[])
+        VisualQA(TeamModel(APAC, tokens_left=10**6, client=model)).inspect_factsheet(
+            [b"png1", b"png2"], display_date="31 Jan 2026", period_label="ending 31 Jan 2026", account_id="alpha-world-t")
+        note = model.requests[0]["input"][0]["content"][0]["text"]
+        self.assertIn("Capital Path", note)
+        self.assertNotIn("Top 5", note)
+        self.assertNotIn("sector allocation", note)
 
     def test_visual_qa_says_so_when_the_model_cannot_read_images(self):
         result = VisualQA(TeamModel(APAC, tokens_left=10**6, client=FakeModel(reject_images=True))).inspect_factsheet(

@@ -362,6 +362,68 @@ acknowledges at approval 2. A clean review passes.
    the month-end report job calls `record_agent_reviews` after
    `render_onboarding_composite_reports.py`.
 
+## Operations agent
+
+The autonomous administrator (`scripts/run_autonomous_administrator.py`)
+checks the platform every five minutes and opens an incident for each failing
+check. It is still the only thing that acts. The operations agent adds the
+investigation it lacked, so that it can say what the exact problem is.
+
+**What it reads.** Every 5 minutes, for each open warning or critical
+incident it has not yet looked at (once per episode: an incident that resolves
+and comes back is looked at again):
+
+- the incident and the administrator's evidence, the administrator's runs and
+  actions over 7 days, and import runs over 14 days, through the tool server
+  (`list_open_incidents`, `get_operations_history`; only the `operations` job
+  is offered them);
+- Azure telemetry, read with read-only roles: error lines from the container
+  apps' logs (Log Analytics), each job's recent executions, resource health,
+  fired alerts, the build VM's metrics and the resource group's daily cost.
+
+Anything that looks like a credential is removed before the model or the
+agent's table sees it. A source that cannot be read is recorded as unread and
+the others carry on.
+
+**What it writes.** The model (on `wr-reports-apac`) writes a summary, the
+likely cause, a confidence, the evidence and up to four steps for the owner.
+Code keeps only evidence whose source was read and whose every number appears
+in that source; with none left, the diagnosis is inconclusive and low
+confidence. The diagnosis goes to `agent.ops_investigations` with a digest of
+each source, never the logs themselves.
+
+**Draft pull requests.** When the cause is a defect in this repository's code
+(a traceback naming a file under `src/` or `scripts/`) and a GitHub token is
+configured, it writes the fix and a test and opens them as a draft pull
+request on `yingchinyeung/Wealthryse` only. Code checks the patch: only the
+files the diagnosis named, under `src/`, `scripts/` or `tests/`, a test under
+`tests/test_*.py`, valid Python, nothing that looks like a credential. It
+never touches workflows, infrastructure, migrations or configuration, opens at
+most three a day, and cannot merge or deploy. A refused patch or a GitHub
+failure keeps the diagnosis.
+
+**Where you see it.** The administrator posts each new diagnosis once in the
+admin chat's "System administrator updates" conversation, and the System
+health page lists open incidents with the latest diagnosis and any draft fix
+(`ibkr_etl/ops_agent_posts.py`). Until the platform role is granted the
+agent's table, both simply show nothing from the agent.
+
+**Turning it on** (each step needs Ying's typed approval naming the resources):
+
+1. **Database.** Rerun `scripts/install_agent_schema.py` with
+   `--platform-reader <the platform's role>`. It applies `006_operations.sql`
+   and lets that role read `agent.ops_investigations`.
+2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
+3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOperations=true`. This
+   creates `ibkrv2stg-agent-ops` and gives the jobs identity Reader and
+   Cost Management Reader on the resource group and Log Analytics Reader on
+   `ibkrv2stg-logs`.
+4. **Draft pull requests (optional).** Put a fine-grained GitHub token limited
+   to this repository's contents and pull requests in a Key Vault secret, give
+   the jobs identity Key Vault Secrets User on it (the network thread's step),
+   and redeploy with `opsGithubTokenSecretUri`. Without it the agent diagnoses
+   but never opens a pull request.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool
@@ -375,6 +437,8 @@ acknowledges at approval 2. A clean review passes.
 - The onboarding agents, when deployed: an hourly job that calls the model
   only for new documents, a NAV break or new reports, with its own monthly budget
   (`onboardingTokenBudget`).
+- The operations agent, when deployed: a job every 5 minutes that calls the
+  model only for a new incident, with its own monthly budget (`opsTokenBudget`).
 - No new database server.
 
 ## Not yet done

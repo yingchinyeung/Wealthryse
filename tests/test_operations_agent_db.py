@@ -1,0 +1,226 @@
+"""The operations agent's database side: its views, its table, and how the platform shows its diagnoses.
+
+Needs a disposable PostgreSQL server: set AGENT_TEST_PG_ADMIN_DSN to a
+superuser DSN (CI starts one). Skipped otherwise. Creates and drops its own
+database and uses synthetic data only.
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import unittest
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+os.environ.setdefault("AGENT_TOOLS_AUTOSTART", "0")
+os.environ.setdefault("AGENT_API_AUTOSTART", "0")
+
+ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
+ROOT = Path(__file__).resolve().parents[1]
+TENANT = "00000000-0000-0000-0000-000000000001"
+OWNER_ROLE = "ops_agent_test_owner"
+READER, WRITER, PLATFORM = "ops_agent_test_reader", "ops_agent_test_writer", "ops_agent_test_app"
+TEST_PASSWORD = "ops-agent-test-only"  # throwaway roles in a disposable test server
+TOLERATED_MIGRATIONS = {"027_legacy_external_market_data_approval.sql", "056_specialist_audit_ledger.sql"}
+
+
+def _dsn(base: str, database: str, user: str | None = None) -> str:
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    params = conninfo_to_dict(base)
+    params["dbname"] = database
+    if user:
+        params["user"] = user
+        params["password"] = TEST_PASSWORD
+    return make_conninfo(**params)
+
+
+def _script(name: str):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class OperationsAgentDatabaseTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import psycopg
+
+        from ibkr_etl.db import PostgresConnection
+
+        cls.database = "ops_agent_test_" + uuid.uuid4().hex[:8]
+        with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
+            for role in (READER, WRITER, PLATFORM):
+                if admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone() is None:
+                    admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD '{TEST_PASSWORD}'")
+            if admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (OWNER_ROLE,)).fetchone() is None:
+                # Not a superuser, so forced row-level security applies as on Azure.
+                admin.execute(f"CREATE ROLE {OWNER_ROLE} LOGIN CREATEROLE PASSWORD '{TEST_PASSWORD}'")
+            admin.execute(f"GRANT {READER}, {WRITER} TO {OWNER_ROLE} WITH ADMIN OPTION")
+            admin.execute(f'CREATE DATABASE "{cls.database}" OWNER {OWNER_ROLE}')
+        with psycopg.connect(_dsn(ADMIN_DSN, cls.database), autocommit=True) as admin:
+            admin.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        connection = PostgresConnection(psycopg.connect(_dsn(ADMIN_DSN, cls.database, OWNER_ROLE)))
+        connection.execute("SELECT set_config('app.tenant_id', ?, false)", (TENANT,))
+        connection.commit()
+        for path in sorted((ROOT / "migrations" / "postgres").glob("*.sql")):
+            try:
+                connection.execute(path.read_text(encoding="utf-8"))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                if path.name not in TOLERATED_MIGRATIONS:
+                    raise
+            if connection.execute("SELECT to_regclass('public.tenants')").fetchone()[0] and \
+                    connection.execute("SELECT 1 FROM tenants").fetchone() is None:
+                connection.execute("INSERT INTO tenants(tenant_id, name, status, created_at) "
+                                   "VALUES (?, 'Test', 'active', '2026-01-01')", (TENANT,))
+                connection.commit()
+        connection.close()
+        with psycopg.connect(_dsn(ADMIN_DSN, cls.database, OWNER_ROLE), options=f"-c app.tenant_id={TENANT}") as owner:
+            for path in sorted((ROOT / "migrations" / "agent").glob("*.sql")):
+                owner.execute(path.read_text(encoding="utf-8"))
+            # The website and administrator's own access, as the platform role has it.
+            owner.execute(f"GRANT SELECT, UPDATE ON system_incidents TO {PLATFORM}")
+            owner.execute(f"GRANT SELECT, INSERT, UPDATE ON admin_chat_conversations, admin_chat_messages TO {PLATFORM}")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            owner.execute(
+                "INSERT INTO system_incidents(incident_key, check_id, severity, status, description, evidence_json, "
+                "first_seen_at, last_seen_at) VALUES "
+                "('synthetic_open', 'risk_free_freshness', 'warning', 'open', 'Synthetic open incident', "
+                "'{\"days\": 4}', '2026-10-14T01:00:00Z', %s), "
+                "('synthetic_done', 'portal', 'critical', 'resolved', 'Synthetic resolved incident', '{}', "
+                "'2026-10-01T01:00:00Z', '2026-10-01T02:00:00Z')", (today,))
+            owner.execute(
+                "INSERT INTO ingestion_runs(run_type, started_at, status, error_message) VALUES "
+                "('flex', %s, 'failed', 'synthetic failure'), ('flex', '2020-01-01T00:00:00Z', 'success', NULL)",
+                (today,))
+            owner.execute("INSERT INTO autonomous_agent_runs(correlation_id, started_at, status) "
+                          "VALUES ('synthetic', %s, 'degraded')", (today,))
+        with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:  # roles are cluster-wide
+            admin.execute(f"GRANT agent_reader TO {READER}")
+            admin.execute(f"GRANT agent_writer TO {WRITER}")
+
+        from wealthryse_agent.config import DatabaseSettings, ServiceAuthSettings
+        from wealthryse_agent.tool_server import ToolService
+
+        cls.reader = DatabaseSettings("", cls.database, "", "", TENANT, _dsn(ADMIN_DSN, cls.database, READER))
+        cls.writer = DatabaseSettings("", cls.database, "", "", TENANT, _dsn(ADMIN_DSN, cls.database, WRITER))
+        cls.service = ToolService(cls.reader, ServiceAuthSettings("", "", frozenset(), disabled_for_local_tests=True),
+                                  frozenset(), frozenset())
+
+    @classmethod
+    def tearDownClass(cls):
+        import psycopg
+
+        with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
+            admin.execute(f'DROP DATABASE IF EXISTS "{cls.database}" WITH (FORCE)')
+
+    def _call(self, name, job="operations"):
+        return self.service.call(caller_id="", user=None, job=job, correlation_id="test", name=name, arguments={})
+
+    def _platform(self):
+        """The platform role's raw connection, as the administrator and the website open it."""
+        import psycopg
+        from psycopg.rows import dict_row
+
+        connection = psycopg.connect(_dsn(ADMIN_DSN, self.database, PLATFORM), row_factory=dict_row)
+        connection.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+        self.addCleanup(connection.close)
+        return connection
+
+    def _grant_platform_reads(self):
+        install = _script("install_agent_schema")
+        self.assertEqual(install.main(["--database-url", _dsn(ADMIN_DSN, self.database, OWNER_ROLE),
+                                       "--existing-logins", "--platform-reader", PLATFORM]), 0)
+
+    def _investigation(self, store, status="diagnosed", pull_request=None):
+        from wealthryse_agent.operations import Investigation
+
+        incident = self._call("list_open_incidents")["data"]["incidents"][0]
+        diagnosis = {"summary": "Synthetic summary.", "likely_cause": "Synthetic cause.", "confidence": "high",
+                     "evidence": [{"source_id": "platform:imports", "finding": "one failed run"}],
+                     "owner_steps": ["Look at it."], "code_fix": {"needed": False, "reason": "", "files": []}}
+        store.save(incident, Investigation(status, diagnosis, [{"source_id": "platform:imports"}], pull_request,
+                                           {"input_tokens": 40, "output_tokens": 2}), "test")
+        return incident
+
+    def test_1_the_agent_sees_open_incidents_and_recent_runs_only_through_its_own_job(self):
+        incidents = self._call("list_open_incidents")["data"]["incidents"]
+        self.assertEqual([i["incident_key"] for i in incidents], ["synthetic_open"])
+        self.assertEqual(incidents[0]["evidence"], {"days": 4})
+        history = self._call("get_operations_history")["data"]
+        self.assertEqual([r["error_message"] for r in history["ingestion_runs"]], ["synthetic failure"])
+        self.assertEqual(len(history["admin_runs"]), 1)
+        from wealthryse_agent.tools import ToolError
+
+        with self.assertRaises(ToolError):  # no other job is offered the tool
+            self._call("list_open_incidents", job="onboarding")
+
+    def test_2_the_agent_writes_only_its_own_table_once_per_episode(self):
+        import psycopg
+
+        from wealthryse_agent.database import connect
+        from wealthryse_agent.operations import OpsStore
+
+        store = OpsStore(connect(self.writer, search_path="agent"), TENANT)
+        self.addCleanup(store.db.close)
+        incident = self._investigation(store)
+        self.assertTrue(store.done(incident))
+        self.assertFalse(store.done(dict(incident, first_seen_at="2026-11-01T00:00:00Z")))
+        self._investigation(store)  # the same episode again: ignored
+        self.assertEqual(store.tokens_used_this_month(), 42)
+        self.assertEqual(store.pull_requests_today(), 0)
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            store.db.execute("UPDATE public.system_incidents SET status = 'resolved'")
+        store.db.rollback()
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            store.db.execute("DELETE FROM agent.ops_investigations")
+        store.db.rollback()
+
+    def test_3_the_platform_shows_diagnoses_once_granted_and_posts_each_once(self):
+        import psycopg
+
+        from ibkr_etl.ops_agent_posts import open_incidents
+
+        admin = _script("run_autonomous_administrator")
+        platform = self._platform()
+
+        def publish():
+            admin._publish_admin_chat_updates(platform, findings=[], new_keys=set(), incident_ids={}, diagnosis=None,
+                                              correlation_id=str(uuid.uuid4()))
+            platform.commit()
+            return platform.execute(
+                "SELECT message_kind, response_json, incident_id FROM admin_chat_messages "
+                "WHERE response_json ? 'investigation_id' ORDER BY sequence_no").fetchall()
+
+        # Before the grant: nothing from the agent, and the administrator's own work carries on.
+        self.assertEqual(publish(), [])
+        before = open_incidents(platform)
+        self.assertEqual([(i["incident_key"], i["diagnosis"]) for i in before], [("synthetic_open", None)])
+        platform.rollback()
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            platform.execute("SELECT 1 FROM agent.ops_investigations")
+        platform.rollback()
+
+        self._grant_platform_reads()
+        posted = publish()
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]["message_kind"], "proactive_update")
+        self.assertEqual(posted[0]["response_json"]["title"], "Incident diagnosis")
+        self.assertIsNotNone(posted[0]["incident_id"])
+        self.assertEqual(len(publish()), 1)  # not posted twice
+        shown = open_incidents(platform)
+        self.assertEqual(shown[0]["diagnosis"]["summary"], "Synthetic summary.")
+        self.assertEqual(shown[0]["diagnosis"]["owner_steps"], ["Look at it."])
+        platform.rollback()
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            platform.execute("DELETE FROM agent.ops_investigations")
+        platform.rollback()
+
+
+if __name__ == "__main__":
+    unittest.main()

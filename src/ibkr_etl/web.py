@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from psycopg.errors import InsufficientPrivilege
 from psycopg import Error as PostgresError
 from psycopg.rows import dict_row
+from .ops_agent_posts import open_incidents
 from .platform_health import aggregate_health
 from .risk_display import RISK_DISPLAY_SCRIPT
 from .subject_read_contract import ACTIVE_NAV_CURRENCY_SQL
@@ -2522,6 +2523,7 @@ def system_health(user: dict[str, str] = Depends(_authorized_user)) -> dict:
             ORDER BY s.subject_id
             """
         ).fetchall()
+        incidents = open_incidents(connection)
     analyst_assurance = max(
         all_assurance, key=lambda row: str(row.get("completed_at") or ""), default=None
     )
@@ -2544,6 +2546,7 @@ def system_health(user: dict[str, str] = Depends(_authorized_user)) -> dict:
         "status": status,
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "issues": issues,
+        "incidents": incidents,
         "environment": "internal-production",
         "release_channel": RELEASE_CHANNEL,
         "portfolio": portfolio,
@@ -5004,6 +5007,7 @@ fetch('/api/system/health',{cache:'no-store'}).then(json).then(health=>{
   healthLastChecked=health.checked_at||new Date().toISOString();
   document.querySelector('#health-note').textContent=(health.message||'')+' Last checked: '+new Date(healthLastChecked).toLocaleString()+'. Updates automatically every 60 seconds while this page is visible.';
   document.querySelector('#health-findings').innerHTML=(health.issues||[]).map(item=>`<p><strong>${esc(item.display_name||item.subject_id)} — ${esc(item.severity)}</strong><br>${esc(item.message)}${item.metrics?.length?'<br>Metrics needing reconciliation: '+esc(item.metrics.join(', ')):''}</p>`).join('')||'<p>No account assurance findings were returned. Data dates and missing assurance still need to be checked.</p>';
+  document.querySelector('#health-incidents').innerHTML=(health.incidents||[]).map(item=>{const d=item.diagnosis;const diag=!d?'<br><span class="muted">The operations agent has not diagnosed this incident yet.</span>':`<br><strong>${d.status==='diagnosed'?'Diagnosis':'Inconclusive'}${d.confidence?' ('+esc(d.confidence)+' confidence)':''}:</strong> ${esc(d.summary||'')}${d.likely_cause?'<br>Likely cause: '+esc(d.likely_cause):''}${(d.owner_steps||[]).length?'<ol>'+d.owner_steps.map(step=>`<li>${esc(step)}</li>`).join('')+'</ol>':''}${(d.evidence||[]).length?'<details><summary>Evidence</summary>'+d.evidence.map(e=>`<div class="muted">${esc(e.finding)} <code>${esc(e.source_id)}</code></div>`).join('')+'</details>':''}${d.pull_request_url&&/^https:\/\/github\.com\//.test(d.pull_request_url)?`<br><a href="${esc(d.pull_request_url)}" target="_blank" rel="noopener">Draft fix for review</a>`:''}`;return `<p><strong>${esc(String(item.severity||'').toUpperCase())} — ${esc(item.check_id)}</strong><br>${esc(item.description)}<br><span class="muted">First seen ${esc(item.first_seen_at)} · last seen ${esc(item.last_seen_at)} · ${esc(item.occurrence_count)} checks</span>${diag}</p>`}).join('')||'<p>No open incidents.</p>';
   document.querySelector('#benchmark-health').innerHTML=(health.benchmarks||[]).map(item=>`<div class="status-item"><span class="label">${esc(item.benchmark_id)}</span><strong>${esc(item.latest_date||'—')}</strong><span class="muted">${esc(item.observations??0)} observations · ${esc(item.quality_status||'—')}</span></div>`).join('')||'<div class="empty">No benchmark observations are available.</div>';
   const assuranceRows=health.portfolio_analyst_assurance_all||[];
   document.querySelector('#assurance-status').textContent=`${assuranceRows.length} active portfolios checked for coverage`;
@@ -10527,7 +10531,7 @@ def _render_platform_page(user: dict[str, str], *, section: str) -> str:
         script = TABLE_SCRIPT + COMBINED_HOLDINGS_PAGE_SCRIPT
     elif section == "system-health":
         description = "Platform-wide data freshness, ingestion, benchmark, assurance and reporting status across every account and portfolio."
-        content = """<div class="page-view active" data-section="system-health"><div class="card wide"><div class="label">Platform health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Benchmark coverage</div><div id="benchmark-health" class="status-row"></div></div><div class="card wide"><div class="label">Latest portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Platform acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>"""
+        content = """<div class="page-view active" data-section="system-health"><div class="card wide"><div class="label">Platform health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Open incidents</div><div id="health-incidents"></div></div><div class="card wide"><div class="label">Benchmark coverage</div><div id="benchmark-health" class="status-row"></div></div><div class="card wide"><div class="label">Latest portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Platform acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>"""
         content = content.replace('<div id="health-note" class="muted"></div>',
                                   '<div id="health-note" class="muted" aria-live="polite"></div><div id="health-findings"></div>')
         content = content.replace('Platform acceptance burn-in', 'Registered account acceptance burn-in')

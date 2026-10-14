@@ -946,6 +946,44 @@ def get_onboarding_broker_day(connection, arguments: Mapping[str, Any]) -> dict[
                      _citation("cash_snapshots", account, date=day)]}
 
 
+# Operations: the administrator's incidents and the platform's recent runs ------------------
+
+
+def list_open_incidents(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Open and acknowledged incidents, with the administrator's own evidence."""
+    rows = connection.execute(
+        "SELECT incident_id, incident_key, check_id, severity, status, description, evidence_json, first_seen_at, "
+        "last_seen_at, occurrence_count FROM open_incidents ORDER BY incident_id"
+    ).fetchall()
+    incidents = []
+    for row in rows:
+        item = {key: row[key] for key in ("incident_id", "incident_key", "check_id", "severity", "status",
+                                          "description", "first_seen_at", "last_seen_at", "occurrence_count")}
+        try:
+            item["evidence"] = json.loads(row["evidence_json"] or "{}")
+        except ValueError:
+            item["evidence"] = {"unreadable": True}
+        incidents.append(item)
+    return {"as_of": None, "data": {"incidents": incidents}, "citations": [_citation("system_incidents", None)]}
+
+
+def get_operations_history(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Import runs over 14 days and the administrator's runs and actions over 7 days, newest first."""
+    def rows(sql: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in connection.execute(sql).fetchall()]
+
+    data = {
+        "ingestion_runs": rows("SELECT run_id, run_type, started_at, completed_at, status, row_count, error_message "
+                               "FROM recent_ingestion_runs ORDER BY started_at DESC LIMIT 200"),
+        "admin_runs": rows("SELECT agent_run_id, started_at, completed_at, status, finding_count, action_count, "
+                           "summary, error_code FROM recent_admin_runs ORDER BY started_at DESC LIMIT 100"),
+        "admin_actions": rows("SELECT action_id, incident_id, action_type, target_job, status, reason, created_at, "
+                              "executed_at, error_code FROM recent_admin_actions ORDER BY created_at DESC LIMIT 50"),
+    }
+    return {"as_of": None, "data": data, "citations": [_citation("ingestion_runs", None),
+                                                       _citation("autonomous_agent_runs", None)]}
+
+
 # Registry ------------------------------------------------------------------
 
 
@@ -956,6 +994,7 @@ def _schema(properties: Mapping[str, Any], required: list[str]) -> dict[str, Any
 _ACCOUNT = {"type": "string", "description": "account_id from list_accounts"}
 MONTH_TEAM = frozenset({"month_team"})
 ONBOARDING = frozenset({"onboarding"})
+OPERATIONS = frozenset({"operations"})
 _DATE = {"type": "string", "description": "YYYY-MM-DD"}
 _AS_OF = {"type": "string", "description": "YYYY-MM-DD; omit for the latest valuation"}
 
@@ -1014,6 +1053,12 @@ TOOLS: tuple[ToolSpec, ...] = (
              "NAV, and corporate actions and transactions within five days.",
              _schema({"case_id": _CASE_ID, "date": _DATE}, ["case_id", "date"]), get_onboarding_broker_day, False,
              only_jobs=ONBOARDING),
+    ToolSpec("list_open_incidents", "The autonomous administrator's open and acknowledged incidents, with its "
+             "evidence, for the operations agent to investigate.", _schema({}, []), list_open_incidents, False,
+             only_jobs=OPERATIONS),
+    ToolSpec("get_operations_history", "Import runs over the last 14 days and the autonomous administrator's runs "
+             "and actions over the last 7 days, newest first.", _schema({}, []), get_operations_history, False,
+             only_jobs=OPERATIONS),
 )
 REGISTRY = {tool.name: tool for tool in TOOLS}
 

@@ -10,10 +10,13 @@ records); nothing is sent, published or released.
     python -m wealthryse_agent.jobs onboarding           # hourly: draft new cases' terms from their documents,
                                                          # reconcile new broker accounts, and review new
                                                          # composites' historical reports
+    python -m wealthryse_agent.jobs operations           # every 5 minutes: diagnose the autonomous
+                                                         # administrator's open incidents from Azure telemetry
 
 Accounts come from agent.service_grants for the job, enforced by the tool server. The
 onboarding job has no accounts: its cases are not live yet, and it sees only the case views
-its own tools give it.
+its own tools give it. Neither has the operations job: it reads only incidents, run records and
+Azure telemetry, never client data.
 """
 from __future__ import annotations
 
@@ -223,10 +226,33 @@ def onboarding(store: Store, tools: ToolClient, usage: dict, correlation_id: str
     return drafted + reconciled + reviewed
 
 
+def operations(store: Store, tools: ToolClient, usage: dict, correlation_id: str, client_id: str) -> int:
+    from .month_team.agents import TeamModel
+    from .month_team.settings import validate_report_model
+    from .operations import Investigator, OpsSettings, OpsStore, investigate_open_incidents
+
+    settings, model_settings = OpsSettings.from_env(), ModelSettings.from_env()
+    settings.validate()
+    validate_report_model(model_settings)
+    ops_store = OpsStore(store.db, store.tenant_id)
+    tokens_left = settings.monthly_token_budget - ops_store.tokens_used_this_month()
+    if tokens_left <= 0:
+        raise BudgetExhausted
+    shared: list[TeamModel] = []
+
+    def model() -> TeamModel:
+        if not shared:
+            shared.append(TeamModel(model_settings, tokens_left=tokens_left))
+        return shared[0]
+
+    return investigate_open_incidents(ops_store, tools.call, Investigator(settings, model, client_id=client_id),
+                                      usage, correlation_id)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team",
-                                                  "onboarding"])
+                                                  "onboarding", "operations"])
     parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
@@ -249,6 +275,11 @@ def main(argv: list[str] | None = None) -> int:
             written = onboarding(store, tools, usage, correlation_id)
             store.finish_run(run_id, status="succeeded", items=written, usage=usage)
             LOGGER.info("onboarding reviewed %s case(s)", written)
+            return 0
+        if args.job == "operations":
+            written = operations(store, tools, usage, correlation_id, runtime.managed_identity_client_id)
+            store.finish_run(run_id, status="succeeded", items=written, usage=usage)
+            LOGGER.info("operations investigated %s incident(s)", written)
             return 0
         accounts = [a["account_id"] for a in tools.call("list_accounts", {})["data"]["accounts"]]
         if args.job == "data_quality":

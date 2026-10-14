@@ -1,0 +1,72 @@
+"""Stage 3 reports for new-onboarding composites in the Alpha World MS or T design.
+
+The month-end report job runs this after its packages, in the same image and
+with the same private storage. It does nothing until migration 064 exists, or
+while no composite case is waiting on its reports. Each case's outcome is
+recorded on its reports_rendered check; see ibkr_etl/composite_reports.py.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = PROJECT_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+from azure.core.exceptions import ResourceExistsError  # noqa: E402
+
+from ibkr_etl.cloud_storage import download_blob_bytes, upload_bytes  # noqa: E402
+from ibkr_etl.composite_reports import HONG_KONG, run_composite_report_cases  # noqa: E402
+from ibkr_etl.db import connect  # noqa: E402
+
+
+def _required(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def main() -> int:
+    if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() != "internal-production":
+        raise RuntimeError("Onboarding composite reports run only in internal production")
+    database_url = _required("DATABASE_URL")
+    if not database_url.startswith(("postgres://", "postgresql://")):
+        raise RuntimeError("DATABASE_URL must be a PostgreSQL connection URL")
+    tenant_id = os.environ.get("PORTFOLIO_TENANT_ID", "00000000-0000-0000-0000-000000000001")
+    storage_url = _required("AZURE_STORAGE_ACCOUNT_URL")
+    container = os.environ.get("INTERNAL_REPORT_CONTAINER", "internal-reports")
+
+    def fetch(bucket: str, blob: str) -> bytes:
+        return download_blob_bytes(storage_url, bucket, blob, maximum_bytes=64 * 1024 * 1024)
+
+    def store(bucket: str, blob: str, content: bytes, content_type: str) -> None:
+        # Content-addressed and immutable: an existing blob must already hold these bytes.
+        try:
+            stored = upload_bytes(storage_url, bucket, blob, content, overwrite=False, content_type=content_type)
+        except ResourceExistsError:
+            stored = fetch(bucket, blob) == content
+        if not stored:
+            raise RuntimeError("Private report storage refused the factsheet")
+
+    connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
+    try:
+        if connection.execute("SELECT to_regclass('public.broker_onboarding_cases')").fetchone()[0] is None:
+            print(json.dumps({"status": "not_installed", "cases": []}, sort_keys=True))
+            return 0
+        results = run_composite_report_cases(connection, tenant_id, container=container,
+                                             today=datetime.now(HONG_KONG).date(), fetch=fetch, store=store)
+    finally:
+        connection.close()
+    print(json.dumps({"status": "success", "cases": results}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

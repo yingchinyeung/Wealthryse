@@ -16,6 +16,7 @@ stored, logged or returned.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -24,7 +25,7 @@ from datetime import date
 from typing import Any, Callable, Iterable, Literal, Mapping
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from .broker_connections import (
@@ -42,6 +43,7 @@ from .broker_connections import (
 from .composition_tree import composite_tree, filtered_tree, tree_for_definition, tree_svg
 from .flex_recipe import RECIPE_STEPS
 from .market_data import ALPHA_WORLD_MARKET_INSTRUMENTS
+from .monthly_reports import REPORT_TYPES, MonthlyReportError, validate_period_end, validate_review_artifact
 from .onboarding import FEATURE_KEYS
 from .onboarding_cases import (
     APPROVAL_LABELS,
@@ -541,6 +543,48 @@ def _reports(checks: Iterable[Mapping[str, Any]]) -> list[dict[str, str]]:
             "download_path": path if _LOCAL_PATH.fullmatch(path) else "",
         })
     return sorted(listed, key=lambda item: (item["period_end"], item["report_type"]), reverse=True)
+
+
+def case_report(connection, tenant_id: str, case_id: str, generation_run_id: int, *, container: str) -> dict:
+    """One file the case's report run listed, located in private storage for the owner to open.
+
+    Only a file named in the case's reports_rendered evidence, generated from
+    this subject's frozen snapshot and still unchanged, is ever served.
+    """
+
+    row = connection.execute(
+        "SELECT c.target_subject_id, k.evidence_json FROM broker_onboarding_cases c "
+        "JOIN broker_onboarding_checks k ON k.tenant_id = c.tenant_id AND k.case_id = c.case_id "
+        "AND k.check_id = 'reports_rendered' WHERE c.tenant_id = %s AND c.case_id = %s",
+        (tenant_id, case_id),
+    ).fetchone()
+    reports = _evidence(row).get("reports") if row else None
+    item = next((entry for entry in reports if isinstance(entry, Mapping)
+                 and entry.get("generation_run_id") == generation_run_id), None) if isinstance(reports, list) else None
+    if item is None:
+        raise OnboardingError("This report is not listed on the case", 404)
+    subject_id = str(row["target_subject_id"])
+    run = connection.execute(
+        "SELECT r.generation_run_id, r.report_type, r.output_reference, r.output_sha256, s.period_end, s.subject_id "
+        "FROM report_generation_runs r JOIN reporting_snapshots s "
+        "ON s.tenant_id = r.tenant_id AND s.snapshot_id = r.snapshot_id "
+        "WHERE r.tenant_id = %s AND r.generation_run_id = %s AND s.subject_id = %s "
+        "AND r.status IN ('awaiting_approval', 'released_internal') AND s.status IN ('frozen', 'approved')",
+        (tenant_id, generation_run_id, subject_id),
+    ).fetchone()
+    if run is None:
+        raise OnboardingError("This report is not listed on the case", 404)
+    try:
+        period_end = validate_period_end(str(run["period_end"])[:10])
+        artifact = validate_review_artifact(dict(run), account_id=subject_id, period_end=period_end,
+                                            container=container)
+    except MonthlyReportError as error:
+        raise OnboardingError(str(error), 503) from error
+    if artifact["sha256"] != str(item.get("sha256") or ""):
+        raise OnboardingError("The report changed after it was listed; the next report run lists it again")
+    label = "Factsheet" if artifact["report_type"] == "factsheet" else "Presentation"
+    extension = REPORT_TYPES[artifact["report_type"]]["extension"]
+    return {**artifact, "file_name": f"{subject_id}_{label}_{period_end}{extension}"}
 
 
 def _go_live(connection, tenant_id: str, row: Mapping[str, Any], case: OnboardingCase, actor: str) -> None:
@@ -1334,11 +1378,14 @@ def install(
     platform_ip: Callable[[], str | None],
     derived_definition: Callable[[Any, str, dict], dict],
     today: Callable[[], date] = date.today,
+    download_report: Callable[[str, str], bytes] | None = None,
+    report_container: str = "internal-reports",
 ) -> None:
     """Add the new onboarding routes. Each answers 404 while the switch is off.
 
     derived_definition(connection, kind, fields) runs the Derived Portfolio
     Studio's validation on the builder's fields and returns the definition.
+    download_report(container, blob) reads a stage 3 report from private storage.
     """
 
     def switched_on() -> None:
@@ -1431,6 +1478,24 @@ def install(
             c, tenant_id, str(case_id), approval=approval, terms_sha256=body.terms_sha256,
             acknowledge_warnings=body.acknowledge_warnings, confirmation=body.confirmation,
             actor=actor(user) or ""))
+
+    @app.get("/api/onboarding-v2/cases/{case_id}/reports/{generation_run_id}")
+    def case_report_file(case_id: uuid.UUID, generation_run_id: int,
+                         user: dict[str, Any] = Depends(v2_owner)) -> Response:
+        artifact = run(read_database, lambda c: case_report(c, tenant_id, str(case_id), generation_run_id,
+                                                            container=report_container))
+        try:
+            if download_report is None:
+                raise RuntimeError("Private report storage is not configured")
+            content = download_report(artifact["container_name"], artifact["blob_name"])
+        except Exception as error:
+            raise HTTPException(status_code=503, detail="The report could not be read from private storage") from error
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != artifact["sha256"]:
+            raise HTTPException(status_code=503, detail="The report failed its integrity check")
+        return Response(content=content, media_type=str(artifact["media_type"]), headers={
+            "Content-Disposition": f'attachment; filename="{artifact["file_name"]}"',
+            "X-Content-SHA256": digest, "X-Report-Scope": "owner-review", "Cache-Control": "private, no-store"})
 
     @app.post("/api/onboarding-v2/cases/{case_id}/cancel")
     def cancel_route(case_id: uuid.UUID, body: CancelCaseRequest, user: dict[str, Any] = Depends(v2_owner)) -> dict:

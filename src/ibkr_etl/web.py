@@ -10963,4 +10963,6 @@ onboarding_v2_web.install(
     tenant_id=TENANT_ID,
     platform_ip=lambda: os.environ.get("BROKER_EGRESS_IP", "").strip() or None,
     derived_definition=_builder_definition,
+    download_report=lambda container, blob: download_blob_bytes(AZURE_STORAGE_ACCOUNT_URL, container, blob),
+    report_container=INTERNAL_REPORT_CONTAINER,
 )

@@ -693,5 +693,195 @@ class PortfolioDryRunTests(_MigratedDatabase):
                                "WHERE case_id = %s", (case_id,)).fetchone()["live"]
         self.assertTrue(went_live)
 
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class CompositeReportRunTests(_MigratedDatabase):
+    """Stage 3's report run for a composite in the MS design, with rendering and storage stubbed."""
+
+    def _composite_with_history(self, db):
+        from datetime import date
+
+        from ibkr_etl.db import transaction
+        from ibkr_etl.onboarding_dry_run import record_history_build, run_portfolio_dry_runs
+        from ibkr_etl.onboarding_v2_web import approve_case, case_detail, start_derived_case
+        from ibkr_etl.subject_onboarding import fixed_unit_composite_definition
+
+        db.execute("INSERT INTO platform_subjects (subject_id, subject_type, display_name, base_currency, "
+                   "lifecycle_status) VALUES ('U0000601', 'physical_account', 'Synthetic tech', 'USD', 'active')")
+        definition = fixed_unit_composite_definition(
+            subject_id="synthetic-design", display_name="Synthetic design", base_currency="HKD",
+            normalization_date="2025-01-20", constant_cash=58.0,
+            components=[{"component_id": "U0000601", "component_name": "Synthetic tech",
+                         "component_type": "account", "coefficient": 0.42, "source_currency": "USD"}])
+        case_id = start_derived_case(db, TENANT, definition=definition, description="A synthetic composite case.",
+                                     actor=IDENTITY, today=date(2025, 3, 3), report_style="alpha-world-ms")["case_id"]
+        db.commit()
+
+        def write_history(connection, subject_id):
+            with transaction(connection):
+                connection.execute("INSERT INTO accounts (account_id, first_seen_at, last_seen_at, source_json) "
+                                   "VALUES ('composite-source', 'x', 'x', '{}') ON CONFLICT DO NOTHING")
+                connection.execute(
+                    "INSERT INTO derived_portfolios (portfolio_id, name, source_account_id, base_currency, "
+                    "exclusion_rule_json, calculation_version, status, created_at, updated_at) "
+                    "VALUES (?, 'Synthetic', 'composite-source', 'HKD', '{}', 'v1', 'active', 'x', 'x')",
+                    (subject_id,))
+                for day, nav in (("2025-01-20", 100.0), ("2025-01-31", 101.2), ("2025-02-28", 103.4)):
+                    connection.execute(
+                        "INSERT INTO derived_portfolio_nav (portfolio_id, snapshot_date, currency, total_nav, "
+                        "excluded_market_value_base, source_position_count, included_position_count, "
+                        "excluded_position_count, generated_at) VALUES (?, ?, 'HKD', ?, 0, 2, 2, 0, 'x')",
+                        (subject_id, day, nav))
+
+        run_portfolio_dry_runs(db, TENANT, calculate=lambda dry, contract: write_history(
+            dry, contract["subject_id"]) or {}, today=date(2025, 3, 3))
+        approve_case(db, TENANT, case_id, approval="account_terms",
+                     terms_sha256=case_detail(db, TENANT, case_id)["awaiting_terms_sha256"],
+                     acknowledge_warnings=[], confirmation=None, actor=IDENTITY)
+        db.commit()
+        write_history(db, "synthetic-design")
+        record_history_build(db, TENANT, "synthetic-design", error=None, today=date(2025, 3, 3))
+        return case_id
+
+    def test_each_completed_month_is_rendered_once_and_listed_for_approval_two(self):
+        import hashlib
+        import json
+        import types
+        from datetime import date
+        from unittest.mock import patch
+
+        import psycopg
+        from psycopg.rows import dict_row
+
+        from ibkr_etl import composite_reports as cr
+        from ibkr_etl.db import PostgresConnection
+        from ibkr_etl.onboarding_v2_web import OnboardingError, case_detail, case_report
+
+        db = PostgresConnection(psycopg.connect(_dsn(ADMIN_DSN, self.database, OWNER_ROLE), row_factory=dict_row,
+                                                options=f"-c app.tenant_id={TENANT}"))
+        self.addCleanup(db.close)
+        self.assertEqual(cr.eligible_cases(db, TENANT), [])
+        case_id = self._composite_with_history(db)
+        self.assertEqual([c["case_id"] for c in cr.eligible_cases(db, TENANT)], [case_id])
+
+        # The MS design's own approved files, as registered for alpha-world-ms (synthetic bytes here).
+        design = {"template": b"%PDF synthetic MS template", "completed_example": b"%PDF synthetic MS completed"}
+        blobs = {("design-assets", f"alpha-world-ms/{role}.pdf"): content for role, content in design.items()}
+        db.execute("INSERT INTO platform_subjects (subject_id, subject_type, display_name, base_currency, "
+                   "lifecycle_status) VALUES ('alpha-world-ms', 'composite_portfolio', 'Alpha World MS', 'HKD', "
+                   "'active')")
+        for role, content in design.items():
+            db.execute(
+                "INSERT INTO subject_report_template_assets (template_asset_id, subject_id, report_type, asset_role, "
+                "version_label, container_name, blob_name, content_type, sha256, byte_count, approval_status, "
+                "is_current) VALUES (?, 'alpha-world-ms', 'factsheet', ?, 'v1', 'design-assets', ?, "
+                "'application/pdf', ?, ?, 'active', true)",
+                (str(uuid.uuid4()), role, f"alpha-world-ms/{role}.pdf", hashlib.sha256(content).hexdigest(),
+                 len(content)))
+        db.commit()
+
+        def fetch(container, blob):
+            return blobs[(container, blob)]
+
+        def store(container, blob, content, content_type):
+            self.assertEqual(content_type, "application/pdf")
+            blobs.setdefault((container, blob), content)
+
+        rendered, ready = [], set()
+
+        def freeze(connection, *, tenant_id, subject_id, period_start, period_end, reporting_currency,
+                   reject_quality_fail):
+            self.assertEqual((period_start, reporting_currency, reject_quality_fail), ("2025-01-20", "HKD", True))
+            payload = json.dumps({"subject_id": subject_id, "period_end": period_end}, sort_keys=True)
+            snapshot_id = str(uuid.uuid4())
+            connection.execute(
+                "INSERT INTO reporting_snapshots (snapshot_id, tenant_id, subject_id, period_start, period_end, "
+                "as_of_at, reporting_currency, formula_version, source_manifest_json, snapshot_payload_json, "
+                "data_sha256, quality_status, status, created_at) VALUES (?, ?, ?, ?, ?, 'x', 'HKD', 'v1', '{}', ?, "
+                "?, 'warn', 'frozen', 'x')",
+                (snapshot_id, tenant_id, subject_id, period_start, period_end, payload,
+                 hashlib.sha256(payload.encode()).hexdigest()))
+            connection.commit()
+            return types.SimpleNamespace(snapshot_id=snapshot_id)
+
+        def render(payload, *, template_path, design_model_path, output_path):
+            # MS renders from its completed factsheet, with its template as support.
+            self.assertEqual((template_path.read_bytes(), design_model_path.read_bytes()),
+                             (design["template"], design["completed_example"]))
+            rendered.append(payload["period_end"])
+            output_path.write_bytes(b"%PDF synthetic composite " + payload["period_end"].encode())
+            return {"pdf_accuracy_validation": {"status": "fail" if payload["period_end"] == "2025-04-30"
+                                                else "pass"}}
+
+        def run(today):
+            return cr.run_composite_report_cases(db, TENANT, container="internal-reports", today=today,
+                                                 fetch=fetch, store=store, render=render)
+
+        def check():
+            return next(k for k in case_detail(db, TENANT, case_id)["checks"] if k["check_id"] == "reports_rendered")
+
+        authority = hashlib.sha256(design["completed_example"]).hexdigest()
+        with patch.dict(cr.DESIGNS["alpha-world-ms"], {"authority": authority}), \
+                patch.object(cr, "freeze_month_end_snapshot", freeze), \
+                patch.object(cr, "month_end_ready", lambda connection, subject_id, period_end: period_end in ready):
+            # Nothing is frozen before a month's month-end calculation has run.
+            self.assertEqual(run(date(2025, 3, 3))[0]["check"], "pending")
+            self.assertIn("2025-01-31 month-end calculation", check()["message"])
+
+            ready.add("2025-01-31")
+            self.assertEqual(run(date(2025, 3, 3))[0], {"case_id": case_id, "check": "pass", "recorded": True,
+                                                        "reports": 1})
+            self.assertEqual(check()["message"], "1 monthly factsheet for 2025-01-31 in the Alpha World MS design, "
+                                                 "each read back and checked. 2025-02-28 follows once its month-end "
+                                                 "calculation has run.")
+            ready.add("2025-02-28")
+            run(date(2025, 3, 3))
+            self.assertEqual(rendered, ["2025-01-31", "2025-02-28"])
+            # A daily run with nothing new renders nothing and leaves approval 2's evidence alone.
+            self.assertEqual(run(date(2025, 3, 3))[0]["recorded"], False)
+            self.assertEqual(rendered, ["2025-01-31", "2025-02-28"])
+
+            detail = case_detail(db, TENANT, case_id)
+            self.assertEqual(detail["awaiting_approval"], None)  # the agent review is still to come
+            runs = {row["period_end"]: row for row in db.execute(
+                "SELECT s.period_end, r.generation_run_id, r.status, r.template_id, r.template_version, "
+                "r.output_reference, r.output_sha256 FROM report_generation_runs r JOIN reporting_snapshots s "
+                "USING (tenant_id, snapshot_id) WHERE s.subject_id = 'synthetic-design'").fetchall()}
+            january = runs["2025-01-31"]
+            content = b"%PDF synthetic composite 2025-01-31"
+            digest = hashlib.sha256(content).hexdigest()
+            self.assertEqual((january["status"], january["template_id"], january["output_sha256"]),
+                             ("awaiting_approval", "synthetic-design-monthly-factsheet", digest))
+            self.assertEqual(january["template_version"],
+                             f"sha256:{authority}+supporting-sha256:{hashlib.sha256(design['template']).hexdigest()}"
+                             f"+layout:{cr.LAYOUT_VERSION}")
+            self.assertEqual(january["output_reference"], f"internal-reports/review/synthetic-design/2025-01-31/"
+                                                          f"{digest}-synthetic-design_Factsheet_2025-01-31.pdf")
+            self.assertEqual([(r["period_end"], r["download_path"]) for r in detail["reports"]], [
+                (period, f"/api/onboarding-v2/cases/{case_id}/reports/{runs[period]['generation_run_id']}")
+                for period in ("2025-02-28", "2025-01-31")])
+
+            # The owner's download finds exactly the listed file, and nothing else.
+            served = case_report(db, TENANT, case_id, january["generation_run_id"], container="internal-reports")
+            self.assertEqual((served["container_name"], served["blob_name"], served["sha256"], served["file_name"]),
+                             ("internal-reports", january["output_reference"].split("/", 1)[1], digest,
+                              "synthetic-design_Factsheet_2025-01-31.pdf"))
+            for run_id in (january["generation_run_id"] + 1000, -1):
+                with self.assertRaises(OnboardingError) as refused:
+                    case_report(db, TENANT, case_id, run_id, container="internal-reports")
+                self.assertEqual(refused.exception.status_code, 404)
+            db.rollback()
+            with self.assertRaises(OnboardingError) as refused:
+                case_report(db, TENANT, case_id, january["generation_run_id"], container="other-container")
+            self.assertEqual(refused.exception.status_code, 503)
+            db.rollback()
+
+            # A month whose factsheet fails its read-back check blocks the case with the reason.
+            ready.update({"2025-03-31", "2025-04-30"})
+            self.assertEqual(run(date(2025, 5, 2))[0]["check"], "fail")
+            self.assertIn("The 2025-04-30 factsheet failed its read-back check", check()["message"])
+            self.assertEqual(case_detail(db, TENANT, case_id)["status"], "blocked")
+            self.assertEqual(rendered, ["2025-01-31", "2025-02-28", "2025-03-31", "2025-04-30"])
+
 if __name__ == "__main__":
     unittest.main()

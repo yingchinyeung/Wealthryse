@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import unittest
@@ -288,6 +289,35 @@ class OnboardingV2WebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(writes.statements, [])
         self.assertNotIn("123456", response.text)
+
+    def test_the_owner_opens_a_listed_stage_three_report_from_private_storage(self):
+        content = b"%PDF synthetic composite factsheet"
+        artifact = {"container_name": "internal-reports", "sha256": hashlib.sha256(content).hexdigest(),
+                    "blob_name": "review/synthetic-design/2025-01-31/x-synthetic-design_Factsheet_2025-01-31.pdf",
+                    "media_type": "application/pdf", "file_name": "synthetic-design_Factsheet_2025-01-31.pdf"}
+        case_id = "00000000-0000-0000-0000-000000000001"
+        path = f"/api/onboarding-v2/cases/{case_id}/reports/7"
+        with patch.dict(os.environ, OFF):
+            self.assertEqual(self.client.get(path).status_code, 404)
+        with patch.dict(os.environ, ON), \
+                patch.object(web, "_database", side_effect=lambda: _database(_RecordingConnection())), \
+                patch.object(onboarding_v2_web, "case_report", return_value=artifact) as lookup, \
+                patch.object(web, "download_blob_bytes", return_value=content) as download:
+            response = self.client.get(path)
+            self.assertEqual((response.status_code, response.content), (200, content))
+            self.assertEqual(response.headers["content-disposition"],
+                             'attachment; filename="synthetic-design_Factsheet_2025-01-31.pdf"')
+            self.assertIn("no-store", response.headers["cache-control"])
+            self.assertEqual(lookup.call_args.args[1:], (web.TENANT_ID, case_id, 7))
+            self.assertEqual(lookup.call_args.kwargs, {"container": web.INTERNAL_REPORT_CONTAINER})
+            self.assertEqual(download.call_args.args,
+                             (web.AZURE_STORAGE_ACCOUNT_URL, "internal-reports", artifact["blob_name"]))
+            download.return_value = b"changed in storage"
+            self.assertEqual(self.client.get(path).status_code, 503)
+            lookup.side_effect = onboarding_v2_web.OnboardingError("This report is not listed on the case", 404)
+            self.assertEqual(self.client.get(path).status_code, 404)
+            self.user = OPERATOR
+            self.assertEqual(self.client.get(path).status_code, 403)
 
 
 if __name__ == "__main__":

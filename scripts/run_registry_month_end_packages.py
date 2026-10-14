@@ -87,6 +87,18 @@ def main() -> int:
         else:
             results.append({"subject_id": str(row["subject_id"]), "status": "processed"})
     print(json.dumps({"status": "partial_failure" if failed else "success", "subjects": results}, sort_keys=True))
+    # Stage 3 reports for new-onboarding composites. Each case records its own
+    # outcome, so this never changes the month-end packages' result.
+    try:
+        subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "scripts" / "render_onboarding_composite_reports.py")],
+            cwd=PROJECT_ROOT,
+            env=dict(os.environ),
+            check=True,
+            timeout=1800,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        print(json.dumps({"onboarding_composite_reports": "failed", "reason": str(error)}, sort_keys=True))
     return 1 if failed else 0
 
 

@@ -247,6 +247,60 @@ only, as it does today; the factsheet renderer never receives it.
 - The month-end package job does not read the team's commentary yet (see
   "Go live" above).
 
+## Onboarding agents
+
+The onboarding agents work through the four stages of a new-onboarding case
+(`ibkr_etl/onboarding_cases.py`). They record the case's own checks with
+evidence, and Ying keeps the case's three approvals and the first release.
+The first agent is the history reviewer; the intake and reconciliation agents
+follow.
+
+**History reviewer** (`wealthryse_agent/onboarding_review.py`). It reviews a
+composite in the Alpha World MS or T design that is in stage 3 with its
+historical reports rendered (`ibkr_etl/composite_reports.py`). It reads every
+stored file before approval 2 and checks that:
+
+- every month from the first to the last has a factsheet and a deck, with no gap;
+- each stored file matches the hash recorded when it was rendered;
+- each factsheet has the design's two pages, prints the composite's own name
+  and each page's report date, carries no commentary, and keeps no text from
+  the reference design (unless the composite's own name or description uses it);
+- each deck names the composite and keeps no MS or T identity text;
+- visual QA, looking at every factsheet page against the Alpha World layout's
+  checklist, finds no fault. It runs on `wr-reports-apac`, APAC only.
+
+A missing file, a hash mismatch, wrong identity or date text, commentary on a
+factsheet, or a high-severity layout fault fails the review. A medium layout
+point, or a month that visual QA could not look at, gives a warning, which Ying
+acknowledges at approval 2. A clean review passes.
+
+**How it is recorded.** The agent cannot write a case or a check:
+
+1. The `onboarding` job (`python -m wealthryse_agent.jobs onboarding`, hourly)
+   reads the waiting cases through the tool server's
+   `list_onboarding_report_cases`. Only that job is offered this tool.
+2. It writes one row per case and set of reports to `agent.onboarding_reviews`.
+   The row is bound to the digest of the case's `reports_rendered` evidence.
+3. The month-end report job, after the composite reports, calls
+   `ibkr_etl.onboarding_agent_review.record_agent_reviews`. This records the
+   review as the case's `agent_review_complete` check through
+   `record_platform_check`, like every other stage 3 check.
+4. Until the current reports have a review, the check is pending, so approval
+   2 cannot be given. A re-render puts it back to pending.
+
+**Turning it on** (each step needs Ying's typed approval naming the resources):
+
+1. **Database.** Rerun `scripts/install_agent_schema.py` with
+   `--platform-reader <the platform jobs' role>`. It applies
+   `003_onboarding_review.sql` and lets that role read the reviews (and
+   nothing else in the agent schema).
+2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
+3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOnboarding=true`
+   (needs `deployMonthTeam=true` for the report reader). This creates
+   `ibkrv2stg-agent-onboarding`.
+4. **Recording.** The month-end report job calls `record_agent_reviews` after
+   `render_onboarding_composite_reports.py`.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool
@@ -257,6 +311,9 @@ only, as it does today; the factsheet renderer never receives it.
 - Two Container Apps that scale to zero, and three short jobs.
 - The month-end team, when deployed: an hourly job on six days a month, and
   its own monthly token budget on `wr-reports-apac`.
+- The onboarding agents, when deployed: an hourly job that calls the model
+  only when a case has new reports to review, with its own monthly budget
+  (`onboardingTokenBudget`).
 - No new database server.
 
 ## Not yet done

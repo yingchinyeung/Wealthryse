@@ -46,6 +46,20 @@ class AgentAppsBicepTest(unittest.TestCase):
         self.assertIn("if (deployMonthTeam)", reader)
         self.assertIn("scope: reportContainer", reader)  # one container, read only
 
+    def test_onboarding_agents_are_off_until_approved_and_stay_in_the_apac_data_zone(self):
+        apps = BICEP.read_text()
+        self.assertIn("param deployOnboarding bool = false", apps)
+        job = apps[apps.index("resource onboardingJob"):apps.index("output agentApiUrl")]
+        name = re.search(r"name: '([^']+)'", job).group(1)
+        self.assertEqual(name, "ibkrv2stg-agent-onboarding")
+        self.assertTrue(2 <= len(name) <= 32)
+        # It reads review files through the month-end team's one-container reader, so it needs that too.
+        self.assertIn("= if (deployOnboarding && deployMonthTeam)", job.splitlines()[0])
+        self.assertIn("monthTeamReader", job)
+        self.assertIn("{ name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }", job)
+        self.assertIn("value: reportModelDeployment", job)
+        self.assertIn("args: ['onboarding']", job)
+
 
 if __name__ == "__main__":
     unittest.main()

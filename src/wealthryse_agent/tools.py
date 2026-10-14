@@ -816,6 +816,27 @@ def list_month_end_packages(connection, arguments: Mapping[str, Any]) -> dict[st
             "citations": [_citation("report_generation_runs", account_id)]}
 
 
+def list_onboarding_report_cases(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Composite cases in stage 3 whose historical reports are rendered, with the files to review."""
+    rows = connection.execute(
+        "SELECT case_id::text AS case_id, subject_id, display_name, description, report_style, reporting_currency, "
+        "history_start_date, reports_evidence_json, reports_checked_at FROM onboarding_report_cases ORDER BY case_id"
+    ).fetchall()
+    cases = []
+    for row in rows:
+        try:
+            evidence = json.loads(row["reports_evidence_json"] or "{}")
+        except ValueError as error:
+            raise ToolError("evidence_unreadable", "A case's rendered-reports record could not be read.") from error
+        cases.append({"case_id": row["case_id"], "subject_id": row["subject_id"], "display_name": row["display_name"],
+                      "description": row["description"], "report_style": row["report_style"],
+                      "reporting_currency": row["reporting_currency"],
+                      "history_start_date": row["history_start_date"], "reports_rendered": evidence,
+                      "reports_checked_at": row["reports_checked_at"]})
+    return {"as_of": None, "data": {"cases": cases},
+            "citations": [_citation("broker_onboarding_checks", None, check_id="reports_rendered")]}
+
+
 # Registry ------------------------------------------------------------------
 
 
@@ -825,6 +846,7 @@ def _schema(properties: Mapping[str, Any], required: list[str]) -> dict[str, Any
 
 _ACCOUNT = {"type": "string", "description": "account_id from list_accounts"}
 MONTH_TEAM = frozenset({"month_team"})
+ONBOARDING = frozenset({"onboarding"})
 _DATE = {"type": "string", "description": "YYYY-MM-DD"}
 _AS_OF = {"type": "string", "description": "YYYY-MM-DD; omit for the latest valuation"}
 
@@ -868,6 +890,9 @@ TOOLS: tuple[ToolSpec, ...] = (
              get_month_end_snapshot, only_jobs=MONTH_TEAM),
     ToolSpec("list_month_end_packages", "Every month with a built month-end package, and each file's status.",
              _schema({"account_id": _ACCOUNT}, ["account_id"]), list_month_end_packages, only_jobs=MONTH_TEAM),
+    ToolSpec("list_onboarding_report_cases", "Composite onboarding cases whose historical reports are rendered and "
+             "waiting for the agent review, with each report's month, file, hash and private storage path.",
+             _schema({}, []), list_onboarding_report_cases, False, only_jobs=ONBOARDING),
 )
 REGISTRY = {tool.name: tool for tool in TOOLS}
 

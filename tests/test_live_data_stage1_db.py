@@ -127,10 +127,18 @@ class Stage1PayloadDatabaseTests(unittest.TestCase):
             self.assertEqual(web.execute("SELECT count(*) FROM live_gateway_status").fetchone()[0], 1)
             web.execute("SELECT * FROM subject_live_summary").fetchall()
 
+        # A rerun with a new password (the secret replaced) moves the login to it.
+        import rollout_live_data_stage1 as rollout
+
+        self.verifier = rollout.scram_verifier(COLLECTOR_PASSWORD + "-replaced")
         second = self._run()
         self.assertEqual(second["status"], "pass", second)
         self.assertFalse(second["migration_applied"])
         self.assertFalse(second["role_created"])
+        with psycopg.connect(_dsn(self.database, COLLECTOR, COLLECTOR_PASSWORD + "-replaced")) as collector:
+            collector.execute("SELECT 1 FROM live_gateway_status").fetchall()
+        with self.assertRaises(psycopg.OperationalError):
+            psycopg.connect(_dsn(self.database, COLLECTOR, COLLECTOR_PASSWORD)).close()
 
     def test_refuses_without_changes_when_the_database_differs_from_main(self):
         before = self._migrations()

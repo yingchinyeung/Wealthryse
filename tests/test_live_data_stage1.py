@@ -107,27 +107,34 @@ class SecretHandlingTests(unittest.TestCase):
         self.assertNotIn("volumeMounts", value)
         self.assertNotIn(PASSWORD, json.dumps(value))
 
+    def _state(self):
+        return {"container": rollout.validate_job(_job(), rollout.recorded_image()), "bundle": rollout.bundle(),
+                "head": "0" * 40}
+
     def test_start_never_prints_or_sends_the_password(self):
         calls = []
 
         def fake(method, url, *, data=None, audience=rollout.MANAGEMENT, missing=False):
             calls.append((method, url, data))
             if url.startswith("https://" + rollout.VAULT):
+                raise AssertionError("a new secret needs no read through the vault's data plane")
+            if url == rollout.SECRET_PATH:
                 if method == "PUT":
-                    fake.secret = data["value"]
-                    return {}
-                return None if not hasattr(fake, "secret") else {"value": fake.secret}
+                    fake.secret = data["properties"]["value"]
+                    return {"id": "secret"}
+                return {"id": "secret"} if hasattr(fake, "secret") else None
             if url.endswith("/start" + rollout.API):
                 return {"name": "ibkrv2stg-bootstrap-abc1234"}
             raise AssertionError(url)
 
-        state = {"container": rollout.validate_job(_job(), rollout.recorded_image()), "bundle": rollout.bundle(),
-                 "head": "0" * 40}
         output = io.StringIO()
-        with mock.patch.object(rollout, "request", fake), mock.patch.object(rollout, "preflight", return_value=state), \
+        with mock.patch.object(rollout, "request", fake), \
+                mock.patch.object(rollout, "preflight", return_value=self._state()), \
                 contextlib.redirect_stdout(output):
             self.assertEqual(rollout.main(["start"]), 0)
         password = rollout.collector_password(fake.secret)
+        self.assertEqual([m for m, url, _ in calls if url == rollout.SECRET_PATH], ["GET", "PUT"])
+        self.assertTrue(rollout.SECRET_PATH.startswith(rollout.BASE + "Microsoft.KeyVault/vaults/" + rollout.VAULT))
         started = [data for method, url, data in calls if url.endswith("/start" + rollout.API)]
         self.assertEqual(len(started), 1)
         self.assertNotIn(password, json.dumps(started[0]))
@@ -135,20 +142,93 @@ class SecretHandlingTests(unittest.TestCase):
         self.assertIn("ibkrv2stg-bootstrap-abc1234", output.getvalue())
         verifier = started[0]["containers"][0]["env"][1]["value"]
         self.assertRegex(verifier, payload.VERIFIER)
+        salt = base64.b64decode(verifier.split(":")[1].split("$")[0])
+        self.assertEqual(rollout.scram_verifier(password, salt), verifier)
+
+    def test_check_changes_nothing_and_needs_no_vault_data_plane(self):
+        def fake(method, url, *, data=None, audience=rollout.MANAGEMENT, missing=False):
+            if method != "GET" or url != rollout.SECRET_PATH:
+                raise AssertionError((method, url))
+            return None
+
+        output = io.StringIO()
+        with mock.patch.object(rollout, "request", fake), \
+                mock.patch.object(rollout, "preflight", return_value=self._state()), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(rollout.main(["check"]), 0)
+        self.assertIn("database-live-url will be created", output.getvalue())
 
     def test_an_existing_secret_is_reused_not_replaced(self):
+        calls = []
+
         def fake(method, url, *, data=None, audience=rollout.MANAGEMENT, missing=False):
-            if method == "PUT" and url.startswith("https://" + rollout.VAULT):
+            calls.append((method, url))
+            if method == "PUT":
                 raise AssertionError("must not overwrite the secret")
+            if url == rollout.SECRET_PATH:
+                return {"id": "secret"}
             if url.startswith("https://" + rollout.VAULT):
                 return {"value": rollout.collector_url(PASSWORD)}
             return {"name": "ibkrv2stg-bootstrap-abc1234"}
 
-        state = {"container": rollout.validate_job(_job(), rollout.recorded_image()), "bundle": rollout.bundle(),
-                 "head": "0" * 40}
-        with mock.patch.object(rollout, "request", fake), mock.patch.object(rollout, "preflight", return_value=state), \
+        with mock.patch.object(rollout, "request", fake), \
+                mock.patch.object(rollout, "preflight", return_value=self._state()), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(rollout.main(["start"]), 0)
+        self.assertTrue(any(url.endswith("/start" + rollout.API) for _, url in calls))
+
+    def test_an_existing_secret_this_computer_cannot_read_stops_before_anything_starts(self):
+        calls = []
+
+        def fake(method, url, *, data=None, audience=rollout.MANAGEMENT, missing=False):
+            calls.append((method, url))
+            if url == rollout.SECRET_PATH:
+                return {"id": "secret"}
+            if url.startswith("https://" + rollout.VAULT):
+                raise SystemExit("Azure GET failed with HTTP 403 (Forbidden, ForbiddenByConnection)")
+            raise AssertionError(url)
+
+        with mock.patch.object(rollout, "request", fake), \
+                mock.patch.object(rollout, "preflight", return_value=self._state()), \
+                self.assertRaisesRegex(SystemExit, "cannot read it .*ForbiddenByConnection"):
+            rollout.main(["start"])
+        self.assertFalse([m for m, _ in calls if m in ("PUT", "POST")])
+
+
+    def test_new_secret_replaces_an_unreadable_secret(self):
+        calls = []
+
+        def fake(method, url, *, data=None, audience=rollout.MANAGEMENT, missing=False):
+            calls.append((method, url, data))
+            if url.startswith("https://" + rollout.VAULT):
+                raise AssertionError("must not need the vault's data plane")
+            if url == rollout.SECRET_PATH:
+                return {"id": "secret"}
+            return {"name": "ibkrv2stg-bootstrap-abc1234"}
+
+        with mock.patch.object(rollout, "request", fake), \
+                mock.patch.object(rollout, "preflight", return_value=self._state()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(rollout.main(["start", "--new-secret"]), 0)
+        put = [data for method, url, data in calls if method == "PUT"]
+        password = rollout.collector_password(put[0]["properties"]["value"])
+        verifier = [data for method, url, data in calls if method == "POST"][0]["containers"][0]["env"][1]["value"]
+        salt = base64.b64decode(verifier.split(":")[1].split("$")[0])
+        self.assertEqual(rollout.scram_verifier(password, salt), verifier)
+
+
+class ResultTests(unittest.TestCase):
+    def test_reports_the_execution_status_when_logs_cannot_be_read(self):
+        args = rollout.command(rollout.bundle())
+
+        def fake(method, url, *, data=None, audience=rollout.MANAGEMENT, missing=False):
+            if audience == rollout.LOGS:
+                raise SystemExit("Azure POST failed with HTTP 403")
+            return {"properties": {"status": "Succeeded", "template": {"containers": [{"args": args}]}}}
+
+        with mock.patch.object(rollout, "request", fake), \
+                self.assertRaisesRegex(SystemExit, "status is Succeeded"):
+            rollout.main(["result", "--execution", "ibkrv2stg-bootstrap-abc1234"])
 
 
 class AzureErrorTests(unittest.TestCase):

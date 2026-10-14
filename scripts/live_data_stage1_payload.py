@@ -14,7 +14,8 @@ transactions, it applies 063 and records it exactly as bootstrap_postgres.py
 does, and creates the ibkr_live_collector login with its grants, rolled back
 unless the grants are least-privilege. The login's password arrives as a
 SCRAM-SHA-256 verifier (LIVE_COLLECTOR_VERIFIER), never as the password. A
-rerun applies nothing twice and leaves an existing login as it is. It prints one
+rerun applies nothing twice and does not recreate the login; it sets the
+login's password to the verifier, so it always matches the Key Vault secret. It prints one
 LIVE_DATA_STAGE1 line of JSON with no secret in it.
 
 Environment: DATABASE_ADMIN_URL, LIVE_COLLECTOR_VERIFIER.
@@ -86,6 +87,13 @@ def run(connection, bundle: dict, verifier: str) -> dict:
     with connection.transaction():
         if not role_existed:
             access.provision(connection, password=verifier, database=database, role=role)
+        else:
+            from psycopg import sql
+
+            # The verifier always comes from the Key Vault secret's current password, so a
+            # rerun keeps the login's password the one the secret holds.
+            connection.execute(sql.SQL("ALTER ROLE {} PASSWORD {}").format(sql.Identifier(role),
+                                                                           sql.Literal(verifier)))
         problems = access.least_privilege_problems(access.privilege_report(connection, role))
         if problems and not role_existed:
             # Leaves the transaction, so the new login and its grants are rolled back.
@@ -108,6 +116,7 @@ def run(connection, bundle: dict, verifier: str) -> dict:
         migrations_matched=len(applied),
         role=role,
         role_created=not role_existed,
+        password_matched_to_secret=True,
         role_problems=problems,
         website_role=web_role,
         website_cannot_read=web_unreadable,

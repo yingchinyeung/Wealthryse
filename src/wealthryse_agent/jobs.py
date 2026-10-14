@@ -1,8 +1,12 @@
-"""Scheduled agents. Each writes to the inbox only; nothing is sent or published.
+"""Scheduled agents. They write only to the agent schema (the inbox and their own run
+records); nothing is sent, published or released.
 
     python -m wealthryse_agent.jobs holdings_explainer   # daily, after the account sync
     python -m wealthryse_agent.jobs month_end_drafter    # 1st–7th of each month
     python -m wealthryse_agent.jobs data_quality         # daily; also applies chat retention
+    python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team, in shadow
+    python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
+                                                         # re-check months already released
 
 Accounts come from agent.service_grants for the job, enforced by the tool server.
 """
@@ -18,6 +22,7 @@ from typing import Any
 from .auth import TokenSource
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings
 from .database import connect
+from .month_team.agents import BudgetExhausted
 from .prompts import HOLDINGS_EXPLAINER, MONTH_END_DRAFTER
 from .runtime import Agent, AgentError
 from .store import Store
@@ -128,10 +133,71 @@ def data_quality(store: Store, tools: ToolClient, accounts: list[str], retention
     return written
 
 
+def replay_targets(tools: ToolClient, accounts: list[str], start: str, end: str) -> list[tuple[str, str]]:
+    """Every account and month in the range whose factsheet was released."""
+    from .month_team.coordinator import RELEASED
+
+    targets = []
+    for account_id in accounts:
+        for month in tools.call("list_month_end_packages", {"account_id": account_id})["data"]["months"]:
+            factsheet = month["files"].get("factsheet") or {}
+            if start <= month["period_end"] <= end and factsheet.get("status") in RELEASED:
+                targets.append((account_id, month["period_end"]))
+    return targets
+
+
+def month_team(store: Store, tools: ToolClient, accounts: list[str], usage: dict, args: argparse.Namespace,
+               correlation_id: str, today: date | None = None) -> int:
+    from .month_team.agents import TeamModel
+    from .month_team.coordinator import Coordinator
+    from .month_team.settings import TeamSettings, validate_report_model
+    from .month_team.store import MonthStore
+
+    settings, model_settings = TeamSettings.from_env(), ModelSettings.from_env()
+    settings.validate()
+    validate_report_model(model_settings)
+    team_store = MonthStore(store.db, store.tenant_id)
+    tokens_left = settings.monthly_token_budget - team_store.tokens_used_this_month()
+    if tokens_left <= 0:
+        raise BudgetExhausted
+    mode = "replay" if args.replay else "shadow"
+    holder: dict[str, TeamModel] = {}
+
+    def model() -> TeamModel:
+        holder["model"] = TeamModel(model_settings, tokens_left=tokens_left)
+        return holder["model"]
+
+    coordinator = Coordinator(team_store, tools.call, model, settings, today=today, correlation_id=correlation_id)
+    period = args.period or ((today or date.today()).replace(day=1) - timedelta(days=1)).isoformat()
+    if args.retry:
+        first, last = (args.from_period, args.to_period) if args.replay else (period, period)
+        LOGGER.info("retrying %s stopped runs", team_store.retry_stopped(mode, first, last))
+    try:
+        if mode == "shadow":
+            counts = coordinator.run_month(accounts, period, "shadow")
+        else:
+            counts = {}
+            for account_id, period in replay_targets(tools, accounts, args.from_period, args.to_period):
+                stage = coordinator.advance(account_id, period, "replay")
+                counts[stage] = counts.get(stage, 0) + 1
+    finally:
+        if "model" in holder:
+            _sum_usage(usage, holder["model"].usage)
+    LOGGER.info("month team stages: %s", counts)
+    return counts.get("ready", 0)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality"])
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team"])
+    parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
+    parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
+    parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
+    parser.add_argument("--to", dest="to_period", default="2999-12-31", help="month_team --replay: last month end")
+    parser.add_argument("--retry", action="store_true", help="month_team: retry runs stopped after repeated failures")
     args = parser.parse_args(argv)
+    if args.job != "month_team" and (args.period or args.replay or args.retry):
+        parser.error("--period, --replay and --retry apply to month_team only")
     logging.basicConfig(level=logging.INFO)
     db, runtime = DatabaseSettings.from_env(), RuntimeSettings.from_env()
     correlation_id = str(uuid.uuid4())
@@ -145,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
         accounts = [a["account_id"] for a in tools.call("list_accounts", {})["data"]["accounts"]]
         if args.job == "data_quality":
             written = data_quality(store, tools, accounts, runtime.retention_days)
+        elif args.job == "month_team":
+            written = month_team(store, tools, accounts, usage, args, correlation_id)
         else:
             if store.tokens_used_today() >= runtime.daily_token_budget:
                 store.finish_run(run_id, status="failed", items=0, usage=usage, error_code="budget_exhausted")
@@ -155,6 +223,10 @@ def main(argv: list[str] | None = None) -> int:
         store.finish_run(run_id, status="succeeded", items=written, usage=usage)
         LOGGER.info("%s wrote %s inbox items", args.job, written)
         return 0
+    except BudgetExhausted:
+        store.finish_run(run_id, status="failed", items=0, usage=usage, error_code="budget_exhausted")
+        LOGGER.error("%s paused: the monthly token budget is used up", args.job)
+        return 1
     except (AgentError, ToolCallFailed) as error:
         store.finish_run(run_id, status="failed", items=0, usage=usage, error_code=error.code)
         LOGGER.error("%s failed: %s", args.job, error.code)

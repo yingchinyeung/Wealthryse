@@ -109,11 +109,13 @@ class Store:
     # Budget ----------------------------------------------------------------
 
     def tokens_used_today(self) -> int:
+        """Chat and the daily jobs. The month-end team has its own monthly budget."""
         row = self.db.execute(
             """
             SELECT COALESCE(SUM((m.usage->>'input_tokens')::bigint + (m.usage->>'output_tokens')::bigint), 0)
                  + COALESCE((SELECT SUM((r.usage->>'input_tokens')::bigint + (r.usage->>'output_tokens')::bigint)
-                             FROM agent.runs r WHERE r.tenant_id = ?::uuid AND r.started_at >= date_trunc('day', now())), 0)
+                             FROM agent.runs r WHERE r.tenant_id = ?::uuid AND r.started_at >= date_trunc('day', now())
+                               AND r.job_name <> 'month_team'), 0)
                    AS used
             FROM agent.messages m JOIN agent.conversations c ON c.conversation_id = m.conversation_id
             WHERE c.tenant_id = ?::uuid AND m.created_at >= date_trunc('day', now()) AND (m.usage->>'input_tokens') IS NOT NULL

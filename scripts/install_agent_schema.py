@@ -11,7 +11,7 @@ that owns the platform tables, from a machine inside the private network
         --grant holdings_explainer=U1234567 --grant data_quality=U1234567
 
 What it does, in one transaction:
-  1. applies migrations/agent/001_agent_schema.sql (idempotent);
+  1. applies every file in migrations/agent in name order (each idempotent);
   2. creates each managed identity's Entra login role if missing
      (pgaadauth_create_principal) and grants it agent_reader or agent_writer;
   3. records which accounts each scheduled job may cover.
@@ -39,8 +39,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA = ROOT / "migrations" / "agent" / "001_agent_schema.sql"
-JOBS = {"holdings_explainer", "month_end_drafter", "data_quality"}
+SCHEMAS = tuple(sorted((ROOT / "migrations" / "agent").glob("*.sql")))
+JOBS = {"holdings_explainer", "month_end_drafter", "data_quality", "month_team"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}\Z")
 
 
@@ -82,7 +82,8 @@ def main(argv: list[str] | None = None) -> int:
 
     with psycopg.connect(args.database_url, options=f"-c app.tenant_id={args.tenant_id}") as connection:
         if not args.logins_only:
-            connection.execute(SCHEMA.read_text(encoding="utf-8"))
+            for schema in SCHEMAS:
+                connection.execute(schema.read_text(encoding="utf-8"))
         for name, role in args.principal:
             exists = connection.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (name,)).fetchone()
             if not exists:

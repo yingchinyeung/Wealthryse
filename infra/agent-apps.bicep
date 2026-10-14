@@ -1,7 +1,8 @@
 targetScope = 'resourceGroup'
 
-// WealthRyse agents, part 2: the agent runtime, the tool server and three
-// scheduled jobs in the existing Container Apps environment. Internal ingress
+// WealthRyse agents, part 2: the agent runtime, the tool server, three
+// scheduled jobs and (when deployMonthTeam) the month-end team's job, in the
+// existing Container Apps environment. Internal ingress
 // only. Deploy after agent-foundation.bicep, the Entra app registrations and
 // scripts/install_agent_schema.py (see docs/AGENTS.md), with Ying's approval.
 
@@ -44,6 +45,16 @@ param retentionDays int = 90
 
 param agentAppName string = 'ibkrv2stg-agent'
 param toolsAppName string = 'ibkrv2stg-agent-tools'
+
+// Month-end team (docs/AGENTS.md, "Month-end team"). Off until Ying approves the
+// job and its read access by name; a redeploy for anything else leaves it out.
+param deployMonthTeam bool = false
+@description('APAC Data Zone deployment for report content. The team refuses any other processing scope.')
+param reportModelDeployment string = 'wr-reports-apac'
+param reportStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
+param reportContainerName string = 'internal-reports'
+@description('Tokens per calendar month for the month-end team, separate from the daily chat budget.')
+param monthTeamTokenBudget int = 20000000
 
 var tags = {
   application: 'wealthryse-agents'
@@ -252,6 +263,80 @@ resource agentJobs 'Microsoft.App/jobs@2024-03-01' = [for j in jobs: {
     }
   }
 }]
+
+// The month-end team: hourly from 15:00 to 20:00 HKT on the 2nd to 7th, so each
+// account moves on as soon as its data, package or Ying's decision is ready.
+// It shares the jobs identity, reads review files and writes only the agent schema.
+resource reportStorage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
+  name: reportStorageAccountName
+}
+resource reportBlobs 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' existing = {
+  parent: reportStorage
+  name: 'default'
+}
+resource reportContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: reportBlobs
+  name: reportContainerName
+}
+var storageBlobDataReaderRole = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
+resource monthTeamReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployMonthTeam) {
+  name: guid(reportContainer.id, jobsIdentity.id, storageBlobDataReaderRole)
+  scope: reportContainer
+  properties: {
+    principalId: jobsIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataReaderRole)
+  }
+}
+
+resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
+  name: 'ibkrv2stg-agent-month-team'
+  location: resourceGroup().location
+  tags: tags
+  dependsOn: [pulls, tools, monthTeamReader]
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: { '${jobsIdentity.id}': {} }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 3600
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        cronExpression: '0 7-12 2-7 * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [{ server: registry.properties.loginServer, identity: jobsIdentity.id }]
+    }
+    template: {
+      containers: [
+        {
+          name: 'job'
+          image: image
+          command: ['python', '-m', 'wealthryse_agent.jobs']
+          args: ['month_team']
+          env: concat(commonEnv, [
+            { name: 'AGENT_MODEL_ENDPOINT', value: modelEndpoint }
+            { name: 'AGENT_MODEL_DEPLOYMENT', value: reportModelDeployment }
+            { name: 'AGENT_MODEL_REGION', value: 'southeastasia' }
+            { name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }
+            { name: 'AGENT_TOOL_SERVER_URL', value: 'https://${toolsAppName}.internal.${managedEnvironment.properties.defaultDomain}' }
+            { name: 'AGENT_TOOL_SERVER_AUDIENCE', value: toolsAudience }
+            { name: 'AGENT_MONTH_TEAM_TOKEN_BUDGET', value: string(monthTeamTokenBudget) }
+            { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${reportStorageAccountName}.blob.${environment().suffixes.storage}' }
+            { name: 'INTERNAL_REPORT_CONTAINER', value: reportContainerName }
+            { name: 'AZURE_CLIENT_ID', value: jobsIdentity.properties.clientId }
+            { name: 'AGENT_DB_USER', value: jobsIdentity.name }
+          ])
+          resources: { cpu: json('0.5'), memory: '1Gi' }
+        }
+      ]
+    }
+  }
+}
 
 output agentApiUrl string = 'https://${agent.properties.configuration.ingress.fqdn}'
 output toolServerUrl string = 'https://${tools.properties.configuration.ingress.fqdn}'

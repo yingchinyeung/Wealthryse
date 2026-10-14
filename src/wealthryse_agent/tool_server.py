@@ -108,7 +108,7 @@ class ToolService:
             subject = arguments.get("account_id") if isinstance(arguments, dict) else None
             spec = REGISTRY.get(name)
             try:
-                if spec is None:
+                if spec is None or not _offered(spec, job if kind == "service" else None):
                     raise ToolError("unknown_tool", "That tool does not exist.", 404)
                 if spec.needs_account:
                     if not isinstance(subject, str) or subject not in allowed:
@@ -130,9 +130,15 @@ class ToolService:
             return result
 
 
-def tool_list() -> list[dict[str, Any]]:
+def _offered(spec: Any, job: str | None) -> bool:
+    return not spec.only_jobs or job in spec.only_jobs
+
+
+def tool_list(job: str | None = None) -> list[dict[str, Any]]:
+    """The tools a caller may use: a person gets the shared ones, a job also its own."""
     return [{"name": t.name, "description": t.description, "inputSchema": t.parameters,
-             "annotations": {"readOnlyHint": True, "openWorldHint": False}} for t in TOOLS]
+             "annotations": {"readOnlyHint": True, "openWorldHint": False}}
+            for t in TOOLS if _offered(t, job)]
 
 
 def _rpc_result(request_id: Any, result: Any) -> dict[str, Any]:
@@ -174,7 +180,8 @@ def create_app(service: ToolService) -> FastAPI:
         if method == "ping":
             return JSONResponse(_rpc_result(request_id, {}))
         if method == "tools/list":
-            return JSONResponse(_rpc_result(request_id, {"tools": tool_list()}))
+            job = None if request.headers.get("x-wr-user") else request.headers.get("x-wr-job")
+            return JSONResponse(_rpc_result(request_id, {"tools": tool_list(job)}))
         if method != "tools/call":
             return JSONResponse(_rpc_error(request_id, -32601, "Method not found"))
         name = str(params.get("name") or "")

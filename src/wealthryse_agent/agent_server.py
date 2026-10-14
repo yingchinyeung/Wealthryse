@@ -14,23 +14,27 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import uuid
 from typing import Any, Callable, Iterator
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .auth import ServiceCaller, TokenSource, Unauthorized, verify_service_token
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings, ServiceAuthSettings
 from .database import connect
+from .month_team.store import MonthStore
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
 
 LOGGER = logging.getLogger("wealthryse_agent.runtime")
 USER_ID = r"^[0-9a-fA-F-]{36}$"
+PERIOD = r"^\d{4}-\d{2}-\d{2}$"
+MONTH_MODE = r"^(shadow|replay)$"
 # Deep reasoning can think for minutes without an event; a comment line keeps the website's read open.
 KEEPALIVE_SECONDS = 15.0
 
@@ -117,7 +121,8 @@ class Services:
 
     def __init__(self, *, auth: ServiceAuthSettings, runtime: RuntimeSettings, tenant_id: str,
                  store_factory: Callable[[], Store], agent_factory: Callable[[], Agent],
-                 tools_factory: Callable[[str, str], ToolClient]) -> None:
+                 tools_factory: Callable[[str, str], ToolClient],
+                 month_store_factory: Callable[[], MonthStore] | None = None) -> None:
         self.auth = auth
         self.runtime = runtime
         self.tenant_id = tenant_id
@@ -126,6 +131,8 @@ class Services:
         self.tools_for = tools_factory
         self._store: _LockedStore | None = None
         self._store_lock = threading.Lock()
+        self._month_store_factory = month_store_factory
+        self._month_store: _LockedStore | None = None
         self._agent: Agent | None = None
         self.keepalive_seconds = KEEPALIVE_SECONDS
 
@@ -134,6 +141,14 @@ class Services:
             if self._store is None:
                 self._store = _LockedStore(self._store_factory)
         return self._store  # type: ignore[return-value]
+
+    def month_store(self) -> MonthStore:
+        if self._month_store_factory is None:
+            raise HTTPException(status_code=503, detail="The month-end team is not configured.")
+        with self._store_lock:
+            if self._month_store is None:
+                self._month_store = _LockedStore(self._month_store_factory)
+        return self._month_store  # type: ignore[return-value]
 
     def agent(self) -> Agent:
         if self._agent is None:
@@ -261,6 +276,27 @@ def create_app(services: Services) -> FastAPI:
             raise HTTPException(status_code=404, detail="Item not found.")
         return {"saved": True}
 
+    @app.get("/v1/month-end/runs")
+    def month_runs(user_object_id: str, period_end: str | None = Query(default=None, pattern=PERIOD),
+                   mode: str = Query(default="shadow", pattern=MONTH_MODE),
+                   _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        accounts = accounts_for(user_object_id.lower(), str(uuid.uuid4()))
+        store = services.month_store()
+        return {"runs": store.runs(accounts, period_end, mode), "team": store.team_status()}
+
+    @app.get("/v1/month-end/runs/{account_id}/{period_end}")
+    def month_run(account_id: str, period_end: str, user_object_id: str,
+                  mode: str = Query(default="shadow", pattern=MONTH_MODE),
+                  _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        if not re.match(PERIOD, period_end):
+            raise HTTPException(status_code=400, detail="period_end must be YYYY-MM-DD.")
+        if account_id not in accounts_for(user_object_id.lower(), str(uuid.uuid4())):
+            raise HTTPException(status_code=403, detail="You do not have access to that account.")
+        found = services.month_store().run_detail(account_id, period_end, mode)
+        if found is None:
+            raise HTTPException(status_code=404, detail="The team has not worked on that month yet.")
+        return found
+
     return app
 
 
@@ -275,6 +311,7 @@ def _from_env() -> FastAPI:
         store_factory=lambda: Store(connect(db, search_path="agent"), db.tenant_id),
         agent_factory=lambda: Agent(ModelSettings.from_env()),
         tools_factory=lambda user, cid: ToolClient(runtime.tool_server_url, tokens, user=user, correlation_id=cid),
+        month_store_factory=lambda: MonthStore(connect(db, search_path="agent"), db.tenant_id),
     )
     return create_app(services)
 

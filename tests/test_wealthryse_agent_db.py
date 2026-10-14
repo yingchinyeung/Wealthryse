@@ -82,8 +82,13 @@ class AgentDatabaseTests(unittest.TestCase):
         # Raw psycopg: the SQL files use the jsonb "?" operator family and $$ bodies.
         with psycopg.connect(_dsn(ADMIN_DSN, cls.database, "agent_test_owner"),
                              options=f"-c app.tenant_id={TENANT}") as owner:
-            owner.execute((ROOT / "migrations/agent/001_agent_schema.sql").read_text(encoding="utf-8"))
+            # Every agent schema file in name order, as scripts/install_agent_schema.py applies them;
+            # twice, because the installer must be safe to re-run.
+            for _ in range(2):
+                for path in sorted((ROOT / "migrations" / "agent").glob("*.sql")):
+                    owner.execute(path.read_text(encoding="utf-8"))
             owner.execute((ROOT / "tests/fixtures/agent_seed.sql").read_text(encoding="utf-8"))
+            cls._seed_month_end(owner)
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:  # roles are cluster-wide
             admin.execute("GRANT agent_reader TO agent_test_reader")
             admin.execute("GRANT agent_writer TO agent_test_writer")
@@ -100,6 +105,34 @@ class AgentDatabaseTests(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         cls.client = TestClient(create_app(cls.service))
+
+    SNAPSHOT = "aaaaaaaa-0000-4000-8000-000000000001"
+    TAMPERED = "aaaaaaaa-0000-4000-8000-000000000002"
+
+    @classmethod
+    def _seed_month_end(cls, owner):
+        import hashlib
+        import json
+
+        payload = json.dumps({"subject_id": "UTEST1", "period_end": "2026-03-31"})
+        rows = [(cls.SNAPSHOT, "2026-03-31", payload, hashlib.sha256(payload.encode()).hexdigest()),
+                (cls.TAMPERED, "2026-02-28", payload, "0" * 64)]
+        for snapshot_id, period_end, text, digest in rows:
+            owner.execute(
+                "INSERT INTO reporting_snapshots(snapshot_id, tenant_id, subject_id, period_start, period_end, as_of_at, "
+                "reporting_currency, formula_version, source_manifest_json, data_sha256, quality_status, status, "
+                "created_at, snapshot_payload_json, publication_allowed) VALUES (%s, %s, 'UTEST1', '2026-01-02', %s, "
+                "'2026-04-01', 'USD', 'test', '{}', %s, 'pass', 'frozen', '2026-04-01', %s, true)",
+                (snapshot_id, TENANT, period_end, digest, text))
+        for report_type, status, sha in (("factsheet", "failed", None), ("factsheet", "awaiting_approval", "a" * 64),
+                                         ("presentation", "released_internal", "b" * 64)):
+            owner.execute(
+                "INSERT INTO report_generation_runs(tenant_id, snapshot_id, report_type, status, output_reference, "
+                "output_sha256, started_at, completed_at) VALUES (%s, %s, %s, %s, %s, %s, '2026-04-02', '2026-04-02')",
+                (TENANT, cls.SNAPSHOT, report_type, status, f"internal-reports/review/UTEST1/2026-03-31/{report_type}",
+                 sha))
+        owner.execute("INSERT INTO agent.service_grants(tenant_id, job_name, subject_id, granted_by) "
+                      "VALUES (%s, 'month_team', 'UTEST1', 'test')", (TENANT,))
 
     @classmethod
     def tearDownClass(cls):
@@ -226,6 +259,82 @@ class AgentDatabaseTests(unittest.TestCase):
         self.assertTrue(store.archive(cid, VIEWER))
         self.assertEqual(store.purge(90), 0)
         store.db.close()
+
+    # Month-end team -----------------------------------------------------------
+
+    def test_month_end_tools_are_for_the_team_only(self):
+        package = self._call("get_month_end_package", {"account_id": "UTEST1", "period_end": "2026-03-31"},
+                             job="month_team")["structuredContent"]["data"]
+        self.assertEqual(package["snapshot_id"], self.SNAPSHOT)
+        self.assertEqual([(f["report_type"], f["status"]) for f in package["files"]],
+                         [("factsheet", "awaiting_approval"), ("presentation", "released_internal")])
+        snapshot = self._call("get_month_end_snapshot", {"account_id": "UTEST1", "snapshot_id": self.SNAPSHOT},
+                              job="month_team")["structuredContent"]["data"]
+        self.assertEqual(snapshot["payload"]["period_end"], "2026-03-31")
+        tampered = self._call("get_month_end_snapshot", {"account_id": "UTEST1", "snapshot_id": self.TAMPERED},
+                              job="month_team")
+        self.assertEqual(tampered["structuredContent"]["error"]["code"], "snapshot_integrity_failed")
+        months = self._call("list_month_end_packages", {"account_id": "UTEST1"}, job="month_team")
+        self.assertEqual(months["structuredContent"]["data"]["months"][0]["files"]["presentation"]["status"],
+                         "released_internal")
+        # A person, even the owner, can neither call nor see them.
+        refused = self._call("get_month_end_package", {"account_id": "UTEST1", "period_end": "2026-03-31"}, user=OWNER)
+        self.assertEqual(refused["structuredContent"]["error"]["code"], "unknown_tool")
+        listed = self.client.post("/mcp", headers={"X-WR-User": OWNER},
+                                  json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).json()["result"]["tools"]
+        self.assertNotIn("get_month_end_snapshot", [t["name"] for t in listed])
+        # Nor can another job, even one granted the account.
+        other = self._call("get_month_end_package", {"account_id": "UTEST1", "period_end": "2026-03-31"},
+                           job="holdings_explainer")
+        self.assertEqual(other["structuredContent"]["error"]["code"], "unknown_tool")
+
+    def test_month_store_round_trip(self):
+        from wealthryse_agent.database import connect
+        from wealthryse_agent.month_team.store import MonthStore
+        from wealthryse_agent.store import Store
+
+        connection = connect(self.writer_settings, search_path="agent")
+        store = MonthStore(connection, TENANT)
+        run = store.run("UTEST1", "2026-03-31", "shadow")
+        self.assertEqual((run["stage"], run["attempts"]), ("data", 0))
+        self.assertEqual(store.run("UTEST1", "2026-03-31", "shadow")["month_run_id"], run["month_run_id"])
+        self.assertNotEqual(store.run("UTEST1", "2026-03-31", "replay")["month_run_id"], run["month_run_id"])
+        store.update_run(run["month_run_id"], stage="ready", figures={"figures": [{"id": "F1"}]},
+                         commentary_status="agreed", verdicts={"reviewer": "objection"}, attempts=3, last_error="x")
+        step = store.add_step(run["month_run_id"], "reviewer", "objection", "One objection.", evidence={"n": 1})
+        store.add_objection(run["month_run_id"], step, raised_by="visual_qa", target="factsheet", message="Clipped",
+                            page=1, region={"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.1})
+        store.add_objection(run["month_run_id"], step, raised_by="reviewer", target="commentary", message="Wrong way")
+        self.assertEqual(store.settle_objections(run["month_run_id"], ["commentary"], "overruled", "Kept"), 1)
+        listed = store.runs(["UTEST1", "UTEST2"], "2026-03-31")
+        self.assertEqual([(r["subject_id"], r["open_objections"]) for r in listed], [("UTEST1", 1)])
+        detail = store.run_detail("UTEST1", "2026-03-31")
+        self.assertEqual(detail["figures"]["figures"][0]["id"], "F1")
+        self.assertEqual(detail["objections"][0]["region"]["w"], 0.3)
+        self.assertEqual([s["agent_name"] for s in detail["steps"]], ["reviewer"])
+        self.assertIsNone(store.run_detail("UTEST2", "2026-03-31"))
+        self.assertEqual(store.retry_stopped("shadow", "2026-03-31", "2026-03-31"), 1)
+        # Cards: one per kind, account and month; a refresh can reopen it.
+        store.put_card(kind="month_end_report", account_id="UTEST1", period_key="2026-03-31", title="t", body="b")
+        self.assertEqual(store.card_status("month_end_report", "UTEST1", "2026-03-31"), "new")
+        main = Store(connection, TENANT)
+        item = next(i for i in main.inbox(["UTEST1"]) if i["kind"] == "month_end_report")
+        self.assertTrue(main.decide(item["item_id"], ["UTEST1"], "read", "x" * 64))
+        store.put_card(kind="month_end_report", account_id="UTEST1", period_key="2026-03-31", title="t2", body="b2")
+        self.assertEqual(store.card_status("month_end_report", "UTEST1", "2026-03-31"), "read")
+        store.put_card(kind="month_end_report", account_id="UTEST1", period_key="2026-03-31", title="t3", body="b3",
+                       reopen=True)
+        self.assertEqual(store.card_status("month_end_report", "UTEST1", "2026-03-31"), "new")
+        # The team's tokens count against its own monthly budget, not the daily chat budget.
+        before = main.tokens_used_today()
+        connection.execute("INSERT INTO agent.runs(tenant_id, job_name, correlation_id, status, usage) VALUES "
+                           "(?::uuid, 'month_team', 'c', 'succeeded', '{\"input_tokens\": 900, \"output_tokens\": 100}')",
+                           (TENANT,))
+        connection.commit()
+        self.assertEqual(main.tokens_used_today(), before)
+        self.assertEqual(store.tokens_used_this_month(), 1000)
+        self.assertEqual(store.team_status()["latest_job"]["status"], "succeeded")
+        connection.close()
 
 
 if __name__ == "__main__":

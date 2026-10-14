@@ -10949,6 +10949,7 @@ await renderAsOf(asOfSelect.value)
 
 # WealthRyse agents: chat panel, Explain buttons and inbox. Off unless
 # AGENT_UI_MODE is "owner" or "all"; see agent_web.py.
+from .agent_web import case_question_stream as _case_question_stream
 from .agent_web import install as _install_agent_web
 
 _install_agent_web(
@@ -10985,4 +10986,6 @@ onboarding_v2_web.install(
     upload_document=_upload_intake_document,
     list_documents=lambda container, prefix: list_blobs(AZURE_STORAGE_ACCOUNT_URL, container, prefix),
     intake_container=ONBOARDING_INTAKE_CONTAINER,
+    # "Ask about this case", answered by the agent service from the case's facts (also behind that switch).
+    ask_case=lambda: _case_question_stream(),
 )

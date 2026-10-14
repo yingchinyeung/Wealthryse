@@ -164,7 +164,7 @@ class OnboardingAgentsDatabaseTests(unittest.TestCase):
         return db
 
     def test_the_readiness_pack_and_connection_reports_on_a_real_database(self):
-        from ibkr_etl.onboarding_agents import case_readiness, connection_reports
+        from ibkr_etl.onboarding_agents import case_facts, case_readiness, connection_reports
 
         db = self._platform()
         # One case at a time: reuse the one the other test opened when it ran first.
@@ -188,6 +188,11 @@ class OnboardingAgentsDatabaseTests(unittest.TestCase):
         reports = connection_reports(website, TENANT, environ=ON)
         self.assertEqual(reports[str(connection_id)]["state"], "found_accounts")
         self.assertEqual(reports[str(connection_id)]["owner_steps"], ["Nothing to do."])
+        # What the analyst reads to answer "Ask about this case": plain JSON, the pack and the agents' results.
+        facts = case_facts(website, TENANT, case_id)
+        self.assertEqual(facts["case"]["case_id"], case_id)
+        self.assertEqual(set(facts), {"case", "drafted_terms", "proposed_securities"})
+        self.assertEqual(json.loads(json.dumps(facts)), facts)
         # The case page still reads after both, in the same read-only transaction.
         self.assertEqual(website.execute("SELECT 1 AS one").fetchone()["one"], 1)
 

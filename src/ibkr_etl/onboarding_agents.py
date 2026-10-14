@@ -16,7 +16,9 @@ is what the platform does with them:
   (document_blob_name, validate_document);
 - the case page shows the go-live readiness pack above the GO LIVE box
   (case_readiness), and the Broker connections page shows what the connection
-  agent found when it checked each IBKR login (connection_reports).
+  agent found when it checked each IBKR login (connection_reports);
+- the owner can ask the analyst about a case; the website sends it the case's
+  facts (case_facts) and the agent service answers from them alone.
 
 While the switch is off nothing here reads the agent schema, records a check
 or accepts a document. With it on, a missing agent table or a platform role
@@ -198,6 +200,29 @@ def connection_reports(connection, tenant_id: str, *, environ: Mapping[str, str]
         }
         for row in rows
     }
+
+
+MAX_FACT_PROPOSALS = 50
+
+
+def case_facts(connection, tenant_id: str, case_id: str) -> dict:
+    """What the analyst may read to answer a question about the case: the readiness pack and the agents' results.
+
+    Called only while the switch is on. Plain JSON (dates as text), as it is sent to the agent service.
+    """
+    from .onboarding_readiness import readiness_pack
+    from .onboarding_v2_web import _load_case
+
+    with connection.transaction():
+        pack = readiness_pack(connection, tenant_id, case_id)
+    _, checks, _, _ = _load_case(connection, tenant_id, case_id)
+    view = case_agent_view(connection, tenant_id, case_id, checks, environ={SWITCH_NAME: "true"}) or {}
+    facts = {
+        "case": pack,
+        "drafted_terms": view.get("term_draft"),
+        "proposed_securities": list(view.get("security_proposals") or [])[:MAX_FACT_PROPOSALS],
+    }
+    return json.loads(json.dumps(facts, default=str))
 
 
 # Case documents (the intake agent's input) ------------------------------------------------------------------

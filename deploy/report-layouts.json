@@ -1,0 +1,29 @@
+{
+ "note": "Layout names the deployed assurance job expects (tested 13 Oct, run 70ev9hl) and the deployed month-end job renders. If a renderer layout name changes, rebuild and test the assurance image, then update this file in the same PR.",
+ "assurance_job": "ibkrv2stg-analyst-assurance",
+ "assurance_image": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:80cc030ae751a0a8c122e930c3238ab16d2f49811de0dec360f04b9cf3e09ac5",
+ "month_end_job": "ibkrv2stg-month-end-factsheet",
+ "month_end_image": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:f5394492f671973d5bb033ec4cd02d0e32a0e6fa911a075bcfa7c2d269a6aaa3",
+ "subjects": {
+  "U16088571": {
+   "factsheet": "approved-august-2026-v9-full-portfolio-history",
+   "presentation": "platform-standard-v24-reporting-currency-full-nav-v9"
+  },
+  "U16088606": {
+   "factsheet": "subject-completed-factsheet-model-v8-full-portfolio-history",
+   "presentation": "platform-standard-v24-reporting-currency-full-nav-v9"
+  },
+  "hong-kong-china": {
+   "factsheet": "subject-completed-factsheet-model-v8-full-portfolio-history",
+   "presentation": "platform-standard-v24-reporting-currency-full-nav-v9"
+  },
+  "alpha-world-ms": {
+   "factsheet": "subject-completed-factsheet-model-v14r16-alpha-world-ms-owner-disclaimer",
+   "presentation": "alpha-world-ms-v24-hkd-hibor-crisis-evidence-v3"
+  },
+  "alpha-world-t": {
+   "factsheet": "alpha-world-t-owner-template-hkd-hibor-v7",
+   "presentation": "alpha-world-t-v24-hkd-hibor-internal-crisis-v1"
+  }
+ }
+}

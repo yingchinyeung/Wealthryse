@@ -37,8 +37,7 @@ setText('sh/14ryd8fq', 'Private T review. '+longDate(periodEnd)+'. Internal/shar
 setText('sh/ydgnit07','Weights use absolute component values including cash. Gross risky exposure / NAV: '+percent((grossMarketValue-58)/nav)+'.');
 setText('sh/onmxcv69','Each contribution equals the fixed-unit component value change divided by starting NAV. These are percentage-point effects on return.');
 setText('sh/cva9k7a9','Signed component-type effects sum to the monthly NAV return. Bars show magnitudes. Benchmark comparisons are unavailable.');
-// The bottom line carries the month-end commentary, as on the other decks; without any it states the basis.
-setText('sh/at8j290z',agentSummary?'Portfolio analyst: '+agentSummary:'HKD total return '+percent(risk.total_return)+'. HIBOR uses the inception-to-date period average. Benchmark comparisons are unavailable. '+(tHasCrisis?'Hypothetical crisis replay uses provisional prices and documented proxies.':'Crisis replay is not qualified.'));
+setText('sh/at8j290z','HKD total return '+percent(risk.total_return)+'. HIBOR uses the inception-to-date period average. Benchmark comparisons are unavailable. '+(tHasCrisis?'Hypothetical crisis replay uses provisional prices and documented proxies.':'Crisis replay is not qualified.'));
 setText('sh/e98nydwb','Underlying account NAV includes actual cash and interest.');
 setText('sh/fah47idw','Initial gross risky exposure is 230%. Fixed units let weights drift.');
 setText('sh/gbq50neh','Current gross risky exposure / NAV: '+percent((grossMarketValue-58)/nav)+'.');

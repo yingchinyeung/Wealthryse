@@ -288,10 +288,9 @@ def check_deck_text(subject_id: str, period_end: str, slides: Sequence[str]) -> 
     return []
 
 
-# Commentary goes in the deck only; the factsheet never carries it (Ying, 14 October 2026). A subject listed
-# here has a deck with no commentary line, so the team writes none for it. Alpha World T's deck
-# (scripts/render_alpha_t_private_presentation.mjs) has carried the line since 14 October 2026 (Ying).
-DECKS_WITHOUT_COMMENTARY: frozenset[str] = frozenset()
+# Commentary goes in the deck only; the factsheet never carries it (Ying, 14 October 2026). This subject's
+# deck is built by scripts/render_alpha_t_presentation.mjs, which has no commentary line either.
+DECKS_WITHOUT_COMMENTARY = frozenset({"alpha-world-t"})
 
 
 def factsheet_commentary(pages: Sequence[str], sentences: Sequence[str]) -> list[int]:

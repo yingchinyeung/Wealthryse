@@ -41,7 +41,7 @@ ACCOUNT = "U0000001"  # synthetic
 PERIOD = "2026-01-31"
 STORAGE = "https://reports.blob.core.windows.net"
 SPECIAL = sorted(ALPHA_WORLD_SUBJECT_IDS)[0]  # a subject with its own report layout
-NO_LINE = "synthetic-no-line"  # a subject whose deck has no commentary line (patched in where used)
+NO_LINE = sorted(fig.DECKS_WITHOUT_COMMENTARY)[0]  # a subject whose deck has no commentary line
 APAC = ModelSettings(endpoint="https://wr-agents-sea.services.ai.azure.com", deployment="wr-reports-apac",
                      router_deployment="", region="southeastasia", processing_scope="apac-data-zone",
                      managed_identity_client_id="x")
@@ -756,17 +756,13 @@ class CoordinatorTests(unittest.TestCase):
         model = FakeModel()
         plain = deck(["Monthly portfolio review | 31 January 2026"], ["What is working"])
         coordinator, store = team(FakeTools(presentation=plain), model, live=True)
-        with mock.patch.object(fig, "DECKS_WITHOUT_COMMENTARY", frozenset({NO_LINE})):
-            self.assertEqual(coordinator.advance(NO_LINE, PERIOD, "month"), "ready")
+        self.assertEqual(coordinator.advance(NO_LINE, PERIOD, "month"), "ready")
         run = store.runs_by_key[(NO_LINE, PERIOD, "month")]
         self.assertIsNone(run["commentary_status"])
         self.assertEqual(model.named("month_end_commentary"), [])
         self.assertEqual((run["verdicts"]["commentary_in_report"], run["verdicts"]["deck_has_commentary"]), (None, False))
         self.assertEqual(store.objections(1, "open"), [])
         self.assertIn("deck has no commentary line", store.cards[("month_end_report", NO_LINE, PERIOD)]["body"])
-
-    def test_alpha_world_t_gets_commentary_like_the_other_decks(self):
-        self.assertNotIn("alpha-world-t", fig.DECKS_WITHOUT_COMMENTARY)
 
     def test_live_cards_say_what_each_choice_does_to_the_report(self):
         coordinator, store = team(FakeTools(jump_on="2026-01-15"), FakeModel(), live=True)

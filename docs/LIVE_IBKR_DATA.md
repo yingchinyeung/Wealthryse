@@ -96,7 +96,11 @@ approval naming the resources, and the project's Azure change slot.
    inside the network, if that is ever easier.)
 2. Release the website from main with the Deploy website workflow. Until a
    `live_view` switch is set, it shows no live data.
-3. Store `ibkr-username` and `ibkr-password` in Key Vault.
+3. Store `ibkr-username` and `ibkr-password` in Key Vault with
+   `python scripts/store_ibkr_login.py`. It asks for each value at a hidden
+   prompt and writes it through Azure Resource Manager (the vault's data plane
+   refuses this computer), never printing it; existing secrets are kept unless
+   `--replace` is given.
 4. Copy the gateway image into the main registry by digest; build and push
    `Dockerfile.live-collector`.
 5. Network change: the `ibkr-gateway` subnet behind the NAT gateway.

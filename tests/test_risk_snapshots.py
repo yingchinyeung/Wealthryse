@@ -75,12 +75,14 @@ class RiskSnapshotTests(unittest.TestCase):
         snapshot=_ms_snapshot();inputs=self.inputs()
         from ibkr_etl.alpha_world_ms_cache import methodology_identity
         snapshot['methodology_identity']=methodology_identity()
-        inputs.update(subject_id='alpha-world-ms',as_of='2026-01-31',ms_hkd_snapshot=snapshot,
+        inputs.update(subject_id='alpha-world-ms',subject_type='composite_portfolio',as_of='2026-01-31',
+            ms_hkd_snapshot=snapshot,benchmark_id=None,rows=[],
             risk_free=snapshot['risk']['risk_free'],positions=[],crisis_replay=None)
         expected=analyze(snapshot)[0]
         payload,timings,_=compute_risk_snapshot(Mock(),tenant_id='test',subject_id='alpha-world-ms',
             as_of='2026-01-31',loaded_inputs=(inputs,{'input_query_ms':1.,'tail_position_query_ms':0.}))
-        self.assertEqual(payload['metrics'],expected)
+        self.assertEqual({k:payload['metrics'][k] for k in expected},expected)
+        self.assertEqual(payload['runtime_version'],'alpha-world-ms-hkd-risk-runtime-v2')
         self.assertEqual(payload['reporting_currency'],'HKD')
         self.assertEqual(payload['quality_status'],'warn')
         self.assertIsNone(payload['crisis_replay'])

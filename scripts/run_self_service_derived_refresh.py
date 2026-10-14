@@ -26,6 +26,7 @@ from ibkr_etl.derived_portfolio import (  # noqa: E402
     refresh_fixed_unit_composite,
 )
 from ibkr_etl.market_data import refresh_alpha_world_market_data  # noqa: E402
+from ibkr_etl.onboarding_agents import run_reconciliations  # noqa: E402
 from ibkr_etl.onboarding_dry_run import record_history_build, run_portfolio_dry_runs  # noqa: E402
 from ibkr_etl.profiled_composite import is_profiled  # noqa: E402
 from ibkr_etl.provisional_benchmark import refresh_and_materialize  # noqa: E402
@@ -390,6 +391,19 @@ def _record_history_build(connection, tenant_id: str, subject_id: str, error: st
         return {"error_type": type(failure).__name__, "error": str(failure)[:400]}
 
 
+def _record_agent_reconciliations(connection, tenant_id: str) -> dict:
+    """Stage 2's four checks on new IBKR account cases, from the reconciliation agent's newest results.
+
+    Does nothing while ONBOARDING_AGENTS_ENABLED is off; never fails the refresh.
+    """
+
+    try:
+        return run_reconciliations(connection, tenant_id)
+    except Exception as failure:  # the refresh's own result stands either way
+        connection.rollback()
+        return {"status": "failed", "error_type": type(failure).__name__, "error": str(failure)[:400]}
+
+
 def _dry_run_portfolio_cases(connection, tenant_id: str, reference_path: Path, reference) -> list[dict]:
     """Stage 2 of each new-onboarding portfolio case: calculate, measure, roll back.
 
@@ -450,6 +464,7 @@ def main() -> int:
             return downloaded["source"]
 
         portfolio_cases = _dry_run_portfolio_cases(connection, settings.tenant_id, reference_path, reference)
+        agent_reconciliations = _record_agent_reconciliations(connection, settings.tenant_id)
         onboarding_cases = _has_onboarding_cases(connection)
         targets = _ordered_targets(_approved_targets(connection))
         if not targets:
@@ -460,6 +475,7 @@ def main() -> int:
                         "subjects": [],
                         "market_data": market_data,
                         "portfolio_cases": portfolio_cases,
+                        "agent_reconciliations": agent_reconciliations,
                     }
                 )
             )
@@ -646,6 +662,7 @@ def main() -> int:
                     "reference_data": reference_source,
                     "market_data": market_data,
                     "portfolio_cases": portfolio_cases,
+                    "agent_reconciliations": agent_reconciliations,
                 }
             )
         )

@@ -71,7 +71,7 @@ from .benchmark_analytics import (
     ComparisonRow,
     comparison_metrics,
 )
-from .cloud_storage import download_blob_bytes, upload_bytes
+from .cloud_storage import download_blob_bytes, list_blobs, upload_bytes
 from .db import PostgresConnection
 from .subject_read_contract import require_ms_hkd_contract, synthetic_exposure
 from .model_cash_display import load_model_cash
@@ -10955,6 +10955,12 @@ _install_agent_web(
 )
 
 
+def _upload_intake_document(container: str, blob: str, content: bytes, content_type: str) -> None:
+    if not AZURE_STORAGE_ACCOUNT_URL:
+        raise RuntimeError("Private intake storage is unavailable")
+    upload_bytes(AZURE_STORAGE_ACCOUNT_URL, container, blob, content, overwrite=False, content_type=content_type)
+
+
 # New account onboarding (broker connections and four-stage cases). Every
 # route answers 404 unless ONBOARDING_V2_ENABLED is true; see onboarding_v2_web.py.
 onboarding_v2_web.install(
@@ -10971,4 +10977,8 @@ onboarding_v2_web.install(
     derived_definition=_builder_definition,
     download_report=lambda container, blob: download_blob_bytes(AZURE_STORAGE_ACCOUNT_URL, container, blob),
     report_container=INTERNAL_REPORT_CONTAINER,
+    # Case documents for the intake agent; only while ONBOARDING_AGENTS_ENABLED is on (onboarding_agents.py).
+    upload_document=_upload_intake_document,
+    list_documents=lambda container, prefix: list_blobs(AZURE_STORAGE_ACCOUNT_URL, container, prefix),
+    intake_container=ONBOARDING_INTAKE_CONTAINER,
 )

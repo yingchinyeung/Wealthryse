@@ -34,9 +34,11 @@ LONG_TEXT = ("A fixed-unit composite that holds 91% of NAV in the China & Hong K
              "from inception (3 March 2025); nothing here is a forecast or an offer.")
 
 
-def payload(style, *, name=None, description=tpc.DESCRIPTION):
+def payload(style, *, name=None, description=tpc.DESCRIPTION, **changes):
     """A frozen month-end snapshot of the synthetic composite, as the reporting snapshot assembles it."""
-    plan = (lambda: tpc.definition(display_name=name)) if name else tpc.definition
+    if name:
+        changes["display_name"] = name
+    plan = (lambda: tpc.definition(**changes)) if changes else tpc.definition
     record = build_profile(definition=plan(), style=style, description=description)
     with patch.object(tpr, "definition", plan), \
             patch.object(tpr, "profile", lambda s: profile_from_metadata(tpc.SUBJECT, {"report_profile": record})):

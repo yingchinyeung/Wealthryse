@@ -1,10 +1,11 @@
 """Stage 3 reports for a composite in the Alpha World MS or T design.
 
 Once approval 1 has registered the composite and the daily refresh has kept its
-history (the case's history_built check), this run renders one factsheet for
-every completed month since inception in the composite's design, stores each
-privately where the month-end packages go, and records the case's
+history (the case's history_built check), this run renders a factsheet and a
+deck for every completed month since inception in the composite's design,
+stores each privately where the month-end packages go, and records the case's
 reports_rendered check with the list of files. Approval 2 is bound to that list.
+The deck is MS's HKD deck under the composite's name (composite_presentation).
 
 A month is frozen only once its month-end calculation has run, by the same rule
 the month-end package applies to derived portfolios, and the frozen snapshot is
@@ -25,8 +26,10 @@ from tempfile import TemporaryDirectory
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
+from .composite_presentation import CONTRACT_VERSION
 from .historical_reporting import queue_report_generation_run
 from .monthly_artifacts import render_factsheet
+from .monthly_reports import REPORT_TYPES
 from .onboarding_v2_web import OnboardingError, _evidence, record_platform_check
 from .profiled_factsheet import DESIGNS, LAYOUT_VERSION
 from .report_profiles import ReportProfileError, load_profile
@@ -35,7 +38,8 @@ from .util import utc_now_iso
 
 HONG_KONG = ZoneInfo("Asia/Hong_Kong")
 CHECK_ID = "reports_rendered"
-PDF = "application/pdf"
+# Each month's reports, by the label in their file names; extension and media type as for review files.
+KINDS = {"factsheet": "Factsheet", "presentation": "Presentation"}
 # The month-end package's limit on how far before the month end its last NAV may be.
 STALE_AFTER_DAYS = 7
 
@@ -59,6 +63,18 @@ class DesignAssets:
         if design_sha != template_sha:
             return f"sha256:{design_sha}+supporting-sha256:{template_sha}+layout:{LAYOUT_VERSION}"
         return f"sha256:{template_sha}+layout:{LAYOUT_VERSION}"
+
+
+@dataclass(frozen=True)
+class DeckRenderer:
+    """The approved deck template's version and a renderer that checks its own output.
+
+    render(snapshot_text, output_path) renders the deck from the frozen snapshot's
+    exact text and returns validate_subject_presentation's result.
+    """
+
+    template_version: str
+    render: Callable[[str, Path], Mapping[str, Any]]
 
 
 def _sha256(content: bytes) -> str:
@@ -180,7 +196,7 @@ def eligible_cases(connection, tenant_id: str) -> list[dict]:
     return [{**dict(row), "case_id": str(row["case_id"])} for row in rows]
 
 
-def _frozen_payload(connection, tenant_id: str, subject_id: str, snapshot_id: str) -> tuple[dict, str]:
+def _frozen_payload(connection, tenant_id: str, subject_id: str, snapshot_id: str) -> tuple[dict, str, str]:
     row = connection.execute(
         "SELECT snapshot_payload_json, data_sha256 FROM reporting_snapshots "
         "WHERE tenant_id = ? AND snapshot_id = ? AND subject_id = ? AND status IN ('frozen', 'approved')",
@@ -191,34 +207,34 @@ def _frozen_payload(connection, tenant_id: str, subject_id: str, snapshot_id: st
     text = str(row["snapshot_payload_json"])
     if _sha256(text.encode("utf-8")) != str(row["data_sha256"]):
         raise CompositeReportError("The frozen month-end snapshot failed its integrity check")
-    return json.loads(text), str(row["data_sha256"])
+    return json.loads(text), text, str(row["data_sha256"])
 
 
-def _existing_run(connection, tenant_id: str, snapshot_id: str, template_id: str,
+def _existing_run(connection, tenant_id: str, snapshot_id: str, report_type: str, template_id: str,
                   template_version: str) -> Mapping[str, Any] | None:
     return connection.execute(
         """
         SELECT generation_run_id, output_reference, output_sha256 FROM report_generation_runs
-        WHERE tenant_id = ? AND snapshot_id = CAST(? AS uuid) AND report_type = 'factsheet'
+        WHERE tenant_id = ? AND snapshot_id = CAST(? AS uuid) AND report_type = ?
           AND template_id = ? AND template_version = ?
           AND status IN ('awaiting_approval', 'released_internal')
           AND output_reference IS NOT NULL AND output_sha256 IS NOT NULL
         ORDER BY generation_run_id DESC LIMIT 1
         """,
-        (tenant_id, snapshot_id, template_id, template_version),
+        (tenant_id, snapshot_id, report_type, template_id, template_version),
     ).fetchone()
 
 
 def _store(store: Callable[[str, str, bytes, str], None], fetch: Callable[[str, str], bytes],
-           container: str, blob: str, content: bytes) -> None:
-    store(container, blob, content, PDF)
+           container: str, blob: str, content: bytes, report_type: str) -> None:
+    store(container, blob, content, str(REPORT_TYPES[report_type]["media_type"]))
     if fetch(container, blob) != content:
-        raise CompositeReportError("A rendered factsheet did not read back from private storage")
+        raise CompositeReportError(f"A rendered {report_type} did not read back from private storage")
 
 
 def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, container: str,
                         today: date, fetch: Callable[[str, str], bytes],
-                        store: Callable[[str, str, bytes, str], None],
+                        store: Callable[[str, str, bytes, str], None], deck: DeckRenderer,
                         render: Callable[..., Mapping[str, Any]] = render_factsheet) -> dict:
     """Render the case's completed months and return the reports_rendered evidence."""
 
@@ -231,8 +247,8 @@ def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, 
         raise CompositeReportError(f"{subject_id} has no {style} report profile")
     if profile.definition_sha256 != str(case["definition_sha256"]):
         raise CompositeReportError("The report profile is not bound to this case's approved definition")
-    template_id = f"{subject_id}-monthly-factsheet"
     assets = design_assets(connection, style)
+    versions = {"factsheet": assets.template_version, "presentation": deck.template_version}
     reports: list[dict] = []
     waiting_for = None
     with TemporaryDirectory(prefix=f"{subject_id}-stage-3-") as directory:
@@ -249,41 +265,54 @@ def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, 
                     connection, tenant_id=tenant_id, subject_id=subject_id, period_start=profile.inception,
                     period_end=period_end, reporting_currency=profile.reporting_currency,
                     reject_quality_fail=True).snapshot_id
-            file_name = f"{subject_id}_Factsheet_{period_end}.pdf"
-            existing = _existing_run(connection, tenant_id, str(snapshot_id), template_id, assets.template_version)
-            if existing is not None:
-                run_id, reference = int(existing["generation_run_id"]), str(existing["output_reference"])
-                digest = str(existing["output_sha256"])
-            else:
-                if sources is None:
-                    sources = fetch_sources(assets, root, fetch=fetch)
-                payload, _ = _frozen_payload(connection, tenant_id, subject_id, str(snapshot_id))
-                output = root / file_name
-                result = render(payload, output_path=output, **sources)
-                if (result.get("pdf_accuracy_validation") or {}).get("status") != "pass":
-                    raise CompositeReportError(f"The {period_end} factsheet failed its read-back check")
-                content = output.read_bytes()
-                output.unlink()
-                digest = _sha256(content)
-                blob = f"review/{subject_id}/{period_end}/{digest}-{file_name}"
-                _store(store, fetch, container, blob, content)
-                run_id = queue_report_generation_run(connection, tenant_id=tenant_id, snapshot_id=str(snapshot_id),
-                                                     report_type="factsheet", template_id=template_id,
-                                                     template_version=assets.template_version)
-                reference = f"{container}/{blob}"
-                connection.execute(
-                    "UPDATE report_generation_runs SET status = 'awaiting_approval', output_reference = ?, "
-                    "output_sha256 = ?, completed_at = ?, error_message = NULL "
-                    "WHERE tenant_id = ? AND generation_run_id = ? AND status NOT IN ('released_internal', 'published')",
-                    (reference, digest, utc_now_iso(), tenant_id, run_id),
-                )
-                connection.commit()
-            reports.append({
-                "period_end": period_end, "report_type": "factsheet", "file_name": file_name, "sha256": digest,
-                "generation_run_id": run_id, "snapshot_id": str(snapshot_id), "output_reference": reference,
-                "download_path": f"/api/onboarding-v2/cases/{case['case_id']}/reports/{run_id}",
-            })
+            frozen = None
+            for kind, label in KINDS.items():
+                template_id = f"{subject_id}-monthly-{kind}"
+                file_name = f"{subject_id}_{label}_{period_end}{REPORT_TYPES[kind]['extension']}"
+                existing = _existing_run(connection, tenant_id, str(snapshot_id), kind, template_id, versions[kind])
+                if existing is not None:
+                    run_id, reference = int(existing["generation_run_id"]), str(existing["output_reference"])
+                    digest = str(existing["output_sha256"])
+                else:
+                    if frozen is None:
+                        frozen = _frozen_payload(connection, tenant_id, subject_id, str(snapshot_id))
+                    payload, text, snapshot_sha = frozen
+                    output = root / file_name
+                    if kind == "factsheet":
+                        if sources is None:
+                            sources = fetch_sources(assets, root, fetch=fetch)
+                        result = render(payload, output_path=output, **sources)
+                        if (result.get("pdf_accuracy_validation") or {}).get("status") != "pass":
+                            raise CompositeReportError(f"The {period_end} factsheet failed its read-back check")
+                    else:
+                        result = deck.render(text, output)
+                        if (result.get("content_contract_version") != CONTRACT_VERSION
+                                or result.get("snapshot_sha256") != snapshot_sha
+                                or result.get("output_sha256") != _sha256(output.read_bytes())):
+                            raise CompositeReportError(f"The {period_end} deck failed its output check")
+                    content = output.read_bytes()
+                    output.unlink()
+                    digest = _sha256(content)
+                    blob = f"review/{subject_id}/{period_end}/{digest}-{file_name}"
+                    _store(store, fetch, container, blob, content, kind)
+                    run_id = queue_report_generation_run(connection, tenant_id=tenant_id, snapshot_id=str(snapshot_id),
+                                                         report_type=kind, template_id=template_id,
+                                                         template_version=versions[kind])
+                    reference = f"{container}/{blob}"
+                    connection.execute(
+                        "UPDATE report_generation_runs SET status = 'awaiting_approval', output_reference = ?, "
+                        "output_sha256 = ?, completed_at = ?, error_message = NULL "
+                        "WHERE tenant_id = ? AND generation_run_id = ? AND status NOT IN ('released_internal', 'published')",
+                        (reference, digest, utc_now_iso(), tenant_id, run_id),
+                    )
+                    connection.commit()
+                reports.append({
+                    "period_end": period_end, "report_type": kind, "file_name": file_name, "sha256": digest,
+                    "generation_run_id": run_id, "snapshot_id": str(snapshot_id), "output_reference": reference,
+                    "download_path": f"/api/onboarding-v2/cases/{case['case_id']}/reports/{run_id}",
+                })
     return {"design": style, "layout_version": LAYOUT_VERSION, "template_version": assets.template_version,
+            "deck_contract_version": CONTRACT_VERSION, "deck_template_version": deck.template_version,
             "reports": reports, "waiting_for": waiting_for}
 
 
@@ -293,10 +322,11 @@ def _message(evidence: Mapping[str, Any]) -> tuple[str, str]:
     if not reports:
         if waiting_for:
             return "pending", f"Waiting for the {waiting_for} month-end calculation before rendering."
-        return "warn", "No month has ended since inception, so there is no factsheet to review yet."
+        return "warn", "No month has ended since inception, so there are no reports to review yet."
     first, last = reports[0]["period_end"], reports[-1]["period_end"]
+    months = len({item["period_end"] for item in reports})
     span = f"for {first}" if first == last else f"from {first} to {last}"
-    count = "1 monthly factsheet" if len(reports) == 1 else f"{len(reports)} monthly factsheets"
+    count = "A factsheet and a deck" if months == 1 else f"Factsheets and decks for {months} months"
     later = f" {waiting_for} follows once its month-end calculation has run." if waiting_for else ""
     return "pass", f"{count} {span} in the {design} design, each read back and checked.{later}"
 
@@ -305,11 +335,12 @@ def _verify_reused(evidence: Mapping[str, Any], fetch: Callable[[str, str], byte
     for item in evidence["reports"]:
         container, _, blob = str(item["output_reference"]).partition("/")
         if _sha256(fetch(container, blob)) != item["sha256"]:
-            raise CompositeReportError(f"The stored {item['period_end']} factsheet failed its integrity check")
+            raise CompositeReportError(f"The stored {item['period_end']} {item['report_type']} failed its integrity check")
 
 
 def run_composite_report_cases(connection, tenant_id: str, *, container: str, today: date,
                                fetch: Callable[[str, str], bytes], store: Callable[[str, str, bytes, str], None],
+                               deck: DeckRenderer,
                                render: Callable[..., Mapping[str, Any]] = render_factsheet) -> list[dict]:
     """Render and record every eligible case. One case's failure never stops the others."""
 
@@ -319,7 +350,7 @@ def run_composite_report_cases(connection, tenant_id: str, *, container: str, to
         recorded = (case["recorded"], case["recorded_message"], _evidence(case))
         try:
             evidence = render_case_reports(connection, tenant_id, case, container=container, today=today,
-                                           fetch=fetch, store=store, render=render)
+                                           fetch=fetch, store=store, deck=deck, render=render)
             status, message = _message(evidence)
             if (status, message, evidence) != recorded:
                 _verify_reused(evidence, fetch)

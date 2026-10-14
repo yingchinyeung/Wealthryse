@@ -76,13 +76,28 @@ def presentation_content_requirements(subject_id: str) -> tuple[str, ...]:
     return PLATFORM_PRESENTATION_CONTENT_REQUIREMENTS
 
 
+def design_composite(payload: dict[str, Any]) -> bool:
+    """True for a composite's snapshot that carries an Alpha World report profile; never MS or T."""
+
+    from .report_profiles import snapshot_profile
+
+    profile = snapshot_profile(payload)
+    return profile is not None and not profile.built_in
+
+
 def platform_content_expectations(
     payload: dict[str, Any],
 ) -> dict[str, dict[Any, Any]]:
     """Build account-independent presentation assertions from one frozen snapshot."""
 
     is_ms_hkd=payload.get('subject_id')=='alpha-world-ms' and payload.get('reporting_currency')=='HKD'
-    if is_ms_hkd:
+    composite = design_composite(payload)
+    if composite:
+        # A composite in the Alpha World MS or T design: MS's HKD deck under its own name.
+        from .composite_presentation import build_model
+        build_model(payload)
+        is_ms_hkd = True
+    elif is_ms_hkd:
         from .alpha_world_ms_presentation import build_model
         build_model(payload)  # Do not accept a relabelled or inconsistent snapshot.
     else:

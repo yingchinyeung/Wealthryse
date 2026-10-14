@@ -250,7 +250,7 @@ class DesignGeneratorTests(unittest.TestCase):
             period_end='2026-09-30',expected_versions=VERSIONS,allow_replacement=True,snapshot_id=ID))
         sql,parameters=connection.execute.call_args.args
         self.assertIn('s.snapshot_id = CAST(? AS uuid)',sql)
-        self.assertEqual(parameters[-2:],(ID,ID))
+        self.assertEqual(parameters[-1],ID)
 
     def test_normal_scheduler_cannot_overwrite_month_under_design_review(self):
         connection=Mock();current=plan()
@@ -262,16 +262,25 @@ class DesignGeneratorTests(unittest.TestCase):
         connection=Mock(); rows=[{'report_type':kind,'status':'released_internal','template_version':'old'}
             for kind in VERSIONS]
         connection.execute.return_value.fetchall.return_value=rows
-        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS)
+        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS,snapshot_id=ID)
         self.assertEqual(_existing_package(connection,**kwargs),'already_released')
         self.assertIsNone(_existing_package(connection,**kwargs,allow_replacement=True))
         for row in rows:row['template_version']=VERSIONS[row['report_type']]
         self.assertEqual(_existing_package(connection,**kwargs,allow_replacement=True),'already_released')
 
+    def test_missing_frozen_snapshot_never_reuses_a_package(self):
+        connection=Mock();connection.execute.return_value.fetchall.return_value=[
+            {'report_type':kind,'status':'released_internal','template_version':VERSIONS[kind]} for kind in VERSIONS]
+        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS)
+        self.assertIsNone(_existing_package(connection,**kwargs))
+        connection.execute.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError,'exact approved snapshot'):
+            _existing_package(connection,**kwargs,allow_replacement=True)
+
     def test_qualified_retry_accepts_partial_release_but_normal_job_fails(self):
         connection=Mock();connection.execute.return_value.fetchall.return_value=[
             {'report_type':'factsheet','status':'released_internal','template_version':'old'}]
-        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS)
+        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS,snapshot_id=ID)
         with self.assertRaisesRegex(RuntimeError,'partial release'):_existing_package(connection,**kwargs)
         self.assertIsNone(_existing_package(connection,**kwargs,allow_replacement=True))
 

@@ -33,7 +33,7 @@ class ImageArgumentTest(unittest.TestCase):
                 release.image_argument(bad)
 
     def test_capture_refuses_paths_outside_the_package_and_scripts(self):
-        for names in (["web.py"], ["src/ibkr_etl/../x.py"], ["migrations/a.py"], ["scripts/a.txt"]):
+        for names in (["src/ibkr_etl/../x.py"], ["migrations/a.py"], ["scripts/a.txt"]):
             with mock.patch.object(sys, "argv", ["website_release.py", "capture", "--image", IMAGE, *names]):
                 with self.assertRaises(SystemExit):
                     release.capture()

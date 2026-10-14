@@ -144,6 +144,17 @@ def tree_hashes(folder):
             for p in sorted(folder.rglob('*.py')) if '__pycache__' not in p.parts}
 
 
+def without_files(patch, names):
+    """The patch minus the sections for the named src/ibkr_etl files."""
+    keep, out = True, []
+    for line in patch.splitlines(keepends=True):
+        if line.startswith(b'diff --git '):
+            keep = line.split()[-1].decode().partition('src/ibkr_etl/')[2] not in names
+        if keep:
+            out.append(line)
+    return b''.join(out)
+
+
 def rejected_context(package):
     """For each hunk patch rejected, the live lines it was aimed at."""
     out = {}
@@ -331,7 +342,13 @@ def main():
         # change touches must be where the change expects it, and every hunk must
         # apply exactly (no fuzz); otherwise nothing is built.
         touched = sorted(n for n in set(expected) | set(wanted) if expected.get(n) != wanted.get(n))
+        # A file already exactly as the reviewed commit has it (for example code
+        # the live site had before the repo caught up) is left alone.
+        already = [n for n in touched if n in live and live[n] == wanted.get(n)]
+        result['already_live'] = already
         for name in touched:
+            if name in already:
+                continue
             if (name in expected) != (name in live):
                 raise ValueError('Live website file ' + name + ' is not where the change expects it; nothing built')
         # Some live files were saved with Windows line endings; the change uses
@@ -345,7 +362,7 @@ def main():
         result['line_endings_normalised'] = normalised
         live = {**live, **{n: h for n, h in tree_hashes(package).items() if n in normalised}}
         patch_file = root / 'change.patch'
-        patch_file.write_bytes(gzip.decompress(base64.b64decode(config['patch'])))
+        patch_file.write_bytes(without_files(gzip.decompress(base64.b64decode(config['patch'])), already))
         applied = subprocess.run(['patch', '-p1', '--forward', '--fuzz=0', '--no-backup-if-mismatch', '-i', str(patch_file)],
                                  capture_output=True, text=True, timeout=300, cwd=str(context))
         if applied.returncode:

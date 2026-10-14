@@ -135,8 +135,8 @@ class PageMarkupTests(unittest.TestCase):
         self.assertIn('id="combined-filter"', page)
         self.assertIn("wrTable('#combined-holdings'", page)
 
-    def test_live_merged_copy_carries_the_same_changes(self):
-        live = Path("deploy/live-merged/src/ibkr_etl/web.py").read_text(encoding="utf-8")
+    def test_web_source_carries_the_overview_changes(self):
+        live = Path("src/ibkr_etl/web.py").read_text(encoding="utf-8")
         for marker in ('@app.get("/api/portfolio/{account_id}/sectors")', '@app.get("/api/accounts/overview")',
                        "from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT",
                        'id="overview-returns"', 'id="sector-bars"', "holdingsRows(h)",
@@ -179,7 +179,7 @@ class NavigationAndChartTests(unittest.TestCase):
     def test_charts_are_sharp_and_have_period_buttons(self):
         for source in (web._render_account_page({"email": "o@example.com", "role": "owner"},
                                                 account_id="U16088571", section="performance"),
-                       Path("deploy/live-merged/src/ibkr_etl/web.py").read_text(encoding="utf-8")):
+                       Path("src/ibkr_etl/web.py").read_text(encoding="utf-8")):
             self.assertIn("ctx.setTransform(dpr,0,0,dpr,0,0)", source)
             self.assertIn('data-chart="#chart"', source)
             self.assertIn('data-chart="#benchmark-chart"', source)
@@ -235,8 +235,8 @@ class PerformanceRiskLayoutTests(unittest.TestCase):
         guide = web._render_platform_page(self.OWNER, section="metrics-guide")
         self.assertNotIn("Platform workspace", guide)
 
-    def test_live_merged_copy_has_the_layout(self):
-        live = Path("deploy/live-merged/src/ibkr_etl/web.py").read_text(encoding="utf-8")
+    def test_web_source_has_the_layout(self):
+        live = Path("src/ibkr_etl/web.py").read_text(encoding="utf-8")
         for marker in ('class="account-hero-controls"', "{section_jumps}</div>", 'id="perf-chart"',
                        "{RISK_ANALYTICS_CARDS}{CORRELATION_CARD}</div>", "esc(asOfLabel(x))",
                        "activeSection==='performance'||activeSection==='risk'"):
@@ -250,7 +250,7 @@ class FailureStateTests(unittest.TestCase):
 
     def test_failures_stay_in_their_card(self):
         for source in (web._render_account_page(self.OWNER, account_id="U16088571", section="risk"),
-                       Path("deploy/live-merged/src/ibkr_etl/web.py").read_text(encoding="utf-8")):
+                       Path("src/ibkr_etl/web.py").read_text(encoding="utf-8")):
             self.assertNotIn("Unable to load validated portfolio data", source)
             self.assertIn("loadFailure(error,", source)
             self.assertIn("/risk${suffix}`).then(json).catch(", source.replace("{{", "{").replace("}}", "}"))
@@ -274,7 +274,7 @@ class DarkModeTests(unittest.TestCase):
     def test_chart_lines_and_labels_use_theme_colours(self):
         for source in (web._render_account_page({"email": "o@example.com", "role": "owner"},
                                                 account_id="U16088571", section="performance"),
-                       Path("deploy/live-merged/src/ibkr_etl/web.py").read_text(encoding="utf-8")):
+                       Path("src/ibkr_etl/web.py").read_text(encoding="utf-8")):
             self.assertIn("chartInk('--chart-grid','#e7ebf2')", source)
             self.assertNotIn("ctx.strokeStyle='#e7ebf2'", source)
             self.assertNotIn("ctx.fillStyle='#667085'", source)

@@ -30,8 +30,6 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
                     'src/wealthryse_agent/', 'migrations/agent/', 'Dockerfile.agent',
                     'scripts/install_agent_schema.py')
 STATE = Path('release-state.json')
-SNAPSHOT = Path(__file__).resolve().parent / 'live-snapshot'
-MERGED = Path(__file__).resolve().parent / 'live-merged'
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -52,26 +50,18 @@ def package_files(commit):
 def change_set(state):
     """The patch from what is live to what should be live, with before/after hashes.
 
-    Files copied from the live image into deploy/live-snapshot/ go to their merged
-    version in deploy/live-merged/ (live code plus our changes); every other file
-    goes from the deployed commit to HEAD. Once a release from this repo is live,
-    those files on live are the deployed commit's deploy/live-merged copies.
+    Every file goes from the deployed commit to HEAD's src/ibkr_etl. Releases made
+    before the repo caught up with the live site shipped merged copies of a few
+    files from deploy/live-merged/ (since removed); when the deployed commit has
+    those copies, they are what is live, so they are the "before" side.
     """
+    if state['deployed_commit'] == BASELINE_COMMIT:
+        raise SystemExit('The live website was not released from this repo; releases now start from a repo-built image')
     before, after = package_files(state['deployed_commit']), package_files(state['head'])
-    snapshot = SNAPSHOT / PACKAGE
-    if snapshot.exists():
-        from_repo = state['deployed_commit'] != BASELINE_COMMIT
-        if not from_repo and (SNAPSHOT / 'IMAGE').read_text().strip() != state['live_image']:
-            raise SystemExit('deploy/live-snapshot was copied from a different live image; copy it again')
-        for path in sorted(snapshot.glob('*.py')):
-            merged = MERGED / PACKAGE / path.name
-            if not merged.exists():
-                raise SystemExit('No merged version of live ' + path.name + ' in deploy/live-merged')
-            if from_repo:
-                before[path.name] = git('show', state['deployed_commit'] + ':deploy/live-merged/' + PACKAGE + '/' + path.name, binary=True)
-            else:
-                before[path.name] = path.read_bytes().replace(b'\r\n', b'\n')
-            after[path.name] = merged.read_bytes()
+    merged = 'deploy/live-merged/' + PACKAGE + '/'
+    for path in git('ls-tree', '-r', '--name-only', state['deployed_commit'], merged).split():
+        if path.endswith('.py'):
+            before[path[len(merged):]] = git('show', state['deployed_commit'] + ':' + path, binary=True)
     changed = [n for n in set(before) | set(after) if before.get(n) != after.get(n)]
     with tempfile.TemporaryDirectory() as tmp:
         for side, files in (('a', before), ('b', after)):
@@ -253,15 +243,13 @@ def image_argument(args):
 def capture():
     """Copy named files out of a deployed image (read-only).
 
-    With no --image, the files come from the live website image into deploy/live-snapshot/
-    (bare names, src/ibkr_etl only). With --image they go to deploy/image-captures/<digest>/
-    under their repository paths (src/ibkr_etl/... or scripts/...).
+    With no --image, the files come from the live website image. They go to
+    deploy/image-captures/<image>/ under their repository paths; a bare name
+    means src/ibkr_etl/<name>.
     """
     image, names = image_argument(sys.argv[2:])
-    if image is None:
-        if not names or any('/' in n or not n.endswith('.py') for n in names):
-            raise SystemExit('Name the src/ibkr_etl/*.py files to copy')
-    elif not names or any(not n.endswith('.py') or '..' in n or not n.startswith(('src/ibkr_etl/', 'scripts/')) for n in names):
+    names = [n if '/' in n else PACKAGE + '/' + n for n in names]
+    if not names or any(not n.endswith('.py') or '..' in n or not n.startswith(('src/ibkr_etl/', 'scripts/')) for n in names):
         raise SystemExit('Name src/ibkr_etl/... or scripts/... .py files to copy')
     head = git('rev-parse', 'HEAD').strip()
     live = image or az('containerapp', 'show', '-n', APP, '-g', RG)['properties']['template']['containers'][0]['image']
@@ -270,10 +258,8 @@ def capture():
     result, detail = read_only_on_vm(config, 'website-capture')
     archive = base64.b64decode(detail)
     import io, tarfile
-    if image is None:
-        target = ROOT / 'deploy' / 'live-snapshot' / PACKAGE
-    else:
-        target = ROOT / 'deploy' / 'image-captures' / image[len(IMAGE_PREFIX):][:12]
+    folder = live.split('@sha256:')[1][:12] if '@sha256:' in live else live.rsplit(':', 1)[-1][:16]
+    target = ROOT / 'deploy' / 'image-captures' / folder
     with tarfile.open(fileobj=io.BytesIO(archive), mode='r:xz') as tar:
         for member in tar.getmembers():
             if member.name not in names or not member.isfile():
@@ -283,10 +269,7 @@ def capture():
                 raise SystemExit('Captured file damaged in transfer: ' + member.name)
             (target / member.name).parent.mkdir(parents=True, exist_ok=True)
             (target / member.name).write_bytes(data)
-    if image is None:
-        (target.parent.parent / 'IMAGE').write_text(live + '\n')
-    else:
-        (target / 'IMAGE').write_text(live + '\n')
+    (target / 'IMAGE').write_text(live + '\n')
     print('Copied', ', '.join(names), 'from', live)
 
 

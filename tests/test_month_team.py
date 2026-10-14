@@ -619,6 +619,26 @@ class CoordinatorTests(unittest.TestCase):
         self.assertIn(f"{len(open_items)} objection(s) to review", card["title"])
         self.assertIn("Top holding weights", card["body"])
 
+    def test_alpha_world_files_checked_with_the_old_checklist_are_checked_again(self):
+        missing = [{"page": 1, "severity": "high", "kind": "missing_element",
+                    "description": "The required Top 5 holdings table is missing from the page."}]
+        model = FakeModel(visual=missing)
+        coordinator, store = team(FakeTools(), model)
+        self.assertEqual(coordinator.advance("alpha-world-t", PERIOD, "month"), "ready")
+        run = store.runs_by_key[("alpha-world-t", PERIOD, "month")]
+        self.assertTrue(run["verdicts"]["owner_layout_checked"])
+        self.assertEqual(coordinator.advance("alpha-world-t", PERIOD, "month"), "ready")  # checked already: left alone
+        self.assertEqual(len(model.named("visual_qa")), 1)
+
+        del run["verdicts"]["owner_layout_checked"]  # as the runs checked before the fix were saved
+        model.visual = []
+        self.assertEqual(coordinator.advance("alpha-world-t", PERIOD, "month"), "ready")
+        self.assertEqual(store.objections(run["month_run_id"], "open"), [])
+        self.assertEqual(len(model.named("visual_qa")), 2)
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
+        self.assertEqual(len(model.named("visual_qa")), 3)  # other accounts are not checked again
+
     def test_a_tampered_file_is_an_objection_not_a_crash(self):
         tools = FakeTools()
         original = tools.download

@@ -59,6 +59,16 @@ class AgentAppsBicepTest(unittest.TestCase):
         self.assertIn("{ name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }", job)
         self.assertIn("value: reportModelDeployment", job)
         self.assertIn("args: ['onboarding']", job)
+        # The intake agent reads the case documents: read-only, on the intake container only, and only with the job.
+        reader = apps[apps.index("resource onboardingIntakeReader"):apps.index("resource monthTeamJob")]
+        self.assertIn("= if (deployOnboarding && deployMonthTeam)", reader.splitlines()[0])
+        self.assertIn("scope: intakeContainer", reader)
+        self.assertIn("roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', "
+                      "storageBlobDataReaderRole)", reader)
+        self.assertIn("param intakeContainerName string = 'onboarding-intake'", apps)
+        self.assertIn("onboardingIntakeReader", job)
+        self.assertIn("{ name: 'ONBOARDING_INTAKE_CONTAINER', value: intakeContainerName }", job)
+        self.assertEqual(apps.count("ONBOARDING_INTAKE_CONTAINER"), 1)
 
 
 if __name__ == "__main__":

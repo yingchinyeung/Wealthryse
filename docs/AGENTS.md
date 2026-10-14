@@ -252,8 +252,30 @@ only, as it does today; the factsheet renderer never receives it.
 The onboarding agents work through the four stages of a new-onboarding case
 (`ibkr_etl/onboarding_cases.py`). They record the case's own checks with
 evidence, and Ying keeps the case's three approvals and the first release.
-The first agent is the history reviewer; the intake and reconciliation agents
-follow.
+The intake agent and the history reviewer are built; the reconciliation agent
+follows.
+
+**Intake agent** (`wealthryse_agent/onboarding_intake.py`). Before approval 1
+it drafts a case's account terms from the client's own documents: the mandate,
+the fee terms and any side letter, uploaded to the private `onboarding-intake`
+container under `cases/{case_id}/documents/` (PDF, Word or text). For each term
+it gives the value with the document, page and exact quote it came from:
+
+- the terms approval 1 binds: the account's name, reporting currency and start
+  date;
+- the benchmark, management fee, performance fee, hurdle or high-water mark,
+  how often fees are charged, the investment objective and restrictions.
+
+The model only proposes. Code checks every quote against the document's own
+text and drops any it cannot find, so no term in the draft is invented. Two
+documents giving different values for a term, or a reporting currency other
+than the case's, fail the draft and name both clauses. A different start date,
+a binding term no document states, or a document that could not be read gives
+a warning. The draft is written to `agent.onboarding_term_drafts`, bound to the
+documents it read; a new or replaced document gets a new draft. It never
+changes the case: Ying approves the terms on the case page as before. The
+upload on the case page and showing the draft beside approval 1 are PR 57
+files, so they go through the onboarding thread.
 
 **History reviewer** (`wealthryse_agent/onboarding_review.py`). It reviews a
 composite in the Alpha World MS or T design that is in stage 3 with its
@@ -274,7 +296,7 @@ factsheet, or a high-severity layout fault fails the review. A medium layout
 point, or a month that visual QA could not look at, gives a warning, which Ying
 acknowledges at approval 2. A clean review passes.
 
-**How it is recorded.** The agent cannot write a case or a check:
+**How the review is recorded.** The agent cannot write a case or a check:
 
 1. The `onboarding` job (`python -m wealthryse_agent.jobs onboarding`, hourly)
    reads the waiting cases through the tool server's
@@ -291,13 +313,14 @@ acknowledges at approval 2. A clean review passes.
 **Turning it on** (each step needs Ying's typed approval naming the resources):
 
 1. **Database.** Rerun `scripts/install_agent_schema.py` with
-   `--platform-reader <the platform jobs' role>`. It applies
-   `003_onboarding_review.sql` and lets that role read the reviews (and
-   nothing else in the agent schema).
+   `--platform-reader <the platform's role>`. It applies
+   `003_onboarding_review.sql` and `004_onboarding_intake.sql` and lets that
+   role read the reviews and drafts (and nothing else in the agent schema).
 2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
 3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOnboarding=true`
    (needs `deployMonthTeam=true` for the report reader). This creates
-   `ibkrv2stg-agent-onboarding`.
+   `ibkrv2stg-agent-onboarding` and gives the jobs identity read access to the
+   `onboarding-intake` container only.
 4. **Recording.** The month-end report job calls `record_agent_reviews` after
    `render_onboarding_composite_reports.py`.
 
@@ -312,7 +335,7 @@ acknowledges at approval 2. A clean review passes.
 - The month-end team, when deployed: an hourly job on six days a month, and
   its own monthly token budget on `wr-reports-apac`.
 - The onboarding agents, when deployed: an hourly job that calls the model
-  only when a case has new reports to review, with its own monthly budget
+  only when a case has new documents or new reports, with its own monthly budget
   (`onboardingTokenBudget`).
 - No new database server.
 

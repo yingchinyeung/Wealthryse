@@ -837,6 +837,17 @@ def list_onboarding_report_cases(connection, arguments: Mapping[str, Any]) -> di
             "citations": [_citation("broker_onboarding_checks", None, check_id="reports_rendered")]}
 
 
+def list_onboarding_intake_cases(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Cases before approval 1, with the terms the owner entered, for the intake agent to draft against."""
+    rows = connection.execute(
+        "SELECT case_id::text AS case_id, source_kind, subject_id, display_name, description, reporting_currency, "
+        "history_start_date, stage FROM onboarding_intake_cases ORDER BY case_id"
+    ).fetchall()
+    cases = [{key: row[key] for key in ("case_id", "source_kind", "subject_id", "display_name", "description",
+                                        "reporting_currency", "history_start_date", "stage")} for row in rows]
+    return {"as_of": None, "data": {"cases": cases}, "citations": [_citation("broker_onboarding_cases", None)]}
+
+
 # Registry ------------------------------------------------------------------
 
 
@@ -893,6 +904,9 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("list_onboarding_report_cases", "Composite onboarding cases whose historical reports are rendered and "
              "waiting for the agent review, with each report's month, file, hash and private storage path.",
              _schema({}, []), list_onboarding_report_cases, False, only_jobs=ONBOARDING),
+    ToolSpec("list_onboarding_intake_cases", "Onboarding cases waiting for approval 1 (the account terms), with "
+             "the terms entered on the case, for the intake agent to draft from the client's documents.",
+             _schema({}, []), list_onboarding_intake_cases, False, only_jobs=ONBOARDING),
 )
 REGISTRY = {tool.name: tool for tool in TOOLS}
 

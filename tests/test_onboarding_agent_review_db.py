@@ -1,4 +1,4 @@
-"""The history reviewer's database side: the case view, the review table and the recorded check.
+"""The onboarding agents' database side: the case views, the agents' tables and the recorded check.
 
 Needs a disposable PostgreSQL server: set AGENT_TEST_PG_ADMIN_DSN to a
 superuser DSN (CI starts one). Skipped otherwise. Creates and drops its own
@@ -105,7 +105,7 @@ class OnboardingReviewDatabaseTests(unittest.TestCase):
         self.addCleanup(db.close)
         return db
 
-    def _composite_in_stage_three(self, db):
+    def _composite_in_stage_three(self, db, before_terms=None):
         """A composite in the MS design, through its dry run and approval 1, with its history built."""
         from datetime import date
 
@@ -143,6 +143,8 @@ class OnboardingReviewDatabaseTests(unittest.TestCase):
 
         run_portfolio_dry_runs(db, TENANT, calculate=lambda dry, contract: write_history(
             dry, contract["subject_id"]) or {}, today=date(2025, 3, 3))
+        if before_terms:
+            before_terms(db, case_id)
         approve_case(db, TENANT, case_id, approval="account_terms",
                      terms_sha256=case_detail(db, TENANT, case_id)["awaiting_terms_sha256"],
                      acknowledge_warnings=[], confirmation=None, actor=IDENTITY)
@@ -165,6 +167,37 @@ class OnboardingReviewDatabaseTests(unittest.TestCase):
         db.commit()
         return evidence
 
+    def _drafts_terms_before_approval_one(self, db, case_id):
+        from wealthryse_agent.database import connect
+        from wealthryse_agent.onboarding_intake import Draft, DraftStore
+        from wealthryse_agent.tools import ToolError
+
+        with self.assertRaises(ToolError):
+            self._call("list_onboarding_intake_cases", "month_team")
+        case, = self._call("list_onboarding_intake_cases", "onboarding")["data"]["cases"]
+        self.assertEqual((case["case_id"], case["source_kind"], case["subject_id"], case["reporting_currency"],
+                          case["history_start_date"], case["stage"]),
+                         (case_id, "composite_portfolio", "synthetic-review", "HKD", "2025-01-20",
+                          "load_and_reconcile"))
+        store = DraftStore(connect(self.writer, search_path="agent"), TENANT)
+        self.addCleanup(store.db.close)
+        digest = "d" * 64
+        self.assertFalse(store.drafted(case_id, digest))
+        draft = Draft("pass", "The intake agent traced 3 of 10 terms to a clause.",
+                      {"reporting_currency": {"value": "HKD", "status": "found", "sources": []}}, [],
+                      [{"document": "mandate.pdf", "sha256": "e" * 64, "byte_count": 10, "pages": 1, "error": None}],
+                      {"input_tokens": 5, "output_tokens": 1})
+        store.save(case, digest, draft, "corr")
+        store.save(case, digest, draft, "corr")  # the same documents are drafted once
+        self.assertTrue(store.drafted(case_id, digest))
+        row = db.execute("SELECT outcome, terms->'reporting_currency'->>'value' AS currency, COUNT(*) OVER () AS n "
+                         "FROM agent.onboarding_term_drafts WHERE case_id = CAST(? AS uuid)", (case_id,)).fetchone()
+        self.assertEqual((row["outcome"], row["currency"], row["n"]), ("pass", "HKD", 1))
+        db.rollback()
+        with self.assertRaises(Exception):  # the agent cannot change the case or its terms
+            store.db.execute("UPDATE public.broker_onboarding_cases SET reporting_currency = 'USD'")
+        store.db.rollback()
+
     def _call(self, name, job):
         return self.service.call(caller_id="", user=None, job=job, correlation_id="test", name=name, arguments={})
 
@@ -177,7 +210,9 @@ class OnboardingReviewDatabaseTests(unittest.TestCase):
 
         db = self._platform()
         self.assertEqual(self._call("list_onboarding_report_cases", "onboarding")["data"]["cases"], [])
-        case_id = self._composite_in_stage_three(db)
+        case_id = self._composite_in_stage_three(db, before_terms=self._drafts_terms_before_approval_one)
+        # After approval 1 the case has left the intake agent's view.
+        self.assertEqual(self._call("list_onboarding_intake_cases", "onboarding")["data"]["cases"], [])
         self.assertEqual(record_agent_reviews(db, TENANT), [])  # nothing is rendered yet
         evidence = self._rendered(db, case_id, ["2025-01-31", "2025-02-28"])
 
@@ -236,11 +271,12 @@ class OnboardingReviewDatabaseTests(unittest.TestCase):
         url = _dsn(ADMIN_DSN, self.database, OWNER_ROLE)
         self.assertEqual(install_agent_schema.main(["--database-url", url, "--existing-logins",
                                                     "--platform-reader", PLATFORM]), 0)
-        self.assertEqual(reader.execute("SELECT COUNT(*) AS n FROM agent.onboarding_reviews").fetchone()["n"], 0)
-        reader.rollback()
-        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
-            reader.execute("DELETE FROM agent.onboarding_reviews")
-        reader.rollback()
+        for table in ("onboarding_reviews", "onboarding_term_drafts"):
+            reader.execute(f"SELECT COUNT(*) AS n FROM agent.{table}").fetchone()
+            reader.rollback()
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                reader.execute(f"DELETE FROM agent.{table}")
+            reader.rollback()
 
 
 if __name__ == "__main__":

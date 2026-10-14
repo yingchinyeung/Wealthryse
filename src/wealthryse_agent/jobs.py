@@ -7,11 +7,12 @@ records); nothing is sent, published or released.
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
                                                          # re-check months already released
-    python -m wealthryse_agent.jobs onboarding           # hourly: review new composites' historical reports
+    python -m wealthryse_agent.jobs onboarding           # hourly: draft new cases' terms from their documents,
+                                                         # and review new composites' historical reports
 
 Accounts come from agent.service_grants for the job, enforced by the tool server. The
-onboarding job has no accounts: its cases are not live yet, and it sees only the case view
-its own tool gives it.
+onboarding job has no accounts: its cases are not live yet, and it sees only the case views
+its own tools give it.
 """
 from __future__ import annotations
 
@@ -193,17 +194,29 @@ def month_team(store: Store, tools: ToolClient, accounts: list[str], usage: dict
 def onboarding(store: Store, tools: ToolClient, usage: dict, correlation_id: str) -> int:
     from .month_team.agents import TeamModel
     from .month_team.settings import validate_report_model
+    from .onboarding_intake import DraftStore, IntakeDrafter, IntakeSettings, draft_waiting_cases
     from .onboarding_review import HistoryReviewer, ReviewSettings, ReviewStore, review_waiting_cases
 
-    settings, model_settings = ReviewSettings.from_env(), ModelSettings.from_env()
+    settings, intake_settings, model_settings = ReviewSettings.from_env(), IntakeSettings.from_env(), ModelSettings.from_env()
     settings.validate()
+    intake_settings.validate()
     validate_report_model(model_settings)
     review_store = ReviewStore(store.db, store.tenant_id)
     tokens_left = settings.monthly_token_budget - review_store.tokens_used_this_month()
     if tokens_left <= 0:
         raise BudgetExhausted
-    reviewer = HistoryReviewer(settings, lambda: TeamModel(model_settings, tokens_left=tokens_left))
-    return review_waiting_cases(review_store, tools.call, reviewer, usage, correlation_id)
+    # One model for both agents, so they share the month's remaining budget.
+    shared: list[TeamModel] = []
+
+    def model() -> TeamModel:
+        if not shared:
+            shared.append(TeamModel(model_settings, tokens_left=tokens_left))
+        return shared[0]
+
+    drafted = draft_waiting_cases(DraftStore(store.db, store.tenant_id), tools.call,
+                                  IntakeDrafter(intake_settings, model), usage, correlation_id)
+    reviewed = review_waiting_cases(review_store, tools.call, HistoryReviewer(settings, model), usage, correlation_id)
+    return drafted + reviewed
 
 
 def main(argv: list[str] | None = None) -> int:

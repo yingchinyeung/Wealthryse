@@ -267,8 +267,17 @@ def main():
             files = {prefix + name: folder / name for prefix, folder in roots.items() for name in tree_hashes(folder)}
             hashes = {prefix + name: digest for prefix, folder in roots.items() for name, digest in tree_hashes(folder).items()}
         if config.get('inventory'):
-            detail = base64.b64encode(gzip.compress(json.dumps(hashes, sort_keys=True).encode(), 9)).decode()
+            # Compared here, so the answer fits in Run Command's 4 KB of output: the
+            # image's file names plus which of them differ from the repository.
+            repo = json.loads(gzip.decompress(base64.b64decode(config['repo_hashes'])))
+            names = sorted(hashes)
+            differ = [i for i, n in enumerate(names) if repo.get(n) != hashes[n][:16]]
+            listing = base64.b64encode(gzip.compress(json.dumps({'files': names, 'differ': differ}).encode(), 9)).decode()
             result.update(passed=True, files=len(hashes), has_scripts='scripts/' in roots)
+            if len(listing) <= 3000:
+                result.update(listing=listing)
+            else:
+                detail = listing
             raise Captured()
         if config.get('capture'):
             # Read-only: hand back exact copies of the named live files; nothing is built.

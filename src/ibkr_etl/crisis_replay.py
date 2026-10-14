@@ -11,6 +11,7 @@ from .provisional_benchmark import (
 )
 from .sector_classification import candidate_symbols
 from .util import utc_now_iso
+from .crisis_identity_policy import apply_identity_proxy
 
 
 CRISIS_START = date(2008, 9, 15)
@@ -742,6 +743,19 @@ def refresh_crisis_replay(
             as_of=latest,
         )
         market_value = float(row["market_value"]) * fx_rate
+        identity = None
+        if account_id == 'U16088571':
+            identity = apply_identity_proxy({'conid':str(row['conid']), 'holding_symbol':symbol},
+                                            subject_id=account_id, crisis_start=CRISIS_START.isoformat())
+        if identity and identity.get('proxy_policy_version'):
+            # Apply verified identity policy BEFORE vendor history can appear
+            # complete. A historical ticker path alone is not lineage proof.
+            components.append(ReplayComponent(
+                conid=str(row['conid']), symbol=symbol,
+                description=str(row['description'] or ''), currency='USD',
+                market_value=market_value, source_symbol=identity['source_symbol'],
+                mapping_method=identity['mapping_method'], proxy_reason=identity['proxy_reason']))
+            continue
         source_symbol = ""
         for candidate in candidate_symbols(
             symbol, str(row["listing_exchange"] or ""), currency

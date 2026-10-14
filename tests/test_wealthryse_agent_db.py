@@ -161,6 +161,26 @@ class AgentDatabaseTests(unittest.TestCase):
         self.assertEqual(self._accounts(job="holdings_explainer"), ["UTEST1"])
         self.assertEqual(self._accounts(job="month_end_drafter"), [])
 
+    def test_an_all_accounts_grant_covers_accounts_onboarded_later(self):
+        import psycopg
+
+        with psycopg.connect(_dsn(ADMIN_DSN, self.database, "agent_test_owner"), autocommit=True) as owner:
+            owner.execute("INSERT INTO agent.service_grants(tenant_id, job_name, subject_id, granted_by) "
+                          "VALUES (%s, 'weekly_brief', '*', 'test')", (TENANT,))
+            try:
+                self.assertEqual(self._accounts(job="weekly_brief"), ["UTEST1", "UTEST2"])
+                owner.execute(
+                    "INSERT INTO platform_subjects(tenant_id, subject_id, subject_type, display_name, lifecycle_status) "
+                    "VALUES (%s, 'UTEST3', 'composite_portfolio', 'Test three', 'onboarding'), "
+                    "(%s, 'BTEST1', 'benchmark', 'Test benchmark', 'active')", (TENANT, TENANT))
+                self.assertEqual(self._accounts(job="weekly_brief"), ["UTEST1", "UTEST2"])
+                owner.execute("UPDATE platform_subjects SET lifecycle_status = 'active' WHERE subject_id = 'UTEST3'")
+                self.assertEqual(self._accounts(job="weekly_brief"), ["UTEST1", "UTEST2", "UTEST3"])
+                self.assertEqual(self._accounts(job="live_market"), [])
+            finally:
+                owner.execute("DELETE FROM platform_subjects WHERE subject_id IN ('UTEST3', 'BTEST1')")
+                owner.execute("DELETE FROM agent.service_grants WHERE subject_id = '*'")
+
     def test_other_accounts_are_refused_and_audited(self):
         result = self._call("get_holdings", {"account_id": "UTEST2"}, user=VIEWER)
         self.assertTrue(result["isError"])

@@ -11,6 +11,9 @@ that owns the platform tables, from a machine inside the private network
         --grant holdings_explainer=U1234567 --grant data_quality=U1234567 \
         --platform-reader ibkr_stg_app
 
+--grant <job>=all lets a job cover every active account and portfolio,
+including accounts onboarded later.
+
 What it does, in one transaction:
   1. applies every file in migrations/agent in name order (each idempotent);
   2. creates each managed identity's Entra login role if missing
@@ -116,6 +119,12 @@ def main(argv: list[str] | None = None) -> int:
             connection.execute(sql.SQL("GRANT {} TO {}").format(sql.Identifier(f"agent_{role}"), sql.Identifier(name)))
             print(f"{name}: agent_{role}{'' if exists else ' (login created)'}")
         for job, account in args.grant:
+            if account == "all":  # every active account and portfolio, including ones onboarded later
+                connection.execute(
+                    "INSERT INTO agent.service_grants(tenant_id, job_name, subject_id, granted_by) VALUES (%s, %s, '*', %s) "
+                    "ON CONFLICT DO NOTHING", (args.tenant_id, job, args.granted_by))
+                print(f"{job}: all accounts")
+                continue
             found = connection.execute(
                 "SELECT 1 FROM public.platform_subjects WHERE tenant_id = %s AND subject_id = %s AND lifecycle_status = 'active'",
                 (args.tenant_id, account)).fetchone()

@@ -377,6 +377,18 @@ def main():
                 raise ValueError('Patched ' + name + ' does not match the reviewed commit; nothing built')
         if any(patched.get(n) != live[n] for n in live if n not in touched):
             raise ValueError('The change altered files it should not have; nothing built')
+        # Files the reviewed website imports for the first time that did not change in
+        # the repo are not in the patch; the live image may lack them or hold a copy
+        # nothing imported, so they are added whole, exactly as reviewed.
+        first = []
+        for name, data in sorted((config.get('imported') or {}).items()):
+            content = gzip.decompress(base64.b64decode(data))
+            if '/' in name or not name.endswith('.py') or name in touched or hashlib.sha256(content).hexdigest() != wanted.get(name):
+                raise ValueError('First-imported file ' + name + ' does not match the reviewed commit; nothing built')
+            if patched.get(name) != wanted[name]:
+                (package / name).write_bytes(content)
+                first.append(name)
+        result['first_imported'] = first
         result['touched_files'] = touched
         removed = sorted(n for n in set(expected) - set(wanted) if n in live)
         # The live image has no "root" passwd entry and may have no shell, so

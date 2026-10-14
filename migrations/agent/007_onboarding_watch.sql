@@ -19,7 +19,7 @@ ALTER TABLE agent.inbox DROP CONSTRAINT IF EXISTS inbox_kind_check;
 ALTER TABLE agent.inbox ADD CONSTRAINT inbox_kind_check CHECK (kind IN (
     'holdings_explainer', 'month_end_draft', 'data_quality',
     'month_end_report', 'month_end_hold', 'month_end_dispute',
-    'onboarding_watch'));
+    'onboarding_watch')) NOT VALID;
 
 CREATE OR REPLACE FUNCTION agent.scoped_onboarding_live_cases()
 RETURNS TABLE (

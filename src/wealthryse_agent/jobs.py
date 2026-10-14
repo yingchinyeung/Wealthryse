@@ -226,10 +226,12 @@ def onboarding(store: Store, tools: ToolClient, usage: dict, correlation_id: str
     from .onboarding_intake import DraftStore, IntakeDrafter, IntakeSettings, draft_waiting_cases
     from .onboarding_reconcile import Reconciler, ReconciliationStore, reconcile_waiting_cases
     from .onboarding_review import HistoryReviewer, ReviewSettings, ReviewStore, review_waiting_cases
+    from .connection_watch import watch_connections
     from .onboarding_watch import watch_live_cases
 
-    # The first-month watch is plain code, so it runs even when the month's model budget is used up.
-    watched = watch_live_cases(store, tools.call, run_id)
+    # The connection agent and the first-month watch are plain code, so they run even when the month's
+    # model budget is used up.
+    watched = watch_connections(store, tools.call, run_id) + watch_live_cases(store, tools.call, run_id)
     settings, intake_settings, model_settings = ReviewSettings.from_env(), IntakeSettings.from_env(), ModelSettings.from_env()
     settings.validate()
     intake_settings.validate()

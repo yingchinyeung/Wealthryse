@@ -366,11 +366,27 @@ acknowledges at approval 2. A clean review passes.
   the first month-end released. It reads only dates and statuses through
   `list_live_onboarding_cases` (`007_onboarding_watch.sql`).
 
+**Connection agent** (`wealthryse_agent/connection_watch.py`, in the same
+hourly `onboarding` job, also plain code). A new IBKR login is not contacted
+until a check runs. For each login never checked, the agent queues its first
+check through `agent.queue_first_connection_check()`: the same one-attempt
+request as the "Check now" button, which the Flex discovery job
+(`ibkrv2stg-flex-discovery`) then runs. It reports once per check, in plain
+words: the accounts the login sees (they appear under Available), or the
+exact problem with IBKR's error code and what to do, or that a check has
+waited 30 minutes, meaning the discovery job is not running. It never
+retries, and never queues while the login is cooling down or held for a
+reset: IBKR locks a token after repeated failures, so every later check is
+the owner's. It sees statuses, codes and counts through `list_broker_logins`,
+never the token or its Key Vault name (`009_connection_checks.sql`). Its
+reports go to `agent.connection_reports`, which the administrator posts to
+its system updates conversation.
+
 **Turning it on** (each step needs Ying's typed approval naming the resources):
 
 1. **Database.** Rerun `scripts/install_agent_schema.py` with
    `--platform-reader <the platform's role>`. It applies
-   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` (and `007_onboarding_watch.sql`) and lets
+   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` (and `007_onboarding_watch.sql` and `009_connection_checks.sql`) and lets
    that role read the agents' results (and nothing else in the agent schema).
 2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
 3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOnboarding=true`

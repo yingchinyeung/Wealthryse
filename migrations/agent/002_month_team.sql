@@ -12,7 +12,7 @@
 
 ALTER TABLE agent.service_grants DROP CONSTRAINT IF EXISTS service_grants_job_name_check;
 ALTER TABLE agent.service_grants ADD CONSTRAINT service_grants_job_name_check
-    CHECK (job_name IN ('holdings_explainer', 'month_end_drafter', 'data_quality', 'month_team'));
+    CHECK (job_name IN ('holdings_explainer', 'month_end_drafter', 'data_quality', 'month_team')) NOT VALID;
 
 -- month_end_report: one per report, links to the account's Reports tab.
 -- month_end_hold: an account the data agent blocked; approved = proceed, dismissed = hold.
@@ -21,7 +21,7 @@ ALTER TABLE agent.service_grants ADD CONSTRAINT service_grants_job_name_check
 ALTER TABLE agent.inbox DROP CONSTRAINT IF EXISTS inbox_kind_check;
 ALTER TABLE agent.inbox ADD CONSTRAINT inbox_kind_check CHECK (kind IN (
     'holdings_explainer', 'month_end_draft', 'data_quality',
-    'month_end_report', 'month_end_hold', 'month_end_dispute'));
+    'month_end_report', 'month_end_hold', 'month_end_dispute')) NOT VALID;
 
 -- Scoped package and snapshot views (tool server) ---------------------------
 

@@ -89,7 +89,7 @@ class InstallAgentSchemaTests(unittest.TestCase):
         run(connection, "--existing-logins", "--platform-reader", "ibkr_stg_app")
         self.assertIn('GRANT USAGE ON SCHEMA agent TO "ibkr_stg_app"', connection.statements)
         self.assertIn('GRANT SELECT ON agent.onboarding_reviews, agent.onboarding_term_drafts, '
-                      'agent.onboarding_reconciliations, agent.ops_investigations TO "ibkr_stg_app"',
+                      'agent.onboarding_reconciliations, agent.ops_investigations, agent.connection_reports TO "ibkr_stg_app"',
                       connection.statements)
         self.assertTrue(connection.committed)
         with self.assertRaises(SystemExit):

@@ -199,6 +199,26 @@ class Store:
         self._commit()
         return row is not None
 
+    def queue_first_connection_check(self, flex_source_id: str) -> str | None:
+        """Queue a never-checked IBKR login's first check; None when the database says it is not eligible."""
+        row = self.db.execute("SELECT agent.queue_first_connection_check(?::uuid) AS request_id",
+                              (flex_source_id,)).fetchone()
+        self._commit()
+        return str(row["request_id"]) if row and row["request_id"] else None
+
+    def add_connection_report(self, *, connection_id: str, flex_source_id: str, key: str, state: str, title: str,
+                              body: str, owner_steps: Sequence[str], validation_request_id: str | None,
+                              run_id: int | None) -> bool:
+        row = self.db.execute(
+            "INSERT INTO agent.connection_reports(tenant_id, connection_id, flex_source_id, report_key, state, title, "
+            "body, owner_steps, validation_request_id, run_id) VALUES (?::uuid, ?::uuid, ?::uuid, ?, ?, ?, ?, ?::jsonb, "
+            "?::uuid, ?) ON CONFLICT (tenant_id, flex_source_id, report_key) DO NOTHING RETURNING report_id",
+            (self.tenant_id, connection_id, flex_source_id, key[:120], state, title[:200], body[:2000],
+             json.dumps(list(owner_steps)), validation_request_id, run_id),
+        ).fetchone()
+        self._commit()
+        return row is not None
+
     def inbox(self, accounts: Sequence[str], status: str | None = None) -> list[dict[str, Any]]:
         if not accounts:
             return []

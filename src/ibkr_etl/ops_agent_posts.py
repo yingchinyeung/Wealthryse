@@ -149,6 +149,54 @@ def post_new_diagnoses(connection, conversation_id: str,
     return len(rows or [])
 
 
+_UNPOSTED_CONNECTION_REPORTS = f"""
+    SELECT r.report_id, r.state, r.title, r.body, r.owner_steps
+    FROM agent.connection_reports r
+    WHERE r.tenant_id = app_tenant_id()
+      AND r.created_at >= now() - interval '{POST_WINDOW}'
+      AND NOT EXISTS (
+          SELECT 1 FROM admin_chat_messages m
+          WHERE m.conversation_id = %s
+            AND m.response_json ->> 'connection_report_id' = r.report_id::text
+      )
+    ORDER BY r.report_id
+    LIMIT {MAX_POSTS_PER_RUN}
+"""
+
+
+def connection_report_message(row: dict) -> tuple[str, dict]:
+    """The admin chat message for one connection agent report."""
+    steps = [str(step).strip() for step in _json(row.get("owner_steps")) or [] if str(step).strip()]
+    parts = [str(row["body"]).strip()]
+    if steps:
+        parts.append("What to do: " + " ".join(f"{n}. {step}" for n, step in enumerate(steps, 1)))
+    response = {
+        "title": str(row["title"]),
+        "message": "\n\n".join(parts),
+        "status_points": [],
+        "proposed_action_type": "none",
+        "action_reason": "",
+        "requires_owner_approval": False,
+        "limitations": ["The connection agent only queues a login's first check; every later check is yours, "
+                        "because IBKR locks a token after repeated failures."],
+        "proactive": True,
+        "connection_report_id": int(row["report_id"]),
+        "connection_state": str(row["state"]),
+        "owner_steps": steps,
+    }
+    return "\n\n".join(parts), response
+
+
+def post_connection_reports(connection, conversation_id: str,
+                            append: Callable[[str, str, dict, int | None], None]) -> int:
+    """Post each connection agent report not yet in the updates conversation; returns how many."""
+    rows = _agent_rows(connection, _UNPOSTED_CONNECTION_REPORTS, (conversation_id,))
+    for row in rows or []:
+        content, response = connection_report_message(row)
+        append(content, "proactive_update", response, None)
+    return len(rows or [])
+
+
 def open_incidents(connection) -> list[dict]:
     """Open and acknowledged incidents, each with the agent's latest diagnosis when there is one."""
     rows = _agent_rows(connection, _OPEN_WITH_DIAGNOSIS)

@@ -1,7 +1,8 @@
 """The operations agent's and go-live coordinator's database side.
 
 The operations agent's views, its table, and how the platform shows its
-diagnoses; the first-month watch's view of live cases; and the readiness pack.
+diagnoses; the first-month watch's view of live cases; the readiness pack;
+memory and weekly briefs; and the connection agent's first checks.
 
 Needs a disposable PostgreSQL server: set AGENT_TEST_PG_ADMIN_DSN to a
 superuser DSN (CI starts one). Skipped otherwise. Creates and drops its own
@@ -301,6 +302,74 @@ class OperationsAgentDatabaseTests(unittest.TestCase):
         store.db.rollback()
         self.assertTrue(store.add_inbox(kind="weekly_brief", account_id="U0000901", period_key="2026-W42",
                                         title="Your week", body="Synthetic.", citations=[], run_id=None))
+
+    def test_7_the_connection_agent_queues_only_a_first_check_and_reports_each_result_once(self):
+        import psycopg
+
+        from wealthryse_agent.connection_watch import watch_connections
+        from wealthryse_agent.database import connect
+        from wealthryse_agent.store import Store
+
+        owner = self._owner()
+        login, source = str(uuid.uuid4()), str(uuid.uuid4())
+        secret = "ibkr-flex-source-" + uuid.uuid4().hex
+        owner.execute("INSERT INTO ibkr_flex_credentials (credential_id, display_name, key_vault_secret_name, "
+                      "token_fingerprint, status) VALUES (%s, 'Synthetic login', %s, %s, 'pending_validation')",
+                      (login, secret, "a" * 16))
+        owner.execute("INSERT INTO ibkr_flex_queries (flex_source_id, credential_id, query_id, display_name, status) "
+                      "VALUES (%s, %s, '123456', 'Synthetic login daily', 'pending_validation')", (source, login))
+        owner.execute("INSERT INTO broker_connections (connection_id, broker, environment, display_name, "
+                      "key_vault_secret_name, credential_fingerprint, credential_expires_on, status) "
+                      "VALUES (%s, 'ibkr_flex', 'live', 'Synthetic login', %s, %s, '2027-01-01', 'pending_check')",
+                      (login, secret, "a" * 16))
+        owner.commit()
+
+        store = Store(connect(self.writer, search_path="agent"), TENANT)
+        self.addCleanup(store.db.close)
+
+        def call(name, arguments):
+            return self.service.call(caller_id="", user=None, job="onboarding", correlation_id="test", name=name,
+                                     arguments=arguments)
+
+        self.assertEqual(call("list_broker_logins", {})["data"]["logins"][0]["checks_requested"], 0)
+        self.assertEqual(watch_connections(store, call, None), 1)  # queued, and said so
+        requests = owner.execute("SELECT validation_request_id, status, requested_by_identity_sha256 "
+                                 "FROM ibkr_flex_source_validation_requests WHERE flex_source_id = %s",
+                                 (source,)).fetchall()
+        owner.commit()
+        self.assertEqual([(r["status"], r["requested_by_identity_sha256"]) for r in requests], [("pending", None)])
+        self.assertEqual(watch_connections(store, call, None), 0)  # never a second request or report
+
+        # The discovery job fails the check: the agent says why, once, and does not retry.
+        owner.execute("UPDATE ibkr_flex_source_validation_requests SET status = 'blocked', error_phase = "
+                      "'send_request', error_code = '1012', completed_at = now() WHERE flex_source_id = %s", (source,))
+        owner.commit()
+        self.assertEqual(watch_connections(store, call, None), 1)
+        self.assertEqual(watch_connections(store, call, None), 0)
+        self.assertIsNone(store.queue_first_connection_check(source))
+        reports = owner.execute("SELECT state, body, owner_steps FROM agent.connection_reports ORDER BY report_id"
+                                ).fetchall()
+        owner.commit()
+        self.assertEqual([r["state"] for r in reports], ["queued", "blocked"])
+        self.assertIn("the token has expired (IBKR error 1012)", reports[1]["body"])
+        self.assertNotIn(secret, str(reports))
+
+        # The writer can queue checks only through the function, and cannot read the platform tables.
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            store.db.execute("SELECT 1 FROM public.ibkr_flex_source_validation_requests")
+        store.db.rollback()
+
+        self._grant_platform_reads()
+        admin = _script("run_autonomous_administrator")
+        platform = self._platform()
+        for _ in range(2):
+            admin._publish_admin_chat_updates(platform, findings=[], new_keys=set(), incident_ids={}, diagnosis=None,
+                                              correlation_id=str(uuid.uuid4()))
+            platform.commit()
+        posted = platform.execute("SELECT response_json FROM admin_chat_messages "
+                                  "WHERE response_json ? 'connection_report_id' ORDER BY sequence_no").fetchall()
+        self.assertEqual([p["response_json"]["connection_state"] for p in posted], ["queued", "blocked"])
+        self.assertIn("Generate a new Flex Web Service token", posted[1]["response_json"]["message"])
 
 
 if __name__ == "__main__":

@@ -958,6 +958,21 @@ def list_live_onboarding_cases(connection, arguments: Mapping[str, Any]) -> dict
     return {"as_of": None, "data": {"cases": cases}, "citations": [_citation("broker_onboarding_cases", None)]}
 
 
+def list_broker_logins(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """The tenant's IBKR logins with their latest check: statuses, dates and counts, never the token."""
+    rows = connection.execute(
+        "SELECT connection_id::text AS connection_id, display_name, connection_status, credential_expires_on, "
+        "flex_source_id::text AS flex_source_id, source_status, credential_status, blocked_until, "
+        "requires_manual_reset, checks_requested, latest_request_id::text AS latest_request_id, latest_status, "
+        "latest_error_phase, latest_error_code, latest_created_at, latest_completed_at, latest_account_count, "
+        "accounts_found FROM broker_logins ORDER BY display_name, connection_id"
+    ).fetchall()
+    stamps = ("credential_expires_on", "blocked_until", "latest_created_at", "latest_completed_at")
+    logins = [{key: (str(value) if key in stamps and value is not None else value)
+               for key, value in dict(row).items()} for row in rows]
+    return {"as_of": None, "data": {"logins": logins}, "citations": [_citation("broker_connections", None)]}
+
+
 # Operations: the administrator's incidents and the platform's recent runs ------------------
 
 
@@ -1068,6 +1083,9 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("list_live_onboarding_cases", "Onboarding cases that went live and wait for their first month-end, "
              "with the go-live time, latest data and assurance dates, and whether the month-end team has access.",
              _schema({}, []), list_live_onboarding_cases, False, only_jobs=ONBOARDING),
+    ToolSpec("list_broker_logins", "The IBKR logins added for onboarding, with the latest check of each: its "
+             "status, IBKR's error code if it failed, and how many accounts it found.", _schema({}, []),
+             list_broker_logins, False, only_jobs=ONBOARDING),
     ToolSpec("list_open_incidents", "The autonomous administrator's open and acknowledged incidents, with its "
              "evidence, for the operations agent to investigate.", _schema({}, []), list_open_incidents, False,
              only_jobs=OPERATIONS),

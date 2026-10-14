@@ -106,5 +106,38 @@ class AlreadyLiveFilesTest(unittest.TestCase):
             self.assertEqual((pkg / "risk_display.py").read_text(), "risk\n")
 
 
+class PrepareTest(unittest.TestCase):
+    def run_prepare(self, changed):
+        app = {"properties": {"template": {"containers": [{"image": "reg/ibkr-platform:web-" + DEPLOYED}]},
+                              "configuration": {"ingress": {"fqdn": "site.example"}}}}
+
+        def git(*args, binary=False):
+            if args[0] == "rev-parse":
+                return HEAD + "\n"
+            if args[0] == "diff":
+                return "\n".join(changed)
+            raise AssertionError(args)
+
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "release-state.json"
+            with mock.patch.object(release, "git", side_effect=git), \
+                    mock.patch.object(release, "az", return_value=app), \
+                    mock.patch.object(release, "STATE", state), \
+                    mock.patch.object(release.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+                    mock.patch("builtins.print"):
+                release.prepare()
+            return json.loads(state.read_text())
+
+    def test_postgres_migrations_are_not_shipped_and_do_not_stop_the_release(self):
+        state = self.run_prepare(["migrations/postgres/064_onboarding.sql", "src/ibkr_etl/web.py"])
+        self.assertEqual(state["changed_files"], ["src/ibkr_etl/web.py"])
+        self.assertEqual(state["migrations_not_shipped"], ["migrations/postgres/064_onboarding.sql"])
+
+    def test_other_image_files_still_stop_the_release(self):
+        with self.assertRaises(SystemExit):
+            self.run_prepare(["Dockerfile", "src/ibkr_etl/web.py"])
+
+
 if __name__ == "__main__":
     unittest.main()

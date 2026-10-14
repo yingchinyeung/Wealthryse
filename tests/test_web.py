@@ -1224,7 +1224,7 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("Risk analytics through", page)
         self.assertIn("Expected maximum drawdown (1 year)", page)
         self.assertIn("Crisis maximum drawdown (15/9/2008–9/3/2009)", page)
-        self.assertIn("hypothetical fixed-unit replay", page)
+        self.assertIn("Hypothetical fixed-unit crisis replay", page)
         self.assertIn("Daily Expected Tail Loss (95%)", page)
         self.assertIn("Top 5 Expected Tail Loss contributors", page)
         self.assertIn("Bottom 5 Expected Tail Loss contributors", page)

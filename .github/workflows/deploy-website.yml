@@ -5,6 +5,12 @@ name: Deploy website
 # are left as they are. See deploy/website_release.py for the steps.
 on:
   workflow_dispatch:
+    inputs:
+      builder:
+        description: Where to build the image (acr = ACR Tasks, when the build VM is unavailable)
+        type: choice
+        options: [vm, acr]
+        default: vm
 
 permissions:
   contents: read
@@ -37,8 +43,8 @@ jobs:
           subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
       - name: Check what changed since the live website
         run: python deploy/website_release.py prepare
-      - name: Build the image on the private build VM
-        run: python deploy/website_release.py build
+      - name: Build the image (private build VM, or ACR Tasks)
+        run: python deploy/website_release.py ${{ inputs.builder == 'acr' && 'acr-build' || 'build' }}
       - name: Switch the website to the new image
         run: python deploy/website_release.py deploy
       - name: Check health and sign-in

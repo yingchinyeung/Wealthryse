@@ -252,8 +252,7 @@ only, as it does today; the factsheet renderer never receives it.
 The onboarding agents work through the four stages of a new-onboarding case
 (`ibkr_etl/onboarding_cases.py`). They record the case's own checks with
 evidence, and Ying keeps the case's three approvals and the first release.
-The intake agent and the history reviewer are built; the reconciliation agent
-follows.
+The intake agent, the reconciliation agent and the history reviewer are built.
 
 **Intake agent** (`wealthryse_agent/onboarding_intake.py`). Before approval 1
 it drafts a case's account terms from the client's own documents: the mandate,
@@ -276,6 +275,33 @@ documents it read; a new or replaced document gets a new draft. It never
 changes the case: Ying approves the terms on the case page as before. The
 upload on the case page and showing the draft beside approval 1 are PR 57
 files, so they go through the onboarding thread.
+
+**Reconciliation agent** (`wealthryse_agent/onboarding_reconcile.py`). In
+stage 2 of an IBKR broker account it records the four checks nothing recorded
+before. The scheduled Flex worker already loads every account in its
+statement, so the agent reads the case account's data through scoped views
+that show the accounts of open stage 2 cases and nothing else:
+
+- **Holdings and cash loaded:** a recent day has holdings or cash; older than
+  five days is a warning.
+- **Transactions loaded:** the daily NAV reaches back to the case's start date
+  with no gap of ten days or more, and trades or cash transactions are loaded.
+- **Securities mapped:** every security held has its instrument details and
+  resolves in the security master. A new security is proposed with its
+  identifiers (a warning, acknowledged at approval 1); identifiers that point
+  at two securities fail, for Ying to decide.
+- **NAV reconciled:** on the latest day and each recent month-end, positions
+  plus cash plus accruals, in the base currency at IBKR's FX rates, against
+  IBKR's own NAV, within 0.01% or one unit. Each break says which side it is
+  on and its likely cause: a corporate action, a missing price, a missing FX
+  rate, a settlement, or that nothing loaded explains it. Above 0.5% it fails.
+
+Arithmetic runs in code. The model only words a break's explanation from the
+facts code found, and any number in its wording must be one of those facts or
+the platform's own wording is used. Results go to
+`agent.onboarding_reconciliations`; `ibkr_etl.onboarding_agent_reconcile.record_agent_reconciliations`
+records them on the case as checks marked `recorded_by: agent`, with the
+proposed security master entries in the evidence.
 
 **History reviewer** (`wealthryse_agent/onboarding_review.py`). It reviews a
 composite in the Alpha World MS or T design that is in stage 3 with its
@@ -314,14 +340,15 @@ acknowledges at approval 2. A clean review passes.
 
 1. **Database.** Rerun `scripts/install_agent_schema.py` with
    `--platform-reader <the platform's role>`. It applies
-   `003_onboarding_review.sql` and `004_onboarding_intake.sql` and lets that
-   role read the reviews and drafts (and nothing else in the agent schema).
+   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` and lets
+   that role read the agents' results (and nothing else in the agent schema).
 2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
 3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOnboarding=true`
    (needs `deployMonthTeam=true` for the report reader). This creates
    `ibkrv2stg-agent-onboarding` and gives the jobs identity read access to the
    `onboarding-intake` container only.
-4. **Recording.** The month-end report job calls `record_agent_reviews` after
+4. **Recording.** A platform job calls `record_agent_reconciliations`, and
+   the month-end report job calls `record_agent_reviews` after
    `render_onboarding_composite_reports.py`.
 
 ## Cost drivers
@@ -335,7 +362,7 @@ acknowledges at approval 2. A clean review passes.
 - The month-end team, when deployed: an hourly job on six days a month, and
   its own monthly token budget on `wr-reports-apac`.
 - The onboarding agents, when deployed: an hourly job that calls the model
-  only when a case has new documents or new reports, with its own monthly budget
+  only for new documents, a NAV break or new reports, with its own monthly budget
   (`onboardingTokenBudget`).
 - No new database server.
 

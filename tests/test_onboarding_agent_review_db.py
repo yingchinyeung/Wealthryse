@@ -198,8 +198,108 @@ class OnboardingReviewDatabaseTests(unittest.TestCase):
             store.db.execute("UPDATE public.broker_onboarding_cases SET reporting_currency = 'USD'")
         store.db.rollback()
 
-    def _call(self, name, job):
-        return self.service.call(caller_id="", user=None, job=job, correlation_id="test", name=name, arguments={})
+    def _call(self, name, job, arguments=None):
+        return self.service.call(caller_id="", user=None, job=job, correlation_id="test", name=name,
+                                 arguments=arguments or {})
+
+    def _broker_case_with_data(self, db):
+        """An IBKR account in stage 2 whose Flex data is loaded, beside another account's data."""
+        from datetime import date
+
+        from ibkr_etl.broker_connections import new_connection_record
+        from ibkr_etl.onboarding_v2_web import register_connection, start_case
+
+        record = new_connection_record(
+            broker="ibkr_flex", display_name="Synthetic login", environment="live", credentials={"flex_token": "1"},
+            expires_on=date(2026, 1, 1), ip_locked_to=None, today=date(2025, 3, 3))
+        register_connection(db, TENANT, record=record, stored_fingerprint="0" * 16, query_id="988", account_id=None,
+                            actor=IDENTITY)
+        source = db.execute("SELECT flex_source_id FROM ibkr_flex_queries WHERE credential_id = ?",
+                            (record.connection_id,)).fetchone()["flex_source_id"]
+        db.execute("INSERT INTO ibkr_flex_source_accounts (flex_source_id, source_account_id, base_currency, "
+                   "account_name, discovery_status) VALUES (?, 'U0000088', 'HKD', 'Synthetic', 'discovered')", (source,))
+        case_id = start_case(db, TENANT, connection_id=record.connection_id, broker_account_id="U0000088",
+                             display_name="Synthetic HKD", reporting_currency="HKD",
+                             history_start_date=date(2025, 2, 24), actor=IDENTITY, today=date(2025, 3, 3))["case_id"]
+        run = db.execute("INSERT INTO ingestion_runs(run_type, started_at, status) VALUES ('test', '2025-03-01', "
+                         "'success') RETURNING run_id").fetchone()["run_id"]
+        db.execute("INSERT INTO instruments (conid, symbol, description, asset_category, currency, listing_exchange, "
+                   "first_seen_at, last_seen_at, source_json) VALUES ('1001', '9999', 'SYNTHETIC HK LTD', 'STK', "
+                   "'HKD', 'SEHK', 'x', 'x', '{}') ON CONFLICT DO NOTHING")
+        for account, total in (("U0000088", "7012"), ("U0000099", "999")):
+            db.execute("INSERT INTO accounts (account_id, base_currency, first_seen_at, last_seen_at, source_json) "
+                       "VALUES (?, 'HKD', 'x', 'x', '{}')", (account,))
+            for day in ("2025-02-24", "2025-02-25", "2025-02-26", "2025-02-27", "2025-02-28"):
+                db.execute("INSERT INTO nav_snapshots (account_id, snapshot_date, currency, asset_class, total_text, "
+                           "cash_text, stock_text, accruals_text, row_sha256, last_seen_run_id) "
+                           "VALUES (?, ?, 'HKD', 'TOTAL', ?, '2000', '5000', '12', 'x', ?)", (account, day, total, run))
+            db.execute("INSERT INTO position_snapshots (account_id, snapshot_date, conid, currency, quantity_text, "
+                       "mark_price_text, market_value_text, row_sha256, last_seen_run_id) VALUES "
+                       "(?, '2025-02-28', '1001', 'HKD', '500', '10', '5000', 'x', ?)", (account, run))
+            db.execute("INSERT INTO cash_snapshots (account_id, snapshot_date, currency, ending_cash_text, "
+                       "fx_rate_to_base_text, row_sha256, last_seen_run_id) VALUES (?, '2025-02-28', 'HKD', '2000', "
+                       "'1', 'x', ?)", (account, run))
+            db.execute("INSERT INTO trades (account_id, source_key, conid, trade_date, settle_date, buy_sell, "
+                       "net_cash_text, currency, row_sha256, last_seen_run_id) VALUES (?, 't1', '1001', '2025-02-24', "
+                       "'2025-02-26', 'BUY', '-5000', 'HKD', 'x', ?)", (account, run))
+        db.commit()
+        return case_id
+
+    def test_a_broker_account_is_reconciled_and_the_platform_records_its_four_checks(self):
+        from datetime import date
+
+        from ibkr_etl.onboarding_agent_reconcile import record_agent_reconciliations
+        from ibkr_etl.onboarding_v2_web import cancel_case, case_detail
+        from wealthryse_agent.database import connect
+        from wealthryse_agent.onboarding_reconcile import Reconciler, ReconciliationStore, reconcile_waiting_cases
+        from wealthryse_agent.tools import ToolError
+
+        db = self._platform()
+        self.assertEqual(self._call("list_onboarding_broker_cases", "onboarding")["data"]["cases"], [])
+        case_id = self._broker_case_with_data(db)
+        try:
+            for job in ("month_team", "data_quality"):
+                with self.assertRaises(ToolError):
+                    self._call("list_onboarding_broker_cases", job)
+            case, = self._call("list_onboarding_broker_cases", "onboarding")["data"]["cases"]
+            self.assertEqual((case["case_id"], case["broker_account_id"], case["base_currency"]),
+                             (case_id, "U0000088", "HKD"))
+            # The views show the case's account only; the other account's data is never reachable.
+            overview = self._call("get_onboarding_broker_overview", "onboarding", {"case_id": case_id})["data"]
+            self.assertEqual(({n["total_text"] for n in overview["nav"]}, len(overview["nav"])), ({"7012"}, 5))
+            self.assertEqual([s["conid"] for s in overview["securities"]], ["1001"])
+            with self.assertRaises(ToolError):
+                self._call("get_onboarding_broker_day", "onboarding",
+                           {"case_id": "aaaaaaaa-0000-4000-8000-000000000099", "date": "2025-02-28"})
+            reader = connect(self.reader, search_path="agent")
+            self.addCleanup(reader.close)
+            for view in ("onboarding_nav", "onboarding_positions", "onboarding_cash", "onboarding_activity"):
+                accounts = {r["account_id"] for r in reader.execute(f"SELECT account_id FROM {view}").fetchall()}
+                self.assertEqual(accounts, {"U0000088"}, view)
+            reader.rollback()
+
+            store = ReconciliationStore(connect(self.writer, search_path="agent"), TENANT)
+            self.addCleanup(store.db.close)
+            call = lambda name, arguments: self._call(name, "onboarding", arguments)  # noqa: E731
+            reconciler = Reconciler(lambda: self.fail("a clean account needs no model"))
+            self.assertEqual(reconcile_waiting_cases(store, call, reconciler, {}, today=date(2025, 3, 3)), 1)
+            self.assertEqual(reconcile_waiting_cases(store, call, reconciler, {}, today=date(2025, 3, 3)), 0)
+            with self.assertRaises(Exception):  # the agent cannot touch the case's checks
+                store.db.execute("UPDATE public.broker_onboarding_checks SET status = 'pass'")
+            store.db.rollback()
+
+            recorded, = record_agent_reconciliations(db, TENANT)
+            self.assertEqual(recorded["recorded"], ["holdings_and_cash_loaded", "nav_reconciled", "securities_mapped",
+                                                    "transactions_loaded"])
+            self.assertEqual(record_agent_reconciliations(db, TENANT)[0]["recorded"], [])
+            checks = {k["check_id"]: k for k in case_detail(db, TENANT, case_id)["checks"]}
+            self.assertEqual({k: checks[k]["status"] for k in recorded["recorded"]},
+                             {"holdings_and_cash_loaded": "pass", "transactions_loaded": "pass",
+                              "securities_mapped": "warn", "nav_reconciled": "pass"})
+            self.assertIn("1 are new and proposed with their identifiers: 9999", checks["securities_mapped"]["message"])
+        finally:
+            cancel_case(db, TENANT, case_id, reason="Test case.", actor=IDENTITY)
+            db.commit()
 
     def test_the_reviewer_sees_waiting_cases_and_the_platform_records_its_review(self):
         from ibkr_etl.onboarding_agent_review import record_agent_reviews, reports_digest

@@ -155,7 +155,7 @@ function render(run){
 })();"""
 
 MONTH_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Month-end</title><style>{THEME}
-.mt-table{border-collapse:collapse;width:100%;font-size:14px}.mt-table th,.mt-table td{padding:8px;border-bottom:1px solid var(--border,#dce2eb);text-align:left;vertical-align:top}
+.mt-table{border-collapse:collapse;width:100%;font-size:14px}.mt-table button.link{border:0;background:none;color:inherit;text-decoration:underline;cursor:pointer;padding:0;font:inherit}.mt-why ul{margin:0;padding-left:18px}.mt-table th,.mt-table td{padding:8px;border-bottom:1px solid var(--border,#dce2eb);text-align:left;vertical-align:top}
 .mt-wrap{overflow-x:auto}.mt-log:empty{display:none}.mt-log{margin:12px 0;padding:10px 14px;border:1px solid var(--border,#dce2eb);border-radius:10px;font-size:14px}.mt-need{font-weight:600}.mt-banner{padding:10px 14px;border-radius:10px;background:rgba(232,131,58,.14);margin:12px 0}
 </style></head><body><header><strong class="brand-title">Month-end</strong><div class="session">{VIEWER} · <a href="/agent-inbox">Agent inbox</a> · <a href="/">Accounts</a></div></header>
 <main><h1>Month-end</h1><p class="muted">Every account the month-end team is checking, by stage. The team never releases anything: release each report on its Reports tab as usual.</p>
@@ -204,6 +204,18 @@ async function load(period){const mode=document.querySelector('#mode').value;con
 function render(){const f=document.querySelector('#filter').value,rows=all.filter(r=>!f||(f==='need'?needs(r):clean(r)));const n=all.filter(needs).length,c=all.filter(clean).length;
  const button=document.querySelector('#batch');button.hidden=!c;button.textContent=`Release ${c} clean report${c===1?'':'s'}`;
  document.querySelector('#summary').textContent=all.length?`${all.length} account(s); ${n} need you.`:'The team has not run for this month yet.';
- document.querySelector('#rows').innerHTML=rows.map(r=>`<tr class="${needs(r)?'mt-need':''}"><td><a href="/accounts/${encodeURIComponent(r.subject_id)}/reports">${esc(r.subject_id)}</a></td><td>${esc(stage(r))}</td><td>${esc(VERDICT[r.data_verdict]||'—')}</td><td>${esc(COMMENTARY[r.commentary_status]||'—')}</td><td>${esc(files(r))}</td><td>${r.open_objections}</td><td>${esc(String(r.updated_at||'').slice(0,16).replace('T',' '))}</td></tr>`).join('')}
+ document.querySelector('#rows').innerHTML=rows.map(r=>`<tr class="${needs(r)?'mt-need':''}"><td><a href="/accounts/${encodeURIComponent(r.subject_id)}/reports">${esc(r.subject_id)}</a></td><td>${esc(stage(r))}</td><td>${esc(VERDICT[r.data_verdict]||'—')}</td><td>${esc(COMMENTARY[r.commentary_status]||'—')}</td><td>${esc(files(r))}</td><td>${r.open_objections?`<button class="link" type="button" data-why="${esc(r.subject_id)}" aria-expanded="false">${r.open_objections} · Show</button>`:r.open_objections}</td><td>${esc(String(r.updated_at||'').slice(0,16).replace('T',' '))}</td></tr>`).join('')}
+// What each open objection says, in place: replay runs have no Reports-tab panel, so this is where they are read.
+const RAISED={coordinator:'Coordinator',data:'Data',analyst:'Analyst',writer:'Writer',reviewer:'Reviewer',visual_qa:'Visual QA'};
+const WHAT={commentary:'Commentary',factsheet:'Factsheet',presentation:'Presentation',data:'Data'};
+async function why(button){const row=button.closest('tr'),next=row.nextElementSibling;
+ if(next&&next.classList.contains('mt-why')){next.remove();button.setAttribute('aria-expanded','false');return}
+ const r=all.find(x=>x.subject_id===button.dataset.why);if(!r)return;button.setAttribute('aria-expanded','true');
+ const detail=document.createElement('tr');detail.className='mt-why';detail.innerHTML='<td colspan="7" class="muted">Loading…</td>';row.after(detail);
+ try{const q=await fetch(`/api/agents/month-end/runs/${encodeURIComponent(r.subject_id)}/${encodeURIComponent(r.period_end)}?mode=${encodeURIComponent(r.mode)}`,{credentials:'same-origin'});
+  if(!q.ok)throw new Error();const run=await q.json(),open=(run.objections||[]).filter(o=>o.status==='open');
+  detail.innerHTML=`<td colspan="7"><ul>${open.map(o=>`<li><strong>${esc(WHAT[o.target]||o.target)}${o.page?', page '+esc(o.page):''}</strong> · ${esc(RAISED[o.raised_by]||o.raised_by)}: ${esc(o.message)}</li>`).join('')||'<li>No open objections now.</li>'}</ul></td>`}
+ catch(e){detail.innerHTML='<td colspan="7" class="muted">The objections could not be loaded.</td>'}}
+document.querySelector('#rows').addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('button[data-why]');if(b)why(b)});
 document.querySelector('#batch').addEventListener('click',batch);document.querySelector('#mode').addEventListener('change',()=>load());document.querySelector('#period').addEventListener('change',e=>load(e.target.value));document.querySelector('#filter').addEventListener('change',render);load();
 </script></body></html>"""

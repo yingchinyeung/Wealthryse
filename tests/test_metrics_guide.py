@@ -10,7 +10,7 @@ from ibkr_etl import metrics_guide as guide
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src/ibkr_etl"
-WEB_SOURCES = (SRC / "web.py", ROOT / "deploy/live-merged/src/ibkr_etl/web.py")
+WEB_SOURCES = (SRC / "web.py",)
 
 
 def _metric_card_labels(source: str, start: str, end: str) -> set[str]:

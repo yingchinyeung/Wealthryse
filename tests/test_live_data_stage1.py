@@ -66,6 +66,13 @@ class BundleTests(unittest.TestCase):
         self.assertTrue(set(value["held_back"]) <= set(names))
         self.assertNotIn(rollout.TARGET, value["held_back"])
 
+    def test_a_downloaded_copy_without_git_gives_the_same_bundle_and_command(self):
+        from_git = rollout.bundle(), rollout.command(rollout.bundle())
+        with mock.patch.object(rollout, "has_git", return_value=False):
+            self.assertEqual((rollout.bundle(), rollout.command(rollout.bundle())), from_git)
+            with self.assertRaises(SystemExit):
+                rollout.bundle("HEAD~1")
+
     def test_command_is_deterministic_and_runs_the_payload(self):
         value = rollout.bundle()
         args = rollout.command(value)

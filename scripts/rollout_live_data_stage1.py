@@ -1,7 +1,9 @@
 """Stage 1 of the live IBKR data rollout: migration 063 and the collector login.
 
 Run on the owner's computer, from a clone of main, after `az login`, with a
-Python that has requests and azure-identity:
+Python that has requests and azure-identity. Without git, a downloaded copy of
+main works too (GitHub's "Download ZIP" for a commit); check prints the same
+migration and payload checksums either way, so they can be compared:
 
     python scripts/rollout_live_data_stage1.py check
     python scripts/rollout_live_data_stage1.py start
@@ -29,6 +31,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -61,15 +64,30 @@ PAYLOAD = "scripts/live_data_stage1_payload.py"
 ACCESS = "src/ibkr_etl/live_collector_access.py"
 
 
+def has_git() -> bool:
+    """A git clone with git installed; otherwise the files on disk are a downloaded copy."""
+    return shutil.which("git") is not None and (ROOT / ".git").exists()
+
+
 def git_text(path: str, commit: str = "HEAD") -> str:
     """A file as committed, with LF line ends like the Linux images, whatever the checkout does."""
-    data = subprocess.run(["git", "show", f"{commit}:{path}"], cwd=ROOT, capture_output=True, check=True).stdout
+    if has_git():
+        data = subprocess.run(["git", "show", f"{commit}:{path}"], cwd=ROOT, capture_output=True, check=True).stdout
+    elif commit == "HEAD":
+        data = (ROOT / path).read_bytes()
+    else:
+        raise SystemExit("Reading another commit needs a git clone")
     return data.decode("utf-8").replace("\r\n", "\n")
 
 
 def bundle(commit: str = "HEAD") -> dict:
-    names = subprocess.run(["git", "ls-tree", "--name-only", commit, "migrations/postgres/"], cwd=ROOT,
-                           capture_output=True, text=True, check=True).stdout.split()
+    if has_git():
+        names = subprocess.run(["git", "ls-tree", "--name-only", commit, "migrations/postgres/"], cwd=ROOT,
+                               capture_output=True, text=True, check=True).stdout.split()
+    else:
+        git_text(PAYLOAD, commit)  # refuses another commit
+        names = sorted("migrations/postgres/" + path.name for path in (ROOT / "migrations" / "postgres").iterdir()
+                       if path.is_file())
     texts = {Path(name).name: git_text(name, commit) for name in names if name.endswith(".sql")}
     if TARGET not in texts or not set(HELD_BACK) <= set(texts):
         raise SystemExit(f"{TARGET} or a held-back migration is not in {commit}; run this from main")
@@ -212,7 +230,8 @@ def preflight() -> dict:
     if busy:
         raise SystemExit("The bootstrap job is busy: " + ", ".join(busy))
     value = bundle()
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    head = (subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.strip()
+            if has_git() else "downloaded copy (no git); compare the checksums")
     identity = next(iter(job["identity"]["userAssignedIdentities"])).rsplit("/", 1)[-1]
     return {"container": container, "bundle": value, "head": head, "identity": identity}
 

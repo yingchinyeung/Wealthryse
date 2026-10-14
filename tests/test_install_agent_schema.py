@@ -83,3 +83,18 @@ class InstallAgentSchemaTests(unittest.TestCase):
     def test_logins_only_refuses_grants(self):
         with self.assertRaises(SystemExit):
             run(FakeConnection(), "--logins-only", "--grant", "data_quality=U1")
+
+    def test_platform_reader_may_read_the_onboarding_agents_tables_only(self):
+        connection = FakeConnection(roles={"ibkr_stg_app"})
+        run(connection, "--existing-logins", "--platform-reader", "ibkr_stg_app")
+        self.assertIn('GRANT USAGE ON SCHEMA agent TO "ibkr_stg_app"', connection.statements)
+        self.assertIn('GRANT SELECT ON agent.onboarding_reviews, agent.onboarding_term_drafts, '
+                      'agent.onboarding_reconciliations TO "ibkr_stg_app"', connection.statements)
+        self.assertTrue(connection.committed)
+        with self.assertRaises(SystemExit):
+            run(FakeConnection(), "--existing-logins", "--platform-reader", "ibkr_stg_app")  # no such role
+        with self.assertRaises(SystemExit):
+            run(FakeConnection(), "--logins-only", "--platform-reader", "ibkr_stg_app")
+
+    def test_the_onboarding_job_is_known(self):
+        self.assertIn("onboarding", install.JOBS)

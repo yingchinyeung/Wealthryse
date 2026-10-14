@@ -45,8 +45,10 @@ NO_LINE = sorted(fig.DECKS_WITHOUT_COMMENTARY)[0]  # a subject whose deck has no
 APAC = ModelSettings(endpoint="https://wr-agents-sea.services.ai.azure.com", deployment="wr-reports-apac",
                      router_deployment="", region="southeastasia", processing_scope="apac-data-zone",
                      managed_identity_client_id="x")
+# Most tests below keep the deck path (commentary and deck checks) covered for the summary deck to come; the
+# default, with decks no longer built, is tested on its own.
 SETTINGS = TeamSettings(storage_account_url=STORAGE, container="internal-reports", monthly_token_budget=1_000_000,
-                        report_time_limit_seconds=900)
+                        report_time_limit_seconds=900, decks=True)
 
 
 def snapshot() -> dict:
@@ -290,9 +292,9 @@ def fake_pages(content: bytes, dpi: int) -> list[bytes]:
 
 
 def team(tools: FakeTools, model: FakeModel, store: FakeStore | None = None, *, today=date(2026, 2, 2),
-         budget: int = 1_000_000, live: bool = False) -> tuple[Coordinator, FakeStore]:
+         budget: int = 1_000_000, live: bool = False, decks: bool = True) -> tuple[Coordinator, FakeStore]:
     store = store or FakeStore()
-    settings = dataclasses.replace(SETTINGS, live=live)
+    settings = dataclasses.replace(SETTINGS, live=live, decks=decks)
     coordinator = Coordinator(store, tools, lambda: TeamModel(APAC, tokens_left=budget, client=model),
                               settings, today=today, download=tools.download, render_pages=fake_pages)
     return coordinator, store
@@ -750,7 +752,7 @@ class CoordinatorTests(unittest.TestCase):
             self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
         [objection] = store.objections(1, "open")
         self.assertEqual((objection["target"], objection["page"]), ("factsheet", 2))
-        self.assertIn("belongs in the deck only", objection["message"])
+        self.assertIn("the factsheet never carries commentary", objection["message"])
 
     def test_a_deck_without_a_commentary_line_gets_no_commentary(self):
         model = FakeModel()
@@ -763,6 +765,23 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual((run["verdicts"]["commentary_in_report"], run["verdicts"]["deck_has_commentary"]), (None, False))
         self.assertEqual(store.objections(1, "open"), [])
         self.assertIn("deck has no commentary line", store.cards[("month_end_report", NO_LINE, PERIOD)]["body"])
+
+    def test_without_decks_the_team_checks_the_factsheet_only_and_writes_no_commentary(self):
+        self.assertFalse(TeamSettings(storage_account_url=STORAGE, container="c", monthly_token_budget=1,
+                                      report_time_limit_seconds=60).decks)
+        model = FakeModel()
+        coordinator, store = team(FakeTools(), model, live=True, decks=False)
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "month"), "ready")
+        run = store.runs_by_key[(ACCOUNT, PERIOD, "month")]
+        self.assertIsNone(run["commentary_status"])
+        self.assertEqual(model.named("month_end_commentary"), [])
+        self.assertEqual([f["report_type"] for f in run["package"]["files"]], ["factsheet"])
+        self.assertEqual(run["verdicts"]["deck_has_commentary"], False)
+        body = store.cards[("month_end_report", ACCOUNT, PERIOD)]["body"]
+        self.assertIn("decks are no longer built", body)
+        self.assertNotIn("deck:", body)
+        coordinator.advance(ACCOUNT, PERIOD, "month")
+        self.assertEqual(store.objections(1, "open"), [])
 
     def test_live_cards_say_what_each_choice_does_to_the_report(self):
         coordinator, store = team(FakeTools(jump_on="2026-01-15"), FakeModel(), live=True)

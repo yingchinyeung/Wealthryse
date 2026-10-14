@@ -101,8 +101,8 @@ def evaluate_database_state(
 
     ready_types = set(state.get("ready_report_types") or [])
     checks["ready_report_types"] = sorted(ready_types)
-    if ready_types != {"factsheet", "presentation"}:
-        failures.append("Latest month-end snapshot does not have one ready report pair")
+    if "factsheet" not in ready_types:
+        failures.append("Latest month-end snapshot does not have a ready factsheet")
 
     client_approvals = int(state.get("client_approval_count") or 0)
     checks["client_approval_count"] = client_approvals

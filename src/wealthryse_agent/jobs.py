@@ -7,8 +7,13 @@ records); nothing is sent, published or released.
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
                                                          # re-check months already released
+    python -m wealthryse_agent.jobs onboarding           # hourly: draft new cases' terms from their documents,
+                                                         # reconcile new broker accounts, and review new
+                                                         # composites' historical reports
 
-Accounts come from agent.service_grants for the job, enforced by the tool server.
+Accounts come from agent.service_grants for the job, enforced by the tool server. The
+onboarding job has no accounts: its cases are not live yet, and it sees only the case views
+its own tools give it.
 """
 from __future__ import annotations
 
@@ -187,9 +192,41 @@ def month_team(store: Store, tools: ToolClient, accounts: list[str], usage: dict
     return counts.get("ready", 0)
 
 
+def onboarding(store: Store, tools: ToolClient, usage: dict, correlation_id: str) -> int:
+    from .month_team.agents import TeamModel
+    from .month_team.settings import validate_report_model
+    from .onboarding_intake import DraftStore, IntakeDrafter, IntakeSettings, draft_waiting_cases
+    from .onboarding_reconcile import Reconciler, ReconciliationStore, reconcile_waiting_cases
+    from .onboarding_review import HistoryReviewer, ReviewSettings, ReviewStore, review_waiting_cases
+
+    settings, intake_settings, model_settings = ReviewSettings.from_env(), IntakeSettings.from_env(), ModelSettings.from_env()
+    settings.validate()
+    intake_settings.validate()
+    validate_report_model(model_settings)
+    review_store = ReviewStore(store.db, store.tenant_id)
+    tokens_left = settings.monthly_token_budget - review_store.tokens_used_this_month()
+    if tokens_left <= 0:
+        raise BudgetExhausted
+    # One model for both agents, so they share the month's remaining budget.
+    shared: list[TeamModel] = []
+
+    def model() -> TeamModel:
+        if not shared:
+            shared.append(TeamModel(model_settings, tokens_left=tokens_left))
+        return shared[0]
+
+    drafted = draft_waiting_cases(DraftStore(store.db, store.tenant_id), tools.call,
+                                  IntakeDrafter(intake_settings, model), usage, correlation_id)
+    reconciled = reconcile_waiting_cases(ReconciliationStore(store.db, store.tenant_id), tools.call, Reconciler(model),
+                                         usage, correlation_id)
+    reviewed = review_waiting_cases(review_store, tools.call, HistoryReviewer(settings, model), usage, correlation_id)
+    return drafted + reconciled + reviewed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team"])
+    parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team",
+                                                  "onboarding"])
     parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
@@ -208,6 +245,11 @@ def main(argv: list[str] | None = None) -> int:
     usage: dict[str, int] = {}
     try:
         tools.wait_until_ready()
+        if args.job == "onboarding":
+            written = onboarding(store, tools, usage, correlation_id)
+            store.finish_run(run_id, status="succeeded", items=written, usage=usage)
+            LOGGER.info("onboarding reviewed %s case(s)", written)
+            return 0
         accounts = [a["account_id"] for a in tools.call("list_accounts", {})["data"]["accounts"]]
         if args.job == "data_quality":
             written = data_quality(store, tools, accounts, runtime.retention_days)

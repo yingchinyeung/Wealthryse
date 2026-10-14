@@ -8,13 +8,17 @@ that owns the platform tables, from a machine inside the private network
     python scripts/install_agent_schema.py --database-url "<admin URL>" \
         --principal id-wr-agent-tools=reader --principal id-wr-agent=writer \
         --principal id-wr-agent-jobs=writer \
-        --grant holdings_explainer=U1234567 --grant data_quality=U1234567
+        --grant holdings_explainer=U1234567 --grant data_quality=U1234567 \
+        --platform-reader ibkr_stg_app
 
 What it does, in one transaction:
   1. applies every file in migrations/agent in name order (each idempotent);
   2. creates each managed identity's Entra login role if missing
      (pgaadauth_create_principal) and grants it agent_reader or agent_writer;
-  3. records which accounts each scheduled job may cover.
+  3. records which accounts each scheduled job may cover;
+  4. lets the platform's role read the onboarding agents' results (reviews,
+     drafted terms, reconciliations), so the platform can record them on
+     their cases (--platform-reader).
 Nothing in the public schema is changed. --dry-run rolls everything back.
 
 On a server where the Entra administrator does not own the platform tables,
@@ -40,7 +44,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMAS = tuple(sorted((ROOT / "migrations" / "agent").glob("*.sql")))
-JOBS = {"holdings_explainer", "month_end_drafter", "data_quality", "month_team"}
+# The onboarding agents' results, which the platform records on their cases.
+PLATFORM_READS = "agent.onboarding_reviews, agent.onboarding_term_drafts, agent.onboarding_reconciliations"
+JOBS = {"holdings_explainer", "month_end_drafter", "data_quality", "month_team", "onboarding"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}\Z")
 
 
@@ -49,6 +55,12 @@ def _pair(value: str) -> tuple[str, str]:
     if not sep or not NAME.match(left) or not NAME.match(right):
         raise argparse.ArgumentTypeError(f"bad value: {value}")
     return left, right
+
+
+def _role_name(value: str) -> str:
+    if not NAME.match(value):
+        raise argparse.ArgumentTypeError(f"bad role name: {value}")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,6 +72,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--grant", action="append", default=[], type=_pair,
                         help="job=account_id")
     parser.add_argument("--granted-by", default="install_agent_schema")
+    parser.add_argument("--platform-reader", type=_role_name,
+                        help="the platform's database role, which may read the onboarding agents' results "
+                             "(agent.onboarding_reviews, onboarding_term_drafts, onboarding_reconciliations)")
     parser.add_argument("--dry-run", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--logins-only", action="store_true",
@@ -74,8 +89,8 @@ def main(argv: list[str] | None = None) -> int:
     for name, role in args.principal:
         if role not in ("reader", "writer"):
             parser.error(f"{name}: role must be reader or writer")
-    if args.logins_only and args.grant:
-        parser.error("--logins-only does not take --grant")
+    if args.logins_only and (args.grant or args.platform_reader):
+        parser.error("--logins-only does not take --grant or --platform-reader")
     for job, _ in args.grant:
         if job not in JOBS:
             parser.error(f"unknown job {job}")
@@ -107,6 +122,13 @@ def main(argv: list[str] | None = None) -> int:
                 "INSERT INTO agent.service_grants(tenant_id, job_name, subject_id, granted_by) VALUES (%s, %s, %s, %s) "
                 "ON CONFLICT DO NOTHING", (args.tenant_id, job, account, args.granted_by))
             print(f"{job}: {account}")
+        if args.platform_reader:
+            if not connection.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (args.platform_reader,)).fetchone():
+                raise SystemExit(f"{args.platform_reader} is not a database role; nothing was changed")
+            reader = sql.Identifier(args.platform_reader)
+            connection.execute(sql.SQL("GRANT USAGE ON SCHEMA agent TO {}").format(reader))
+            connection.execute(sql.SQL("GRANT SELECT ON {} TO {}").format(sql.SQL(PLATFORM_READS), reader))
+            print(f"{args.platform_reader}: reads {PLATFORM_READS}")
         if args.dry_run:
             connection.rollback()
             print("Dry run: rolled back.")

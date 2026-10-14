@@ -133,13 +133,22 @@ internal-reports, writes agent.month_* tables and agent.inbox only
 
 ## Month-end team
 
-Six agents check each month's reports and write the deck's commentary. Until
-the go-live switch is on they run in shadow: their commentary is shown, never
-used. Once live, the month-end package job (`ibkrv2stg-month-end-factsheet`,
-which builds both the factsheet and the deck) puts the team's agreed
-commentary into the deck, and Release asks for confirmation while the team has
-an open objection. Commentary goes in the deck only: the factsheet never
-carries it. The team itself never changes a file or releases anything.
+Six agents check each month's factsheet. Until the go-live switch is on they
+run in shadow. Once live, Release asks for confirmation while the team has an
+open objection. The team itself never changes a file or releases anything.
+
+**Per-account decks are no longer built** (Ying, 14 October 2026). The
+month-end package job (`ibkrv2stg-month-end-factsheet`) builds the factsheet
+only and makes no commentary call; a month is complete, releasable and healthy
+with its factsheet alone. Decks built before stay downloadable, and a new
+factsheet released for a month withdraws that month's older deck. Stage 3 of
+new onboarding renders factsheets only. With `decks` off in the team's
+settings (the default), the team checks the factsheet, ignores any deck and
+writes no commentary, since the factsheet never carries it; the writer,
+reviewer and deck checks below stay in the code for the all-accounts summary
+deck that comes next. The older manual onboarding render jobs
+(`run_self_service_onboarding_reports.py`,
+`render_onboarding_historical_reports.py`) still build decks and are not run.
 
 | Agent | What it does | Model |
 |---|---|---|
@@ -210,6 +219,8 @@ left for Ying. The page lists what was released and what was not.
 - `wr-reports-apac` goes to about 50,000 tokens a minute (an Azure step, below).
 - Batch release of clean reports is ready for November.
 - Commentary goes in the deck only. The factsheet never carries commentary.
+- Per-account decks are no longer built; an all-accounts summary deck follows
+  the onboarding work.
 
 **Which commentary goes into a live deck** (the rule for the package job
 change). The team's, when the writer and reviewer agreed or Ying kept the
@@ -247,6 +258,110 @@ only, as it does today; the factsheet renderer never receives it.
 - The month-end package job does not read the team's commentary yet (see
   "Go live" above).
 
+## Onboarding agents
+
+The onboarding agents work through the four stages of a new-onboarding case
+(`ibkr_etl/onboarding_cases.py`). They record the case's own checks with
+evidence, and Ying keeps the case's three approvals and the first release.
+The intake agent, the reconciliation agent and the history reviewer are built.
+
+**Intake agent** (`wealthryse_agent/onboarding_intake.py`). Before approval 1
+it drafts a case's account terms from the client's own documents: the mandate,
+the fee terms and any side letter, uploaded to the private `onboarding-intake`
+container under `cases/{case_id}/documents/` (PDF, Word or text). For each term
+it gives the value with the document, page and exact quote it came from:
+
+- the terms approval 1 binds: the account's name, reporting currency and start
+  date;
+- the benchmark, management fee, performance fee, hurdle or high-water mark,
+  how often fees are charged, the investment objective and restrictions.
+
+The model only proposes. Code checks every quote against the document's own
+text and drops any it cannot find, so no term in the draft is invented. Two
+documents giving different values for a term, or a reporting currency other
+than the case's, fail the draft and name both clauses. A different start date,
+a binding term no document states, or a document that could not be read gives
+a warning. The draft is written to `agent.onboarding_term_drafts`, bound to the
+documents it read; a new or replaced document gets a new draft. It never
+changes the case: Ying approves the terms on the case page as before. The
+upload on the case page and showing the draft beside approval 1 are PR 57
+files, so they go through the onboarding thread.
+
+**Reconciliation agent** (`wealthryse_agent/onboarding_reconcile.py`). In
+stage 2 of an IBKR broker account it records the four checks nothing recorded
+before. The scheduled Flex worker already loads every account in its
+statement, so the agent reads the case account's data through scoped views
+that show the accounts of open stage 2 cases and nothing else:
+
+- **Holdings and cash loaded:** a recent day has holdings or cash; older than
+  five days is a warning.
+- **Transactions loaded:** the daily NAV reaches back to the case's start date
+  with no gap of ten days or more, and trades or cash transactions are loaded.
+- **Securities mapped:** every security held has its instrument details and
+  resolves in the security master. A new security is proposed with its
+  identifiers (a warning, acknowledged at approval 1); identifiers that point
+  at two securities fail, for Ying to decide.
+- **NAV reconciled:** on the latest day and each recent month-end, positions
+  plus cash plus accruals, in the base currency at IBKR's FX rates, against
+  IBKR's own NAV, within 0.01% or one unit. Each break says which side it is
+  on and its likely cause: a corporate action, a missing price, a missing FX
+  rate, a settlement, or that nothing loaded explains it. Above 0.5% it fails.
+
+Arithmetic runs in code. The model only words a break's explanation from the
+facts code found, and any number in its wording must be one of those facts or
+the platform's own wording is used. Results go to
+`agent.onboarding_reconciliations`; `ibkr_etl.onboarding_agent_reconcile.record_agent_reconciliations`
+records them on the case as checks marked `recorded_by: agent`, with the
+proposed security master entries in the evidence.
+
+**History reviewer** (`wealthryse_agent/onboarding_review.py`). It reviews a
+composite in the Alpha World MS or T design that is in stage 3 with its
+historical reports rendered (`ibkr_etl/composite_reports.py`). It reads every
+stored file before approval 2 and checks that:
+
+- every month from the first to the last has a factsheet, with no gap (decks are
+  no longer built, and one listed from before is not read);
+- each stored file matches the hash recorded when it was rendered;
+- each factsheet has the design's two pages, prints the composite's own name
+  and each page's report date, carries no commentary, and keeps no text from
+  the reference design (unless the composite's own name or description uses it);
+- visual QA, looking at every factsheet page against the Alpha World layout's
+  checklist, finds no fault. It runs on `wr-reports-apac`, APAC only.
+
+A missing file, a hash mismatch, wrong identity or date text, commentary on a
+factsheet, or a high-severity layout fault fails the review. A medium layout
+point, or a month that visual QA could not look at, gives a warning, which Ying
+acknowledges at approval 2. A clean review passes.
+
+**How the review is recorded.** The agent cannot write a case or a check:
+
+1. The `onboarding` job (`python -m wealthryse_agent.jobs onboarding`, hourly)
+   reads the waiting cases through the tool server's
+   `list_onboarding_report_cases`. Only that job is offered this tool.
+2. It writes one row per case and set of reports to `agent.onboarding_reviews`.
+   The row is bound to the digest of the case's `reports_rendered` evidence.
+3. The month-end report job, after the composite reports, calls
+   `ibkr_etl.onboarding_agent_review.record_agent_reviews`. This records the
+   review as the case's `agent_review_complete` check through
+   `record_platform_check`, like every other stage 3 check.
+4. Until the current reports have a review, the check is pending, so approval
+   2 cannot be given. A re-render puts it back to pending.
+
+**Turning it on** (each step needs Ying's typed approval naming the resources):
+
+1. **Database.** Rerun `scripts/install_agent_schema.py` with
+   `--platform-reader <the platform's role>`. It applies
+   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` and lets
+   that role read the agents' results (and nothing else in the agent schema).
+2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
+3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOnboarding=true`
+   (needs `deployMonthTeam=true` for the report reader). This creates
+   `ibkrv2stg-agent-onboarding` and gives the jobs identity read access to the
+   `onboarding-intake` container only.
+4. **Recording.** A platform job calls `record_agent_reconciliations`, and
+   the month-end report job calls `record_agent_reviews` after
+   `render_onboarding_composite_reports.py`.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool
@@ -257,6 +372,9 @@ only, as it does today; the factsheet renderer never receives it.
 - Two Container Apps that scale to zero, and three short jobs.
 - The month-end team, when deployed: an hourly job on six days a month, and
   its own monthly token budget on `wr-reports-apac`.
+- The onboarding agents, when deployed: an hourly job that calls the model
+  only for new documents, a NAV break or new reports, with its own monthly budget
+  (`onboardingTokenBudget`).
 - No new database server.
 
 ## Not yet done

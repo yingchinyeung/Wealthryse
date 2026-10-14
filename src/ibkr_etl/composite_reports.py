@@ -1,11 +1,11 @@
 """Stage 3 reports for a composite in the Alpha World MS or T design.
 
 Once approval 1 has registered the composite and the daily refresh has kept its
-history (the case's history_built check), this run renders a factsheet and a
-deck for every completed month since inception in the composite's design,
-stores each privately where the month-end packages go, and records the case's
+history (the case's history_built check), this run renders a factsheet for
+every completed month since inception in the composite's design, stores each
+privately where the month-end packages go, and records the case's
 reports_rendered check with the list of files. Approval 2 is bound to that list.
-The deck is MS's HKD deck under the composite's name (composite_presentation).
+Per-account decks are no longer built (Ying, 14 October 2026).
 
 A month is frozen only once its month-end calculation has run, by the same rule
 the month-end package applies to derived portfolios, and the frozen snapshot is
@@ -26,7 +26,6 @@ from tempfile import TemporaryDirectory
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
-from .composite_presentation import CONTRACT_VERSION
 from .historical_reporting import queue_report_generation_run
 from .monthly_artifacts import render_factsheet
 from .monthly_reports import REPORT_TYPES
@@ -39,7 +38,7 @@ from .util import utc_now_iso
 HONG_KONG = ZoneInfo("Asia/Hong_Kong")
 CHECK_ID = "reports_rendered"
 # Each month's reports, by the label in their file names; extension and media type as for review files.
-KINDS = {"factsheet": "Factsheet", "presentation": "Presentation"}
+KINDS = {"factsheet": "Factsheet"}
 # The month-end package's limit on how far before the month end its last NAV may be.
 STALE_AFTER_DAYS = 7
 
@@ -63,18 +62,6 @@ class DesignAssets:
         if design_sha != template_sha:
             return f"sha256:{design_sha}+supporting-sha256:{template_sha}+layout:{LAYOUT_VERSION}"
         return f"sha256:{template_sha}+layout:{LAYOUT_VERSION}"
-
-
-@dataclass(frozen=True)
-class DeckRenderer:
-    """The approved deck template's version and a renderer that checks its own output.
-
-    render(snapshot_text, output_path) renders the deck from the frozen snapshot's
-    exact text and returns validate_subject_presentation's result.
-    """
-
-    template_version: str
-    render: Callable[[str, Path], Mapping[str, Any]]
 
 
 def _sha256(content: bytes) -> str:
@@ -234,7 +221,7 @@ def _store(store: Callable[[str, str, bytes, str], None], fetch: Callable[[str, 
 
 def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, container: str,
                         today: date, fetch: Callable[[str, str], bytes],
-                        store: Callable[[str, str, bytes, str], None], deck: DeckRenderer,
+                        store: Callable[[str, str, bytes, str], None],
                         render: Callable[..., Mapping[str, Any]] = render_factsheet) -> dict:
     """Render the case's completed months and return the reports_rendered evidence."""
 
@@ -248,7 +235,7 @@ def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, 
     if profile.definition_sha256 != str(case["definition_sha256"]):
         raise CompositeReportError("The report profile is not bound to this case's approved definition")
     assets = design_assets(connection, style)
-    versions = {"factsheet": assets.template_version, "presentation": deck.template_version}
+    versions = {"factsheet": assets.template_version}
     reports: list[dict] = []
     waiting_for = None
     with TemporaryDirectory(prefix=f"{subject_id}-stage-3-") as directory:
@@ -276,20 +263,13 @@ def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, 
                 else:
                     if frozen is None:
                         frozen = _frozen_payload(connection, tenant_id, subject_id, str(snapshot_id))
-                    payload, text, snapshot_sha = frozen
+                    payload = frozen[0]
                     output = root / file_name
-                    if kind == "factsheet":
-                        if sources is None:
-                            sources = fetch_sources(assets, root, fetch=fetch)
-                        result = render(payload, output_path=output, **sources)
-                        if (result.get("pdf_accuracy_validation") or {}).get("status") != "pass":
-                            raise CompositeReportError(f"The {period_end} factsheet failed its read-back check")
-                    else:
-                        result = deck.render(text, output)
-                        if (result.get("content_contract_version") != CONTRACT_VERSION
-                                or result.get("snapshot_sha256") != snapshot_sha
-                                or result.get("output_sha256") != _sha256(output.read_bytes())):
-                            raise CompositeReportError(f"The {period_end} deck failed its output check")
+                    if sources is None:
+                        sources = fetch_sources(assets, root, fetch=fetch)
+                    result = render(payload, output_path=output, **sources)
+                    if (result.get("pdf_accuracy_validation") or {}).get("status") != "pass":
+                        raise CompositeReportError(f"The {period_end} factsheet failed its read-back check")
                     content = output.read_bytes()
                     output.unlink()
                     digest = _sha256(content)
@@ -312,7 +292,6 @@ def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, 
                     "download_path": f"/api/onboarding-v2/cases/{case['case_id']}/reports/{run_id}",
                 })
     return {"design": style, "layout_version": LAYOUT_VERSION, "template_version": assets.template_version,
-            "deck_contract_version": CONTRACT_VERSION, "deck_template_version": deck.template_version,
             "reports": reports, "waiting_for": waiting_for}
 
 
@@ -326,7 +305,7 @@ def _message(evidence: Mapping[str, Any]) -> tuple[str, str]:
     first, last = reports[0]["period_end"], reports[-1]["period_end"]
     months = len({item["period_end"] for item in reports})
     span = f"for {first}" if first == last else f"from {first} to {last}"
-    count = "A factsheet and a deck" if months == 1 else f"Factsheets and decks for {months} months"
+    count = "A factsheet" if months == 1 else f"Factsheets for {months} months"
     later = f" {waiting_for} follows once its month-end calculation has run." if waiting_for else ""
     return "pass", f"{count} {span} in the {design} design, each read back and checked.{later}"
 
@@ -340,7 +319,6 @@ def _verify_reused(evidence: Mapping[str, Any], fetch: Callable[[str, str], byte
 
 def run_composite_report_cases(connection, tenant_id: str, *, container: str, today: date,
                                fetch: Callable[[str, str], bytes], store: Callable[[str, str, bytes, str], None],
-                               deck: DeckRenderer,
                                render: Callable[..., Mapping[str, Any]] = render_factsheet) -> list[dict]:
     """Render and record every eligible case. One case's failure never stops the others."""
 
@@ -350,7 +328,7 @@ def run_composite_report_cases(connection, tenant_id: str, *, container: str, to
         recorded = (case["recorded"], case["recorded_message"], _evidence(case))
         try:
             evidence = render_case_reports(connection, tenant_id, case, container=container, today=today,
-                                           fetch=fetch, store=store, deck=deck, render=render)
+                                           fetch=fetch, store=store, render=render)
             status, message = _message(evidence)
             if (status, message, evidence) != recorded:
                 _verify_reused(evidence, fetch)

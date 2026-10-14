@@ -136,7 +136,7 @@ function render(run){
  let h='';
  if(run.attempts>=3)h+=`<div class="mt-warn">Stopped at “${esc(STAGES[run.stage]||run.stage)}” after repeated failures (${esc(run.last_error||'unknown')}). It resumes when retried.</div>`;
  h+=`<dl class="mt-grid"><dt>Stage</dt><dd>${esc(stage(run))}</dd><dt>Data</dt><dd>${esc(VERDICT[run.data_verdict]||'Not checked')}</dd>`+
-  `<dt>Figures</dt><dd>${figs.length?figs.length+' cited figures':'Not built'}</dd><dt>Commentary</dt><dd>${esc(COMMENTARY[run.commentary_status]||(v.deck_has_commentary===false?'None: this deck has no commentary line':'Not drafted'))}${run.commentary_rounds?' · '+run.commentary_rounds+' round(s)':''}</dd>`+
+  `<dt>Figures</dt><dd>${figs.length?figs.length+' cited figures':'Not built'}</dd><dt>Commentary</dt><dd>${esc(COMMENTARY[run.commentary_status]||(v.deck_has_commentary===false?'None: the factsheet carries no commentary':'Not drafted'))}${run.commentary_rounds?' · '+run.commentary_rounds+' round(s)':''}</dd>`+
   `<dt>Printed figures</dt><dd>${esc(v.reviewer_summary||'Not checked yet')}</dd><dt>Pages</dt><dd>${esc(v.visual_qa_summary||'Not checked yet')}</dd></dl>`;
  const obj=(run.objections||[]).slice().sort((a,b)=>(a.status==='open'?0:1)-(b.status==='open'?0:1));
  if(obj.length){h+=`<h4>Objections (${obj.filter(o=>o.status==='open').length} open)</h4>`+obj.map(o=>{const r=o.region,link=o.target==='factsheet'||o.target==='presentation'?fileLink(run,o.target):'';

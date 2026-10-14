@@ -46,6 +46,7 @@ class Context:
     mode: str
     started: float
     live: bool = False
+    decks: bool = False
 
     @property
     def month(self) -> bool:
@@ -55,7 +56,7 @@ class Context:
     @property
     def deck_line(self) -> bool:
         """Whether this account's deck has a commentary line. The factsheet never carries commentary."""
-        return self.account_id not in figures.DECKS_WITHOUT_COMMENTARY
+        return self.decks and self.account_id not in figures.DECKS_WITHOUT_COMMENTARY
 
 
 class Coordinator:
@@ -96,7 +97,8 @@ class Coordinator:
         run = self.store.run(account_id, period_end, mode)
         if run["attempts"] >= MAX_STEP_ATTEMPTS:
             return "stopped"
-        ctx = Context(account_id, period_end, mode, self.clock(), live=mode == "month" and self.settings.live)
+        ctx = Context(account_id, period_end, mode, self.clock(), live=mode == "month" and self.settings.live,
+                      decks=self.settings.decks)
         if run.get("live", False) != ctx.live:
             self.store.update_run(run["month_run_id"], live=ctx.live)
             run["live"] = ctx.live
@@ -197,8 +199,9 @@ class Coordinator:
         self.store.update_run(run["month_run_id"], figures=figure_set)
         run["figures"] = figure_set
         if not ctx.deck_line:
-            self._step(run, "writer", "skipped", "No commentary written: this account's deck has no commentary "
-                                                 "line, and the factsheet never carries commentary.")
+            self._step(run, "writer", "skipped", "No commentary written: " + (
+                "this account's deck has no commentary line" if ctx.decks else "decks are no longer built")
+                + ", and the factsheet never carries commentary.")
             return "package"
         previous = self.store.previous_commentary(ctx.account_id, ctx.period_end) if ctx.month else None
         writer, reviewer = Writer(self.model), Reviewer(self.model)
@@ -286,7 +289,7 @@ class Coordinator:
         sentences = [item["text"] for item in (run.get("commentary") or {}).get("sentences") or []]
         for page in figures.factsheet_commentary(pages or [], sentences):
             integrity.append({"target": "factsheet", "page": page,
-                              "message": "The factsheet prints commentary; commentary belongs in the deck only."})
+                              "message": "The factsheet prints commentary; the factsheet never carries commentary."})
         review = Reviewer(self.model).check_files(
             account_id=ctx.account_id, period_end=ctx.period_end, snapshot=snapshot, factsheet_pages=pages,
             deck_slides=slides, figure_set=run.get("figures") or {}, inception_date=(run.get("figures") or {}).get("inception_date"))
@@ -352,7 +355,8 @@ class Coordinator:
             if error.code == "no_package":
                 return None
             raise
-        files = [f for f in package["files"] if f.get("output_reference")]
+        files = [f for f in package["files"] if f.get("output_reference")
+                 and (ctx.decks or f["report_type"] != "presentation")]
         if not any(f["report_type"] == "factsheet" for f in files):
             return None
         if not ctx.month and any(f["status"] not in RELEASED for f in files):
@@ -383,12 +387,14 @@ class Coordinator:
                       "disputed": "the writer and reviewer disagree (see the separate card)",
                       "writer_upheld": "you kept the writer's text", "reviewer_upheld": "you agreed with the reviewer",
                       }.get(str(run.get("commentary_status")),
-                            "not drafted" if ctx.deck_line else "none, as this account's deck has no commentary line")
+                            "not drafted" if ctx.deck_line else
+                            "none, as this account's deck has no commentary line" if ctx.decks else
+                            "none, as decks are no longer built and the factsheet carries no commentary")
         carried = {True: "; the deck carries it", False: "; the deck does not carry it"}.get(
             verdicts.get("commentary_in_report"), "") if ctx.live else ""
         lines = [f"- Data: {run.get('data_verdict') or 'not checked'}",
                  f"- Commentary: {commentary}{carried}",
-                 f"- Printed figures and deck: {verdicts['reviewer_summary']}",
+                 f"- Printed figures{' and deck' if ctx.decks else ''}: {verdicts['reviewer_summary']}",
                  f"- Pages: {verdicts['visual_qa_summary']}"]
         if open_items:
             lines.append("\nObjections:")

@@ -193,13 +193,13 @@ def evaluate_supervisor_state(
         )
 
     ready_types = sorted(set(state.get("ready_report_types") or []))
-    if ready_types != ["factsheet", "presentation"]:
+    if "factsheet" not in ready_types:
         findings.append(
             Finding(
                 "month_end_report_pair",
                 "month_end_report_pair",
                 "warning",
-                "Latest month-end snapshot does not have one ready report pair",
+                "Latest month-end snapshot does not have a ready factsheet",
                 {"ready_report_types": ready_types},
             )
         )

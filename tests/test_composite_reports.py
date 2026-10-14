@@ -62,10 +62,10 @@ class MonthTests(unittest.TestCase):
         reports = [{"period_end": period, "report_type": kind} for period in ("2025-01-31", "2025-02-28")
                    for kind in cr.KINDS]
         self.assertEqual(cr._message({"design": "alpha-world-t", "reports": reports, "waiting_for": None}),
-                         ("pass", "Factsheets and decks for 2 months from 2025-01-31 to 2025-02-28 in the Alpha World "
+                         ("pass", "Factsheets for 2 months from 2025-01-31 to 2025-02-28 in the Alpha World "
                                   "T design, each read back and checked."))
-        self.assertEqual(cr._message({"design": "alpha-world-ms", "reports": reports[:2], "waiting_for": "2025-02-28"}),
-                         ("pass", "A factsheet and a deck for 2025-01-31 in the Alpha World MS design, each read back "
+        self.assertEqual(cr._message({"design": "alpha-world-ms", "reports": reports[:1], "waiting_for": "2025-02-28"}),
+                         ("pass", "A factsheet for 2025-01-31 in the Alpha World MS design, each read back "
                                   "and checked. 2025-02-28 follows once its month-end calculation has run."))
         self.assertEqual(cr._message({"design": "alpha-world-ms", "reports": [], "waiting_for": None}),
                          ("warn", "No month has ended since inception, so there are no reports to review yet."))

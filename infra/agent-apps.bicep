@@ -57,6 +57,12 @@ param reportContainerName string = 'internal-reports'
 param monthTeamLive bool = false
 @description('Tokens per calendar month for the month-end team, separate from the daily chat budget.')
 param monthTeamTokenBudget int = 20000000
+@description('The onboarding agents\' job (ibkrv2stg-agent-onboarding): drafts a new case\'s account terms from its documents before approval 1, and reviews a new composite\'s historical reports before approval 2. Off until approved; needs the month-end team\'s report reader and the APAC report deployment.')
+param deployOnboarding bool = false
+@description('The private container the website stores onboarding documents in; the onboarding job may read it.')
+param intakeContainerName string = 'onboarding-intake'
+@description('Monthly token cap for the onboarding agents, separate from the month-end team\'s.')
+param onboardingTokenBudget int = 5000000
 
 var tags = {
   application: 'wealthryse-agents'
@@ -291,6 +297,22 @@ resource monthTeamReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
   }
 }
 
+// The intake agent reads the case documents (mandate, fee terms) in the private
+// intake container, read-only, and only when the onboarding job is deployed.
+resource intakeContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: reportBlobs
+  name: intakeContainerName
+}
+resource onboardingIntakeReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployOnboarding && deployMonthTeam) {
+  name: guid(intakeContainer.id, jobsIdentity.id, storageBlobDataReaderRole)
+  scope: intakeContainer
+  properties: {
+    principalId: jobsIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataReaderRole)
+  }
+}
+
 resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
   name: 'ibkrv2stg-agent-month-team'
   location: resourceGroup().location
@@ -331,6 +353,61 @@ resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
             { name: 'AGENT_MONTH_TEAM_LIVE', value: monthTeamLive ? 'true' : 'false' }
             { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${reportStorageAccountName}.blob.${environment().suffixes.storage}' }
             { name: 'INTERNAL_REPORT_CONTAINER', value: reportContainerName }
+            { name: 'AZURE_CLIENT_ID', value: jobsIdentity.properties.clientId }
+            { name: 'AGENT_DB_USER', value: jobsIdentity.name }
+          ])
+          resources: { cpu: json('0.5'), memory: '1Gi' }
+        }
+      ]
+    }
+  }
+}
+
+// The onboarding agents: hourly, they draft the account terms of any case
+// waiting for approval 1 from its documents, and review the historical reports
+// of any composite case waiting in stage 3. Same jobs identity and report reader
+// as the month-end team, plus read access to the intake container; it writes
+// only agent.onboarding_term_drafts and agent.onboarding_reviews.
+resource onboardingJob 'Microsoft.App/jobs@2024-03-01' = if (deployOnboarding && deployMonthTeam) {
+  name: 'ibkrv2stg-agent-onboarding'
+  location: resourceGroup().location
+  tags: tags
+  dependsOn: [pulls, tools, monthTeamReader, onboardingIntakeReader]
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: { '${jobsIdentity.id}': {} }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 3600
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        cronExpression: '20 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [{ server: registry.properties.loginServer, identity: jobsIdentity.id }]
+    }
+    template: {
+      containers: [
+        {
+          name: 'job'
+          image: image
+          command: ['python', '-m', 'wealthryse_agent.jobs']
+          args: ['onboarding']
+          env: concat(commonEnv, [
+            { name: 'AGENT_MODEL_ENDPOINT', value: modelEndpoint }
+            { name: 'AGENT_MODEL_DEPLOYMENT', value: reportModelDeployment }
+            { name: 'AGENT_MODEL_REGION', value: 'southeastasia' }
+            { name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }
+            { name: 'AGENT_TOOL_SERVER_URL', value: 'https://${toolsAppName}.internal.${managedEnvironment.properties.defaultDomain}' }
+            { name: 'AGENT_TOOL_SERVER_AUDIENCE', value: toolsAudience }
+            { name: 'AGENT_ONBOARDING_TOKEN_BUDGET', value: string(onboardingTokenBudget) }
+            { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${reportStorageAccountName}.blob.${environment().suffixes.storage}' }
+            { name: 'INTERNAL_REPORT_CONTAINER', value: reportContainerName }
+            { name: 'ONBOARDING_INTAKE_CONTAINER', value: intakeContainerName }
             { name: 'AZURE_CLIENT_ID', value: jobsIdentity.properties.clientId }
             { name: 'AGENT_DB_USER', value: jobsIdentity.name }
           ])

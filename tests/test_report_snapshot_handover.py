@@ -62,8 +62,12 @@ class CatalogHandoverTests(unittest.TestCase):
         row=catalog(rows=releases('new'))[0]
         self.assertFalse(row['replacement_pending']);self.assertFalse(row['review_ready'])
     def test_revoked_type_is_not_reconstructed(self):
-        row=catalog(rows=releases()[:1])[0]
+        row=catalog(rows=releases()[1:])[0]
         self.assertFalse(row['ready']);self.assertEqual(len(row['released_artifacts']),1)
+    def test_a_released_factsheet_is_ready_without_a_deck(self):
+        # Decks are no longer built: the month is complete with its factsheet alone.
+        row=catalog(rows=releases()[:1])[0]
+        self.assertTrue(row['ready']);self.assertEqual(len(row['released_artifacts']),1)
     def test_other_month_cannot_supply_current_month(self):
         row=catalog(rows=releases(period='2026-08-31'))[0]
         self.assertEqual(row['released_artifacts'],[])

@@ -79,7 +79,11 @@ class InternalReleasePolicyTests(unittest.TestCase):
         with self.assertRaises(InternalReleaseError):
             approve_internal_release(_snapshot(), _runs(), user_acceptance_recorded=False)
         with self.assertRaises(InternalReleaseError):
-            approve_internal_release(_snapshot(), _runs()[:1], user_acceptance_recorded=True)
+            approve_internal_release(_snapshot(), _runs()[1:], user_acceptance_recorded=True)
+        with self.assertRaises(InternalReleaseError):
+            approve_internal_release(_snapshot(), [*_runs(), _runs()[0]], user_acceptance_recorded=True)
+        # Decks are no longer built: the factsheet alone is a complete release.
+        approve_internal_release(_snapshot(), _runs()[:1], user_acceptance_recorded=True)
 
     def test_existing_blob_restores_metadata_after_http_properties(self) -> None:
         script = (

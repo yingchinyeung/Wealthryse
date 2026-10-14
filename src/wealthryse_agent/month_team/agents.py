@@ -419,10 +419,11 @@ class VisualQA:
         self.model = model
 
     def inspect_factsheet(self, images: Sequence[bytes], *, display_date: str, period_label: str,
-                          account_id: str = "") -> Outcome:
+                          account_id: str = "", alpha_world_layout: bool = False) -> Outcome:
+        """``alpha_world_layout`` for a factsheet in the Alpha World design under another name (a composite)."""
         if not images:
             return Outcome("skipped", "No factsheet pages to look at.")
-        if account_id in ALPHA_WORLD_FACTSHEETS:
+        if alpha_world_layout or account_id in ALPHA_WORLD_FACTSHEETS:
             # The owner's template has no Top 5, allocation table or historical performance by design
             # (monthly_artifacts rejects a factsheet that prints them), so the standard list would flag them missing.
             note = {"report_date": display_date, "layout": "Alpha World owner template", "pages": [

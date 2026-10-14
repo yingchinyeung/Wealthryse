@@ -146,7 +146,7 @@ class MonthlyReportTests(unittest.TestCase):
             "/api/accounts/U16088571/reporting/review-artifacts/10/download",
         )
 
-    def test_catalog_supports_one_released_file_and_one_pending_file(self) -> None:
+    def test_a_released_factsheet_completes_the_month_beside_an_old_pending_deck(self) -> None:
         snapshot = {
             "snapshot_id": "snapshot-1", "period_end": "2026-08-31",
             "data_as_of": "2026-08-31", "quality_status": "pass",
@@ -178,9 +178,9 @@ class MonthlyReportTests(unittest.TestCase):
             [snapshot], runs, released,
             account_id="U16088571", container="internal-reports",
         )[0]
-        self.assertFalse(month["ready"])
-        self.assertTrue(month["partially_released"])
-        self.assertEqual(month["status"], "partially_released")
+        self.assertTrue(month["ready"])
+        self.assertFalse(month["partially_released"])
+        self.assertEqual(month["status"], "ready")
         self.assertEqual(len(month["released_artifacts"]), 1)
         self.assertEqual(len(month["review_artifacts"]), 2)
 

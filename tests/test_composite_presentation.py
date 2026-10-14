@@ -6,7 +6,6 @@ the adaptation of the reference renderer and the output gate's composite branch.
 """
 import copy
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
@@ -24,7 +23,6 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 
 import audit_composite_presentation
 from audit_composite_presentation import js_percent, js_text, monthly_table
-import render_onboarding_composite_reports as runner
 import validate_subject_presentation as gate
 from ibkr_etl import composite_presentation as cp
 from ibkr_etl import factsheet_tree
@@ -374,63 +372,6 @@ console.log(JSON.stringify(%s.map(([model, periodEnd]) => {
                           audit_composite_presentation._axis_limit(chart, "max")), (-20.0, 1.0))
         chart.find(f".//{{{audit_composite_presentation.C}}}valAx/{{{audit_composite_presentation.C}}}scaling").clear()
         self.assertIsNone(audit_composite_presentation._axis_limit(chart, "max"))
-
-
-class RunnerTests(unittest.TestCase):
-    """The stage 3 job's deck renderer, with node replaced by a script."""
-
-    def setUp(self):
-        folder = tempfile.TemporaryDirectory()
-        self.addCleanup(folder.cleanup)
-        self.root = Path(folder.name)
-        self.template = self.root / "template.pptx"
-        self.template.write_bytes(b"synthetic template")
-        self.snapshot = json.dumps(tpf.payload("alpha-world-ms"))
-        log = patch.object(runner.sys, "stderr", io.StringIO())  # the renderer's output goes to the job log
-        log.start()
-        self.addCleanup(log.stop)
-
-    def renderer(self, script, sha=None):
-        node = self.root / "node"
-        node.write_text("#!/bin/sh\n" + script)
-        node.chmod(0o755)
-        environment = patch.dict(os.environ, {
-            "NODE_EXECUTABLE": str(node), "PRESENTATION_TEMPLATE_PATH": str(self.template),
-            "PRESENTATION_TEMPLATE_SHA256": sha or hashlib.sha256(b"synthetic template").hexdigest()})
-        environment.start()
-        self.addCleanup(environment.stop)
-        return runner.deck_renderer()
-
-    def test_the_deck_is_rendered_under_the_composites_name_and_checked(self):
-        deck = self.renderer('printf "%s" "$PRESENTATION_STRATEGY_NAME" > "$4"\n')
-        self.assertTrue(deck.template_version.endswith(f"+layout:{cp.CONTRACT_VERSION}"))
-        output = self.root / "deck.pptx"
-        with patch.object(runner, "validate_subject_presentation", return_value={"status": "passed"}) as checked:
-            self.assertEqual(deck.render(self.snapshot, output), {"status": "passed"})
-        self.assertEqual(output.read_text(), STRATEGY)
-        self.assertEqual(checked.call_args.kwargs, {"subject_id": "alpha-world-asia", "period_end": "2025-04-30",
-                                                    "expected_strategy": STRATEGY})
-
-    def test_a_failed_render_records_the_same_reason_without_its_temporary_paths(self):
-        deck = self.renderer('echo "Command failed: python -m ibkr_etl.composite_presentation compose $4" >&2\n'
-                             'echo "ValueError: Slide 18 is missing a sleeve in $3" >&2\n'
-                             'echo "Error: Command failed" >&2\nexit 1\n')
-        reasons = []
-        for attempt in range(2):
-            with self.assertRaises(RuntimeError) as failed:
-                deck.render(self.snapshot, self.root / f"{attempt}" / "deck.pptx")
-            reasons.append(str(failed.exception))
-        self.assertEqual(reasons, ["The deck renderer failed: Slide 18 is missing a sleeve in <snapshot>/snapshot.json"] * 2)
-        # Node's own errors carry a code, as when the artifact runtime is not installed.
-        deck = self.renderer('echo "node:internal/modules/package_json_reader:314" >&2\n'
-                             'echo "Error [ERR_MODULE_NOT_FOUND]: Cannot find package \'@oai/artifact-tool\'" >&2\n'
-                             'exit 1\n')
-        with self.assertRaisesRegex(RuntimeError, "failed: Cannot find package '@oai/artifact-tool'$"):
-            deck.render(self.snapshot, self.root / "deck.pptx")
-
-    def test_a_changed_template_is_refused(self):
-        with self.assertRaisesRegex(RuntimeError, "missing or changed"):
-            self.renderer("exit 0\n", sha="0" * 64)
 
 
 class GateTests(unittest.TestCase):

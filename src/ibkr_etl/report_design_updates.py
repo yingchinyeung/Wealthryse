@@ -39,8 +39,10 @@ def qualified_design(row, *, installed_image_sha256):
     if not re.fullmatch('[0-9a-f]{64}',str(evidence.get('evidence_sha256') or '')):
         raise ValueError('The protected qualification receipt is missing')
     versions=decoded(row['template_versions_json'])
-    if set(versions)!={'factsheet','presentation'} or any(not isinstance(v,str) or not v.strip() for v in versions.values()):
-        raise ValueError('Both qualified template versions are required')
+    # Designs qualified while decks were built also name a deck template; the factsheet's is what is used.
+    if ('factsheet' not in versions or not set(versions)<={'factsheet','presentation'}
+            or any(not isinstance(v,str) or not v.strip() for v in versions.values())):
+        raise ValueError('A qualified factsheet template version is required')
     return versions
 
 

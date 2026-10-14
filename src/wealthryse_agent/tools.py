@@ -816,6 +816,136 @@ def list_month_end_packages(connection, arguments: Mapping[str, Any]) -> dict[st
             "citations": [_citation("report_generation_runs", account_id)]}
 
 
+def list_onboarding_report_cases(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Composite cases in stage 3 whose historical reports are rendered, with the files to review."""
+    rows = connection.execute(
+        "SELECT case_id::text AS case_id, subject_id, display_name, description, report_style, reporting_currency, "
+        "history_start_date, reports_evidence_json, reports_checked_at FROM onboarding_report_cases ORDER BY case_id"
+    ).fetchall()
+    cases = []
+    for row in rows:
+        try:
+            evidence = json.loads(row["reports_evidence_json"] or "{}")
+        except ValueError as error:
+            raise ToolError("evidence_unreadable", "A case's rendered-reports record could not be read.") from error
+        cases.append({"case_id": row["case_id"], "subject_id": row["subject_id"], "display_name": row["display_name"],
+                      "description": row["description"], "report_style": row["report_style"],
+                      "reporting_currency": row["reporting_currency"],
+                      "history_start_date": row["history_start_date"], "reports_rendered": evidence,
+                      "reports_checked_at": row["reports_checked_at"]})
+    return {"as_of": None, "data": {"cases": cases},
+            "citations": [_citation("broker_onboarding_checks", None, check_id="reports_rendered")]}
+
+
+def list_onboarding_intake_cases(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Cases before approval 1, with the terms the owner entered, for the intake agent to draft against."""
+    rows = connection.execute(
+        "SELECT case_id::text AS case_id, source_kind, subject_id, display_name, description, reporting_currency, "
+        "history_start_date, stage FROM onboarding_intake_cases ORDER BY case_id"
+    ).fetchall()
+    cases = [{key: row[key] for key in ("case_id", "source_kind", "subject_id", "display_name", "description",
+                                        "reporting_currency", "history_start_date", "stage")} for row in rows]
+    return {"as_of": None, "data": {"cases": cases}, "citations": [_citation("broker_onboarding_cases", None)]}
+
+
+# Onboarding: broker accounts in stage 2 --------------------------------------------
+# Values stay as the loaded text, so the agent does its arithmetic in Decimal on exactly what was stored.
+
+_CASE_ID = {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}
+_BROKER_CASE_FIELDS = ("case_id", "subject_id", "broker", "broker_account_id", "display_name", "reporting_currency",
+                       "history_start_date", "base_currency")
+
+
+def _broker_case(connection, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+    row = connection.execute(
+        "SELECT case_id::text AS case_id, subject_id, broker, broker_account_id, display_name, reporting_currency, "
+        "history_start_date, base_currency FROM onboarding_broker_cases WHERE case_id::text = ?",
+        (str(arguments["case_id"]),),
+    ).fetchone()
+    if row is None:
+        raise ToolError("no_case", "That case is not a broker account waiting in load and reconcile.", 404)
+    return row
+
+
+def list_onboarding_broker_cases(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """IBKR broker-account cases in stage 2 (load and reconcile)."""
+    rows = connection.execute(
+        "SELECT case_id::text AS case_id, subject_id, broker, broker_account_id, display_name, reporting_currency, "
+        "history_start_date, base_currency FROM onboarding_broker_cases ORDER BY case_id"
+    ).fetchall()
+    return {"as_of": None, "data": {"cases": [{k: row[k] for k in _BROKER_CASE_FIELDS} for row in rows]},
+            "citations": [_citation("broker_onboarding_cases", None)]}
+
+
+def get_onboarding_broker_overview(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """The broker's daily NAV, how much activity is loaded, and every security the account has held."""
+    case = _broker_case(connection, arguments)
+    account = str(case["broker_account_id"])
+    nav = connection.execute(
+        "SELECT snapshot_date, currency, total_text, cash_text, stock_text, options_text, futures_text, bonds_text, "
+        "accruals_text FROM onboarding_nav WHERE account_id = ? AND asset_class = 'TOTAL' ORDER BY snapshot_date",
+        (account,),
+    ).fetchall()
+    activity = connection.execute(
+        "SELECT kind, COUNT(*) AS count, MIN(activity_date) AS first, MAX(activity_date) AS last "
+        "FROM onboarding_activity WHERE account_id = ? GROUP BY kind ORDER BY kind",
+        (account,),
+    ).fetchall()
+    held = connection.execute(
+        "SELECT p.conid, MIN(p.snapshot_date) AS first_held, MAX(p.snapshot_date) AS last_held, MAX(p.currency) AS "
+        "position_currency, i.symbol, i.description, i.asset_category, i.currency, i.listing_exchange, i.isin "
+        "FROM onboarding_positions p LEFT JOIN onboarding_instruments i ON i.conid = p.conid "
+        "WHERE p.account_id = ? GROUP BY p.conid, i.symbol, i.description, i.asset_category, i.currency, "
+        "i.listing_exchange, i.isin ORDER BY p.conid",
+        (account,),
+    ).fetchall()
+    wanted = {str(r["conid"]) for r in held} | {str(r["isin"]) for r in held if r["isin"]} | \
+        {str(r["symbol"]) for r in held if r["symbol"]}
+    identifiers = [dict(row) for row in connection.execute(
+        "SELECT scheme, identifier, security_key FROM security_identifiers WHERE identifier = ANY(?) "
+        "ORDER BY scheme, identifier", (sorted(wanted),)).fetchall()] if wanted else []
+    return {"as_of": nav[-1]["snapshot_date"] if nav else None,
+            "data": {"case": {k: case[k] for k in _BROKER_CASE_FIELDS}, "nav": [dict(r) for r in nav],
+                     "activity": [dict(r) for r in activity], "securities": [dict(r) for r in held],
+                     "security_identifiers": identifiers},
+            "citations": [_citation("nav_snapshots", account), _citation("position_snapshots", account),
+                          _citation("trades", account), _citation("cash_transactions", account),
+                          _citation("security_identifiers", None)]}
+
+
+def get_onboarding_broker_day(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Everything needed to rebuild one day's NAV: positions, cash, FX, the broker's NAV and nearby events."""
+    case = _broker_case(connection, arguments)
+    account, day = str(case["broker_account_id"]), _day(arguments["date"], "date")
+    near = [(date.fromisoformat(day) + timedelta(days=offset)).isoformat() for offset in (-5, 5)]
+
+    def query(sql: str, params: tuple) -> list[dict[str, Any]]:
+        return [dict(r) for r in connection.execute(sql, params).fetchall()]
+
+    return {"as_of": day, "data": {
+        "date": day,
+        "nav": query("SELECT currency, asset_class, total_text, cash_text, stock_text, options_text, futures_text, "
+                     "bonds_text, accruals_text FROM onboarding_nav WHERE account_id = ? AND snapshot_date = ? "
+                     "ORDER BY asset_class", (account, day)),
+        "positions": query("SELECT conid, currency, quantity_text, mark_price_text, market_value_text "
+                           "FROM onboarding_positions WHERE account_id = ? AND snapshot_date = ? ORDER BY conid",
+                           (account, day)),
+        "cash": query("SELECT currency, ending_cash_text, fx_rate_to_base_text FROM onboarding_cash "
+                      "WHERE account_id = ? AND snapshot_date = ? ORDER BY currency", (account, day)),
+        "fx_rates": query("SELECT from_currency, to_currency, rate_text FROM onboarding_fx_rates "
+                          "WHERE account_id = ? AND rate_date = ? ORDER BY from_currency, to_currency", (account, day)),
+        "corporate_actions": query("SELECT effective_date, action_type, description, conid, quantity_text, amount_text, "
+                                   "currency FROM onboarding_corporate_actions WHERE account_id = ? "
+                                   "AND effective_date BETWEEN ? AND ? ORDER BY effective_date, conid",
+                                   (account, near[0], near[1])),
+        "activity": query("SELECT kind, activity_date, settle_date, activity_type, conid, amount_text, currency "
+                          "FROM onboarding_activity WHERE account_id = ? AND (activity_date BETWEEN ? AND ? "
+                          "OR settle_date BETWEEN ? AND ?) ORDER BY activity_date LIMIT 200",
+                          (account, near[0], near[1], near[0], near[1])),
+    }, "citations": [_citation("nav_snapshots", account, date=day), _citation("position_snapshots", account, date=day),
+                     _citation("cash_snapshots", account, date=day)]}
+
+
 # Registry ------------------------------------------------------------------
 
 
@@ -825,6 +955,7 @@ def _schema(properties: Mapping[str, Any], required: list[str]) -> dict[str, Any
 
 _ACCOUNT = {"type": "string", "description": "account_id from list_accounts"}
 MONTH_TEAM = frozenset({"month_team"})
+ONBOARDING = frozenset({"onboarding"})
 _DATE = {"type": "string", "description": "YYYY-MM-DD"}
 _AS_OF = {"type": "string", "description": "YYYY-MM-DD; omit for the latest valuation"}
 
@@ -868,6 +999,21 @@ TOOLS: tuple[ToolSpec, ...] = (
              get_month_end_snapshot, only_jobs=MONTH_TEAM),
     ToolSpec("list_month_end_packages", "Every month with a built month-end package, and each file's status.",
              _schema({"account_id": _ACCOUNT}, ["account_id"]), list_month_end_packages, only_jobs=MONTH_TEAM),
+    ToolSpec("list_onboarding_report_cases", "Composite onboarding cases whose historical reports are rendered and "
+             "waiting for the agent review, with each report's month, file, hash and private storage path.",
+             _schema({}, []), list_onboarding_report_cases, False, only_jobs=ONBOARDING),
+    ToolSpec("list_onboarding_intake_cases", "Onboarding cases waiting for approval 1 (the account terms), with "
+             "the terms entered on the case, for the intake agent to draft from the client's documents.",
+             _schema({}, []), list_onboarding_intake_cases, False, only_jobs=ONBOARDING),
+    ToolSpec("list_onboarding_broker_cases", "IBKR broker-account onboarding cases waiting in load and reconcile.",
+             _schema({}, []), list_onboarding_broker_cases, False, only_jobs=ONBOARDING),
+    ToolSpec("get_onboarding_broker_overview", "A stage 2 broker case's daily NAV from the broker, how many trades "
+             "and cash transactions are loaded, and every security it has held with its identifiers.",
+             _schema({"case_id": _CASE_ID}, ["case_id"]), get_onboarding_broker_overview, False, only_jobs=ONBOARDING),
+    ToolSpec("get_onboarding_broker_day", "One day of a stage 2 broker case: positions, cash, FX rates, the broker's "
+             "NAV, and corporate actions and transactions within five days.",
+             _schema({"case_id": _CASE_ID, "date": _DATE}, ["case_id", "date"]), get_onboarding_broker_day, False,
+             only_jobs=ONBOARDING),
 )
 REGISTRY = {tool.name: tool for tool in TOOLS}
 

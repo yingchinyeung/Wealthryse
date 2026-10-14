@@ -496,9 +496,11 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("render_factsheet", script)
         self.assertIn("layout_authority", script)
         self.assertIn("deterministic-renderers", script)
-        self.assertIn("generate_month_end_commentary", script)
-        self.assertIn("render_monthly_presentation.mjs", script)
-        self.assertIn("validate_subject_presentation", script)
+        # Factsheets only: no deck and no commentary (commentary belonged to the deck).
+        self.assertNotIn("generate_month_end_commentary", script)
+        self.assertNotIn("render_monthly_presentation.mjs", script)
+        self.assertNotIn("PRESENTATION_TEMPLATE_PATH", script)
+        self.assertIn('PACKAGE_REPORT_TYPES = ("factsheet",)', script)
         self.assertIn("month_end_report_package_generated", script)
         self.assertIn("'system', 'gpt-5.6-sol-portfolio-analyst'", script)
         self.assertIn("awaiting_approval", script)
@@ -813,7 +815,8 @@ class SecurityDefinitionTests(unittest.TestCase):
         month_end_script = (
             root / "scripts" / "generate_month_end_package.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("validate_subject_presentation", month_end_script)
+        # Per-account decks are no longer built by the month-end job.
+        self.assertNotIn("validate_subject_presentation", month_end_script)
         self.assertIn("platform_content_expectations", output_gate)
         self.assertIn("expected_security_axis_labels", output_gate)
         self.assertIn("expected_summary_table_rows", output_gate)

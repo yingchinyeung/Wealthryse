@@ -57,20 +57,20 @@ def fetch(file: dict, *, account_url: str, expected_container: str, download: Do
     return ReviewFile(str(file["report_type"]), int(file["generation_run_id"]), content)
 
 
-def pdf_text(content: bytes) -> list[str]:
+def pdf_text(content: bytes, *, max_pages: int = MAX_PAGES, label: str = "factsheet PDF") -> list[str]:
     """Each page's text runs, joined by newlines, in drawing order."""
     from pypdf import PdfReader
 
     try:
         reader = PdfReader(io.BytesIO(content))
         pages = []
-        for page in reader.pages[:MAX_PAGES]:
+        for page in reader.pages[:max_pages]:
             runs: list[str] = []
             page.extract_text(visitor_text=lambda text, *_: runs.append(text.strip()) if text.strip() else None)
             pages.append("\n".join(runs))
         return pages
     except Exception as error:  # pypdf raises many types for damaged files
-        raise DocumentError("unreadable_pdf", "The factsheet PDF could not be read.") from error
+        raise DocumentError("unreadable_pdf", f"The {label} could not be read.") from error
 
 
 def pdf_page_images(content: bytes, *, dpi: int = 110) -> list[bytes]:

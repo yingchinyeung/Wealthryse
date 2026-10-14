@@ -74,6 +74,14 @@ class InstallAgentSchemaTests(unittest.TestCase):
         self.assertNotIn("ALTER ROLE", joined)
         self.assertIn("agent.service_grants", joined)
 
+    def test_a_grant_to_all_covers_every_account_without_naming_one(self):
+        connection = FakeConnection()
+        self.assertEqual(0, run(connection, "--existing-logins", "--grant", "weekly_brief=all"))
+        grants = [s for s in connection.statements if s.startswith("INSERT INTO agent.service_grants")]
+        self.assertEqual(1, len(grants))
+        self.assertIn("'*'", grants[0])
+        self.assertTrue(connection.committed)
+
     def test_existing_logins_stops_when_a_login_is_missing(self):
         connection = FakeConnection()
         with self.assertRaisesRegex(SystemExit, "run --logins-only first"):

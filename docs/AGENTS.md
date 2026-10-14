@@ -486,7 +486,9 @@ withdrawals, and any data gaps. It uses the same tools, model
 (`wr-analyst-astra`) and figure check as chat, and it skips a brief that
 fails the check. Briefs appear only in the website inbox, to the people who
 can see that account. Nothing is emailed. Like the other scheduled jobs, it
-covers only the accounts granted to it (`--grant weekly_brief=<account>`).
+covers only the accounts granted to it (`--grant weekly_brief=<account>`, or
+`--grant weekly_brief=all` for every active account and portfolio, including
+ones onboarded later; `012_all_accounts_grants.sql`).
 
 **Turning it on** (each step needs Ying's typed approval naming the resources):
 
@@ -532,7 +534,7 @@ website view.
 PR 58's gateway VM and collector first, per `docs/LIVE_IBKR_DATA.md`; then
 rerun `scripts/install_agent_schema.py` (applies `010_live_market.sql`), rebuild
 the agent and platform images, deploy `infra/agent-apps.bicep`, and grant
-accounts to the job with `--grant live_market=<account>`.
+accounts to the job with `--grant live_market=<account>` (or `=all`).
 
 ## Cost drivers
 

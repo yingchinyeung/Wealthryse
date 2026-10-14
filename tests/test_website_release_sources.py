@@ -107,8 +107,8 @@ class AlreadyLiveFilesTest(unittest.TestCase):
 
 
 class PrepareTest(unittest.TestCase):
-    def run_prepare(self, changed):
-        app = {"properties": {"template": {"containers": [{"image": "reg/ibkr-platform:web-" + DEPLOYED}]},
+    def run_prepare(self, changed, env=()):
+        app = {"properties": {"template": {"containers": [{"image": "reg/ibkr-platform:web-" + DEPLOYED, "env": list(env)}]},
                               "configuration": {"ingress": {"fqdn": "site.example"}}}}
 
         def git(*args, binary=False):
@@ -141,6 +141,15 @@ class PrepareTest(unittest.TestCase):
     def test_other_image_files_still_stop_the_release(self):
         with self.assertRaises(SystemExit):
             self.run_prepare(["Dockerfile", "src/ibkr_etl/web.py"])
+
+    def test_onboarding_switched_on_stops_the_release(self):
+        with self.assertRaises(SystemExit) as stopped:
+            self.run_prepare(["src/ibkr_etl/web.py"], env=[{"name": "ONBOARDING_V2_ENABLED", "value": "True"}])
+        self.assertIn("064_broker_connections_and_onboarding_cases.sql", str(stopped.exception))
+
+    def test_onboarding_switch_absent_or_off_does_not_stop_the_release(self):
+        for env in ([], [{"name": "ONBOARDING_V2_ENABLED", "value": "false"}], [{"name": "OTHER", "secretRef": "x"}]):
+            self.assertEqual(self.run_prepare(["src/ibkr_etl/web.py"], env=env)["changed_files"], ["src/ibkr_etl/web.py"])
 
 
 if __name__ == "__main__":

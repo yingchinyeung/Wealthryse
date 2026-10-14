@@ -33,6 +33,10 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
                     'Dockerfile.live-collector', 'requirements-live.lock',
                     # Repository metadata, not copied into any image.
                     'LICENSE')
+# Website switches whose code reads tables from these migrations.
+SWITCHES_NEEDING_MIGRATIONS = {
+    'ONBOARDING_V2_ENABLED': '064_broker_connections_and_onboarding_cases.sql and 065_onboarding_report_style.sql',
+}
 STATE = Path('release-state.json')
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -87,6 +91,14 @@ def prepare():
     if len(containers) != 1:
         raise SystemExit('Expected one website container')
     live = containers[0]['image']
+    # A switch that turns on code needing tables the bootstrap job may not have
+    # created yet stops the release; with the switch off that code stays dark.
+    switched_on = [e['name'] for e in containers[0].get('env') or []
+                   if e.get('name') in SWITCHES_NEEDING_MIGRATIONS and str(e.get('value', '')).strip().lower() == 'true']
+    if switched_on:
+        raise SystemExit('Switched on for the website: ' + ', '.join(switched_on) + '. Apply '
+                         + ', '.join(SWITCHES_NEEDING_MIGRATIONS[n] for n in switched_on)
+                         + ' with the bootstrap job before releasing, or turn the switch off.')
     tag = live.split(':')[-1] if '@' not in live else ''
     deployed = tag[len('web-'):] if tag.startswith('web-') and len(tag) == 44 else BASELINE_COMMIT
     if subprocess.run(['git', 'merge-base', '--is-ancestor', deployed, head], cwd=ROOT).returncode:

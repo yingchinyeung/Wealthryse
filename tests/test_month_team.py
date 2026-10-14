@@ -32,7 +32,7 @@ from test_monthly_artifacts import _snapshot  # noqa: E402
 from wealthryse_agent.config import ModelSettings  # noqa: E402
 from wealthryse_agent.month_team import documents, figures as fig  # noqa: E402
 from wealthryse_agent.month_team.agents import (  # noqa: E402
-    BudgetExhausted, DataAgent, Reviewer, TeamModel, VisualQA, Writer)
+    BudgetExhausted, DataAgent, Reviewer, TeamModel, TeamModelError, VisualQA, Writer)
 from wealthryse_agent.month_team.coordinator import Coordinator  # noqa: E402
 from wealthryse_agent.month_team.settings import TeamSettings  # noqa: E402
 from wealthryse_agent.tool_client import ToolCallFailed  # noqa: E402
@@ -192,6 +192,8 @@ class FakeModel:
                 error.status_code, error.body = 400, {"error": {"code": "invalid_value", "param": "input"}}
                 raise error
             body = {"findings": self.visual}
+        if body == "INCOMPLETE":  # a reply cut off at the output cap
+            return SimpleNamespace(status="incomplete", output_text="", usage=SimpleNamespace(input_tokens=100, output_tokens=20))
         return SimpleNamespace(status="completed", output_text=json.dumps(body),
                                usage=SimpleNamespace(input_tokens=100, output_tokens=20))
 
@@ -469,6 +471,33 @@ class WriterReviewerTests(unittest.TestCase):
         self.assertTrue(labels)
         self.assertTrue(all("contributor" in l or "detractor" in l for l in labels))
         self.assertFalse(any(c.isdigit() for l in labels for c in l.split(",", 1)[1]))
+
+    def test_a_sentence_saying_a_measure_is_unavailable_needs_no_figure(self):
+        tools = FakeTools()
+        tools.fail["get_risk_metrics"] = ToolCallFailed("not_enough_history", "x")
+        young = fig.build_figure_set(tools, ACCOUNT, PERIOD)
+        draft = copy.deepcopy(GOOD_DRAFT)
+        draft["risk_observations"][0] = {"text": "Risk measures are unavailable for this period.", "figures": []}
+        result = Writer(TeamModel(APAC, tokens_left=10**6, client=FakeModel(drafts=[draft]))).draft(
+            young, account_id=ACCOUNT)
+        self.assertEqual(result.outcome, "pass")
+        draft["risk_observations"][0] = {"text": "Risk was moderate this month.", "figures": []}
+        failed = Writer(TeamModel(APAC, tokens_left=10**6, client=FakeModel(drafts=[draft, draft]))).draft(
+            young, account_id=ACCOUNT)
+        self.assertIn("risk_observations 0 cites no figure", failed.summary)
+        draft["risk_observations"][0] = {"text": "Risk measures are unavailable for this period.", "figures": []}
+        complete = Writer(TeamModel(APAC, tokens_left=10**6, client=FakeModel(drafts=[draft, draft]))).draft(
+            {**self.figures, "unavailable": []}, account_id=ACCOUNT)
+        self.assertEqual(complete.outcome, "failed")
+
+    def test_a_cut_off_draft_gets_one_more_try(self):
+        model = FakeModel(drafts=["INCOMPLETE", GOOD_DRAFT])
+        result = Writer(TeamModel(APAC, tokens_left=10**6, client=model)).draft(self.figures, account_id=ACCOUNT)
+        self.assertEqual(result.outcome, "pass")
+        self.assertIn("cut off", json.loads(model.requests[1]["input"][0]["content"][0]["text"])["format_problem"])
+        with self.assertRaises(TeamModelError):
+            Writer(TeamModel(APAC, tokens_left=10**6, client=FakeModel(drafts=["INCOMPLETE"]))).draft(
+                self.figures, account_id=ACCOUNT)
 
     def test_the_summary_fits_the_decks_line(self):
         long = copy.deepcopy(GOOD_DRAFT)

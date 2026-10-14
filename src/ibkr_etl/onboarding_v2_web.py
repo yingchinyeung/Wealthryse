@@ -24,7 +24,7 @@ from dataclasses import replace
 from datetime import date
 from typing import Any, Callable, Iterable, Literal, Mapping
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
@@ -43,6 +43,7 @@ from .broker_connections import (
 from .composition_tree import composite_tree, filtered_tree, tree_for_definition, tree_svg
 from .flex_recipe import RECIPE_STEPS
 from .market_data import ALPHA_WORLD_MARKET_INSTRUMENTS
+from . import onboarding_agents
 from .monthly_reports import REPORT_TYPES, MonthlyReportError, validate_period_end, validate_review_artifact
 from .onboarding import FEATURE_KEYS
 from .onboarding_cases import (
@@ -837,6 +838,9 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
         "account_terms_sha256": terms_digest(terms),
         "go_live_phrase": go_live_phrase(account_display),
         "can_cancel": case.stage in PRE_LIVE_STAGES and not case.cancelled,
+        # The onboarding agents' part (None while ONBOARDING_AGENTS_ENABLED is off); see onboarding_agents.py.
+        "agents": onboarding_agents.case_agent_view(connection, tenant_id, case.case_id, checks),
+        "documents_open": onboarding_agents.agents_enabled() and onboarding_agents.documents_open(row, approvals),
     }
 
 
@@ -1380,12 +1384,18 @@ def install(
     today: Callable[[], date] = date.today,
     download_report: Callable[[str, str], bytes] | None = None,
     report_container: str = "internal-reports",
+    upload_document: Callable[[str, str, bytes, str], None] | None = None,
+    list_documents: Callable[[str, str], list[dict]] | None = None,
+    intake_container: str = onboarding_agents.INTAKE_CONTAINER,
 ) -> None:
     """Add the new onboarding routes. Each answers 404 while the switch is off.
 
     derived_definition(connection, kind, fields) runs the Derived Portfolio
     Studio's validation on the builder's fields and returns the definition.
     download_report(container, blob) reads a stage 3 report from private storage.
+    upload_document(container, blob, content, content_type) stores a case document in the private intake
+    container without overwriting, and list_documents(container, prefix) lists what is there; both are used
+    only while ONBOARDING_AGENTS_ENABLED is on.
     """
 
     def switched_on() -> None:
@@ -1497,6 +1507,70 @@ def install(
             "Content-Disposition": f'attachment; filename="{artifact["file_name"]}"',
             "X-Content-SHA256": digest, "X-Report-Scope": "owner-review", "Cache-Control": "private, no-store"})
 
+    def agents_on() -> None:
+        if not onboarding_agents.agents_enabled():
+            raise HTTPException(status_code=404, detail="Not found")
+
+    def case_documents(case_id: str) -> list[dict]:
+        if list_documents is None:
+            raise HTTPException(status_code=503, detail="Private document storage is not configured")
+        prefix = onboarding_agents.document_prefix(case_id)
+        try:
+            listed = list_documents(intake_container, prefix)
+        except Exception as error:
+            raise HTTPException(status_code=503, detail="The case documents could not be listed") from error
+        return [{"name": str(item["name"])[len(prefix):], "byte_count": int(item.get("size") or 0)}
+                for item in sorted(listed, key=lambda item: str(item["name"]))
+                if str(item["name"]).startswith(prefix) and not str(item["name"]).endswith("/")]
+
+    @app.get("/api/onboarding-v2/cases/{case_id}/documents")
+    def documents(case_id: uuid.UUID, user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
+        agents_on()
+
+        def exists(connection) -> dict:
+            _load_case(connection, tenant_id, str(case_id))
+            return {}
+
+        run(read_database, exists)
+        return {"documents": case_documents(str(case_id)), "max_documents": onboarding_agents.MAX_DOCUMENTS}
+
+    @app.post("/api/onboarding-v2/cases/{case_id}/documents")
+    async def add_document(case_id: uuid.UUID, document: UploadFile = File(...),
+                           user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
+        """One client document (mandate, fee terms, side letter) for the intake agent to draft the terms from."""
+
+        agents_on()
+
+        def still_open(connection) -> dict:
+            row, _, approvals, _ = _load_case(connection, tenant_id, str(case_id))
+            if not onboarding_agents.documents_open(row, approvals):
+                raise OnboardingError("Documents can be added only before the account terms are approved", 409)
+            return {}
+
+        run(read_database, still_open)
+        content = await document.read(onboarding_agents.MAX_DOCUMENT_BYTES + 1)
+        try:
+            name, content_type = onboarding_agents.validate_document(document.filename or "", content)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        existing = case_documents(str(case_id))
+        if any(item["name"] == name for item in existing):
+            raise HTTPException(status_code=409, detail=f"{name} is already on this case")
+        if len(existing) >= onboarding_agents.MAX_DOCUMENTS:
+            raise HTTPException(status_code=409, detail=(
+                f"This case already has {onboarding_agents.MAX_DOCUMENTS} documents, the most the agent reads"))
+        if upload_document is None:
+            raise HTTPException(status_code=503, detail="Private document storage is not configured")
+        try:
+            upload_document(intake_container, onboarding_agents.document_blob_name(str(case_id), name), content,
+                            content_type)
+        except Exception as error:
+            if type(error).__name__ == "ResourceExistsError":  # added by someone else a moment ago
+                raise HTTPException(status_code=409, detail=f"{name} is already on this case") from error
+            raise HTTPException(status_code=503, detail="The document was not stored") from error
+        return {"status": "stored", "name": name, "byte_count": len(content),
+                "sha256": hashlib.sha256(content).hexdigest()}
+
     @app.post("/api/onboarding-v2/cases/{case_id}/cancel")
     def cancel_route(case_id: uuid.UUID, body: CancelCaseRequest, user: dict[str, Any] = Depends(v2_owner)) -> dict:
         return run(write_database, lambda c: cancel_case(c, tenant_id, str(case_id), reason=body.reason,
@@ -1572,7 +1646,9 @@ CASE_CONTENT = """<div class="page-view active" data-section="account-onboarding
 <div class="card wide"><div class="label" id="case-kicker">Loading…</div><h2 id="case-title"></h2><div id="case-next" class="muted"></div><div id="case-progress" class="status-row"></div></div>
 <div class="card wide" id="case-portfolio" hidden><div class="label">The portfolio</div><p id="case-description"></p><p class="muted" id="case-report-style" hidden></p><div id="case-tree" style="max-width:760px;margin-top:14px;overflow-x:auto"></div></div>
 <div class="card wide"><div class="label">Checks for this stage</div><div id="case-checks" class="onboarding-checks"></div></div>
-<div class="card wide"><div class="label">Your three approvals</div><div id="case-approvals" class="status-row"></div><div id="case-approval-form"></div><div id="case-result" class="muted" role="status" aria-live="polite"></div></div>
+<div class="card wide" id="case-proposals" hidden><div class="label">Proposed security master entries</div><p class="muted">Securities in this account that the security master does not have yet, as the agent proposes them. Nothing is added until you approve the account terms.</p><div id="case-proposal-list"></div></div>
+<div class="card wide" id="case-documents" hidden><div class="label">Client documents</div><p class="muted">The mandate, fee terms and side letters. The agent drafts the account terms from them, quoting each clause, for you to compare before approval 1.</p><div id="case-document-list"></div><form id="case-document-form" hidden><div class="actions"><input type="file" name="document" accept=".pdf,.docx,.txt,.md" required aria-label="Client document"><button class="button" type="submit">Add document</button></div><div class="muted" role="status"></div></form></div>
+<div class="card wide"><div class="label">Your three approvals</div><div id="case-approvals" class="status-row"></div><div id="case-term-draft" hidden></div><div id="case-approval-form"></div><div id="case-result" class="muted" role="status" aria-live="polite"></div></div>
 <div class="card wide" id="case-cancel-card" hidden><div class="label">Stop this case</div><p class="muted">Cancelling frees the account or portfolio ID to be added again later. Nothing reached viewers.</p><div class="actions"><input id="case-cancel-reason" type="text" maxlength="500" placeholder="Reason" aria-label="Reason for cancelling"><button id="case-cancel" class="button" type="button">Cancel this case</button></div></div>
 </div>"""
 
@@ -1598,7 +1674,7 @@ CONNECTIONS_CONTENT = """<div class="page-view active" data-section="broker-conn
 
 _COMMON_SCRIPT = r"""
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const json=async response=>{const payload=await response.json().catch(()=>({}));if(!response.ok){const detail=Array.isArray(payload.detail)?payload.detail.map(d=>d.msg).join('; '):payload.detail;throw new Error(detail||`http_${response.status}`)}return payload};
+const json=async response=>{const payload=await response.json().catch(()=>({}));if(!response.ok){const detail=Array.isArray(payload.detail)?payload.detail.map(d=>d.msg).join('; '):payload.detail;throw new Error((typeof detail==='string'?detail:detail&&detail.message)||`http_${response.status}`)}return payload};
 const post=(url,body)=>fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(json);
 const pill=(text,cls)=>`<span class="onboarding-pill ${cls||''}">${esc(text)}</span>`;
 const row=(name,note,right)=>`<div class="onboarding-row"><div><strong>${esc(name)}</strong><div class="muted">${esc(note)}</div></div><div class="actions">${right||''}</div></div>`;
@@ -1622,6 +1698,19 @@ load();
 CASE_SCRIPT = "<script>\n(()=>{" + _COMMON_SCRIPT + r"""
 const root=document.querySelector('[data-case-id]'),caseId=root.dataset.caseId,result=document.querySelector('#case-result');
 const tileState={done:['Done','active'],current:['In progress',''],not_started:['Not started','blocked'],cancelled:['Cancelled','blocked']};
+const words=key=>String(key).replace(/_/g,' ').replace(/^./,ch=>ch.toUpperCase());
+const shown=value=>value!==null&&typeof value==='object'?`<pre style="white-space:pre-wrap;margin:4px 0 0">${esc(JSON.stringify(value,null,2))}</pre>`:esc(value);
+const evidenceDrawer=ev=>`<details class="agent-evidence" style="grid-column:1/-1;margin-top:8px"><summary>Evidence</summary><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin-top:8px">${Object.entries(ev).filter(([key])=>key!=='recorded_by').map(([key,value])=>`<div class="status-item" style="min-width:0;overflow-wrap:anywhere"><div class="label">${esc(words(key))}</div>${shown(value)}</div>`).join('')}</div></details>`;
+const outcomePill={pass:['Matches the documents','active'],warn:['Check the notes',''],fail:['Needs your attention','blocked']};
+const renderProposals=list=>{const card=document.querySelector('#case-proposals');card.hidden=!list.length;document.querySelector('#case-proposal-list').innerHTML=list.map(p=>row(`${(p.evidence||{}).symbol||p.security_key} · ${p.display_name||''}`,[p.asset_class,p.currency,p.primary_exchange].filter(Boolean).join(' · ')+((p.identifiers||[]).length?' · '+p.identifiers.map(i=>`${i.scheme} ${i.identifier}`).join(', '):''),pill('Proposed',''))).join('')};
+const renderDraft=(c,d)=>{const box=document.querySelector('#case-term-draft');const before=!c.approvals.find(a=>a.kind==='account_terms'&&a.approved);box.hidden=!(d&&before);if(!d||!before){box.innerHTML='';return}
+  const [text,cls]=outcomePill[d.outcome]||[d.outcome,''];
+  const terms=Object.values(d.terms||{}).filter(t=>t.status!=='not_found'||t.value);
+  const source=s=>`${esc(s.document)} p.${esc(s.page)}: “${esc(s.quote)}”`;
+  box.innerHTML=`<div class="onboarding-row" style="display:block;margin-top:14px"><strong>Terms drafted by the agent from the client's documents</strong> ${pill(text,cls)}<p class="muted">${esc(d.summary)} Compare them with the terms below before you approve; the agent does not change the case.</p>${terms.map(t=>`<div class="status-item" style="min-width:0;margin-top:8px"><div class="label">${esc(t.label)}${t.status==='conflict'?' · documents disagree':''}</div><strong>${esc(t.status==='conflict'?(t.values||[]).join(' / '):t.value)}</strong><details><summary>Sources</summary>${(t.sources||[]).map(s=>`<div class="muted">${source(s)}</div>`).join('')}</details></div>`).join('')}${(d.findings||[]).length?`<div class="warning" style="margin-top:10px">${d.findings.map(f=>`<div>${esc(f.message)}</div>`).join('')}</div>`:''}<div class="muted">Read from ${esc((d.documents||[]).map(x=>x.document).join(', ')||'no documents')} · drafted ${esc(d.drafted_at)}</div></div>`};
+const renderDocuments=c=>{const card=document.querySelector('#case-documents');card.hidden=!c.agents;if(!c.agents)return;const form=document.querySelector('#case-document-form');form.hidden=!c.documents_open;
+  fetch(`/api/onboarding-v2/cases/${caseId}/documents`).then(json).then(data=>{document.querySelector('#case-document-list').innerHTML=data.documents.length?data.documents.map(d=>row(d.name,`${Math.max(1,Math.round(d.byte_count/1024))} KB`,'')).join(''):'<p class="muted">No documents yet.</p>'}).catch(error=>{document.querySelector('#case-document-list').innerHTML=`<div class="warning">The documents could not be listed: ${esc(error.message)}</div>`})};
+document.querySelector('#case-document-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget,note=form.querySelector('[role=status]'),button=form.querySelector('button');button.disabled=true;note.textContent='Uploading…';try{const done=await fetch(`/api/onboarding-v2/cases/${caseId}/documents`,{method:'POST',body:new FormData(form)}).then(json);note.textContent=`Added ${done.name}. The agent drafts the terms on its next run.`;form.reset();load()}catch(error){note.textContent=`Not added: ${error.message}`}finally{button.disabled=false}});
 const render=c=>{
   document.querySelector('#case-kicker').textContent=`Stage ${c.stage_number} of 4 · ${c.broker_label} · ${c.reporting_currency} reporting`;
   document.querySelector('#case-title').textContent=`${c.display_name} (${c.account})`;
@@ -1629,7 +1718,11 @@ const render=c=>{
   if(c.composition_svg){document.querySelector('#case-description').textContent=c.description||'';const style=document.querySelector('#case-report-style');style.hidden=!c.report_style_label;style.textContent=c.report_style_label?`Reports use the ${c.report_style_label}, under this portfolio's name, with this description and tree.`:'';const box=document.querySelector('#case-tree');box.innerHTML=c.composition_svg;box.firstElementChild.style.minWidth='560px'}
   document.querySelector('#case-next').textContent=c.next_owner_action||(c.status==='cancelled'?'This case was cancelled.':'Nothing needs you right now.');
   document.querySelector('#case-progress').innerHTML=c.progress.map(t=>{const [text,cls]=tileState[t.state];return `<div class="status-item"><div class="label">${esc(t.number)} · ${esc(t.label)}</div>${pill(text,cls)}</div>`}).join('');
-  document.querySelector('#case-checks').innerHTML=c.checks.map(k=>`<div class="onboarding-check ${esc(k.status==='pending'?'':k.status)}"><strong>${esc(k.label)}</strong><span>${esc(k.message)}${k.status==='warn'&&k.acknowledged?' Acknowledged.':''}</span></div>`).join('')||'<div class="muted">No checks in this stage.</div>';
+  const agent=c.agents||{checks:{}};
+  document.querySelector('#case-checks').innerHTML=c.checks.map(k=>{const ev=agent.checks[k.check_id];return `<div class="onboarding-check ${esc(k.status==='pending'?'':k.status)}"><strong>${esc(k.label)}${ev?' '+pill('Checked by agent',''):''}</strong><span>${esc(k.message)}${k.status==='warn'&&k.acknowledged?' Acknowledged.':''}</span>${ev?evidenceDrawer(ev):''}</div>`}).join('')||'<div class="muted">No checks in this stage.</div>';
+  renderProposals(agent.security_proposals||[]);
+  renderDraft(c,agent.term_draft);
+  renderDocuments(c);
   document.querySelector('#case-approvals').innerHTML=c.approvals.map((a,i)=>`<div class="status-item"><div class="label">Approval ${i+1}</div><strong>${esc(a.label)}</strong>${a.approved?pill('Approved','active'):c.awaiting_approval===a.kind?pill('Waiting on you',''):pill('Not yet','blocked')}</div>`).join('');
   const ready=c.may_approve&&c.awaiting_approval==='account_terms';
   const form=document.querySelector('#case-approval-form');

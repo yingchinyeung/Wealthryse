@@ -98,6 +98,15 @@ def download_file_if_exists(
     return True
 
 
+def list_blobs(account_url: str, container: str, prefix: str) -> list[dict]:
+    """Names and sizes of the blobs under prefix."""
+    service = _service(account_url)
+    if service is None:
+        return []
+    client = service.get_container_client(container)
+    return [{"name": blob.name, "size": int(blob.size or 0)} for blob in client.list_blobs(name_starts_with=prefix)]
+
+
 def blob_exists(account_url: str, container: str, blob_name: str) -> bool:
     service = _service(account_url)
     if service is None:

@@ -239,6 +239,15 @@ def assemble_month_end_payload(
             name: result.get("citations", []) for name, result in sanitized.items()
         },
     }
+    design = sanitized.get('report_profile') if subject_id not in ('alpha-world-ms','alpha-world-t') else None
+    if design is not None:
+        from .profiled_composite import analyze as analyze_profiled, ANALYTICS_VERSION
+        evidence_data = design.get('data') or {}
+        payload['report_profile'] = evidence_data.get('report_profile')
+        payload['methodology_identity'] = evidence_data.get('methodology_identity')
+        inception = (payload['report_profile'] or {}).get('inception')
+        _check_hkd_design(payload, label="The composite", analyze=analyze_profiled, version=ANALYTICS_VERSION,
+                          reporting_currency=reporting_currency, inception=inception)
     if subject_id in ('alpha-world-ms','alpha-world-t'):
         if subject_id=='alpha-world-t':
             from .alpha_world_t_analytics import analyze,VERSION,methodology_identity
@@ -247,31 +256,37 @@ def assemble_month_end_payload(
             from .alpha_world_ms_analytics import analyze
             from .alpha_world_ms_hkd import VERSION
         label='T' if subject_id=='alpha-world-t' else 'MS'
-        if reporting_currency.upper() != 'HKD' or payload['period_start'] != '2025-01-20':
-            raise ReportingSnapshotError(label+' requires the approved HKD inception contract')
-        account = (payload['portfolio_summary'] or {}).get('account') or {}
-        nav = (payload['portfolio_summary'] or {}).get('latest_nav') or {}
-        if account.get('base_currency') != 'HKD' or nav.get('currency') != 'HKD':
-            raise ReportingSnapshotError(label+' summary currency differs from the reporting contract')
-        series = (payload['performance'] or {}).get('series') or []
-        if not series or not math.isclose(float(nav['total_text']),float(series[-1]['nav']),rel_tol=1e-12):
-            raise ReportingSnapshotError(label+' summary NAV differs from its full history')
-        if any(row.get('currency') != 'HKD' for row in (payload['holdings'] or {}).get('holdings', [])):
-            raise ReportingSnapshotError(label+' holdings contain another reporting currency')
-        metrics,_,evidence = analyze(payload)
-        stored = (payload['risk'] or {}).get('metrics') or {}
-        for field,value in metrics.items():
-            recorded = stored.get(field)
-            if (recorded is None) != (value is None) or (value is not None and
-                    (not math.isfinite(float(recorded)) or not math.isclose(float(recorded),value,rel_tol=1e-10,abs_tol=1e-12))):
-                raise ReportingSnapshotError(label+' reported metric differs from full HKD history: '+field)
-        payload['formula_version'] = VERSION
-        payload['risk']['analytics_evidence'] = evidence
-        points = {}
-        for row in series:
-            points[row['date'][:7]] = {'date':row['date'],'portfolio':float(row['nav'])}
-        payload['month_end_performance'] = [points[key] for key in sorted(points)]
+        _check_hkd_design(payload, label=label, analyze=analyze, version=VERSION,
+                          reporting_currency=reporting_currency, inception='2025-01-20')
     return payload, quality_status, publication_allowed, tuple(blockers)
+
+
+def _check_hkd_design(payload, *, label, analyze, version, reporting_currency, inception):
+    """MS, T and design composites: recompute every metric from the full HKD history."""
+    if reporting_currency.upper() != 'HKD' or payload['period_start'] != inception:
+        raise ReportingSnapshotError(label+' requires the approved HKD inception contract')
+    account = (payload['portfolio_summary'] or {}).get('account') or {}
+    nav = (payload['portfolio_summary'] or {}).get('latest_nav') or {}
+    if account.get('base_currency') != 'HKD' or nav.get('currency') != 'HKD':
+        raise ReportingSnapshotError(label+' summary currency differs from the reporting contract')
+    series = (payload['performance'] or {}).get('series') or []
+    if not series or not math.isclose(float(nav['total_text']),float(series[-1]['nav']),rel_tol=1e-12):
+        raise ReportingSnapshotError(label+' summary NAV differs from its full history')
+    if any(row.get('currency') != 'HKD' for row in (payload['holdings'] or {}).get('holdings', [])):
+        raise ReportingSnapshotError(label+' holdings contain another reporting currency')
+    metrics,_,evidence = analyze(payload)
+    stored = (payload['risk'] or {}).get('metrics') or {}
+    for field,value in metrics.items():
+        recorded = stored.get(field)
+        if (recorded is None) != (value is None) or (value is not None and
+                (not math.isfinite(float(recorded)) or not math.isclose(float(recorded),value,rel_tol=1e-10,abs_tol=1e-12))):
+            raise ReportingSnapshotError(label+' reported metric differs from full HKD history: '+field)
+    payload['formula_version'] = version
+    payload['risk']['analytics_evidence'] = evidence
+    points = {}
+    for row in series:
+        points[row['date'][:7]] = {'date':row['date'],'portfolio':float(row['nav'])}
+    payload['month_end_performance'] = [points[key] for key in sorted(points)]
 
 
 def _collect_tool_results(
@@ -323,6 +338,16 @@ def _collect_tool_results(
         results['monthly_reporting']=build_monthly_reporting_analytics(connection,
             subject_id=subject_id,period_end=period_end,reporting_currency=reporting_currency)
         return results
+    if reporting_currency == 'HKD':
+        from .profiled_composite import is_profiled
+        if is_profiled(connection, subject_id, tenant_id=tenant_id):
+            # A composite in the Alpha World MS or T design: T's reporting
+            # inputs from its own approved definition, never the USD tools.
+            from .profiled_reporting import load as load_profiled, tool_results
+            try:
+                return tool_results(load_profiled(connection, subject_id, period_end, tenant_id=tenant_id))
+            except ValueError as error:
+                raise ReportingSnapshotError(str(error)) from error
     mappings = connection.execute(
         """
         SELECT benchmark_id, mapping_type

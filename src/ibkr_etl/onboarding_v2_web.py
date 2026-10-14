@@ -66,6 +66,7 @@ from .onboarding_cases import (
     stage_check_states,
     terms_digest,
 )
+from .report_profiles import STYLES as REPORT_STYLES, ReportProfileError, build_profile, check_style
 from .subject_activation import activate_subject
 from .subject_onboarding import configuration_sha256, dependencies_for_definition
 
@@ -200,8 +201,11 @@ def _account_terms(row: Mapping[str, Any]) -> dict[str, object]:
     kind = str(row.get("source_kind") or "broker_account")
     if kind in DERIVED_SOURCE_KINDS:
         # The owner approves the exact typed definition, not a description of it.
-        return {"source_kind": kind, **common, "description": str(row["description"]),
-                "definition_sha256": str(row["definition_sha256"]), "definition": _definition(row)}
+        terms = {"source_kind": kind, **common, "description": str(row["description"]),
+                 "definition_sha256": str(row["definition_sha256"]), "definition": _definition(row)}
+        if kind == "composite_portfolio":
+            terms["report_style"] = row.get("report_style")
+        return terms
     return {"broker": str(row["broker"]), "broker_account_id": str(row["broker_account_id"]), **common}
 
 
@@ -395,6 +399,13 @@ def _clean_description(description: str | None) -> str:
     return text
 
 
+def _report_style(definition: Mapping[str, Any], style: str | None) -> str | None:
+    try:
+        return check_style(definition, style)
+    except ReportProfileError as error:
+        raise OnboardingError(str(error), 400) from error
+
+
 def _as_stored(value: Any) -> Any:
     """A definition exactly as PostgreSQL's jsonb returns it, so its fingerprint survives storage.
 
@@ -413,7 +424,7 @@ def _as_stored(value: Any) -> Any:
 
 
 def start_derived_case(connection, tenant_id: str, *, definition: Mapping[str, Any], description: str,
-                       actor: str | None, today: date) -> dict:
+                       actor: str | None, today: date, report_style: str | None = None) -> dict:
     """Open a case for a filtered or composite portfolio the builder already validated."""
 
     definition = _as_stored(definition)
@@ -422,6 +433,7 @@ def start_derived_case(connection, tenant_id: str, *, definition: Mapping[str, A
         raise OnboardingError("Only filtered portfolios and fixed-unit composites are supported", 400)
     text = _clean_description(description)
     subject_id = _portfolio_id(definition)
+    style = _report_style(definition, report_style)
     starts = date.fromisoformat(str(definition.get("history_start_date") or definition["normalization_date"]))
     if starts > today:
         raise OnboardingError("History cannot start in the future", 400)
@@ -439,14 +451,14 @@ def start_derived_case(connection, tenant_id: str, *, definition: Mapping[str, A
     case_id = str(uuid.uuid4())
     connection.execute(
         "INSERT INTO broker_onboarding_cases (case_id, tenant_id, source_kind, definition_json, definition_sha256, "
-        "target_subject_id, display_name, description, reporting_currency, history_start_date, stage, status, "
-        "created_by_identity_sha256) "
-        "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, 'request', 'platform_working', %s)",
+        "target_subject_id, display_name, description, reporting_currency, history_start_date, report_style, "
+        "stage, status, created_by_identity_sha256) "
+        "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, 'request', 'platform_working', %s)",
         (case_id, tenant_id, kind, _json(definition), digest, subject_id, str(definition["display_name"]), text,
-         str(definition["base_currency"]), starts, actor),
+         str(definition["base_currency"]), starts, style, actor),
     )
     _event(connection, tenant_id, case_id, "created", "request", "request", actor,
-           {"source_kind": kind, "definition_sha256": digest})
+           {"source_kind": kind, "definition_sha256": digest, "report_style": style})
     case = OnboardingCase(case_id=case_id, broker=None, broker_account_id=None, source_kind=kind,
                           target_subject_id=subject_id)
     case = _write_check(connection, tenant_id, case, "sleeves_are_live", "pass",
@@ -652,16 +664,23 @@ def _register_derived_subject(connection, tenant_id: str, row: Mapping[str, Any]
     if not_live:
         raise OnboardingError("A sleeve stopped being live: " + ", ".join(not_live))
     subject_id = str(terms["subject_id"])
+    metadata = {"onboarding": "broker_onboarding_v2", "case_id": str(row["case_id"]),
+                "source_system": "derived_definition", "definition_origin": "website_portfolio_builder",
+                "definition_sha256": digest, "description": terms["description"]}
+    if terms.get("report_style"):
+        # The reports' name, description and tree, exactly as approved.
+        try:
+            metadata["report_profile"] = build_profile(definition=definition, style=str(terms["report_style"]),
+                                                       description=str(terms["description"]))
+        except ReportProfileError as error:
+            raise OnboardingError(str(error)) from error
     connection.execute(
         "INSERT INTO platform_subjects (tenant_id, subject_id, subject_type, display_name, source_account_id, "
         "base_currency, reporting_currency, history_start_date, inception_date, lifecycle_status, metadata_json) "
         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'onboarding', %s::jsonb)",
         (tenant_id, subject_id, definition["subject_type"], terms["display_name"],
          definition.get("source_account_id"), definition["base_currency"], terms["reporting_currency"],
-         terms["history_start_date"], terms["history_start_date"],
-         _json({"onboarding": "broker_onboarding_v2", "case_id": str(row["case_id"]),
-                "source_system": "derived_definition", "definition_origin": "website_portfolio_builder",
-                "definition_sha256": digest, "description": terms["description"]})),
+         terms["history_start_date"], terms["history_start_date"], _json(metadata)),
     )
     connection.execute(
         "INSERT INTO subject_calculation_definitions (definition_id, tenant_id, subject_id, subject_type, "
@@ -727,14 +746,20 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
     awaiting_terms = _approval_terms(row, checks, approvals, awaiting) if awaiting else None
     derived = case.source_kind in DERIVED_SOURCE_KINDS
     stage_number = min(list(STAGE_LABELS).index(case.stage) + 1, 4)
+    style_label = (f"{REPORT_STYLES[row['report_style']]['label']} design"
+                   if row.get("report_style") in REPORT_STYLES else None)
+    summary = _definition_summary(terms["definition"]) if derived else []
+    if style_label:
+        summary.append({"label": "Report design", "value": style_label})
     return {
         "case_id": case.case_id,
         "source_kind": case.source_kind,
         "broker": case.broker,
         "broker_label": SOURCE_LABELS[case.source_kind] if derived else BROKERS[str(case.broker)].label,
         "account": account_display,
-        "definition_summary": _definition_summary(terms["definition"]) if derived else [],
+        "definition_summary": summary,
         "description": row.get("description"),
+        "report_style_label": style_label,
         "composition_svg": _composition_svg(connection, tenant_id, terms["definition"]) if derived else None,
         "display_name": row["display_name"],
         "reporting_currency": row["reporting_currency"],
@@ -795,10 +820,12 @@ def _market_indices() -> dict[str, Any]:
     return {item.instrument_id: item for item in ALPHA_WORLD_MARKET_INSTRUMENTS}
 
 
-def builder_form_from_definition(definition: Mapping[str, Any]) -> dict[str, Any]:
+def builder_form_from_definition(definition: Mapping[str, Any], *, report_style: str | None = None
+                                 ) -> dict[str, Any]:
     """A live portfolio's definition as builder fields, to copy as a starting point.
 
-    Exposures are rescaled so the copy starts at a NAV of 100, as MS and T do.
+    Exposures are rescaled so the copy starts at a NAV of 100, as MS and T do. A
+    copy of MS or T, or of a composite in their design, keeps that design.
     """
 
     if definition.get("subject_type") == "composite_portfolio":
@@ -808,6 +835,8 @@ def builder_form_from_definition(definition: Mapping[str, Any]) -> dict[str, Any
             "kind": "composite_portfolio",
             "reporting_currency": definition.get("base_currency"),
             "start_date": definition.get("normalization_date"),
+            "report_style": report_style if report_style in REPORT_STYLES else (
+                definition.get("subject_id") if definition.get("subject_id") in REPORT_STYLES else None),
             "sleeves": [{"component_id": c["component_id"],
                          "direction": "long" if float(c["coefficient"]) > 0 else "short",
                          "exposure_percent": round(abs(float(c["coefficient"])) * 100.0 * 100.0 / nav, 6)}
@@ -849,7 +878,7 @@ def portfolio_builder_catalogue(connection, tenant_id: str) -> dict:
         ).fetchall()
     }
     copies = connection.execute(
-        "SELECT d.subject_id, s.display_name, d.configuration_json FROM subject_calculation_definitions d "
+        "SELECT d.subject_id, s.display_name, s.metadata_json, d.configuration_json FROM subject_calculation_definitions d "
         "JOIN platform_subjects s ON s.tenant_id = d.tenant_id AND s.subject_id = d.subject_id "
         "WHERE d.tenant_id = %s AND d.approval_status = 'approved' AND d.effective_to IS NULL "
         "AND s.lifecycle_status = 'active' ORDER BY s.display_name",
@@ -859,8 +888,11 @@ def portfolio_builder_catalogue(connection, tenant_id: str) -> dict:
     for row in copies:
         definition = row["configuration_json"]
         definition = json.loads(definition) if isinstance(definition, str) else dict(definition)
+        metadata = row["metadata_json"] or {}
+        metadata = json.loads(metadata) if isinstance(metadata, str) else dict(metadata)
         try:
-            form = builder_form_from_definition(definition)
+            form = builder_form_from_definition(
+                definition, report_style=(metadata.get("report_profile") or {}).get("style"))
         except (KeyError, TypeError, ValueError, ZeroDivisionError):
             continue
         starting_points.append({"subject_id": str(row["subject_id"]), "display_name": str(row["display_name"]),
@@ -876,6 +908,7 @@ def portfolio_builder_catalogue(connection, tenant_id: str) -> dict:
                      "latest_date": str(coverage[key]["latest_date"]) if key in coverage else None}
                     for key, item in indices.items()],
         "starting_points": starting_points,
+        "report_styles": [{"style": key, "label": f"{value['label']} design"} for key, value in REPORT_STYLES.items()],
     }
 
 
@@ -952,12 +985,13 @@ def preview_tree(connection, tenant_id: str, body: "PortfolioRequest") -> dict:
 
 
 def check_portfolio(connection, tenant_id: str, *, definition: Mapping[str, Any], description: str,
-                    today: date) -> dict:
+                    today: date, report_style: str | None = None) -> dict:
     """Everything start_derived_case would refuse, as a list, without writing anything."""
 
     definition = _as_stored(definition)
     problems = []
-    for rule in (lambda: _clean_description(description), lambda: _portfolio_id(definition)):
+    for rule in (lambda: _clean_description(description), lambda: _portfolio_id(definition),
+                 lambda: _report_style(definition, report_style)):
         try:
             rule()
         except OnboardingError as error:
@@ -1275,6 +1309,7 @@ class PortfolioRequest(BaseModel):
     allowed_cash_currencies: list[str] = Field(default_factory=list, max_length=16)
     opening_cash: dict[str, float] = Field(default_factory=dict)
     include_actual_interest: bool = True
+    report_style: Literal["alpha-world-ms", "alpha-world-t"] | None = None
 
 
 class TrackLoginRequest(BaseModel):
@@ -1363,13 +1398,14 @@ def install(
     @app.post("/api/onboarding-v2/portfolios/check")
     def portfolio_check(body: PortfolioRequest, user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
         return run(write_database, lambda c: check_portfolio(c, tenant_id, definition=validated(c, body),
-                                                             description=body.description, today=today()))
+                                                             description=body.description, today=today(),
+                                                             report_style=body.report_style))
 
     @app.post("/api/onboarding-v2/portfolios")
     def portfolio_start(body: PortfolioRequest, user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
         return run(write_database, lambda c: start_derived_case(
             c, tenant_id, definition=validated(c, body), description=body.description, actor=actor(user),
-            today=today()))
+            today=today(), report_style=body.report_style))
 
     @app.get("/api/onboarding-v2/overview")
     def overview(user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
@@ -1469,7 +1505,7 @@ ONBOARDING_CONTENT = """<div class="page-view active" data-section="account-onbo
 
 CASE_CONTENT = """<div class="page-view active" data-section="account-onboarding" data-case-id="{case_id}">
 <div class="card wide"><div class="label" id="case-kicker">Loading…</div><h2 id="case-title"></h2><div id="case-next" class="muted"></div><div id="case-progress" class="status-row"></div></div>
-<div class="card wide" id="case-portfolio" hidden><div class="label">The portfolio</div><p id="case-description"></p><div id="case-tree" style="max-width:760px;margin-top:14px;overflow-x:auto"></div></div>
+<div class="card wide" id="case-portfolio" hidden><div class="label">The portfolio</div><p id="case-description"></p><p class="muted" id="case-report-style" hidden></p><div id="case-tree" style="max-width:760px;margin-top:14px;overflow-x:auto"></div></div>
 <div class="card wide"><div class="label">Checks for this stage</div><div id="case-checks" class="onboarding-checks"></div></div>
 <div class="card wide"><div class="label">Your three approvals</div><div id="case-approvals" class="status-row"></div><div id="case-approval-form"></div><div id="case-result" class="muted" role="status" aria-live="polite"></div></div>
 <div class="card wide" id="case-cancel-card" hidden><div class="label">Stop this case</div><p class="muted">Cancelling frees the account or portfolio ID to be added again later. Nothing reached viewers.</p><div class="actions"><input id="case-cancel-reason" type="text" maxlength="500" placeholder="Reason" aria-label="Reason for cancelling"><button id="case-cancel" class="button" type="button">Cancel this case</button></div></div>
@@ -1525,7 +1561,7 @@ const render=c=>{
   document.querySelector('#case-kicker').textContent=`Stage ${c.stage_number} of 4 · ${c.broker_label} · ${c.reporting_currency} reporting`;
   document.querySelector('#case-title').textContent=`${c.display_name} (${c.account})`;
   const portfolio=document.querySelector('#case-portfolio');portfolio.hidden=!c.composition_svg;
-  if(c.composition_svg){document.querySelector('#case-description').textContent=c.description||'';const box=document.querySelector('#case-tree');box.innerHTML=c.composition_svg;box.firstElementChild.style.minWidth='560px'}
+  if(c.composition_svg){document.querySelector('#case-description').textContent=c.description||'';const style=document.querySelector('#case-report-style');style.hidden=!c.report_style_label;style.textContent=c.report_style_label?`Reports use the ${c.report_style_label}, under this portfolio's name, with this description and tree.`:'';const box=document.querySelector('#case-tree');box.innerHTML=c.composition_svg;box.firstElementChild.style.minWidth='560px'}
   document.querySelector('#case-next').textContent=c.next_owner_action||(c.status==='cancelled'?'This case was cancelled.':'Nothing needs you right now.');
   document.querySelector('#case-progress').innerHTML=c.progress.map(t=>{const [text,cls]=tileState[t.state];return `<div class="status-item"><div class="label">${esc(t.number)} · ${esc(t.label)}</div>${pill(text,cls)}</div>`}).join('');
   document.querySelector('#case-checks').innerHTML=c.checks.map(k=>`<div class="onboarding-check ${esc(k.status==='pending'?'':k.status)}"><strong>${esc(k.label)}</strong><span>${esc(k.message)}${k.status==='warn'&&k.acknowledged?' Acknowledged.':''}</span></div>`).join('')||'<div class="muted">No checks in this stage.</div>';
@@ -1603,6 +1639,7 @@ PORTFOLIO_CONTENT = """<style>
 <label style="display:block;margin-top:16px"><span class="label">Description</span><textarea name="description" rows="3" required minlength="10" maxlength="600" placeholder="What the portfolio holds and why. Its reports and factsheets show this text."></textarea></label>
 </div>
 <div class="card wide" data-kind="composite_portfolio"><div class="label">Sleeves</div><p class="muted">Give each sleeve a share of the starting value. Long and short sleeves can add up to more than 100%; cash makes up the rest, and negative cash means the portfolio borrows. Alpha World MS is 91% and 45% long, 49% and 45% short, with 58% cash.</p><div id="pb-sleeves"></div><div class="actions"><button class="button pb-quiet" type="button" id="pb-add">Add sleeve</button></div><div id="pb-totals" class="status-row"></div></div>
+<div class="card wide" data-kind="composite_portfolio"><div class="label">Reports</div><p class="muted">An HKD composite reports in the Alpha World MS or T design: the same factsheet and presentation, under this portfolio's name, with its description and composition tree. A USD composite uses the standard design.</p><div class="status-row"><label class="status-item"><span class="label">Report design</span><select name="report_style"><option value="">Standard design (USD)</option><option value="alpha-world-ms">Alpha World MS design</option><option value="alpha-world-t">Alpha World T design</option></select></label></div></div>
 <div class="card wide" data-kind="filtered_portfolio" hidden><div class="label">Filter</div><p class="muted">Keep one account's holdings except what you exclude, and rebuild its cash in the currencies you allow.</p>
 <div class="status-row">
 <label class="status-item"><span class="label">Account</span><select name="source_account_id" required></select></label>
@@ -1613,7 +1650,7 @@ PORTFOLIO_CONTENT = """<style>
 <label class="status-item"><span class="label">Opening cash</span><input type="text" name="opening_cash" required placeholder="HKD=484300, USD=0"></label>
 </div>
 <label style="display:flex;gap:10px;align-items:flex-start;margin-top:14px"><input type="checkbox" name="include_actual_interest" checked> <span>Include interest the broker actually posted in an allowed cash currency. No assumed interest is added.</span></label></div>
-<div class="card wide"><div class="label">Composition</div><p class="muted">This tree goes on the case page and, once report profiles land, on the portfolio's factsheet.</p><div id="pb-tree" class="pb-tree"><div class="muted">Add a sleeve to see the tree.</div></div></div>
+<div class="card wide"><div class="label">Composition</div><p class="muted">This tree goes on the case page and, in the Alpha World designs, on the portfolio's factsheet and presentation.</p><div id="pb-tree" class="pb-tree"><div class="muted">Add a sleeve to see the tree.</div></div></div>
 <div class="card wide"><div class="label">Check and start</div><p class="muted">Check runs the same rules as starting, without saving anything. Starting opens a private case where you approve the definition.</p><div id="pb-check" class="onboarding-checks"></div><div class="actions"><button class="button pb-quiet" type="button" id="pb-run-check">Check</button><button class="button" type="submit" id="pb-submit">Start onboarding</button></div><div id="pb-status" class="muted" role="status" aria-live="polite"></div></div>
 </form>
 </div>"""
@@ -1635,7 +1672,7 @@ const addRow=(sleeve={})=>{const div=document.createElement('div');div.className
 const sleeves=()=>[...rows.querySelectorAll('.pb-sleeve')].map(row=>{const input=row.querySelector('[name=sleeve_exposure]'),value=amount(input.value),bad=input.value.trim()!==''&&!(value>0&&value<=1000);input.setAttribute('aria-invalid',bad?'true':'false');return {component_id:row.querySelector('[name=sleeve_component]').value,direction:row.querySelector('[name=sleeve_direction]').value,exposure_percent:value}}).filter(s=>s.component_id&&s.exposure_percent>0&&s.exposure_percent<=1000);
 const showKind=()=>{const value=kind.value;form.querySelectorAll('[data-kind]').forEach(card=>{const active=card.dataset.kind===value;card.hidden=!active;card.querySelectorAll('input,select,textarea,button').forEach(field=>{field.disabled=!active})});document.querySelector('#pb-date-label').textContent=value==='composite_portfolio'?'Starts at 100 on':'History from'};
 const body=()=>{const values=new FormData(form),b={kind:kind.value,subject_id:String(values.get('subject_id')||'').trim(),display_name:String(values.get('display_name')||'').trim(),description:String(values.get('description')||'').trim(),reporting_currency:String(values.get('reporting_currency')||'').trim().toUpperCase(),start_date:values.get('start_date')||''};
-  if(b.kind==='composite_portfolio')b.sleeves=sleeves();
+  if(b.kind==='composite_portfolio')Object.assign(b,{sleeves:sleeves(),report_style:values.get('report_style')||null});
   else Object.assign(b,{source_account_id:values.get('source_account_id')||null,excluded_countries:csvList(values.get('excluded_countries')),excluded_exchanges:codes(values.get('excluded_exchanges')),excluded_currencies:codes(values.get('excluded_currencies')),allowed_cash_currencies:codes(values.get('allowed_cash_currencies')),opening_cash:parseCash(values.get('opening_cash')),include_actual_interest:form.elements.include_actual_interest.checked});
   return b};
 const showTotals=()=>{const box=document.querySelector('#pb-totals');if(kind.value!=='composite_portfolio'){box.innerHTML='';return}const chosen=sleeves(),long=chosen.filter(s=>s.direction==='long').reduce((t,s)=>t+s.exposure_percent,0),short=chosen.filter(s=>s.direction==='short').reduce((t,s)=>t+s.exposure_percent,0),cash=100-long+short;box.innerHTML=[['Long',pct(long)],['Short',pct(short)],['Cash',cash<0?`${pct(cash)} (borrowed)`:pct(cash)],['Gross exposure',pct(long+short)]].map(([k,v])=>`<div class="status-item"><div class="label">${esc(k)}</div><strong>${esc(v)}</strong></div>`).join('')};
@@ -1644,7 +1681,7 @@ const changed=()=>{checks.innerHTML='';status.textContent='';showTotals();previe
 const fill=(form_,label)=>{kind.value=form_.kind;showKind();rows.innerHTML='';
   if(form_.kind==='composite_portfolio')(form_.sleeves||[]).forEach(addRow);
   const set=(name,value)=>{const field=form.elements[name];if(field&&value!==undefined&&value!==null)field.value=value};
-  set('reporting_currency',form_.reporting_currency||'USD');set('start_date',form_.start_date||'');
+  set('reporting_currency',form_.reporting_currency||'USD');set('start_date',form_.start_date||'');if(form_.kind==='composite_portfolio')set('report_style',form_.report_style||'');
   if(form_.kind==='filtered_portfolio'){set('source_account_id',form_.source_account_id||'');set('excluded_countries',(form_.excluded_countries||[]).join(', '));set('excluded_exchanges',(form_.excluded_exchanges||[]).join(', '));set('excluded_currencies',(form_.excluded_currencies||[]).join(', '));set('allowed_cash_currencies',(form_.allowed_cash_currencies||[]).join(', '));set('opening_cash',cashText(form_.opening_cash));form.elements.include_actual_interest.checked=form_.include_actual_interest!==false}
   ['display_name','subject_id','description'].forEach(name=>{form.elements[name].value=''});idTouched=false;
   document.querySelector('#pb-start-note').textContent=label?`Copied from ${label}. Give the new portfolio its own name, ID and description.`:'';

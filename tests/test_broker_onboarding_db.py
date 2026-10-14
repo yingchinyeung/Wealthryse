@@ -1,4 +1,4 @@
-"""Database rules for the new account onboarding (migration 064).
+"""Database rules for the new account onboarding (migrations 064 and 065).
 
 Needs a disposable PostgreSQL server: set AGENT_TEST_PG_ADMIN_DSN to a
 superuser DSN (CI starts one). Skipped otherwise. Creates and drops its own
@@ -196,6 +196,13 @@ class BrokerOnboardingSchemaTests(_MigratedDatabase):
         self.assertRejected(derived, (None, None, None, "{}", "d" * 64, "synthetic-long-short", None))
         self.assertRejected(derived, (None, None, None, "{}", "d" * 64, "synthetic-long-short", "Too short"))
         self.db.execute(derived, (None, None, None, "{}", "d" * 64, "synthetic-long-short", about))
+        # Migration 065: only an HKD composite takes the Alpha World MS or T report design.
+        self.assertRejected("UPDATE broker_onboarding_cases SET report_style = 'standard'")
+        self.assertRejected("UPDATE broker_onboarding_cases SET report_style = 'alpha-world-ms', "
+                            "reporting_currency = 'USD'")
+        self.assertRejected("UPDATE broker_onboarding_cases SET report_style = 'alpha-world-t', "
+                            "source_kind = 'filtered_portfolio'")
+        self.db.execute("UPDATE broker_onboarding_cases SET report_style = 'alpha-world-t'")
         self._subject("other-portfolio")
         self.assertRejected("UPDATE broker_onboarding_cases SET subject_id = 'other-portfolio'")
 
@@ -413,12 +420,16 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
 
         def start(**changes):
             return start_derived_case(self.db, TENANT, **{"definition": definition, "description": about,
-                                                          "actor": IDENTITY, "today": today, **changes})
+                                                          "actor": IDENTITY, "today": today,
+                                                          "report_style": "alpha-world-t", **changes})
 
-        def check():
-            return check_portfolio(self.db, TENANT, definition=definition, description=about, today=today)
+        def check(**changes):
+            return check_portfolio(self.db, TENANT, **{"definition": definition, "description": about,
+                                                       "today": today, "report_style": "alpha-world-t", **changes})
 
         self.assertEqual(check()["problems"], ["Not live yet: U0000501."])
+        self.assertIn("An HKD composite reports in the Alpha World MS or T design; choose one.",
+                      check(report_style=None)["problems"])
         with self.assertRaisesRegex(OnboardingError, "Every sleeve must be live.*U0000501"):
             start()
         self.db.execute("UPDATE platform_subjects SET lifecycle_status = 'active' WHERE subject_id = 'U0000501'")
@@ -432,6 +443,8 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
             start(definition={**definition, "subject_id": "synthetic_long_short"})
         with self.assertRaisesRegex(OnboardingError, "future"):
             start(today=date(2025, 1, 19))
+        with self.assertRaisesRegex(OnboardingError, "MS or T design; choose one"):
+            start(report_style=None)
         started = start()
         case_id = started["case_id"]
         self.assertEqual((started["stage"], started["status"]), ("load_and_reconcile", "platform_working"))
@@ -452,12 +465,22 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
         self.assertEqual(detail["account_terms"]["definition"], definition)
         self.assertEqual((detail["description"], detail["account_terms"]["description"]), (about, about))
         self.assertIn("Composition of Synthetic long short", detail["composition_svg"])
+        self.assertEqual(detail["account_terms"]["report_style"], "alpha-world-t")
+        self.assertEqual(detail["report_style_label"], "Alpha World T design")
+        self.assertIn({"label": "Report design", "value": "Alpha World T design"}, detail["definition_summary"])
         approve_case(self.db, TENANT, case_id, approval="account_terms", terms_sha256=detail["account_terms_sha256"],
                      acknowledge_warnings=[], confirmation=None, actor=IDENTITY)
         subject = self.db.execute("SELECT subject_type, lifecycle_status, reporting_currency FROM platform_subjects "
                                   "WHERE subject_id = 'synthetic-long-short'").fetchone()
         self.assertEqual(dict(subject), {"subject_type": "composite_portfolio", "lifecycle_status": "onboarding",
                                          "reporting_currency": "HKD"})
+        from ibkr_etl.db import PostgresConnection
+        from ibkr_etl.report_profiles import load_profile
+        profile = load_profile(PostgresConnection(self.db), "synthetic-long-short", tenant_id=TENANT)
+        self.assertEqual((profile.style, profile.display_name, profile.description, profile.inception),
+                         ("alpha-world-t", "Synthetic long short", about, "2025-01-20"))
+        self.assertEqual(profile.definition_sha256, started["definition_sha256"])
+        self.assertEqual([group["label"] for group in profile.composition["groups"]], ["Long", "Short", "Cash"])
         stored = self.db.execute("SELECT approval_status, configuration_sha256 FROM subject_calculation_definitions "
                                  "WHERE subject_id = 'synthetic-long-short'").fetchone()
         self.assertEqual(dict(stored), {"approval_status": "approved",
@@ -532,7 +555,7 @@ class PortfolioDryRunTests(_MigratedDatabase):
             components=[{"component_id": "U0000501", "component_name": "Synthetic tech",
                          "component_type": "account", "coefficient": 0.42, "source_currency": "USD"}])
         case_id = start_derived_case(db, TENANT, definition=definition, description="A synthetic long short case.",
-                                     actor=IDENTITY, today=date(2025, 3, 3))["case_id"]
+                                     actor=IDENTITY, today=date(2025, 3, 3), report_style="alpha-world-ms")["case_id"]
         db.commit()
         calls = []
 

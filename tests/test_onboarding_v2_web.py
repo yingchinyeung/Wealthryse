@@ -18,7 +18,7 @@ OFF = {"ONBOARDING_V2_ENABLED": "false"}
 MS_LIKE = {
     "kind": "composite_portfolio", "subject_id": "alpha-world-asia", "display_name": "Alpha World Asia",
     "description": "Alpha World MS sleeves, reported under its own name.", "reporting_currency": "HKD",
-    "start_date": "2025-01-20",
+    "start_date": "2025-01-20", "report_style": "alpha-world-ms",
     "sleeves": [{"component_id": "hong-kong-china", "direction": "long", "exposure_percent": 91},
                 {"component_id": "U16088571", "direction": "long", "exposure_percent": 45},
                 {"component_id": "hang-seng-price-index", "direction": "short", "exposure_percent": 49},
@@ -181,6 +181,9 @@ class OnboardingV2WebTests(unittest.TestCase):
                               ("spy-settlement", -0.45)])
             self.assertEqual(start.call_args.kwargs["description"], MS_LIKE["description"])
             self.assertEqual(start.call_args.kwargs["definition"]["subject_id"], "alpha-world-asia")
+            self.assertEqual(start.call_args.kwargs["report_style"], "alpha-world-ms")
+            unknown = self.client.post("/api/onboarding-v2/portfolios", json={**MS_LIKE, "report_style": "x"})
+            self.assertEqual(unknown.status_code, 422)
             for bad in ("ab", "alpha_world_asia"):
                 refused = self.client.post("/api/onboarding-v2/portfolios", json={**MS_LIKE, "subject_id": bad})
                 self.assertEqual(refused.status_code, 400)
@@ -198,6 +201,7 @@ class OnboardingV2WebTests(unittest.TestCase):
             self.assertEqual(self.client.post("/api/onboarding-v2/portfolios/check", json=MS_LIKE).json(),
                              {"ok": True})
         self.assertEqual(check.call_args.kwargs["description"], MS_LIKE["description"])
+        self.assertEqual(check.call_args.kwargs["report_style"], "alpha-world-ms")
 
     def test_the_builder_previews_the_tree_from_the_read_only_database(self):
         connection = _RecordingConnection()

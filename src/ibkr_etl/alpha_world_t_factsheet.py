@@ -98,19 +98,21 @@ def _footer(c, page_number, *, synthetic):
         c.drawCentredString(297.375,51.5,SYNTHETIC_LABEL)
 
 
-def _header_values(c):
+def _header_values(c, values=HEADER_VALUES):
     """All four values use one font and one baseline, including descenders."""
     c.setFillColor(black)
     c.setFont('Helvetica',HEADER_SIZE)
-    for x,value in HEADER_VALUES:
+    for x,value in values:
         c.drawString(x,HEADER_BASELINE,value)
 
 
-def _page_one(c, snapshot, inputs):
+def _page_one(c, snapshot, inputs, header_values=None):
     from .monthly_artifacts import (_draw_alpha_world_line_chart,
         _draw_alpha_world_distribution, ALPHA_WORLD_FACTSHEET_LAYOUT)
     # T identity and values on the exact MS static table and row geometry.
-    _header_values(c)
+    # A composite in the T design passes its own values; T's call is unchanged.
+    if header_values is None: _header_values(c)
+    else: _header_values(c, header_values)
     for field,y in zip(METRIC_FIELDS,METRIC_BASELINES):
         c.setFillColor(white); c.rect(516.,y-2.,46.,10.5,fill=1,stroke=0)
         value = inputs.chart_metrics[field]

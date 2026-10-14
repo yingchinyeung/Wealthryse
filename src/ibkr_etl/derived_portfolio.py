@@ -1548,19 +1548,24 @@ def refresh_fixed_unit_composite(
     contract: dict[str, Any],
     *,
     generated_at: str | None = None,
+    strict_hkd: bool = False,
 ) -> dict[str, Any]:
     """Evaluate one canonical fixed-unit Studio contract.
 
     Account and portfolio sleeves define the common daily calendar. Benchmark
     observations may carry only up to the approved number of days. Every sleeve
     is converted to the reporting currency before it is normalized to 100.
+    strict_hkd applies MS and T's FX carry and positive-value rules to a
+    composite that reports in their design.
     """
 
     generated_at = generated_at or datetime.now(HKT).isoformat(timespec="seconds")
     portfolio_id = str(contract["subject_id"])
-    reference_hkd = portfolio_id in ('alpha-world-ms', 'alpha-world-t')
-    reference_label = 'MS' if portfolio_id == 'alpha-world-ms' else 'T'
-    if reference_hkd:
+    reference_hkd = portfolio_id in ('alpha-world-ms', 'alpha-world-t') or strict_hkd
+    reference_label = {'alpha-world-ms': 'MS', 'alpha-world-t': 'T'}.get(portfolio_id, 'The composite')
+    if strict_hkd and str(contract["base_currency"]).upper() != 'HKD':
+        raise ValueError('Only an HKD composite can report in the Alpha World design')
+    if portfolio_id in ('alpha-world-ms', 'alpha-world-t'):
         from .subject_onboarding import validate_reference_runtime_contract, configuration_sha256
         validate_reference_runtime_contract(portfolio_id,contract,configuration_sha256(contract))
     portfolio_name = str(contract["display_name"])

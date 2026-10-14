@@ -1448,6 +1448,10 @@ def _alpha_world_return_distribution(
     if inputs.subject_id == 'alpha-world-t' and inputs.chart_daily_returns is not None:
         from .alpha_world_t_analytics import simulate
         return simulate(inputs.chart_daily_returns, inputs.period_end, paths=paths)
+    from .profiled_composite import ANALYTICS_VERSION as COMPOSITE_VERSION
+    if (inputs.chart_evidence or {}).get('version') == COMPOSITE_VERSION and inputs.chart_daily_returns is not None:
+        from .profiled_composite import simulate
+        return simulate(inputs.chart_daily_returns, inputs.period_end, subject_id=inputs.subject_id, paths=paths)
     returns = [
         float(current["value"]) / float(previous["value"]) - 1.0
         for previous, current in zip(inputs.normalized_nav, inputs.normalized_nav[1:])
@@ -2653,6 +2657,15 @@ def render_factsheet(
     output_path: str | Path,
     design_model_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    from .report_profiles import ReportProfileError, snapshot_profile
+    try:
+        profile = snapshot_profile(snapshot)
+    except ReportProfileError as error:
+        raise MonthlyArtifactError(str(error)) from error
+    if profile is not None and not profile.built_in:
+        from .profiled_factsheet import render
+        return render(snapshot, template_path=template_path, output_path=output_path,
+                      design_model_path=design_model_path)
     if snapshot.get('subject_id') == 'alpha-world-t':
         from .alpha_world_t_factsheet import render
         return render(snapshot, template_path=template_path, output_path=output_path,

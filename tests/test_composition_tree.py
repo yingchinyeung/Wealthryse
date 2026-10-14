@@ -50,6 +50,13 @@ class CompositionTreeTests(unittest.TestCase):
             self.assertEqual(fields["normalization_date"], reference["normalization_date"])
             self.assertEqual([(c["component_id"], c["coefficient"]) for c in fields["components"]],
                              [(c["component_id"], c["coefficient"]) for c in reference["components"]])
+            self.assertEqual(form["report_style"], subject_id)
+
+    def test_a_copy_keeps_the_report_design_of_what_it_copies(self):
+        reference = dict(approved_reference_definitions()["alpha-world-ms"], subject_id="alpha-world-asia")
+        self.assertEqual(builder_form_from_definition(reference, report_style="alpha-world-t")["report_style"],
+                         "alpha-world-t")
+        self.assertIsNone(builder_form_from_definition(reference)["report_style"])
 
 
 if __name__ == "__main__":

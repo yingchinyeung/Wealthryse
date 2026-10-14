@@ -27,6 +27,7 @@ from ibkr_etl.derived_portfolio import (  # noqa: E402
 )
 from ibkr_etl.market_data import refresh_alpha_world_market_data  # noqa: E402
 from ibkr_etl.onboarding_dry_run import record_history_build, run_portfolio_dry_runs  # noqa: E402
+from ibkr_etl.profiled_composite import is_profiled  # noqa: E402
 from ibkr_etl.provisional_benchmark import refresh_and_materialize  # noqa: E402
 from ibkr_etl.risk_snapshots import build_risk_snapshot  # noqa: E402
 from ibkr_etl.sector_classification import (  # noqa: E402
@@ -257,6 +258,18 @@ def _refresh_analytics_if_approved(
             'benchmark_comparison':benchmark,
             'crisis_replay':{'available':False,'reason':'Composite crisis attribution not qualified'},
             'onboarding_activated':False,'acceptance_check_changed':False}
+    if row.get('subject_type')=='composite_portfolio':
+        from ibkr_etl.profiled_composite import require_contract as require_design_contract
+        if is_profiled(connection,row['subject_id'],tenant_id=tenant_id):
+            # A composite in the Alpha World MS or T design is measured as MS
+            # and T are: its own HKD/HIBOR contract, never the USD comparison.
+            require_design_contract(connection,row['subject_id'],tenant_id=tenant_id)
+            latest=connection.execute("SELECT MAX(snapshot_date) AS latest FROM subject_nav_series WHERE tenant_id=? AND subject_id=? AND currency='HKD'",(tenant_id,row['subject_id'])).fetchone()['latest']
+            return {'risk_snapshot':None if latest is None else build_risk_snapshot(connection,
+                tenant_id=tenant_id,subject_id=row['subject_id'],as_of=str(latest)),
+                'benchmark_comparison':{'available':False,'reason':'HIBOR + Spread comparison methodology is not qualified'},
+                'crisis_replay':{'available':False,'reason':'Composite crisis attribution not qualified'},
+                'onboarding_activated':False,'acceptance_check_changed':False}
     approved = connection.execute(
         """
         SELECT 1 FROM account_onboarding_approvals
@@ -393,7 +406,10 @@ def _dry_run_portfolio_cases(connection, tenant_id: str, reference_path: Path, r
                 dry_connection, reference_path, contract=definition,
                 expected_reference_sha256=reference()["content_sha256"],
             )
-        return refresh_fixed_unit_composite(dry_connection, definition)
+        # The builder gives every HKD composite the MS or T design, so its dry
+        # run applies the same HKD rules its daily refresh will.
+        return refresh_fixed_unit_composite(
+            dry_connection, definition, strict_hkd=str(definition["base_currency"]).upper() == "HKD")
 
     return run_portfolio_dry_runs(
         connection, tenant_id, calculate=calculate, today=datetime.now(timezone.utc).date()
@@ -470,6 +486,8 @@ def main() -> int:
                         connection, reference_path, contract=definition,
                         expected_reference_sha256=reference_source["content_sha256"],
                     )
+                elif is_profiled(connection, str(row["subject_id"]), tenant_id=settings.tenant_id):
+                    calculation = refresh_fixed_unit_composite(connection, definition, strict_hkd=True)
                 else:
                     calculation = refresh_fixed_unit_composite(connection, definition)
                 runtime_contract = {

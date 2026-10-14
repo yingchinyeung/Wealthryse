@@ -1,0 +1,78 @@
+{
+  "_comment": "Synthetic IB Gateway responses for tests/test_live_collector.py. Accounts, prices and executions are made up.",
+  "managed_accounts": ["U1000001", "U1000002"],
+  "account_summary": [
+    {"account": "U1000001", "tag": "AccountType", "value": "INDIVIDUAL", "currency": ""},
+    {"account": "U1000001", "tag": "NetLiquidation", "value": "1250000.50", "currency": "HKD"},
+    {"account": "U1000001", "tag": "TotalCashValue", "value": "50000.00", "currency": "HKD"},
+    {"account": "U1000001", "tag": "CashBalance", "value": "30000.00", "currency": "HKD"},
+    {"account": "U1000001", "tag": "CashBalance", "value": "2564.10", "currency": "USD"},
+    {"account": "U1000001", "tag": "CashBalance", "value": "50000.00", "currency": "BASE"},
+    {"account": "U1000002", "tag": "NetLiquidation", "value": "80000.00", "currency": "USD"},
+    {"account": "U1000002", "tag": "TotalCashValue", "value": "4000.00", "currency": "USD"},
+    {"account": "U1000002", "tag": "CashBalance", "value": "4000.00", "currency": "USD"},
+    {"account": "U9999999", "tag": "NetLiquidation", "value": "1.00", "currency": "USD"}
+  ],
+  "pnl": {
+    "U1000001": {"dailyPnL": 1234.5, "unrealizedPnL": 45000.25, "realizedPnL": NaN},
+    "U1000002": {"dailyPnL": -80.0, "unrealizedPnL": 3900.0, "realizedPnL": 0.0}
+  },
+  "positions": [
+    {"account": "U1000001", "position": 100, "avgCost": 150.25,
+     "contract": {"conId": 265598, "symbol": "AAPL", "secType": "STK", "currency": "USD", "primaryExchange": "NASDAQ", "multiplier": ""}},
+    {"account": "U1000001", "position": 500, "avgCost": 320.0,
+     "contract": {"conId": 2042, "symbol": "700", "secType": "STK", "currency": "HKD", "primaryExchange": "", "multiplier": ""}},
+    {"account": "U1000001", "position": 2, "avgCost": 512.0,
+     "contract": {"conId": 700000001, "symbol": "AAPL", "secType": "OPT", "currency": "USD", "primaryExchange": "", "multiplier": "100"}},
+    {"account": "U1000001", "position": 12.5, "avgCost": 10.0,
+     "contract": {"conId": 900001, "symbol": "GLOBALFUND", "secType": "FUND", "currency": "USD", "primaryExchange": "", "multiplier": ""}},
+    {"account": "U1000001", "position": 0, "avgCost": 0.0,
+     "contract": {"conId": 111, "symbol": "CLOSED", "secType": "STK", "currency": "USD", "primaryExchange": "", "multiplier": ""}},
+    {"account": "U1000002", "position": 10, "avgCost": 400.0,
+     "contract": {"conId": 756733, "symbol": "SPY", "secType": "STK", "currency": "USD", "primaryExchange": "ARCA", "multiplier": ""}}
+  ],
+  "contract_details": {
+    "265598": {"longName": "APPLE INC", "industry": "Technology", "category": "Computers", "subcategory": "Computers",
+               "contract": {"conId": 265598, "symbol": "AAPL", "localSymbol": "AAPL", "secType": "STK", "currency": "USD", "exchange": "SMART", "primaryExchange": "NASDAQ"}},
+    "2042": {"longName": "TENCENT HOLDINGS LTD", "industry": "Communications", "category": "Internet", "subcategory": "Web Portals/ISP",
+             "contract": {"conId": 2042, "symbol": "700", "localSymbol": "700", "secType": "STK", "currency": "HKD", "exchange": "SEHK", "primaryExchange": "SEHK"}},
+    "700000001": {"longName": "APPLE INC", "industry": "", "category": "", "subcategory": "",
+                  "contract": {"conId": 700000001, "symbol": "AAPL", "localSymbol": "AAPL  261218C00200000", "secType": "OPT", "currency": "USD", "exchange": "SMART", "primaryExchange": ""}},
+    "900001": {"longName": "GLOBAL FUND CLASS A", "industry": "", "category": "", "subcategory": "",
+               "contract": {"conId": 900001, "symbol": "GLOBALFUND", "localSymbol": "", "secType": "FUND", "currency": "USD", "exchange": "FUNDSERV", "primaryExchange": ""}},
+    "756733": {"longName": "SPDR S&P 500 ETF TRUST", "industry": "Funds", "category": "Equity Fund", "subcategory": "Growth&Income-Large Cap",
+               "contract": {"conId": 756733, "symbol": "SPY", "localSymbol": "SPY", "secType": "STK", "currency": "USD", "exchange": "SMART", "primaryExchange": "ARCA"}},
+    "IND:SPX": {"longName": "S&P 500 Stock Index", "industry": "Indices", "category": "", "subcategory": "",
+                "contract": {"conId": 416904, "symbol": "SPX", "localSymbol": "SPX", "secType": "IND", "currency": "USD", "exchange": "CBOE", "primaryExchange": ""}},
+    "IND:COMP": {"longName": "NASDAQ COMPOSITE INDEX", "industry": "Indices", "category": "", "subcategory": "",
+                 "contract": {"conId": 12345678, "symbol": "COMP", "localSymbol": "COMP", "secType": "IND", "currency": "USD", "exchange": "NASDAQ", "primaryExchange": ""}}
+  },
+  "tickers": {
+    "265598": {"last": 190.5, "bid": 190.4, "ask": 190.6, "close": 188.0, "marketDataType": 1},
+    "2042": {"last": NaN, "bid": 380.0, "ask": 380.4, "close": 378.0, "marketDataType": 3},
+    "700000001": {"last": 6.0, "bid": 5.9, "ask": 6.1, "close": 5.5, "marketDataType": 1},
+    "756733": {"last": 580.0, "bid": NaN, "ask": NaN, "close": 575.0, "marketDataType": 1},
+    "416904": {"last": 5800.5, "bid": NaN, "ask": NaN, "close": 5790.0, "marketDataType": 1},
+    "12345678": {"last": NaN, "bid": NaN, "ask": NaN, "close": NaN, "marketDataType": 1}
+  },
+  "fills": [
+    {"contract": {"conId": 265598, "symbol": "AAPL", "secType": "STK", "currency": "USD"},
+     "execution": {"execId": "0000e0d5.6705a1b2.01.01", "time": "2026-10-13T14:31:05+00:00", "acctNumber": "U1000001", "side": "BOT", "shares": 10, "price": 190.1},
+     "commissionReport": {"execId": "0000e0d5.6705a1b2.01.01", "commission": 1.0, "currency": "USD", "realizedPNL": 1.7976931348623157e308}},
+    {"contract": {"conId": 2042, "symbol": "700", "secType": "STK", "currency": "HKD"},
+     "execution": {"execId": "0000e0d5.6705a1b3.01.01", "time": "2026-10-13T02:15:00+00:00", "acctNumber": "U1000001", "side": "SLD", "shares": 100, "price": 381.2},
+     "commissionReport": {"execId": "", "commission": 0.0, "currency": "", "realizedPNL": 0.0}},
+    {"contract": {"conId": 756733, "symbol": "SPY", "secType": "STK", "currency": "USD"},
+     "execution": {"execId": "0000e0d5.6705a1b4.01.01", "time": "2026-10-13T14:40:00+00:00", "acctNumber": "U9999999", "side": "BOT", "shares": 1, "price": 579.0},
+     "commissionReport": {"execId": "", "commission": 0.0, "currency": "", "realizedPNL": 0.0}}
+  ],
+  "bars": {
+    "265598": [
+      {"date": "2026-10-09", "open": 185.0, "high": 189.0, "low": 184.5, "close": 188.0, "volume": 51000000},
+      {"date": "2026-10-12", "open": 188.2, "high": 191.0, "low": 187.9, "close": 190.2, "volume": 48000000}
+    ],
+    "416904": [
+      {"date": "2026-10-12", "open": 5770.0, "high": 5801.0, "low": 5760.0, "close": 5790.0, "volume": -1}
+    ]
+  }
+}

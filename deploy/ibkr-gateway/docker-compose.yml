@@ -1,0 +1,140 @@
+# IB Gateway and the WealthRyse live collector on ibkrv2stg-ibkr-gateway.
+#
+# Started only by ibkr-live.service:
+#   docker compose --project-directory /opt/ibkr-live \
+#     --env-file /etc/ibkr-live/ibkr-live.env -f /opt/ibkr-live/docker-compose.yml up -d
+# /etc/ibkr-live/ibkr-live.env holds non-secret settings only (image digests,
+# trading mode, relay port, account IDs), written by cloud-init from
+# infra/staging-ibkr-gateway.bicep.
+#
+# Rules (tests/test_ibkr_gateway_bicep.py checks them):
+# - No ports are published. The IB API never leaves the VM: the collector
+#   reaches the gateway's socat relay over the private "ibkr" bridge network by
+#   service name.
+# - No credential is in this file or in any container environment.
+#   fetch-secrets.sh writes them to tmpfs under /run/ibkr-secrets, and each
+#   container mounts only its own files, read-only, under /run/secrets.
+# - The gateway never restarts itself. Every IBC login sends an IB Key push to
+#   the owner's phone, so re-logins come only from the host timers
+#   (relogin-check.sh). The collector restarts freely: it never logs in.
+#
+# Room for later: a "broker container" from a separate plan (IBKR Flex and
+# Kiwoom REST calls from the same NAT IP) would be its own service here with
+# its own secret files. It is deliberately not part of this file.
+
+name: ibkr-live
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  ib-gateway:
+    # <main registry>/ib-gateway@sha256:..., copied from ghcr.io/gnzsnz/ib-gateway.
+    image: ${GATEWAY_IMAGE:?GATEWAY_IMAGE must be set in /etc/ibkr-live/ibkr-live.env}
+    # "ibgateway" (1000:1000) in the image; fetch-secrets.sh gives its files to this uid.
+    user: "1000:1000"
+    # Never "always"/"unless-stopped": a restart loop would be a login loop.
+    restart: "no"
+    # The image reads the password from TWS_PASSWORD_FILE but has no file
+    # option for TWS_USERID. Read the username from its secret file into the
+    # process environment here, so it is never part of the container
+    # configuration Docker keeps on disk, then run the image's own start script.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - 'TWS_USERID="$$(cat /run/secrets/ibkr-username)" && export TWS_USERID && exec /home/ibgateway/scripts/run.sh'
+    environment:
+      TRADING_MODE: ${TRADING_MODE:?TRADING_MODE must be set in /etc/ibkr-live/ibkr-live.env}
+      TWS_PASSWORD_FILE: /run/secrets/ibkr-password
+      # run.sh writes IBC's config.ini, which holds the password, to IBC_INI.
+      # Point it at a tmpfs so the password never reaches the container's
+      # writable layer on disk. The template path (IBC_INI_TMPL) is fixed in
+      # the image, so only the output moves.
+      IBC_INI: /run/ibc/config.ini
+      # API clients can read but never place, modify or cancel orders.
+      READ_ONLY_API: "yes"
+      # Always step aside when the owner signs in elsewhere.
+      EXISTING_SESSION_DETECTED_ACTION: secondary
+      # "restart" is what lets the nightly auto-restart relaunch the gateway
+      # inside the container. A missed IB Key push does not log in again by
+      # itself ("no"), which IBC would otherwise repeat every few minutes all
+      # night; relogin-check.sh retries every 30 minutes from 08:00 to 23:00.
+      TWOFA_TIMEOUT_ACTION: restart
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "no"
+      # Nightly restart without 2FA, 05:30 Hong Kong time (after the US close).
+      AUTO_RESTART_TIME: "05:30 AM"
+      TIME_ZONE: Asia/Hong_Kong
+      TZ: Asia/Hong_Kong
+      # Only the in-container socat relay (127.0.0.1) may use the API.
+      TWS_ACCEPT_INCOMING: reject
+      ALLOW_BLIND_TRADING: "no"
+      # VNC stays off: VNC_SERVER_PASSWORD is deliberately not set.
+    secrets:
+      - ibkr-username
+      - ibkr-password
+    tmpfs:
+      - /run/ibc:uid=1000,gid=1000,mode=0700,size=1m
+    networks:
+      - ibkr
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *logging
+
+  collector:
+    # <main registry>/ibkr-live-collector@sha256:...
+    image: ${COLLECTOR_IMAGE:?COLLECTOR_IMAGE must be set in /etc/ibkr-live/ibkr-live.env}
+    # "ibkr" (10001:10001) in the WealthRyse images.
+    user: "10001:10001"
+    restart: unless-stopped
+    command: ["python", "-m", "ibkr_etl.live_collector"]
+    depends_on:
+      - ib-gateway
+    environment:
+      IB_GATEWAY_HOST: ib-gateway
+      # socat relay inside the gateway container: 4004 paper, 4003 live.
+      IB_GATEWAY_PORT: ${IB_GATEWAY_PORT:?IB_GATEWAY_PORT must be set in /etc/ibkr-live/ibkr-live.env}
+      IB_CLIENT_ID: "17"
+      LIVE_ACCOUNT_IDS: ${LIVE_ACCOUNT_IDS:?LIVE_ACCOUNT_IDS must be set in /etc/ibkr-live/ibkr-live.env}
+      PORTFOLIO_TENANT_ID: ${PORTFOLIO_TENANT_ID:?PORTFOLIO_TENANT_ID must be set in /etc/ibkr-live/ibkr-live.env}
+      LIVE_DATABASE_URL_FILE: /run/secrets/database-live-url
+      # {"gateway_state", "observed_at", "last_message_at"}, rewritten every
+      # minute; relogin-check.sh reads it on the host.
+      LIVE_STATUS_FILE: /run/ibkr-live/status.json
+      LIVE_MARKET_DATA_TYPE: ${LIVE_MARKET_DATA_TYPE:?LIVE_MARKET_DATA_TYPE must be set in /etc/ibkr-live/ibkr-live.env}
+    secrets:
+      - database-live-url
+    volumes:
+      # Host tmpfs directory created by ibkr-live.service for uid 10001.
+      - type: bind
+        source: /run/ibkr-live
+        target: /run/ibkr-live
+        bind:
+          create_host_path: false
+    networks:
+      - ibkr
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *logging
+
+networks:
+  ibkr:
+    # Not "internal": the gateway needs IBKR's servers and the collector needs
+    # Postgres. Nothing is published to the host or the VNet.
+    driver: bridge
+
+# Files on tmpfs written by fetch-secrets.sh (root-only directory, each file
+# owned by the one container user that reads it, mode 0400).
+secrets:
+  ibkr-username:
+    file: /run/ibkr-secrets/gateway/ibkr-username
+  ibkr-password:
+    file: /run/ibkr-secrets/gateway/ibkr-password
+  database-live-url:
+    file: /run/ibkr-secrets/collector/database-live-url

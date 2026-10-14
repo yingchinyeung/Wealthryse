@@ -27,8 +27,9 @@ jobs:
       - name: Test
         run: python scripts/ci_run_tests.py
 
-  # Agent schema, account isolation and tool figures against a real
-  # PostgreSQL (synthetic data only). The main test job skips these.
+  # Agent schema, account isolation and tool figures, and the live IBKR
+  # tables and collector role, against a real PostgreSQL (synthetic data
+  # only). The main test job skips these.
   agent-database:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -54,7 +55,7 @@ jobs:
       - name: Test
         env:
           AGENT_TEST_PG_ADMIN_DSN: "host=localhost port=5432 user=postgres password=ci-only dbname=postgres"
-        run: python -m unittest discover -s tests -p "test_wealthryse_agent_db.py" -v
+        run: python -m unittest discover -s tests -p "test_*_db.py" -v
 
   ingestion-image:
     runs-on: ubuntu-latest
@@ -66,6 +67,9 @@ jobs:
       # pushes nothing.
       - name: Build
         run: docker build -f Dockerfile.azure -t wealthryse-ingestion:ci .
+      # The read-only live collector that runs beside IB Gateway on the gateway VM.
+      - name: Build live collector
+        run: docker build -f Dockerfile.live-collector -t wealthryse-live-collector:ci .
 
   bicep:
     runs-on: ubuntu-latest

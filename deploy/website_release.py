@@ -28,7 +28,9 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
                     'scripts/ci_run_tests.py',
                     # Agent services ship in their own image (Dockerfile.agent).
                     'src/wealthryse_agent/', 'migrations/agent/', 'Dockerfile.agent',
-                    'scripts/install_agent_schema.py')
+                    'scripts/install_agent_schema.py',
+                    # The live IBKR collector ships in its own image on the gateway VM.
+                    'Dockerfile.live-collector', 'requirements-live.lock')
 STATE = Path('release-state.json')
 ROOT = Path(__file__).resolve().parents[1]
 

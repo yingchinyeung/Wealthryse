@@ -84,12 +84,15 @@ approval naming the resources, and the project's Azure change slot.
    ```
 
    `start` creates `database-live-url` in Key Vault with a new random
-   password if it is missing, and passes the database only its SCRAM
+   password if it is missing (through Azure Resource Manager, which the
+   vault's network rules do not block), and passes the database only its SCRAM
    verifier. The execution refuses, changing nothing, unless every applied
    migration matches main and nothing is pending except 063 and the
    deliberately held-back 054, 055, 059, 060 and 061 (063 does not depend on
    them; a later normal bootstrap from a main image would apply them all).
-   Rerunning it is safe. (`scripts/provision_live_collector.py` does the same login step from
+   Rerunning it is safe. If the secret exists but the vault's network rules
+   stop this computer reading it, `start --new-secret` writes a new password
+   and the run moves the login to it. (`scripts/provision_live_collector.py` does the same login step from
    inside the network, if that is ever easier.)
 2. Release the website from main with the Deploy website workflow. Until a
    `live_view` switch is set, it shows no live data.

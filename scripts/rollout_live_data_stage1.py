@@ -8,7 +8,8 @@ Python that has requests and azure-identity:
     python scripts/rollout_live_data_stage1.py result --execution ibkrv2stg-bootstrap-xxxxxxx
 
 check is read-only. start creates the Key Vault secret database-live-url if it
-is missing (a new random password, never printed), then starts one execution of
+is missing (a new random password, never printed; written through Azure Resource
+Manager, which the vault's network rules do not block), then starts one execution of
 the existing ibkrv2stg-bootstrap job with an override that runs
 live_data_stage1_payload.py. No job, image, identity or secret binding is
 changed, and no image is built. result reads the execution's one result line
@@ -43,6 +44,8 @@ JOB_PATH = BASE + "Microsoft.App/jobs/" + JOB
 API = "?api-version=2024-03-01"
 VAULT = "ibkrv2stg-auhecwc4itaoo"
 SECRET = "database-live-url"
+# The secret as an Azure Resource Manager resource: metadata on GET, never the value.
+SECRET_PATH = BASE + "Microsoft.KeyVault/vaults/" + VAULT + "/secrets/" + SECRET + "?api-version=2023-07-01"
 IDENTITY_PREFIX = BASE + "Microsoft.ManagedIdentity/userAssignedIdentities/"
 HOST = "ibkrv2stg-pg-auhecwc4itaoo.postgres.database.azure.com"
 DATABASE = "ibkr_staging"
@@ -202,6 +205,17 @@ def secret_url() -> str:
     return f"https://{VAULT}.vault.azure.net/secrets/{SECRET}?api-version=7.4"
 
 
+def existing_password() -> str:
+    """An existing secret's password. Only the vault's data plane returns values, and its network rules may refuse."""
+    try:
+        value = request("GET", secret_url(), audience=VAULT_AUDIENCE)["value"]
+    except SystemExit as error:
+        raise SystemExit(f"{SECRET} already exists, but this computer cannot read it ({error}). Nothing was "
+                         "started. Add --new-secret to write a new password instead; the run then sets the "
+                         "login's password to match.") from None
+    return collector_password(value)
+
+
 def preflight() -> dict:
     if request("GET", f"/subscriptions/{SUB}?api-version=2022-12-01").get("state") != "Enabled":
         raise SystemExit("The subscription is not enabled for this login")
@@ -221,6 +235,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("stage", choices=["check", "start", "result"])
     parser.add_argument("--execution")
+    parser.add_argument("--new-secret", action="store_true",
+                        help="write a new password to the secret even if it exists (when it cannot be read from here)")
     args = parser.parse_args(argv)
 
     if args.stage == "result":
@@ -231,8 +247,13 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("That execution did not run this stage's payload")
         query = ("ContainerAppConsoleLogs_CL | where ContainerGroupName_s startswith '" + args.execution
                  + "' | where Log_s startswith '" + PREFIX.strip() + "' | order by TimeGenerated asc | project Log_s")
-        tables = request("POST", f"{LOGS}/v1/workspaces/{WORKSPACE}/query", data={"query": query},
-                         audience=LOGS)["tables"]
+        try:
+            tables = request("POST", f"{LOGS}/v1/workspaces/{WORKSPACE}/query", data={"query": query},
+                             audience=LOGS)["tables"]
+        except SystemExit as error:
+            # The payload exits 0 only when it passes, so the status alone still answers that.
+            raise SystemExit(f"{error}. The execution's status is {run['properties']['status']}; "
+                             "Succeeded means stage 1 passed, Failed means it did not.") from None
         records = [json.loads(row[0].removeprefix(PREFIX)) for row in tables[0]["rows"]]
         print(json.dumps({"execution": args.execution, "status": run["properties"]["status"],
                           "records": records}, indent=2, sort_keys=True))
@@ -246,29 +267,28 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if records[-1].get("status") == "pass" else 1
 
     state = preflight()
-    existing = request("GET", secret_url(), audience=VAULT_AUDIENCE, missing=True)
+    existing = request("GET", SECRET_PATH, missing=True) is not None
     summary = {
         "subscription": SUB, "job": JOB, "job_image": state["container"]["image"], "job_identity": state.get("identity"),
         "commit": state["head"], "migrations_on_main": len(state["bundle"]["expected"]),
         "migration": TARGET, "migration_sha256": state["bundle"]["expected"][TARGET],
         "payload_sha256": hashlib.sha256(" ".join(command(state["bundle"])).encode()).hexdigest(),
-        "key_vault_secret": SECRET + (" exists" if existing else " will be created"),
+        "key_vault_secret": SECRET + (" will be replaced" if existing and args.new_secret
+                                      else " exists" if existing else " will be created"),
     }
-    if existing:
-        collector_password(existing["value"])
+    password = existing_password() if existing and not args.new_secret else None
     if args.stage == "check":
         print(json.dumps(summary, indent=2))
         print("Read-only check passed. Nothing was changed.")
         return 0
 
-    if existing is None:
+    if password is None:
         password = secrets.token_urlsafe(48)
-        request("PUT", secret_url(), audience=VAULT_AUDIENCE, data={
-            "value": collector_url(password), "contentType": "postgresql-url",
+        request("PUT", SECRET_PATH, data={
+            "properties": {"value": collector_url(password), "contentType": "postgresql-url"},
             "tags": {"purpose": "live-ibkr-collector"}})
-        existing = request("GET", secret_url(), audience=VAULT_AUDIENCE)
-    verifier = scram_verifier(collector_password(existing["value"]))
-    del existing
+    verifier = scram_verifier(password)
+    del password
     run = request("POST", JOB_PATH + "/start" + API,
                   data=template(state["container"], command(state["bundle"]), verifier))
     print(json.dumps(dict(summary, execution=run.get("name"), key_vault_secret=SECRET + " ready"), indent=2))

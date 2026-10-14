@@ -65,6 +65,35 @@ class Store:
         self.db.rollback()
         return [_split_visuals(dict(r)) for r in rows]
 
+    # Memory ----------------------------------------------------------------
+
+    def memories(self, user: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT key, value, source, updated_at FROM agent.memories WHERE tenant_id = ?::uuid "
+            "AND user_object_id = ? ORDER BY key", (self.tenant_id, user.lower()),
+        ).fetchall()
+        self.db.rollback()
+        return [dict(r) for r in rows]
+
+    def remember(self, user: str, key: str, value: str, source: str) -> None:
+        self.db.execute(
+            "INSERT INTO agent.memories(tenant_id, user_object_id, key, value, source) VALUES (?::uuid, ?, ?, ?, ?) "
+            "ON CONFLICT (tenant_id, user_object_id, key) DO UPDATE SET value = EXCLUDED.value, "
+            "source = EXCLUDED.source, updated_at = now()",
+            (self.tenant_id, user.lower(), key, value, source),
+        )
+        self._commit()
+
+    def forget(self, user: str, key: str | None = None) -> int:
+        """Delete one preference, or all of them when key is None."""
+        row = self.db.execute(
+            "WITH gone AS (DELETE FROM agent.memories WHERE tenant_id = ?::uuid AND user_object_id = ? "
+            "AND (?::text IS NULL OR key = ?) RETURNING 1) SELECT COUNT(*) AS n FROM gone",
+            (self.tenant_id, user.lower(), key, key),
+        ).fetchone()
+        self._commit()
+        return int(row["n"])
+
     def add_message(self, conversation_id: str, role: str, content: str, *, citations: Sequence[Any] = (),
                     status: str = "ok", correlation_id: str | None = None,
                     usage: dict[str, int] | None = None) -> int:
@@ -166,6 +195,26 @@ class Store:
             "VALUES (?::uuid, ?, ?, ?, ?, ?, ?::jsonb, ?) ON CONFLICT (tenant_id, kind, subject_id, period_key) DO NOTHING "
             "RETURNING item_id",
             (self.tenant_id, kind, account_id, period_key, title[:200], body, json.dumps(list(citations), default=str), run_id),
+        ).fetchone()
+        self._commit()
+        return row is not None
+
+    def queue_first_connection_check(self, flex_source_id: str) -> str | None:
+        """Queue a never-checked IBKR login's first check; None when the database says it is not eligible."""
+        row = self.db.execute("SELECT agent.queue_first_connection_check(?::uuid) AS request_id",
+                              (flex_source_id,)).fetchone()
+        self._commit()
+        return str(row["request_id"]) if row and row["request_id"] else None
+
+    def add_connection_report(self, *, connection_id: str, flex_source_id: str, key: str, state: str, title: str,
+                              body: str, owner_steps: Sequence[str], validation_request_id: str | None,
+                              run_id: int | None) -> bool:
+        row = self.db.execute(
+            "INSERT INTO agent.connection_reports(tenant_id, connection_id, flex_source_id, report_key, state, title, "
+            "body, owner_steps, validation_request_id, run_id) VALUES (?::uuid, ?::uuid, ?::uuid, ?, ?, ?, ?, ?::jsonb, "
+            "?::uuid, ?) ON CONFLICT (tenant_id, flex_source_id, report_key) DO NOTHING RETURNING report_id",
+            (self.tenant_id, connection_id, flex_source_id, key[:120], state, title[:200], body[:2000],
+             json.dumps(list(owner_steps)), validation_request_id, run_id),
         ).fetchone()
         self._commit()
         return row is not None

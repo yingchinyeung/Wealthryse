@@ -63,6 +63,16 @@ param deployOnboarding bool = false
 param intakeContainerName string = 'onboarding-intake'
 @description('Monthly token cap for the onboarding agents, separate from the month-end team\'s.')
 param onboardingTokenBudget int = 5000000
+@description('The operations agent\'s job (ibkrv2stg-agent-ops): every 5 minutes it diagnoses the autonomous administrator\'s open incidents from Azure telemetry, read-only. Off until approved; needs the APAC report deployment.')
+param deployOperations bool = false
+@description('The Log Analytics workspace the container apps log to; the operations job may query it.')
+param opsLogWorkspaceName string = 'ibkrv2stg-logs'
+@description('The VM whose metrics the operations job reads.')
+param opsVmName string = 'ibkrv2stg-private-admin'
+@description('Monthly token cap for the operations agent.')
+param opsTokenBudget int = 5000000
+@description('Optional Key Vault secret URI of a GitHub token limited to this repository\'s contents and pull requests. Empty: the agent diagnoses but never opens a draft pull request. The jobs identity needs Key Vault Secrets User on that secret first.')
+param opsGithubTokenSecretUri string = ''
 
 var tags = {
   application: 'wealthryse-agents'
@@ -230,6 +240,12 @@ var jobs = [
   { name: 'ibkrv2stg-agent-month-end', job: 'month_end_drafter', cron: '0 2 2-7 * *' }
   // 09:00 HKT; also deletes chats older than the retention period.
   { name: 'ibkrv2stg-agent-data-quality', job: 'data_quality', cron: '0 1 * * *' }
+  // 09:30 HKT on Saturdays: each granted account's weekly brief, in the website inbox only.
+  { name: 'ibkrv2stg-agent-weekly-brief', job: 'weekly_brief', cron: '30 1 * * 6' }
+  // Every 15 minutes on weekdays across Hong Kong and US trading hours (the job itself checks the
+  // market is open): alerts on big live moves of granted accounts whose live view is on. Reads only
+  // what PR 58's collector stored; never the gateway.
+  { name: 'ibkrv2stg-agent-live-market', job: 'live_market', cron: '*/15 1-8,13-21 * * 1-5' }
 ]
 
 resource agentJobs 'Microsoft.App/jobs@2024-03-01' = [for j in jobs: {
@@ -408,6 +424,95 @@ resource onboardingJob 'Microsoft.App/jobs@2024-03-01' = if (deployOnboarding &&
             { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${reportStorageAccountName}.blob.${environment().suffixes.storage}' }
             { name: 'INTERNAL_REPORT_CONTAINER', value: reportContainerName }
             { name: 'ONBOARDING_INTAKE_CONTAINER', value: intakeContainerName }
+            { name: 'AZURE_CLIENT_ID', value: jobsIdentity.properties.clientId }
+            { name: 'AGENT_DB_USER', value: jobsIdentity.name }
+          ])
+          resources: { cpu: json('0.5'), memory: '1Gi' }
+        }
+      ]
+    }
+  }
+}
+
+// The operations agent: every 5 minutes, it reads the administrator's open
+// incidents, the recent run records and Azure telemetry (container logs, job
+// executions, resource health, fired alerts, VM metrics, cost), and writes a
+// diagnosis to agent.ops_investigations, which the administrator posts and
+// System health shows. Its Azure roles are read-only: Reader and Cost
+// Management Reader on this resource group, Log Analytics Reader on the
+// workspace. With a GitHub token it may open draft pull requests on this
+// repository only, at most three a day; it never merges.
+var readerRole = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+var costReaderRole = '72fafb9e-0641-4937-9268-a91bfd8191a3'
+var logReaderRole = '73c42c96-874c-492b-b04d-ab87d138a893'
+resource opsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
+  name: opsLogWorkspaceName
+}
+resource opsReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for role in [readerRole, costReaderRole]: if (deployOperations) {
+  name: guid(resourceGroup().id, jobsIdentity.id, role)
+  properties: {
+    principalId: jobsIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', role)
+  }
+}]
+resource opsLogReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (deployOperations) {
+  name: guid(opsWorkspace.id, jobsIdentity.id, logReaderRole)
+  scope: opsWorkspace
+  properties: {
+    principalId: jobsIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', logReaderRole)
+  }
+}
+var opsGithubSecrets = empty(opsGithubTokenSecretUri) ? [] : [
+  { name: 'ops-github-token', keyVaultUrl: opsGithubTokenSecretUri, identity: jobsIdentity.id }
+]
+var opsGithubEnv = empty(opsGithubTokenSecretUri) ? [] : [
+  { name: 'OPS_GITHUB_TOKEN', secretRef: 'ops-github-token' }
+]
+resource operationsJob 'Microsoft.App/jobs@2024-03-01' = if (deployOperations) {
+  name: 'ibkrv2stg-agent-ops'
+  location: resourceGroup().location
+  tags: tags
+  dependsOn: [pulls, tools, opsReader, opsLogReader]
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: { '${jobsIdentity.id}': {} }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 600
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        cronExpression: '*/5 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [{ server: registry.properties.loginServer, identity: jobsIdentity.id }]
+      secrets: opsGithubSecrets
+    }
+    template: {
+      containers: [
+        {
+          name: 'job'
+          image: image
+          command: ['python', '-m', 'wealthryse_agent.jobs']
+          args: ['operations']
+          env: concat(commonEnv, opsGithubEnv, [
+            { name: 'AGENT_MODEL_ENDPOINT', value: modelEndpoint }
+            { name: 'AGENT_MODEL_DEPLOYMENT', value: reportModelDeployment }
+            { name: 'AGENT_MODEL_REGION', value: 'southeastasia' }
+            { name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }
+            { name: 'AGENT_TOOL_SERVER_URL', value: 'https://${toolsAppName}.internal.${managedEnvironment.properties.defaultDomain}' }
+            { name: 'AGENT_TOOL_SERVER_AUDIENCE', value: toolsAudience }
+            { name: 'AGENT_OPS_TOKEN_BUDGET', value: string(opsTokenBudget) }
+            { name: 'AZURE_SUBSCRIPTION_ID', value: subscription().subscriptionId }
+            { name: 'OPS_RESOURCE_GROUP', value: resourceGroup().name }
+            { name: 'OPS_LOG_WORKSPACE_ID', value: opsWorkspace.properties.customerId }
+            { name: 'OPS_VM_NAME', value: opsVmName }
             { name: 'AZURE_CLIENT_ID', value: jobsIdentity.properties.clientId }
             { name: 'AGENT_DB_USER', value: jobsIdentity.name }
           ])

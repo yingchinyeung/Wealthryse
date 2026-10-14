@@ -68,6 +68,22 @@ class AgentWebTests(unittest.TestCase):
         response = client.post("/api/agents/chat", json={"account_id": "U1", "message": "hi", "user_object_id": "x"})
         self.assertEqual(response.status_code, 422)
 
+    def test_memory_is_always_the_signed_in_persons_own(self):
+        client = _app("all", VIEWER)
+        with mock.patch.object(agent_web._AgentApi, "request", return_value={"memories": []}) as request:
+            self.assertEqual(client.get("/api/agents/memory").status_code, 200)
+            self.assertEqual(client.put("/api/agents/memory/tone", json={"value": "plain"}).status_code, 200)
+            self.assertEqual(client.delete("/api/agents/memory/tone").status_code, 200)
+            self.assertEqual(client.put("/api/agents/memory/tone",
+                                        json={"value": "plain", "user_object_id": OWNER["object_id"]}).status_code, 422)
+        calls = request.call_args_list
+        self.assertEqual(calls[0].kwargs["params"]["user_object_id"], VIEWER["object_id"])
+        self.assertEqual((calls[1].args, calls[1].kwargs["json"]),
+                         (("PUT", "/v1/memory/tone"), {"user_object_id": VIEWER["object_id"], "value": "plain"}))
+        self.assertEqual(calls[2].args, ("DELETE", "/v1/memory/tone"))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(_app("owner", VIEWER).get("/api/agents/memory").status_code, 404)
+
 
 class MonthTeamWebTests(unittest.TestCase):
     CARDS = [{"item_id": 1, "kind": "holdings_explainer"}, {"item_id": 2, "kind": "month_end_hold"},

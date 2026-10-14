@@ -347,11 +347,46 @@ acknowledges at approval 2. A clean review passes.
 4. Until the current reports have a review, the check is pending, so approval
    2 cannot be given. A re-render puts it back to pending.
 
+**Go-live coordinator.** Two parts, neither of which calls a model:
+
+- **Readiness pack** (`ibkr_etl/onboarding_readiness.py`, `readiness_pack`).
+  Everything for approvals 2 and 3 in one place: every check of every stage
+  so far with its evidence and whether an agent or the platform recorded it,
+  the warnings already acknowledged, the approved name, currency and start
+  date beside what the intake agent read in the client's documents, exactly
+  what GO LIVE switches on, and what still stands in the way. It is computed
+  from the case each time, with a digest. The case page shows it above the
+  GO LIVE box (the onboarding thread's part).
+- **First-month watch** (`wealthryse_agent/onboarding_watch.py`, in the
+  hourly `onboarding` job, even when the model budget is used up). For each
+  case that went live and waits for its first month-end, it posts an inbox
+  card once for: the first daily data and checks after go-live, five days
+  without data, failed daily checks, the month-end team lacking access (with
+  the `--grant month_team=<account>` command; the grant stays your step), and
+  the first month-end released. It reads only dates and statuses through
+  `list_live_onboarding_cases` (`007_onboarding_watch.sql`).
+
+**Connection agent** (`wealthryse_agent/connection_watch.py`, in the same
+hourly `onboarding` job, also plain code). A new IBKR login is not contacted
+until a check runs. For each login never checked, the agent queues its first
+check through `agent.queue_first_connection_check()`: the same one-attempt
+request as the "Check now" button, which the Flex discovery job
+(`ibkrv2stg-flex-discovery`) then runs. It reports once per check, in plain
+words: the accounts the login sees (they appear under Available), or the
+exact problem with IBKR's error code and what to do, or that a check has
+waited 30 minutes, meaning the discovery job is not running. It never
+retries, and never queues while the login is cooling down or held for a
+reset: IBKR locks a token after repeated failures, so every later check is
+the owner's. It sees statuses, codes and counts through `list_broker_logins`,
+never the token or its Key Vault name (`009_connection_checks.sql`). Its
+reports go to `agent.connection_reports`, which the administrator posts to
+its system updates conversation.
+
 **Turning it on** (each step needs Ying's typed approval naming the resources):
 
 1. **Database.** Rerun `scripts/install_agent_schema.py` with
    `--platform-reader <the platform's role>`. It applies
-   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` and lets
+   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` (and `007_onboarding_watch.sql` and `009_connection_checks.sql`) and lets
    that role read the agents' results (and nothing else in the agent schema).
 2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
 3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOnboarding=true`
@@ -361,6 +396,136 @@ acknowledges at approval 2. A clean review passes.
 4. **Recording.** A platform job calls `record_agent_reconciliations`, and
    the month-end report job calls `record_agent_reviews` after
    `render_onboarding_composite_reports.py`.
+
+## Operations agent
+
+The autonomous administrator (`scripts/run_autonomous_administrator.py`)
+checks the platform every five minutes and opens an incident for each failing
+check. It is still the only thing that acts. The operations agent adds the
+investigation it lacked, so that it can say what the exact problem is.
+
+**What it reads.** Every 5 minutes, for each open warning or critical
+incident it has not yet looked at (once per episode: an incident that resolves
+and comes back is looked at again):
+
+- the incident and the administrator's evidence, the administrator's runs and
+  actions over 7 days, and import runs over 14 days, through the tool server
+  (`list_open_incidents`, `get_operations_history`; only the `operations` job
+  is offered them);
+- Azure telemetry, read with read-only roles: error lines from the container
+  apps' logs (Log Analytics), each job's recent executions, resource health,
+  fired alerts, the build VM's metrics and the resource group's daily cost.
+
+Anything that looks like a credential is removed before the model or the
+agent's table sees it. A source that cannot be read is recorded as unread and
+the others carry on.
+
+**What it writes.** The model (on `wr-reports-apac`) writes a summary, the
+likely cause, a confidence, the evidence and up to four steps for the owner.
+Code keeps only evidence whose source was read and whose every number appears
+in that source; with none left, the diagnosis is inconclusive and low
+confidence. The diagnosis goes to `agent.ops_investigations` with a digest of
+each source, never the logs themselves.
+
+**Draft pull requests.** When the cause is a defect in this repository's code
+(a traceback naming a file under `src/` or `scripts/`) and a GitHub token is
+configured, it writes the fix and a test and opens them as a draft pull
+request on `yingchinyeung/Wealthryse` only. Code checks the patch: only the
+files the diagnosis named, under `src/`, `scripts/` or `tests/`, a test under
+`tests/test_*.py`, valid Python, nothing that looks like a credential. It
+never touches workflows, infrastructure, migrations or configuration, opens at
+most three a day, and cannot merge or deploy. A refused patch or a GitHub
+failure keeps the diagnosis.
+
+**Where you see it.** The administrator posts each new diagnosis once in the
+admin chat's "System administrator updates" conversation, and the System
+health page lists open incidents with the latest diagnosis and any draft fix
+(`ibkr_etl/ops_agent_posts.py`). Until the platform role is granted the
+agent's table, both simply show nothing from the agent.
+
+**Turning it on** (each step needs Ying's typed approval naming the resources):
+
+1. **Database.** Rerun `scripts/install_agent_schema.py` with
+   `--platform-reader <the platform's role>`. It applies `006_operations.sql`
+   and lets that role read `agent.ops_investigations`.
+2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
+3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOperations=true`. This
+   creates `ibkrv2stg-agent-ops` and gives the jobs identity Reader and
+   Cost Management Reader on the resource group and Log Analytics Reader on
+   `ibkrv2stg-logs`.
+4. **Draft pull requests (optional).** Put a fine-grained GitHub token limited
+   to this repository's contents and pull requests in a Key Vault secret, give
+   the jobs identity Key Vault Secrets User on it (the network thread's step),
+   and redeploy with `opsGithubTokenSecretUri`. Without it the agent diagnoses
+   but never opens a pull request.
+
+## Personal analyst: memory and weekly briefs
+
+**Memory.** Chat remembers only the current conversation. Memory adds four
+preferences per person: answer length (short or detailed), tone (plain or
+technical), the benchmark they compare with, and what they care about. A
+person sets them under "What I remember" in the chat panel, or by asking the
+analyst to remember something; the analyst then confirms it in the chat. Code
+checks each value (fixed choices, or up to 60 or 200 characters of plain
+text) before saving it to `agent.memories`. Each person sees, changes and
+deletes only their own, and retention does not delete them. They go to the
+model after the rules, marked as data about how to write, so they never change
+the rules, the figures or which account it answers about.
+
+**Weekly brief.** On Saturdays at 09:30 HKT, `weekly_brief` writes four to
+eight sentences per account on its latest week of data: the value and
+return against the benchmark, the holdings that moved it most, deposits and
+withdrawals, and any data gaps. It uses the same tools, model
+(`wr-analyst-astra`) and figure check as chat, and it skips a brief that
+fails the check. Briefs appear only in the website inbox, to the people who
+can see that account. Nothing is emailed. Like the other scheduled jobs, it
+covers only the accounts granted to it (`--grant weekly_brief=<account>`).
+
+**Turning it on** (each step needs Ying's typed approval naming the resources):
+
+1. **Database.** Rerun `scripts/install_agent_schema.py`. It applies
+   `008_chat_memory_and_briefs.sql`.
+2. **Image.** Rebuild `Dockerfile.agent` and the platform image (the chat
+   panel's "What I remember" view).
+3. **Job.** Deploy `infra/agent-apps.bicep`. This adds
+   `ibkrv2stg-agent-weekly-brief`, and grant the accounts that should get
+   briefs.
+
+## Live market agent
+
+It builds on PR 58's read-only IBKR data: the collector on the gateway VM
+stores live account values, positions, quotes and executions. The agent reads
+only those stored rows (`010_live_market.sql`): it never runs on the VM and
+never connects to the gateway, so it has no route to an order. Like the
+website, it shows an account's live data only when that account's
+`live_view` switch is `active`; the `preview` pilot stays the owner's own
+website view.
+
+- **Chat.** Two new tools for website chat. `get_live_snapshot` gives today's
+  net liquidation value, P&L and return, cash, the biggest movers with their
+  change since the prior close, and today's executions count, or says live
+  data is not available. `run_stress_test` revalues the latest statement
+  holdings under hypothetical moves ("Hong Kong falls 10%", "the yen falls 5%")
+  by market, currency, sector, asset class or symbol, and returns the total
+  impact, its share of NAV and the holdings most affected. Arithmetic runs in
+  code, and the answer's figures pass the same check as every chat answer.
+  Live positions and chat use `wr-analyst-astra`, as decided.
+- **Alerts.** The `live_market` job (`ibkrv2stg-agent-live-market`) runs every
+  15 minutes on weekdays in Hong Kong and US trading hours. For each account
+  granted to it with its live view on, it posts an inbox card, once a day per
+  rule, when the account is up or down 2% today or one position adds or takes
+  0.75% of its value. The analyst writes a short explanation from the live
+  tools; if the explanation fails the figure check, the card says what moved
+  and leaves the explanation out. Nothing is sent outside the website.
+- **Website.** The "Live now" card gets an Explain button that asks the
+  analyst what moved the account today, and a badge linking to the inbox when
+  today has alerts for that account.
+
+**Turning it on** (each step needs Ying's typed approval naming the resources):
+PR 58's gateway VM and collector first, per `docs/LIVE_IBKR_DATA.md`; then
+rerun `scripts/install_agent_schema.py` (applies `010_live_market.sql`), rebuild
+the agent and platform images, deploy `infra/agent-apps.bicep`, and grant
+accounts to the job with `--grant live_market=<account>`.
 
 ## Cost drivers
 
@@ -375,6 +540,13 @@ acknowledges at approval 2. A clean review passes.
 - The onboarding agents, when deployed: an hourly job that calls the model
   only for new documents, a NAV break or new reports, with its own monthly budget
   (`onboardingTokenBudget`).
+- The operations agent, when deployed: a job every 5 minutes that calls the
+  model only for a new incident, with its own monthly budget (`opsTokenBudget`).
+- Weekly briefs: one model run per granted account per week, within the
+  daily token budget.
+- Live market alerts: a short job every 15 minutes in trading hours that
+  reads stored rows only and calls the model once per alert (at most one per
+  rule, account and day), within the daily token budget.
 - No new database server.
 
 ## Not yet done

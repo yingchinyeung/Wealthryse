@@ -17,6 +17,7 @@ import os
 import re
 import threading
 from html import escape
+from urllib.parse import quote
 from typing import Any, Callable, Iterable
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -44,6 +45,11 @@ class ChatBody(BaseModel):
     account_id: str = Field(min_length=1, max_length=64)
     message: str = Field(min_length=1, max_length=2000)
     conversation_id: str | None = Field(default=None, max_length=36)
+
+
+class MemoryBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    value: str = Field(min_length=1, max_length=200)
 
 
 class FeedbackBody(BaseModel):
@@ -148,6 +154,22 @@ def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
         stream = api.stream("/v1/chat", {"user_object_id": oid(user), **body.model_dump()})
         return StreamingResponse(stream, media_type="text/event-stream",
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+    @app.get("/api/agents/memory")
+    def agent_memory(user: dict[str, Any] = Depends(agent_user)) -> Any:
+        return api.request("GET", "/v1/memory", params={"user_object_id": oid(user)})
+
+    @app.put("/api/agents/memory/{key}")
+    def agent_set_memory(key: str, body: MemoryBody, user: dict[str, Any] = Depends(agent_user)) -> Any:
+        return api.request("PUT", f"/v1/memory/{quote(key, safe='')}", json={"user_object_id": oid(user), "value": body.value})
+
+    @app.delete("/api/agents/memory")
+    def agent_forget_all(user: dict[str, Any] = Depends(agent_user)) -> Any:
+        return api.request("DELETE", "/v1/memory", params={"user_object_id": oid(user)})
+
+    @app.delete("/api/agents/memory/{key}")
+    def agent_forget(key: str, user: dict[str, Any] = Depends(agent_user)) -> Any:
+        return api.request("DELETE", f"/v1/memory/{quote(key, safe='')}", params={"user_object_id": oid(user)})
 
     @app.get("/api/agents/conversations")
     def agent_conversations(account_id: str, user: dict[str, Any] = Depends(agent_user)) -> Any:
@@ -269,7 +291,7 @@ const css=`.wr-fab{position:fixed;right:20px;bottom:20px;z-index:50;border:0;bor
 .wr-rate{margin-top:6px;display:flex;gap:6px}.wr-rate button{border:1px solid var(--border,#ccc);background:none;border-radius:6px;cursor:pointer;padding:1px 6px;color:inherit}
 .wr-form{display:flex;gap:8px;padding:10px;border-top:1px solid var(--border,#ddd)}.wr-form textarea{flex:1;resize:none;height:44px;font:inherit;font-size:14px;padding:8px;border-radius:8px;border:1px solid var(--border,#ccc);background:transparent;color:inherit}
 .wr-form button{border:0;border-radius:8px;padding:0 14px;font:inherit;font-weight:600;cursor:pointer;background:var(--accent,#1f6feb);color:#fff}
-.wr-explain{margin-left:8px;font-size:12px;border:1px solid var(--border,#ccc);background:none;border-radius:999px;padding:1px 8px;cursor:pointer;color:inherit;vertical-align:middle}
+.wr-alert{text-decoration:none;color:#8a5a00;border-color:rgba(194,137,0,.4)}.wr-explain{margin-left:8px;font-size:12px;border:1px solid var(--border,#ccc);background:none;border-radius:999px;padding:1px 8px;cursor:pointer;color:inherit;vertical-align:middle}
 .wr-panel.wide{width:min(760px,calc(100vw - 32px));height:min(780px,calc(100vh - 120px))}
 .wr-visual{margin:8px 0 4px;padding:0}.wr-visual figcaption{font-weight:600;font-size:13px;margin-bottom:4px}.wr-chart{width:100%;height:auto;display:block;overflow:visible}
 .wr-chart .wr-tick{font-size:10px;fill:currentColor;opacity:.75}.wr-chart .wr-grid{stroke:currentColor;opacity:.12}.wr-chart .wr-axis{stroke:currentColor;opacity:.45}
@@ -282,7 +304,7 @@ function init(){
  const style=document.createElement('style');style.textContent=css;document.head.appendChild(style);
  const fab=document.createElement('button');fab.className='wr-fab';fab.type='button';fab.textContent='Ask about this account';
  const panel=document.createElement('section');panel.className='wr-panel';panel.setAttribute('aria-label','Portfolio analyst');
- panel.innerHTML=`<div class="wr-head"><strong>Portfolio analyst</strong><span><a href="/agent-inbox">Inbox</a> · <button type="button" data-new>New chat</button> · <button type="button" data-wide aria-label="Wider panel">⤢</button> · <button type="button" data-close aria-label="Close">✕</button></span></div><div class="wr-log" aria-live="polite"></div><form class="wr-form"><textarea maxlength="2000" placeholder="Ask about holdings or performance…" aria-label="Your question"></textarea><button type="submit">Send</button></form>`;
+ panel.innerHTML=`<div class="wr-head"><strong>Portfolio analyst</strong><span><a href="/agent-inbox">Inbox</a> · <button type="button" data-new>New chat</button> · <button type="button" data-memory>What I remember</button> · <button type="button" data-wide aria-label="Wider panel">⤢</button> · <button type="button" data-close aria-label="Close">✕</button></span></div><div class="wr-log" aria-live="polite"></div><form class="wr-form"><textarea maxlength="2000" placeholder="Ask about holdings or performance…" aria-label="Your question"></textarea><button type="submit">Send</button></form>`;
  document.body.append(fab,panel);
  const log=panel.querySelector('.wr-log'),form=panel.querySelector('form'),input=form.querySelector('textarea'),send=form.querySelector('button');
  let conversation=store.get(key),busy=false;
@@ -302,6 +324,7 @@ function init(){
      if(e.type==='start'){conversation=e.conversation_id;store.set(key,conversation)}
      else if(e.type==='status'){status.textContent=e.text+'…'}
      else if(e.type==='answer'||e.type==='rejected'){status.className='wr-msg wr-bot';status.innerHTML=md(e.answer)+visuals(e.visuals)+sources(e.citations);rate(status,e.message_id)}
+     else if(e.type==='remembered'){add('wr-bot wr-status','I will remember: '+e.memories.map(x=>esc(x.label)+': '+esc(x.value)).join('; ')+'. Change it under What I remember.')}
      else if(e.type==='error'){status.className='wr-msg wr-bot';status.textContent=e.message}}}
   }catch(e){status.className='wr-msg wr-bot';status.textContent='The connection dropped. Try again.'}
   finally{busy=false;send.disabled=false;log.scrollTop=log.scrollHeight}}
@@ -310,12 +333,34 @@ function init(){
  panel.querySelector('[data-wide]').addEventListener('click',()=>panel.classList.toggle('wide'));
  panel.querySelector('[data-close]').addEventListener('click',()=>panel.classList.remove('open'));
  panel.querySelector('[data-new]').addEventListener('click',()=>{conversation=null;store.set(key,null);empty();input.focus()});
+ const mem=(method,path,body)=>fetch('/api/agents/memory'+path,{method,credentials:'same-origin',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined})
+  .then(async r=>{const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.detail||'Not saved.');return j});
+ async function memory(){log.innerHTML='';const box=add('wr-bot','<p>Loading…</p>');
+  try{const data=await mem('GET','');const by=Object.fromEntries(data.memories.map(x=>[x.key,x]));
+   box.innerHTML='<p><strong>What I remember</strong><br>These shape how I write answers, never the figures. Only you can see them.</p>'+data.keys.map(k=>{const cur=by[k.key];
+    const field=k.choices?`<select data-key="${esc(k.key)}"><option value="">Not set</option>${k.choices.map(c=>`<option ${cur&&cur.value===c?'selected':''}>${esc(c)}</option>`).join('')}</select>`
+     :`<input data-key="${esc(k.key)}" maxlength="${k.max_length}" value="${esc(cur?cur.value:'')}" placeholder="Not set">`;
+    return `<p><label>${esc(k.label)}<br>${field}</label> ${cur?`<button type="button" class="wr-explain" data-forget="${esc(k.key)}">Delete</button>`:''}</p>`}).join('')+
+    '<p><button type="button" class="wr-explain" data-save>Save</button> <button type="button" class="wr-explain" data-forget-all>Forget everything</button> <button type="button" class="wr-explain" data-back>Back to chat</button></p><p class="wr-status" data-note></p>';
+   const note=box.querySelector('[data-note]');
+   box.querySelector('[data-save]').addEventListener('click',async()=>{try{for(const f of box.querySelectorAll('[data-key]')){const v=f.value.trim(),k=f.dataset.key;
+     if(v&&(!by[k]||by[k].value!==v))await mem('PUT','/'+encodeURIComponent(k),{value:v});else if(!v&&by[k])await mem('DELETE','/'+encodeURIComponent(k))}memory()}catch(e){note.textContent=e.message}});
+   box.querySelectorAll('[data-forget]').forEach(b=>b.addEventListener('click',()=>mem('DELETE','/'+encodeURIComponent(b.dataset.forget)).then(memory).catch(e=>{note.textContent=e.message})));
+   box.querySelector('[data-forget-all]').addEventListener('click',()=>mem('DELETE','').then(memory).catch(e=>{note.textContent=e.message}));
+   box.querySelector('[data-back]').addEventListener('click',()=>load());
+  }catch(e){box.textContent='What I remember could not be loaded.'}}
+ panel.querySelector('[data-memory]').addEventListener('click',memory);
  form.addEventListener('submit',e=>{e.preventDefault();const q=input.value;input.value='';ask(q)});
  input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
  const explain=()=>{document.querySelectorAll('.page-view.active .card > .label').forEach((label,n)=>{if(n>=6||label.querySelector('.wr-explain'))return;
   const topic=label.textContent.replace(/[·—].*$/,'').trim();if(!topic)return;const b=document.createElement('button');b.type='button';b.className='wr-explain';b.textContent='Explain';
-  b.setAttribute('aria-label','Explain '+topic);b.addEventListener('click',()=>{open();ask(`Explain the ${topic.toLowerCase()} for this account as of the latest data.`)});label.appendChild(b)})};
- explain();new MutationObserver(()=>explain()).observe(document.querySelector('main')||document.body,{childList:true,subtree:false});
+  const live=label.closest('.live-card');const question=live?'Explain what moved this account today, using the live data.':`Explain the ${topic.toLowerCase()} for this account as of the latest data.`;
+  b.setAttribute('aria-label','Explain '+topic);b.addEventListener('click',()=>{open();ask(question)});label.appendChild(b)})};
+ const alerts=()=>{const label=document.querySelector('.live-card > .label');if(!label||label.querySelector('.wr-alert'))return;
+  fetch('/api/agents/inbox',{credentials:'same-origin'}).then(r=>r.ok?r.json():{items:[]}).then(d=>{const today=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Hong_Kong'});
+   const n=(d.items||[]).filter(x=>x.kind==='live_alert'&&x.subject_id===account&&x.status==='new'&&String(x.period_key).startsWith(today)).length;
+   if(!n||label.querySelector('.wr-alert'))return;const a=document.createElement('a');a.className='wr-explain wr-alert';a.href='/agent-inbox';a.textContent=n===1?'1 alert today':n+' alerts today';label.appendChild(a)}).catch(()=>{})};
+ explain();alerts();new MutationObserver(()=>explain()).observe(document.querySelector('main')||document.body,{childList:true,subtree:false});
 }
 })();"""
 

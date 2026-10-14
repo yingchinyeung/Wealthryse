@@ -35,6 +35,7 @@ from ibkr_etl.autonomous_admin import (  # noqa: E402
     plan_safe_repairs,
 )
 from ibkr_etl.burn_in import now_hkt_date, portal_boundary_check  # noqa: E402
+from ibkr_etl.ops_agent_posts import post_connection_reports, post_new_diagnoses  # noqa: E402
 from ibkr_etl.util import canonical_json, utc_now_iso  # noqa: E402
 
 
@@ -471,6 +472,10 @@ def _publish_admin_chat_updates(
             },
             incident_ids.get(finding.incident_key),
         )
+    # The operations agent's diagnoses of open incidents and the connection agent's
+    # reports, posted here because only the administrator writes this conversation.
+    post_new_diagnoses(connection, conversation_id, append)
+    post_connection_reports(connection, conversation_id, append)
 
 
 def _ai_config(identity_client_id: str) -> AIAnalystConfig:

@@ -44,9 +44,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMAS = tuple(sorted((ROOT / "migrations" / "agent").glob("*.sql")))
-# The onboarding agents' results, which the platform records on their cases.
-PLATFORM_READS = "agent.onboarding_reviews, agent.onboarding_term_drafts, agent.onboarding_reconciliations"
-JOBS = {"holdings_explainer", "month_end_drafter", "data_quality", "month_team", "onboarding"}
+# The onboarding agents' results, which the platform records on their cases, and the
+# operations agent's diagnoses, which the administrator posts and System health shows.
+PLATFORM_READS = ("agent.onboarding_reviews, agent.onboarding_term_drafts, agent.onboarding_reconciliations, "
+                  "agent.ops_investigations, agent.connection_reports")
+JOBS = {"holdings_explainer", "month_end_drafter", "data_quality", "month_team", "onboarding", "operations",
+        "weekly_brief", "live_market"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}\Z")
 
 

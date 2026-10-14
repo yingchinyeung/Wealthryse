@@ -134,7 +134,7 @@ class AlreadyLiveFilesTest(unittest.TestCase):
 
 
 class PrepareTest(unittest.TestCase):
-    def run_prepare(self, changed, env=()):
+    def run_prepare(self, changed, env=(), applied=None, migrations=None):
         app = {"properties": {"template": {"containers": [{"image": "reg/ibkr-platform:web-" + DEPLOYED, "env": list(env)}]},
                               "configuration": {"ingress": {"fqdn": "site.example"}}}}
 
@@ -143,12 +143,17 @@ class PrepareTest(unittest.TestCase):
                 return HEAD + "\n"
             if args[0] == "diff":
                 return "\n".join(changed)
+            if args[0] == "show" and args[1].startswith(HEAD + ":migrations/postgres/"):
+                return (migrations or {})[args[1].rsplit("/", 1)[1]]
             raise AssertionError(args)
 
         import json, tempfile
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "release-state.json"
+            record = Path(tmp) / "applied-migrations.json"
+            record.write_text(json.dumps({"migrations": applied or {}}))
             with mock.patch.object(release, "git", side_effect=git), \
+                    mock.patch.object(release, "APPLIED_MIGRATIONS", record), \
                     mock.patch.object(release, "az", return_value=app), \
                     mock.patch.object(release, "STATE", state), \
                     mock.patch.object(release.subprocess, "run", return_value=mock.Mock(returncode=0)), \
@@ -169,10 +174,38 @@ class PrepareTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_prepare(["Dockerfile", "src/ibkr_etl/web.py"])
 
-    def test_onboarding_switched_on_stops_the_release(self):
+    ON = [{"name": "ONBOARDING_V2_ENABLED", "value": "True"}]
+    SQL = {"064_broker_connections_and_onboarding_cases.sql": b"create 064\n",
+           "065_onboarding_report_style.sql": b"alter 065\n"}
+
+    def recorded(self, sql):
+        import hashlib
+        return {name: {"sha256": hashlib.sha256(body).hexdigest()} for name, body in sql.items()}
+
+    def test_onboarding_switched_on_without_its_migrations_recorded_stops_the_release(self):
         with self.assertRaises(SystemExit) as stopped:
-            self.run_prepare(["src/ibkr_etl/web.py"], env=[{"name": "ONBOARDING_V2_ENABLED", "value": "True"}])
+            self.run_prepare(["src/ibkr_etl/web.py"], env=self.ON, migrations=self.SQL)
         self.assertIn("064_broker_connections_and_onboarding_cases.sql", str(stopped.exception))
+        self.assertIn("065_onboarding_report_style.sql", str(stopped.exception))
+
+    def test_onboarding_switched_on_with_its_migrations_recorded_is_released(self):
+        state = self.run_prepare(["src/ibkr_etl/web.py"], env=self.ON, applied=self.recorded(self.SQL), migrations=self.SQL)
+        self.assertEqual(state["changed_files"], ["src/ibkr_etl/web.py"])
+
+    def test_a_recorded_migration_that_differs_from_main_still_stops_the_release(self):
+        changed = dict(self.SQL, **{"065_onboarding_report_style.sql": b"alter 065 differently\n"})
+        with self.assertRaises(SystemExit) as stopped:
+            self.run_prepare(["src/ibkr_etl/web.py"], env=self.ON, applied=self.recorded(self.SQL), migrations=changed)
+        self.assertIn("065_onboarding_report_style.sql", str(stopped.exception))
+        self.assertNotIn("064_broker", str(stopped.exception))
+
+    def test_the_repository_records_the_onboarding_migrations_as_on_main(self):
+        import hashlib, json
+        recorded = json.loads(release.APPLIED_MIGRATIONS.read_text())["migrations"]
+        for names in release.SWITCHES_NEEDING_MIGRATIONS.values():
+            for name in names:
+                body = (ROOT / "migrations" / "postgres" / name).read_bytes()
+                self.assertEqual(recorded[name]["sha256"], hashlib.sha256(body).hexdigest(), name)
 
     def test_onboarding_switch_absent_or_off_does_not_stop_the_release(self):
         for env in ([], [{"name": "ONBOARDING_V2_ENABLED", "value": "false"}], [{"name": "OTHER", "secretRef": "x"}]):

@@ -94,7 +94,13 @@ def prepare():
     skipped = [p for p in changed if p.startswith('scripts/') and p.endswith(('.mjs', '.py'))]
     if skipped:
         print('Not part of the website release (reporting scripts):\n  ' + '\n  '.join(skipped))
-    image_changes = [p for p in changed if not p.startswith(IGNORED_PREFIXES) and not p.endswith('.md') and p not in skipped]
+    # Database migrations are applied by the bootstrap job, never by this release.
+    migrations = [p for p in changed if p.startswith('migrations/postgres/')]
+    if migrations:
+        print('Not part of the website release (database migrations; apply them with the bootstrap job '
+              'before switching the website if the new code needs them):\n  ' + '\n  '.join(migrations))
+    image_changes = [p for p in changed if not p.startswith(IGNORED_PREFIXES) and not p.endswith('.md')
+                     and p not in skipped and p not in migrations]
     unsupported = [p for p in image_changes if not p.startswith(PACKAGE + '/')]
     if unsupported:
         raise SystemExit('This release path only ships src/ibkr_etl. Other image files changed:\n  ' + '\n  '.join(unsupported))
@@ -103,6 +109,7 @@ def prepare():
         'fqdn': app['properties']['configuration']['ingress']['fqdn'],
         'target_image': f'{REG}/ibkr-platform:web-{head}',
         'changed_files': [p for p in image_changes],
+        'migrations_not_shipped': migrations,
     }
     STATE.write_text(json.dumps(state, indent=2))
     print(json.dumps(state, indent=2))

@@ -27,8 +27,9 @@ jobs:
       - name: Test
         run: python scripts/ci_run_tests.py
 
-  # Agent schema, account isolation, tool figures and onboarding schema rules against a real
-  # PostgreSQL (synthetic data only). The main test job skips these.
+  # Agent schema, account isolation and tool figures, onboarding schema rules,
+  # and the live IBKR tables and collector role, against a real PostgreSQL
+  # (synthetic data only). The main test job skips these.
   agent-database:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -66,6 +67,9 @@ jobs:
       # pushes nothing.
       - name: Build
         run: docker build -f Dockerfile.azure -t wealthryse-ingestion:ci .
+      # The read-only live collector that runs beside IB Gateway on the gateway VM.
+      - name: Build live collector
+        run: docker build -f Dockerfile.live-collector -t wealthryse-live-collector:ci .
 
   bicep:
     runs-on: ubuntu-latest

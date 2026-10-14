@@ -15,6 +15,7 @@ from psycopg.rows import dict_row
 
 from .config import load_settings
 from .flex_client import FlexClient, FlexError, is_lockout_error
+from .flex_recipe import check_flex_recipe
 from .flex_sources import discovered_account_summaries
 from .parser import parse_flex_xml
 from .service import ingest_content
@@ -55,6 +56,30 @@ def _secret_value(vault_uri: str, secret_name: str, client_id: str) -> str:
     if not value:
         raise RuntimeError("Flex token secret is empty")
     return value
+
+
+def recipe_summary(content: bytes) -> dict[str, object]:
+    """What the statement lacks against the platform's Flex recipe: section names and messages only.
+
+    Never raises, so a statement the check cannot read never stops discovery.
+    """
+    try:
+        result = check_flex_recipe(content)
+    except Exception as error:  # noqa: BLE001 - the check is advisory here
+        return {"status": "unchecked", "reason": str(error)[:200], "problems": []}
+    problems: dict[tuple[str, str, str], dict[str, object]] = {}
+    for account, findings in sorted(result.account_findings.items()):
+        for finding in (*result.statement_findings, *findings):
+            if finding.status == "pass":
+                continue
+            key = (finding.section, finding.status, finding.message)
+            item = problems.setdefault(key, {"section": finding.section, "label": finding.label,
+                                             "status": finding.status, "message": finding.message,
+                                             "accounts": []})
+            if account not in item["accounts"]:
+                item["accounts"].append(account)
+    ordered = sorted(problems.values(), key=lambda p: (p["status"] != "fail", str(p["label"])))
+    return {"status": result.status, "problems": ordered[:20]}
 
 
 def _claim_request(connection, tenant_id: str):
@@ -261,6 +286,7 @@ def run_one_validation() -> dict[str, object]:
             accounts = discovered_account_summaries(parsed)
             if not accounts or len(accounts) > 250:
                 raise RuntimeError("invalid_discovered_account_count")
+            recipe = recipe_summary(report.content)
             report_sha256 = hashlib.sha256(report.content).hexdigest()
             reference_sha256 = hashlib.sha256(
                 report.reference_code.encode("utf-8")
@@ -385,6 +411,7 @@ def run_one_validation() -> dict[str, object]:
                                 "report_sha256": report_sha256,
                                 "ingestion_run_id": ingestion["run_id"],
                                 "reconciliation": ingestion["reconciliation"],
+                                "recipe": recipe,
                             },
                             sort_keys=True,
                         ),

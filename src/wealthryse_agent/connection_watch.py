@@ -107,6 +107,28 @@ def problem(code: str | None, phase: str | None) -> tuple[str, list[str]]:
             ["Look at the Flex discovery job's runs (ibkrv2stg-flex-discovery) in Azure."])
 
 
+def recipe_gaps(recipe: Any, account_count: int) -> tuple[str, list[str]]:
+    """What the Flex query lacks against the recipe, in words, and the owner's steps; empty when nothing."""
+    if not isinstance(recipe, Mapping):
+        return "", []
+    problems = [p for p in recipe.get("problems") or [] if isinstance(p, Mapping)]
+    must = [p for p in problems if p.get("status") == "fail"]
+    may = [p for p in problems if p.get("status") == "warn"]
+    if not must and not may:
+        return "", []
+    parts = []
+    for item in must + may:
+        accounts = list(item.get("accounts") or [])
+        where = f" (for {', '.join(map(str, accounts))})" if accounts and len(accounts) < account_count else ""
+        parts.append(f"{item.get('label')}: {item.get('message')}{where}")
+    lead = "Must fix: " if must else "Worth checking: "
+    text = lead + " ".join(f"{n}. {part}" for n, part in enumerate(parts[:8], 1))
+    steps = ["In IBKR Client Portal open Performance & Reports, then Flex Queries, and edit this login's query."]
+    steps += [f"{p.get('label')}: {p.get('message')}" for p in (must + may)[:5]]
+    steps.append("Save, then " + _AGAIN)
+    return text, steps
+
+
 def findings(login: Mapping[str, Any], now: datetime) -> list[dict[str, Any]]:
     """The reports this login warrants now. Each key makes a report appear once."""
     name = login["display_name"]
@@ -117,12 +139,21 @@ def findings(login: Mapping[str, Any], now: datetime) -> list[dict[str, Any]]:
     out = []
     if status == "succeeded":
         count = login.get("latest_account_count") or login.get("accounts_found") or 0
-        out.append({"key": f"{request}:done", "state": "found_accounts",
-                    "title": f"{name}: IBKR login works and sees {count} account{'s' if count != 1 else ''}",
-                    "body": (f"The check of {name} succeeded. IBKR's statement covered {count} "
-                             f"account{'s' if count != 1 else ''}; they are listed under Available on the Account "
-                             "onboarding page, ready to start a case."),
-                    "owner_steps": []})
+        accounts = f"{count} account{'s' if count != 1 else ''}"
+        gaps, steps = recipe_gaps(login.get("latest_recipe"), count)
+        if gaps:
+            out.append({"key": f"{request}:done", "state": "found_accounts",
+                        "title": f"{name}: IBKR login works, but its Flex query needs changes",
+                        "body": (f"The check of {name} succeeded and IBKR's statement covered {accounts}, but the "
+                                 f"Flex query does not match the platform's recipe. {gaps} Until it is fixed, "
+                                 "onboarding those accounts will stop at these gaps."),
+                        "owner_steps": steps})
+        else:
+            out.append({"key": f"{request}:done", "state": "found_accounts",
+                        "title": f"{name}: IBKR login works and sees {accounts}",
+                        "body": (f"The check of {name} succeeded. IBKR's statement covered {accounts}; they are "
+                                 "listed under Available on the Account onboarding page, ready to start a case."),
+                        "owner_steps": []})
     elif status in ("failed", "blocked"):
         words, steps = problem(login.get("latest_error_code"), login.get("latest_error_phase"))
         held = " The platform will not use this token again until an owner resets it." if (

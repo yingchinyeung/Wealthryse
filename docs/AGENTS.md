@@ -382,11 +382,18 @@ never the token or its Key Vault name (`009_connection_checks.sql`). Its
 reports go to `agent.connection_reports`, which the administrator posts to
 its system updates conversation.
 
+When a check succeeds, the discovery job also compares the statement with the
+platform's Flex recipe (`ibkr_etl.flex_recipe`) and keeps what the query lacks:
+section names, statuses and messages, never statement content
+(`recipe_summary`, stored with the check's result). The agent's report then
+names exactly which sections or fields to tick, and for which accounts, with
+the steps to fix the query (`011_connection_recipe.sql`).
+
 **Turning it on** (each step needs Ying's typed approval naming the resources):
 
 1. **Database.** Rerun `scripts/install_agent_schema.py` with
    `--platform-reader <the platform's role>`. It applies
-   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` (and `007_onboarding_watch.sql` and `009_connection_checks.sql`) and lets
+   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` (and `007_onboarding_watch.sql`, `009_connection_checks.sql` and `011_connection_recipe.sql`) and lets
    that role read the agents' results (and nothing else in the agent schema).
 2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
 3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOnboarding=true`

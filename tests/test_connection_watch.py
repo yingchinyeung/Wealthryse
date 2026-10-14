@@ -4,7 +4,9 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from wealthryse_agent.connection_watch import eligible, findings, problem, watch_connections
+from ibkr_etl.flex_discovery import recipe_summary
+from test_flex_recipe import FULL
+from wealthryse_agent.connection_watch import eligible, findings, problem, recipe_gaps, watch_connections
 
 NOW = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
 
@@ -84,6 +86,31 @@ class ConnectionAgentTests(unittest.TestCase):
         ):
             with self.subTest(code=code):
                 self.assertIn(words, problem(code, phase)[0])
+
+
+class RecipeTests(unittest.TestCase):
+    def test_the_discovery_job_keeps_only_what_the_query_lacks(self):
+        summary = recipe_summary(FULL)
+        self.assertEqual(summary["status"], "fail")
+        nav = next(p for p in summary["problems"] if p["section"] == "nav")
+        self.assertEqual((nav["status"], nav["accounts"]), ("fail", ["U0000002"]))
+        self.assertTrue(all(p["status"] in ("fail", "warn") for p in summary["problems"]))
+        self.assertNotIn("100", str(summary))  # no statement figures
+        self.assertEqual(recipe_summary(b"not xml")["status"], "unchecked")
+
+    def test_the_report_names_the_sections_to_tick(self):
+        recipe = recipe_summary(FULL)
+        done = findings(login(latest_request_id="r1", latest_status="succeeded", latest_account_count=2,
+                              latest_recipe=recipe), NOW)[0]
+        self.assertIn("needs changes", done["title"])
+        self.assertIn("Must fix: 1.", done["body"])
+        self.assertIn("Tick Net Asset Value (NAV) in Base in the Flex query. (for U0000002)", done["body"])
+        self.assertTrue(done["owner_steps"][0].startswith("In IBKR Client Portal"))
+        self.assertEqual(recipe_gaps({"status": "pass", "problems": []}, 2), ("", []))
+        self.assertEqual(recipe_gaps(None, 2), ("", []))
+        clean = findings(login(latest_request_id="r1", latest_status="succeeded", latest_account_count=1,
+                               latest_recipe={"status": "pass", "problems": []}), NOW)[0]
+        self.assertIn("sees 1 account", clean["title"])
 
 
 if __name__ == "__main__":

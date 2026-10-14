@@ -237,6 +237,12 @@ def _has_shape(draft: Mapping[str, Any]) -> bool:
     return True
 
 
+def _states_unavailable(text: str, figure_set: Mapping[str, Any]) -> bool:
+    """A sentence that only says a measure is unavailable has no figure to cite (a young account has no risk
+    measures, for one). Allowed only when the analyst listed something as unavailable; the reviewer checks it."""
+    return bool(figure_set.get("unavailable")) and "unavailable" in text.lower()
+
+
 class Writer:
     def __init__(self, model: TeamModel) -> None:
         self.model = model
@@ -252,8 +258,15 @@ class Writer:
         for attempt in (1, 2):
             if feedback:
                 payload["format_problem"] = feedback
-            draft, used = self.model.ask(name="month_end_commentary", instructions=WRITER, payload=payload,
-                                         schema=WRITER_SCHEMA, max_output_tokens=OUTPUT_TOKENS["writer"])
+            try:
+                draft, used = self.model.ask(name="month_end_commentary", instructions=WRITER, payload=payload,
+                                             schema=WRITER_SCHEMA, max_output_tokens=OUTPUT_TOKENS["writer"])
+            except TeamModelError as error:
+                # A reply cut off at the cap gets the second attempt, told to be brief, before the step fails.
+                if error.code != "model_incomplete" or attempt == 2:
+                    raise
+                feedback = "Your last reply was cut off before it finished. Keep this draft short and simple."
+                continue
             for key in usage:
                 usage[key] += used[key]
             feedback = self._format_problem(draft, figure_set)
@@ -284,6 +297,8 @@ class Writer:
         known = set(fig.figure_lookup(figure_set))
         for item in commentary_items(draft):
             unknown = [i for i in item["figures"] if i not in known]
+            if not item["figures"] and _states_unavailable(item["text"], figure_set):
+                continue
             if not item["figures"] or unknown:
                 return (f"{item['field']} {item['index']} cites no figure" if not item["figures"]
                         else f"{item['field']} {item['index']} cites figures that are not in the set: {', '.join(unknown)}")

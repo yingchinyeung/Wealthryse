@@ -66,6 +66,15 @@ class BundleTests(unittest.TestCase):
         self.assertTrue(set(value["held_back"]) <= set(names))
         self.assertNotIn(rollout.TARGET, value["held_back"])
 
+    def test_payload_checksum_does_not_depend_on_the_zlib_build(self):
+        value = rollout.bundle()
+        packed, expected = rollout.command(value), rollout.payload_sha256(value)
+        real = gzip.compress
+        # Another zlib build (zlib-ng on Windows) packs the same content into different bytes.
+        with mock.patch.object(rollout.gzip, "compress", lambda data, level=9, mtime=None: real(data, 1, mtime=0)):
+            self.assertNotEqual(rollout.command(value), packed)
+            self.assertEqual(rollout.payload_sha256(value), expected)
+
     def test_command_is_deterministic_and_runs_the_payload(self):
         value = rollout.bundle()
         args = rollout.command(value)

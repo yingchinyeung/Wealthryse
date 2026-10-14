@@ -93,6 +93,12 @@ def encode(value: dict) -> str:
     return base64.b64encode(gzip.compress(raw, 9, mtime=0)).decode()
 
 
+def payload_sha256(value: dict, commit: str = "HEAD") -> str:
+    """What the execution runs, before packing: zlib builds (e.g. zlib-ng on Windows) pack it differently."""
+    unpacked = git_text(PAYLOAD, commit) + "\n" + json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(unpacked.encode()).hexdigest()
+
+
 def command(value: dict, commit: str = "HEAD") -> list[str]:
     source = git_text(PAYLOAD, commit)
     marker = "BUNDLE = None  # replaced by rollout_live_data_stage1.py"
@@ -272,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         "subscription": SUB, "job": JOB, "job_image": state["container"]["image"], "job_identity": state.get("identity"),
         "commit": state["head"], "migrations_on_main": len(state["bundle"]["expected"]),
         "migration": TARGET, "migration_sha256": state["bundle"]["expected"][TARGET],
-        "payload_sha256": hashlib.sha256(" ".join(command(state["bundle"])).encode()).hexdigest(),
+        "payload_sha256": payload_sha256(state["bundle"]),
         "key_vault_secret": SECRET + (" will be replaced" if existing and args.new_secret
                                       else " exists" if existing else " will be created"),
     }

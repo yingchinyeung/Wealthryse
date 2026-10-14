@@ -8,7 +8,10 @@ ToolError) instead of guessing when data is missing.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -39,6 +42,8 @@ class ToolSpec:
     parameters: Mapping[str, Any]
     run: Callable[[Any, Mapping[str, Any]], dict[str, Any]]
     needs_account: bool = True
+    # When set, only these scheduled jobs may call it; people (and so website chat) never see it.
+    only_jobs: frozenset[str] = frozenset()
 
 
 def _now() -> str:
@@ -732,13 +737,94 @@ def get_risk_metrics(connection, arguments: Mapping[str, Any]) -> dict[str, Any]
     return {"as_of": dates[-1], "data": data, "citations": citations}
 
 
+# Month-end package (the scheduled month-end team only) -------------------------
+
+
+def _uuid(value: Any, name: str) -> str:
+    try:
+        return str(uuid.UUID(str(value)))
+    except ValueError as error:
+        raise ToolError("invalid_arguments", f"{name} must be an id from get_month_end_package.", 400) from error
+
+
+def get_month_end_package(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    account_id = str(arguments["account_id"])
+    period_end = _day(arguments["period_end"], "period_end")
+    rows = connection.execute(
+        "SELECT snapshot_id::text AS snapshot_id, snapshot_sha256, quality_status, publication_allowed, report_type, "
+        "generation_run_id, status, output_reference, output_sha256, completed_at FROM month_end_packages "
+        "WHERE subject_id = ? AND period_end = ? ORDER BY generation_run_id DESC",
+        (account_id, period_end),
+    ).fetchall()
+    if not rows:
+        raise ToolError("no_package", "No month-end package has been built for that month yet.", 404)
+    newest: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        newest.setdefault(str(row["report_type"]), row)
+    head = newest.get("factsheet") or next(iter(newest.values()))
+    files = [{"report_type": kind, "generation_run_id": int(row["generation_run_id"]), "status": row["status"],
+              "snapshot_id": row["snapshot_id"], "output_reference": row["output_reference"],
+              "output_sha256": row["output_sha256"], "completed_at": row["completed_at"]}
+             for kind, row in sorted(newest.items())]
+    return {
+        "as_of": period_end,
+        "data": {"period_end": period_end, "snapshot_id": head["snapshot_id"], "snapshot_sha256": head["snapshot_sha256"],
+                 "quality_status": head["quality_status"], "publication_allowed": bool(head["publication_allowed"]),
+                 "files": files},
+        "citations": [_citation("report_generation_runs", account_id, period_end=period_end),
+                      _citation("reporting_snapshots", account_id, snapshot_id=head["snapshot_id"])],
+    }
+
+
+def get_month_end_snapshot(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    account_id = str(arguments["account_id"])
+    snapshot_id = _uuid(arguments["snapshot_id"], "snapshot_id")
+    row = connection.execute(
+        "SELECT period_end, snapshot_sha256, payload_json FROM month_end_snapshots "
+        "WHERE subject_id = ? AND snapshot_id = ?::uuid", (account_id, snapshot_id),
+    ).fetchone()
+    if row is None or not row["payload_json"]:
+        raise ToolError("no_snapshot", "That month-end snapshot is not available for this account.", 404)
+    # The same integrity rule the package job applies before rendering.
+    if hashlib.sha256(str(row["payload_json"]).encode("utf-8")).hexdigest() != row["snapshot_sha256"]:
+        raise ToolError("snapshot_integrity_failed", "The month-end snapshot does not match its recorded hash.")
+    try:
+        payload = json.loads(row["payload_json"])
+    except ValueError as error:
+        raise ToolError("snapshot_unreadable", "The month-end snapshot could not be read.") from error
+    return {
+        "as_of": str(row["period_end"]),
+        "data": {"snapshot_id": snapshot_id, "snapshot_sha256": row["snapshot_sha256"],
+                 "period_end": str(row["period_end"]), "payload": payload},
+        "citations": [_citation("reporting_snapshots", account_id, snapshot_id=snapshot_id)],
+    }
+
+
+def list_month_end_packages(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    account_id = str(arguments["account_id"])
+    rows = connection.execute(
+        "SELECT period_end, report_type, status, MAX(generation_run_id) AS generation_run_id FROM month_end_packages "
+        "WHERE subject_id = ? GROUP BY period_end, report_type, status ORDER BY period_end", (account_id,),
+    ).fetchall()
+    months: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        month = months.setdefault(str(row["period_end"]), {"period_end": str(row["period_end"]), "files": {}})
+        current = month["files"].get(row["report_type"])
+        if current is None or int(row["generation_run_id"]) > current["generation_run_id"]:
+            month["files"][row["report_type"]] = {"status": row["status"], "generation_run_id": int(row["generation_run_id"])}
+    return {"as_of": None, "data": {"months": list(months.values())},
+            "citations": [_citation("report_generation_runs", account_id)]}
+
+
 # Registry ------------------------------------------------------------------
+
 
 def _schema(properties: Mapping[str, Any], required: list[str]) -> dict[str, Any]:
     return {"type": "object", "properties": dict(properties), "required": required, "additionalProperties": False}
 
 
 _ACCOUNT = {"type": "string", "description": "account_id from list_accounts"}
+MONTH_TEAM = frozenset({"month_team"})
 _DATE = {"type": "string", "description": "YYYY-MM-DD"}
 _AS_OF = {"type": "string", "description": "YYYY-MM-DD; omit for the latest valuation"}
 
@@ -773,6 +859,15 @@ TOOLS: tuple[ToolSpec, ...] = (
              "beta, correlation and tracking error against the benchmark.",
              _schema({"account_id": _ACCOUNT, "from_date": {**_DATE, "description": "YYYY-MM-DD; omit for one year"},
                       "to_date": _AS_OF, "benchmark_id": {"type": "string"}}, ["account_id"]), get_risk_metrics),
+    ToolSpec("get_month_end_package", "The month-end factsheet and presentation built for a month, with their "
+             "snapshot, status, file references and hashes.",
+             _schema({"account_id": _ACCOUNT, "period_end": _DATE}, ["account_id", "period_end"]),
+             get_month_end_package, only_jobs=MONTH_TEAM),
+    ToolSpec("get_month_end_snapshot", "The frozen month-end snapshot a package was rendered from.",
+             _schema({"account_id": _ACCOUNT, "snapshot_id": {"type": "string"}}, ["account_id", "snapshot_id"]),
+             get_month_end_snapshot, only_jobs=MONTH_TEAM),
+    ToolSpec("list_month_end_packages", "Every month with a built month-end package, and each file's status.",
+             _schema({"account_id": _ACCOUNT}, ["account_id"]), list_month_end_packages, only_jobs=MONTH_TEAM),
 )
 REGISTRY = {tool.name: tool for tool in TOOLS}
 

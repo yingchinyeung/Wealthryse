@@ -7,7 +7,8 @@ naming the person, and streams the validated answer back.
 
 Settings: AGENT_UI_MODE, AGENT_API_URL (internal https URL of the agent
 service), AGENT_API_AUDIENCE (its Entra app ID URI), AZURE_CLIENT_ID (the
-website identity, already set).
+website identity, already set), and MONTH_TEAM_UI for the month-end team's
+screens (see month_team_web).
 """
 from __future__ import annotations
 
@@ -21,6 +22,8 @@ from typing import Any, Callable, Iterable
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+
+from . import month_team_web
 
 WIDGET_PATHS = re.compile(r"^/accounts/[^/]+/(overview|holdings|performance)$")
 MODES = {"off", "owner", "all"}
@@ -163,12 +166,21 @@ def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
         return api.request("POST", f"/v1/messages/{message_id}/feedback",
                            json={"user_object_id": oid(user), **body.model_dump()})
 
+    def inbox_items(user: dict[str, Any]) -> list[dict[str, Any]]:
+        items = api.request("GET", "/v1/inbox", params={"user_object_id": oid(user)})["items"]
+        # The month-end team's cards ask the owner to decide; nobody else sees them.
+        if month_team_web.is_month_owner(user):
+            return items
+        return [x for x in items if x.get("kind") not in month_team_web.MONTH_TEAM_KINDS]
+
     @app.get("/api/agents/inbox")
     def agent_inbox(user: dict[str, Any] = Depends(agent_user)) -> Any:
-        return api.request("GET", "/v1/inbox", params={"user_object_id": oid(user)})
+        return {"items": inbox_items(user)}
 
     @app.post("/api/agents/inbox/{item_id}/decision")
     def agent_decision(item_id: int, body: DecisionBody, user: dict[str, Any] = Depends(agent_user)) -> Any:
+        if not month_team_web.is_month_owner(user) and not any(x.get("item_id") == item_id for x in inbox_items(user)):
+            raise HTTPException(status_code=404, detail="Item not found.")
         return api.request("POST", f"/v1/inbox/{item_id}/decision", json={"user_object_id": oid(user), **body.model_dump()})
 
     @app.get("/agents/widget.js")
@@ -177,21 +189,30 @@ def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
 
     @app.get("/agent-inbox", response_class=HTMLResponse)
     def agent_inbox_page(user: dict[str, Any] = Depends(agent_user)) -> str:
-        return INBOX_PAGE.replace("{THEME}", theme_css).replace("{VIEWER}", escape(str(user.get("email") or "")))
+        month_link = ' · <a href="/month-end">Month-end</a>' if month_team_web.is_month_owner(user) else ""
+        return (INBOX_PAGE.replace("{THEME}", theme_css).replace("{MONTH_END}", month_link)
+                .replace("{VIEWER}", escape(str(user.get("email") or ""))))
 
-    if settings.mode == "off":
+    month_team_web.install(app, authorized_user, allowed_accounts, theme_css, api)
+    scripts = []
+    if settings.mode != "off":
+        scripts.append((WIDGET_PATHS, b'<script src="/agents/widget.js" defer></script>'))
+    if month_team_web.enabled():
+        scripts.append((month_team_web.PANEL_PATHS, b'<script src="/agents/month-team.js" defer></script>'))
+    if not scripts:
         return
 
     @app.middleware("http")
     async def agent_widget_injector(request: Request, call_next):
         response = await call_next(request)
-        if (request.method != "GET" or response.status_code != 200 or not WIDGET_PATHS.match(request.url.path)
+        tags = [tag for paths, tag in scripts if paths.match(request.url.path)]
+        if (request.method != "GET" or response.status_code != 200 or not tags
                 or not response.headers.get("content-type", "").startswith("text/html")):
             return response
         body = b"".join([chunk async for chunk in response.body_iterator])
         marker = body.rfind(b"</body>")
         if marker >= 0:
-            body = body[:marker] + b'<script src="/agents/widget.js" defer></script>' + body[marker:]
+            body = body[:marker] + b"".join(tags) + body[marker:]
         headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
         return Response(body, status_code=response.status_code, headers=headers, media_type="text/html")
 
@@ -301,18 +322,23 @@ function init(){
 
 INBOX_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent inbox</title><style>{THEME}
 .inbox-item{margin-bottom:14px}.inbox-item h3{margin:4px 0 8px}.inbox-body p{margin:0 0 8px}.inbox-meta{font-size:13px;opacity:.75}.inbox-actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
-</style></head><body><header><strong class="brand-title">Agent inbox</strong><div class="session">{VIEWER} · <a href="/">Accounts</a></div></header>
+</style></head><body><header><strong class="brand-title">Agent inbox</strong><div class="session">{VIEWER}{MONTH_END} · <a href="/">Accounts</a></div></header>
 <main><h1>Agent inbox</h1><p class="muted">Explanations, draft commentary and data checks written by the scheduled agents. Nothing here has been sent or published. Approving a draft marks it ready for the normal report release process.</p>
 <div class="actions"><label>Show <select id="filter"><option value="">All</option><option value="new">New</option><option value="approved">Approved</option><option value="dismissed">Dismissed</option></select></label></div>
 <section id="items" class="grid"><div class="card wide muted">Loading…</div></section></main>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const md=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').split(/\n{2,}/).map(p=>'<p>'+p.replace(/\n/g,'<br>')+'</p>').join('');
-const kinds={holdings_explainer:'What changed',month_end_draft:'Draft commentary',data_quality:'Data check'};
+const kinds={holdings_explainer:'What changed',month_end_draft:'Draft commentary',data_quality:'Data check',month_end_report:'Month-end report',month_end_hold:'Account blocked',month_end_dispute:'Agents disagree'};
+const choices={month_end_hold:[['approved','Proceed'],['dismissed','Hold']],month_end_dispute:[['approved',"Keep the writer's text"],['dismissed','Agree with the reviewer']]};
+const decided={month_end_hold:{approved:'You chose to proceed.',dismissed:'You chose to hold this account.'},month_end_dispute:{approved:"You kept the writer's text.",dismissed:'You agreed with the reviewer.'}};
+const link=x=>{const c=(x.citations||[]).find(c=>c&&typeof c.link==='string'&&/^\/accounts\/[^/]+\/reports$/.test(c.link));return c?`<a class="button" href="${esc(c.link)}">Open the Reports tab</a>`:''};
+const buttons=x=>{if(choices[x.kind]){const done=(decided[x.kind]||{})[x.status];return (done?`<span>${esc(done)}</span>`:choices[x.kind].map(([d,l])=>`<button class="button" data-d="${d}">${esc(l)}</button>`).join(''))+link(x)}
+ return (x.status==='new'?'<button class="button" data-d="read">Mark read</button>':'')+(x.kind==='month_end_draft'&&x.status!=='approved'?'<button class="button" data-d="approved">Approve draft</button>':'')+link(x)+(x.status!=='dismissed'?'<button class="button" data-d="dismissed">Dismiss</button>':'')};
 async function load(){const r=await fetch('/api/agents/inbox',{credentials:'same-origin'});const box=document.querySelector('#items');
  if(!r.ok){box.innerHTML='<div class="card wide">The inbox could not be loaded.</div>';return}
  const f=document.querySelector('#filter').value;const items=(await r.json()).items.filter(x=>!f||x.status===f);
- box.innerHTML=items.length?items.map(x=>`<article class="card wide inbox-item" data-id="${x.item_id}"><div class="label">${esc(kinds[x.kind]||x.kind)} · ${esc(x.subject_id)} · ${esc(x.period_key)}</div><h3>${esc(x.title)}</h3><div class="inbox-body">${md(x.body)}</div><div class="inbox-meta">Status: ${esc(x.status)}</div><div class="inbox-actions">${x.status==='new'?'<button class="button" data-d="read">Mark read</button>':''}${x.kind==='month_end_draft'&&x.status!=='approved'?'<button class="button" data-d="approved">Approve draft</button>':''}${x.status!=='dismissed'?'<button class="button" data-d="dismissed">Dismiss</button>':''}</div></article>`).join(''):'<div class="card wide muted">Nothing here yet.</div>';
+ box.innerHTML=items.length?items.map(x=>`<article class="card wide inbox-item" data-id="${x.item_id}"><div class="label">${esc(kinds[x.kind]||x.kind)} · ${esc(x.subject_id)} · ${esc(x.period_key)}</div><h3>${esc(x.title)}</h3><div class="inbox-body">${md(x.body)}</div><div class="inbox-meta">Status: ${esc(x.status)}</div><div class="inbox-actions">${buttons(x)}</div></article>`).join(''):'<div class="card wide muted">Nothing here yet.</div>';
  box.querySelectorAll('[data-d]').forEach(b=>b.addEventListener('click',async()=>{const id=b.closest('[data-id]').dataset.id;b.disabled=true;
   await fetch(`/api/agents/inbox/${id}/decision`,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({decision:b.dataset.d})});load()}))}
 document.querySelector('#filter').addEventListener('change',load);load();

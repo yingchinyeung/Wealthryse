@@ -25,15 +25,18 @@ Browser → ibkrv2stg-web (chat panel, Explain buttons, /agent-inbox)
 
 Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
             → write to agent.inbox only
+Month-end team job (same image, off until approved): reads review files from
+internal-reports, writes agent.month_* tables and agent.inbox only
 ```
 
 | Piece | Code |
 |---|---|
-| Database schema | `migrations/agent/001_agent_schema.sql`, installed by `scripts/install_agent_schema.py` |
+| Database schema | `migrations/agent/*.sql`, installed in name order by `scripts/install_agent_schema.py` |
 | Tool server | `src/wealthryse_agent/tool_server.py`, `tools.py`, `access.py` |
 | Agent runtime | `src/wealthryse_agent/agent_server.py`, `runtime.py`, `validator.py`, `calculator.py`, `store.py` |
 | Jobs | `src/wealthryse_agent/jobs.py` |
-| Website | `src/ibkr_etl/agent_web.py` and a hook at the end of `web.py` |
+| Month-end team | `src/wealthryse_agent/month_team/`, `migrations/agent/002_month_team.sql` |
+| Website | `src/ibkr_etl/agent_web.py`, `month_team_web.py` and a hook at the end of `web.py` |
 | Azure | `infra/agent-foundation.bicep`, `infra/agent-apps.bicep`, `Dockerfile.agent` |
 
 ## Safety properties
@@ -128,6 +131,122 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
    another account, and at least 90% passing. Its token use counts against the
    daily budget.
 
+## Month-end team
+
+Six agents check each month's reports and write the deck's commentary. Until
+the go-live switch is on they run in shadow: their commentary is shown, never
+used. Once live, the month-end package job (`ibkrv2stg-month-end-factsheet`,
+which builds both the factsheet and the deck) puts the team's agreed
+commentary into the deck, and Release asks for confirmation while the team has
+an open objection. Commentary goes in the deck only: the factsheet never
+carries it. The team itself never changes a file or releases anything.
+
+| Agent | What it does | Model |
+|---|---|---|
+| Data | Is the month's data complete? Month-end valuation present, no price gap over 5 days, no one-day move over 20%, exchange rates available. Clean, fixable (waits up to 3 days for the next sync) or blocked (asks Ying). | none |
+| Analyst | Builds the figure set from the tools: month, year-to-date and since-inception returns against the benchmark, risk, contributors, sectors. Every figure has an id and a source. | none |
+| Writer | Drafts the deck's commentary from the figure set only. Every sentence cites figure ids, and the text makes no numerical claim of its own, as with today's drafter. The summary fits the deck's line (221 characters). Accounts whose deck has no commentary line (Alpha World T) get none. | `wr-reports-apac` |
+| Reviewer | Reads the draft cold and objects sentence by sentence; a code check also catches wording that goes against the cited figure ("rose" on a negative return). Once the package is built, it re-derives every printed factsheet figure from the frozen snapshot with the renderer's own inputs, compares the snapshot with today's database (10 bp), and checks the deck's date and narrative. | `wr-reports-apac` and code |
+| Visual QA | Looks at the factsheet pages as images for clipped text, overlaps, blank areas and wrong dates. Each finding carries a page and a region. | `wr-reports-apac` |
+| Coordinator | One stage machine per account and month: data, held, words, package, checking, ready. Runs up to two writer and reviewer rounds, sends a dispute to Ying, and checks again when the package is rebuilt. | none |
+
+**Proof, not trust.**
+
+- Files are read only from `internal-reports/review/` and must match the
+  sha256 the package job recorded. The snapshot must match its recorded hash.
+- The model never sees the snapshot or a file's bytes; visual QA sees page
+  images only. The writer sees figure labels and display values only.
+- Report content goes only to `wr-reports-apac` (APAC Data Zone); the team
+  refuses to start on any other processing scope.
+- Its own monthly token budget (`AGENT_MONTH_TEAM_TOKEN_BUDGET`, 20 million by
+  default), separate from the daily chat budget. When it runs out the team
+  pauses without skipping a check.
+- An account that fails three times in a row stops and the others carry on;
+  `--retry` restarts it. One account gets at most 15 minutes per run.
+- Once live, the reviewer checks that the deck prints the team's agreed
+  summary; a deck built with the standard commentary is an objection.
+- A factsheet that prints commentary (a "Portfolio analyst:" line or any of
+  the team's sentences) is an objection, live or not.
+
+**Where Ying sees it** (`MONTH_TEAM_UI=owner` on the website; owners only):
+
+- the "Agent review" panel on each account's Reports tab, above the release
+  checklist (marked Shadow until live): verdicts, objections with a page map,
+  the team's commentary with its figure chips, sources and every step. Once
+  live, Release asks for confirmation when it would release files the team
+  still has an open objection to; it never blocks;
+- the Month-end page (`/month-end`): each account's stage for a month, a
+  "Needs you" filter, the budget, the replay results, and batch release;
+- three inbox cards: the month's report, "Hold or proceed" for a blocked
+  account, and "Agents disagree" for a dispute. Answers apply on the next run.
+
+**Running it.**
+
+```
+python -m wealthryse_agent.jobs month_team                        # last month
+python -m wealthryse_agent.jobs month_team --period 2026-09-30
+python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
+python -m wealthryse_agent.jobs month_team --retry                # restart stopped accounts
+```
+
+Replay re-checks months whose factsheet was already released and shows the
+results on the Month-end page only, with no inbox cards. It does not train the
+model: it shows where the team is wrong, its instructions and checks are
+tuned, and a second replay shows whether that helped.
+
+**Batch release.** For a live month, the Month-end page offers to release
+every report the team passed with nothing open: clean data, agreed
+commentary that the deck carries (unless the deck has no commentary line),
+printed figures and pages passed, and a file not yet released. Ying's browser then runs each account through the
+Reports tab's own release preview and release, so every server-side check
+still applies; an account whose files changed after the team checked them is
+left for Ying. The page lists what was released and what was not.
+
+**Decisions (Ying, 14 October 2026).**
+
+- No shadow month: the team goes live from November's close once the replay
+  of the 105 released reports looks right. Ying still releases every report.
+- Release warns on an open objection rather than blocking.
+- `wr-reports-apac` goes to about 50,000 tokens a minute (an Azure step, below).
+- Batch release of clean reports is ready for November.
+- Commentary goes in the deck only. The factsheet never carries commentary.
+
+**Which commentary goes into a live deck** (the rule for the package job
+change). The team's, when the writer and reviewer agreed or Ying kept the
+writer's text. The standard commentary when Ying agreed with the reviewer,
+held the account, or the team has not settled the text when the package job
+builds the files. Either way the job passes commentary to the deck renderer
+only, as it does today; the factsheet renderer never receives it.
+
+**Turning it on** (each step needs Ying's typed approval naming the resources):
+
+1. **Database.** Rerun `scripts/install_agent_schema.py` as in step 3 above,
+   adding `--grant month_team=<account>` for each account. It applies
+   `002_month_team.sql`.
+2. **Image.** Rebuild `Dockerfile.agent`; it now includes poppler for page images.
+3. **Capacity.** Raise the tokens-per-minute of `wr-reports-apac` so a month's
+   run fits between 15:00 and 20:00 HKT.
+4. **Job.** Deploy `infra/agent-apps.bicep` with `deployMonthTeam=true`. This
+   creates `ibkrv2stg-agent-month-team` and gives `id-wr-agent-jobs` read
+   access to the `internal-reports` container only.
+5. **Website.** Set `MONTH_TEAM_UI=owner` on `ibkrv2stg-web` through the
+   release process.
+6. **Replay.** Run a replay of the 105 released reports and review the results
+   on the Month-end page.
+7. **Go live.** Set `monthTeamLive=true` on the team job together with the
+   package job's team-commentary setting. The package job change is
+   separate and waits until the assurance image work is finished.
+
+**Not covered yet.**
+
+- Slides are not looked at as images until the package job saves slide
+  images; the deck's text is checked meanwhile.
+- The analyst-assurance job's findings are not read.
+- No reconciliation against the broker's statements.
+- `month_end_drafter` stays until the team's commentary has proven itself.
+- The month-end package job does not read the team's commentary yet (see
+  "Go live" above).
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool
@@ -136,11 +255,13 @@ Scheduled jobs (same image): holdings explainer, month-end drafter, data quality
   the reasoning level is `chatReasoningEffort` in `infra/agent-apps.bicep`.
 - One private endpoint.
 - Two Container Apps that scale to zero, and three short jobs.
+- The month-end team, when deployed: an hourly job on six days a month, and
+  its own monthly token budget on `wr-reports-apac`.
 - No new database server.
 
 ## Not yet done
 
-- The month-end drafts are not wired into the factsheet renderer. Approving a
+- The month-end drafts are not wired into the deck renderer. Approving a
   draft marks it ready for the existing report release process.
 - The old AI pieces (`ai_analyst.py`, `agent_tools.py` and related modules,
   and the `ibkrv2stg-ai-…` account) stay in place. `agent_tools.py` still feeds

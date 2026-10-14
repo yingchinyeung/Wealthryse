@@ -32,6 +32,20 @@ class AgentAppsBicepTest(unittest.TestCase):
         timeout = int(re.search(r"param chatTimeoutSeconds int = (\d+)", apps).group(1))
         self.assertLess(timeout, 240)
 
+    def test_month_team_is_off_until_approved_and_stays_in_the_apac_data_zone(self):
+        apps = BICEP.read_text()
+        self.assertIn("param deployMonthTeam bool = false", apps)
+        job = apps[apps.index("resource monthTeamJob"):]
+        name = re.search(r"name: '([^']+)'", job).group(1)
+        self.assertTrue(2 <= len(name) <= 32, f"{name} is {len(name)} characters")
+        self.assertIn("= if (deployMonthTeam)", job.splitlines()[0])
+        self.assertIn("{ name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }", job)
+        self.assertIn("param reportModelDeployment string = 'wr-reports-apac'", apps)
+        self.assertIn("value: reportModelDeployment", job)
+        reader = apps[apps.index("resource monthTeamReader"):apps.index("resource monthTeamJob")]
+        self.assertIn("if (deployMonthTeam)", reader)
+        self.assertIn("scope: reportContainer", reader)  # one container, read only
+
 
 if __name__ == "__main__":
     unittest.main()

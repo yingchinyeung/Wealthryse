@@ -133,13 +133,22 @@ internal-reports, writes agent.month_* tables and agent.inbox only
 
 ## Month-end team
 
-Six agents check each month's reports and write the deck's commentary. Until
-the go-live switch is on they run in shadow: their commentary is shown, never
-used. Once live, the month-end package job (`ibkrv2stg-month-end-factsheet`,
-which builds both the factsheet and the deck) puts the team's agreed
-commentary into the deck, and Release asks for confirmation while the team has
-an open objection. Commentary goes in the deck only: the factsheet never
-carries it. The team itself never changes a file or releases anything.
+Six agents check each month's factsheet. Until the go-live switch is on they
+run in shadow. Once live, Release asks for confirmation while the team has an
+open objection. The team itself never changes a file or releases anything.
+
+**Per-account decks are no longer built** (Ying, 14 October 2026). The
+month-end package job (`ibkrv2stg-month-end-factsheet`) builds the factsheet
+only and makes no commentary call; a month is complete, releasable and healthy
+with its factsheet alone. Decks built before stay downloadable, and a new
+factsheet released for a month withdraws that month's older deck. Stage 3 of
+new onboarding renders factsheets only. With `decks` off in the team's
+settings (the default), the team checks the factsheet, ignores any deck and
+writes no commentary, since the factsheet never carries it; the writer,
+reviewer and deck checks below stay in the code for the all-accounts summary
+deck that comes next. The older manual onboarding render jobs
+(`run_self_service_onboarding_reports.py`,
+`render_onboarding_historical_reports.py`) still build decks and are not run.
 
 | Agent | What it does | Model |
 |---|---|---|
@@ -210,6 +219,8 @@ left for Ying. The page lists what was released and what was not.
 - `wr-reports-apac` goes to about 50,000 tokens a minute (an Azure step, below).
 - Batch release of clean reports is ready for November.
 - Commentary goes in the deck only. The factsheet never carries commentary.
+- Per-account decks are no longer built; an all-accounts summary deck follows
+  the onboarding work.
 
 **Which commentary goes into a live deck** (the rule for the package job
 change). The team's, when the writer and reviewer agreed or Ying kept the
@@ -308,12 +319,12 @@ composite in the Alpha World MS or T design that is in stage 3 with its
 historical reports rendered (`ibkr_etl/composite_reports.py`). It reads every
 stored file before approval 2 and checks that:
 
-- every month from the first to the last has a factsheet and a deck, with no gap;
+- every month from the first to the last has a factsheet, with no gap (decks are
+  no longer built, and one listed from before is not read);
 - each stored file matches the hash recorded when it was rendered;
 - each factsheet has the design's two pages, prints the composite's own name
   and each page's report date, carries no commentary, and keeps no text from
   the reference design (unless the composite's own name or description uses it);
-- each deck names the composite and keeps no MS or T identity text;
 - visual QA, looking at every factsheet page against the Alpha World layout's
   checklist, finds no fault. It runs on `wr-reports-apac`, APAC only.
 

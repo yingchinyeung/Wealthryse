@@ -21,6 +21,10 @@ class TeamSettings:
     # team's agreed commentary then goes into the month's decks (never the
     # factsheets).
     live: bool = False
+    # Per-account decks are no longer built (Ying, 14 October 2026): with this
+    # off the team checks the factsheet only, ignores any deck, and writes no
+    # commentary, as the factsheet never carries it.
+    decks: bool = False
 
     @classmethod
     def from_env(cls) -> "TeamSettings":

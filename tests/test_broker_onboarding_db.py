@@ -698,7 +698,7 @@ class PortfolioDryRunTests(_MigratedDatabase):
 class CompositeReportRunTests(_MigratedDatabase):
     """Stage 3's report run for a composite in the MS design, with rendering and storage stubbed.
 
-    Each month gets a factsheet and a deck; the deck's renderer is a stub returning its gate's receipt.
+    Each month gets a factsheet; per-account decks are no longer built.
     """
 
     def _composite_with_history(self, db):
@@ -760,7 +760,6 @@ class CompositeReportRunTests(_MigratedDatabase):
         from ibkr_etl.db import PostgresConnection
         from ibkr_etl.onboarding_v2_web import OnboardingError, case_detail, case_report
 
-        PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         db = PostgresConnection(psycopg.connect(_dsn(ADMIN_DSN, self.database, OWNER_ROLE), row_factory=dict_row,
                                                 options=f"-c app.tenant_id={TENANT}"))
         self.addCleanup(db.close)
@@ -788,7 +787,7 @@ class CompositeReportRunTests(_MigratedDatabase):
             return blobs[(container, blob)]
 
         def store(container, blob, content, content_type):
-            self.assertEqual(content_type, {".pdf": "application/pdf", ".pptx": PPTX}[blob[blob.rindex("."):]])
+            self.assertEqual((blob[blob.rindex("."):], content_type), (".pdf", "application/pdf"))
             blobs.setdefault((container, blob), content)
 
         rendered, ready = [], set()
@@ -817,23 +816,9 @@ class CompositeReportRunTests(_MigratedDatabase):
             return {"pdf_accuracy_validation": {"status": "fail" if payload["period_end"] == "2025-04-30"
                                                 else "pass"}}
 
-        decks, bad_decks = [], set()
-
-        def render_deck(snapshot_text, output_path):
-            # The deck renders from the frozen snapshot's exact text and returns its output gate's receipt.
-            period_end = json.loads(snapshot_text)["period_end"]
-            decks.append(period_end)
-            output_path.write_bytes(b"PK synthetic composite deck " + period_end.encode())
-            snapshot_sha = hashlib.sha256(snapshot_text.encode()).hexdigest()
-            return {"content_contract_version": cr.CONTRACT_VERSION,
-                    "snapshot_sha256": "0" * 64 if period_end in bad_decks else snapshot_sha,
-                    "output_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest()}
-
-        deck = cr.DeckRenderer(template_version=f"sha256:{'d' * 64}+layout:{cr.CONTRACT_VERSION}", render=render_deck)
-
         def run(today):
             return cr.run_composite_report_cases(db, TENANT, container="internal-reports", today=today,
-                                                 fetch=fetch, store=store, deck=deck, render=render)
+                                                 fetch=fetch, store=store, render=render)
 
         def check():
             return next(k for k in case_detail(db, TENANT, case_id)["checks"] if k["check_id"] == "reports_rendered")
@@ -848,16 +833,16 @@ class CompositeReportRunTests(_MigratedDatabase):
 
             ready.add("2025-01-31")
             self.assertEqual(run(date(2025, 3, 3))[0], {"case_id": case_id, "check": "pass", "recorded": True,
-                                                        "reports": 2})
-            self.assertEqual(check()["message"], "A factsheet and a deck for 2025-01-31 in the Alpha World MS design, "
+                                                        "reports": 1})
+            self.assertEqual(check()["message"], "A factsheet for 2025-01-31 in the Alpha World MS design, "
                                                  "each read back and checked. 2025-02-28 follows once its month-end "
                                                  "calculation has run.")
             ready.add("2025-02-28")
             run(date(2025, 3, 3))
-            self.assertEqual((rendered, decks), (["2025-01-31", "2025-02-28"], ["2025-01-31", "2025-02-28"]))
+            self.assertEqual(rendered, ["2025-01-31", "2025-02-28"])
             # A daily run with nothing new renders nothing and leaves approval 2's evidence alone.
             self.assertEqual(run(date(2025, 3, 3))[0]["recorded"], False)
-            self.assertEqual((rendered, decks), (["2025-01-31", "2025-02-28"], ["2025-01-31", "2025-02-28"]))
+            self.assertEqual(rendered, ["2025-01-31", "2025-02-28"])
 
             detail = case_detail(db, TENANT, case_id)
             self.assertEqual(detail["awaiting_approval"], None)  # the agent review is still to come
@@ -866,7 +851,7 @@ class CompositeReportRunTests(_MigratedDatabase):
                 "r.template_version, r.output_reference, r.output_sha256 FROM report_generation_runs r "
                 "JOIN reporting_snapshots s USING (tenant_id, snapshot_id) "
                 "WHERE s.subject_id = 'synthetic-design'").fetchall()}
-            self.assertEqual(len(runs), 4)
+            self.assertEqual(len(runs), 2)
             january = runs[("2025-01-31", "factsheet")]
             content = b"%PDF synthetic composite 2025-01-31"
             digest = hashlib.sha256(content).hexdigest()
@@ -877,27 +862,15 @@ class CompositeReportRunTests(_MigratedDatabase):
                              f"+layout:{cr.LAYOUT_VERSION}")
             self.assertEqual(january["output_reference"], f"internal-reports/review/synthetic-design/2025-01-31/"
                                                           f"{digest}-synthetic-design_Factsheet_2025-01-31.pdf")
-            january_deck = runs[("2025-01-31", "presentation")]
-            deck_digest = hashlib.sha256(b"PK synthetic composite deck 2025-01-31").hexdigest()
-            self.assertEqual((january_deck["status"], january_deck["template_id"], january_deck["template_version"],
-                              january_deck["output_sha256"]),
-                             ("awaiting_approval", "synthetic-design-monthly-presentation", deck.template_version,
-                              deck_digest))
-            self.assertEqual(january_deck["output_reference"],
-                             f"internal-reports/review/synthetic-design/2025-01-31/"
-                             f"{deck_digest}-synthetic-design_Presentation_2025-01-31.pptx")
             self.assertEqual([(r["period_end"], r["report_type"], r["download_path"]) for r in detail["reports"]], [
                 (period, kind, f"/api/onboarding-v2/cases/{case_id}/reports/{runs[(period, kind)]['generation_run_id']}")
-                for period in ("2025-02-28", "2025-01-31") for kind in ("presentation", "factsheet")])
+                for period in ("2025-02-28", "2025-01-31") for kind in ("factsheet",)])
 
             # The owner's download finds exactly the listed file, and nothing else.
             served = case_report(db, TENANT, case_id, january["generation_run_id"], container="internal-reports")
             self.assertEqual((served["container_name"], served["blob_name"], served["sha256"], served["file_name"]),
                              ("internal-reports", january["output_reference"].split("/", 1)[1], digest,
                               "synthetic-design_Factsheet_2025-01-31.pdf"))
-            served = case_report(db, TENANT, case_id, january_deck["generation_run_id"], container="internal-reports")
-            self.assertEqual((served["sha256"], served["file_name"]),
-                             (deck_digest, "synthetic-design_Presentation_2025-01-31.pptx"))
             for run_id in (january["generation_run_id"] + 1000, -1):
                 with self.assertRaises(OnboardingError) as refused:
                     case_report(db, TENANT, case_id, run_id, container="internal-reports")
@@ -908,21 +881,17 @@ class CompositeReportRunTests(_MigratedDatabase):
             self.assertEqual(refused.exception.status_code, 503)
             db.rollback()
 
-            # A deck that fails its output gate blocks the case; the month's stored factsheet is kept and reused.
             ready.add("2025-03-31")
-            bad_decks.add("2025-03-31")
-            self.assertEqual(run(date(2025, 4, 2))[0]["check"], "fail")
-            self.assertIn("The 2025-03-31 deck failed its output check", check()["message"])
-            self.assertEqual(case_detail(db, TENANT, case_id)["status"], "blocked")
-            bad_decks.clear()
-
             # A month whose factsheet fails its read-back check blocks the case with the reason.
             ready.add("2025-04-30")
             self.assertEqual(run(date(2025, 5, 2))[0]["check"], "fail")
             self.assertIn("The 2025-04-30 factsheet failed its read-back check", check()["message"])
             self.assertEqual(case_detail(db, TENANT, case_id)["status"], "blocked")
             self.assertEqual(rendered, ["2025-01-31", "2025-02-28", "2025-03-31", "2025-04-30"])
-            self.assertEqual(decks, ["2025-01-31", "2025-02-28", "2025-03-31", "2025-03-31"])
+            # No deck is built: every stored report is a factsheet.
+            self.assertEqual({row["report_type"] for row in db.execute(
+                "SELECT r.report_type FROM report_generation_runs r JOIN reporting_snapshots s USING (tenant_id, "
+                "snapshot_id) WHERE s.subject_id = 'synthetic-design'").fetchall()}, {"factsheet"})
 
 if __name__ == "__main__":
     unittest.main()

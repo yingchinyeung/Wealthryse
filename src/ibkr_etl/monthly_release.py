@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 from .internal_release import approve_internal_release
 from .monthly_reports import (
+    REQUIRED_REPORT_TYPES,
     MonthlyReportError,
     validate_artifact,
     validate_period_end,
@@ -26,7 +27,11 @@ def review_package(
     releases: Sequence[Mapping[str, Any]] = (),
     enforce_eligibility: bool = True,
 ) -> dict[str, Any]:
-    """Bind a file checklist to the latest exact pair and current release state."""
+    """Bind a file checklist to the latest files and their current release state.
+
+    A package is the factsheet, plus the deck when one was built for this
+    snapshot before decks were retired (it stays reviewable and downloadable).
+    """
 
     normalized_period = validate_period_end(period_end)
     if str(snapshot.get("subject_id")) != subject_id or str(snapshot.get("period_end")) != normalized_period:
@@ -36,11 +41,11 @@ def review_package(
         kind = str(row.get("report_type"))
         if kind in {"factsheet", "presentation"} and kind not in latest:
             latest[kind] = row
-    if set(latest) != {"factsheet", "presentation"}:
-        raise MonthlyReportError("A complete factsheet and presentation pair is required")
-    selected = [latest["factsheet"], latest["presentation"]]
+    if not REQUIRED_REPORT_TYPES <= set(latest):
+        raise MonthlyReportError("A factsheet is required")
+    selected = [latest[kind] for kind in ("factsheet", "presentation") if kind in latest]
     if any(str(row.get("status")) not in {"awaiting_approval", "released_internal"} for row in selected):
-        raise MonthlyReportError("The selected report pair is not ready for owner review")
+        raise MonthlyReportError("The selected report files are not ready for owner review")
     releases_by_run: dict[int, Mapping[str, Any]] = {}
     for row in releases:
         run_id = int(row["generation_run_id"])

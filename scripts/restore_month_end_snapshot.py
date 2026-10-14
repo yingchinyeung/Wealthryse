@@ -12,7 +12,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from ibkr_etl.db import connect  # noqa: E402
-from ibkr_etl.monthly_reports import REPORT_TYPES, validate_period_end  # noqa: E402
+from ibkr_etl.monthly_reports import REQUIRED_REPORT_TYPES, validate_period_end  # noqa: E402
 from ibkr_etl.util import canonical_json, utc_now_iso  # noqa: E402
 
 
@@ -76,9 +76,10 @@ def main() -> int:
             (tenant_id, restore_id),
         ).fetchall()
         by_type = {str(row["report_type"]): row for row in runs}
-        if set(by_type) != set(REPORT_TYPES):
+        # A factsheet is the package; a deck is checked only where one was built before decks were retired.
+        if not REQUIRED_REPORT_TYPES <= set(by_type):
             raise RuntimeError("The restored snapshot does not have a complete report package")
-        for report_type in REPORT_TYPES:
+        for report_type in sorted(by_type):
             run = by_type[report_type]
             if str(run["status"]) != "awaiting_approval":
                 raise RuntimeError(f"The {report_type} is not awaiting owner approval")

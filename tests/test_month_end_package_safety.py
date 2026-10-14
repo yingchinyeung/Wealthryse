@@ -41,14 +41,45 @@ class ExistingArtifactTests(unittest.TestCase):
     def test_changed_file_fails(self):
         with self.assertRaisesRegex(RuntimeError,'integrity'):self.verify(_rows(),content=b'changed')
 
-    def test_incomplete_pair_fails(self):
-        with self.assertRaisesRegex(RuntimeError,'incomplete'):self.verify(_rows()[:1])
+    def test_factsheet_alone_is_a_complete_package(self):
+        self.verify(_rows()[:1])
+
+    def test_missing_factsheet_fails_even_with_an_old_deck(self):
+        with self.assertRaisesRegex(RuntimeError,'incomplete'):self.verify(_rows()[1:])
+
+    def test_old_deck_is_not_checked(self):
+        rows=_rows();rows[1]['output_sha256']='0'*64
+        self.verify(rows)
 
     def test_reference_outside_container_fails(self):
         rows=_rows();rows[0]['output_reference']='other/review/a/factsheet.bin'
         with self.assertRaisesRegex(RuntimeError,'reference'):self.verify(rows)
         rows=_rows();rows[0]['output_reference']='reports/../secret'
         with self.assertRaisesRegex(RuntimeError,'reference'):self.verify(rows)
+
+
+def _runs(*rows):
+    return [{'template_version':'v','output_reference':'reports/x','output_sha256':'a'*64,**row} for row in rows]
+
+
+class ExistingPackageTests(unittest.TestCase):
+    def status(self,rows,**kwargs):
+        connection=Mock();connection.execute.return_value.fetchall.return_value=rows
+        return monthly._existing_package(connection,tenant_id='tenant',account_id='alpha-world-t',
+            period_end='2026-09-30',expected_versions={'factsheet':'v'},snapshot_id=SNAPSHOT,**kwargs)
+
+    def test_a_factsheet_awaiting_approval_is_generated(self):
+        self.assertEqual('already_generated',self.status(_runs({'report_type':'factsheet','status':'awaiting_approval'})))
+
+    def test_a_released_factsheet_is_released_without_a_deck(self):
+        self.assertEqual('already_released',self.status(_runs({'report_type':'factsheet','status':'released_internal'})))
+
+    def test_an_old_deck_alone_needs_a_new_factsheet(self):
+        self.assertIsNone(self.status(_runs({'report_type':'presentation','status':'released_internal'})))
+
+    def test_an_older_factsheet_template_is_regenerated(self):
+        self.assertIsNone(self.status(_runs({'report_type':'factsheet','status':'awaiting_approval',
+                                             'template_version':'old'})))
 
 
 class ImmutableUploadTests(unittest.TestCase):

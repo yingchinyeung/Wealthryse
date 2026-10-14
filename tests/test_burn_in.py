@@ -47,14 +47,14 @@ class BurnInTests(unittest.TestCase):
                 "latest_risk_free_date": "2026-09-22",
                 "latest_import": {"status": "success"},
                 "latest_snapshot": {"status": "frozen", "quality_status": "warn"},
-                "ready_report_types": ["factsheet"],
+                "ready_report_types": ["presentation"],
                 "client_approval_count": 0,
             },
             today_hkt=date(2026, 9, 23),
         )
         self.assertIn("latest_snapshot", checks)
         self.assertIn(
-            "Latest month-end snapshot does not have one ready report pair", failures
+            "Latest month-end snapshot does not have a ready factsheet", failures
         )
 
     def test_fourteen_day_window_is_inclusive_and_non_retroactive(self) -> None:

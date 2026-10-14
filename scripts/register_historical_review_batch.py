@@ -16,6 +16,7 @@ from ibkr_etl.cloud_storage import content_type_for_path, download_blob_bytes  #
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.monthly_reports import (  # noqa: E402
     REPORT_TYPES,
+    REQUIRED_REPORT_TYPES,
     validate_period_end,
     validate_review_artifact,
 )
@@ -95,7 +96,8 @@ def main() -> int:
             if snapshot is None:
                 raise RuntimeError(f"Frozen snapshot is unavailable for {period_end}")
             files = item.get("files", [])
-            if {str(file["report_type"]) for file in files} != set(REPORT_TYPES):
+            kinds = [str(file["report_type"]) for file in files]
+            if len(kinds) != len(set(kinds)) or not REQUIRED_REPORT_TYPES <= set(kinds) <= set(REPORT_TYPES):
                 raise RuntimeError(f"Review package is incomplete for {period_end}")
             for file in files:
                 report_type = str(file["report_type"])

@@ -1,19 +1,21 @@
 """The history reviewer: the onboarding agent that reads a new composite's past reports before go-live.
 
-Stage 3 of an onboarding case renders a factsheet and a deck for every month
-since the composite's inception, in the Alpha World MS or T design under the
+Stage 3 of an onboarding case renders a factsheet for every month since the
+composite's inception, in the Alpha World MS or T design under the
 composite's own name (ibkr_etl.composite_reports). Before the owner approves
 those historical reports, this agent reads every stored file, as the
 month-end team reads each month's package:
 
-  - every month from the first to the last has both files, with no gap;
+  - every month from the first to the last has its factsheet, with no gap;
   - each stored file is the one recorded when it was rendered (its hash);
   - each factsheet has the design's two pages, prints the composite's own
-    name and the month's date, carries no commentary (commentary belongs in
-    the deck only) and no text left over from the reference design;
-  - each deck names the composite and carries no MS or T identity text;
+    name and the month's date, carries no commentary and no text left over
+    from the reference design;
   - visual QA looks at every factsheet page with the Alpha World layout's
     checklist, on the APAC report deployment.
+
+Per-account decks are no longer built (Ying, 14 October 2026): a deck listed
+in older evidence is not read.
 
 The review is written to agent.onboarding_reviews, bound to the exact
 reports_rendered evidence it read. The platform records it on the case as the
@@ -37,14 +39,12 @@ from .month_team import documents
 from .month_team.agents import TeamModel, TeamModelError, VisualQA
 
 LOGGER = logging.getLogger("wealthryse_agent.onboarding_review")
-REVIEW_KINDS = ("factsheet", "presentation")
-# Text from the reference designs that must not survive in a composite's files unless the composite's own
-# name, description or tree uses it (the renderers' own read-back lists: profiled_factsheet.FOREIGN_TEXT and
-# scripts/audit_composite_presentation.py).
+REVIEW_KINDS = ("factsheet",)
+# Text from the reference designs that must not survive in a composite's factsheet unless the composite's own
+# name, description or tree uses it (the renderer's own read-back list: profiled_factsheet.FOREIGN_TEXT).
 FACTSHEET_FOREIGN_TEXT = ("Alpha World Enhanced Index", "Alpha World T Enhanced Index", "Greater China",
                           "China & Hong Kong", "US Technology", "S&P500", "130% LONG", "70% SHORT", "150% LONG",
                           "150% SHORT")
-DECK_FOREIGN_TEXT = ("Alpha World MS", "Alpha World T", "UST 3-month", "FOCUS US Tech")
 COMMENTARY_PREFIX = "Portfolio analyst:"
 SUMMARY_LIMIT = 1000
 
@@ -110,7 +110,7 @@ def _finding(severity: str, period_end: str | None, report_type: str | None, mes
 
 
 def coverage_findings(reports: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Every month from the first to the last, each with exactly one factsheet and one deck."""
+    """Every month from the first to the last, each with exactly one factsheet."""
     findings = []
     months: dict[str, list[str]] = {}
     for item in reports:
@@ -119,10 +119,9 @@ def coverage_findings(reports: Sequence[Mapping[str, Any]]) -> list[dict[str, An
         for kind in REVIEW_KINDS:
             count = kinds.count(kind)
             if count != 1:
-                what = "factsheet" if kind == "factsheet" else "deck"
                 findings.append(_finding("high", period_end, kind, (
-                    f"{month_label(period_end)} has no {what}." if count == 0 else
-                    f"{month_label(period_end)} lists {count} {what}s; there should be one.")))
+                    f"{month_label(period_end)} has no {kind}." if count == 0 else
+                    f"{month_label(period_end)} lists {count} {kind}s; there should be one.")))
     ordered = sorted(months)
     for previous, current in zip(ordered, ordered[1:]):
         gap = _month_index(current) - _month_index(previous) - 1
@@ -147,30 +146,13 @@ def factsheet_findings(pages: Sequence[str], *, period_end: str, display_name: s
                                      f"Page {number} does not show the report date {wanted}.", number))
         if COMMENTARY_PREFIX in text:
             findings.append(_finding("high", period_end, "factsheet", (
-                f"Page {number} prints commentary; commentary belongs in the deck only."), number))
+                f"Page {number} prints commentary; the factsheet never carries commentary."), number))
     for foreign in FACTSHEET_FOREIGN_TEXT:
         if foreign not in own_text:
             for number, text in enumerate(flat, 1):
                 if foreign in text:
                     findings.append(_finding("high", period_end, "factsheet", (
                         f"Page {number} still prints '{foreign}' from the reference design."), number))
-    return findings
-
-
-def deck_findings(slides: Sequence[str], *, period_end: str, display_name: str, own_text: str) -> list[dict]:
-    if not slides:
-        return [_finding("high", period_end, "presentation", "The deck has no slides.")]
-    findings = []
-    flat = [_flat(slide) for slide in slides]
-    if not any(_flat(display_name) in text for text in flat):
-        findings.append(_finding("high", period_end, "presentation", "No slide names the composite."))
-    for foreign in DECK_FOREIGN_TEXT:
-        if foreign not in own_text:
-            hits = [number for number, text in enumerate(flat, 1) if foreign in text]
-            if hits:
-                findings.append(_finding("high", period_end, "presentation", (
-                    f"Slide {hits[0]} still names '{foreign}' from the reference design"
-                    + (f" (and {len(hits) - 1} more slide(s))." if len(hits) > 1 else ".")), hits[0]))
     return findings
 
 
@@ -210,29 +192,24 @@ class HistoryReviewer:
             try:
                 file = documents.fetch(record, account_url=self.settings.storage_account_url,
                                        expected_container=self.settings.container, download=self.download)
-                if kind == "factsheet":
-                    pages = documents.pdf_text(file.content)
-                    findings += factsheet_findings(pages, period_end=period_end, display_name=display_name,
-                                                   own_text=own_text)
-                    factsheets[period_end] = file.content
-                else:
-                    slides = documents.pptx_text(file.content)
-                    findings += deck_findings(slides, period_end=period_end, display_name=display_name,
-                                              own_text=own_text)
+                pages = documents.pdf_text(file.content)
+                findings += factsheet_findings(pages, period_end=period_end, display_name=display_name,
+                                               own_text=own_text)
+                factsheets[period_end] = file.content
                 files_checked += 1
             except documents.DocumentError as error:
                 findings.append(_finding("high", period_end, kind, error.message))
         visual = self._visual(factsheets, findings, usage)
         months = sorted({str(item["period_end"]) for item in reports})
-        evidence = {"files_checked": files_checked, "files_listed": len(reports),
+        evidence = {"files_checked": files_checked,
+                    "files_listed": sum(str(item["report_type"]) in REVIEW_KINDS for item in reports),
                     "months": {"first": months[0] if months else None, "last": months[-1] if months else None,
                                "count": len(months)},
                     "design": evidence_in.get("design"), "visual_qa": visual,
-                    "checks": ["every month has a factsheet and a deck, with no gap",
+                    "checks": ["every month has a factsheet, with no gap",
                                "each stored file matches the hash recorded when it was rendered",
                                "factsheet: two pages, the composite's name and each page's report date, "
                                "no commentary, no text left from the reference design",
-                               "deck: names the composite, no MS or T identity text",
                                "visual QA of every factsheet page against the Alpha World layout"]}
         return Review(*_verdict(findings, visual, files_checked, months, evidence_in.get("design")), findings,
                       evidence, usage)
@@ -299,8 +276,8 @@ def _verdict(findings: Sequence[Mapping[str, Any]], visual: Mapping[str, Any], f
                             f"no blocking problem, but " + " and ".join(parts + gaps) + ".")
     return "pass", _fit(f"The agent review read all {files_checked} files for {span} in the {design_name} design: "
                         "every month is there, every file matches its recorded hash, each factsheet prints the "
-                        "composite's name and date with no commentary or reference-design text, each deck names "
-                        "the composite, and visual QA found no layout faults.")
+                        "composite's name and date with no commentary or reference-design text, and visual QA "
+                        "found no layout faults.")
 
 
 def _point(finding: Mapping[str, Any]) -> str:

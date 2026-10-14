@@ -56,10 +56,10 @@ def approve_internal_release(
         raise InternalReleaseError(
             f"Internal release has non-licensing blockers: {sorted(unexpected)}"
         )
-    expected_types = {"factsheet", "presentation"}
-    actual_types = {str(row.get("report_type")) for row in report_runs}
-    if actual_types != expected_types or len(report_runs) != 2:
-        raise InternalReleaseError("Internal release requires one factsheet and one presentation")
+    # The factsheet, plus a deck only where one was built before decks were retired.
+    kinds = [str(row.get("report_type")) for row in report_runs]
+    if len(kinds) != len(set(kinds)) or "factsheet" not in kinds or not set(kinds) <= {"factsheet", "presentation"}:
+        raise InternalReleaseError("Internal release requires one factsheet, and at most one presentation")
     for row in report_runs:
         if str(row.get("snapshot_id")) != str(snapshot.get("snapshot_id")):
             raise InternalReleaseError("Every artifact must reference the approved snapshot")

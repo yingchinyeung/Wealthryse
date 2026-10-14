@@ -26,6 +26,11 @@ REPORT_TYPES = {
     },
 }
 
+# What a month's package must hold. Per-account decks are no longer built:
+# past decks stay supported above so they can still be downloaded, but a
+# month is complete with its factsheet alone.
+REQUIRED_REPORT_TYPES = frozenset({"factsheet"})
+
 
 def validate_period_end(value: str) -> str:
     try:
@@ -197,13 +202,15 @@ def build_monthly_report_catalog(
             key=lambda item: item["report_type"],
         )
         available_types = {item["report_type"] for item in artifacts}
-        ready = available_types == set(REPORT_TYPES)
+        ready = REQUIRED_REPORT_TYPES <= available_types
         review_artifacts = sorted(
             review_artifacts_by_snapshot.get(snapshot_id, []),
             key=lambda item: item["report_type"],
         )
         replacement_pending = any(item['snapshot_id'] != snapshot_id for item in artifacts)
-        review_ready = (not ready or replacement_pending) and {item["report_type"] for item in review_artifacts} == set(REPORT_TYPES)
+        review_ready = (not ready or replacement_pending) and REQUIRED_REPORT_TYPES <= {
+            item["report_type"] for item in review_artifacts
+        }
         runs = runs_by_snapshot.get(snapshot_id, {})
         partially_released = bool(artifacts) and not ready
         catalog.append(

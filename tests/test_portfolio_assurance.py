@@ -155,6 +155,12 @@ class PortfolioAssuranceTests(unittest.TestCase):
         self.assertEqual(qualified['approved_report_layouts']['presentation'],
                          presentation_content_contract_version('alpha-world-ms'))
 
+    def test_a_month_with_its_factsheet_and_no_deck_passes(self) -> None:
+        result = evaluate_portfolio_assurance(_results(), _report_rows()[:1])
+        self.assertEqual(result["status"], "pass")
+        missing = evaluate_portfolio_assurance(_results(), _report_rows()[1:])
+        self.assertIn("reports.2026-09-30.pair", {row["check_id"] for row in missing["findings"]})
+
     def test_validated_data_metrics_and_august_layouts_pass(self) -> None:
         result = evaluate_portfolio_assurance(_results(), _report_rows())
         self.assertEqual(result["status"], "pass")

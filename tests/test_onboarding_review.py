@@ -76,7 +76,6 @@ class Files:
 
     def month(self, period_end: str, **factsheet_options) -> None:
         self.add(period_end, "factsheet", factsheet(period_end, **factsheet_options))
-        self.add(period_end, "presentation", deck([f"iStrategy: {NAME}", "Monthly review"], ["Holdings"]))
 
     def download(self, account_url: str, container: str, blob_name: str) -> bytes:
         assert account_url == STORAGE and container == "internal-reports"
@@ -121,15 +120,16 @@ def finding(page, severity, kind="missing_element", description="The key figures
 
 
 class CoverageTests(unittest.TestCase):
-    def test_every_month_needs_both_files_and_no_month_may_be_skipped(self):
+    def test_every_month_needs_its_factsheet_and_no_month_may_be_skipped(self):
+        # Decks are no longer built: a month without one is complete, and an old deck is not counted.
         reports = [{"period_end": "2025-01-31", "report_type": "factsheet"},
                    {"period_end": "2025-01-31", "report_type": "presentation"},
                    {"period_end": "2025-02-28", "report_type": "factsheet"},
-                   {"period_end": "2025-05-31", "report_type": "factsheet"},
-                   {"period_end": "2025-05-31", "report_type": "presentation"}]
+                   {"period_end": "2025-03-31", "report_type": "presentation"},
+                   {"period_end": "2025-06-30", "report_type": "factsheet"}]
         messages = [f["message"] for f in coverage_findings(reports)]
-        self.assertEqual(messages, ["February 2025 has no deck.",
-                                    "2 month(s) between February 2025 and May 2025 have no reports."])
+        self.assertEqual(messages, ["March 2025 has no factsheet.",
+                                    "2 month(s) between March 2025 and June 2025 have no reports."])
 
 
 class ReviewTests(unittest.TestCase):
@@ -141,8 +141,8 @@ class ReviewTests(unittest.TestCase):
         review = reviewer(files, team_model).review(files.case())
         self.assertEqual(review.findings, [])
         self.assertEqual(review.outcome, "pass", review.summary)
-        self.assertIn("all 6 files for January 2025 to March 2025 in the Alpha World MS design", review.summary)
-        self.assertEqual((review.evidence["files_checked"], review.evidence["visual_qa"]["months_looked_at"]), (6, 3))
+        self.assertIn("all 3 files for January 2025 to March 2025 in the Alpha World MS design", review.summary)
+        self.assertEqual((review.evidence["files_checked"], review.evidence["visual_qa"]["months_looked_at"]), (3, 3))
         self.assertEqual(len(responses.calls), 3)
         # The composite's factsheet is the Alpha World design, so visual QA must not ask for a Top 5 table.
         self.assertIn("Alpha World owner template", responses.calls[0]["input"][0]["content"][0]["text"])
@@ -155,7 +155,7 @@ class ReviewTests(unittest.TestCase):
                                             "Portfolio analyst: the composite rose.", "Greater China"])
         files.month("2025-02-28", name="Alpha World MS")
         files.add("2025-03-31", "factsheet", factsheet("2025-02-28"))  # last month's date on March's file
-        files.add("2025-03-31", "presentation", deck(["Alpha World MS monthly review"]))
+        files.add("2025-03-31", "presentation", deck(["Alpha World MS monthly review"]))  # an old deck, not read
         files.blobs[files.reports[0]["output_reference"].partition("/")[2]] += b"tampered"
         team_model, _ = model()
         review = reviewer(files, team_model).review(files.case())
@@ -165,9 +165,7 @@ class ReviewTests(unittest.TestCase):
                        "The stored file does not match the hash recorded when it was built."), found)
         self.assertIn(("2025-02-28", "factsheet", 1, "Page 1 does not print the composite's name."), found)
         self.assertIn(("2025-03-31", "factsheet", 1, "Page 1 does not show the report date March 31 2025."), found)
-        self.assertIn(("2025-03-31", "presentation", None, "No slide names the composite."), found)
-        self.assertIn(("2025-03-31", "presentation", 1,
-                       "Slide 1 still names 'Alpha World MS' from the reference design."), found)
+        self.assertFalse(any(kind == "presentation" for _, kind, _, _ in found))
         self.assertLessEqual(len(review.summary), 1000)
         self.assertTrue(review.summary.startswith("The agent review found"), review.summary)
 
@@ -177,7 +175,7 @@ class ReviewTests(unittest.TestCase):
                                             "Portfolio analyst: the composite rose.", "Greater China"])
         team_model, _ = model()
         found = {f["message"] for f in reviewer(files, team_model).review(files.case()).findings}
-        self.assertEqual(found, {"Page 2 prints commentary; commentary belongs in the deck only.",
+        self.assertEqual(found, {"Page 2 prints commentary; the factsheet never carries commentary.",
                                  "Page 2 still prints 'Greater China' from the reference design."})
 
     def test_reference_text_the_composite_uses_itself_is_allowed(self):

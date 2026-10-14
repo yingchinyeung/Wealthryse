@@ -135,6 +135,55 @@ class CaseViewTests(unittest.TestCase):
         self.assertEqual(view["security_proposals"], [proposal])
 
 
+class _Savepoints(_Catalogue):
+    """Counts savepoints and answers the connection reports query."""
+
+    def __init__(self, reports=(), **kwargs):
+        super().__init__(**kwargs)
+        self.reports, self.savepoints = list(reports), 0
+
+    @contextmanager
+    def transaction(self):
+        self.savepoints += 1
+        yield
+
+    def execute(self, statement, parameters=()):
+        if "FROM agent.connection_reports" in statement:
+            return _Rows(self.reports)
+        return super().execute(statement, parameters)
+
+
+class ReadinessAndConnectionReportTests(unittest.TestCase):
+    def test_the_readiness_pack_shows_only_while_the_case_waits_for_go_live(self):
+        pack = {"ready": True, "pack_sha256": "f" * 64}
+        with patch("ibkr_etl.onboarding_readiness.readiness_pack", return_value=pack) as built:
+            self.assertIsNone(onboarding_agents.case_readiness(_Untouched(), "t", CASE_ID, "go_live", environ={}))
+            self.assertIsNone(onboarding_agents.case_readiness(_Untouched(), "t", CASE_ID, "historical_reports",
+                                                               environ=ON))
+            connection = _Savepoints()
+            self.assertEqual(onboarding_agents.case_readiness(connection, "t", CASE_ID, "go_live", environ=ON), pack)
+        built.assert_called_once_with(connection, "t", CASE_ID)
+        self.assertEqual(connection.savepoints, 1)
+
+    def test_a_pack_that_cannot_be_built_says_so_instead_of_breaking_the_case_page(self):
+        with patch("ibkr_etl.onboarding_readiness.readiness_pack", side_effect=RuntimeError("boom")), \
+                self.assertLogs("ibkr_etl.onboarding_agents", "ERROR"):
+            self.assertEqual(onboarding_agents.case_readiness(_Savepoints(), "t", CASE_ID, "go_live", environ=ON),
+                             {"unavailable": True})
+
+    def test_connection_reports_are_the_latest_per_connection_and_only_while_switched_on(self):
+        self.assertIsNone(onboarding_agents.connection_reports(_Untouched(), "t", environ={}))
+        self.assertEqual(onboarding_agents.connection_reports(_Savepoints(allowed=False), "t", environ=ON), {})
+        report = {"connection_id": uuid.UUID(int=7), "state": "failed", "title": "The token was refused",
+                  "body": "IBKR said the token is not valid.", "owner_steps": json.dumps(["Make a new token.", " "]),
+                  "created_at": "2026-10-14 21:00:00+00"}
+        self.assertEqual(onboarding_agents.connection_reports(_Savepoints([report]), "t", environ=ON),
+                         {str(uuid.UUID(int=7)): {"state": "failed", "title": "The token was refused",
+                                                  "body": "IBKR said the token is not valid.",
+                                                  "owner_steps": ["Make a new token."],
+                                                  "reported_at": "2026-10-14 21:00:00+00"}})
+
+
 class DocumentTests(unittest.TestCase):
     def test_names_are_kept_readable_and_safe(self):
         self.assertEqual(onboarding_agents.safe_document_name("C:\\Users\\x\\Mandate (signed).PDF"),
@@ -227,8 +276,15 @@ class DocumentRouteTests(unittest.TestCase):
             page = self.client.get(f"/account-onboarding/cases/{uuid.UUID(CASE_ID)}").text
         for part in ("Checked by agent", "Proposed security master entries", "Client documents",
                      "Terms drafted by the agent from the client's documents", 'id="case-term-draft"',
-                     f"/api/onboarding-v2/cases/${{caseId}}/documents"):
+                     f"/api/onboarding-v2/cases/${{caseId}}/documents", 'id="case-readiness"',
+                     "Typing GO LIVE switches on", "Approved terms against the client's documents"):
             self.assertIn(part, page)
+
+    def test_the_connections_page_shows_the_agents_reports(self):
+        with patch.dict(os.environ, ON):
+            page = self.client.get("/broker-connections").text
+        self.assertIn("data.agent_reports", page)
+        self.assertIn("Checked by agent", page)
 
 
 class ScheduledCallTests(unittest.TestCase):

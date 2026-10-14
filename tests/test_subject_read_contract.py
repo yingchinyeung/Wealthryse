@@ -10,6 +10,7 @@ from ibkr_etl.agent_tools import AgentToolContext, AgentToolError, execute_tool
 from ibkr_etl.subject_onboarding import approved_reference_definitions, configuration_sha256
 from ibkr_etl.subject_read_contract import require_ms_hkd_contract, synthetic_exposure
 from ibkr_etl.reporting_snapshot import assemble_month_end_payload, ReportingSnapshotError
+from ibkr_etl.website_benchmarks import website_comparison_version
 
 
 class Cursor:
@@ -63,7 +64,8 @@ class Fixture:
         self.raw.execute("INSERT INTO portfolio_benchmark_mapping VALUES ('alpha-world-ms','GSPC','primary','HKD','2025-01-20',NULL)")
         self.raw.execute("INSERT INTO benchmark_master VALUES ('GSPC','GSPC','Comparison only','fixture','price','approved',1)")
         for ccy,nav in [('USD',999),('HKD',103)]:
-            self.raw.execute("INSERT INTO performance_comparison_daily VALUES ('alpha-world-ms','GSPC','benchmark-comparison-v1','pass','2025-01-21',?, ?,100,?,100,.03,0,.03)",(ccy,nav,nav))
+            self.raw.execute("INSERT INTO performance_comparison_daily VALUES ('alpha-world-ms','GSPC',?,'pass','2025-01-21',?, ?,100,?,100,.03,0,.03)",
+                             (website_comparison_version('alpha-world-ms','HKD'),ccy,nav,nav))
         self.calls=[]
 
     def execute(self,sql,params=()):

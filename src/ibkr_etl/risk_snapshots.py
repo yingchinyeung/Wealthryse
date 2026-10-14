@@ -159,17 +159,20 @@ def load_risk_inputs(
     subject_type = str(subject["subject_type"]) if subject else "physical_account"
     if subject_id == 'alpha-world-ms':
         from .alpha_world_ms_hkd import load_risk_snapshot
+        from .alpha_world_ms_crisis import load as load_ms_crisis
         try:
             snapshot, _, _ = load_risk_snapshot(connection, as_of, tenant_id=tenant_id)
         except ValueError as error:
             raise RiskInputsNotReady(str(error)) from error
         timings['input_query_ms'] = round((time.perf_counter()-started)*1000, 3)
         timings['tail_position_query_ms'] = 0.0
+        try: crisis = load_ms_crisis(connection, snapshot, tenant_id=tenant_id, identity_proxy=True)
+        except ValueError: crisis = None
         # Benchmark comparison is a separate, unqualified capability. Never
         # intersect full HKD NAV metrics with legacy USD/GSPC comparison rows.
         return {'subject_id':subject_id, 'subject_type':subject_type, 'as_of':as_of,
             'benchmark_id':None, 'rows':[], 'positions':[],
-            'risk_free':snapshot['risk']['risk_free'], 'crisis_replay':None,
+            'risk_free':snapshot['risk']['risk_free'], 'crisis_replay':crisis,
             'ms_hkd_snapshot':snapshot}, timings
     benchmark = connection.execute(
         """
@@ -300,8 +303,10 @@ def risk_input_fingerprint(inputs: Mapping[str, Any]) -> str:
     }
     if 'ms_hkd_snapshot' in inputs:
         from .alpha_world_ms_analytics import VERSION
+        from .alpha_world_ms_runtime import VERSION as RUNTIME_VERSION
         manifest['ms_hkd_snapshot']=inputs['ms_hkd_snapshot']
         manifest['ms_methodology_version']=VERSION
+        manifest['ms_runtime_version']=RUNTIME_VERSION
     if 't_hkd_snapshot' in inputs:
         from .alpha_world_t_runtime import VERSION
         manifest['t_hkd_snapshot']=inputs['t_hkd_snapshot']
@@ -340,19 +345,13 @@ def compute_risk_snapshot(
         return payload,timings,source_sha256
 
     if subject_id == 'alpha-world-ms':
-        from .alpha_world_ms_analytics import analyze
-        from .alpha_world_ms_cache import methodology_identity, UNAVAILABLE
+        from .alpha_world_ms_runtime import build_payload
         validate_risk_input_readiness(inputs)
         analytics_started=time.perf_counter()
-        metrics,_,evidence=analyze(inputs['ms_hkd_snapshot'])
+        payload=build_payload(inputs)
         timings['deterministic_metrics_ms']=round((time.perf_counter()-analytics_started)*1000,3)
         timings['total_ms']=round(timings['input_query_ms']+timings['deterministic_metrics_ms'],3)
-        return {'account_id':subject_id,'as_of':as_of,'benchmark_id':None,
-            'methodology_identity':methodology_identity(), 'unavailable_capabilities':dict(UNAVAILABLE),
-            'reporting_currency':'HKD','metrics':metrics,'risk_free':dict(risk_free),
-            'expected_tail_loss_contributors':{'top':[], 'bottom':[]}, 'crisis_replay':None,'quality_status':'warn',
-            'message':'HKD NAV metrics use period-average 1M HIBOR from inception. Composite crisis replay and security-level tail allocation are not qualified.',
-            'analytics_evidence':evidence,'analytics_version':RISK_ANALYTICS_VERSION},timings,source_sha256
+        return payload,timings,source_sha256
 
     analytics_started = time.perf_counter()
     metrics = portfolio_risk_metrics(
@@ -554,8 +553,11 @@ def snapshot_read_status(existing, *, subject_id: str, as_of: str,
     if hashlib.sha256(serialized.encode("utf-8")).hexdigest() != existing.get("payload_sha256"):
         return "payload_hash_mismatch"
     if subject_id == 'alpha-world-ms':
-        from .alpha_world_ms_cache import validate_payload
         try:
+            if payload.get('runtime_version'):
+                from .alpha_world_ms_runtime import validate_payload
+            else:
+                from .alpha_world_ms_cache import validate_payload
             validate_payload(payload)
         except (KeyError, ValueError, TypeError, OverflowError):
             return 'ms_methodology_mismatch'

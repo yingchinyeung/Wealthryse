@@ -38,6 +38,10 @@ class MsCacheTests(unittest.TestCase):
     def setUp(self):
         self.c=CacheFixture()
         self.addCleanup(self.c.raw.close)
+        # This fixture has no crisis tables; the risk build treats an unqualified
+        # MS crisis replay as unavailable rather than as a failed snapshot.
+        crisis=patch('ibkr_etl.alpha_world_ms_crisis.load',side_effect=ValueError('Crisis inputs unavailable'))
+        crisis.start();self.addCleanup(crisis.stop)
 
     def build(self, day='2025-01-22'):
         return build_risk_snapshot(self.c, tenant_id='tenant', subject_id='alpha-world-ms',

@@ -70,6 +70,33 @@ class ChangeSetTest(unittest.TestCase):
         self.assertNotIn("live-snapshot", (ROOT / "deploy" / "website_release.py").read_text())
 
 
+class FirstImportedTest(unittest.TestCase):
+    BEFORE = {
+        "web.py": b"from .db import connect\n",
+        "db.py": b"import json\n",
+        "report_design_ui.py": b"SCRIPT = ''\n",
+        "unused.py": b"x = 1\n",
+    }
+
+    def test_unchanged_modules_the_new_website_imports_first_are_added(self):
+        after = {**self.BEFORE,
+                 "web.py": b"from .db import connect\nfrom . import report_design_ui\nfrom ibkr_etl.fresh import y\n",
+                 "fresh.py": b"def y(): from .unused import x\n"}
+        self.assertEqual(release.website_modules(after), {"web.py", "db.py", "report_design_ui.py", "fresh.py", "unused.py"})
+        # fresh.py is new, so the patch carries it; the other two did not change.
+        self.assertEqual(release.first_imported(self.BEFORE, after), ["report_design_ui.py", "unused.py"])
+
+    def test_nothing_is_added_when_the_website_imports_nothing_new(self):
+        after = {**self.BEFORE, "web.py": b"from .db import connect\nVALUE = 2\n"}
+        self.assertEqual(release.first_imported(self.BEFORE, after), [])
+
+    def test_the_build_adds_them_whole_and_checks_each_against_the_reviewed_hash(self):
+        code = (ROOT / "deploy" / "website_overlay_build_remote.py").read_text()
+        self.assertIn("hashlib.sha256(content).hexdigest() != wanted.get(name)", code)
+        self.assertLess(code.index("The change altered files it should not have"), code.index("result['first_imported']"))
+        self.assertLess(code.index("result['first_imported']"), code.index("'import ibkr_etl.web'"))
+
+
 class AlreadyLiveFilesTest(unittest.TestCase):
     def test_sections_for_files_already_live_are_dropped(self):
         patch = (b"diff --git a/src/ibkr_etl/web.py b/src/ibkr_etl/web.py\n--- a/src/ibkr_etl/web.py\n"

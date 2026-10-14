@@ -10,7 +10,7 @@ Steps, each a subcommand so the workflow can show and stop at each one:
                    the assurance job itself is not changed
 State passes between steps in release-state.json.
 """
-import base64, gzip, hashlib, json, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import ast, base64, gzip, hashlib, json, subprocess, sys, tempfile, time, urllib.request, urllib.error
 from pathlib import Path
 
 RG = 'rg-ibkr-database-v11'
@@ -55,6 +55,50 @@ def package_files(commit):
     return {f[len(PACKAGE) + 1:]: git('show', commit + ':' + f, binary=True) for f in files}
 
 
+def sides(state):
+    """The live ("before") and reviewed ("after") src/ibkr_etl files, by name."""
+    if state['deployed_commit'] == BASELINE_COMMIT:
+        raise SystemExit('The live website was not released from this repo; releases now start from a repo-built image')
+    before, after = package_files(state['deployed_commit']), package_files(state['head'])
+    merged = 'deploy/live-merged/' + PACKAGE + '/'
+    for path in git('ls-tree', '-r', '--name-only', state['deployed_commit'], merged).split():
+        if path.endswith('.py'):
+            before[path[len(merged):]] = git('show', state['deployed_commit'] + ':' + path, binary=True)
+    return before, after
+
+
+def website_modules(files):
+    """The src/ibkr_etl files ibkr_etl.web imports, directly or through other modules."""
+    def imported(source):
+        names = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ImportFrom) and (node.level == 1 or (node.module or '').split('.')[0] == 'ibkr_etl'):
+                module = node.module if node.level else (node.module or '').partition('.')[2]
+                names |= {module.split('.')[0]} if module else {alias.name for alias in node.names}
+            elif isinstance(node, ast.Import):
+                names |= {a.name.split('.')[1] for a in node.names if a.name.startswith('ibkr_etl.')}
+        return {name + '.py' for name in names}
+    found, pending = set(), ['web.py']
+    while pending:
+        name = pending.pop()
+        if name in found or name not in files:
+            continue
+        found.add(name)
+        pending.extend(imported(files[name]))
+    return found
+
+
+def first_imported(before, after):
+    """Unchanged files the reviewed website imports and the live one did not.
+
+    The patch carries only files that changed, so such a file may be missing from
+    the live image, or be an older copy nothing there imported (run 25 on 14 Oct:
+    the reviewed web.py imports report_design_ui, which the live web.py never did).
+    The build adds these files whole.
+    """
+    return sorted(n for n in website_modules(after) - website_modules(before) if before.get(n) == after[n])
+
+
 def change_set(state):
     """The patch from what is live to what should be live, with before/after hashes.
 
@@ -63,13 +107,7 @@ def change_set(state):
     files from deploy/live-merged/ (since removed); when the deployed commit has
     those copies, they are what is live, so they are the "before" side.
     """
-    if state['deployed_commit'] == BASELINE_COMMIT:
-        raise SystemExit('The live website was not released from this repo; releases now start from a repo-built image')
-    before, after = package_files(state['deployed_commit']), package_files(state['head'])
-    merged = 'deploy/live-merged/' + PACKAGE + '/'
-    for path in git('ls-tree', '-r', '--name-only', state['deployed_commit'], merged).split():
-        if path.endswith('.py'):
-            before[path[len(merged):]] = git('show', state['deployed_commit'] + ':' + path, binary=True)
+    before, after = sides(state)
     changed = [n for n in set(before) | set(after) if before.get(n) != after.get(n)]
     with tempfile.TemporaryDirectory() as tmp:
         for side, files in (('a', before), ('b', after)):
@@ -138,7 +176,9 @@ def build():
     if not state['changed_files']:
         return
     patch, live_hashes, new_hashes = change_set(state)
+    before, after = sides(state)
     config = {
+        'imported': {n: base64.b64encode(gzip.compress(after[n], 9)).decode() for n in first_imported(before, after)},
         'base_image': state['live_image'], 'target_image': state['target_image'], 'source_commit': state['head'],
         'live_hashes': live_hashes, 'new_hashes': new_hashes,
         'patch': base64.b64encode(gzip.compress(patch, 9)).decode(),

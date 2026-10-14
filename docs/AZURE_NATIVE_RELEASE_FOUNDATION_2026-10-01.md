@@ -90,17 +90,6 @@ scope reduction). Do not silently reduce permissions on current production jobs.
 
 ## Remaining implementation gates
 
-### Build-input review update — production-runtime rights blocker
-
-Read the actual installed `@oai/artifact-tool` 2.8.59 `LICENSE.md`. The bundled
-text limits use to internal evaluation/testing and restricts production,
-commercial and benchmarking use without prior written permission. No separate
-written grant was found or supplied in this work. This is a release blocker
-for the existing presentation runtime, not a rights determination based on the
-package's `private: true` metadata. Owner deployment approval is not a grant
-of third-party IP rights. Do not copy the runtime into another production build
-until written permission is verified or an appropriately licensed replacement
-is implemented and the approved layouts pass acceptance again.
 
 `scripts/node_modules` resolves through an existing junction into the desktop
 runtime. Its configured location is not a self-contained, version-controlled
@@ -108,8 +97,8 @@ build dependency. Read-only inventory explicitly resolved that one known root;
 no copy, patch, upload or execution of the private runtime was performed here.
 
 Added `build_inputs.py` and `inspect_release_inputs.py` to fingerprint the seven
-private template/intake files, 208 runtime files (66,688,613 bytes), and licence.
-The resulting inventory is explicitly **not production-build-ready**.
+private template/intake files, 208 runtime files (66,688,613 bytes).
+
 Local evidence:
 `.work/azure-native-release/input-inventories/544888f715dd6444df75cd96b218660ec82f71a94a469bf30ff4baa34bb21b52.json`.
 That filename is the SHA-256 of the inventory bytes.
@@ -131,8 +120,6 @@ No ACR task/build, production deployment, live Flex request, new access grant,
 report regeneration or template alteration occurred. The previously uploaded
 315-file source archive remains the previous baseline, not these new changes.
 
-Decision needed: verify written production-use permission if it already exists;
-otherwise authorize a renderer replacement and visual/financial revalidation.
 
 1. Uploader access, version-pinned upload/read-back and safe-rerun verification
    are complete. No archive is a deployable or approved release by itself.

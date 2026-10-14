@@ -112,7 +112,7 @@ a { color: var(--brand-deep); }
 td, .value, .metric, .account-stats { font-variant-numeric: tabular-nums; }
 .gain { color: #0f7a4a; }
 .loss { color: #b42318; }
-select, input[type=text], input[type=search], input[type=date], textarea {
+select, input[type=text], input[type=search], input[type=date], input.secret-field, textarea {
   color: var(--ink);
   background: rgba(255, 255, 255, .92);
   border: 1px solid var(--line-strong);
@@ -121,7 +121,7 @@ select, input[type=text], input[type=search], input[type=date], textarea {
   font: inherit;
   transition: border-color .18s ease, box-shadow .18s ease, background .18s ease;
 }
-select, input[type=text], input[type=search], input[type=date] { min-width: 220px; max-width: 100%; margin-top: 7px; padding: 10px 13px; }
+select, input[type=text], input[type=search], input[type=date], input.secret-field { min-width: 220px; max-width: 100%; margin-top: 7px; padding: 10px 13px; }
 textarea { width: 100%; min-height: 92px; margin-top: 13px; padding: 13px 15px; resize: vertical; }
 select:hover, input:hover, textarea:hover { border-color: rgba(8, 120, 249, .36); }
 select:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visible, button:focus-visible { outline: none; box-shadow: 0 0 0 4px rgba(8, 120, 249, .18); }
@@ -191,7 +191,7 @@ DARK_THEME_CSS = r"""
   .account-card { background: radial-gradient(circle at 88% 4%, rgba(103, 92, 255, .55), transparent 12rem), radial-gradient(circle at 5% 110%, rgba(8, 120, 249, .5), transparent 17rem), linear-gradient(145deg, #1a2336, #0f1520 72%); border-color: rgba(255, 255, 255, .14); }
   .gain { color: #57c994; }
   .loss { color: #ff8a80; }
-  select, input[type=text], input[type=search], input[type=date], textarea { background: rgba(12, 16, 25, .92); box-shadow: none; }
+  select, input[type=text], input[type=search], input[type=date], input.secret-field, textarea { background: rgba(12, 16, 25, .92); box-shadow: none; }
   .button:disabled { color: rgba(255, 255, 255, .6); background: #3a4456; }
   .eyebrow { color: #8bbcff; background: rgba(79, 157, 255, .12); border-color: rgba(79, 157, 255, .22); }
   .accounts-summary .behind { color: #fcd34d; }
@@ -524,6 +524,11 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
 .onboarding-check.fail { border-left-color: #d9485f; }
 .onboarding-check span { color: var(--muted); font-size: 12px; line-height: 1.5; }
 .onboarding-case h4 { margin: 20px 0 0; font-size: 13px; }
+.onboarding-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 10px; padding: 13px 15px; background: var(--surface-soft); border: 1px solid var(--line); border-radius: 12px; }
+.onboarding-row strong { display: block; }
+.onboarding-row .muted { margin-top: 3px; font-size: 12px; }
+.onboarding-row .actions { margin: 0; flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 650px) { .onboarding-row { flex-direction: column; align-items: flex-start; } .onboarding-row .actions { justify-content: flex-start; } }
 @media (max-width: 900px) {
   .page-view.active { grid-template-columns: 1fr 1fr; }
   .wide { grid-column: span 2; }

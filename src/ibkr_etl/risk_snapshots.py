@@ -36,6 +36,12 @@ def validate_risk_input_readiness(inputs: Mapping[str, Any]) -> None:
         except (KeyError,ValueError,TypeError,OverflowError) as error:
             raise RiskInputsNotReady('T HKD/HIBOR inputs are not qualified: '+str(error)) from error
         return
+    if 'profiled_hkd_snapshot' in inputs:
+        from .profiled_composite import validate_inputs as validate_profiled
+        try:validate_profiled(inputs)
+        except (KeyError,ValueError,TypeError,OverflowError) as error:
+            raise RiskInputsNotReady('Composite HKD/HIBOR inputs are not qualified: '+str(error)) from error
+        return
     if inputs['subject_id'] == 'alpha-world-ms':
         from .alpha_world_ms_analytics import analyze
         from .alpha_world_ms_cache import methodology_identity
@@ -157,6 +163,21 @@ def load_risk_inputs(
         (tenant_id, subject_id),
     ).fetchone()
     subject_type = str(subject["subject_type"]) if subject else "physical_account"
+    from .profiled_composite import is_profiled
+    if (subject_type == 'composite_portfolio' and subject_id not in ('alpha-world-ms','alpha-world-t')
+            and is_profiled(connection, subject_id, tenant_id=tenant_id)):
+        # A composite reporting in the Alpha World MS or T design: full HKD
+        # NAV and HIBOR, never the USD benchmark comparison path below.
+        from .profiled_composite import load_risk_snapshot as load_profiled
+        try:
+            snapshot,_,_=load_profiled(connection,subject_id,as_of,tenant_id=tenant_id)
+            inputs={'subject_id':subject_id,'subject_type':subject_type,'as_of':as_of,
+                'benchmark_id':None,'rows':[],'positions':[],'risk_free':snapshot['risk']['risk_free'],
+                'crisis_replay':None,'profiled_hkd_snapshot':snapshot}
+            validate_risk_input_readiness(inputs)
+        except (ValueError,KeyError,TypeError) as error:
+            raise RiskInputsNotReady('Composite qualified stored inputs unavailable: '+str(error)) from error
+        return inputs,{'input_query_ms':round((time.perf_counter()-started)*1000,3),'tail_position_query_ms':0.}
     if subject_id == 'alpha-world-ms':
         from .alpha_world_ms_hkd import load_risk_snapshot
         from .alpha_world_ms_crisis import load as load_ms_crisis
@@ -311,6 +332,11 @@ def risk_input_fingerprint(inputs: Mapping[str, Any]) -> str:
         from .alpha_world_t_runtime import VERSION
         manifest['t_hkd_snapshot']=inputs['t_hkd_snapshot']
         manifest['t_runtime_version']=VERSION
+    if 'profiled_hkd_snapshot' in inputs:
+        from .profiled_composite import ANALYTICS_VERSION, RUNTIME_VERSION
+        manifest['profiled_hkd_snapshot']=inputs['profiled_hkd_snapshot']
+        manifest['profiled_methodology_version']=ANALYTICS_VERSION
+        manifest['profiled_runtime_version']=RUNTIME_VERSION
     # Reject NaN/infinity rather than giving an invalid calculation a cache key.
     serialized = canonical_json(manifest)
     json.loads(serialized, parse_constant=lambda value: (_ for _ in ()).throw(
@@ -327,7 +353,7 @@ def compute_risk_snapshot(
         connection, tenant_id=tenant_id, subject_id=subject_id, as_of=as_of)
     if inputs['subject_id'] != subject_id or inputs['as_of'] != as_of:
         raise RiskInputsNotReady('Risk input identity does not match the requested subject and date')
-    if subject_id == 'alpha-world-t':
+    if subject_id == 'alpha-world-t' or 'profiled_hkd_snapshot' in inputs:
         # Supplied loaded_inputs must not bypass the same T qualification gate
         # enforced by load_risk_inputs and the ordinary background worker.
         validate_risk_input_readiness(inputs)
@@ -340,6 +366,13 @@ def compute_risk_snapshot(
     if subject_id=='alpha-world-t':
         from .alpha_world_t_runtime import build_payload
         started=time.perf_counter();payload=build_payload(inputs)
+        timings['deterministic_metrics_ms']=round((time.perf_counter()-started)*1000,3)
+        timings['total_ms']=round(timings['input_query_ms']+timings['deterministic_metrics_ms'],3)
+        return payload,timings,source_sha256
+
+    if 'profiled_hkd_snapshot' in inputs:
+        from .profiled_composite import build_payload as build_profiled
+        started=time.perf_counter();payload=build_profiled(inputs)
         timings['deterministic_metrics_ms']=round((time.perf_counter()-started)*1000,3)
         timings['total_ms']=round(timings['input_query_ms']+timings['deterministic_metrics_ms'],3)
         return payload,timings,source_sha256
@@ -404,12 +437,13 @@ def store_risk_snapshot(
 ) -> None:
     payload_json = canonical_json(payload)
     payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
-    if subject_id in ('alpha-world-ms','alpha-world-t'):
+    if subject_id in ('alpha-world-ms','alpha-world-t') or _profiled_payload(payload):
         status = snapshot_read_status({'payload_json':payload, 'payload_sha256':payload_sha256,
             'quality_status':payload.get('quality_status'), 'comparison_version':CALCULATION_VERSION},
             subject_id=subject_id, as_of=as_of)
         if status != 'current':
-            raise RiskInputsNotReady(('T' if subject_id=='alpha-world-t' else 'MS')+' output did not pass cache validation: ' + status)
+            label = {'alpha-world-t':'T','alpha-world-ms':'MS'}.get(subject_id,'Composite')
+            raise RiskInputsNotReady(label+' output did not pass cache validation: ' + status)
     connection.execute(
         """
         INSERT INTO risk_analytics_snapshots(
@@ -515,6 +549,11 @@ def decoded_payload(value: Any) -> dict[str, Any]:
     raise ValueError("Risk analytics snapshot payload is not a JSON object")
 
 
+def _profiled_payload(payload: Any) -> bool:
+    from .profiled_composite import RUNTIME_VERSION
+    return isinstance(payload, Mapping) and payload.get('runtime_version') == RUNTIME_VERSION
+
+
 def snapshot_read_status(existing, *, subject_id: str, as_of: str,
                          benchmark_id: str | None = None) -> str:
     """Validate a cached response without querying source data or bootstrapping.
@@ -545,8 +584,9 @@ def snapshot_read_status(existing, *, subject_id: str, as_of: str,
         expected["benchmark_id"] = benchmark_id
     if any(payload.get(key) != value for key, value in expected.items()):
         return "payload_identity_mismatch"
+    profiled = _profiled_payload(payload)
     if (not isinstance(payload.get("metrics"), dict)
-            or (subject_id not in ('alpha-world-ms','alpha-world-t') and
+            or (subject_id not in ('alpha-world-ms','alpha-world-t') and not profiled and
                 (not isinstance(payload.get("benchmark_id"), str) or not payload["benchmark_id"]))
             or payload.get("quality_status") != existing["quality_status"]):
         return "invalid_payload_structure"
@@ -561,6 +601,12 @@ def snapshot_read_status(existing, *, subject_id: str, as_of: str,
             validate_payload(payload)
         except (KeyError, ValueError, TypeError, OverflowError):
             return 'ms_methodology_mismatch'
+    if profiled:
+        try:
+            from .profiled_composite import validate_payload as validate_profiled
+            validate_profiled(payload)
+        except (KeyError, ValueError, TypeError, OverflowError):
+            return 'composite_methodology_mismatch'
     return "current"
 
 

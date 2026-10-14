@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from psycopg.errors import InsufficientPrivilege
 from psycopg import Error as PostgresError
 from psycopg.rows import dict_row
@@ -105,6 +105,7 @@ from .template_upload import (
     validate_pptx_upload,
     validate_subject_id,
 )
+from .subject_activation import activate_subject
 from .subject_onboarding import (
     POST_WAVE0_ONBOARDING_SEQUENCE,
     approved_reference_definitions,
@@ -141,6 +142,8 @@ from .authorization import (
     subject_access_levels,
 )
 from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_guide
+from . import onboarding_v2_web
+from .broker_connections import onboarding_v2_enabled
 from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS
 from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
@@ -4887,7 +4890,9 @@ def _platform_navigation(user: dict[str, object], *, active: str | None = None) 
         "onboarding_operator",
     }:
         operations.append(
-            ("ibkr-connections", "IBKR connections", "/ibkr-connections")
+            ("broker-connections", "Broker connections", "/broker-connections")
+            if onboarding_v2_enabled()
+            else ("ibkr-connections", "IBKR connections", "/ibkr-connections")
         )
         operations.append(
             ("account-onboarding", "Account onboarding", "/account-onboarding")
@@ -5484,6 +5489,17 @@ def account_onboarding_summary(
     }
 
 
+def _refuse_classic_studio() -> None:
+    """With the new onboarding on, portfolios start from the portfolio builder instead."""
+
+    if onboarding_v2_enabled():
+        raise HTTPException(
+            status_code=409,
+            detail="The Derived Portfolio Studio has been replaced by the portfolio builder: "
+            "Account onboarding, New portfolio.",
+        )
+
+
 def _create_derived_studio_case(
     connection,
     *,
@@ -5668,6 +5684,202 @@ def _create_derived_studio_case(
     return str(case_id), definition_digest
 
 
+def _studio_filtered_definition(
+    connection,
+    submission: DerivedStudioFilteredStartRequest,
+    subject: str,
+    source: str,
+) -> dict:
+    """Validate a filtered-portfolio form against its live source account."""
+
+    source_row = connection.execute(
+        """
+        SELECT subject_id, subject_type, lifecycle_status,
+               COALESCE(reporting_currency, base_currency) AS currency,
+               history_start_date
+        FROM platform_subjects
+        WHERE tenant_id = %s AND subject_id = %s
+        FOR SHARE
+        """,
+        (TENANT_ID, source),
+    ).fetchone()
+    if (
+        source_row is None
+        or str(source_row["subject_type"]) != "physical_account"
+        or str(source_row["lifecycle_status"]) != "active"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A filtered portfolio requires an active physical source account",
+        )
+    if (
+        source_row["history_start_date"] is not None
+        and submission.history_start_date < source_row["history_start_date"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The requested history starts before the source account coverage",
+        )
+    if str(source_row["currency"] or "").upper() != submission.base_currency:
+        raise HTTPException(
+            status_code=409,
+            detail="The filtered portfolio base currency must match its source account",
+        )
+    try:
+        definition = filtered_portfolio_definition(
+            subject_id=subject,
+            display_name=submission.display_name,
+            source_account_id=source,
+            base_currency=submission.base_currency,
+            history_start_date=submission.history_start_date.isoformat(),
+            excluded_countries=submission.excluded_countries,
+            excluded_exchanges=submission.excluded_exchanges,
+            excluded_currencies=submission.excluded_currencies,
+            opening_cash=submission.opening_cash,
+            allowed_cash_currencies=submission.allowed_cash_currencies,
+            include_actual_interest=submission.include_actual_interest,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return definition
+
+
+def _studio_composite_definition(
+    connection,
+    submission: DerivedStudioCompositeStartRequest,
+    subject: str,
+) -> dict:
+    """Validate a composite form against live sleeves and approved market history."""
+
+    market_catalog = {
+        item.instrument_id: item for item in ALPHA_WORLD_MARKET_INSTRUMENTS
+    }
+    component_ids = [item.component_id for item in submission.components]
+    rows = connection.execute(
+        """
+        SELECT subject_id, subject_type, display_name,
+               COALESCE(reporting_currency, base_currency) AS currency,
+               lifecycle_status
+        FROM platform_subjects
+        WHERE tenant_id = %s AND subject_id = ANY(%s)
+        FOR SHARE
+        """,
+        (TENANT_ID, component_ids),
+    ).fetchall()
+    registered = {str(row["subject_id"]): dict(row) for row in rows}
+    components = []
+    for request in submission.components:
+        component_id = request.component_id
+        row = registered.get(component_id)
+        if row is not None:
+            if str(row["lifecycle_status"]) != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Component {component_id} is not active",
+                )
+            source_type = str(row["subject_type"])
+            if source_type == "physical_account":
+                component_type = "account"
+            elif source_type in {"filtered_portfolio", "composite_portfolio"}:
+                component_type = "portfolio"
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Component {component_id} is not an investable sleeve",
+                )
+            components.append(
+                {
+                    "component_id": component_id,
+                    "component_name": str(row["display_name"]),
+                    "component_type": component_type,
+                    "coefficient": request.coefficient,
+                    "source_currency": str(row["currency"]),
+                    "price_convention": "nav",
+                }
+            )
+            continue
+        market = market_catalog.get(component_id)
+        if market is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Component {component_id} is not in the approved catalogue",
+            )
+        coverage = connection.execute(
+            """
+            SELECT MAX(price_date) FILTER (WHERE price_date <= %s) AS base_date,
+                   MAX(price_date) AS latest_date
+            FROM market_data_prices WHERE instrument_id = %s
+            """,
+            (submission.normalization_date.isoformat(), component_id),
+        ).fetchone()
+        if coverage is None or coverage["base_date"] is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Component {component_id} has no normalization-date market history",
+            )
+        components.append(
+            {
+                "component_id": component_id,
+                "component_name": market.name,
+                "component_type": "benchmark",
+                "coefficient": request.coefficient,
+                "source_currency": market.currency,
+                "price_convention": _studio_price_convention(market.price_type),
+            }
+        )
+    try:
+        definition = fixed_unit_composite_definition(
+            subject_id=subject,
+            display_name=submission.display_name,
+            base_currency=submission.base_currency,
+            normalization_date=submission.normalization_date.isoformat(),
+            constant_cash=submission.constant_cash,
+            components=components,
+            market_carry_days=submission.market_carry_days,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return definition
+
+
+_BUILDER_FIELD_LABELS = {
+    "subject_id": "the portfolio ID",
+    "display_name": "the name",
+    "source_account_id": "the account",
+    "base_currency": "the reporting currency",
+    "allowed_cash_currencies": "the cash currencies",
+    "opening_cash": "the opening cash",
+    "components": "the sleeves",
+}
+
+
+def _builder_definition(connection, kind: str, fields: dict) -> dict:
+    """The new portfolio builder runs exactly the Studio's validation."""
+
+    try:
+        if kind == "filtered_portfolio":
+            filtered = DerivedStudioFilteredStartRequest.model_validate(fields)
+            return _studio_filtered_definition(
+                connection, filtered,
+                validate_subject_id(filtered.subject_id),
+                validate_subject_id(filtered.source_account_id),
+            )
+        composite = DerivedStudioCompositeStartRequest.model_validate(fields)
+        return _studio_composite_definition(
+            connection, composite, validate_subject_id(composite.subject_id)
+        )
+    except ValidationError as error:
+        first = error.errors()[0] if error.errors() else {}
+        field = str((first.get("loc") or ("",))[0])
+        raise HTTPException(
+            status_code=400,
+            detail=f"Check {_BUILDER_FIELD_LABELS.get(field, 'the portfolio fields')}: "
+            f"{first.get('msg', 'invalid value')}",
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @app.post("/api/onboarding/derived-studio/filtered/start")
 def start_studio_filtered_portfolio(
     submission: DerivedStudioFilteredStartRequest,
@@ -5675,6 +5887,7 @@ def start_studio_filtered_portfolio(
 ) -> dict:
     """Create a private filtered-portfolio case from typed website fields."""
 
+    _refuse_classic_studio()
     try:
         subject = validate_subject_id(submission.subject_id)
         source = validate_subject_id(submission.source_account_id)
@@ -5682,55 +5895,7 @@ def start_studio_filtered_portfolio(
         raise HTTPException(status_code=400, detail=str(error)) from error
     actor = _identity_digest(user["object_id"] or user["email"])
     with _approval_database() as connection:
-        source_row = connection.execute(
-            """
-            SELECT subject_id, subject_type, lifecycle_status,
-                   COALESCE(reporting_currency, base_currency) AS currency,
-                   history_start_date
-            FROM platform_subjects
-            WHERE tenant_id = %s AND subject_id = %s
-            FOR SHARE
-            """,
-            (TENANT_ID, source),
-        ).fetchone()
-        if (
-            source_row is None
-            or str(source_row["subject_type"]) != "physical_account"
-            or str(source_row["lifecycle_status"]) != "active"
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="A filtered portfolio requires an active physical source account",
-            )
-        if (
-            source_row["history_start_date"] is not None
-            and submission.history_start_date < source_row["history_start_date"]
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="The requested history starts before the source account coverage",
-            )
-        if str(source_row["currency"] or "").upper() != submission.base_currency:
-            raise HTTPException(
-                status_code=409,
-                detail="The filtered portfolio base currency must match its source account",
-            )
-        try:
-            definition = filtered_portfolio_definition(
-                subject_id=subject,
-                display_name=submission.display_name,
-                source_account_id=source,
-                base_currency=submission.base_currency,
-                history_start_date=submission.history_start_date.isoformat(),
-                excluded_countries=submission.excluded_countries,
-                excluded_exchanges=submission.excluded_exchanges,
-                excluded_currencies=submission.excluded_currencies,
-                opening_cash=submission.opening_cash,
-                allowed_cash_currencies=submission.allowed_cash_currencies,
-                include_actual_interest=submission.include_actual_interest,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
+        definition = _studio_filtered_definition(connection, submission, subject, source)
         case_id, digest = _create_derived_studio_case(
             connection, definition=definition, actor=actor
         )
@@ -5750,100 +5915,14 @@ def start_studio_fixed_unit_composite(
 ) -> dict:
     """Create a private fixed-unit composite from allow-listed components."""
 
+    _refuse_classic_studio()
     try:
         subject = validate_subject_id(submission.subject_id)
     except RuntimeError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    component_ids = [item.component_id for item in submission.components]
     actor = _identity_digest(user["object_id"] or user["email"])
-    market_catalog = {
-        item.instrument_id: item for item in ALPHA_WORLD_MARKET_INSTRUMENTS
-    }
     with _approval_database() as connection:
-        rows = connection.execute(
-            """
-            SELECT subject_id, subject_type, display_name,
-                   COALESCE(reporting_currency, base_currency) AS currency,
-                   lifecycle_status
-            FROM platform_subjects
-            WHERE tenant_id = %s AND subject_id = ANY(%s)
-            FOR SHARE
-            """,
-            (TENANT_ID, component_ids),
-        ).fetchall()
-        registered = {str(row["subject_id"]): dict(row) for row in rows}
-        components = []
-        for request in submission.components:
-            component_id = request.component_id
-            row = registered.get(component_id)
-            if row is not None:
-                if str(row["lifecycle_status"]) != "active":
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Component {component_id} is not active",
-                    )
-                source_type = str(row["subject_type"])
-                if source_type == "physical_account":
-                    component_type = "account"
-                elif source_type in {"filtered_portfolio", "composite_portfolio"}:
-                    component_type = "portfolio"
-                else:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Component {component_id} is not an investable sleeve",
-                    )
-                components.append(
-                    {
-                        "component_id": component_id,
-                        "component_name": str(row["display_name"]),
-                        "component_type": component_type,
-                        "coefficient": request.coefficient,
-                        "source_currency": str(row["currency"]),
-                        "price_convention": "nav",
-                    }
-                )
-                continue
-            market = market_catalog.get(component_id)
-            if market is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Component {component_id} is not in the approved catalogue",
-                )
-            coverage = connection.execute(
-                """
-                SELECT MAX(price_date) FILTER (WHERE price_date <= %s) AS base_date,
-                       MAX(price_date) AS latest_date
-                FROM market_data_prices WHERE instrument_id = %s
-                """,
-                (submission.normalization_date.isoformat(), component_id),
-            ).fetchone()
-            if coverage is None or coverage["base_date"] is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Component {component_id} has no normalization-date market history",
-                )
-            components.append(
-                {
-                    "component_id": component_id,
-                    "component_name": market.name,
-                    "component_type": "benchmark",
-                    "coefficient": request.coefficient,
-                    "source_currency": market.currency,
-                    "price_convention": _studio_price_convention(market.price_type),
-                }
-            )
-        try:
-            definition = fixed_unit_composite_definition(
-                subject_id=subject,
-                display_name=submission.display_name,
-                base_currency=submission.base_currency,
-                normalization_date=submission.normalization_date.isoformat(),
-                constant_cash=submission.constant_cash,
-                components=components,
-                market_carry_days=submission.market_carry_days,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
+        definition = _studio_composite_definition(connection, submission, subject)
         case_id, digest = _create_derived_studio_case(
             connection, definition=definition, actor=actor
         )
@@ -8628,7 +8707,39 @@ def account_onboarding_step_page(
 def account_onboarding_page(
     request: Request, user: dict[str, str] = Depends(_onboarding_user)
 ) -> str:
+    if onboarding_v2_enabled():
+        return _platform_shell(
+            user, active="account-onboarding", title="Account onboarding",
+            description=onboarding_v2_web.ONBOARDING_DESCRIPTION,
+            content=onboarding_v2_web.ONBOARDING_CONTENT, script=onboarding_v2_web.ONBOARDING_SCRIPT,
+        )
     return _render_platform_page(user, section="account-onboarding")
+
+
+@app.get("/account-onboarding/classic", response_class=HTMLResponse)
+def account_onboarding_classic_page(
+    request: Request, user: dict[str, str] = Depends(_onboarding_user)
+) -> Response:
+    """The earlier onboarding page, kept for derived and master portfolios."""
+
+    if not onboarding_v2_enabled():
+        return RedirectResponse(url="/account-onboarding", status_code=307)
+    page = _render_platform_page(user, section="account-onboarding")
+    return HTMLResponse(page.replace(_STUDIO_CARD_OPENING, _STUDIO_REPLACED_CARD, 1))
+
+
+# With the new onboarding on, the portfolio builder replaces the Studio card;
+# the old card stays in the page, hidden, so the page's own script still runs.
+_STUDIO_CARD_OPENING = '<div class="card wide" id="derived-portfolio-studio">'
+_STUDIO_REPLACED_CARD = (
+    '<div class="card wide"><div class="label">New portfolio</div>'
+    "<h2>Portfolios now start in the portfolio builder</h2>"
+    '<p class="muted">Build a composite like Alpha World MS and T, or filter an account like '
+    "China &amp; Hong Kong, see its composition as a tree, then start its onboarding case.</p>"
+    '<div class="actions"><a class="button" href="/account-onboarding/new-portfolio">'
+    "Open the portfolio builder</a></div></div>"
+    '<div class="card wide" id="derived-portfolio-studio" style="display:none" aria-hidden="true">'
+)
 
 
 def _reconciliation_prerequisite_status(checks: list[dict]) -> dict:
@@ -9715,50 +9826,6 @@ def approve_onboarding_activation(
             """,
             (TENANT_ID, subject),
         )
-        connection.execute(
-            """
-            UPDATE subject_feature_states
-            SET feature_state = CASE
-                    WHEN %s = 'master_account'
-                     AND %s = 'administrative_only'
-                     AND feature_key <> 'viewer_access' THEN 'disabled'
-                    ELSE 'active'
-                END,
-                reason = CASE
-                    WHEN %s = 'master_account'
-                     AND %s = 'administrative_only'
-                     AND feature_key <> 'viewer_access'
-                    THEN 'This administrative-only master does not publish investment analytics or reports.'
-                    ELSE 'Every account-specific onboarding gate passed and the owner activated the subject.'
-                END,
-                updated_at = now()
-            WHERE tenant_id = %s AND subject_id = %s
-            """,
-            (
-                str(case["subject_type"]),
-                (
-                    (case.get("metadata_json") or {}).get("reporting_mode")
-                    if isinstance(case.get("metadata_json"), dict)
-                    else ""
-                ),
-                str(case["subject_type"]),
-                (
-                    (case.get("metadata_json") or {}).get("reporting_mode")
-                    if isinstance(case.get("metadata_json"), dict)
-                    else ""
-                ),
-                TENANT_ID,
-                subject,
-            ),
-        )
-        connection.execute(
-            """
-            UPDATE subject_flex_source_bindings
-            SET status = 'active', updated_at = now()
-            WHERE tenant_id = %s AND subject_id = %s AND status = 'pending'
-            """,
-            (TENANT_ID, subject),
-        )
         metadata = case.get("metadata_json") or {}
         if isinstance(metadata, str):
             try:
@@ -9766,67 +9833,20 @@ def approve_onboarding_activation(
             except json.JSONDecodeError:
                 metadata = {}
         subject_type = str(case["subject_type"])
-        administrative_master = bool(
-            subject_type == "master_account"
-            and isinstance(metadata, dict)
-            and metadata.get("reporting_mode") == "administrative_only"
-        )
-        if administrative_master:
-            capabilities = (("viewer_directory", {}),)
-        else:
-            source_name = (
-                "derived_calculation"
-                if subject_type in {"filtered_portfolio", "composite_portfolio"}
-                else str(case["source_system"])
-            )
-            capabilities = (
-                ("daily_ingestion", {"start_date": str(case["history_start_date"]), "source": source_name}),
-                ("benchmark_refresh", {"start_date": str(case["history_start_date"])}),
-                ("sector_refresh", {"external_approval_required": True}),
-                ("month_end_reporting", {"approval_required": True}),
-                ("analyst_assurance", {}),
-                ("viewer_directory", {}),
-            )
-        for capability, configuration in capabilities:
-            configuration_json = canonical_json(configuration)
-            connection.execute(
-                """
-                INSERT INTO subject_operating_registrations(
-                    registration_id, tenant_id, subject_id, capability,
-                    operating_state, effective_from, configuration_json,
-                    configuration_sha256, activation_approval_id,
-                    changed_by_identity_sha256, created_at, updated_at
-                ) VALUES (
-                    %s, %s, %s, %s, 'active', %s, %s::jsonb, %s,
-                    %s, %s, now(), now()
-                )
-                ON CONFLICT (tenant_id, subject_id, capability, effective_from)
-                DO UPDATE SET operating_state = 'active', effective_to = NULL,
-                              configuration_json = EXCLUDED.configuration_json,
-                              configuration_sha256 = EXCLUDED.configuration_sha256,
-                              activation_approval_id = EXCLUDED.activation_approval_id,
-                              changed_by_identity_sha256 = EXCLUDED.changed_by_identity_sha256,
-                              updated_at = now()
-                """,
-                (
-                    uuid.uuid4(), TENANT_ID, subject, capability,
-                    case["history_start_date"], configuration_json,
-                    sha256_text(configuration_json), approval_id, actor,
-                ),
-            )
-        connection.execute(
-            """
-            UPDATE ibkr_flex_queries q
-            SET schedule_enabled = true, status = 'active', updated_at = now()
-            WHERE q.tenant_id = %s
-              AND EXISTS (
-                  SELECT 1 FROM subject_flex_source_bindings b
-                  WHERE b.tenant_id = q.tenant_id
-                    AND b.flex_source_id = q.flex_source_id
-                    AND b.subject_id = %s AND b.status = 'active'
-              )
-            """,
-            (TENANT_ID, subject),
+        activate_subject(
+            connection,
+            tenant_id=TENANT_ID,
+            subject_id=subject,
+            subject_type=subject_type,
+            source_name=str(case["source_system"]),
+            history_start_date=str(case["history_start_date"]),
+            administrative_master=bool(
+                subject_type == "master_account"
+                and isinstance(metadata, dict)
+                and metadata.get("reporting_mode") == "administrative_only"
+            ),
+            approval_id=approval_id,
+            actor=actor,
         )
     return {
         "status": "active",
@@ -10495,10 +10515,6 @@ def metrics_guide_page(
 def _render_platform_page(user: dict[str, str], *, section: str) -> str:
     if section not in PLATFORM_SECTIONS:
         raise HTTPException(status_code=404, detail="Platform page not found")
-    viewer = escape(user["email"] or "authorized user")
-    role_label = escape(user.get("role", "owner").title())
-    page_title = escape(PLATFORM_SECTIONS[section])
-    platform_navigation = _platform_navigation(user, active=section)
     if section == "combined-holdings":
         description = "Latest holdings across every physical account you can view, converted into one currency with each account's own dated FX history and aggregated by instrument."
         content = """<div class="page-view active" data-section="combined-holdings"><div class="card wide"><div class="label">Combined holdings</div><form id="combined-form" class="actions"><label><span class="label">Currency</span> <input id="combined-currency" name="currency" value="USD" maxlength="3" pattern="[A-Za-z]{3}" required size="4"></label><label><span class="label">As of</span> <input id="combined-asof" name="as_of" type="date"></label><button class="button" type="submit">Update</button></form><div id="combined-note" class="muted" aria-live="polite">Loading…</div><div id="combined-accounts" class="status-row"></div><div class="table-tools"><input id="combined-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter combined holdings"><span id="combined-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Accounts</th><th>Quantity</th><th>Value (<span id="combined-currency-label">USD</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="combined-holdings"></tbody></table></div></div></div>"""
@@ -10535,6 +10551,19 @@ def _render_platform_page(user: dict[str, str], *, section: str) -> str:
         description = "Live owner communication with the controlled AI system administrator, plus platform-wide autonomy, incidents, reviews and audited maintenance actions."
         content = """<div class="page-view active" data-section="administration"><div class="card wide ai-chat-card admin-live-chat"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Administrator chats</div><strong>System operations</strong></div><button id="admin-new-chat" class="button" type="button">New chat</button></div><div id="admin-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="admin-chat-title">System administrator updates</strong><div class="muted">Owner-only · Monitored continuously · Changes remain approval-controlled</div></div><div class="actions"><a id="admin-chat-export-md" class="button" href="#" hidden>Save Markdown</a><a id="admin-chat-export-json" class="button" href="#" hidden>Save JSON</a><button id="admin-chat-archive" class="button" type="button" hidden>Archive</button></div></div><div id="admin-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Controlled system administration</div><div class="value">Connecting to the administrator…</div></div></div><div class="ai-chat-composer"><textarea id="admin-chat-input" maxlength="1200" aria-label="Message the AI System Administrator" placeholder="Ask about health or give a maintenance order…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Supported changes require an exact approval</div><button id="admin-chat-send" class="button" type="button">Send</button></div></div></section></div></div><div class="card wide"><div class="label">Institutional onboarding control plane</div><div id="control-plane-status" class="value">Loading…</div><div id="control-plane-note" class="muted"></div><div id="control-plane-summary" class="status-row"></div></div><div class="admin-layout"><div class="card admin-overview"><div class="label">24/7 controlled autonomy</div><div id="autonomy-status" class="value">Loading…</div><div id="autonomy-note" class="muted"></div><div id="autonomy-summary" class="status-row"></div><div id="autonomy-incidents" class="muted"></div><div id="autonomy-reviews" class="muted"></div></div><div class="card admin-actions-panel"><div class="label">Direct owner-approved actions</div><div id="admin-status" class="value">Loading…</div><div id="admin-note" class="muted"></div><div class="actions"><select id="admin-action" aria-label="Administrative action"></select><button id="admin-preview" class="button" type="button" disabled>Preview action</button></div><div id="admin-preview-result" class="muted" style="margin-top:14px"></div><div class="actions"><input id="admin-confirmation" type="text" maxlength="80" aria-label="Type the exact approval phrase" placeholder="Preview an action to obtain the approval phrase" disabled><button id="admin-execute" class="button" type="button" disabled>Approve and execute once</button></div><div id="admin-result" class="muted" style="margin-top:14px"></div></div></div></div>"""
         script = ADMINISTRATION_PAGE_SCRIPT + ADMIN_LIVE_CHAT_SCRIPT
+    return _platform_shell(
+        user, active=section, title=PLATFORM_SECTIONS[section], description=description,
+        content=content, script=script,
+    )
+
+
+def _platform_shell(
+    user: dict[str, str], *, active: str, title: str, description: str, content: str, script: str
+) -> str:
+    viewer = escape(user["email"] or "authorized user")
+    role_label = escape(user.get("role", "owner").title())
+    page_title = escape(title)
+    platform_navigation = _platform_navigation(user, active=active)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_title} · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body>
@@ -10917,4 +10946,23 @@ _install_agent_web(
     _authorized_user,
     lambda user: _authorized_subject_ids(user, feature_key="viewer_access"),
     ACCOUNT_THEME_CSS,
+)
+
+
+# New account onboarding (broker connections and four-stage cases). Every
+# route answers 404 unless ONBOARDING_V2_ENABLED is true; see onboarding_v2_web.py.
+onboarding_v2_web.install(
+    app,
+    onboarding_user=_onboarding_user,
+    owner_user=_owner_user,
+    read_database=lambda: _database(),
+    write_database=lambda: _approval_database(),
+    render_page=_platform_shell,
+    identity_digest=_identity_digest,
+    store_secret=lambda name, value: _store_flex_token_via_broker(name, value),
+    tenant_id=TENANT_ID,
+    platform_ip=lambda: os.environ.get("BROKER_EGRESS_IP", "").strip() or None,
+    derived_definition=_builder_definition,
+    download_report=lambda container, blob: download_blob_bytes(AZURE_STORAGE_ACCOUNT_URL, container, blob),
+    report_container=INTERNAL_REPORT_CONTAINER,
 )

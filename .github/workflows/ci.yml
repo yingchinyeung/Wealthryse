@@ -27,9 +27,9 @@ jobs:
       - name: Test
         run: python scripts/ci_run_tests.py
 
-  # Agent schema, account isolation and tool figures, and the live IBKR
-  # tables and collector role, against a real PostgreSQL (synthetic data
-  # only). The main test job skips these.
+  # Agent schema, account isolation and tool figures, onboarding schema rules,
+  # and the live IBKR tables and collector role, against a real PostgreSQL
+  # (synthetic data only). The main test job skips these.
   agent-database:
     runs-on: ubuntu-latest
     timeout-minutes: 20

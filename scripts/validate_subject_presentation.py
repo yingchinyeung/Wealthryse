@@ -11,6 +11,7 @@ from pathlib import Path
 from audit_alpha_ms_presentation import audit
 from ibkr_etl.ms_chart_workbooks import verify_ms_chart_workbooks
 from ibkr_etl.presentation_design import (
+    design_composite,
     platform_content_expectations,
     presentation_content_contract_version,
     presentation_content_requirements,
@@ -27,7 +28,29 @@ def validate_subject_presentation(
     payload = json.loads(raw)
     if payload.get("subject_id") != subject_id or payload.get("period_end") != period_end:
         raise ValueError("Presentation snapshot subject or period differs from the requested job")
-    if subject_id == "alpha-world-ms":
+    contract = presentation_content_contract_version(subject_id)
+    requirements = list(presentation_content_requirements(subject_id))
+    if subject_id not in ("alpha-world-ms", "alpha-world-t") and design_composite(payload):
+        # A composite in the Alpha World MS or T design: MS's deck checks on its own model and identity.
+        from audit_composite_presentation import audit as audit_composite
+        from ibkr_etl import composite_presentation
+        if expected_strategy != "iStrategy: " + str(payload["report_profile"]["display_name"]).strip():
+            raise ValueError("A composite's deck requires the strategy name of its own report profile")
+        financial = audit_composite(output, snapshot)
+        if (financial.get("status") != "passed" or financial.get("financial_charts_verified") != 6
+                or financial.get("risk_metrics_verified") != 7
+                or financial.get("snapshot_sha256") != hashlib.sha256(raw).hexdigest()):
+            raise ValueError("The composite's exported financial audit is incomplete or bound to another snapshot")
+        workbooks = verify_ms_chart_workbooks(output, require_format=True)
+        if (workbooks.get("status") != "passed" or workbooks.get("embedded_workbooks_verified") != 6
+                or workbooks.get("owner_slides") != [6, 7, 8, 9, 10, 11]
+                or workbooks.get("output_sha256") != output_sha256):
+            raise ValueError("The composite's chart workbook acceptance is incomplete or bound to another output")
+        result = {**financial["generic_validation"], "composite_financial_audit": financial,
+                  "composite_chart_workbook_audit": workbooks}
+        contract = composite_presentation.CONTRACT_VERSION
+        requirements = list(composite_presentation.CONTENT_REQUIREMENTS)
+    elif subject_id == "alpha-world-ms":
         if expected_strategy != "iStrategy: Alpha World MS":
             raise ValueError("MS presentation requires the approved Alpha World MS identity")
         if payload.get("reporting_currency") != "HKD":
@@ -79,8 +102,8 @@ def validate_subject_presentation(
         raise ValueError("Presentation or frozen input changed during validation")
     return {
         **result,
-        "content_contract_version": presentation_content_contract_version(subject_id),
-        "content_requirements": list(presentation_content_requirements(subject_id)),
+        "content_contract_version": contract,
+        "content_requirements": requirements,
         "snapshot_sha256": hashlib.sha256(raw).hexdigest(),
         "output_sha256": output_sha256,
     }

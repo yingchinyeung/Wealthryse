@@ -395,19 +395,34 @@ def _clamp(region: Mapping[str, Any]) -> dict[str, float]:
             "h": min(max(float(region.get("h", 0)), 0.0), 1.0 - y)}
 
 
+# Accounts whose factsheet uses the owner's Alpha World template (ibkr_etl.monthly_artifacts.ALPHA_WORLD_SUBJECT_IDS).
+ALPHA_WORLD_FACTSHEETS = frozenset({"alpha-world-ms", "alpha-world-t"})
+
+
 class VisualQA:
     def __init__(self, model: TeamModel) -> None:
         self.model = model
 
-    def inspect_factsheet(self, images: Sequence[bytes], *, display_date: str, period_label: str) -> Outcome:
+    def inspect_factsheet(self, images: Sequence[bytes], *, display_date: str, period_label: str,
+                          account_id: str = "") -> Outcome:
         if not images:
             return Outcome("skipped", "No factsheet pages to look at.")
-        note = {"report_date": display_date, "pages": [
-            {"page": 1, "must_show": ["report date at the top and beside the return panel", "Top 5 table",
-                                      "sector allocation table with a total row", f"historical performance table ({period_label})",
-                                      "trailing twelve-month return panel"]},
-            {"page": 2, "must_show": ["report date", f"historical performance chart ({period_label})",
-                                      "axis labels and gridlines"]}][:len(images)]}
+        if account_id in ALPHA_WORLD_FACTSHEETS:
+            # The owner's template has no Top 5, allocation table or historical performance by design
+            # (monthly_artifacts rejects a factsheet that prints them), so the standard list would flag them missing.
+            note = {"report_date": display_date, "layout": "Alpha World owner template", "pages": [
+                {"page": 1, "must_show": ["report date", "key figures panel with its risk-free rate footnote",
+                                          f"Capital Path chart ({period_label})", f"Rebased to 100 chart ({period_label})",
+                                          "return distribution chart with its density axis and legend"]},
+                {"page": 2, "must_show": ["the page's sections filled in, with no blank boxes"]}][:len(images)]}
+        else:
+            note = {"report_date": display_date, "pages": [
+                {"page": 1, "must_show": ["report date at the top and beside the return panel", "Top 5 table",
+                                          "sector allocation table with a total row",
+                                          f"historical performance table ({period_label})",
+                                          "trailing twelve-month return panel"]},
+                {"page": 2, "must_show": ["report date", f"historical performance chart ({period_label})",
+                                          "axis labels and gridlines"]}][:len(images)]}
         try:
             result, usage = self.model.ask(name="visual_qa", instructions=VISUAL_QA, payload=note, schema=VISUAL_SCHEMA,
                                            images=images, max_output_tokens=OUTPUT_TOKENS["visual"])

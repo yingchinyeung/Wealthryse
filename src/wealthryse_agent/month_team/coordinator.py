@@ -299,7 +299,8 @@ class Coordinator:
         if "factsheet" in fetched:
             images = self.render_pages(fetched["factsheet"].content, dpi=self.settings.page_image_dpi)
             visual = VisualQA(self.model).inspect_factsheet(images, display_date=_display_date(ctx.period_end),
-                                                            period_label=f"ending {_display_date(ctx.period_end)}")
+                                                            period_label=f"ending {_display_date(ctx.period_end)}",
+                                                            account_id=ctx.account_id)
         else:
             visual = Outcome("skipped", "There is no factsheet in the package to look at.")
         self._record(run, "visual_qa", visual, round=package_round)

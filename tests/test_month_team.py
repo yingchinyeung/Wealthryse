@@ -512,6 +512,19 @@ class WriterReviewerTests(unittest.TestCase):
         images = [c for c in model.requests[0]["input"][0]["content"] if c["type"] == "input_image"]
         self.assertEqual(len(images), 2)
 
+    def test_visual_qa_checks_alpha_world_factsheets_against_their_own_layout(self):
+        from ibkr_etl.monthly_artifacts import ALPHA_WORLD_SUBJECT_IDS
+        from wealthryse_agent.month_team.agents import ALPHA_WORLD_FACTSHEETS
+
+        self.assertEqual(ALPHA_WORLD_FACTSHEETS, ALPHA_WORLD_SUBJECT_IDS)
+        model = FakeModel(visual=[])
+        VisualQA(TeamModel(APAC, tokens_left=10**6, client=model)).inspect_factsheet(
+            [b"png1", b"png2"], display_date="31 Jan 2026", period_label="ending 31 Jan 2026", account_id="alpha-world-t")
+        note = model.requests[0]["input"][0]["content"][0]["text"]
+        self.assertIn("Capital Path", note)
+        self.assertNotIn("Top 5", note)
+        self.assertNotIn("sector allocation", note)
+
     def test_visual_qa_says_so_when_the_model_cannot_read_images(self):
         result = VisualQA(TeamModel(APAC, tokens_left=10**6, client=FakeModel(reject_images=True))).inspect_factsheet(
             [b"png"], display_date="31 Jan 2026", period_label="x")

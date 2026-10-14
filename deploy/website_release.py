@@ -3,6 +3,7 @@
 Steps, each a subcommand so the workflow can show and stop at each one:
   prepare  read the live image, work out what changed, refuse unsupported changes
   build    build the new image on the private build VM through Azure Run Command
+  acr-build  build the same image with ACR Tasks instead, when the build VM is unavailable
   deploy   point the website at the new image
   verify   wait for the new revision, check health and that sign-in is still required
   rollback point the website back at the image recorded by prepare
@@ -218,6 +219,77 @@ def build():
         if started:
             print('Stopping the build VM again')
             subprocess.run(['az', 'vm', 'deallocate', '-g', RG, '-n', VM, '--no-wait'], capture_output=True)
+
+
+# What the VM build read from the live image (run 25, 14 Oct). ACR Tasks cannot inspect the image
+# first, so the in-image step checks the owner of /app/src against RUNTIME_USER and stops if it differs.
+LIVE_PYTHON = '/usr/local/bin/python3'
+RUNTIME_USER = '10001:10001'
+
+
+def acr_context(state, folder):
+    """Write the ACR Tasks build context: Dockerfile, the in-image swap script and the reviewed files."""
+    before, after = sides(state)
+    changed = sorted(n for n in set(before) | set(after) if before.get(n) != after.get(n))
+    digest = lambda data: None if data is None else hashlib.sha256(data).hexdigest()
+    imported = first_imported(before, after)
+    release = {'runtime_user': RUNTIME_USER,
+               'touched': {n: {'live': digest(before.get(n)), 'new': digest(after.get(n))} for n in changed},
+               'imported': {n: digest(after[n]) for n in imported}}
+    stage = folder / 'release'
+    for name in changed + imported:
+        if name in after:
+            (stage / 'files' / name).parent.mkdir(parents=True, exist_ok=True)
+            (stage / 'files' / name).write_bytes(after[name])
+    stage.mkdir(parents=True, exist_ok=True)
+    (stage / 'release.json').write_text(json.dumps(release, indent=1, sort_keys=True))
+    (stage / 'apply.py').write_text((ROOT / 'deploy' / 'website_acr_apply.py').read_text())
+    install = remote_module().INSTALL_SCRIPT.replace('REMOVED', repr([n for n in changed if n not in after])) \
+                                            .replace('RUNTIME_USER', repr(RUNTIME_USER))
+    (stage / 'install.py').write_text(install)
+    (folder / 'Dockerfile').write_text('\n'.join([
+        'FROM ' + state['live_image'], 'USER 0:0',
+        'LABEL ai.wealthryse.source-commit="' + state['head'] + '"',
+        'COPY release/ /tmp/wealthryse-release/',
+        'RUN ' + json.dumps([LIVE_PYTHON, '/tmp/wealthryse-release/apply.py']),
+        'RUN ' + json.dumps([LIVE_PYTHON, '/tmp/wealthryse-release/install.py']),
+        'RUN ' + json.dumps([LIVE_PYTHON, '-c', "import shutil; shutil.rmtree('/tmp/wealthryse-release')"]),
+        'USER ' + RUNTIME_USER,
+        'RUN ' + json.dumps([LIVE_PYTHON, '-c', 'import ibkr_etl.web']),
+        'RUN ' + json.dumps([LIVE_PYTHON, 'scripts/check_report_runtime.py'])]) + '\n')
+    return release
+
+
+def remote_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('website_overlay_build_remote', ROOT / 'deploy' / 'website_overlay_build_remote.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def acr_build():
+    """Build the release image with ACR Tasks, inside Azure, from the live image; no build VM involved."""
+    state = json.loads(STATE.read_text())
+    if not state['changed_files']:
+        return
+    registry = REG.split('.')[0]
+    tag = state['target_image'][len(REG) + 1:]
+    with tempfile.TemporaryDirectory() as tmp:
+        release = acr_context(state, Path(tmp))
+        print(json.dumps({'touched': sorted(release['touched']), 'first_imported': sorted(release['imported'])}, indent=2))
+        built = subprocess.run(['az', 'acr', 'build', '-r', registry, '-t', tag, '--platform', 'linux/amd64',
+                                '-f', str(Path(tmp) / 'Dockerfile'), tmp])
+    if built.returncode:
+        raise SystemExit('Build failed; the website was not changed')
+    runs = az('acr', 'task', 'list-runs', '-r', registry, '--top', '20')
+    digests = {image['digest'] for run in runs if run.get('status') == 'Succeeded'
+               for image in run.get('outputImages') or [] if f"{image.get('repository')}:{image.get('tag')}" == tag}
+    if len(digests) != 1:
+        raise SystemExit('Could not find the one pushed digest for ' + tag)
+    state['pushed_image'] = IMAGE_PREFIX + digests.pop()[len('sha256:'):]
+    STATE.write_text(json.dumps(state, indent=2))
+    print('Built', state['pushed_image'])
 
 
 def vm_run(base, name, script, location, timeout):
@@ -551,5 +623,5 @@ def rollback():
 
 
 if __name__ == '__main__':
-    {'prepare': prepare, 'build': build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat,
+    {'prepare': prepare, 'build': build, 'acr-build': acr_build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat,
      'assurance-build': assurance_build, 'inventory': inventory}[sys.argv[1]]()

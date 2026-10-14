@@ -9,7 +9,8 @@ records); nothing is sent, published or released.
                                                          # re-check months already released
     python -m wealthryse_agent.jobs onboarding           # hourly: draft new cases' terms from their documents,
                                                          # reconcile new broker accounts, and review new
-                                                         # composites' historical reports
+                                                         # composites' historical reports, and watch
+                                                         # newly live accounts until their first month-end
     python -m wealthryse_agent.jobs operations           # every 5 minutes: diagnose the autonomous
                                                          # administrator's open incidents from Azure telemetry
 
@@ -195,13 +196,16 @@ def month_team(store: Store, tools: ToolClient, accounts: list[str], usage: dict
     return counts.get("ready", 0)
 
 
-def onboarding(store: Store, tools: ToolClient, usage: dict, correlation_id: str) -> int:
+def onboarding(store: Store, tools: ToolClient, usage: dict, correlation_id: str, run_id: int | None = None) -> int:
     from .month_team.agents import TeamModel
     from .month_team.settings import validate_report_model
     from .onboarding_intake import DraftStore, IntakeDrafter, IntakeSettings, draft_waiting_cases
     from .onboarding_reconcile import Reconciler, ReconciliationStore, reconcile_waiting_cases
     from .onboarding_review import HistoryReviewer, ReviewSettings, ReviewStore, review_waiting_cases
+    from .onboarding_watch import watch_live_cases
 
+    # The first-month watch is plain code, so it runs even when the month's model budget is used up.
+    watched = watch_live_cases(store, tools.call, run_id)
     settings, intake_settings, model_settings = ReviewSettings.from_env(), IntakeSettings.from_env(), ModelSettings.from_env()
     settings.validate()
     intake_settings.validate()
@@ -223,7 +227,7 @@ def onboarding(store: Store, tools: ToolClient, usage: dict, correlation_id: str
     reconciled = reconcile_waiting_cases(ReconciliationStore(store.db, store.tenant_id), tools.call, Reconciler(model),
                                          usage, correlation_id)
     reviewed = review_waiting_cases(review_store, tools.call, HistoryReviewer(settings, model), usage, correlation_id)
-    return drafted + reconciled + reviewed
+    return drafted + reconciled + reviewed + watched
 
 
 def operations(store: Store, tools: ToolClient, usage: dict, correlation_id: str, client_id: str) -> int:
@@ -272,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         tools.wait_until_ready()
         if args.job == "onboarding":
-            written = onboarding(store, tools, usage, correlation_id)
+            written = onboarding(store, tools, usage, correlation_id, run_id)
             store.finish_run(run_id, status="succeeded", items=written, usage=usage)
             LOGGER.info("onboarding reviewed %s case(s)", written)
             return 0

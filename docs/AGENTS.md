@@ -347,11 +347,30 @@ acknowledges at approval 2. A clean review passes.
 4. Until the current reports have a review, the check is pending, so approval
    2 cannot be given. A re-render puts it back to pending.
 
+**Go-live coordinator.** Two parts, neither of which calls a model:
+
+- **Readiness pack** (`ibkr_etl/onboarding_readiness.py`, `readiness_pack`).
+  Everything for approvals 2 and 3 in one place: every check of every stage
+  so far with its evidence and whether an agent or the platform recorded it,
+  the warnings already acknowledged, the approved name, currency and start
+  date beside what the intake agent read in the client's documents, exactly
+  what GO LIVE switches on, and what still stands in the way. It is computed
+  from the case each time, with a digest. The case page shows it above the
+  GO LIVE box (the onboarding thread's part).
+- **First-month watch** (`wealthryse_agent/onboarding_watch.py`, in the
+  hourly `onboarding` job, even when the model budget is used up). For each
+  case that went live and waits for its first month-end, it posts an inbox
+  card once for: the first daily data and checks after go-live, five days
+  without data, failed daily checks, the month-end team lacking access (with
+  the `--grant month_team=<account>` command; the grant stays your step), and
+  the first month-end released. It reads only dates and statuses through
+  `list_live_onboarding_cases` (`007_onboarding_watch.sql`).
+
 **Turning it on** (each step needs Ying's typed approval naming the resources):
 
 1. **Database.** Rerun `scripts/install_agent_schema.py` with
    `--platform-reader <the platform's role>`. It applies
-   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` and lets
+   `003_onboarding_review.sql` to `005_onboarding_reconcile.sql` (and `007_onboarding_watch.sql`) and lets
    that role read the agents' results (and nothing else in the agent schema).
 2. **Image.** Rebuild `Dockerfile.agent` and the platform image.
 3. **Job.** Deploy `infra/agent-apps.bicep` with `deployOnboarding=true`

@@ -946,6 +946,18 @@ def get_onboarding_broker_day(connection, arguments: Mapping[str, Any]) -> dict[
                      _citation("cash_snapshots", account, date=day)]}
 
 
+def list_live_onboarding_cases(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Cases live and waiting for their first month-end, with dates and statuses only."""
+    rows = connection.execute(
+        "SELECT case_id::text AS case_id, subject_id, display_name, source_kind, history_start_date, went_live_at, "
+        "latest_data_date, latest_assurance_date, latest_assurance_status, month_team_has_access, "
+        "first_month_end_status FROM onboarding_live_cases ORDER BY case_id"
+    ).fetchall()
+    cases = [{key: (str(value) if key in ("went_live_at", "latest_assurance_date") and value is not None else value)
+              for key, value in dict(row).items()} for row in rows]
+    return {"as_of": None, "data": {"cases": cases}, "citations": [_citation("broker_onboarding_cases", None)]}
+
+
 # Operations: the administrator's incidents and the platform's recent runs ------------------
 
 
@@ -1053,6 +1065,9 @@ TOOLS: tuple[ToolSpec, ...] = (
              "NAV, and corporate actions and transactions within five days.",
              _schema({"case_id": _CASE_ID, "date": _DATE}, ["case_id", "date"]), get_onboarding_broker_day, False,
              only_jobs=ONBOARDING),
+    ToolSpec("list_live_onboarding_cases", "Onboarding cases that went live and wait for their first month-end, "
+             "with the go-live time, latest data and assurance dates, and whether the month-end team has access.",
+             _schema({}, []), list_live_onboarding_cases, False, only_jobs=ONBOARDING),
     ToolSpec("list_open_incidents", "The autonomous administrator's open and acknowledged incidents, with its "
              "evidence, for the operations agent to investigate.", _schema({}, []), list_open_incidents, False,
              only_jobs=OPERATIONS),

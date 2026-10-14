@@ -1,4 +1,7 @@
-"""The operations agent's database side: its views, its table, and how the platform shows its diagnoses.
+"""The operations agent's and go-live coordinator's database side.
+
+The operations agent's views, its table, and how the platform shows its
+diagnoses; the first-month watch's view of live cases; and the readiness pack.
 
 Needs a disposable PostgreSQL server: set AGENT_TEST_PG_ADMIN_DSN to a
 superuser DSN (CI starts one). Skipped otherwise. Creates and drops its own
@@ -220,6 +223,60 @@ class OperationsAgentDatabaseTests(unittest.TestCase):
         with self.assertRaises(psycopg.errors.InsufficientPrivilege):
             platform.execute("DELETE FROM agent.ops_investigations")
         platform.rollback()
+
+    def _owner(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        connection = psycopg.connect(_dsn(ADMIN_DSN, self.database, OWNER_ROLE), row_factory=dict_row,
+                                     options=f"-c app.tenant_id={TENANT}")
+        self.addCleanup(connection.close)
+        return connection
+
+    def _live_composite(self, owner, case_id, subject_id):
+        owner.execute("INSERT INTO platform_subjects (subject_id, subject_type, display_name, base_currency, "
+                      "lifecycle_status) VALUES (%s, 'composite_portfolio', 'Synthetic live', 'HKD', 'active')",
+                      (subject_id,))
+        owner.execute(
+            "INSERT INTO broker_onboarding_cases (case_id, source_kind, definition_json, definition_sha256, "
+            "target_subject_id, display_name, description, reporting_currency, history_start_date, subject_id, "
+            "stage, status, went_live_at) VALUES (%s, 'composite_portfolio', '{}'::jsonb, %s, %s, 'Synthetic live', "
+            "'A synthetic composite for tests.', 'HKD', '2025-01-02', %s, 'first_month_end', 'live', now())",
+            (case_id, "0" * 64, subject_id, subject_id))
+        owner.execute("INSERT INTO broker_onboarding_checks (case_id, check_id, status, message, evidence_json) "
+                      "VALUES (%s, 'history_built', 'pass', 'Built.', '{\"recorded_by\": \"agent\"}'::jsonb)",
+                      (case_id,))
+        owner.commit()
+
+    def test_4_the_watch_sees_live_first_month_cases_as_dates_and_statuses(self):
+        owner = self._owner()
+        case_id = str(uuid.uuid4())
+        self._live_composite(owner, case_id, "synthetic-live")
+        cases = self._call("list_live_onboarding_cases", job="onboarding")["data"]["cases"]
+        self.assertEqual([c["case_id"] for c in cases], [case_id])
+        case = cases[0]
+        self.assertEqual((case["subject_id"], case["month_team_has_access"], case["latest_data_date"]),
+                         ("synthetic-live", False, None))
+        self.assertIsNotNone(case["went_live_at"])
+        from wealthryse_agent.tools import ToolError
+
+        with self.assertRaises(ToolError):  # only the onboarding job is offered it
+            self._call("list_live_onboarding_cases")
+
+    def test_5_the_readiness_pack_lists_every_check_and_what_go_live_switches_on(self):
+        from ibkr_etl.onboarding_readiness import readiness_pack
+
+        owner = self._owner()
+        case_id = str(uuid.uuid4())
+        self._live_composite(owner, case_id, "synthetic-pack")
+        pack = readiness_pack(owner, TENANT, case_id)
+        owner.rollback()
+        built = next(c for s in pack["stages"] for c in s["checks"] if c["check_id"] == "history_built")
+        self.assertEqual((built["status"], built["recorded_by"]), ("pass", "agent"))
+        self.assertFalse(pack["ready"])  # already past go-live
+        self.assertTrue(any("derived calculation" in effect for effect in pack["go_live_switches_on"]))
+        self.assertEqual({r["state"] for r in pack["terms_vs_documents"]}, {"no_draft"})
+        self.assertRegex(pack["pack_sha256"], "^[0-9a-f]{64}$")
 
 
 if __name__ == "__main__":

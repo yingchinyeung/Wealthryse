@@ -134,6 +134,10 @@ class PrepareTest(unittest.TestCase):
         self.assertEqual(state["changed_files"], ["src/ibkr_etl/web.py"])
         self.assertEqual(state["migrations_not_shipped"], ["migrations/postgres/064_onboarding.sql"])
 
+    def test_the_license_file_does_not_stop_the_release(self):
+        state = self.run_prepare(["LICENSE", "src/ibkr_etl/web.py"])
+        self.assertEqual(state["changed_files"], ["src/ibkr_etl/web.py"])
+
     def test_other_image_files_still_stop_the_release(self):
         with self.assertRaises(SystemExit):
             self.run_prepare(["Dockerfile", "src/ibkr_etl/web.py"])

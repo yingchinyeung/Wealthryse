@@ -73,9 +73,26 @@ and every 5 minutes otherwise.
 Each step that changes Azure or the database needs the owner's typed
 approval naming the resources, and the project's Azure change slot.
 
-1. Apply migration 063 with `scripts/bootstrap_postgres.py`.
-2. Create the collector login: `scripts/provision_live_collector.py`, then
-   store its URL in Key Vault as `database-live-url`.
+1. Apply migration 063 and create the collector login in one execution of
+   the existing `ibkrv2stg-bootstrap` job, from the owner's computer after
+   `az login`:
+
+   ```
+   python scripts/rollout_live_data_stage1.py check
+   python scripts/rollout_live_data_stage1.py start
+   python scripts/rollout_live_data_stage1.py result --execution <name start printed>
+   ```
+
+   `start` creates `database-live-url` in Key Vault with a new random
+   password if it is missing, and passes the database only its SCRAM
+   verifier. The execution refuses, changing nothing, unless every applied
+   migration matches main and nothing is pending except 063 and the
+   deliberately held-back 054, 055, 059, 060 and 061 (063 does not depend on
+   them; a later normal bootstrap from a main image would apply them all).
+   Rerunning it is safe. (`scripts/provision_live_collector.py` does the same login step from
+   inside the network, if that is ever easier.)
+2. Release the website from main with the Deploy website workflow. Until a
+   `live_view` switch is set, it shows no live data.
 3. Store `ibkr-username` and `ibkr-password` in Key Vault.
 4. Copy the gateway image into the main registry by digest; build and push
    `Dockerfile.live-collector`.

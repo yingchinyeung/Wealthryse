@@ -112,7 +112,15 @@ class AlreadyLiveFilesTest(unittest.TestCase):
     def test_the_build_skips_files_already_as_reviewed(self):
         code = (ROOT / "deploy" / "website_overlay_build_remote.py").read_text()
         self.assertIn("already = [n for n in touched if n in live and live[n] == wanted.get(n)]", code)
-        self.assertIn("without_files(gzip.decompress(base64.b64decode(config['patch'])), already)", code)
+        self.assertIn("without_files(gzip.decompress(base64.b64decode(config['patch'])), already + skipped)", code)
+
+    def test_files_the_website_does_not_import_and_never_had_are_left_out(self):
+        code = (ROOT / "deploy" / "website_overlay_build_remote.py").read_text()
+        self.assertIn("skipped = [n for n in touched if modules is not None and n not in modules and n not in live]", code)
+        self.assertLess(code.index("touched = [n for n in touched if n not in skipped]"),
+                        code.index("is not where the change expects it"))
+        self.assertIn("'website_modules': sorted(website_modules(after))",
+                      (ROOT / "deploy" / "website_release.py").read_text())
 
     def test_a_trimmed_patch_applies_with_gnu_patch(self):
         import tempfile

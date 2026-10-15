@@ -349,6 +349,13 @@ def main():
         # the live site had before the repo caught up) is left alone.
         already = [n for n in touched if n in live and live[n] == wanted.get(n)]
         result['already_live'] = already
+        # A changed file the website does not import and the live image never had
+        # (report_design_worker.py, run 30 on 14 Oct) belongs to other jobs, so it
+        # is left out of the website build rather than stopping the release.
+        modules = config.get('website_modules')
+        skipped = [n for n in touched if modules is not None and n not in modules and n not in live]
+        result['not_website_files'] = skipped
+        touched = [n for n in touched if n not in skipped]
         for name in touched:
             if name in already:
                 continue
@@ -365,7 +372,7 @@ def main():
         result['line_endings_normalised'] = normalised
         live = {**live, **{n: h for n, h in tree_hashes(package).items() if n in normalised}}
         patch_file = root / 'change.patch'
-        patch_file.write_bytes(without_files(gzip.decompress(base64.b64decode(config['patch'])), already))
+        patch_file.write_bytes(without_files(gzip.decompress(base64.b64decode(config['patch'])), already + skipped))
         applied = subprocess.run(['patch', '-p1', '--forward', '--fuzz=0', '--no-backup-if-mismatch', '-i', str(patch_file)],
                                  capture_output=True, text=True, timeout=300, cwd=str(context))
         if applied.returncode:

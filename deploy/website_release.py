@@ -266,6 +266,7 @@ def overlay_build(state, merged=None):
         'base_image': state['live_image'], 'target_image': state['target_image'], 'source_commit': state['head'],
         'live_hashes': live_hashes, 'new_hashes': new_hashes,
         'patch': base64.b64encode(gzip.compress(patch, 9)).decode(),
+        'website_modules': sorted(website_modules(after)),
     }
     command = remote_script(config)
     vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')

@@ -35,6 +35,9 @@ _ARITHMETIC = re.compile(r"\b(?:inconsisten\w*|does not (?:equal|match|add|recon
                          re.I)
 _ENDING = re.compile(r"\b(?:end|ends|ending|ended|through|until|last|final|latest|stops?|dated|labell?ed|period)\b", re.I)
 _CURRENCY = re.compile(r"\b(?:USD|HKD|CNY|CNH|RMB|EUR|GBP|JPY|SGD|AUD)\b|US\$|HK\$|S\$|A\$|€|£|¥")
+_YTD = re.compile(r"\bYTD\b|year[- ]to[- ]date", re.I)
+_SPREAD = re.compile(r"\+\s*spread\b", re.I)
+_AXIS_LABEL = re.compile(r"^(20\d\d)-(\d\d)$")
 _BENCHMARK_NAMES = re.compile(r"S&P|Hang Seng|HSI\b|MSCI|HIBOR|SOFR|Nasdaq|NASDAQ|FTSE|CSI\s?300|Russell|Dow Jones|"
                               r"Nikkei|STOXX|Bloomberg", re.I)
 
@@ -102,6 +105,38 @@ def unconfirmed(description: str, pages: Sequence[str] | None, period_end: date 
     return None
 
 
+def date_axes(text: str) -> list[list[str]]:
+    """Each chart's month labels (YYYY-MM), as runs of four or more consecutive lines in the printed text."""
+    axes: list[list[str]] = []
+    run: list[str] = []
+    for line in [*text.splitlines(), ""]:
+        if _AXIS_LABEL.match(line.strip()):
+            run.append(line.strip())
+            continue
+        if len(run) >= 4:
+            axes.append(run)
+        run = []
+    return axes
+
+
+def _months_between(a: str, b: str) -> int:
+    return (int(b[:4]) - int(a[:4])) * 12 + int(b[5:7]) - int(a[5:7])
+
+
+def quoted_in(quote: str, pages: Sequence[str]) -> bool:
+    """Whether a quotation appears in the printed text, ignoring line breaks, spacing and curly quotes."""
+    def flat(s: str) -> str:
+        s = s.replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"')
+        return re.sub(r"\s+", " ", s).strip().lower()
+    return bool(quote.strip()) and flat(quote) in flat(" ".join(pages))
+
+
+def figures_printed(text: str, pages: Sequence[str]) -> bool:
+    """Whether every decimal or percentage quoted in ``text`` is printed on the pages."""
+    printed = {_normal_figure(m.group(0)) for m in _FIGURE.finditer("\n".join(pages))}
+    return all(_normal_figure(m.group(0)) in printed for m in _FIGURE.finditer(text))
+
+
 @dataclass
 class TextFindings:
     objections: list[dict[str, Any]] = field(default_factory=list)  # month-specific faults
@@ -129,7 +164,18 @@ def check_text(pages: Sequence[str], period_end: date) -> TextFindings:
                 shown = " and ".join(f'"{x}"' for x in sorted(labels))
                 result.objections.append({"page": number, "message": (
                     f"The same label is printed two ways, {shown}, so one category may be split across two rows.")})
+    for number, text in enumerate(pages, start=1):
+        for labels in date_axes(text):
+            gaps = [_months_between(a, b) for a, b in zip(labels, labels[1:])]
+            if len(set(gaps)) > 1:
+                result.objections.append({"page": number, "message": (
+                    f"A chart's date labels are unevenly spaced ({', '.join(labels)}: gaps of "
+                    f"{', '.join(str(g) for g in gaps)} months), so some may crowd or overlap.")})
     everything = "\n".join(pages)
+    if everything.strip() and not _YTD.search(everything):
+        result.notes.append("No year-to-date return is printed.")
+    if _SPREAD.search(everything) and not re.search(r"spread\W{0,3}(?:of\s+)?[+-]?\d", everything, re.I):
+        result.notes.append("The benchmark adds a spread that is never stated.")
     if everything.strip() and not _CURRENCY.search(everything):
         result.notes.append("The reporting currency is not stated anywhere on the factsheet.")
     if re.search(r"\bbenchmark\b", everything, re.I) and not _BENCHMARK_NAMES.search(everything):

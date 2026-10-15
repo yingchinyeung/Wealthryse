@@ -21,7 +21,7 @@ from ..runtime import _model_error, default_model_client
 from ..tool_client import ToolCallFailed
 from . import figures as fig
 from . import page_checks
-from .prompts import REVIEWER_COMMENTARY, REVIEWER_DECK, VISUAL_QA, WRITER
+from .prompts import PAGE_CLAIMS, REVIEWER_COMMENTARY, REVIEWER_DECK, VISUAL_QA, WRITER
 from .settings import validate_report_model
 
 ToolCall = Callable[[str, dict[str, Any]], dict[str, Any]]
@@ -41,7 +41,7 @@ class TeamModelError(Exception):
 
 # The cap counts reasoning as well as the answer; at the old 2,000 to 3,000 some replies were cut off
 # ("model_incomplete"). Only tokens actually used are billed and counted against the budget.
-OUTPUT_TOKENS = {"writer": 8000, "review": 6000, "deck_review": 6000, "visual": 8000}
+OUTPUT_TOKENS = {"writer": 8000, "review": 6000, "deck_review": 6000, "visual": 8000, "claims": 4000}
 
 
 class BudgetExhausted(Exception):
@@ -319,6 +319,13 @@ DECK_REVIEW_SCHEMA = {"type": "object", "properties": {"objections": {"type": "a
                       "required": ["objections"], "additionalProperties": False}
 
 
+CLAIMS_SCHEMA = {"type": "object", "properties": {"findings": {"type": "array", "items": {
+    "type": "object", "properties": {"statement": {"type": "string"}, "evidence": {"type": "string"},
+                                     "explanation": {"type": "string"}},
+    "required": ["statement", "evidence", "explanation"], "additionalProperties": False}}},
+    "required": ["findings"], "additionalProperties": False}
+
+
 class Reviewer:
     def __init__(self, model: TeamModel) -> None:
         self.model = model
@@ -388,6 +395,33 @@ class Reviewer:
         return Outcome("pass", "Every printed figure matches the frozen snapshot and the deck's narrative is supported.",
                        evidence, [], usage)
 
+    def check_claims(self, factsheet_pages: Sequence[str]) -> tuple[list[str], list[dict[str, Any]], dict[str, int]]:
+        """Statements in the factsheet's own words that its printed figures contradict.
+
+        Returns (notes, set_aside, usage). A finding stands only if its statement and every figure in its evidence
+        are printed on the pages; the rest are set aside with the reason. The notes are template wording to decide
+        once, so they go with the evidence rather than becoming objections."""
+        if not any(page.strip() for page in factsheet_pages):
+            return [], [], {}
+        payload = {"pages": [{"page": n, "printed_text": str(text)[:6000]} for n, text in enumerate(factsheet_pages, start=1)]}
+        try:
+            result, usage = self.model.ask(name="page_claims", instructions=PAGE_CLAIMS, payload=payload,
+                                           schema=CLAIMS_SCHEMA, max_output_tokens=OUTPUT_TOKENS["claims"])
+        except TeamModelError as error:
+            # Notes only, so a failed reply must not fail the checking stage; a spent budget still stops the run.
+            return [], [{"statement": "", "reason": f"The claims check did not run ({error.code})."}], {}
+        notes, set_aside = [], []
+        for finding in result.get("findings", []):
+            statement, evidence = str(finding.get("statement") or "").strip(), str(finding.get("evidence") or "").strip()
+            explanation = str(finding.get("explanation") or "").strip()
+            if not page_checks.quoted_in(statement, factsheet_pages):
+                set_aside.append({"statement": statement[:200], "reason": "The statement is not printed as quoted."})
+            elif not evidence or not page_checks.figures_printed(evidence, factsheet_pages):
+                set_aside.append({"statement": statement[:200], "reason": "Its evidence quotes figures the page does not print."})
+            else:
+                notes.append(f'Claim vs page: "{statement[:160]}" against {evidence[:160]}. {explanation[:240]}')
+        return notes, set_aside, usage
+
 
 # Visual QA -------------------------------------------------------------------
 
@@ -454,7 +488,11 @@ class VisualQA:
             note["last_trading_day"] = page_checks.last_trading_day(end).isoformat()
         if page_text is not None:
             for page in note["pages"]:
-                page["printed_text"] = str(page_text[page["page"] - 1])[:6000] if page["page"] <= len(page_text) else ""
+                text = str(page_text[page["page"] - 1]) if page["page"] <= len(page_text) else ""
+                page["printed_text"] = text[:6000]
+                axes = page_checks.date_axes(text)
+                if axes:
+                    page["date_axis_labels"] = axes
         try:
             result, usage = self.model.ask(name="visual_qa", instructions=VISUAL_QA, payload=note, schema=VISUAL_SCHEMA,
                                            images=images, max_output_tokens=OUTPUT_TOKENS["visual"])

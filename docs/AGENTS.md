@@ -179,8 +179,9 @@ deck that comes next. The older manual onboarding render jobs
   images only. The writer sees figure labels and display values only.
 - Report content goes only to `wr-reports-apac` (APAC Data Zone); the team
   refuses to start on any other processing scope.
-- Its own monthly token budget (`AGENT_MONTH_TEAM_TOKEN_BUDGET`, 20 million by
-  default), separate from the daily chat budget. When it runs out the team
+- Its own monthly token budget (`AGENT_MONTH_TEAM_TOKEN_BUDGET`: deployed at 40
+  million since Ying doubled it on 15 October 2026, 20 million if unset),
+  separate from the daily chat budget. When it runs out the team
   pauses without skipping a check.
 - An account that fails three times in a row stops and the others carry on;
   `--retry` restarts it. One account gets at most 15 minutes per run.
@@ -207,6 +208,7 @@ deck that comes next. The older manual onboarding render jobs
 python -m wealthryse_agent.jobs month_team                        # last month
 python -m wealthryse_agent.jobs month_team --period 2026-09-30
 python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
+python -m wealthryse_agent.jobs month_team --replay --round 2 --from 2026-01-31   # the next round
 python -m wealthryse_agent.jobs month_team --retry                # restart stopped accounts
 ```
 
@@ -214,6 +216,17 @@ Replay re-checks months whose factsheet was already released and shows the
 results on the Month-end page only, with no inbox cards. It does not train the
 model: it shows where the team is wrong, its instructions and checks are
 tuned, and a second replay shows whether that helped.
+
+**Replay rounds** (`013_replay_rounds.sql`). Each replay belongs to a round.
+A new round (`--round 2`, then 3, ...) checks every released month in the
+range afresh, in runs of its own, so earlier rounds stay as they were; running
+the same round again carries on where it stopped. The replays done before
+rounds existed are round 1. On the Month-end page, "Replay of released months"
+shows the newest round, a Round menu picks another, and a table compares the
+rounds: months checked and finished, data verdicts, objections raised (by
+file and how each was settled) and commentary disputes. A later round with
+fewer false objections and the same real ones shows the tuning helped. A
+replay never writes an inbox card, changes a file or releases anything.
 
 **Batch release.** For a live month, the Month-end page offers to release
 every report the team passed with nothing open: clean data, agreed

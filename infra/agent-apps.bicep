@@ -56,7 +56,7 @@ param reportContainerName string = 'internal-reports'
 @description('On only together with the month-end package job\'s team-commentary setting: the team\'s agreed commentary then goes into the decks, never the factsheets.')
 param monthTeamLive bool = false
 @description('Tokens per calendar month for the month-end team, separate from the daily chat budget.')
-param monthTeamTokenBudget int = 20000000
+param monthTeamTokenBudget int = 40000000
 @description('The onboarding agents\' job (ibkrv2stg-agent-onboarding): drafts a new case\'s account terms from its documents before approval 1, and reviews a new composite\'s historical reports before approval 2. Off until approved; needs the month-end team\'s report reader and the APAC report deployment.')
 param deployOnboarding bool = false
 @description('The private container the website stores onboarding documents in; the onboarding job may read it.')

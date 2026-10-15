@@ -138,6 +138,7 @@ class MonthTeamWebTests(unittest.TestCase):
         self.assertFalse(client.get("/api/agents/month-end/status").json()["enabled"])
         self.assertEqual(client.get("/month-end").status_code, 404)
         self.assertEqual(client.get("/api/agents/month-end/runs").status_code, 404)
+        self.assertEqual(client.get("/api/agents/month-end/rounds").status_code, 404)
 
     def test_owner_gets_the_panel_on_the_reports_tab_and_the_month_end_page(self):
         self.month_on()
@@ -158,6 +159,16 @@ class MonthTeamWebTests(unittest.TestCase):
         self.assertEqual(request.call_args_list[0].kwargs["params"],
                          {"user_object_id": OWNER["object_id"], "mode": "month", "period_end": "2026-09-30"})
         self.assertEqual(request.call_args_list[1].args[1], "/v1/month-end/runs/U1/2026-09-30")
+        with mock.patch.object(agent_web._AgentApi, "request", return_value={"rounds": []}) as request:
+            client.get("/api/agents/month-end/runs", params={"mode": "replay", "round": 2})
+            client.get("/api/agents/month-end/runs/U1/2026-09-30", params={"mode": "replay", "round": 2})
+            client.get("/api/agents/month-end/rounds")
+            self.assertEqual(client.get("/api/agents/month-end/runs", params={"round": 0}).status_code, 422)
+        self.assertEqual(request.call_args_list[0].kwargs["params"]["round"], 2)
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["round"], 2)
+        self.assertEqual(request.call_args_list[2].args[1], "/v1/month-end/rounds")
+        self.assertEqual(request.call_count, 3)
+        self.assertIn('id="rounds"', client.get("/month-end").text)
 
     def test_owner_cannot_read_another_accounts_run(self):
         self.month_on()

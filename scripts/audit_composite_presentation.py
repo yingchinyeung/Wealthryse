@@ -162,8 +162,12 @@ def audit(path, snapshot_path):
             value = risk[key]
             if (js_percent(value, 2) if value is not None else 'N/A') not in texts[14]:
                 raise ValueError('One-year drawdown result missing: ' + key)
-        if 'Hypothetical HKD stress' in texts[14] or 'Crisis replay unavailable' not in texts[14]:
-            raise ValueError('Crisis replay must stay unavailable for a composite')
+        if model['crisis_available']:
+            if ('Hypothetical HKD stress' not in texts[14]
+                    or js_percent(risk['crisis_maximum_drawdown'], 2) not in texts[14]):
+                raise ValueError("The composite's crisis replay result is missing")
+        elif 'Hypothetical HKD stress' in texts[14] or 'Crisis replay unavailable' not in texts[14]:
+            raise ValueError('Crisis replay must show as unavailable without its qualified inputs')
     page = verify_page(path, model)
     return {'status': 'passed', 'version': model['version'], 'snapshot_sha256': hashlib.sha256(raw).hexdigest(),
             'financial_charts_verified': 6, 'risk_metrics_verified': 7, 'composite_page': page,

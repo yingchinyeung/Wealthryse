@@ -285,7 +285,7 @@ def validate(
             else {}
         )
     largest_detractor = str(
-        expected_summary_table_rows.get(9, {}).get("Largest detractor", "N/A")
+        (expected_summary_table_rows or {}).get(9, {}).get("Largest detractor", "N/A")
     )
     platform_native_evidence = validate_platform_native_evidence(
         path,

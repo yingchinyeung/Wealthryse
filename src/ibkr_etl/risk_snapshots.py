@@ -171,9 +171,13 @@ def load_risk_inputs(
         from .profiled_composite import load_risk_snapshot as load_profiled
         try:
             snapshot,_,_=load_profiled(connection,subject_id,as_of,tenant_id=tenant_id)
+            from .profiled_crisis import load as load_profiled_crisis
+            # As MS: without exact-date sleeve evidence the replay is shown as unavailable.
+            try:crisis=load_profiled_crisis(connection,snapshot,tenant_id=tenant_id)
+            except (ValueError,KeyError,TypeError):crisis=None
             inputs={'subject_id':subject_id,'subject_type':subject_type,'as_of':as_of,
                 'benchmark_id':None,'rows':[],'positions':[],'risk_free':snapshot['risk']['risk_free'],
-                'crisis_replay':None,'profiled_hkd_snapshot':snapshot}
+                'crisis_replay':crisis,'profiled_hkd_snapshot':snapshot}
             validate_risk_input_readiness(inputs)
         except (ValueError,KeyError,TypeError) as error:
             raise RiskInputsNotReady('Composite qualified stored inputs unavailable: '+str(error)) from error

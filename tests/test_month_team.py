@@ -730,6 +730,41 @@ class WriterReviewerTests(unittest.TestCase):
         self.assertEqual(notes, ['Proofreading: "Example Asset Managment" should read Example Asset Management. Misspelt.'])
         self.assertEqual(aside[0]["reason"], "The statement is not printed as quoted.")
 
+    def test_proofreading_sets_aside_partial_words_repeated_labels_and_known_slips(self):
+        from wealthryse_agent.month_team import page_checks
+
+        # Replay round 6 (made-up text): a slip matched inside a longer word, a label laid over itself, and slips
+        # the code had already noted.
+        pages = ["BENCHMARK\nBENCHMARK\nHoldings in the Example States.\nThis note is intended for professional\n"
+                 "and institutional investors. Information provided on this note is general."]
+        claims = [{"kind": "proofreading", "statement": "Example State", "evidence": "Example States", "explanation": "x"},
+                  {"kind": "proofreading", "statement": "professional and i", "evidence": "y", "explanation": "Cut."},
+                  {"kind": "proofreading", "statement": "BENCHMARK BENCHMARK", "evidence": "BENCHMARK", "explanation": "z"},
+                  {"kind": "proofreading", "statement": "Information provided on this note", "evidence":
+                   "Information provided in this note", "explanation": "Preposition."}]
+        model = FakeModel(claims=claims)
+        notes, aside, _ = Reviewer(TeamModel(APAC, tokens_left=10**6, client=model)).check_claims(pages)
+        self.assertEqual(len(notes), 1)
+        self.assertIn('"Information provided on this note" should read Information provided in this note', notes[0])
+        self.assertEqual([a["reason"][:24] for a in aside], ["The slip is not printed ", "The slip is not printed ",
+                                                             "A label repeated in the "])
+        sent = json.loads(model.named("page_claims")[0]["input"][0]["content"][0]["text"])
+        self.assertIs(sent["pages"][0]["text_cut"], False)
+        # Each slip is shown once: the model's notes repeating the code's are dropped.
+        code = ['Proofreading: "which would subject the firm nor".', "A name is printed two ways: ExampleBrand and Examplebrand."]
+        model_notes = ['Proofreading: "would subject the firm nor any of its agents" should read or. x',
+                       'Proofreading: "Examplebrand iStrategy" should read ExampleBrand. y',
+                       'Proofreading: "ExampleBrand Index is produced" should read The ExampleBrand Index. z',
+                       'Claim vs page: "diversified" against 31.00%. w']
+        self.assertEqual(page_checks.new_slips(code, model_notes), model_notes[2:])
+
+    def test_compact_page_text_drops_repeats_and_letter_runs(self):
+        from wealthryse_agent.month_team import page_checks
+
+        long = "This example paragraph is printed twice by the template."
+        text = "\n".join(["T", "h", "i", "s", "x", "BENCHMARK", "BENCHMARK", long, "A", long, "Page 1"])
+        self.assertEqual(page_checks.compact(text), "\n".join(["BENCHMARK", "BENCHMARK", long, "A", "Page 1"]))
+
     def test_a_failed_claims_reply_is_noted_not_fatal(self):
         pages = ["A diversified portfolio.\nTechnology 64.00%"]
         reviewer = Reviewer(TeamModel(APAC, tokens_left=10**6, client=FakeModel(claims="INCOMPLETE")))

@@ -32,7 +32,12 @@ def unique(rows, key, label):
     return result
 
 
-def _sleeve(records, account, day, days):
+def _t_identity(mapping, *, crisis_start):
+    return apply_identity_proxy(mapping, subject_id=SUBJECT, crisis_start=crisis_start)
+
+
+def _sleeve(records, account, day, days, identity=_t_identity):
+    """One account's USD path from its exact broker holdings; identity applies its owner-approved proxy."""
     navs = [r for r in records['source_nav'] if r['subject_id'] == account
             and str(r['snapshot_date']) == day and r['currency'] == 'USD']
     require(len(navs) == 1, 'T crisis requires exact unique source USD NAV')
@@ -69,7 +74,7 @@ def _sleeve(records, account, day, days):
     entries = []
     for conid in sorted(maps):
         row = held[conid]
-        mapping = apply_identity_proxy(maps[conid], subject_id=SUBJECT, crisis_start=days[0])
+        mapping = identity(maps[conid], crisis_start=days[0])
         require(mapping['currency'] == 'USD' and mapping['price_type'] == 'adjusted_close'
                 and mapping['mapping_method'] in ('direct', 'market_proxy'), 'T crisis mapping convention differs')
         require(mapping['mapping_method'] != 'market_proxy' or bool(mapping.get('proxy_reason')),
@@ -202,24 +207,26 @@ def qualified_snapshot(snapshot, replay):
     return result
 
 
-def capture_records(connection, *, tenant_id, holdings_as_of):
+def capture_records(connection, *, tenant_id, holdings_as_of, accounts=SLEEVES):
     """Read exact dated broker evidence; no refreshes, writes or shared-map edits."""
     require(bool(tenant_id), 'T crisis requires an explicit tenant')
     date.fromisoformat(holdings_as_of)
-    args=(tenant_id, *SLEEVES, holdings_as_of)
+    require(bool(accounts), 'T crisis requires at least one account')
+    accounts=tuple(accounts); among='('+','.join('?' for _ in accounts)+')'
+    args=(tenant_id, *accounts, holdings_as_of)
     nav=database_records(connection.execute('''SELECT subject_id,snapshot_date,currency,total_text
-        FROM subject_nav_series WHERE tenant_id=? AND subject_id IN (?,?)
+        FROM subject_nav_series WHERE tenant_id=? AND subject_id IN '''+among+'''
         AND snapshot_date=? AND currency='USD' ORDER BY subject_id''', args).fetchall())
     positions=database_records(connection.execute('''SELECT p.*,p.account_id AS subject_id
         FROM position_snapshots p JOIN accounts a ON a.account_id=p.account_id
-        WHERE a.tenant_id=? AND p.account_id IN (?,?) AND p.snapshot_date=?
+        WHERE a.tenant_id=? AND p.account_id IN '''+among+''' AND p.snapshot_date=?
         ORDER BY p.account_id,p.conid,p.model_code''', args).fetchall())
     mappings=database_records(connection.execute('''SELECT * FROM crisis_replay_components
-        WHERE tenant_id=? AND subject_id IN (?,?) AND holdings_as_of=?
+        WHERE tenant_id=? AND subject_id IN '''+among+''' AND holdings_as_of=?
         ORDER BY subject_id,conid''', args).fetchall())
     broker_fx=database_records(connection.execute('''SELECT f.* FROM fx_rates f
         JOIN accounts a ON a.account_id=f.account_id
-        WHERE a.tenant_id=? AND f.account_id IN (?,?) AND f.rate_date=?
+        WHERE a.tenant_id=? AND f.account_id IN '''+among+''' AND f.rate_date=?
         AND f.to_currency='USD' ORDER BY f.account_id,f.from_currency''', args).fetchall())
     keys={(r['subject_id'],str(r['conid'])) for r in mappings}
     for position in positions:

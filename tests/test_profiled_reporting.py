@@ -146,6 +146,13 @@ class CollectTests(unittest.TestCase):
             CREATE TABLE synthetic_portfolio_components(tenant_id,portfolio_id,snapshot_date,component_id,
                 base_currency,coefficient,source_value,fx_rate_to_base,base_value,normalized_value,contribution,
                 direction);
+            CREATE TABLE subject_position_series(tenant_id,subject_id,snapshot_date,conid,currency,market_value_text);
+            CREATE TABLE crisis_replay_components(tenant_id,subject_id,holdings_as_of,conid,currency,price_type,
+                mapping_method,source_symbol,current_market_value,opening_weight,proxy_reason);
+            CREATE TABLE crisis_replay_daily(tenant_id,subject_id,holdings_as_of,observation_date,calculation_version,
+                quality_status,normalized_value,drawdown);
+            CREATE TABLE market_data_prices(tenant_id,instrument_id,symbol,price_date,price,currency,price_type);
+            CREATE TABLE reference_fx_rates(tenant_id,from_currency,to_currency,rate_date,rate,provider,quality_status);
         """)
         plan = definition()
         self.c.execute("INSERT INTO platform_subjects VALUES ('tenant',?,'composite_portfolio','HKD','HKD',?,?)",

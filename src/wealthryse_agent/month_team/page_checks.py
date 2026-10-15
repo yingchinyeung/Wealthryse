@@ -43,6 +43,24 @@ _SPREAD = re.compile(r"\+\s*spread\b", re.I)
 _AXIS_LABEL = re.compile(r"^(20\d\d)-(\d\d)$")
 _BENCHMARK_NAMES = re.compile(r"S&P|Hang Seng|HSI\b|MSCI|HIBOR|SOFR|Nasdaq|NASDAQ|FTSE|CSI\s?300|Russell|Dow Jones|"
                               r"Nikkei|STOXX|Bloomberg", re.I)
+_CALM = re.compile(r"\b(?:less|low|lower|reduced|minimal)\s+volatility\b", re.I)
+# A history table row as printed: the ISO date, the NAV, then the month's change.
+_MONTH_ROW = re.compile(r"\b(20\d\d-\d\d-\d\d)\s*\n\s*[\d,]+(?:\.\d+)?\s*\n\s*([+-]?\d+(?:\.\d+)?)%")
+_LARGE_MONTH = 10.0  # percent; a month this large sits badly with "less volatility"
+_VAR_METHOD = re.compile(r"historical|parametric|variance[- ]covariance|monte carlo|simulat|empirical|percentile|"
+                         r"normal distribution", re.I)
+_SHARPE_METHOD = re.compile(r"Sharpe[^.]{0,200}?(?:excess|minus|less|divided|over|annuali[sz]ed|√|sqrt)", re.I)
+_CAP = re.compile(r"capped (?:below|at|under)\s+(\d+(?:\.\d+)?)\s*x\b", re.I)
+_ROTATION = re.compile(r"\bdynamic allocation\b|\brotation process\b", re.I)
+_MIXED_CASE = re.compile(r"\b[A-Za-z]*[a-z][A-Z][A-Za-z]*\b")  # WealthRyse, iStrategy
+_FLOOR_TWICE = re.compile(r"\b(\d+)\s*/?\s*F\s*,\s*\1\s*/?\s*F\b")
+_NEGATION = re.compile(r"\b(?:neither|not|no|never|none|nothing|cannot|without)\b|n't\b", re.I)
+_DOUBLED = re.compile(r"\b([A-Za-z]{2,})[ \t]+\1\b", re.I)  # on one line: table cells repeat across lines
+
+# The owner layout's allocation diagram (ibkr_etl.alpha_world_t_factsheet._allocation and the MS template) is
+# fixed: two sleeves weighted 70% and 30%, the first 130% long and 70% short, the second 150% long and 150% short.
+# On the T factsheet the diagram is drawn without a text layer, so the reviewer reads it from here.
+OWNER_SLEEVES = ((70, 130, 70), (30, 150, 150))  # (weight, long, short), percent
 
 
 def dates_in(text: str) -> list[date]:
@@ -164,7 +182,69 @@ class TextFindings:
     notes: list[str] = field(default_factory=list)  # template wording to decide once, not every month
 
 
-def check_text(pages: Sequence[str], period_end: date) -> TextFindings:
+def _sentences(text: str, pattern: re.Pattern[str]) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?])\s+", " ".join(text.split())) if pattern.search(s)]
+
+
+def owner_gross_exposure() -> int:
+    """Gross exposure of the owner layout's fixed sleeves, in percent of capital."""
+    return round(sum(weight * (long + short) for weight, long, short in OWNER_SLEEVES) / 100)
+
+
+def wording_notes(pages: Sequence[str], *, owner_layout: bool = False) -> list[str]:
+    """Template wording the printed figures or the layout contradict, and proofreading slips. (Replay round 5 and the
+    independent check of 15 Oct 2026: "Less Volatility" beside months of 10% or more, VaR and Sharpe methods never
+    stated, "capped below 2x" on a layout that is 2.3x gross, the brand printed two ways, and typos in the
+    disclosures.)"""
+    notes: list[str] = []
+    everything = "\n".join(pages)
+    if not everything.strip():
+        return notes
+    calm = _CALM.search(everything)
+    if calm:
+        months = [(abs(float(m.group(2))), m.group(2), m.group(1)) for m in _MONTH_ROW.finditer(everything)]
+        large = [m for m in months if m[0] >= _LARGE_MONTH]
+        if large:
+            _, change, day = max(large)
+            notes.append(f'The text says "{" ".join(calm.group(0).split())}", but the history table prints '
+                         f"{len(large)} month(s) of {_LARGE_MONTH:.0f}% or more, up to {change}% (to {day}).")
+    var = _sentences(everything, re.compile(r"\bC?VaR\b"))
+    if var and not any(_VAR_METHOD.search(s) for s in var):
+        notes.append("VaR and CVaR are given a confidence level but not a method (for example historical: the 5th "
+                     "percentile of daily returns over the period shown).")
+    if (re.search(r"\bSharpe\b", everything) or owner_layout or re.search(r"risk[- ]free rate", everything, re.I)) \
+            and not _SHARPE_METHOD.search(" ".join(everything.split())):
+        notes.append("A Sharpe ratio is shown without its method (for example annualised mean daily return less the "
+                     "risk-free rate, divided by annualised volatility).")
+    cap = _CAP.search(everything)
+    if owner_layout and cap and owner_gross_exposure() >= float(cap.group(1)) * 100:
+        parts = " + ".join(f"{w}% × ({lg}% + {sh}%)" for w, lg, sh in OWNER_SLEEVES)
+        notes.append(f'The text says leverage is "{" ".join(cap.group(0).split())}", but the allocation diagram\'s '
+                     f"fixed sleeves are {owner_gross_exposure()}% gross ({parts}).")
+    if owner_layout and _ROTATION.search(everything):
+        notes.append("The text describes a dynamic allocation and rotation between sleeves, but the allocation "
+                     "diagram is the same fixed split every month.")
+    forms: dict[str, set[str]] = {}
+    for word in _MIXED_CASE.findall(everything):
+        forms.setdefault(word.lower(), set())
+    for word in re.findall(r"\b[A-Za-z]+\b", everything):
+        if word.lower() in forms and not word.isupper():
+            forms[word.lower()].add(word)
+    for spelled in forms.values():
+        if len(spelled) > 1:
+            notes.append(f"A name is printed two ways: {' and '.join(sorted(spelled))}.")
+    slips = [m.group(0) for m in _FLOOR_TWICE.finditer(everything)]
+    slips += [m.group(0) for m in _DOUBLED.finditer(everything) if m.group(1).lower() not in {"that", "had"}]
+    for sentence in _sentences(everything, re.compile(r"\bnor\b")):
+        before = sentence[:sentence.find(" nor ")] if " nor " in sentence else ""
+        if before and not _NEGATION.search(before[-80:]):
+            slips.append(" ".join(before.split()[-4:]) + " nor")
+    for slip in dict.fromkeys(slips):
+        notes.append(f'Proofreading: "{slip}".')
+    return notes
+
+
+def check_text(pages: Sequence[str], period_end: date, *, owner_layout: bool = False) -> TextFindings:
     """Faults that the printed text proves, without a model."""
     result = TextFindings()
     for number, text in enumerate(pages, start=1):
@@ -205,4 +285,5 @@ def check_text(pages: Sequence[str], period_end: date) -> TextFindings:
     if twelve:
         result.notes.append("The 12-month return note describes a weighted average of holdings; check it matches how the "
                             "printed figure is calculated (it may be the NAV-to-NAV change).")
+    result.notes += wording_notes(pages, owner_layout=owner_layout)
     return result

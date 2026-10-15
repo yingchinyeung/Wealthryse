@@ -681,6 +681,55 @@ class WriterReviewerTests(unittest.TestCase):
         self.assertIn("31.00%", sent["pages"][0]["printed_text"])
         self.assertEqual(Reviewer(TeamModel(APAC, tokens_left=10**6, client=FakeModel())).check_claims(["  "]), ([], [], {}))
 
+    def test_wording_checks_find_calm_claims_unstated_methods_and_slips(self):
+        from wealthryse_agent.month_team import page_checks
+
+        # Made-up text and history rows: one month moves 12.50%.
+        pages = ["Example Fund\nDesigned to Provide Income with Less Volatility:\n2026-01-30\n100.77\n0.77%\n0.77%\n"
+                 "2026-02-27\n113.71\n12.50%\n13.71%\nVaR and CVaR are calculated at the 95% confidence level on daily "
+                 "returns.\nSharpe 7.77",
+                 "Example Asset Management, of 12F, 12/F, Example House, which would subject the firm nor any of its "
+                 "agents to registration. Nor does it advise. Examplebrand and ExampleBrand iStrategy."]
+        notes = page_checks.wording_notes(pages)
+        self.assertIn('"Less Volatility", but the history table prints 1 month(s) of 10% or more, up to 12.50% '
+                      "(to 2026-02-27)", notes[0])
+        self.assertIn("VaR and CVaR are given a confidence level but not a method", notes[1])
+        self.assertIn("Sharpe ratio is shown without its method", notes[2])
+        self.assertIn("printed two ways: ExampleBrand and Examplebrand", notes[3])
+        self.assertEqual(notes[4:], ['Proofreading: "12F, 12/F".', 'Proofreading: "would subject the firm nor".'])
+        # Calm months, stated methods, one spelling, no slips: nothing to note.
+        clean = ["Less volatility.\n2026-01-30\n100.77\n0.77%\n0.77%\nHistorical VaR is the 5th percentile of daily "
+                 "returns. Sharpe is the annualised excess return divided by volatility. Neither the firm nor its agents."]
+        self.assertEqual(page_checks.wording_notes(clean), [])
+
+    def test_owner_layout_leverage_and_rotation_wording(self):
+        from wealthryse_agent.month_team import page_checks
+
+        self.assertEqual(page_checks.owner_gross_exposure(), 230)
+        text = ["It employs a dynamic allocation framework and incorporates modest leverage, generally capped below 2x."]
+        notes = page_checks.wording_notes(text, owner_layout=True)
+        self.assertTrue(any('"capped below 2x", but the allocation diagram\'s fixed sleeves are 230% gross' in n
+                            for n in notes))
+        self.assertTrue(any("same fixed split every month" in n for n in notes))
+        self.assertFalse(any("capped" in n or "fixed split" in n for n in page_checks.wording_notes(text)))
+        self.assertFalse(any("capped" in n for n in page_checks.wording_notes(
+            ["Leverage capped below 3x."], owner_layout=True)))
+        # The fixed sleeves are the ones the owner-layout renderer draws.
+        renderer = (Path(__file__).resolve().parents[1] / "src" / "ibkr_etl" / "alpha_world_t_factsheet.py")
+        if renderer.exists():
+            source = renderer.read_text(encoding="utf-8")
+            self.assertIn("('70%','30%')", source)
+            self.assertIn("('130% LONG','70% SHORT','150% LONG','150% SHORT')", source)
+
+    def test_proofreading_claims_need_only_the_slip_printed(self):
+        pages = ["Example Asset Managment offers example services."]
+        claims = [{"kind": "proofreading", "statement": "Example Asset Managment", "evidence": "Example Asset Management",
+                   "explanation": "Misspelt."},
+                  {"kind": "proofreading", "statement": "Exampel text", "evidence": "Example text", "explanation": "x"}]
+        notes, aside, _ = Reviewer(TeamModel(APAC, tokens_left=10**6, client=FakeModel(claims=claims))).check_claims(pages)
+        self.assertEqual(notes, ['Proofreading: "Example Asset Managment" should read Example Asset Management. Misspelt.'])
+        self.assertEqual(aside[0]["reason"], "The statement is not printed as quoted.")
+
     def test_a_failed_claims_reply_is_noted_not_fatal(self):
         pages = ["A diversified portfolio.\nTechnology 64.00%"]
         reviewer = Reviewer(TeamModel(APAC, tokens_left=10**6, client=FakeModel(claims="INCOMPLETE")))

@@ -126,6 +126,7 @@ class RenderTests(unittest.TestCase):
                     self.assertEqual(result["pdf_accuracy_validation"]["status"], "pass")
                     self.assertEqual(result["title_font"], "synthetic-bold-georgia" if name else "georgia-bold")
                     self.assertFalse(result["publication_allowed"])
+                    self.assertEqual(result["release_scope"], "internal_shareholder")
                     reader = PdfReader(result["output_path"])
                     first, second = (" ".join(page.extract_text().split()) for page in reader.pages)
                     display = name or "Alpha World Asia"
@@ -148,15 +149,15 @@ class RenderTests(unittest.TestCase):
         for path, digest in authorities.items():
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
 
-    def test_wrong_source_publication_and_existing_output_are_refused(self):
+    def test_wrong_source_failed_snapshot_and_existing_output_are_refused(self):
         with tempfile.TemporaryDirectory() as root:
             target = Path(root) / "composite.pdf"
             cases = ((payload("alpha-world-t"), {"template_path": MS_SOURCE}, "approved design authority"),
                      (payload("alpha-world-ms"), {"template_path": MS_TEMPLATE}, "completed factsheet"),
                      (payload("alpha-world-ms"), {"template_path": MS_TEMPLATE, "design_model_path": T_SOURCE},
                       "approved design authority"),
-                     ({**payload("alpha-world-t"), "publication_allowed": True}, sources("alpha-world-t"),
-                      "publication is not approved"))
+                     ({**payload("alpha-world-t"), "quality_status": "fail"}, sources("alpha-world-t"),
+                      "failed composite snapshot"))
             for snapshot, paths, message in cases:
                 with self.subTest(message=message):
                     with self.assertRaisesRegex(MonthlyArtifactError, message):

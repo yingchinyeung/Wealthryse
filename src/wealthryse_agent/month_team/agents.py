@@ -42,6 +42,9 @@ class TeamModelError(Exception):
 # The cap counts reasoning as well as the answer; at the old 2,000 to 3,000 some replies were cut off
 # ("model_incomplete"). Only tokens actually used are billed and counted against the budget.
 OUTPUT_TOKENS = {"writer": 8000, "review": 6000, "deck_review": 6000, "visual": 8000, "claims": 4000}
+# Each page's text sent to the claims check, after page_checks.compact() removes repeats. (Replay round 6: at 6,000
+# characters the disclosure page was cut part-way and the cut sentences were reported as slips.)
+CLAIMS_PAGE_CHARS = 9000
 
 
 class BudgetExhausted(Exception):
@@ -404,7 +407,9 @@ class Reviewer:
         once, so they go with the evidence rather than becoming objections."""
         if not any(page.strip() for page in factsheet_pages):
             return [], [], {}
-        payload = {"pages": [{"page": n, "printed_text": str(text)[:6000]} for n, text in enumerate(factsheet_pages, start=1)]}
+        texts = [page_checks.compact(str(text)) for text in factsheet_pages]
+        payload = {"pages": [{"page": n, "printed_text": text[:CLAIMS_PAGE_CHARS], "text_cut": len(text) > CLAIMS_PAGE_CHARS}
+                             for n, text in enumerate(texts, start=1)]}
         try:
             result, usage = self.model.ask(name="page_claims", instructions=PAGE_CLAIMS, payload=payload,
                                            schema=CLAIMS_SCHEMA, max_output_tokens=OUTPUT_TOKENS["claims"])
@@ -419,7 +424,14 @@ class Reviewer:
             if not page_checks.quoted_in(statement, factsheet_pages):
                 set_aside.append({"statement": statement[:200], "reason": "The statement is not printed as quoted."})
             elif finding.get("kind") == "proofreading":
-                # The evidence is the correction, so it need not be printed; the slip itself must be.
+                # The evidence is the correction, so it need not be printed; the slip itself must be, as whole words.
+                if not page_checks.slip_printed(statement, factsheet_pages):
+                    set_aside.append({"statement": statement[:200], "reason": "The slip is not printed as whole words."})
+                    continue
+                if page_checks.repeated_label(statement):
+                    set_aside.append({"statement": statement[:200], "reason": "A label repeated in the text layer; "
+                                                                           "the page shows it once."})
+                    continue
                 correction = f" should read {evidence[:160]}." if evidence else "."
                 notes.append(f'Proofreading: "{statement[:160]}"{correction} {explanation[:240]}'.strip())
             elif not evidence or not page_checks.figures_printed(evidence, factsheet_pages):

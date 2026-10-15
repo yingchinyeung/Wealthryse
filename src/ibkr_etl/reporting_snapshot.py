@@ -189,6 +189,11 @@ def assemble_month_end_payload(
                 from .alpha_world_ms_crisis import validate
             validate(crisis,as_of=effective.isoformat(),holdings=sanitized['holdings']['data']['holdings'],
                      nav=sanitized['summary']['data']['latest_nav']['total_text'])
+        elif str(crisis.get('calculation_version') or '').startswith('alpha-world-design-composite-'):
+            from .profiled_crisis import validate as validate_profiled_crisis
+            validate_profiled_crisis(crisis, as_of=effective.isoformat(),
+                                     holdings=sanitized['holdings']['data']['holdings'],
+                                     nav=sanitized['summary']['data']['latest_nav']['total_text'])
         crisis_as_of = date.fromisoformat(str(crisis["holdings_as_of"]))
         if crisis_as_of > effective:
             raise ReportingSnapshotError(

@@ -72,10 +72,11 @@ def audit(deck,source):
         else:
             assert controls=={'Return observations':str(m['risk']['return_observations']),
                 'Block length':'N/A','Simulation paths':'0','Tail confidence':'N/A','Horizon':'N/A'}
-        monthly=table(15)
+        monthly={row[0]:row for row in table(15)[1:]}
+        assert s['period_end'][:4] in monthly
         for r in m['month_rows']:
-            year,month=int(r['date'][:4]),int(r['date'][5:7])
-            assert monthly[year-2024][month]==f"{r['portfolio_monthly_return']*100:.1f}%"
+            if r['date'][:4] in monthly:
+                assert monthly[r['date'][:4]][int(r['date'][5:7])]==f"{r['portfolio_monthly_return']*100:.1f}%"
         charts=[]
         for n in z.namelist():
             if __import__('re').fullmatch(r'ppt/(?:slides/)?charts/chart\d+\.xml',n):

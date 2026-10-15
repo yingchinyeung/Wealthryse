@@ -43,7 +43,7 @@ def sleeves(definition: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def enrich(core: Mapping[str, Any], components: Sequence[Mapping[str, Any]],
-           definition: Mapping[str, Any]) -> dict[str, Any]:
+           definition: Mapping[str, Any], crisis: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Validate every dated component and derive monthly reporting; never mutate inputs."""
 
     _, metrics, _, evidence = _qualified_source(core)
@@ -120,8 +120,7 @@ def enrich(core: Mapping[str, Any], components: Sequence[Mapping[str, Any]],
         snapshot_version=VERSION, formula_version=evidence["version"], quality_status="warn",
         publication_allowed=False,
         publication_blockers=["primary_benchmark:not_licensed_for_publication",
-                              "secondary_1_benchmark:not_licensed_for_publication",
-                              "risk:crisis_replay_unavailable"],
+                              "secondary_1_benchmark:not_licensed_for_publication"],
         month_end_performance=monthly_rows,
         portfolio_summary={"account": {"account_id": subject_id, "alias": profile["display_name"],
                                        "base_currency": "HKD"},
@@ -146,7 +145,14 @@ def enrich(core: Mapping[str, Any], components: Sequence[Mapping[str, Any]],
         secondary_performance_comparison={"available": False, "series": [], "metrics": {},
                                           "publication_allowed": False},
     )
-    snapshot["risk"].update(metrics=metrics, analytics_evidence=evidence, crisis_replay=None)
+    snapshot["risk"].update(metrics=metrics, analytics_evidence=evidence, crisis_replay=deepcopy(crisis))
+    if crisis:
+        from .profiled_crisis import validate
+        validate(crisis, as_of=core["data_as_of"], holdings=holdings,
+                 nav=snapshot["portfolio_summary"]["latest_nav"]["total_text"],
+                 contract_sha256=snapshot["methodology_identity"]["contract_sha256"])
+    else:
+        snapshot["publication_blockers"].append("risk:crisis_replay_unavailable")
     return snapshot
 
 
@@ -157,7 +163,15 @@ def load(connection, subject_id: str, as_of: str, *, tenant_id: str) -> dict[str
         "SELECT * FROM synthetic_portfolio_components WHERE tenant_id = ? AND portfolio_id = ? "
         "AND snapshot_date <= ? ORDER BY snapshot_date, component_id",
         (tenant_id, subject_id, core["data_as_of"])).fetchall()
-    return enrich(core, components, contract.definition)
+    snapshot = enrich(core, components, contract.definition)
+    from .profiled_crisis import build, capture
+    # As MS and T: without exact-date sleeve evidence the replay is shown as unavailable.
+    try:
+        crisis = build(contract.definition, snapshot,
+                       capture(connection, contract.definition, core["data_as_of"], tenant_id=tenant_id))
+    except (ValueError, KeyError, TypeError):
+        return snapshot
+    return enrich(core, components, contract.definition, crisis)
 
 
 def tool_results(snapshot: Mapping[str, Any]) -> dict[str, dict[str, Any]]:

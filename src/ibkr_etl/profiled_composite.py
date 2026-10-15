@@ -38,6 +38,10 @@ CORE_UNAVAILABLE = {
 }
 MESSAGE = ("HKD NAV metrics use inception-to-date average 1M HIBOR. One-year simulations use the documented "
            "moving-block bootstrap. Benchmark comparison and security-level tail attribution remain unavailable.")
+CRISIS_MESSAGE = ("HKD NAV metrics use inception-to-date average 1M HIBOR. One-year simulations use the documented "
+                  "moving-block bootstrap. Hypothetical crisis results use provisional prices and documented proxies; "
+                  "internal/shareholder use only. Benchmark comparison and security-level tail attribution remain "
+                  "unavailable.")
 
 
 @dataclass(frozen=True)
@@ -244,7 +248,9 @@ def validate_inputs(inputs: Mapping[str, Any]) -> dict:
             or inputs["benchmark_id"] is not None or inputs["rows"] or inputs["positions"]):
         raise ValueError("The composite's risk input identity or methodology differs")
     if inputs.get("crisis_replay") is not None:
-        raise ValueError("Crisis replay is not yet qualified for Alpha World design composites")
+        from .profiled_crisis import validate
+        validate(inputs["crisis_replay"], as_of=source["data_as_of"], nav=source["performance"]["series"][-1]["nav"],
+                 contract_sha256=source["methodology_identity"]["contract_sha256"])
     return source
 
 
@@ -256,7 +262,10 @@ def build_payload(inputs: Mapping[str, Any]) -> dict:
     if evidence["excluded_intervals"]:
         raise ValueError("The composite's daily sample has unresolved gaps")
     extra = dict(extended_metrics(tuple(daily)))
-    unavailable = {**CORE_UNAVAILABLE, "crisis_replay": "not-yet-qualified-for-design-composites"}
+    crisis = inputs.get("crisis_replay")
+    unavailable = dict(CORE_UNAVAILABLE)
+    if crisis is None:
+        unavailable["crisis_replay"] = "exact-date-qualified-crisis-inputs-unavailable"
     if not extra["drawdown_simulation_paths"]:
         unavailable["one_year_drawdown"] = "fewer-than-20-validated-return-intervals"
     return {
@@ -267,10 +276,12 @@ def build_payload(inputs: Mapping[str, Any]) -> dict:
         "unavailable_capabilities": unavailable, "reporting_currency": "HKD",
         "quality_status": "warn", "publication_allowed": False,
         "metrics": {**metrics, **extra, "daily_expected_tail_loss": metrics["cvar_95_daily"],
-                    "return_observations": len(daily), "crisis_maximum_drawdown": None},
-        "risk_free": deepcopy(source["risk"]["risk_free"]), "crisis_replay": None,
+                    "return_observations": len(daily),
+                    "crisis_maximum_drawdown": crisis["maximum_drawdown"] if crisis else None},
+        "risk_free": deepcopy(source["risk"]["risk_free"]), "crisis_replay": deepcopy(crisis),
         "expected_tail_loss_contributors": {"top": [], "bottom": []},
-        "source_snapshot": source, "analytics_evidence": evidence, "message": MESSAGE,
+        "source_snapshot": source, "analytics_evidence": evidence,
+        "message": CRISIS_MESSAGE if crisis else MESSAGE,
     }
 
 

@@ -1,7 +1,9 @@
 """Shared visual system for the WealthRyse portfolio portal."""
 
+import base64
 from functools import lru_cache
-from pathlib import Path
+
+from .web_fonts import WEB_FONTS_BASE64
 
 COMMON_THEME_CSS = r"""
 :root {
@@ -242,13 +244,12 @@ DARK_THEME_CSS = r"""
 # It is appended after the shared and dark rules, so it wins on equal
 # specificity. Colours come from the custom properties, so the same rules
 # serve light mode, dark mode (the "@media screen" blocks) and print.
-WEB_FONT_FILES = frozenset(f"barlow-{weight}.woff2" for weight in (400, 500, 600, 700))
-_FONT_DIR = Path(__file__).parent / "assets" / "fonts"
+WEB_FONT_FILES = frozenset(WEB_FONTS_BASE64)
 
 
 @lru_cache(maxsize=None)
 def web_font_bytes(name: str) -> bytes:
-    return (_FONT_DIR / name).read_bytes()
+    return base64.b64decode(WEB_FONTS_BASE64[name])
 
 
 _FONT_FACE_CSS = "".join(

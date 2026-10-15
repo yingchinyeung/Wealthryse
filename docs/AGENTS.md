@@ -179,8 +179,9 @@ deck that comes next. The older manual onboarding render jobs
   images only. The writer sees figure labels and display values only.
 - Report content goes only to `wr-reports-apac` (APAC Data Zone); the team
   refuses to start on any other processing scope.
-- Its own monthly token budget (`AGENT_MONTH_TEAM_TOKEN_BUDGET`, 20 million by
-  default), separate from the daily chat budget. When it runs out the team
+- Its own monthly token budget (`AGENT_MONTH_TEAM_TOKEN_BUDGET`: deployed at 40
+  million since Ying doubled it on 15 October 2026, 20 million if unset),
+  separate from the daily chat budget. When it runs out the team
   pauses without skipping a check.
 - An account that fails three times in a row stops and the others carry on;
   `--retry` restarts it. One account gets at most 15 minutes per run.

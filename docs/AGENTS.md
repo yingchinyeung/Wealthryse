@@ -168,7 +168,7 @@ deck that comes next. The older manual onboarding render jobs
 | Analyst | Builds the figure set from the tools: month, year-to-date and since-inception returns against the benchmark, risk, contributors, sectors. Every figure has an id and a source. | none |
 | Writer | Drafts the deck's commentary from the figure set only. Every sentence cites figure ids, and the text makes no numerical claim of its own, as with today's drafter. The summary fits the deck's line (221 characters). Accounts whose deck has no commentary line (Alpha World T) get none. | `wr-reports-apac` |
 | Reviewer | Reads the draft cold and objects sentence by sentence; a code check also catches wording that goes against the cited figure ("rose" on a negative return). Once the package is built, it re-derives every printed factsheet figure from the frozen snapshot with the renderer's own inputs, compares the snapshot with today's database (10 bp), and checks the deck's date and narrative. | `wr-reports-apac` and code |
-| Visual QA | Looks at the factsheet pages as images for clipped text, overlaps, blank areas and wrong dates. Each finding carries a page and a region. | `wr-reports-apac` |
+| Visual QA | Looks at the factsheet pages as images for clipped text, overlaps, blank areas and wrong dates, with each page's printed text beside them. Each finding carries a page and a region. Code sets aside a finding that quotes a date or figure the page does not print, estimates a value from a chart, does arithmetic (the reviewer's job) or objects to the month's last trading day; set-aside findings stay in the evidence with the reason. Code also checks the printed text for dates after the report date (stale or hidden text) and one label printed two ways, and notes template wording once (no currency stated, an unnamed benchmark, the 12-month note). | `wr-reports-apac` and code |
 | Coordinator | One stage machine per account and month: data, held, words, package, checking, ready. Runs up to two writer and reviewer rounds, sends a dispute to Ying, and checks again when the package is rebuilt. | none |
 
 **Proof, not trust.**
@@ -176,7 +176,7 @@ deck that comes next. The older manual onboarding render jobs
 - Files are read only from `internal-reports/review/` and must match the
   sha256 the package job recorded. The snapshot must match its recorded hash.
 - The model never sees the snapshot or a file's bytes; visual QA sees page
-  images only. The writer sees figure labels and display values only.
+  images and the pages' printed text. The writer sees figure labels and display values only.
 - Report content goes only to `wr-reports-apac` (APAC Data Zone); the team
   refuses to start on any other processing scope.
 - Its own monthly token budget (`AGENT_MONTH_TEAM_TOKEN_BUDGET`: deployed at 40

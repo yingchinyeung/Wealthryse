@@ -17,7 +17,7 @@ from datetime import date
 from typing import Any, Callable, Mapping, Sequence
 
 from ..tool_client import ToolCallFailed
-from . import documents, figures
+from . import documents, figures, page_checks
 from .agents import (ALPHA_WORLD_FACTSHEETS, Analyst, BudgetExhausted, DataAgent, Outcome, Reviewer, TeamModel,
                      VisualQA, Writer, commentary_items)
 from .settings import MAX_REVIEW_ROUNDS, MAX_STEP_ATTEMPTS, TeamSettings
@@ -292,9 +292,14 @@ class Coordinator:
         for page in figures.factsheet_commentary(pages or [], sentences):
             integrity.append({"target": "factsheet", "page": page,
                               "message": "The factsheet prints commentary; the factsheet never carries commentary."})
+        printed = page_checks.check_text(pages or [], date.fromisoformat(ctx.period_end))
+        integrity += [{"target": "factsheet", **o} for o in printed.objections]
         review = Reviewer(self.model).check_files(
             account_id=ctx.account_id, period_end=ctx.period_end, snapshot=snapshot, factsheet_pages=pages,
             deck_slides=slides, figure_set=run.get("figures") or {}, inception_date=(run.get("figures") or {}).get("inception_date"))
+        if printed.notes:
+            # Template wording, the same every month: shown once with the evidence, not raised as objections.
+            review.evidence["template_notes"] = printed.notes
         if integrity:
             review = Outcome("objection", f"{len(integrity) + len(review.objections)} objection(s) to the package files.",
                              review.evidence, integrity + review.objections, review.usage)
@@ -305,7 +310,8 @@ class Coordinator:
             images = self.render_pages(fetched["factsheet"].content, dpi=self.settings.page_image_dpi)
             visual = VisualQA(self.model).inspect_factsheet(images, display_date=_display_date(ctx.period_end),
                                                             period_label=f"ending {_display_date(ctx.period_end)}",
-                                                            account_id=ctx.account_id)
+                                                            account_id=ctx.account_id, page_text=pages,
+                                                            period_end=ctx.period_end)
         else:
             visual = Outcome("skipped", "There is no factsheet in the package to look at.")
         self._record(run, "visual_qa", visual, round=package_round)

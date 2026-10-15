@@ -48,6 +48,21 @@ VERIFIED_HISTORICAL_OVERRIDES: dict[str, dict[str, str]] = {
         ),
         "evidence": "verified_historical_override:twse-delisting-2025-06-27",
     },
+    # Skydance distributed one SKYD WS warrant per SKYD Class B share (record
+    # date 5 Oct 2026); regular-way NYSE trading began 14 Oct 2026, before Yahoo
+    # published a profile for the warrant.  Each warrant converts into one SKYD
+    # share, so it carries the underlying's sector.  Owner-approved on
+    # 15 Oct 2026 and bound to the exact IBKR conid observed in U16088571.
+    # Yahoo still wins once it classifies the warrant itself.
+    "931131905": {
+        "symbol": "SKYD WS",
+        "lookup_symbol": "SKYD",
+        "sector": "Communication Services",
+        "industry": "Entertainment",
+        "exchange": "NYQ",
+        "source_url": "https://infomemo.theocc.com/infomemos?number=59906",
+        "evidence": "owner_approved_underlying_override:occ-memo-59906",
+    },
 }
 
 

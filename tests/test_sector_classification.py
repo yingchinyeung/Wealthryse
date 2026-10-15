@@ -99,6 +99,40 @@ class SectorClassificationTests(unittest.TestCase):
             "verified_historical_override:twse-delisting-2025-06-27",
         )
 
+    def test_new_warrant_override_uses_underlying_sector_until_yahoo_has_one(
+        self,
+    ) -> None:
+        holding = {
+            "conid": "931131905",
+            "symbol": "SKYD WS",
+            "listing_exchange": "NYSE",
+            "currency": "USD",
+        }
+        result = lookup_classification(
+            holding,
+            fetcher=lambda symbol, timeout: {"quotes": []},
+            profile_fetcher=lambda symbol: {},
+        )
+        self.assertEqual(result["status"], "classified")
+        self.assertEqual(result["sector"], "Communication Services")
+        self.assertEqual(result["symbol"], "SKYD WS")
+        self.assertEqual(
+            result["error_code"],
+            "owner_approved_underlying_override:occ-memo-59906",
+        )
+
+        yahoo_result = lookup_classification(
+            holding,
+            fetcher=lambda symbol, timeout: {
+                "quotes": [
+                    {"symbol": "SKYD-WS", "sector": "Technology", "industry": "X"}
+                ]
+            },
+            profile_fetcher=lambda symbol: {},
+        )
+        self.assertEqual(yahoo_result["sector"], "Technology")
+        self.assertIsNone(yahoo_result["error_code"])
+
     def test_allocation_uses_absolute_market_value_and_reports_coverage(self) -> None:
         result = aggregate_sector_allocation(
             [

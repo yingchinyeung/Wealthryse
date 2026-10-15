@@ -112,6 +112,7 @@ a { color: var(--brand-deep); }
 td, .value, .metric, .account-stats { font-variant-numeric: tabular-nums; }
 .gain { color: #0f7a4a; }
 .loss { color: #b42318; }
+.rsi-flag { margin-left: 6px; color: var(--muted-strong); font-size: 10px; font-weight: 720; letter-spacing: .06em; text-transform: uppercase; }
 select, input[type=text], input[type=search], input[type=date], input.secret-field, textarea {
   color: var(--ink);
   background: rgba(255, 255, 255, .92);

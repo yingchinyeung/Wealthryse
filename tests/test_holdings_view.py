@@ -6,6 +6,7 @@ import re
 import sqlite3
 import unittest
 from contextlib import contextmanager
+from datetime import date, timedelta
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -280,6 +281,22 @@ class HoldingsEndpointTests(unittest.TestCase):
         self.assertAlmostEqual(float(rows["700"]["reporting_market_value_text"]), 1000.0)
         self.assertAlmostEqual(rows["700"]["weight"], 0.25)
         self.assertAlmostEqual(rows["700"]["unrealized_pnl_pct"], -780 / 8580)
+
+    def test_account_holdings_carry_rsi_from_stored_daily_marks(self):
+        self.db.raw.execute("DELETE FROM subject_position_series WHERE subject_id = 'U1' "
+                            "AND conid = '265598' AND snapshot_date = '2025-01-20'")
+        day, marks = date(2025, 1, 20), []
+        while len(marks) < 18:
+            if day.weekday() < 5:
+                marks.append(("U1", day.isoformat(), "265598", "USD", "10", "1500",
+                              str(199 - len(marks)), "1990", "0"))
+            day -= timedelta(days=1)
+        self.db.raw.executemany("INSERT INTO subject_position_series VALUES ('tenant',?,?,?,?,?,?,?,?,?)", marks)
+        rows = {row["conid"]: row for row in web.holdings("U1", user=VIEWER)["holdings"]}
+        self.assertEqual(rows["265598"]["rsi"], 100.0)
+        self.assertEqual(rows["265598"]["rsi_signal"], "overbought")
+        self.assertIsNone(rows["700"]["rsi"])
+        self.assertEqual(rows["700"]["rsi_reason"], "insufficient_history")
 
     def test_filtered_portfolio_uses_source_account_fx_and_gross_fallback(self):
         result = web.holdings("F1", user=VIEWER)

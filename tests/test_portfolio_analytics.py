@@ -319,3 +319,61 @@ class EndpointAndPageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RsiTests(unittest.TestCase):
+    # StockCharts' published Wilder RSI worked example; its table rounds the
+    # averages to two decimals, so its RSIs sit about 0.07 above exact values.
+    CLOSES = [44.34, 44.09, 44.15, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08,
+              45.89, 46.03, 45.61, 46.28, 46.28, 46.00, 46.03, 46.41, 46.22]
+
+    def test_matches_the_published_wilder_example(self):
+        for count, published in ((15, 70.53), (16, 66.32), (17, 66.55), (18, 69.41), (19, 66.36)):
+            self.assertAlmostEqual(analytics.wilder_rsi(self.CLOSES[:count]), published, delta=0.1)
+
+    def test_needs_fifteen_closes_and_handles_one_way_runs(self):
+        self.assertIsNone(analytics.wilder_rsi(self.CLOSES[:14]))
+        self.assertEqual(analytics.wilder_rsi([float(i) for i in range(1, 20)]), 100.0)
+        self.assertEqual(analytics.wilder_rsi([float(i) for i in range(20, 1, -1)]), 0.0)
+        self.assertEqual(analytics.wilder_rsi([5.0] * 20), 50.0)
+
+    @staticmethod
+    def _weekday_prices(start: date, values):
+        prices, day = {}, start
+        for value in values:
+            while day.weekday() >= 5:
+                day += timedelta(days=1)
+            prices[day.isoformat()] = value
+            day += timedelta(days=1)
+        return prices
+
+    def test_holding_rsi_signals_and_ignores_weekend_marks(self):
+        prices = self._weekday_prices(date(2026, 9, 1), [100.0 + i for i in range(20)])
+        prices["2026-09-05"] = 1.0  # a Saturday mark is ignored
+        last = max(prices)
+        result = analytics.holding_rsi(prices, last)
+        self.assertEqual(result["rsi"], 100.0)
+        self.assertEqual(result["rsi_signal"], "overbought")
+        self.assertEqual(result["rsi_observations"], 20)
+        falling = self._weekday_prices(date(2026, 9, 1), [100.0 - i for i in range(20)])
+        self.assertEqual(analytics.holding_rsi(falling, max(falling))["rsi_signal"], "oversold")
+        steady = self._weekday_prices(date(2026, 9, 1), self.CLOSES)
+        self.assertEqual(analytics.holding_rsi(steady, max(steady))["rsi_signal"], "neutral")
+
+    def test_split_or_reopened_position_restarts_the_series(self):
+        prices = self._weekday_prices(date(2026, 8, 3), [100.0 + i for i in range(20)])
+        prices.update(self._weekday_prices(date(2026, 9, 1), [10.0 + i * 0.1 for i in range(10)]))
+        result = analytics.holding_rsi(prices, max(prices))
+        self.assertIsNone(result["rsi"])
+        self.assertEqual(result["rsi_reason"], "insufficient_history")
+        self.assertTrue(result["rsi_series_restarted"])
+        self.assertEqual(result["rsi_observations"], 10)
+        reopened = self._weekday_prices(date(2026, 6, 1), [50.0] * 20)
+        reopened.update(self._weekday_prices(date(2026, 9, 1), [51.0] * 5))
+        self.assertTrue(analytics.holding_rsi(reopened, max(reopened))["rsi_series_restarted"])
+
+    def test_no_mark_on_the_holdings_date_leaves_rsi_blank(self):
+        prices = self._weekday_prices(date(2026, 9, 1), [100.0 + i for i in range(20)])
+        result = analytics.holding_rsi(prices, "2026-12-31")
+        self.assertIsNone(result["rsi"])
+        self.assertEqual(result["rsi_reason"], "no_current_mark")

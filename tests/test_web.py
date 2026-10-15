@@ -1331,6 +1331,18 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn('<h2 class="sr-only">Risk analytics</h2>', risk_page)
         self.assertEqual(risk_page.count('class="page-view active"'), 1)
 
+        modelling_page = account_page(
+            "U16088571",
+            "modelling",
+            None,
+            {"email": "analyst@example.com"},
+        )
+        self.assertIn('class="page-view active" data-section="modelling"', modelling_page)
+        self.assertIn('href="/accounts/U16088571/modelling"', modelling_page)
+        for card in ("model-projection", "model-whatif", "model-optimise", "model-factors"):
+            self.assertIn(f'id="{card}"', modelling_page)
+        self.assertIn("if(activeSection==='modelling')renderModelling(asOf);", modelling_page)
+
     def test_account_subpages_reject_unknown_accounts_and_sections(self) -> None:
         for account_id, section in (
             ("ANOTHER_ACCOUNT", "overview"),

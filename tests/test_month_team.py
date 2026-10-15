@@ -170,10 +170,12 @@ class FakeTools:
 class FakeModel:
     """The report deployment. Answers per schema name from scripted queues; records every request."""
 
-    def __init__(self, *, drafts=None, reviews=None, visual=None, deck_review=None, reject_images=False) -> None:
+    def __init__(self, *, drafts=None, reviews=None, visual=None, deck_review=None, reject_images=False,
+                 claims=None) -> None:
         self.drafts = list(drafts or [GOOD_DRAFT])
         self.reviews = list(reviews or [[]])
         self.visual = visual or []
+        self.claims = claims or []
         self.deck_review = deck_review or []
         self.reject_images = reject_images
         self.requests: list[dict] = []
@@ -188,6 +190,8 @@ class FakeModel:
             body = {"objections": self.reviews.pop(0) if len(self.reviews) > 1 else self.reviews[0]}
         elif name == "deck_review":
             body = {"objections": self.deck_review}
+        elif name == "page_claims":
+            body = {"findings": self.claims}
         else:
             if self.reject_images:
                 error = Exception("bad request")
@@ -609,7 +613,7 @@ class WriterReviewerTests(unittest.TestCase):
                                        date(2026, 3, 31))
         self.assertEqual(len(split.objections), 1)
         self.assertIn('"Banks - Diversified" and "Banks-Diversified"', split.objections[0]["message"])
-        clean = page_checks.check_text(["As of 31 Mar 2026\nBanks\n7.00%\nHKD"], date(2026, 3, 31))
+        clean = page_checks.check_text(["As of 31 Mar 2026\nBanks\n7.00%\nHKD\nYTD 2.00%"], date(2026, 3, 31))
         self.assertEqual((clean.objections, clean.notes), ([], []))
 
     def test_printed_text_checks_note_template_wording_once(self):
@@ -617,11 +621,40 @@ class WriterReviewerTests(unittest.TestCase):
 
         text = ["Outperformed the underlying benchmark.\n12-month Return: the weighted average of the holdings' returns."]
         notes = page_checks.check_text(text, date(2026, 9, 30)).notes
-        self.assertEqual(len(notes), 3)
-        self.assertIn("currency is not stated", notes[0])
-        self.assertIn("never names one", notes[1])
-        self.assertIn("weighted average", notes[2])
-        self.assertEqual(page_checks.check_text(["HIBOR + Spread benchmark, HKD"], date(2026, 9, 30)).notes, [])
+        self.assertEqual(len(notes), 4)
+        self.assertIn("No year-to-date return", notes[0])
+        self.assertIn("currency is not stated", notes[1])
+        self.assertIn("never names one", notes[2])
+        self.assertIn("weighted average", notes[3])
+        spread = page_checks.check_text(["HIBOR + Spread benchmark, HKD, YTD +1.00%"], date(2026, 9, 30)).notes
+        self.assertEqual(spread, ["The benchmark adds a spread that is never stated."])
+        self.assertEqual(page_checks.check_text(["HIBOR + spread of 2.00%, HKD, YTD +1.00%"], date(2026, 9, 30)).notes, [])
+
+    def test_printed_text_checks_find_unevenly_spaced_chart_dates(self):
+        from wealthryse_agent.month_team import page_checks
+
+        # One chart's labels skip unevenly (made-up months); the other chart is even.
+        text = "Capital Path\n2025-01\n2025-05\n2025-07\n2025-11\n2026-03\nRebased\n2025-01\n2025-05\n2025-09\n2026-01\nYTD HKD"
+        found = page_checks.check_text([text], date(2026, 4, 30))
+        self.assertEqual(len(found.objections), 1)
+        self.assertIn("gaps of 4, 2, 4, 4 months", found.objections[0]["message"])
+        self.assertEqual(page_checks.date_axes(text)[1], ["2025-01", "2025-05", "2025-09", "2026-01"])
+
+    def test_claims_stand_only_if_the_statement_and_figures_are_printed(self):
+        pages = ["A diversified portfolio with no sector bias.\nTop 5\nExample Holdings Ltd\n31.00%\nTechnology 64.00%"]
+        claims = [
+            {"statement": "A diversified portfolio with no sector bias.", "evidence": "Technology 64.00%; Example Holdings Ltd 31.00%",
+             "explanation": "One sector and one holding dominate."},
+            {"statement": "Capped below 2x leverage.", "evidence": "250%", "explanation": "Not printed at all."},
+            {"statement": "A diversified portfolio", "evidence": "Technology 75.00%", "explanation": "Wrong figure."}]
+        model = FakeModel(claims=claims)
+        notes, aside, _ = Reviewer(TeamModel(APAC, tokens_left=10**6, client=model)).check_claims(pages)
+        self.assertEqual(len(notes), 1)
+        self.assertIn('Claim vs page: "A diversified portfolio with no sector bias."', notes[0])
+        self.assertEqual([a["reason"][:20] for a in aside], ["The statement is not", "Its evidence quotes "])
+        sent = json.loads(model.named("page_claims")[0]["input"][0]["content"][0]["text"])
+        self.assertIn("31.00%", sent["pages"][0]["printed_text"])
+        self.assertEqual(Reviewer(TeamModel(APAC, tokens_left=10**6, client=FakeModel())).check_claims(["  "]), ([], [], {}))
 
     def test_last_trading_day(self):
         from wealthryse_agent.month_team.page_checks import last_trading_day

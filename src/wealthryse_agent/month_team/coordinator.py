@@ -297,9 +297,15 @@ class Coordinator:
         review = Reviewer(self.model).check_files(
             account_id=ctx.account_id, period_end=ctx.period_end, snapshot=snapshot, factsheet_pages=pages,
             deck_slides=slides, figure_set=run.get("figures") or {}, inception_date=(run.get("figures") or {}).get("inception_date"))
-        if printed.notes:
+        reviewer = Reviewer(self.model)
+        claim_notes, claims_aside, claims_usage = reviewer.check_claims(pages) if pages else ([], [], {})
+        for key, value in claims_usage.items():
+            review.usage[key] = review.usage.get(key, 0) + value
+        if claims_aside:
+            review.evidence["claims_set_aside"] = claims_aside
+        if printed.notes or claim_notes:
             # Template wording, the same every month: shown once with the evidence, not raised as objections.
-            review.evidence["template_notes"] = printed.notes
+            review.evidence["template_notes"] = printed.notes + claim_notes
         if integrity:
             review = Outcome("objection", f"{len(integrity) + len(review.objections)} objection(s) to the package files.",
                              review.evidence, integrity + review.objections, review.usage)

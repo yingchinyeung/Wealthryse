@@ -657,5 +657,44 @@ class AccountChartAxisTests(unittest.TestCase):
         self.assertEqual(labels, ["Jul", "2021", "Jul", "2022", "Jul", "2023"])
 
 
+class HistoryWindowTests(unittest.TestCase):
+    """Page one keeps inception plus the latest 36 month-ends (made-up values)."""
+
+    def _page_one_text(self, months: int) -> list[str]:
+        snapshot = AccountChartAxisTests._monthly_snapshot(date(2022, 1, 20), months)
+        with tempfile.TemporaryDirectory() as directory:
+            template = Path(directory, "template.pdf")
+            output = Path(directory, "factsheet.pdf")
+            writer = PdfWriter()
+            writer.add_blank_page(width=595.5, height=842.25)
+            writer.add_blank_page(width=595.5, height=842.25)
+            with template.open("wb") as stream:
+                writer.write(stream)
+            render_factsheet(snapshot, template_path=template, output_path=output)
+            runs: list[str] = []
+            PdfReader(output).pages[0].extract_text(
+                visitor_text=lambda text, *_: runs.append(text.strip()) if text.strip() else None
+            )
+            return runs
+
+    def test_up_to_36_months_shows_every_month(self) -> None:
+        # The inception month counts as one of the 36: 20 Jan 2022 plus 35 month-ends.
+        runs = self._page_one_text(35)
+        self.assertIn("Historical Performance from 20 Jan 2022 to 31 Dec 2024", runs)
+        self.assertIn("2022-02-28", runs)
+        self.assertNotIn("...", runs)
+
+    def test_longer_histories_show_inception_and_the_last_36_months(self) -> None:
+        runs = self._page_one_text(54)
+        self.assertIn("Historical Performance, last 36 months to 31 Jul 2026", runs)
+        self.assertIn("Inception 20 Jan 2022", runs)
+        self.assertIn("...", runs)
+        self.assertIn("2023-08-31", runs)
+        self.assertNotIn("2023-07-31", runs)
+        self.assertIn("2026-07-31", runs)
+        # Cumulative performance still runs from inception: 54 months of 1% steps.
+        self.assertIn("54.00%", runs)
+
+
 if __name__ == "__main__":
     unittest.main()

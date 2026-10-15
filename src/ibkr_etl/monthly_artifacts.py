@@ -904,6 +904,41 @@ def _draw_table(
             cursor += width
 
 
+FACTSHEET_HISTORY_MONTHS_SHOWN = 36
+
+
+def _history_display(inputs: FactsheetInputs) -> tuple[str, list[list[str]]]:
+    """The Historical Performance heading and body rows printed on page one.
+
+    Up to 36 month-ends every row is shown. A longer history keeps its
+    inception row, then a "..." row, then the latest 36 month-ends; their
+    cumulative figures still run from inception.
+    """
+    def row(entry: dict[str, Any]) -> list[str]:
+        return [
+            entry["date"],
+            f"{entry['normalized_nav']:.2f}",
+            "-" if entry["monthly_return"] is None else _percent(entry["monthly_return"]),
+            "-" if entry["monthly_return"] is None else _percent(entry["cumulative_return"]),
+        ]
+
+    inception, months = inputs.history[0], inputs.history[1:]
+    end = _display_date(inputs.period_end, short=True)
+    if len(months) <= FACTSHEET_HISTORY_MONTHS_SHOWN:
+        return (
+            f"Historical Performance from {_display_date(inputs.history_start_date, short=True)} to {end}",
+            [row(entry) for entry in inputs.history],
+        )
+    return (
+        f"Historical Performance, last {FACTSHEET_HISTORY_MONTHS_SHOWN} months to {end}",
+        [
+            [f"Inception {_display_date(inception['date'], short=True)}", f"{inception['normalized_nav']:.2f}", "-", "-"],
+            ["...", "", "", ""],
+            *(row(entry) for entry in months[-FACTSHEET_HISTORY_MONTHS_SHOWN:]),
+        ],
+    )
+
+
 def _historical_performance_geometry(body_rows: int) -> tuple[float, float, float]:
     """Keep the growing history table bottom-aligned and expand it upward."""
     if body_rows < 1:
@@ -999,31 +1034,18 @@ def _draw_factsheet_page_one(
         bold_last_row=True,
     )
 
-    body_rows = len(inputs.history)
+    history_heading, history_body = _history_display(inputs)
     history_heading_y, history_table_top, body_height = _historical_performance_geometry(
-        body_rows
+        len(history_body)
     )
     c.setFont("Helvetica-Bold", 7.8)
-    c.drawString(
-        27,
-        history_heading_y,
-        f"Historical Performance from {_display_date(inputs.history_start_date, short=True)} to {_display_date(inputs.period_end, short=True)}",
-    )
+    c.drawString(27, history_heading_y, history_heading)
     history_rows = [[
         "DATE",
         "NORMALIZED NAV",
         "PERFORMANCE VS\nPREVIOUS MONTH",
         "CUMULATIVE PERFORMANCE\nFR INITIAL DATE",
-    ]]
-    for row in inputs.history:
-        history_rows.append(
-            [
-                row["date"],
-                f"{row['normalized_nav']:.2f}",
-                "-" if row["monthly_return"] is None else _percent(row["monthly_return"]),
-                "-" if row["monthly_return"] is None else _percent(row["cumulative_return"]),
-            ]
-        )
+    ], *history_body]
     _draw_table(
         c,
         x=27,
@@ -2265,12 +2287,13 @@ def validate_factsheet_layout(path: str | Path, inputs: FactsheetInputs) -> None
             y=row_y,
             size=4.7,
         )
+    history_heading, history_body = _history_display(inputs)
     history_heading_y, history_table_top, _ = _historical_performance_geometry(
-        len(inputs.history)
+        len(history_body)
     )
     _require_run(
         page_one_runs,
-        f"Historical Performance from {_display_date(inputs.history_start_date, short=True)} to {_display_date(inputs.period_end, short=True)}",
+        history_heading,
         x=27,
         y=history_heading_y,
         size=7.8,

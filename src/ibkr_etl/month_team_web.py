@@ -56,21 +56,31 @@ def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
     @app.get("/api/agents/month-end/runs")
     def month_runs(period_end: str | None = Query(default=None, pattern=PERIOD),
                    mode: str = Query(default="month", pattern=MODE),
+                   replay_round: int | None = Query(default=None, alias="round", ge=1, le=999),
                    user: dict[str, Any] = Depends(month_user)) -> Any:
-        params = {"user_object_id": oid(user), "mode": mode}
+        params: dict[str, Any] = {"user_object_id": oid(user), "mode": mode}
         if period_end:
             params["period_end"] = period_end
+        if replay_round is not None:
+            params["round"] = replay_round
         return api.request("GET", "/v1/month-end/runs", params=params)
+
+    @app.get("/api/agents/month-end/rounds")
+    def month_rounds(user: dict[str, Any] = Depends(month_user)) -> Any:
+        return api.request("GET", "/v1/month-end/rounds", params={"user_object_id": oid(user)})
 
     @app.get("/api/agents/month-end/runs/{account_id}/{period_end}")
     def month_run(account_id: str, period_end: str, mode: str = Query(default="month", pattern=MODE),
+                  replay_round: int | None = Query(default=None, alias="round", ge=1, le=999),
                   user: dict[str, Any] = Depends(month_user)) -> Any:
         if not re.match(PERIOD, period_end):
             raise HTTPException(status_code=400, detail="period_end must be YYYY-MM-DD.")
         if account_id not in allowed_accounts(user):
             raise HTTPException(status_code=403, detail="You do not have access to that account.")
-        return api.request("GET", f"/v1/month-end/runs/{account_id}/{period_end}",
-                           params={"user_object_id": oid(user), "mode": mode})
+        params: dict[str, Any] = {"user_object_id": oid(user), "mode": mode}
+        if replay_round is not None:
+            params["round"] = replay_round
+        return api.request("GET", f"/v1/month-end/runs/{account_id}/{period_end}", params=params)
 
     @app.get("/agents/month-team.js")
     def month_panel() -> Response:
@@ -173,9 +183,9 @@ MONTH_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><met
 </style></head><body><header><strong class="brand-title">Month-end</strong><div class="session">{VIEWER} · <a href="/agent-inbox">Agent inbox</a> · <a href="/">Accounts</a></div></header>
 <main><h1>Month-end</h1><p class="muted">Every account the month-end team is checking, by stage. The team never releases anything: release each report on its Reports tab as usual.</p>
 <div class="actions"><label>Run <select id="mode"><option value="month">This month</option><option value="replay">Replay of released months</option></select></label>
-<label>Month <select id="period"></select></label><label>Show <select id="filter"><option value="">All accounts</option><option value="need">Needs you</option><option value="clean">Clean, not yet released</option></select></label>
+<label id="round-label" hidden>Round <select id="round"></select></label><label>Month <select id="period"></select></label><label>Show <select id="filter"><option value="">All accounts</option><option value="need">Needs you</option><option value="clean">Clean, not yet released</option></select></label>
 <button id="batch" class="button" type="button" hidden>Release clean reports</button></div>
-<div id="banner"></div><div id="batch-log" class="mt-log" role="status" aria-live="polite"></div><section class="card wide"><div id="summary" class="muted">Loading…</div><div class="mt-wrap"><table class="mt-table"><thead><tr><th>Account</th><th>Stage</th><th>Data</th><th>Commentary</th><th>Files</th><th>Open objections</th><th>Updated</th></tr></thead><tbody id="rows"></tbody></table></div></section></main>
+<div id="banner"></div><section id="rounds" class="card wide" hidden></section><div id="batch-log" class="mt-log" role="status" aria-live="polite"></div><section class="card wide"><div id="summary" class="muted">Loading…</div><div class="mt-wrap"><table class="mt-table"><thead><tr><th>Account</th><th>Stage</th><th>Data</th><th>Commentary</th><th>Files</th><th>Open objections</th><th>Updated</th></tr></thead><tbody id="rows"></tbody></table></div></section></main>
 <script>
 """ + _SHARED_JS + r"""
 const needs=r=>r.attempts>=3||r.stage==='held'||r.commentary_status==='disputed'||r.open_objections>0;
@@ -207,7 +217,21 @@ async function batch(){const list=all.filter(clean);if(!list.length)return;
  const released=lines.filter(l=>l.endsWith(': released')).length;lines.unshift(`<strong>${released} of ${list.length} released.</strong>`);log.innerHTML=lines.join('<br>');button.disabled=false;render()}
 const files=r=>{const v=r.verdicts||{};if(!v.reviewer)return '—';const word={pass:'Passed',objection:'Objections',skipped:'Not looked at',failed:'Failed'};return `Figures: ${word[v.reviewer]||v.reviewer} · Pages: ${word[v.visual_qa]||v.visual_qa}`};
 let all=[];
+// Replay rounds side by side: each round re-checks every released month, so the rounds show whether tuning helped.
+async function rounds(){const box=document.querySelector('#rounds'),label=document.querySelector('#round-label'),sel=document.querySelector('#round');
+ if(document.querySelector('#mode').value!=='replay'){box.hidden=true;label.hidden=true;return}
+ const r=await fetch('/api/agents/month-end/rounds',{credentials:'same-origin'});const list=r.ok?((await r.json()).rounds||[]):[];
+ label.hidden=!list.length;const keep=sel.value;sel.innerHTML=list.slice().reverse().map(x=>`<option value="${esc(x.replay_round)}">${esc(x.replay_round)}</option>`).join('');
+ if(keep&&list.some(x=>String(x.replay_round)===keep))sel.value=keep;
+ if(list.length<1){box.hidden=true;return}
+ const cell=(x,k)=>esc(x[k]??0),obj=(x,k)=>esc((x.objections_by_target||{})[k]||0),st=(x,k)=>esc((x.objections_by_status||{})[k]||0);
+ const rows=[['Released months checked',x=>cell(x,'months')],['Finished',x=>cell(x,'finished')],['Stopped after failures',x=>cell(x,'stopped')],
+  ['Finished with no objection',x=>cell(x,'no_objections')],['Data clean / waiting / blocked',x=>`${cell(x,'data_clean')} / ${cell(x,'data_fixable')} / ${cell(x,'data_blocked')}`],
+  ['Objections raised',x=>cell(x,'objections')],['· to data / commentary',x=>`${obj(x,'data')} / ${obj(x,'commentary')}`],['· to factsheet / presentation',x=>`${obj(x,'factsheet')} / ${obj(x,'presentation')}`],
+  ['· open / settled / overruled',x=>`${st(x,'open')} / ${st(x,'resolved')} / ${st(x,'overruled')}`],['Commentary disputes',x=>cell(x,'disputed')]];
+ box.innerHTML=`<h2>Replay rounds</h2><p class="muted">Each round re-checks every released month afresh. A later round with fewer false objections, and the same real ones, shows the tuning helped. Released files are never changed.</p><div class="mt-wrap"><table class="mt-table"><thead><tr><th></th>${list.map(x=>`<th>Round ${esc(x.replay_round)}</th>`).join('')}</tr></thead><tbody>${rows.map(([name,f])=>`<tr><td>${esc(name)}</td>${list.map(x=>`<td>${f(x)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;box.hidden=false}
 async function load(period){const mode=document.querySelector('#mode').value;const q=new URLSearchParams({mode});if(period)q.set('period_end',period);
+ if(mode==='replay'){if(!period)await rounds();const round=document.querySelector('#round').value;if(round)q.set('round',round)}else await rounds();
  const r=await fetch('/api/agents/month-end/runs?'+q,{credentials:'same-origin'});if(!r.ok){document.querySelector('#summary').textContent='The month-end runs could not be loaded.';return}
  const data=await r.json();all=data.runs;const job=(data.team||{}).latest_job;const banner=document.querySelector('#banner');
  banner.innerHTML=(job&&job.status==='failed'?`<div class="mt-banner">${job.error_code==='budget_exhausted'?"Paused: the team's monthly token budget is used up. No check was skipped; it resumes when budget is added.":'The last team run failed ('+esc(job.error_code||'unknown')+'). The next scheduled run will try again.'}</div>`:'')
@@ -225,10 +249,10 @@ async function why(button){const row=button.closest('tr'),next=row.nextElementSi
  if(next&&next.classList.contains('mt-why')){next.remove();button.setAttribute('aria-expanded','false');return}
  const r=all.find(x=>x.subject_id===button.dataset.why);if(!r)return;button.setAttribute('aria-expanded','true');
  const detail=document.createElement('tr');detail.className='mt-why';detail.innerHTML='<td colspan="7" class="muted">Loading…</td>';row.after(detail);
- try{const q=await fetch(`/api/agents/month-end/runs/${encodeURIComponent(r.subject_id)}/${encodeURIComponent(r.period_end)}?mode=${encodeURIComponent(r.mode)}`,{credentials:'same-origin'});
+ try{const q=await fetch(`/api/agents/month-end/runs/${encodeURIComponent(r.subject_id)}/${encodeURIComponent(r.period_end)}?mode=${encodeURIComponent(r.mode)}${r.mode==='replay'&&r.replay_round?'&round='+encodeURIComponent(r.replay_round):''}`,{credentials:'same-origin'});
   if(!q.ok)throw new Error();const run=await q.json(),open=(run.objections||[]).filter(o=>o.status==='open');
   detail.innerHTML=`<td colspan="7"><ul>${open.map(o=>`<li><strong>${esc(WHAT[o.target]||o.target)}${o.page?', page '+esc(o.page):''}</strong> · ${esc(RAISED[o.raised_by]||o.raised_by)}: ${esc(o.message)}</li>`).join('')||'<li>No open objections now.</li>'}</ul></td>`}
  catch(e){detail.innerHTML='<td colspan="7" class="muted">The objections could not be loaded.</td>'}}
 document.querySelector('#rows').addEventListener('click',e=>{const b=e.target.closest&&e.target.closest('button[data-why]');if(b)why(b)});
-document.querySelector('#batch').addEventListener('click',batch);document.querySelector('#mode').addEventListener('change',()=>load());document.querySelector('#period').addEventListener('change',e=>load(e.target.value));document.querySelector('#filter').addEventListener('change',render);load();
+document.querySelector('#batch').addEventListener('click',batch);document.querySelector('#mode').addEventListener('change',()=>load());document.querySelector('#period').addEventListener('change',e=>load(e.target.value));document.querySelector('#round').addEventListener('change',()=>load());document.querySelector('#filter').addEventListener('change',render);load();
 </script></body></html>"""

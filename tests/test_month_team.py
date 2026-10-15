@@ -229,8 +229,9 @@ class FakeStore:
         self.cards: dict[tuple, dict] = {}
         self.earlier: dict | None = None
 
-    def run(self, account_id, period_end, mode):
-        key = (account_id, period_end, mode)
+    def run(self, account_id, period_end, mode, replay_round=None):
+        # Round 1 (or none) keeps the short key the tests read; a later round is its own run.
+        key = (account_id, period_end, mode) if replay_round in (None, 1) else (account_id, period_end, mode, replay_round)
         if key not in self.runs_by_key:
             self.runs_by_key[key] = {"month_run_id": len(self.runs_by_key) + 1, "subject_id": account_id,
                                      "period_end": period_end, "mode": mode, "live": False, "stage": "data",
@@ -804,6 +805,20 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(store.runs_by_key[(ACCOUNT, PERIOD, "replay")]["data_verdict"], "blocked")
         self.assertEqual(store.cards, {})
 
+    def test_a_new_replay_round_checks_a_replayed_month_again(self):
+        tools = FakeTools(status="released_internal", jump_on="2026-01-15")
+        coordinator, store = team(tools, FakeModel(), today=date(2026, 10, 14))
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "replay"), "ready")
+        steps = len(store.steps)
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "replay", 1), "ready")
+        self.assertEqual(len(store.steps), steps)  # round 1 is done: nothing new
+        self.assertEqual(coordinator.advance(ACCOUNT, PERIOD, "replay", 2), "ready")
+        self.assertGreater(len(store.steps), steps)  # round 2 checked the month afresh
+        round_two = store.runs_by_key[(ACCOUNT, PERIOD, "replay", 2)]
+        self.assertNotEqual(round_two["month_run_id"], store.runs_by_key[(ACCOUNT, PERIOD, "replay")]["month_run_id"])
+        self.assertEqual(round_two["data_verdict"], "blocked")
+        self.assertEqual(store.cards, {})
+
 
 class JobTests(unittest.TestCase):
     def test_replay_targets_only_released_months_in_range(self):
@@ -822,6 +837,13 @@ class JobTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             main(["holdings_explainer", "--replay"])
 
+    def test_a_round_needs_a_replay_and_starts_at_one(self):
+        from wealthryse_agent.jobs import main
+
+        for argv in (["month_team", "--round", "2"], ["month_team", "--replay", "--round", "0"]):
+            with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+                main(argv)
+
 
 class AgentServerMonthEndTests(unittest.TestCase):
     def client(self, accounts):
@@ -838,14 +860,18 @@ class AgentServerMonthEndTests(unittest.TestCase):
                 pass
 
         class MonthStoreStub:
-            def runs(self, accounts, period_end, mode):
-                self.asked = (list(accounts), period_end, mode)
+            def runs(self, accounts, period_end, mode, replay_round=None):
+                self.asked = (list(accounts), period_end, mode, replay_round)
                 return [{"subject_id": a} for a in accounts]
+
+            def round_summary(self, accounts):
+                return [{"replay_round": 1, "months": len(accounts)}]
 
             def team_status(self):
                 return {"latest_job": None, "tokens_this_month": 0}
 
-            def run_detail(self, account_id, period_end, mode):
+            def run_detail(self, account_id, period_end, mode, replay_round=None):
+                self.detail = (account_id, period_end, mode, replay_round)
                 return {"subject_id": account_id, "period_end": period_end} if period_end == PERIOD else None
 
         stub = MonthStoreStub()
@@ -861,11 +887,24 @@ class AgentServerMonthEndTests(unittest.TestCase):
         user = "11111111-1111-1111-1111-111111111111"
         response = client.get("/v1/month-end/runs", params={"user_object_id": user, "period_end": PERIOD})
         self.assertEqual(response.json()["runs"], [{"subject_id": "U1"}])
-        self.assertEqual(stub.asked, (["U1"], PERIOD, "month"))
+        self.assertEqual(stub.asked, (["U1"], PERIOD, "month", None))
         self.assertEqual(client.get(f"/v1/month-end/runs/U2/{PERIOD}", params={"user_object_id": user}).status_code, 403)
         self.assertEqual(client.get(f"/v1/month-end/runs/U1/{PERIOD}", params={"user_object_id": user}).status_code, 200)
         self.assertEqual(client.get("/v1/month-end/runs/U1/2026-02-28", params={"user_object_id": user}).status_code, 404)
         self.assertEqual(client.get("/v1/month-end/runs", params={"user_object_id": user, "mode": "live"}).status_code, 422)
+
+    def test_replay_rounds_are_asked_for_by_number_and_compared_over_the_persons_accounts(self):
+        client, stub = self.client(["U1"])
+        user = "11111111-1111-1111-1111-111111111111"
+        client.get("/v1/month-end/runs", params={"user_object_id": user, "mode": "replay", "round": 2})
+        self.assertEqual(stub.asked, (["U1"], None, "replay", 2))
+        client.get(f"/v1/month-end/runs/U1/{PERIOD}", params={"user_object_id": user, "mode": "replay", "round": 2})
+        self.assertEqual(stub.detail, ("U1", PERIOD, "replay", 2))
+        self.assertEqual(client.get("/v1/month-end/runs", params={"user_object_id": user, "round": 2}).status_code, 400)
+        self.assertEqual(client.get("/v1/month-end/runs", params={"user_object_id": user, "mode": "replay",
+                                                                   "round": 0}).status_code, 422)
+        self.assertEqual(client.get("/v1/month-end/rounds", params={"user_object_id": user}).json(),
+                         {"rounds": [{"replay_round": 1, "months": 1}]})
 
 
 if __name__ == "__main__":

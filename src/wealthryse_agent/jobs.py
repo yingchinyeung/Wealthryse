@@ -9,6 +9,7 @@ records); nothing is sent, published or released.
                                                          # live moves, with an explanation
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
+    python -m wealthryse_agent.jobs month_team --replay --round 2 --from 2026-01-31
                                                          # re-check months already released
     python -m wealthryse_agent.jobs onboarding           # hourly: draft new cases' terms from their documents,
                                                          # reconcile new broker accounts, and review new
@@ -269,14 +270,15 @@ def month_team(store: Store, tools: ToolClient, accounts: list[str], usage: dict
     period = args.period or ((today or date.today()).replace(day=1) - timedelta(days=1)).isoformat()
     if args.retry:
         first, last = (args.from_period, args.to_period) if args.replay else (period, period)
-        LOGGER.info("retrying %s stopped runs", team_store.retry_stopped(mode, first, last))
+        LOGGER.info("retrying %s stopped runs", team_store.retry_stopped(mode, first, last,
+                                                                       args.round if args.replay else None))
     try:
         if mode == "month":
             counts = coordinator.run_month(accounts, period, "month")
         else:
             counts = {}
             for account_id, period in replay_targets(tools, accounts, args.from_period, args.to_period):
-                stage = coordinator.advance(account_id, period, "replay")
+                stage = coordinator.advance(account_id, period, "replay", args.round)
                 counts[stage] = counts.get(stage, 0) + 1
     finally:
         if "model" in holder:
@@ -352,10 +354,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
     parser.add_argument("--to", dest="to_period", default="2999-12-31", help="month_team --replay: last month end")
+    parser.add_argument("--round", type=int, default=1,
+                        help="month_team --replay: the replay round; a new round checks every released month afresh")
     parser.add_argument("--retry", action="store_true", help="month_team: retry runs stopped after repeated failures")
     args = parser.parse_args(argv)
     if args.job != "month_team" and (args.period or args.replay or args.retry):
         parser.error("--period, --replay and --retry apply to month_team only")
+    if args.round != 1 and not args.replay:
+        parser.error("--round applies to month_team --replay only")
+    if args.round < 1:
+        parser.error("--round starts at 1")
     logging.basicConfig(level=logging.INFO)
     db, runtime = DatabaseSettings.from_env(), RuntimeSettings.from_env()
     correlation_id = str(uuid.uuid4())

@@ -424,20 +424,32 @@ def create_app(services: Services) -> FastAPI:
     @app.get("/v1/month-end/runs")
     def month_runs(user_object_id: str, period_end: str | None = Query(default=None, pattern=PERIOD),
                    mode: str = Query(default="month", pattern=MONTH_MODE),
+                   replay_round: int | None = Query(default=None, alias="round", ge=1, le=999),
                    _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        if replay_round is not None and mode != "replay":
+            raise HTTPException(status_code=400, detail="Only a replay has a round.")
         accounts = accounts_for(user_object_id.lower(), str(uuid.uuid4()))
         store = services.month_store()
-        return {"runs": store.runs(accounts, period_end, mode), "team": store.team_status()}
+        return {"runs": store.runs(accounts, period_end, mode, replay_round), "team": store.team_status()}
+
+    @app.get("/v1/month-end/rounds")
+    def month_rounds(user_object_id: str, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        """Each replay round side by side, over the accounts this person may see."""
+        accounts = accounts_for(user_object_id.lower(), str(uuid.uuid4()))
+        return {"rounds": services.month_store().round_summary(accounts)}
 
     @app.get("/v1/month-end/runs/{account_id}/{period_end}")
     def month_run(account_id: str, period_end: str, user_object_id: str,
                   mode: str = Query(default="month", pattern=MONTH_MODE),
+                  replay_round: int | None = Query(default=None, alias="round", ge=1, le=999),
                   _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        if replay_round is not None and mode != "replay":
+            raise HTTPException(status_code=400, detail="Only a replay has a round.")
         if not re.match(PERIOD, period_end):
             raise HTTPException(status_code=400, detail="period_end must be YYYY-MM-DD.")
         if account_id not in accounts_for(user_object_id.lower(), str(uuid.uuid4())):
             raise HTTPException(status_code=403, detail="You do not have access to that account.")
-        found = services.month_store().run_detail(account_id, period_end, mode)
+        found = services.month_store().run_detail(account_id, period_end, mode, replay_round)
         if found is None:
             raise HTTPException(status_code=404, detail="The team has not worked on that month yet.")
         return found

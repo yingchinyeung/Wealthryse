@@ -410,6 +410,44 @@ class AgentDatabaseTests(unittest.TestCase):
         self.assertEqual(store.team_status()["latest_job"]["status"], "succeeded")
         connection.close()
 
+    def test_each_replay_round_checks_a_month_afresh_and_rounds_compare(self):
+        from wealthryse_agent.database import connect
+        from wealthryse_agent.month_team.store import MonthStore
+
+        connection = connect(self.writer_settings, search_path="agent")
+        store = MonthStore(connection, TENANT)
+        first = store.run("UTEST2", "2026-02-28", "replay")
+        self.assertEqual(first["replay_round"], 1)
+        self.assertEqual(store.run("UTEST2", "2026-02-28", "replay", 1)["month_run_id"], first["month_run_id"])
+        second = store.run("UTEST2", "2026-02-28", "replay", 2)
+        self.assertNotEqual(second["month_run_id"], first["month_run_id"])
+        self.assertEqual((second["stage"], second["replay_round"]), ("data", 2))
+        self.assertEqual(store.run("UTEST2", "2026-02-28", "month")["replay_round"], 0)
+        with self.assertRaises(ValueError):
+            store.run("UTEST2", "2026-02-28", "month", 2)
+        # Round 1 found an objection; round 2 finished clean.
+        store.update_run(first["month_run_id"], stage="ready", data_verdict="clean")
+        step = store.add_step(first["month_run_id"], "visual_qa", "objection", "Clipped.")
+        store.add_objection(first["month_run_id"], step, raised_by="visual_qa", target="factsheet", message="Clipped")
+        store.update_run(second["month_run_id"], stage="ready", data_verdict="clean")
+        # Website reads show the newest round unless another is asked for.
+        self.assertEqual(store.latest_round(), 2)
+        self.assertEqual([r["replay_round"] for r in store.runs(["UTEST2"], "2026-02-28", "replay")], [2])
+        self.assertEqual(store.runs(["UTEST2"], "2026-02-28", "replay", 1)[0]["open_objections"], 1)
+        self.assertEqual(store.run_detail("UTEST2", "2026-02-28", "replay", 1)["objections"][0]["message"], "Clipped")
+        self.assertEqual(store.run_detail("UTEST2", "2026-02-28", "replay")["objections"], [])
+        rounds = {r["replay_round"]: r for r in store.round_summary(["UTEST2"])}
+        self.assertEqual((rounds[1]["months"], rounds[1]["objections"], rounds[1]["no_objections"]), (1, 1, 0))
+        self.assertEqual(rounds[1]["objections_by_target"], {"factsheet": 1})
+        self.assertEqual((rounds[2]["months"], rounds[2]["objections"], rounds[2]["no_objections"]), (1, 0, 1))
+        self.assertEqual(store.round_summary(["UTEST1"]), [])  # only the accounts asked about
+        # A retry clears stopped runs in its own round only.
+        store.update_run(first["month_run_id"], attempts=3)
+        store.update_run(second["month_run_id"], attempts=3)
+        self.assertEqual(store.retry_stopped("replay", "2026-02-28", "2026-02-28", 2), 1)
+        self.assertEqual(store.run("UTEST2", "2026-02-28", "replay")["attempts"], 3)
+        connection.close()
+
 
 if __name__ == "__main__":
     unittest.main()

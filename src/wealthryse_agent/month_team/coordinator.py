@@ -93,8 +93,10 @@ class Coordinator:
             counts[stage] = counts.get(stage, 0) + 1
         return counts
 
-    def advance(self, account_id: str, period_end: str, mode: str) -> str:
-        run = self.store.run(account_id, period_end, mode)
+    def advance(self, account_id: str, period_end: str, mode: str, replay_round: int | None = None) -> str:
+        # A replay round other than the first checks the month afresh in its own run.
+        run = (self.store.run(account_id, period_end, mode) if replay_round is None
+               else self.store.run(account_id, period_end, mode, replay_round))
         if run["attempts"] >= MAX_STEP_ATTEMPTS:
             return "stopped"
         ctx = Context(account_id, period_end, mode, self.clock(), live=mode == "month" and self.settings.live,

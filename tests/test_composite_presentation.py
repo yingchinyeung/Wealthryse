@@ -168,9 +168,8 @@ class ModelTests(unittest.TestCase):
 
         cases = (
             (lambda s: s.pop("report_profile"), "composite report profile is required"),
-            (lambda s: s.update(publication_allowed=True), "private, non-failed"),
-            (lambda s: s.update(quality_status="fail"), "private, non-failed"),
-            (lambda s: s["risk"].update(crisis_replay={"scenarios": []}), "Crisis replay"),
+            (lambda s: s.update(quality_status="fail"), "non-failed"),
+            (lambda s: s["risk"].update(crisis_replay={"scenarios": []}), "qualified composite HKD crisis replay"),
             (lambda s: s["holdings"]["holdings"][0].update(market_value_text="1000"), "reconcile to NAV"),
             (lambda s: s["holdings"]["holdings"][0].update(description="Another sleeve"), "approved composition"),
             (lambda s: s["holdings"]["holdings"][2].update(market_value_text="57.0"), "reconcile to NAV"),

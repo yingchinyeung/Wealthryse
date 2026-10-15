@@ -10,7 +10,7 @@ benchmark, risk profile and disclaimer stay the design's own.
 
 Every number comes from profiled_composite.analyze on the frozen snapshot, so
 the factsheet shows exactly what the risk snapshot and the website show.
-Private qualification only; nothing here grants publication.
+For internal and shareholder release, as MS and T; nothing here grants client publication.
 """
 from __future__ import annotations
 
@@ -269,8 +269,8 @@ def render(snapshot, *, template_path, output_path, design_model_path=None):
         raise MonthlyArtifactError(str(error)) from error
     if profile is None or profile.built_in:
         raise MonthlyArtifactError("Only a composite with an Alpha World report profile uses this factsheet")
-    if snapshot.get("publication_allowed") is not False:
-        raise MonthlyArtifactError("Composite factsheets are private qualification only; publication is not approved")
+    if snapshot.get("quality_status") == "fail":
+        raise MonthlyArtifactError("A failed composite snapshot cannot be rendered")
     design = DESIGNS[profile.style]
     if profile.style == "alpha-world-ms":
         if design_model_path is None:
@@ -382,6 +382,6 @@ def render(snapshot, *, template_path, output_path, design_model_path=None):
             "chart_calculation": {"metrics": metrics, **evidence}, "variable_content_removed": removed,
             "title_font": "synthetic-bold-georgia" if runs[0]["synthetic_bold"] else "georgia-bold",
             "pdf_accuracy_validation": validation, "publication_allowed": False,
-            "quality_status": "coverage_warning" if evidence["excluded_intervals"] else "private_qualification",
-            "publication_blockers": ["Composite crisis replay is not available yet",
-                                     "Benchmarks are not licensed for publication"]}
+            "release_scope": "internal_shareholder",
+            "quality_status": "coverage_warning" if evidence["excluded_intervals"] else "pass",
+            "publication_blockers": list(snapshot.get("publication_blockers") or [])}

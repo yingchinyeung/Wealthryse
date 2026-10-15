@@ -43,7 +43,8 @@ CONTENT_REQUIREMENTS = (
     "All six exported charts and seven risk metrics match the frozen composite snapshot.",
     "Six embedded chart-data workbooks match every category, value and series header.",
     "Fixed-unit component effects sum to the monthly NAV return.",
-    "Benchmark results and crisis replay remain unavailable; NAV interest is not charged twice.",
+    "Benchmark results remain unavailable; crisis replay is the qualified hypothetical HKD stress where its "
+    "exact-date inputs exist, otherwise unavailable; NAV interest is not charged twice.",
     "No Alpha World MS or T identity and no reference-account text survives, in slides or notes.",
 )
 UNAVAILABLE = ("benchmark_total_return", "benchmark_annualized_return", "benchmark_annualized_volatility",
@@ -71,7 +72,7 @@ def inception_note(inception: str) -> str:
     return f"{day:%B %Y} is a partial month from inception on {day.day} {day:%B}. Monthly returns use observed HKD NAV."
 
 
-def speaker_note(profile, period_end: str) -> str:
+def speaker_note(profile, period_end: str, crisis_available: bool = False) -> str:
     """Every slide's notes; the template's own notes describe the reference account.
 
     They never name the design: no MS or T identity survives in the deck.
@@ -80,8 +81,11 @@ def speaker_note(profile, period_end: str) -> str:
     return (f"{profile.display_name}, {period_end}. HKD fixed-unit composite from "
             f"{_long_date(date.fromisoformat(profile.inception))}. Source: its approved definition, its frozen "
             "month-end snapshot and published 1M HIBOR fixings. Underlying account NAV includes its own cash and "
-            "interest; no additional financing is charged. Benchmark comparisons and crisis replay are unavailable. "
-            "Private review; internal use only.")
+            "interest; no additional financing is charged. "
+            + ("Crisis replay is a hypothetical HKD stress using provisional prices and documented proxies. "
+               "Benchmark comparisons are unavailable. " if crisis_available
+               else "Benchmark comparisons and crisis replay are unavailable. ")
+            + "Private review; internal use only.")
 
 
 # Rendering model ------------------------------------------------------------
@@ -92,13 +96,11 @@ def build_model(snapshot: Mapping[str, Any]) -> dict[str, Any]:
 
     profile = _profile(snapshot)
     _require(snapshot.get("reporting_currency") == "HKD", "The composite's deck reports in HKD")
-    _require(snapshot.get("publication_allowed") is False and snapshot.get("quality_status") != "fail",
-             "The composite's deck needs its private, non-failed frozen snapshot")
+    _require(snapshot.get("quality_status") != "fail", "The composite's deck needs its non-failed frozen snapshot")
     metrics, daily, evidence = analyze(snapshot)
     _require(snapshot["risk"]["metrics"] == metrics, "The composite's frozen metrics differ from recomputation")
-    _require(snapshot["risk"].get("crisis_replay") is None,
-             "Crisis replay is not yet qualified for Alpha World design composites")
     holdings = snapshot["holdings"]["holdings"]
+    crisis = snapshot["risk"].get("crisis_replay")
     values = [float(row["market_value_text"]) for row in holdings]
     _require(all(row.get("currency") == "HKD" for row in holdings) and all(math.isfinite(v) for v in values),
              "The composite's component values must be finite HKD observations")
@@ -107,6 +109,10 @@ def build_model(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     _require(math.isclose(sum(values), nav, abs_tol=1e-9, rel_tol=0)
              and math.isclose(float(series[-1]["nav"]), nav, abs_tol=1e-9, rel_tol=0),
              "The composite's signed components do not reconcile to NAV")
+    if crisis is not None:
+        from .profiled_crisis import validate
+        validate(crisis, as_of=snapshot["data_as_of"], holdings=holdings, nav=nav,
+                 contract_sha256=snapshot["methodology_identity"]["contract_sha256"])
     sector = snapshot["sector_allocation"]
     _require(math.isclose(sum(abs(v) for v in values), float(sector["gross_market_value"]), abs_tol=1e-9, rel_tol=0)
              and math.isclose(sum(float(r["weight"]) for r in sector["allocation"]), 1., abs_tol=1e-10),
@@ -165,16 +171,18 @@ def build_model(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "expected_maximum_drawdown_1y", "actual_maximum_drawdown_1y", "tail_maximum_drawdown_1y",
             "drawdown_simulation_paths", "drawdown_horizon_sessions", "drawdown_block_length",
             "drawdown_tail_confidence")})
+    if crisis is not None:
+        risk["crisis_maximum_drawdown"] = crisis["maximum_drawdown"]
     return {
         "version": VERSION, "calculation": evidence, "primary": primary,
         "secondary": {name: None for name in UNAVAILABLE}, "risk": risk, "month_rows": month_rows,
-        "constant_cash": constant_cash, "benchmark_available": False, "crisis_available": False,
+        "constant_cash": constant_cash, "benchmark_available": False, "crisis_available": crisis is not None,
         "risk_free_description": "1M HIBOR, inception-to-valuation period average",
         "source_value_sha256": evidence["source_value_sha256"],
         "identity": {"subject_id": profile.subject_id, "style": profile.style, "display_name": profile.display_name,
                      "strategy_name": f"iStrategy: {profile.display_name}", "description": profile.description,
                      "inception": profile.inception, "inception_note": inception_note(profile.inception),
-                     "speaker_note": speaker_note(profile, str(snapshot["period_end"]))},
+                     "speaker_note": speaker_note(profile, str(snapshot["period_end"]), crisis is not None)},
         "composition": dict(profile.composition),
     }
 

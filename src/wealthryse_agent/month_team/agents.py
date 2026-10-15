@@ -20,6 +20,7 @@ from ..config import ModelSettings
 from ..runtime import _model_error, default_model_client
 from ..tool_client import ToolCallFailed
 from . import figures as fig
+from . import page_checks
 from .prompts import REVIEWER_COMMENTARY, REVIEWER_DECK, VISUAL_QA, WRITER
 from .settings import validate_report_model
 
@@ -419,8 +420,12 @@ class VisualQA:
         self.model = model
 
     def inspect_factsheet(self, images: Sequence[bytes], *, display_date: str, period_label: str,
-                          account_id: str = "", alpha_world_layout: bool = False) -> Outcome:
-        """``alpha_world_layout`` for a factsheet in the Alpha World design under another name (a composite)."""
+                          account_id: str = "", alpha_world_layout: bool = False,
+                          page_text: Sequence[str] | None = None, period_end: str | None = None) -> Outcome:
+        """``alpha_world_layout`` for a factsheet in the Alpha World design under another name (a composite).
+
+        ``page_text`` (each page's printed text) and ``period_end`` let it read figures and dates from the text,
+        and set aside a finding the printed text does not bear out (see page_checks.unconfirmed)."""
         if not images:
             return Outcome("skipped", "No factsheet pages to look at.")
         if alpha_world_layout or account_id in ALPHA_WORLD_FACTSHEETS:
@@ -430,7 +435,12 @@ class VisualQA:
                 {"page": 1, "must_show": ["report date", "key figures panel with its risk-free rate footnote",
                                           f"Capital Path chart ({period_label})", f"Rebased to 100 chart ({period_label})",
                                           "return distribution chart with its density axis and legend"]},
-                {"page": 2, "must_show": ["the page's sections filled in, with no blank boxes"]}][:len(images)]}
+                {"page": 2, "must_show": ["the page's sections filled in, with no blank boxes"],
+                 # A replay round netted a sleeve's long leg against its short leg and called the diagram wrong.
+                 "how_to_read": ("The asset allocation diagram's first percentages (such as 60% and 40%) are sleeve "
+                                 "weights; each sleeve lists its long and short legs; the bottom row is the effective "
+                                 "exposure, sleeve weight times leg (60% x 150% long = 90%, 60% x 50% short = -30%). "
+                                 "Never net a sleeve's long against its short.")}][:len(images)]}
         else:
             note = {"report_date": display_date, "pages": [
                 {"page": 1, "must_show": ["report date at the top and beside the return panel", "Top 5 table",
@@ -439,6 +449,12 @@ class VisualQA:
                                           "trailing twelve-month return panel"]},
                 {"page": 2, "must_show": ["report date", f"historical performance chart ({period_label})",
                                           "axis labels and gridlines"]}][:len(images)]}
+        end = date.fromisoformat(period_end) if period_end else None
+        if end is not None:
+            note["last_trading_day"] = page_checks.last_trading_day(end).isoformat()
+        if page_text is not None:
+            for page in note["pages"]:
+                page["printed_text"] = str(page_text[page["page"] - 1])[:6000] if page["page"] <= len(page_text) else ""
         try:
             result, usage = self.model.ask(name="visual_qa", instructions=VISUAL_QA, payload=note, schema=VISUAL_SCHEMA,
                                            images=images, max_output_tokens=OUTPUT_TOKENS["visual"])
@@ -448,7 +464,16 @@ class VisualQA:
                                           "looked at. Visual QA needs an APAC deployment that reads images.",
                                {"error": error.code})
             raise
-        findings = [f for f in result.get("findings", []) if 1 <= int(f.get("page", 0)) <= len(images)]
+        findings, set_aside = [], []
+        for f in result.get("findings", []):
+            if not 1 <= int(f.get("page", 0)) <= len(images):
+                continue
+            reason = page_checks.unconfirmed(str(f.get("description") or ""), page_text, end)
+            if reason:
+                set_aside.append({"page": int(f["page"]), "description": str(f.get("description") or "")[:300],
+                                  "reason": reason})
+            else:
+                findings.append(f)
         objections = [{"target": "factsheet", "page": int(f["page"]), "region": _clamp(f.get("region") or {}),
                        "message": f"{f['kind'].replace('_', ' ').capitalize()} ({f['severity']}): "
                                   f"{str(f['description']).strip()[:450]}"}
@@ -456,7 +481,11 @@ class VisualQA:
         notes = [{"page": int(f["page"]), "description": str(f["description"])[:300]}
                  for f in findings if f.get("severity") == "low"]
         evidence = {"pages": len(images), "cosmetic_notes": notes}
+        aside = ""
+        if set_aside:
+            evidence["set_aside"] = set_aside
+            aside = f" {len(set_aside)} finding(s) set aside: the printed text does not bear them out."
         if objections:
-            return Outcome("objection", f"{len(objections)} layout fault(s) on the factsheet pages.", evidence,
+            return Outcome("objection", f"{len(objections)} layout fault(s) on the factsheet pages.{aside}", evidence,
                            objections, usage)
-        return Outcome("pass", f"Looked at {len(images)} factsheet page(s); no layout faults.", evidence, [], usage)
+        return Outcome("pass", f"Looked at {len(images)} factsheet page(s); no layout faults.{aside}", evidence, [], usage)

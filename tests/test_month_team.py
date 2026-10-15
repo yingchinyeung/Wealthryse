@@ -557,6 +557,79 @@ class WriterReviewerTests(unittest.TestCase):
         self.assertNotIn("Top 5", note)
         self.assertNotIn("sector allocation", note)
 
+    def test_visual_qa_sets_aside_findings_the_printed_text_does_not_bear_out(self):
+        # Replay rounds 1 and 2: every open factsheet objection was one of these kinds of misreading (made-up values).
+        may = ["Historical Performance\n2026-03-31\n101.50\n2026-04-30\n104.20\n2026-05-29\n106.80\n31 May 2026",
+               "Normalized NAV\n31 May 2026"]
+        findings = [
+            {"page": 1, "severity": "high", "kind": "wrong_period", "description": "The historical performance table is "
+             "labelled through 31 May 2026, but its last row is dated 29 March 2026, so April and May are missing."},
+            {"page": 2, "severity": "high", "kind": "other", "description": "The chart ends near a normalized NAV of 98, "
+             "conflicting with the table."},
+            {"page": 1, "severity": "high", "kind": "other", "description": "The table reports 96.40 at the month end."},
+            {"page": 1, "severity": "high", "kind": "other", "description": "The allocation is inconsistent: 150% long "
+             "less 50% short equals 100%, not 60%."},
+            {"page": 1, "severity": "high", "kind": "wrong_period", "description": "The charts are labelled as ending "
+             "29 May 2026 rather than the required report date of 31 May 2026."},
+            {"page": 1, "severity": "high", "kind": "blank_area", "description": "The sector table is empty."}]
+        model = FakeModel(visual=findings)
+        result = VisualQA(TeamModel(APAC, tokens_left=10**6, client=model)).inspect_factsheet(
+            [b"png1", b"png2"], display_date="31 May 2026", period_label="ending 31 May 2026",
+            page_text=may, period_end="2026-05-31")
+        self.assertEqual([o["message"] for o in result.objections], ["Blank area (high): The sector table is empty."])
+        reasons = [s["reason"] for s in result.evidence["set_aside"]]
+        self.assertEqual(len(reasons), 5)
+        self.assertIn("2026-03-29, which the page does not print", reasons[0])
+        self.assertIn("estimates a value from the image", reasons[1])
+        self.assertIn("96.40, which the page does not print", reasons[2])
+        self.assertIn("arithmetic", reasons[3])
+        self.assertIn("last trading day", reasons[4])
+        self.assertIn("5 finding(s) set aside", result.summary)
+        note = json.loads(model.requests[0]["input"][0]["content"][0]["text"])
+        self.assertEqual(note["last_trading_day"], "2026-05-29")
+        self.assertIn("2026-05-29", note["pages"][0]["printed_text"])
+
+    def test_visual_qa_explains_the_alpha_world_allocation_diagram(self):
+        model = FakeModel(visual=[])
+        VisualQA(TeamModel(APAC, tokens_left=10**6, client=model)).inspect_factsheet(
+            [b"png1", b"png2"], display_date="30 Jun 2026", period_label="ending 30 Jun 2026", account_id="alpha-world-ms")
+        note = json.loads(model.requests[0]["input"][0]["content"][0]["text"])
+        self.assertIn("sleeve weights", note["pages"][1]["how_to_read"])
+
+    def test_printed_text_checks_find_stale_dates_and_split_labels(self):
+        from wealthryse_agent.month_team import page_checks
+
+        # A chart range from a later month left hidden under a box (made-up dates).
+        stale = page_checks.check_text(["Capital Path\n(20 Jan 2025 - 30 January 2026)\n(20 Jan 2025 - 31 August 2026)"],
+                                       date(2026, 1, 31))
+        self.assertEqual(len(stale.objections), 1)
+        self.assertIn("2026-08-31, after the report date 2026-01-31", stale.objections[0]["message"])
+        # One sector printed under two spellings (made-up weights).
+        split = page_checks.check_text(["Sector\nBanks-Diversified\n7.00%\nBanks - Diversified\n3.00%\nUSD"],
+                                       date(2026, 3, 31))
+        self.assertEqual(len(split.objections), 1)
+        self.assertIn('"Banks - Diversified" and "Banks-Diversified"', split.objections[0]["message"])
+        clean = page_checks.check_text(["As of 31 Mar 2026\nBanks\n7.00%\nHKD"], date(2026, 3, 31))
+        self.assertEqual((clean.objections, clean.notes), ([], []))
+
+    def test_printed_text_checks_note_template_wording_once(self):
+        from wealthryse_agent.month_team import page_checks
+
+        text = ["Outperformed the underlying benchmark.\n12-month Return: the weighted average of the holdings' returns."]
+        notes = page_checks.check_text(text, date(2026, 9, 30)).notes
+        self.assertEqual(len(notes), 3)
+        self.assertIn("currency is not stated", notes[0])
+        self.assertIn("never names one", notes[1])
+        self.assertIn("weighted average", notes[2])
+        self.assertEqual(page_checks.check_text(["HIBOR + Spread benchmark, HKD"], date(2026, 9, 30)).notes, [])
+
+    def test_last_trading_day(self):
+        from wealthryse_agent.month_team.page_checks import last_trading_day
+
+        self.assertEqual(last_trading_day(date(2026, 1, 31)), date(2026, 1, 30))  # Saturday
+        self.assertEqual(last_trading_day(date(2026, 5, 31)), date(2026, 5, 29))  # Sunday
+        self.assertEqual(last_trading_day(date(2026, 3, 31)), date(2026, 3, 31))
+
     def test_visual_qa_says_so_when_the_model_cannot_read_images(self):
         result = VisualQA(TeamModel(APAC, tokens_left=10**6, client=FakeModel(reject_images=True))).inspect_factsheet(
             [b"png"], display_date="31 Jan 2026", period_label="x")

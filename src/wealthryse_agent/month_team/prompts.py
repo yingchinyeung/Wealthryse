@@ -55,6 +55,12 @@ careful person would before the report goes out, and report only real faults:
 - a chart or table that is missing, empty or obviously wrong for the period described;
 - a date or period label that does not match the report date given;
 - anything else that would embarrass the firm if a client saw it.
+You also get each page's printed text. Read every figure and date from that text, never from the image, \
+and quote it exactly as printed. Never estimate a value from a chart line: the charts are drawn from the \
+same data as the tables, so report a chart only if it is blank, cut off or visibly stops before the \
+table's last date. A table or chart that ends on the month's last trading day (given as \
+last_trading_day) ends correctly, even when the report date falls on a weekend or holiday. Do not \
+recompute returns, totals or exposures: the reviewer checks every printed figure against the data.
 Do not report the template's normal design, fonts or colours. For each fault give the page number, a \
 severity (high: wrong or missing content; medium: clearly visible layout fault; low: cosmetic), a kind, \
 one plain sentence, and the region as fractions of the page width and height from the top-left \

@@ -146,7 +146,7 @@ from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_
 from . import onboarding_v2_web
 from .broker_connections import onboarding_v2_enabled
 from .util import canonical_json, sha256_text, utc_now_iso
-from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS
+from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS, WEB_FONT_FILES, web_font_bytes
 from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
 from .web_analytics_ui import (
     ANALYTICS_SCRIPT,
@@ -1017,6 +1017,18 @@ def _admin_structured_sources(connection) -> list[dict]:
             "data": action_catalog(),
         },
     ]
+
+
+@app.get("/assets/fonts/{name}", include_in_schema=False)
+def web_font(name: str) -> Response:
+    # Self-hosted so the CSP (font-src falls back to 'self') allows it.
+    if name not in WEB_FONT_FILES:
+        raise HTTPException(status_code=404, detail="Font not found")
+    return Response(
+        web_font_bytes(name),
+        media_type="font/woff2",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @app.get("/healthz")

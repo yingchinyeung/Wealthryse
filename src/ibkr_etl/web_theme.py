@@ -1,5 +1,8 @@
 """Shared visual system for the WealthRyse portfolio portal."""
 
+from functools import lru_cache
+from pathlib import Path
+
 COMMON_THEME_CSS = r"""
 :root {
   color-scheme: light;
@@ -163,7 +166,7 @@ select:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visib
 """
 
 DARK_THEME_CSS = r"""
-@media screen and (prefers-color-scheme: dark) {
+@media screen {
   :root {
     color-scheme: dark;
     --ink: #e6ebf3;
@@ -234,6 +237,190 @@ DARK_THEME_CSS = r"""
 }
 """
 
+
+# Mission theme: a black, typographic look inspired by spacex.com. It is
+# appended after the shared and dark rules, so it wins on equal specificity.
+# Screens are always dark; print keeps the light rules above.
+WEB_FONT_FILES = frozenset(f"barlow-{weight}.woff2" for weight in (400, 500, 600, 700))
+_FONT_DIR = Path(__file__).parent / "assets" / "fonts"
+
+
+@lru_cache(maxsize=None)
+def web_font_bytes(name: str) -> bytes:
+    return (_FONT_DIR / name).read_bytes()
+
+
+_FONT_FACE_CSS = "".join(
+    f'@font-face {{ font-family: "WR Mission"; font-style: normal; font-weight: {weight}; '
+    f'font-display: swap; src: url("/assets/fonts/barlow-{weight}.woff2") format("woff2"); }}\n'
+    for weight in (400, 500, 600, 700)
+)
+
+_STARFIELD = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='480' height='480' fill='white'%3E%3Ccircle cx='217' cy='269' r='1.2' fill-opacity='0.55'/%3E%3Ccircle cx='244' cy='282' r='0.5' fill-opacity='0.77'/%3E%3Ccircle cx='228' cy='295' r='0.5' fill-opacity='0.31'/%3E%3Ccircle cx='146' cy='44' r='1.2' fill-opacity='0.83'/%3E%3Ccircle cx='305' cy='286' r='0.7' fill-opacity='0.88'/%3E%3Ccircle cx='314' cy='295' r='0.5' fill-opacity='0.66'/%3E%3Ccircle cx='399' cy='30' r='0.5' fill-opacity='0.37'/%3E%3Ccircle cx='116' cy='14' r='0.7' fill-opacity='0.46'/%3E%3Ccircle cx='284' cy='94' r='0.5' fill-opacity='0.67'/%3E%3Ccircle cx='240' cy='318' r='0.7' fill-opacity='0.68'/%3E%3Ccircle cx='195' cy='265' r='1.2' fill-opacity='0.3'/%3E%3Ccircle cx='122' cy='364' r='0.8' fill-opacity='0.44'/%3E%3Ccircle cx='34' cy='368' r='0.7' fill-opacity='0.32'/%3E%3Ccircle cx='140' cy='32' r='0.5' fill-opacity='0.8'/%3E%3Ccircle cx='0' cy='101' r='0.5' fill-opacity='0.56'/%3E%3Ccircle cx='471' cy='191' r='0.5' fill-opacity='0.62'/%3E%3Ccircle cx='95' cy='324' r='0.6' fill-opacity='0.31'/%3E%3Ccircle cx='160' cy='463' r='1.2' fill-opacity='0.85'/%3E%3Ccircle cx='65' cy='339' r='0.5' fill-opacity='0.29'/%3E%3Ccircle cx='383' cy='85' r='0.8' fill-opacity='0.37'/%3E%3Ccircle cx='244' cy='473' r='1.2' fill-opacity='0.34'/%3E%3Ccircle cx='309' cy='56' r='0.7' fill-opacity='0.89'/%3E%3Ccircle cx='0' cy='415' r='1.2' fill-opacity='0.64'/%3E%3Ccircle cx='479' cy='9' r='0.5' fill-opacity='0.51'/%3E%3Ccircle cx='410' cy='308' r='0.5' fill-opacity='0.28'/%3E%3Ccircle cx='70' cy='212' r='0.5' fill-opacity='0.75'/%3E%3Ccircle cx='158' cy='142' r='0.5' fill-opacity='0.3'/%3E%3Ccircle cx='100' cy='306' r='0.5' fill-opacity='0.64'/%3E%3Ccircle cx='178' cy='218' r='0.8' fill-opacity='0.56'/%3E%3Ccircle cx='276' cy='416' r='0.5' fill-opacity='0.66'/%3E%3Ccircle cx='149' cy='110' r='0.8' fill-opacity='0.41'/%3E%3Ccircle cx='91' cy='355' r='0.8' fill-opacity='0.38'/%3E%3Ccircle cx='456' cy='423' r='0.8' fill-opacity='0.3'/%3E%3Ccircle cx='23' cy='52' r='0.8' fill-opacity='0.88'/%3E%3Ccircle cx='114' cy='338' r='0.6' fill-opacity='0.52'/%3E%3Ccircle cx='434' cy='236' r='0.8' fill-opacity='0.36'/%3E%3Ccircle cx='346' cy='33' r='0.5' fill-opacity='0.56'/%3E%3Ccircle cx='314' cy='296' r='0.5' fill-opacity='0.43'/%3E%3Ccircle cx='440' cy='98' r='0.5' fill-opacity='0.29'/%3E%3Ccircle cx='197' cy='120' r='0.5' fill-opacity='0.36'/%3E%3Ccircle cx='177' cy='275' r='0.5' fill-opacity='0.31'/%3E%3Ccircle cx='66' cy='216' r='0.6' fill-opacity='0.68'/%3E%3Ccircle cx='332' cy='281' r='0.5' fill-opacity='0.63'/%3E%3Ccircle cx='443' cy='228' r='0.6' fill-opacity='0.71'/%3E%3Ccircle cx='462' cy='10' r='1' fill-opacity='0.3'/%3E%3Ccircle cx='32' cy='149' r='0.5' fill-opacity='0.9'/%3E%3Ccircle cx='36' cy='262' r='1' fill-opacity='0.28'/%3E%3Ccircle cx='449' cy='354' r='0.5' fill-opacity='0.77'/%3E%3Ccircle cx='439' cy='169' r='1' fill-opacity='0.56'/%3E%3Ccircle cx='37' cy='412' r='1.2' fill-opacity='0.27'/%3E%3Ccircle cx='240' cy='7' r='1' fill-opacity='0.5'/%3E%3Ccircle cx='280' cy='292' r='0.5' fill-opacity='0.31'/%3E%3Ccircle cx='55' cy='123' r='0.7' fill-opacity='0.72'/%3E%3Ccircle cx='186' cy='353' r='0.8' fill-opacity='0.55'/%3E%3Ccircle cx='222' cy='260' r='0.8' fill-opacity='0.74'/%3E%3Ccircle cx='14' cy='289' r='0.7' fill-opacity='0.26'/%3E%3Ccircle cx='460' cy='54' r='1.2' fill-opacity='0.65'/%3E%3Ccircle cx='442' cy='123' r='0.5' fill-opacity='0.49'/%3E%3Ccircle cx='69' cy='294' r='0.8' fill-opacity='0.36'/%3E%3Ccircle cx='435' cy='317' r='0.7' fill-opacity='0.57'/%3E%3Ccircle cx='116' cy='194' r='0.6' fill-opacity='0.38'/%3E%3Ccircle cx='207' cy='387' r='0.5' fill-opacity='0.82'/%3E%3Ccircle cx='185' cy='280' r='0.6' fill-opacity='0.39'/%3E%3Ccircle cx='65' cy='168' r='1.2' fill-opacity='0.28'/%3E%3Ccircle cx='31' cy='471' r='1.2' fill-opacity='0.36'/%3E%3Ccircle cx='216' cy='132' r='0.5' fill-opacity='0.79'/%3E%3Ccircle cx='184' cy='250' r='1' fill-opacity='0.45'/%3E%3Ccircle cx='403' cy='471' r='0.7' fill-opacity='0.46'/%3E%3Ccircle cx='398' cy='133' r='0.8' fill-opacity='0.28'/%3E%3Ccircle cx='340' cy='274' r='0.6' fill-opacity='0.67'/%3E%3C/svg%3E"
+
+MISSION_THEME_CSS = _FONT_FACE_CSS + r"""
+@media screen {
+  :root {
+    color-scheme: dark;
+    --font-mission: "WR Mission", "D-DIN", Bahnschrift, "DIN Alternate", "DIN Next", "Helvetica Neue", Arial, sans-serif;
+    --ink: #f5f5f5;
+    --ink-soft: #d6d6d6;
+    --muted: #8c8c8c;
+    --muted-strong: #b3b3b3;
+    --line: rgba(255, 255, 255, .12);
+    --line-strong: rgba(255, 255, 255, .26);
+    --brand: #ffffff;
+    --brand-deep: #ffffff;
+    --accent: #a7b8cc;
+    --chart-portfolio: #f2f2f2;
+    --chart-benchmark: #6f8fb3;
+    --chart-grid: rgba(255, 255, 255, .08);
+    --chart-axis: rgba(255, 255, 255, .28);
+    --chart-text: #8c8c8c;
+    --chart-point-ring: #000;
+    --bg: #000;
+    --surface: #0a0a0a;
+    --surface-soft: #111;
+    --shadow-sm: none;
+    --shadow-lg: none;
+    --radius-md: 2px;
+    --radius-lg: 3px;
+  }
+  html, body { background: #000; }
+  body { color: var(--ink); font-family: var(--font-mission); font-size: 15px; letter-spacing: .01em; }
+  h1, h2, h3, .value, .account-id { font-family: var(--font-mission); }
+  h1 { font-size: clamp(34px, 5.2vw, 64px); font-weight: 700; line-height: 1; letter-spacing: .015em; text-transform: uppercase; }
+  h2 { font-size: clamp(20px, 2.2vw, 26px); font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+  h3 { font-weight: 600; letter-spacing: .03em; }
+  a { color: #fff; text-underline-offset: 4px; }
+  .label { color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .2em; }
+  .value { font-weight: 500; letter-spacing: 0; }
+  .gain { color: #5fd49a; }
+  .loss { color: #ff7b72; }
+
+  /* Header: black bar, uppercase navigation with an underline marker. */
+  header { min-height: 72px; padding: 10px clamp(18px, 3.4vw, 52px); background: rgba(0, 0, 0, .9); border-bottom: 1px solid rgba(255, 255, 255, .1); box-shadow: none; }
+  .company-logo { width: 42px; height: 42px; border-color: rgba(255, 255, 255, .22); border-radius: 4px; box-shadow: none; }
+  .company-logo-link { flex-basis: 42px; border-radius: 4px; }
+  .company-logo-link:hover .company-logo { border-color: #fff; box-shadow: none; transform: none; }
+  .brand-title { color: #fff; font-size: 13px; font-weight: 600; letter-spacing: .2em; text-transform: uppercase; }
+  .platform-nav { gap: 2px; padding: 0; background: none; border: 0; border-radius: 0; }
+  .platform-nav-link, .platform-menu summary.platform-nav-link { position: relative; padding: 10px 12px; color: rgba(255, 255, 255, .72); background: none; border-radius: 0; font-size: 12px; font-weight: 600; letter-spacing: .16em; text-transform: uppercase; }
+  .platform-nav-link::before { position: absolute; left: 12px; right: 12px; bottom: 2px; height: 2px; content: ""; background: #fff; transform: scaleX(0); transform-origin: left; transition: transform .25s ease; }
+  .platform-nav-link:hover, .platform-nav-link:focus-visible { color: #fff; background: none; }
+  .platform-nav-link:hover::before, .platform-nav-link:focus-visible::before, .platform-nav-link.active::before { transform: scaleX(1); }
+  .platform-nav-link.active { color: #fff; background: none; box-shadow: none; }
+  .platform-menu-list { background: #000; border: 1px solid rgba(255, 255, 255, .18); border-radius: 0; box-shadow: none; }
+  .platform-menu-link { border-radius: 0; font-size: 11px; letter-spacing: .14em; text-transform: uppercase; }
+  .platform-menu-link.active { background: rgba(255, 255, 255, .12); }
+  .session { color: rgba(255, 255, 255, .6); font-size: 11px; letter-spacing: .08em; }
+  .session a { letter-spacing: .14em; text-transform: uppercase; }
+  .session a:hover { color: #fff; text-decoration: underline; }
+  main { width: min(1320px, calc(100% - 48px)); }
+
+  /* Buttons: the spacex.com outline button that fills white on hover. */
+  .button { min-height: 44px; padding: 11px 24px; color: #fff; background: transparent; border: 2px solid #fff; border-radius: 0; box-shadow: none; font-size: 12px; font-weight: 700; letter-spacing: .18em; text-transform: uppercase; transition: background .2s ease, color .2s ease, border-color .2s ease; }
+  .button:hover { color: #000; background: #fff; box-shadow: none; transform: none; }
+  .button:disabled { color: rgba(255, 255, 255, .4); background: transparent; border-color: rgba(255, 255, 255, .25); }
+  select, input[type=text], input[type=search], input[type=date], input.secret-field, textarea { color: #fff; background: #0b0b0b; border: 1px solid rgba(255, 255, 255, .24); border-radius: 0; box-shadow: none; }
+  select:hover, input:hover, textarea:hover { border-color: rgba(255, 255, 255, .55); }
+  select:focus-visible, input:focus-visible, textarea:focus-visible { border-color: #fff; box-shadow: none; }
+  a:focus-visible, button:focus-visible { outline: 2px solid #fff; outline-offset: 3px; box-shadow: none; }
+
+  /* Surfaces: flat black panels with hairline borders. */
+  .card { background: #070707; border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .card:hover { border-color: rgba(255, 255, 255, .22); box-shadow: none; }
+  .page-view[data-section="overview"] .card::before { width: 56px; height: 2px; background: #fff; }
+  .metric, .status-item { background: transparent; border: 0; border-top: 1px solid var(--line-strong); border-radius: 0; padding: 16px 2px 6px; }
+  .metric .value { font-size: 26px; font-weight: 500; }
+  .metric-guide-card:hover { border-color: #fff; box-shadow: none; transform: none; }
+  .warning { color: #f2cf73; background: rgba(242, 207, 115, .06); border: 1px solid rgba(242, 207, 115, .3); border-radius: 0; }
+  .onboarding-row, .methodology-callout, .methodology-callout.secondary, .metric-definition, .onboarding-case, .agent-diagnosis, .health-incident { background: #0b0b0b; border-color: var(--line); border-radius: var(--radius-md); }
+  .eyebrow { display: inline-flex; align-items: center; gap: 12px; margin-bottom: 18px; padding: 0; color: rgba(255, 255, 255, .78); background: none; border: 0; border-radius: 0; font-size: 12px; font-weight: 600; letter-spacing: .26em; }
+  .eyebrow::before { width: 32px; height: 1px; content: ""; background: currentColor; }
+  .freshness, .freshness.late, .freshness.stale, .onboarding-pill, .ops-pill, .live-source, .live-flag { border-radius: 0; letter-spacing: .08em; text-transform: uppercase; font-size: 11px; }
+  .page-error { border-radius: 0; }
+
+  /* Account pages: uppercase title, tab bar with an underline marker. */
+  .breadcrumbs { font-size: 11px; letter-spacing: .16em; text-transform: uppercase; }
+  .breadcrumbs a { color: var(--muted-strong); }
+  .breadcrumbs a:hover { color: #fff; }
+  .account-hero h1 { font-size: clamp(28px, 3.8vw, 48px); letter-spacing: .02em; }
+  .account-hero::after { display: none; }
+  .account-nav { gap: 0; padding: 0; background: rgba(0, 0, 0, .94); border: 0; border-bottom: 1px solid var(--line); border-radius: 0; box-shadow: none; }
+  .account-nav-link { padding: 16px 14px 14px; color: rgba(255, 255, 255, .62); border: 0; border-radius: 0; font-size: 11px; font-weight: 600; letter-spacing: .18em; text-transform: uppercase; }
+  .account-nav-link:hover, .account-nav-link:focus-visible { color: #fff; background: none; }
+  .account-nav-link.active { color: #fff; background: none; border: 0; box-shadow: inset 0 -2px 0 #fff; }
+  .section-jumps, .metric-guide-toolbar { background: rgba(0, 0, 0, .94); border-color: var(--line); border-radius: 0; }
+  .section-jumps a { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; }
+  .section-jumps a, .metric-jump a, .range-buttons button, .chart-mode button, .benchmark-choice, .benchmark-clear, .metric-expand, .metric-copy { border-radius: 0; }
+  .range-buttons, .chart-mode { background: none; border: 1px solid var(--line); border-radius: 0; }
+  .range-buttons button, .chart-mode button { letter-spacing: .12em; text-transform: uppercase; font-size: 11px; }
+  .range-buttons button.active, .chart-mode button.active { color: #000; background: #fff; }
+  .spark-area { fill: rgba(255, 255, 255, .06); }
+  .sector-track { height: 4px; background: rgba(255, 255, 255, .1); border-radius: 0; }
+  .sector-fill { background: #fff; border-radius: 0; }
+  .table-scroll { border-color: var(--line); border-radius: 0; }
+  th { color: var(--muted); background: transparent; font-size: 10px; font-weight: 600; letter-spacing: .18em; }
+  th, .total-row td { background: transparent; }
+  tbody tr:hover { background: rgba(255, 255, 255, .04); }
+  .chart-tooltip { background: #000; border-color: rgba(255, 255, 255, .3); border-radius: 0; box-shadow: none; }
+  .ai-chat-sidebar, .admin-live-chat .ai-chat-sidebar, .ai-chat-composer { background: #050505; }
+  .ai-chat-main { background: #080808; }
+  .ai-conversation-item:hover, .ai-conversation-item.active, .ai-message.assistant .ai-message-bubble, .ai-typing, .ai-chat-composer textarea { background: #141414; }
+  .ai-prompt-chip { color: #fff; background: transparent; border: 1px solid rgba(255, 255, 255, .3); border-radius: 0; letter-spacing: .04em; }
+  .ai-prompt-chip:hover { color: #000; background: #fff; }
+
+  @media (max-width: 650px) {
+    header { padding: 10px 16px; }
+    .platform-nav { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+    .platform-nav-link { padding: 10px 10px; font-size: 11px; letter-spacing: .12em; }
+    .brand-title { font-size: 12px; letter-spacing: .12em; }
+    .account-hero h1 { font-size: 28px; }
+    .session { padding-left: 55px; }
+    main { width: min(100% - 32px, 1320px); }
+  }
+}
+"""
+
+HOME_MISSION_CSS = MISSION_THEME_CSS + r"""
+@media screen {
+  /* Full-bleed hero: starfield over the curve of the Earth, as on spacex.com. */
+  .home-hero { position: relative; isolation: isolate; display: flex; flex-direction: column; justify-content: flex-end; max-width: none; width: 100vw; min-height: min(74vh, 720px); margin: -42px 0 0 calc(50% - 50vw); padding: 120px max(24px, calc(50vw - 660px)) 64px; overflow: hidden; }
+  .home-hero::before { position: absolute; inset: 0; z-index: -2; content: ""; background: url("__STARFIELD__") 0 0 / 480px 480px repeat, #000; opacity: .85; }
+  .home-hero::after { position: absolute; inset: 0; z-index: -1; content: ""; background:
+    linear-gradient(180deg, transparent 80%, #000 100%),
+    radial-gradient(ellipse 95% 62% at 78% 128%, #0d2a50 0, #071a33 55%, #030a14 97%, transparent 100%),
+    radial-gradient(ellipse 95% 62% at 78% 128%, transparent 96.4%, rgba(170, 210, 255, .85) 98.2%, rgba(80, 150, 240, .35) 101%, rgba(40, 100, 210, .12) 106%, transparent 116%),
+    linear-gradient(90deg, rgba(0, 0, 0, .7) 0, rgba(0, 0, 0, .2) 50%, transparent 100%); }
+  .home-hero h1 { max-width: 900px; font-size: clamp(44px, 7.4vw, 96px); }
+  .home-hero .lead { max-width: 560px; margin-top: 18px; color: rgba(255, 255, 255, .78); font-size: 18px; letter-spacing: .02em; }
+  .accounts-summary { margin-top: 26px; color: rgba(255, 255, 255, .72); font-size: 12px; letter-spacing: .16em; text-transform: uppercase; }
+  .accounts-summary .behind { color: #f2cf73; }
+  .accounts { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 0; margin-top: 56px; border-top: 1px solid var(--line); }
+  .account-card { padding: 34px 0 30px; background: none; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; box-shadow: none; transition: none; }
+  .account-card::after { display: none; }
+  .account-card:hover, .account-card:focus-visible { transform: none; box-shadow: none; }
+  .account-badge { margin-bottom: 14px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .22em; }
+  .account-id { font-size: clamp(22px, 2.6vw, 32px); font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+  .account-stats { margin-top: 22px; padding-top: 0; border-top: 0; }
+  .account-nav-value { font-size: clamp(34px, 4vw, 52px); font-weight: 500; letter-spacing: 0; }
+  .account-returns { gap: 26px; font-size: 16px; }
+  .account-stat-label { color: var(--muted); letter-spacing: .2em; }
+  .open { align-self: flex-start; margin-top: 26px; padding: 12px 26px; border: 2px solid #fff; font-size: 12px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase; transition: background .2s ease, color .2s ease; }
+  .account-card:hover .open, .account-card:focus-visible .open { color: #000; background: #fff; }
+  .account-card:hover .open span { transform: none; }
+  @media (max-width: 650px) {
+    .home-hero { min-height: 64vh; margin-top: -28px; padding: 96px 16px 44px; }
+    .home-hero::after { background:
+      radial-gradient(ellipse 160% 46% at 70% 122%, #0d2a50 0, #071a33 55%, #030a14 97%, transparent 100%),
+      radial-gradient(ellipse 160% 46% at 70% 122%, transparent 96.4%, rgba(170, 210, 255, .85) 98.2%, rgba(80, 150, 240, .35) 101%, transparent 112%),
+      linear-gradient(180deg, transparent 0, rgba(0, 0, 0, .35) 100%); }
+  }
+}
+""".replace("__STARFIELD__", _STARFIELD)
+
+
 HOME_THEME_CSS = COMMON_THEME_CSS + r"""
 .home-hero { max-width: 820px; padding: 48px 0 12px; }
 .eyebrow { display: inline-flex; margin-bottom: 18px; padding: 7px 11px; color: #075dbf; background: rgba(8, 120, 249, .09); border: 1px solid rgba(8, 120, 249, .14); border-radius: 999px; font-size: 10px; font-weight: 750; letter-spacing: .11em; text-transform: uppercase; }
@@ -276,7 +463,7 @@ HOME_THEME_CSS = COMMON_THEME_CSS + r"""
 .accounts-summary:empty { display: none; }
 .accounts-summary .behind { color: #9a6700; font-weight: 650; }
 .home-hero { padding-bottom: 0; }
-""" + DARK_THEME_CSS
+""" + DARK_THEME_CSS + HOME_MISSION_CSS
 
 ACCOUNT_THEME_CSS = COMMON_THEME_CSS + r"""
 .breadcrumbs { display: flex; align-items: center; gap: 8px; margin-bottom: 23px; color: var(--muted); font-size: 12px; }
@@ -696,11 +883,11 @@ table.correlation-matrix th.text-col { text-align: left; }
 .admin-actions-panel #admin-confirmation { flex: 1 1 260px; min-width: 0; }
 .admin-chat-who { margin-top: 14px; font-size: 12px; line-height: 1.5; }
 @media (max-width: 650px) { #health-overview { grid-template-columns: 1fr 1fr; } }
-@media screen and (prefers-color-scheme: dark) {
+@media screen {
   .ops-pill { color: #cbd5e1; background: rgba(148, 163, 184, .16); }
   .ops-pill.is-critical, .ops-pill.is-fail { color: #fda4af; }
   .ops-pill.is-warning, .ops-pill.is-warn { color: #fcd34d; }
   .ops-pill.is-pass { color: #86efac; }
   .ops-pill.is-agent { color: #c4b5fd; }
 }
-""" + DARK_THEME_CSS
+""" + DARK_THEME_CSS + MISSION_THEME_CSS

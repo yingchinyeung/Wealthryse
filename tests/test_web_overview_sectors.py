@@ -263,13 +263,29 @@ class FailureStateTests(unittest.TestCase):
 
 
 class DarkModeTests(unittest.TestCase):
-    def test_dark_theme_follows_the_computer_setting_on_every_page(self):
-        from ibkr_etl.web_theme import ACCOUNT_THEME_CSS, DARK_THEME_CSS, HOME_THEME_CSS
-        self.assertIn("@media screen and (prefers-color-scheme: dark)", DARK_THEME_CSS)
-        self.assertTrue(ACCOUNT_THEME_CSS.endswith(DARK_THEME_CSS))
-        self.assertTrue(HOME_THEME_CSS.endswith(DARK_THEME_CSS))
+    def test_screens_use_the_dark_mission_theme_on_every_page(self):
+        from ibkr_etl.web_theme import (
+            ACCOUNT_THEME_CSS, DARK_THEME_CSS, HOME_THEME_CSS, MISSION_THEME_CSS, WEB_FONT_FILES,
+        )
+        self.assertIn("@media screen {", DARK_THEME_CSS)
+        self.assertNotIn("prefers-color-scheme", DARK_THEME_CSS)
+        self.assertTrue(ACCOUNT_THEME_CSS.endswith(DARK_THEME_CSS + MISSION_THEME_CSS))
+        self.assertIn(DARK_THEME_CSS + MISSION_THEME_CSS, HOME_THEME_CSS)
         for token in ("--bg:", "--surface:", "--ink:", "--chart-grid:", "--chart-text:"):
             self.assertIn(token, DARK_THEME_CSS)
+            self.assertIn(token, MISSION_THEME_CSS)
+        for name in WEB_FONT_FILES:
+            self.assertIn(f"/assets/fonts/{name}", MISSION_THEME_CSS)
+
+    def test_mission_font_is_served_from_the_package(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(web.app)
+        response = client.get("/assets/fonts/barlow-600.woff2")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "font/woff2")
+        self.assertTrue(response.content.startswith(b"wOF2"))
+        self.assertEqual(client.get("/assets/fonts/..%2Fweb.py").status_code, 404)
+        self.assertEqual(client.get("/assets/fonts/other.woff2").status_code, 404)
 
     def test_chart_lines_and_labels_use_theme_colours(self):
         for source in (web._render_account_page({"email": "o@example.com", "role": "owner"},

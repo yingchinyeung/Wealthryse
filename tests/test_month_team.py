@@ -191,7 +191,7 @@ class FakeModel:
         elif name == "deck_review":
             body = {"objections": self.deck_review}
         elif name == "page_claims":
-            body = {"findings": self.claims}
+            body = "INCOMPLETE" if self.claims == "INCOMPLETE" else {"findings": self.claims}
         else:
             if self.reject_images:
                 error = Exception("bad request")
@@ -655,6 +655,13 @@ class WriterReviewerTests(unittest.TestCase):
         sent = json.loads(model.named("page_claims")[0]["input"][0]["content"][0]["text"])
         self.assertIn("31.00%", sent["pages"][0]["printed_text"])
         self.assertEqual(Reviewer(TeamModel(APAC, tokens_left=10**6, client=FakeModel())).check_claims(["  "]), ([], [], {}))
+
+    def test_a_failed_claims_reply_is_noted_not_fatal(self):
+        pages = ["A diversified portfolio.\nTechnology 64.00%"]
+        reviewer = Reviewer(TeamModel(APAC, tokens_left=10**6, client=FakeModel(claims="INCOMPLETE")))
+        notes, aside, usage = reviewer.check_claims(pages)
+        self.assertEqual((notes, usage), ([], {}))
+        self.assertIn("did not run (model_incomplete)", aside[0]["reason"])
 
     def test_last_trading_day(self):
         from wealthryse_agent.month_team.page_checks import last_trading_day

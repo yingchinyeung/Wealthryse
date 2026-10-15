@@ -404,8 +404,12 @@ class Reviewer:
         if not any(page.strip() for page in factsheet_pages):
             return [], [], {}
         payload = {"pages": [{"page": n, "printed_text": str(text)[:6000]} for n, text in enumerate(factsheet_pages, start=1)]}
-        result, usage = self.model.ask(name="page_claims", instructions=PAGE_CLAIMS, payload=payload,
-                                       schema=CLAIMS_SCHEMA, max_output_tokens=OUTPUT_TOKENS["claims"])
+        try:
+            result, usage = self.model.ask(name="page_claims", instructions=PAGE_CLAIMS, payload=payload,
+                                           schema=CLAIMS_SCHEMA, max_output_tokens=OUTPUT_TOKENS["claims"])
+        except TeamModelError as error:
+            # Notes only, so a failed reply must not fail the checking stage; a spent budget still stops the run.
+            return [], [{"statement": "", "reason": f"The claims check did not run ({error.code})."}], {}
         notes, set_aside = [], []
         for finding in result.get("findings", []):
             statement, evidence = str(finding.get("statement") or "").strip(), str(finding.get("evidence") or "").strip()

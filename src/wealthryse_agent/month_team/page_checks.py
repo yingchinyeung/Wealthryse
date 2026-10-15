@@ -35,6 +35,9 @@ _ARITHMETIC = re.compile(r"\b(?:inconsisten\w*|does not (?:equal|match|add|recon
                          re.I)
 _ENDING = re.compile(r"\b(?:end|ends|ending|ended|through|until|last|final|latest|stops?|dated|labell?ed|period)\b", re.I)
 _CURRENCY = re.compile(r"\b(?:USD|HKD|CNY|CNH|RMB|EUR|GBP|JPY|SGD|AUD)\b|US\$|HK\$|S\$|A\$|€|£|¥")
+_SHORT_PERIOD = re.compile(r"\b(?:missing|does not (?:extend|reach|run|cover)|doesn't (?:extend|reach|run|cover)|"
+                           r"stops? (?:short|before)|ends? (?:short|before)|incomplete)\b[^.]{0,80}?"
+                           r"\b(?:months?|rows?|through|period|end(?:ing)? date)\b", re.I)
 _YTD = re.compile(r"\bYTD\b|year[- ]to[- ]date", re.I)
 _SPREAD = re.compile(r"\+\s*spread\b", re.I)
 _AXIS_LABEL = re.compile(r"^(20\d\d)-(\d\d)$")
@@ -95,6 +98,18 @@ def unconfirmed(description: str, pages: Sequence[str] | None, period_end: date 
         return None
     printed_text = "\n".join(pages)
     printed_dates = set(dates_in(printed_text))
+    # Table rows are printed as ISO dates; headings print the report date in words, so only ISO dates show how far
+    # a table really runs.
+    row_dates: set[date] = set()
+    for m in _ISO.finditer(printed_text):
+        row_dates.update(d for _, d in _date(0, int(m.group(1)), int(m.group(2)), int(m.group(3))))
+    if period_end is not None and _SHORT_PERIOD.search(description) and any(
+            _closes_month(d, period_end) for d in row_dates):
+        # Replay round 4: "the table does not extend through 31 May ... missing the final months", quoting no date,
+        # on a table whose last row was 29 May, the last trading day.
+        closing = max(d for d in row_dates if _closes_month(d, period_end))
+        return (f"The printed text reaches {closing.isoformat()}, the month's last trading day, so nothing is missing "
+                f"at the end of the period.")
     for day in quoted:
         if day not in printed_dates and day != period_end:
             return f"It quotes {day.isoformat()}, which the page does not print."
@@ -123,12 +138,18 @@ def _months_between(a: str, b: str) -> int:
     return (int(b[:4]) - int(a[:4])) * 12 + int(b[5:7]) - int(a[5:7])
 
 
+def _flat(s: str) -> str:
+    s = s.replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"')
+    s = re.sub(r"-\s+", "-", s)  # a word the PDF hyphenates across a line break ("alpha-\ngenerated")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
 def quoted_in(quote: str, pages: Sequence[str]) -> bool:
-    """Whether a quotation appears in the printed text, ignoring line breaks, spacing and curly quotes."""
-    def flat(s: str) -> str:
-        s = s.replace("‘", "'").replace("’", "'").replace("“", '"').replace("”", '"')
-        return re.sub(r"\s+", " ", s).strip().lower()
-    return bool(quote.strip()) and flat(quote) in flat(" ".join(pages))
+    """Whether a quotation appears in the printed text, ignoring line breaks, spacing, curly quotes, the quotation
+    marks wrapped around it and a leading or trailing ellipsis. (Replay round 4: most real statements were set aside
+    only because the model wrapped them in quotation marks.)"""
+    core = _flat(quote).strip("\"' ").removeprefix("...").removesuffix("...").strip("… ")
+    return len(core) >= 3 and core in _flat(" ".join(pages))
 
 
 def figures_printed(text: str, pages: Sequence[str]) -> bool:

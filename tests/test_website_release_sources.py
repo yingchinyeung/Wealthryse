@@ -210,10 +210,18 @@ class PrepareTest(unittest.TestCase):
     def test_the_repository_records_the_onboarding_migrations_as_on_main(self):
         import hashlib, json
         recorded = json.loads(release.APPLIED_MIGRATIONS.read_text())["migrations"]
-        for names in release.SWITCHES_NEEDING_MIGRATIONS.values():
-            for name in names:
+        # Only migrations confirmed applied are recorded; the crisis scenarios one is
+        # added after the bootstrap job has run it.
+        for switch in ("ONBOARDING_V2_ENABLED",):
+            for name in release.SWITCHES_NEEDING_MIGRATIONS[switch]:
                 body = (ROOT / "migrations" / "postgres" / name).read_bytes()
                 self.assertEqual(recorded[name]["sha256"], hashlib.sha256(body).hexdigest(), name)
+
+    def test_crisis_scenarios_switched_on_before_its_migration_is_recorded_stops_the_release(self):
+        env = [{"name": "CRISIS_SCENARIOS_ENABLED", "value": "true"}]
+        with self.assertRaises(SystemExit) as stopped:
+            self.run_prepare(["src/ibkr_etl/web.py"], env=env, migrations={"066_crisis_scenarios.sql": b"create 066\n"})
+        self.assertIn("066_crisis_scenarios.sql", str(stopped.exception))
 
     def test_onboarding_switch_absent_or_off_does_not_stop_the_release(self):
         for env in ([], [{"name": "ONBOARDING_V2_ENABLED", "value": "false"}], [{"name": "OTHER", "secretRef": "x"}]):

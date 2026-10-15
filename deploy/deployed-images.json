@@ -1,5 +1,5 @@
 {
- "recorded": "2026-10-15T13:44:00Z agent apps and jobs moved to wealthryse-agent main-16ca328 (agent-apps-20261015c); 2026-10-15T04:21:25Z onboarding, ops, weekly-brief and live-market jobs added (agent-apps-20261015); autonomous-admin moved to ibkr-platform main-7c74151 at 2026-10-15T04:05:07Z; other entries from the 2026-10-13T18:17:00Z read-only inventory",
+ "recorded": "2026-10-15T14:43:44Z sector-classification moved to ibkr-platform main-7d274e8 (SKYD WS sector, PR 95); 2026-10-15T13:44:00Z agent apps and jobs moved to wealthryse-agent main-16ca328 (agent-apps-20261015c); 2026-10-15T04:21:25Z onboarding, ops, weekly-brief and live-market jobs added (agent-apps-20261015); autonomous-admin moved to ibkr-platform main-7c74151 at 2026-10-15T04:05:07Z; other entries from the 2026-10-13T18:17:00Z read-only inventory",
  "note": "Images every ibkrv2stg app and job ran when recorded. The website is checked separately: it must run a web-<commit> tag built from main. Update this file in the same PR as any deliberate image change.",
  "images": {
   "ibkrv2stg-account-sync-daily": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:3535a487c4d4b608350c5377650dd63fa14fbbe1df57938f3cc399cefd4bd7d3",
@@ -42,7 +42,7 @@
   "ibkrv2stg-risk-free-daily": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:06c44ff756bbc7da0f41f14c9bfe08fff2ecb16e06a94c8576654bf176a00038",
   "ibkrv2stg-risk-snapshots": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:bd669adb8265ae75d11644cd98a1dec25fd9ba615281a2abc1536e4625d49429",
   "ibkrv2stg-secret-metadata": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:59f9e53079939c478d7e484095f3f6fcdad2019870fe7338bdc4d153d6154d61",
-  "ibkrv2stg-sector-classification": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:eba14e6eb9648913c093e0d61b6444fb52257401b345f49db3b660b701f247cd",
+  "ibkrv2stg-sector-classification": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:2b2f679c7aa613de712b74655ebf79e57d6b333cdacc43cbf04c5e9b17400551",
   "ibkrv2stg-template-intake": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:d4b956474a2090a6a8998b13869224a0c66f961e419c9f0b297cef0fae2427ea",
   "ibkrv2stg-verify-u16088571": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:9d5df84e8b850640de351f931e1cb698db30cd61612886d117beee6dc6f85519"
  }

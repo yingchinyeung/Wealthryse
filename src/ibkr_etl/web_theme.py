@@ -675,4 +675,31 @@ table.correlation-matrix th.text-col { text-align: left; }
   .account-sticky { top: 0; margin-top: 24px; }
   .page-view > .card[id] { scroll-margin-top: 120px; }
 }
+/* System health and Administration: severity pills, incident cards and the agents' diagnoses. */
+.ai-conversation-item .admin-chat-badge { display: inline-flex; margin-top: 0; color: #fff; font-size: 10px; }
+.ops-pill { display: inline-flex; align-items: center; padding: 2px 9px; color: #334155; background: rgba(100, 116, 139, .14); border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .02em; vertical-align: middle; white-space: nowrap; }
+.ops-pill.is-critical, .ops-pill.is-fail { color: #b4232f; background: rgba(217, 72, 95, .13); }
+.ops-pill.is-warning, .ops-pill.is-warn { color: #8a5a00; background: rgba(217, 154, 21, .16); }
+.ops-pill.is-pass { color: #1f7a4a; background: rgba(47, 158, 98, .14); }
+.ops-pill.is-agent { color: #3d3aa8; background: rgba(103, 92, 255, .13); }
+.health-overview-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+.health-overview-head .value { font-size: 26px; }
+.health-incident { margin-top: 12px; padding: 16px; border: 1px solid var(--line); border-left: 4px solid #94a3b8; border-radius: var(--radius-md); }
+.health-incident.is-critical { border-left-color: #d9485f; }
+.health-incident.is-warning { border-left-color: #d99a15; }
+.health-incident h3 { margin: 8px 0 4px; font-size: 16px; }
+.agent-diagnosis { margin-top: 12px; padding: 13px 15px; background: linear-gradient(135deg, rgba(8, 120, 249, .06), rgba(103, 92, 255, .07)); border: 1px solid rgba(103, 92, 255, .2); border-radius: 13px; }
+.agent-diagnosis p { margin: 6px 0; }
+.agent-diagnosis ol { margin: 8px 0 0; padding-left: 20px; }
+.agent-diagnosis .actions { margin-top: 12px; }
+.admin-actions-panel #admin-confirmation { flex: 1 1 260px; min-width: 0; }
+.admin-chat-who { margin-top: 14px; font-size: 12px; line-height: 1.5; }
+@media (max-width: 650px) { #health-overview { grid-template-columns: 1fr 1fr; } }
+@media screen and (prefers-color-scheme: dark) {
+  .ops-pill { color: #cbd5e1; background: rgba(148, 163, 184, .16); }
+  .ops-pill.is-critical, .ops-pill.is-fail { color: #fda4af; }
+  .ops-pill.is-warning, .ops-pill.is-warn { color: #fcd34d; }
+  .ops-pill.is-pass { color: #86efac; }
+  .ops-pill.is-agent { color: #c4b5fd; }
+}
 """ + DARK_THEME_CSS

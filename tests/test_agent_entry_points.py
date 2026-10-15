@@ -49,3 +49,36 @@ class AgentEntryPointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OperationsPagesTests(unittest.TestCase):
+    def _health(self, user: dict) -> str:
+        with mock.patch.dict(os.environ, {"AGENT_UI_MODE": "owner"}):
+            return web._render_platform_page(user, section="system-health")
+
+    def test_system_health_leads_with_a_summary_and_the_operations_agents_incidents(self):
+        owner = self._health(OWNER)
+        self.assertLess(owner.index("At a glance"), owner.index('id="health-incidents"'))
+        self.assertLess(owner.index('id="health-incidents"'), owner.index('id="health-status"'))
+        self.assertEqual(owner.count('id="health-incidents"'), 1)
+        self.assertIn('data-admin-chat="1"', owner)
+        self.assertIn('href="/administration">Open the administrator chat</a>', owner)
+        self.assertIn('href="/agent-inbox">Agent inbox</a>', owner)
+        self.assertIn("Review the draft fix", web.SYSTEM_HEALTH_PAGE_SCRIPT)
+        self.assertIn("/administration?ask=", web.SYSTEM_HEALTH_PAGE_SCRIPT)
+
+    def test_viewers_get_no_administration_links_on_system_health(self):
+        viewer = self._health(VIEWER)
+        self.assertIn("At a glance", viewer)
+        self.assertNotIn('data-admin-chat', viewer)
+        self.assertNotIn('href="/administration"', viewer)
+        self.assertNotIn('href="/agent-inbox"', viewer)
+
+    def test_administration_names_the_agent_behind_each_update_and_puts_the_control_plane_last(self):
+        page = web._render_platform_page(OWNER, section="administration")
+        self.assertLess(page.index('class="admin-layout"'), page.index("Institutional onboarding control plane"))
+        self.assertIn("the operations agent and the connection agent post their updates", page)
+        self.assertIn("'Operations agent'", web.ADMIN_LIVE_CHAT_SCRIPT)
+        self.assertIn("'Connection agent'", web.ADMIN_LIVE_CHAT_SCRIPT)
+        self.assertIn("get('ask')", web.ADMIN_LIVE_CHAT_SCRIPT)
+        self.assertIn('href="/system-health"', web.ADMINISTRATION_PAGE_SCRIPT)

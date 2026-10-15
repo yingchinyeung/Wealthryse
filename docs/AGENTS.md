@@ -88,7 +88,12 @@ internal-reports, writes agent.month_* tables and agent.inbox only
   While the older analyst's model (`AI_ANALYST_ENABLED`) is off, its AI analyst
   tab is left out and old links to it open Overview with the chat open. The
   Agent inbox and Month-end pages use the website's own header and navigation,
-  and Month-end is under Operations.
+  and Month-end is under Operations. System health opens with an "At a glance"
+  summary and the open incidents, each with the operations agent's diagnosis,
+  its draft fix and (for the owner) "Ask the administrator about this", which
+  opens Administration with the question filled in. In the Administration chat,
+  each update says whether the administrator, the operations agent or the
+  connection agent wrote it.
 
 ## Turning it on (each Azure step needs Ying's typed approval)
 

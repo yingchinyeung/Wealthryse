@@ -175,7 +175,8 @@ class GroundingTests(unittest.TestCase):
 
 class InvestigationTests(unittest.TestCase):
     def investigator(self, model, github=None):
-        return Investigator(SETTINGS, lambda: model, request=fake_request(), github=github)
+        return Investigator(SETTINGS, lambda: model, request=fake_request(), github=github,
+                            now=datetime(2026, 10, 14, 3, tzinfo=timezone.utc))
 
     def test_a_grounded_diagnosis_is_saved_once_per_episode(self):
         model, store, usage = FakeModel(diagnosis_answer()), FakeStore(), {}

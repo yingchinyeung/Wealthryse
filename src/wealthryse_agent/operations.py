@@ -574,8 +574,9 @@ class PullRequestDrafter:
 
 class Investigator:
     def __init__(self, settings: OpsSettings, model: Callable[[], TeamModel], *, request: Request | None = None,
-                 github: GitHubRequest | None = None, client_id: str = "") -> None:
+                 github: GitHubRequest | None = None, client_id: str = "", now: datetime | None = None) -> None:
         self.settings = settings
+        self._now = now
         self.diagnoser = Diagnoser(model)
         self._request = request
         self._client_id = client_id
@@ -588,7 +589,7 @@ class Investigator:
         # Read once per run: every incident in the run is diagnosed against the same picture.
         if self._telemetry is None:
             request = self._request or default_request(self._client_id)
-            self._telemetry = Telemetry(self.settings, request).collect()
+            self._telemetry = Telemetry(self.settings, request, now=self._now).collect()
         return self._telemetry
 
     def investigate(self, call: Callable[[str, dict], dict], incident: Mapping[str, Any], *,

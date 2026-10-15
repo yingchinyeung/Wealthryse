@@ -1665,8 +1665,13 @@ CASE_DESCRIPTION = "One account or portfolio, four stages, three decisions from 
 CONNECTIONS_DESCRIPTION = "One connection per broker login. Keys go straight to Key Vault and are never shown again."
 
 ONBOARDING_CONTENT = """<div class="page-view active" data-section="account-onboarding">
+<div class="card wide"><div class="label">How it works</div><ol class="onboarding-steps" style="margin:10px 0 0 18px;padding:0;line-height:1.7">
+<li><strong>Connect the broker login</strong> on Broker connections. The platform checks it and finds its accounts.</li>
+<li><strong>Pick an account</strong> below, or build a portfolio from live accounts in the portfolio builder.</li>
+<li><strong>Follow its case</strong> through four stages: request, load and reconcile, build history, first month-end. You make three decisions; nothing reaches viewers before you approve.</li></ol>
+<div class="actions"><a class="button" href="/broker-connections">Broker connections</a><a class="button" href="/account-onboarding/new-portfolio">Portfolio builder</a><a class="button" href="/account-onboarding/classic">Master accounts and earlier cases</a></div></div>
 <div class="card wide"><div class="label">Cases in progress</div><div id="v2-cases"><div class="muted">Loading…</div></div></div>
-<div class="card wide"><div class="label">Available to onboard</div><div class="muted">Found through your broker connections. Each account is onboarded only when you choose it.</div><div id="v2-available"><div class="muted">Loading…</div></div><div id="v2-start" hidden></div><div class="actions"><a class="button" href="/broker-connections">Broker connections</a><a class="button" href="/account-onboarding/new-portfolio">New portfolio</a><a class="button" href="/account-onboarding/classic">Master accounts and earlier cases</a></div></div>
+<div class="card wide"><div class="label">Available to onboard</div><div class="muted">Found through your broker connections. Each account is onboarded only when you choose it.</div><div id="v2-available"><div class="muted">Loading…</div></div><div id="v2-start" hidden></div></div>
 <div class="card wide"><div class="label">Live accounts</div><div id="v2-live" class="status-row"></div></div>
 </div>"""
 
@@ -1699,6 +1704,7 @@ CONNECTIONS_CONTENT = """<div class="page-view active" data-section="broker-conn
 <details id="bc-recipe" style="margin-top:16px"><summary>Show the Flex query recipe</summary><ol id="bc-recipe-steps"></ol></details>
 <div class="actions"><button class="button" type="submit">Save and check</button></div><div id="bc-status" class="muted" role="status" aria-live="polite"></div></form>
 <div class="warning">Never paste a token or key into chat, email or a support message. Use only this form.</div></div>
+<div class="card wide"><div class="label">Next step</div><p class="muted">Once a connection is healthy, its accounts appear under Available to onboard.</p><div class="actions"><a class="button" href="/account-onboarding">Account onboarding</a></div></div>
 </div>"""
 
 _COMMON_SCRIPT = r"""

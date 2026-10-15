@@ -84,10 +84,11 @@ internal-reports, writes agent.month_* tables and agent.inbox only
   owners only; `all` to everyone with account access.
 - **Where people find it.** When it is on for someone: "Agent inbox" in the top
   navigation with a count of new items; the "Ask about this account" button and
-  Explain buttons on every account tab, with starter questions for that tab; and
-  the AI analyst tab, which opens this analyst while the older analyst's model
-  (`AI_ANALYST_ENABLED`) is off. The Agent inbox and Month-end pages use the
-  website's own header and navigation, and Month-end is under Operations.
+  Explain buttons on every account tab, with starter questions for that tab.
+  While the older analyst's model (`AI_ANALYST_ENABLED`) is off, its AI analyst
+  tab is left out and old links to it open Overview with the chat open. The
+  Agent inbox and Month-end pages use the website's own header and navigation,
+  and Month-end is under Operations.
 
 ## Turning it on (each Azure step needs Ying's typed approval)
 

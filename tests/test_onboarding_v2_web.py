@@ -103,14 +103,26 @@ class OnboardingV2WebTests(unittest.TestCase):
             self.assertIn("Available to onboard", page)
             self.assertIn("/api/onboarding-v2/overview", page)
             self.assertIn('href="/broker-connections">Broker connections</a>', page)
-            self.assertIn('href="/account-onboarding/new-portfolio">New portfolio</a>', page)
+            self.assertIn('href="/account-onboarding/new-portfolio">Portfolio builder</a>', page)
+            self.assertIn("How it works", page)
             self.assertNotIn("IBKR connections</a>", page)
             self.assertNotIn("Guided onboarding wizard", page)
             classic = self.client.get("/account-onboarding/classic")
             self.assertEqual(classic.status_code, 200)
-            self.assertIn("Portfolios now start in the portfolio builder", classic.text)
-            self.assertIn('id="derived-portfolio-studio" style="display:none" aria-hidden="true"', classic.text)
+            self.assertIn("<h1>Master accounts and earlier cases</h1>", classic.text)
+            self.assertIn("New accounts and portfolios start on Account onboarding", classic.text)
+            self.assertIn('style="display:none" aria-hidden="true" id="derived-portfolio-studio"', classic.text)
             self.assertEqual(classic.text.count('id="derived-portfolio-studio"'), 1)
+            # What the new pages replace stays in the page for its script, hidden.
+            for label in ("Guided onboarding wizard", "IBKR connection prerequisite", "Existing v1.1 source accounts"):
+                self.assertIn(f'<div class="card wide" style="display:none" aria-hidden="true"><div class="label">{label}</div>',
+                              classic.text)
+            # Still offered: the master-account programme and cases started on the earlier wizard.
+            self.assertIn('<div class="card wide"><div class="label">Owner-approved rollout programme</div>', classic.text)
+            self.assertIn('<div class="card wide"><div class="label">Onboarding cases</div>', classic.text)
+            old_connections = self.client.get("/ibkr-connections", follow_redirects=False)
+            self.assertEqual((old_connections.status_code, old_connections.headers["location"]),
+                             (307, "/broker-connections"))
             builder = self.client.get("/account-onboarding/new-portfolio").text
             self.assertIn("Start from", builder)
             self.assertIn("/api/onboarding-v2/portfolio-builder", builder)
@@ -119,6 +131,7 @@ class OnboardingV2WebTests(unittest.TestCase):
             self.assertIn('aria-current="page">Broker connections</a>', connections)
             self.assertIn("Show the Flex query recipe", connections)
             self.assertIn("Never paste a token or key into chat", connections)
+            self.assertIn('<a class="button" href="/account-onboarding">Account onboarding</a>', connections)
             case_page = self.client.get("/account-onboarding/cases/00000000-0000-0000-0000-000000000001").text
             self.assertIn('data-case-id="00000000-0000-0000-0000-000000000001"', case_page)
             self.assertIn("Your three approvals", case_page)

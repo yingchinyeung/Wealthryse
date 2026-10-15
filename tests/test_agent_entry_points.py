@@ -26,23 +26,25 @@ class AgentEntryPointTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"AGENT_UI_MODE": "off", "MONTH_TEAM_UI": "off"}):
             self.assertNotIn("/agent-inbox", web._platform_navigation(OWNER))
 
-    def _ai_analyst_tab(self, mode: str) -> str:
+    def _page(self, mode: str, section: str = "overview") -> str:
         with mock.patch.dict(os.environ, {"AGENT_UI_MODE": mode}), \
                 mock.patch.object(web, "_account_directory", return_value=[]), \
                 mock.patch.object(web, "AI_ANALYST_CONFIG", replace(web.AI_ANALYST_CONFIG, enabled=False)):
-            return web._render_account_page(OWNER, account_id="U1", section="ai-analyst", access=dict(ACCESS))
+            return web._render_account_page(OWNER, account_id="U1", section=section, access=dict(ACCESS))
 
-    def test_ai_analyst_tab_hands_over_to_the_agents_analyst_while_the_older_model_is_off(self):
-        page = self._ai_analyst_tab("owner")
-        self.assertIn("data-agent-home", page)
-        self.assertIn('data-agent-open data-question="What if Hong Kong falls 10%?"', page)
-        self.assertIn('<div class="card wide ai-chat-card" style="display:none">', page)
-        self.assertIn('id="analysis-run"', page)  # still in the page for its script
+    def test_ai_analyst_tab_is_left_out_while_the_agents_analyst_replaces_it(self):
+        self.assertNotIn('href="/accounts/U1/ai-analyst"', self._page("owner"))
+        self.assertIn('href="/accounts/U1/ai-analyst"', self._page("off"))
+        with mock.patch.dict(os.environ, {"AGENT_UI_MODE": "owner"}), \
+                mock.patch.object(web, "_portfolio_access_context", return_value=dict(ACCESS)), \
+                mock.patch.object(web, "AI_ANALYST_CONFIG", replace(web.AI_ANALYST_CONFIG, enabled=False)):
+            response = web.account_page("U1", "ai-analyst", None, OWNER)
+        self.assertEqual((response.status_code, response.headers["location"]), (307, "/accounts/U1/overview#ask"))
 
-    def test_ai_analyst_tab_is_unchanged_when_the_agents_are_off(self):
-        page = self._ai_analyst_tab("off")
-        self.assertNotIn("data-agent-home", page)
-        self.assertIn('<div class="card wide ai-chat-card">', page)
+    def test_ai_analyst_tab_stays_while_the_older_analysts_model_is_on(self):
+        with mock.patch.dict(os.environ, {"AGENT_UI_MODE": "owner"}), \
+                mock.patch.object(web, "AI_ANALYST_CONFIG", replace(web.AI_ANALYST_CONFIG, enabled=True)):
+            self.assertFalse(web._agent_analyst_replaces_tab(OWNER))
 
 
 if __name__ == "__main__":

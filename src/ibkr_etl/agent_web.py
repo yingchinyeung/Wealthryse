@@ -425,9 +425,8 @@ function init(){
  panel.querySelector('[data-memory]').addEventListener('click',memory);
  form.addEventListener('submit',e=>{e.preventDefault();const q=input.value;input.value='';ask(q)});
  input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
- // Buttons the page itself offers (the AI analyst tab) open the panel, optionally with a question.
- document.querySelectorAll('[data-agent-open]').forEach(b=>b.addEventListener('click',()=>{open();if(b.dataset.question)ask(b.dataset.question)}));
- const home=document.querySelector('.page-view.active [data-agent-home]');if(home)open();
+ // Old links to the AI analyst tab land on Overview with the panel open.
+ if(location.hash==='#ask')open();
  const explain=()=>{document.querySelectorAll('.page-view.active .card > .label').forEach((label,n)=>{if(n>=6||label.querySelector('.wr-explain'))return;
   const topic=label.textContent.replace(/[·—].*$/,'').trim();if(!topic)return;const b=document.createElement('button');b.type='button';b.className='wr-explain';b.textContent='Explain';
   const live=label.closest('.live-card');const question=live?'Explain what moved this account today, using the live data.':`Explain the ${topic.toLowerCase()} for this account as of the latest data.`;
@@ -436,7 +435,7 @@ function init(){
   inbox().then(d=>{const today=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Hong_Kong'});
    const n=(d.items||[]).filter(x=>x.kind==='live_alert'&&x.subject_id===account&&x.status==='new'&&String(x.period_key).startsWith(today)).length;
    if(!n||label.querySelector('.wr-alert'))return;const a=document.createElement('a');a.className='wr-explain wr-alert';a.href='/agent-inbox';a.textContent=n===1?'1 alert today':n+' alerts today';label.appendChild(a)})};
- if(!home){explain();new MutationObserver(()=>explain()).observe(document.querySelector('main')||document.body,{childList:true,subtree:false})}
+ explain();new MutationObserver(()=>explain()).observe(document.querySelector('main')||document.body,{childList:true,subtree:false});
  alerts();
 }
 })();"""

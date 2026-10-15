@@ -5190,7 +5190,11 @@ def system_health_page(
 @app.get("/ibkr-connections", response_class=HTMLResponse)
 def ibkr_connections_page(
     request: Request, user: dict[str, str] = Depends(_onboarding_user)
-) -> str:
+):
+    # With the new onboarding on, Broker connections replaces this page (it lists the
+    # IBKR logins already on the platform too), so old links and bookmarks go there.
+    if onboarding_v2_enabled():
+        return RedirectResponse(url="/broker-connections", status_code=307)
     return _render_platform_page(user, section="ibkr-connections")
 
 
@@ -8738,25 +8742,52 @@ def account_onboarding_page(
 def account_onboarding_classic_page(
     request: Request, user: dict[str, str] = Depends(_onboarding_user)
 ) -> Response:
-    """The earlier onboarding page, kept for derived and master portfolios."""
+    """The earlier onboarding page, kept for master accounts and cases started before the new onboarding."""
 
     if not onboarding_v2_enabled():
         return RedirectResponse(url="/account-onboarding", status_code=307)
     page = _render_platform_page(user, section="account-onboarding")
-    return HTMLResponse(page.replace(_STUDIO_CARD_OPENING, _STUDIO_REPLACED_CARD, 1))
+    for old, new in _CLASSIC_PAGE_REPLACEMENTS:
+        page = page.replace(old, new, 1)
+    for opening in _CLASSIC_HIDDEN_CARDS:
+        page = page.replace(opening, opening.replace('<div class="card wide"', _HIDDEN_CARD, 1), 1)
+    return HTMLResponse(page)
 
 
-# With the new onboarding on, the portfolio builder replaces the Studio card;
-# the old card stays in the page, hidden, so the page's own script still runs.
-_STUDIO_CARD_OPENING = '<div class="card wide" id="derived-portfolio-studio">'
-_STUDIO_REPLACED_CARD = (
-    '<div class="card wide"><div class="label">New portfolio</div>'
-    "<h2>Portfolios now start in the portfolio builder</h2>"
-    '<p class="muted">Build a composite like Alpha World MS and T, or filter an account like '
-    "China &amp; Hong Kong, see its composition as a tree, then start its onboarding case.</p>"
-    '<div class="actions"><a class="button" href="/account-onboarding/new-portfolio">'
-    "Open the portfolio builder</a></div></div>"
-    '<div class="card wide" id="derived-portfolio-studio" style="display:none" aria-hidden="true">'
+# With the new onboarding on, the earlier page keeps only what the new one does not
+# cover: starting a master account and finishing cases started on the earlier wizard.
+# The new Account onboarding, Broker connections and portfolio builder pages replace
+# everything else, so those cards stay in the page (its script expects them) but hidden.
+_HIDDEN_CARD = '<div class="card wide" style="display:none" aria-hidden="true"'
+_CLASSIC_HIDDEN_CARDS = (
+    '<div class="card wide"><div class="label">Guided onboarding wizard</div>',
+    '<div class="card wide"><div class="label">Choose what you are onboarding</div>',
+    '<div class="card wide" id="derived-portfolio-studio">',
+    '<div class="card wide"><div class="label">IBKR connection prerequisite</div>',
+    '<div class="card wide"><div class="label">Platform-wide presentation requirements</div>',
+    '<div class="card wide"><div class="label">Approved implementation sequence</div>',
+    '<div class="card wide"><div class="label">Existing v1.1 source accounts</div>',
+)
+_CLASSIC_TITLE = "Master accounts and earlier cases"
+_CLASSIC_PAGE_REPLACEMENTS = (
+    ("<title>Account onboarding ·", f"<title>{_CLASSIC_TITLE} ·"),
+    ("<span>Account onboarding</span></div>",
+     '<a href="/account-onboarding">Account onboarding</a><span aria-hidden="true">/</span>'
+     f"<span>{_CLASSIC_TITLE}</span></div>"),
+    ("<h1>Account onboarding</h1>", f"<h1>{_CLASSIC_TITLE}</h1>"),
+    ("Controlled account discovery, source configuration, reconciliation gates and feature activation for "
+     "safely scaling the platform beyond the U16088571 reference account.",
+     "Starting a master account, and cases started on the earlier onboarding wizard."),
+    ('<div class="card wide"><div class="label">Scalable account onboarding</div>',
+     '<div class="card wide"><div class="label">Where to start</div>'
+     "<h2>New accounts and portfolios start on Account onboarding</h2>"
+     '<p class="muted">Use this page only to start a master account or to finish a case started '
+     "before the new onboarding. Broker logins are on Broker connections, and new portfolios start "
+     "in the portfolio builder.</p><div class=\"actions\">"
+     '<a class="button" href="/account-onboarding">Account onboarding</a>'
+     '<a class="button" href="/broker-connections">Broker connections</a>'
+     '<a class="button" href="/account-onboarding/new-portfolio">Portfolio builder</a></div></div>'
+     '<div class="card wide"><div class="label">Scalable account onboarding</div>'),
 )
 
 
@@ -10589,6 +10620,14 @@ def _platform_shell(
 <main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>Platform</span><span aria-hidden="true">/</span><span>{page_title}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{page_title}</h1><div class="muted">{escape(description)}</div></div></div><section class="grid">{content}</section></main>{script}</body></html>"""
 
 
+def _agent_analyst_replaces_tab(user: dict[str, object]) -> bool:
+    """The "Ask about this account" analyst is on every tab, so while the older analyst's
+    model is off its AI analyst tab is left out and old links open Overview with the chat."""
+    from .agent_web import ui_enabled_for
+
+    return not AI_ANALYST_CONFIG.enabled and ui_enabled_for(user)
+
+
 @app.get("/accounts/{account_id}", response_class=RedirectResponse)
 def account_root(
     account_id: str,
@@ -10634,6 +10673,8 @@ def account_page(
     access = _portfolio_access_context(account_id, user)
     if access["preview_mode"] and section not in ONBOARDING_PREVIEW_SECTIONS:
         raise HTTPException(status_code=404, detail="Account page not found")
+    if section == "ai-analyst" and _agent_analyst_replaces_tab(user):
+        return RedirectResponse(url=f"/accounts/{urllib.parse.quote(account_id, safe='')}/overview#ask", status_code=307)
     return _render_account_page(
         user, account_id=account_id, section=section, access=access
     )
@@ -10667,33 +10708,9 @@ def _render_account_page(
     visible_sections = (
         ONBOARDING_PREVIEW_SECTIONS if preview_mode else set(ACCOUNT_SECTIONS)
     )
+    if _agent_analyst_replaces_tab(user):
+        visible_sections = visible_sections - {"ai-analyst"}
     page_title = escape(ACCOUNT_SECTIONS[section])
-    # While the older analyst's model is off, the AI analyst tab hands over to the agents' analyst,
-    # which opens on every tab. The older chat stays in the page (its script expects it) but hidden.
-    from .agent_web import ui_enabled_for as _agent_ui_enabled_for
-
-    agent_home = not preview_mode and not AI_ANALYST_CONFIG.enabled and _agent_ui_enabled_for(user)
-    agent_home_html = (
-        '<div class="card wide" data-agent-home><div class="label">Portfolio analyst</div>'
-        f'<h2>Ask about {account_display_name}</h2>'
-        '<p class="muted">The analyst answers from this account\'s validated data and names the source of every '
-        'figure. It is on every account tab through the <strong>Ask about this account</strong> button, and it '
-        'cannot trade, approve or change anything.</p><div class="actions">'
-        '<button class="button" type="button" data-agent-open>Open the analyst</button>'
-        + "".join(
-            f'<button class="button" type="button" data-agent-open data-question="{escape(question)}">{escape(question)}</button>'
-            for question in (
-                "What changed in this account this week?",
-                "How has it done against its benchmark this year?",
-                "What if Hong Kong falls 10%?",
-            )
-        )
-        + '</div><p class="muted">Weekly briefs, alerts and draft commentary from the scheduled agents are in the '
-        '<a href="/agent-inbox">Agent inbox</a>.</p></div>'
-        if agent_home
-        else ""
-    )
-    legacy_chat_style = ' style="display:none"' if agent_home else ""
     active = {key: " active" if key == section else "" for key in ALL_PAGE_SECTIONS}
     navigation = "".join(
         f'<a class="account-nav-link{active[key]}" href="/accounts/{account}/{key}"'
@@ -10794,7 +10811,7 @@ def _render_account_page(
 <div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Sector allocation</div><div id="sector-summary" class="muted"></div><div id="sector-bars" class="sector-bars"></div><details class="sector-detail"><summary>Industries within each sector</summary><div class="table-scroll"><table><thead><tr><th class="text-col">Sector</th><th class="text-col">Industry</th><th class="text-col">Region</th><th>Holdings</th><th>Value (<span>{reporting_currency}</span>)</th><th>Weight</th></tr></thead><tbody id="sector-detail"></tbody></table></div></details><div id="sector-note" class="muted sector-note"></div></div>{HOLDINGS_CONCENTRATION_CARD}<div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-tools"><input id="holdings-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter holdings"><span id="holdings-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
 <div class="page-view{active['reports']}" data-section="reports"><div class="card wide"><div class="label">Monthly factsheets and presentations</div><div class="value">Report centre</div><div id="report-note" class="muted">Loading frozen month-end reports…</div><div class="actions"><select id="report-month" aria-label="Monthly report period"></select><button id="report-prepare" class="button" type="button" disabled>Generate secure downloads</button></div><div id="report-status" class="muted" style="margin-top:14px"></div><div id="report-downloads" class="actions"></div><div id="report-owner-review" style="display:none;margin-top:22px"><h3>Review and release files</h3><p class="muted">Tick a file to make it available to authorized users. Untick it and submit to revoke its download access. A newly approved replacement becomes the current download and withdraws the older version. The original file and approval history are retained. Review files before approving; client distribution remains prohibited.</p><div id="report-release-details" class="muted" style="margin-top:12px"></div><div id="report-release-list" style="display:grid;gap:12px;margin:16px 0"></div><button id="report-release" class="button" type="button" disabled>Submit approval changes</button><div id="report-release-status" class="muted" role="status" aria-live="polite"></div></div>{design_controls_html}</div></div>
 <div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a>{trade_export_link}<a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
-<div class="page-view{active['ai-analyst']}" data-section="ai-analyst">{agent_home_html}<div class="card wide ai-chat-card"{legacy_chat_style}><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Saved chats</div><strong>AI Analyst</strong></div><button id="ai-new-chat" class="button" type="button">New chat</button></div><div id="ai-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="ai-chat-title">New conversation</strong><div id="agent-status" class="muted">Loading analyst…</div></div><div class="actions"><a id="ai-export-md" class="button" href="#" hidden>Save Markdown</a><a id="ai-export-json" class="button" href="#" hidden>Save JSON</a><button id="ai-archive-chat" class="button" type="button" hidden>Archive</button></div></div><div id="ai-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Live grounded analysis</div><div class="value">Ask about this portfolio</div><div id="agent-note" class="muted">The analyst uses validated portfolio tools for every figure and chart.</div><div class="ai-prompt-chips"><button class="ai-prompt-chip" type="button">Compare performance with the selected benchmark</button><button class="ai-prompt-chip" type="button">Explain the portfolio's main risks</button><button class="ai-prompt-chip" type="button">Show NAV history and key performance metrics</button></div></div></div><div class="ai-chat-composer"><textarea id="analysis-question" maxlength="1200" aria-label="Message the AI Portfolio Analyst" placeholder="Message the AI Portfolio Analyst…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Conversations save automatically</div><button id="analysis-run" class="button" type="button" disabled>Send</button></div></div></section></div></div></div>
+<div class="page-view{active['ai-analyst']}" data-section="ai-analyst"><div class="card wide ai-chat-card"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Saved chats</div><strong>AI Analyst</strong></div><button id="ai-new-chat" class="button" type="button">New chat</button></div><div id="ai-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="ai-chat-title">New conversation</strong><div id="agent-status" class="muted">Loading analyst…</div></div><div class="actions"><a id="ai-export-md" class="button" href="#" hidden>Save Markdown</a><a id="ai-export-json" class="button" href="#" hidden>Save JSON</a><button id="ai-archive-chat" class="button" type="button" hidden>Archive</button></div></div><div id="ai-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Live grounded analysis</div><div class="value">Ask about this portfolio</div><div id="agent-note" class="muted">The analyst uses validated portfolio tools for every figure and chart.</div><div class="ai-prompt-chips"><button class="ai-prompt-chip" type="button">Compare performance with the selected benchmark</button><button class="ai-prompt-chip" type="button">Explain the portfolio's main risks</button><button class="ai-prompt-chip" type="button">Show NAV history and key performance metrics</button></div></div></div><div class="ai-chat-composer"><textarea id="analysis-question" maxlength="1200" aria-label="Message the AI Portfolio Analyst" placeholder="Message the AI Portfolio Analyst…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Conversations save automatically</div><button id="analysis-run" class="button" type="button" disabled>Send</button></div></div></section></div></div></div>
 <div class="page-view{active['system-health']}" data-section="system-health"><div class="card wide"><div class="label">System health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Daily portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Stage 4 acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>
 <div class="page-view{active['administration']}" data-section="administration"><div class="admin-layout"><div class="card admin-overview"><div class="label">24/7 controlled autonomy</div><div id="autonomy-status" class="value">Loading…</div><div id="autonomy-note" class="muted"></div><div id="autonomy-summary" class="status-row"></div><div id="autonomy-incidents" class="muted"></div><div id="autonomy-reviews" class="muted"></div></div><div class="card admin-actions-panel"><div class="label">Owner-approved administrator actions</div><div id="admin-status" class="value">Loading…</div><div id="admin-note" class="muted"></div><div class="actions"><select id="admin-action" aria-label="Staging administrative action"></select><button id="admin-preview" class="button" type="button" disabled>Preview action</button></div><div id="admin-preview-result" class="muted" style="margin-top:14px"></div><div class="actions"><input id="admin-confirmation" type="text" maxlength="80" aria-label="Type the exact approval phrase" placeholder="Preview an action to obtain the approval phrase" disabled><button id="admin-execute" class="button" type="button" disabled>Approve and execute once</button></div><div id="admin-result" class="muted" style="margin-top:14px"></div></div></div></div></section></main>
 {TABLE_SCRIPT}<script>

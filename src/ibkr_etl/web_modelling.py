@@ -394,10 +394,9 @@ MODELLING_CSS = """
 .model-frontier .axis{stroke:var(--line,#d0d5dd)}.model-frontier text{fill:var(--muted,#667085);font-size:12px}
 .model-frontier .frontier{fill:none;stroke:var(--chart-portfolio,#2646a6);stroke-width:2}
 .model-frontier .point{stroke:var(--surface,#fff);stroke-width:1.5}
-[data-section="modelling"] input[type=number]{min-width:0;width:100%;max-width:100%;margin-top:7px;padding:10px 13px;color:var(--ink);background:rgba(255,255,255,.92);border:1px solid var(--line-strong);border-radius:13px;font:inherit}
+[data-section="modelling"] input[type=number]{min-width:0;width:100%;max-width:100%;margin-top:7px;padding:10px 13px;color:var(--ink);background:var(--surface);border:1px solid var(--line-strong);font:inherit}
 [data-section="modelling"] .filter-grid label{display:flex;flex-direction:column;justify-content:flex-end}
 #whatif-holdings input[type=number]{width:8em;margin-top:0;padding:6px 10px;text-align:right}
-@media screen and (prefers-color-scheme: dark){[data-section="modelling"] input[type=number]{background:rgba(12,16,25,.92)}}
 """
 
 MODELLING_SCRIPT = r"""
@@ -450,7 +449,7 @@ document.querySelector('#whatif-run').addEventListener('click',()=>void runWhati
 document.querySelector('#whatif-reset').addEventListener('click',()=>{modelState.added={};void runWhatif(false)});
 document.querySelector('#whatif-add').addEventListener('click',()=>{const symbol=document.querySelector('#whatif-add-symbol').value.trim().toUpperCase(),weight=Number(document.querySelector('#whatif-add-weight').value)/100;if(!/^[A-Z0-9.^=\-]{1,20}$/.test(symbol)||!(weight>0)){document.querySelector('#whatif-note').textContent='Enter a ticker and a weight above 0% to add it.';return}if(!modelState.added[symbol]&&Object.keys(modelState.added).length>=5){document.querySelector('#whatif-note').textContent='Add at most 5 tickers at a time.';return}modelState.added[symbol]=weight;document.querySelector('#whatif-add-symbol').value='';document.querySelector('#whatif-add-weight').value='';void runWhatif()});
 const portfolioNames={current:'Current mix',minimum_variance:'Minimum variance',risk_parity:'Risk parity',maximum_sharpe:'Maximum Sharpe'};
-const portfolioColors={current:'#d97706',minimum_variance:'#0e9384',risk_parity:'#7a5af8',maximum_sharpe:'#2646a6'};
+const portfolioColors={current:chartColors.benchmark,minimum_variance:'#0e9384',risk_parity:'#7a5af8',maximum_sharpe:chartColors.portfolio};
 const frontierSvg=r=>{
   const points=[...r.frontier,...Object.values(r.portfolios)],xs=points.map(p=>p.volatility),ys=points.map(p=>p.expected_return);
   const x0=Math.min(...xs)*0.9,x1=Math.max(...xs)*1.05,ylo=Math.min(...ys),yhi=Math.max(...ys),pad=(yhi-ylo)*0.1||0.01,y0=ylo-pad,y1=yhi+pad,W=720,H=320,L=70,R=20,T=16,B=66;

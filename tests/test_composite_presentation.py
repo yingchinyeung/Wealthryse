@@ -350,13 +350,19 @@ import {adaptReferenceRenderer} from %s;
 const source = fs.readFileSync(%s, 'utf8');
 const code = adaptReferenceRenderer(source, 'file:///runtime/artifact_tool.mjs');
 const percent = source.split('\\n').find(line => line.startsWith('const percent = '));
-const start = code.indexOf('const compositeFirstYear');
-const end = code.indexOf('\\n]);', code.indexOf('setTable("tb/a9srud0n"', start)) + 4;
-const block = new Function('msModel', 'periodEnd', 'portfolioMonthRows', 'setTable', percent + '\\n' + code.slice(start, end));
-console.log(JSON.stringify(%s.map(([model, periodEnd]) => {
+const slide15 = text => {
+  const start = text.indexOf('const monthlyByYear = new Map();');
+  const end = text.indexOf('\\n]);', text.indexOf('setTable("tb/a9srud0n"', start)) + 4;
+  return new Function('msModel', 'periodEnd', 'portfolioMonthRows', 'setTable', percent + '\\n' + text.slice(start, end));
+};
+// The composite adapter and the MS, T and account decks share one year rule.
+console.log(JSON.stringify([code, source].map(slide15).map(block => %s.map(([model, periodEnd]) => {
   let written; block(model, periodEnd, model.month_rows, (id, rows) => { written = rows; }); return written;
-})));""", (ROOT / "scripts/composite_presentation_runtime.mjs").as_uri(),
+}))));""", (ROOT / "scripts/composite_presentation_runtime.mjs").as_uri(),
             str(ROOT / "scripts/render_monthly_presentation.mjs"), cases))
+        adapted, reference = rendered
+        self.assertEqual(adapted, reference)
+        rendered = adapted
         for (case, period_end), table in zip(cases, rendered):
             with self.subTest(period_end=period_end):
                 self.assertEqual(table[1:], monthly_table(case, period_end))
@@ -440,7 +446,7 @@ for (const gone of ['Frongello',"'Alpha World MS'",'alpha_world_ms_presentation'
                     "snapshot.subject_id === 'alpha-world-ms'",'from "@oai/artifact-tool"'])
   assert.ok(!code.includes(gone),gone);
 for (const gone of ['max: 0.7,','["2025", ...(monthlyByYear']) assert.ok(!code.includes(gone),gone);
-for (const kept of ['compositeFirstYear + 1','Math.floor(msModel.constant_cash / 10) * 10',
+for (const kept of ['firstMonthlyYear + 1','Math.floor(msModel.constant_cash / 10) * 10',
                     'Math.ceil(Math.max(...sector.allocation.map(row => Number(row.weight))) * 10) / 10'])
   assert.ok(code.includes(kept),kept);
 for (const kept of ['ibkr_etl.composite_presentation','scripts/audit_composite_presentation.py',

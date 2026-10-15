@@ -1054,6 +1054,26 @@ def _draw_factsheet_page_one(
     )
 
 
+def _account_chart_month_ticks(start: date, end: date) -> tuple[date, ...]:
+    """First-of-month ticks after ``start``: every odd month, thinned for long histories.
+
+    Up to three years keeps the approved Jan/Mar/May... cadence. Longer
+    histories step to Jan/Jul, then to January only, so labels stay apart.
+    """
+    month_span = (end.year - start.year) * 12 + end.month - start.month
+    month_step = 2 if month_span <= 36 else 6 if month_span <= 72 else 12
+    # Zero-based month index; January is index 0, so odd months are even indices.
+    index = start.year * 12 + start.month - 1
+    index += (-index) % month_step
+    if date(index // 12, index % 12 + 1, 1) <= start:
+        index += month_step
+    ticks: list[date] = []
+    while (tick := date(index // 12, index % 12 + 1, 1)) <= end:
+        ticks.append(tick)
+        index += month_step
+    return tuple(ticks)
+
+
 def _draw_factsheet_page_two(
     c: canvas.Canvas, inputs: FactsheetInputs, page_width: float, page_height: float
 ) -> None:
@@ -1086,11 +1106,20 @@ def _draw_factsheet_page_two(
     if maximum <= minimum:
         minimum -= 5.0
         maximum += 5.0
-    first_tick = math.ceil(minimum / 10.0) * 10.0
-    last_tick = math.floor(maximum / 10.0) * 10.0
+    # Ten-point gridlines, widened for strongly trending histories so the
+    # labels never pile up (no more than ten across the plot).
+    y_step = next(
+        step
+        for step in (10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, math.inf)
+        if (maximum - minimum) / step <= 10.0
+    )
+    if not math.isfinite(y_step):
+        y_step = 10.0 ** math.ceil(math.log10((maximum - minimum) / 10.0))
+    first_tick = math.ceil(minimum / y_step) * y_step
+    last_tick = math.floor(maximum / y_step) * y_step
     y_ticks = tuple(
-        first_tick + 10.0 * index
-        for index in range(max(0, int(round((last_tick - first_tick) / 10.0))) + 1)
+        first_tick + y_step * index
+        for index in range(max(0, int(round((last_tick - first_tick) / y_step))) + 1)
     )
     c.setStrokeColor(GRID)
     c.setFillColor(MUTED)
@@ -1106,24 +1135,7 @@ def _draw_factsheet_page_two(
     end_date = date.fromisoformat(inputs.normalized_nav[-1]["date"])
     start_ordinal = start_date.toordinal()
     ordinal_span = max(1, end_date.toordinal() - start_ordinal)
-    tick_year, tick_month = start_date.year, start_date.month
-    if tick_month % 2 == 0:
-        tick_month += 1
-    while date(tick_year, tick_month, 1) <= start_date:
-        tick_month += 2
-        if tick_month > 12:
-            tick_month -= 12
-            tick_year += 1
-    date_ticks: list[date] = []
-    while True:
-        tick_date = date(tick_year, tick_month, 1)
-        if tick_date > end_date:
-            break
-        date_ticks.append(tick_date)
-        tick_month += 2
-        if tick_month > 12:
-            tick_month -= 12
-            tick_year += 1
+    date_ticks = _account_chart_month_ticks(start_date, end_date)
     c.setFont("Helvetica", 6.5)
     for tick_date in date_ticks:
         x = x0 + width * (tick_date.toordinal() - start_ordinal) / ordinal_span

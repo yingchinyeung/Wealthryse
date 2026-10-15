@@ -3,7 +3,7 @@
 import {bindTemplateObjectIds} from './alpha_t_presentation_runtime.mjs';
 
 // render_monthly_presentation.mjs as reviewed; T's adapter pins the same bytes.
-export const REFERENCE_SHA256='bc2e3120c26fedfda202e29fc40b8ef59191ca43b9cfed5a3b2568de63d58882';
+export const REFERENCE_SHA256='c3d268fc87340f83ee7f4a568f295082474760f1568d25eb04825e7c1da8b9da';
 const STYLES=['alpha-world-ms','alpha-world-t'];
 
 export function compositeStrategyName(snapshot) {
@@ -67,11 +67,6 @@ export function adaptReferenceRenderer(source, artifactUrl) {
        'xAxis: { numberFormatCode: "0%", min: 0, max: Math.max(0.7, Math.ceil(Math.max(...sector.allocation.map(row => Number(row.weight))) * 10) / 10),');
   swap("numberFormatCode: isMsHkd ? '\"HKD \"0' : \"$0\",\n    min: 0,",
        "numberFormatCode: isMsHkd ? '\"HKD \"0' : \"$0\",\n    min: Math.min(0, Math.floor(msModel.constant_cash / 10) * 10),");
-  // Slide 15's two years are the composite's own, never MS's 2025 and 2026.
-  swap('const monthlyByYear = new Map();',
-       "const compositeFirstYear = Math.max(Number(msModel.identity.inception.slice(0, 4)), Number(periodEnd.slice(0, 4)) - 1);\nconst monthlyByYear = new Map();");
-  swap('  ["2025", ...(monthlyByYear.get(2025) ?? Array(12).fill("—"))],\n  ["2026", ...(monthlyByYear.get(2026) ?? Array(12).fill("—"))],',
-       '  ...[compositeFirstYear, compositeFirstYear + 1].map(year => [String(year), ...(monthlyByYear.get(year) ?? Array(12).fill("—"))]),');
   swap('scripts/audit_alpha_ms_presentation.py','scripts/audit_composite_presentation.py');
   swap('if (isMsHkd) {\n  const workbookPath',PAGE+'if (isMsHkd) {\n  const workbookPath');
   swap('const outputDir = path.dirname(path.resolve(finalPath));',WORDING+'const outputDir = path.dirname(path.resolve(finalPath));');

@@ -599,5 +599,63 @@ class MonthlyArtifactTests(unittest.TestCase):
             self.assertIn(("2026-09-30", 52.76, 5.2), runs)
 
 
+class AccountChartAxisTests(unittest.TestCase):
+    """Page-two chart axes for any start month, history length and growth (made-up values)."""
+
+    @staticmethod
+    def _page_two_runs(snapshot: dict) -> list[tuple[str, float, float]]:
+        with tempfile.TemporaryDirectory() as directory:
+            template = Path(directory, "template.pdf")
+            output = Path(directory, "factsheet.pdf")
+            writer = PdfWriter()
+            writer.add_blank_page(width=595.5, height=842.25)
+            writer.add_blank_page(width=595.5, height=842.25)
+            with template.open("wb") as stream:
+                writer.write(stream)
+            render_factsheet(snapshot, template_path=template, output_path=output)
+            runs: list[tuple[str, float, float]] = []
+
+            def visitor(text, cm, tm, _font, _size) -> None:
+                if text.strip():
+                    # Page coordinates: the date labels are drawn rotated.
+                    x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+                    y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+                    runs.append((text.strip(), float(x), float(y)))
+
+            PdfReader(output).pages[1].extract_text(visitor_text=visitor)
+            return runs
+
+    @staticmethod
+    def _monthly_snapshot(first: date, months: int, growth: float = 0.01) -> dict:
+        snapshot = _snapshot()
+        series = [{"date": first.isoformat(), "nav": 100000}]
+        year, month = first.year, first.month
+        for index in range(1, months + 1):
+            month += 1
+            if month == 13:
+                year, month = year + 1, 1
+            day = date(year, month, monthrange(year, month)[1])
+            series.append({"date": day.isoformat(), "nav": 100000 * (1 + growth * index)})
+        snapshot["performance"]["series"] = series
+        snapshot["period_end"] = snapshot["data_as_of"] = series[-1]["date"]
+        return snapshot
+
+    def test_a_history_starting_in_december_renders(self) -> None:
+        runs = self._page_two_runs(self._monthly_snapshot(date(2024, 12, 16), 13))
+        labels = [text for text, _x, y in runs if 594.88 - 25 < y < 594.88 - 4]
+        self.assertEqual(labels[:3], ["2025", "Mar", "May"])
+
+    def test_strong_growth_keeps_value_labels_apart(self) -> None:
+        runs = self._page_two_runs(self._monthly_snapshot(date(2024, 1, 2), 30, growth=0.15))
+        ticks = sorted(y for text, x, y in runs if x < 77.2 and text.isdigit())
+        self.assertLessEqual(len(ticks), 11)
+        self.assertGreater(min(b - a for a, b in zip(ticks, ticks[1:])), 8.0)
+
+    def test_long_histories_thin_the_date_labels(self) -> None:
+        runs = self._page_two_runs(self._monthly_snapshot(date(2020, 1, 2), 40))
+        labels = [text for text, _x, y in runs if 594.88 - 25 < y < 594.88 - 4]
+        self.assertEqual(labels, ["Jul", "2021", "Jul", "2022", "Jul", "2023"])
+
+
 if __name__ == "__main__":
     unittest.main()

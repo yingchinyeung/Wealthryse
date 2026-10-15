@@ -77,6 +77,10 @@ TOOL_LABELS = {
     "get_nav_history": "Reading the value history",
     "get_risk_metrics": "Measuring risk",
     "get_case": "Reading the case",
+    "project_wealth": "Simulating future values",
+    "run_what_if": "Comparing a different mix",
+    "optimise_portfolio": "Measuring where the risk sits",
+    "get_factor_exposures": "Fitting the factor model",
     calculator.NAME: "Calculating",
 }
 OUT_OF_SCOPE = ("I can explain your holdings and performance, but I can't recommend trades, rebalancing "

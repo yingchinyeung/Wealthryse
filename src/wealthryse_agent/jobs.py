@@ -117,7 +117,8 @@ def weekly_brief(store: Store, tools: ToolClient, agent: Agent, accounts: list[s
         task = WEEKLY_BRIEF.format(account_id=account_id, from_date=start, to_date=end)
         answer, citations, used, ok = _run_agent(
             agent, tools, account_id, task,
-            ["get_performance", "compare_to_benchmark", "get_holdings_changes", "get_cash_flows", "get_data_freshness"])
+            ["get_performance", "compare_to_benchmark", "get_holdings_changes", "get_cash_flows", "get_data_freshness",
+             "optimise_portfolio"])
         _sum_usage(usage, used)
         if ok and store.add_inbox(kind="weekly_brief", account_id=account_id, period_key=period,
                                   title=f"Your week to {end}", body=answer, citations=citations, run_id=None):

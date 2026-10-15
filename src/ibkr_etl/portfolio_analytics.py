@@ -586,6 +586,90 @@ def holdings_correlation(
     }
 
 
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70.0
+RSI_OVERSOLD = 30.0
+# Calendar days of marks loaded for RSI: about 200 trading days, enough for
+# Wilder's smoothing to settle well past its 14-day seed.
+RSI_LOOKBACK_DAYS = 300
+# A gap this long between marks means the position was closed and reopened,
+# so the change across it is not one day's move.
+RSI_MAXIMUM_GAP_DAYS = 14
+
+
+def wilder_rsi(closes: Iterable[float], period: int = RSI_PERIOD) -> float | None:
+    """Wilder's relative strength index of the last value in ``closes``.
+
+    Seeds average gain and loss with the simple mean of the first ``period``
+    changes, then smooths each later change with weight 1/``period``. Needs at
+    least ``period`` + 1 closes; returns None otherwise. A run with no losses
+    is 100, with no gains 0, and with no movement at all 50.
+    """
+
+    values = list(closes)
+    if len(values) < period + 1:
+        return None
+    changes = [current - previous for previous, current in zip(values, values[1:])]
+    gain = sum(max(change, 0.0) for change in changes[:period]) / period
+    loss = sum(max(-change, 0.0) for change in changes[:period]) / period
+    for change in changes[period:]:
+        gain = (gain * (period - 1) + max(change, 0.0)) / period
+        loss = (loss * (period - 1) + max(-change, 0.0)) / period
+    if loss == 0:
+        return 50.0 if gain == 0 else 100.0
+    return 100.0 - 100.0 / (1.0 + gain / loss)
+
+
+def rsi_signal(value: float | None) -> str | None:
+    if value is None:
+        return None
+    if value > RSI_OVERBOUGHT:
+        return "overbought"
+    if value < RSI_OVERSOLD:
+        return "oversold"
+    return "neutral"
+
+
+def holding_rsi(
+    prices: Mapping[str, float], as_of: str, *, period: int = RSI_PERIOD
+) -> dict[str, Any]:
+    """14-day Wilder RSI for one holding from its daily mark prices.
+
+    ``prices`` maps ISO date to mark price in the holding's own currency.
+    Weekend dates and non-positive marks are ignored. A one-day move beyond
+    PRICE_BREAK_THRESHOLD is treated as a split or other corporate action, and
+    a gap over RSI_MAXIMUM_GAP_DAYS as a closed and reopened position, so only
+    marks after the latest break or gap are used. The latest mark must be on
+    ``as_of`` so a stale price never produces a current-looking reading.
+    """
+
+    series = sorted(
+        (day, float(value)) for day, value in prices.items()
+        if day <= as_of and value is not None and math.isfinite(float(value)) and float(value) > 0
+        and date.fromisoformat(day[:10]).weekday() < 5
+    )
+    start = 0
+    for index in range(1, len(series)):
+        (previous_day, previous), (day, current) = series[index - 1], series[index]
+        gap = (date.fromisoformat(day[:10]) - date.fromisoformat(previous_day[:10])).days
+        if abs(current / previous - 1.0) > PRICE_BREAK_THRESHOLD or gap > RSI_MAXIMUM_GAP_DAYS:
+            start = index
+    usable = series[start:]
+    result: dict[str, Any] = {
+        "rsi": None, "rsi_signal": None, "rsi_observations": len(usable),
+        "rsi_reason": None, "rsi_series_restarted": start > 0,
+    }
+    if not usable or usable[-1][0] != as_of:
+        result["rsi_reason"] = "no_current_mark"
+        return result
+    value = wilder_rsi([price for _, price in usable], period)
+    if value is None:
+        result["rsi_reason"] = "insufficient_history"
+        return result
+    result.update(rsi=value, rsi_signal=rsi_signal(value))
+    return result
+
+
 __all__ = [
     "CALCULATION_VERSION",
     "PerformanceInputError",
@@ -593,10 +677,12 @@ __all__ = [
     "drawdown_analysis",
     "holdings_concentration",
     "holdings_correlation",
+    "holding_rsi",
     "monthly_calendar",
     "portfolio_analytics",
     "return_statistics",
     "rolling_benchmark_statistics",
     "rolling_series",
     "trading_activity",
+    "wilder_rsi",
 ]

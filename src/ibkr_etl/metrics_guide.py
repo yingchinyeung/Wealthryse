@@ -613,6 +613,12 @@ _DEFINITIONS = (
         "Weights on a NAV basis can sum to less or more than 100% because cash, margin and other NAV components are not holdings.",
     ),
     MetricDefinition(
+        "RSI (14)",
+        "A momentum gauge from 0 to 100 showing whether a holding's price has recently risen or fallen strongly.",
+        "Wilder's 14-day relative strength index from the holding's daily closing mark prices in its own currency, on weekdays it was held: average gain and loss are seeded with the mean of the first 14 daily changes and then smoothed with weight 1/14; RSI = 100 − 100 ÷ (1 + average gain ÷ average loss). Up to 300 calendar days of marks are used. A one-day move above 50% (a likely split) or a gap of more than 14 days (a closed and reopened position) restarts the series. Blank when fewer than 15 marks remain or there is no mark on the holdings date.",
+        "Above 70 is marked overbought and below 30 oversold. These are conventional signals of stretched momentum, not forecasts or recommendations, and a newly bought position has no RSI until it has 15 daily marks.",
+    ),
+    MetricDefinition(
         "Sector allocation",
         "How the holdings are spread across economic sectors, with sub-sectors and regions in the detail table.",
         "Group holdings by their stored sector classification and divide each group's absolute market value by gross holdings value; cash is excluded. Classification coverage is the share of gross holdings value that has a sector, and unclassified holdings are named.",
@@ -661,7 +667,7 @@ _LAYOUT = (
         "Holdings and concentration",
         "Position values from the latest validated holdings snapshot on or before As of, converted into the reporting currency with dated FX (holdings-view-v1), plus the concentration measures on the Holdings tab.",
         ("Quantity", "Market value", "Value in reporting currency", "Cost basis", "Unrealized P&L", "P&L %",
-         "Holding weight", "Sector allocation", "Currency exposure", "Largest holding", "Top 5 weight",
+         "Holding weight", "RSI (14)", "Sector allocation", "Currency exposure", "Largest holding", "Top 5 weight",
          "Top 10 weight", "Effective number of holdings"),
     ),
     (
@@ -833,6 +839,7 @@ CLIENT_CALCULATIONS = {
     "Unrealized P&L": "Subtract what the units cost from what they are worth now.",
     "P&L %": "Divide the unrealized gain or loss by what the position cost.",
     "Holding weight": "Divide each holding's value by the total value of the portfolio.",
+    "RSI (14)": "Compare the size of the holding's recent daily price rises with its recent falls and score the balance from 0 to 100.",
     "Sector allocation": "Group the holdings by sector and add up each sector's share of the holdings value.",
 }
 
@@ -868,6 +875,7 @@ METRIC_ALIASES = {
     "Currency exposure": ("FX exposure", "currency risk"),
     "Sector allocation": ("industry", "GICS", "classification coverage"),
     "Unrealized P&L": ("paper gain", "unrealised profit"),
+    "RSI (14)": ("RSI", "relative strength index", "overbought", "oversold", "momentum"),
     "Annualized volatility": ("standard deviation", "vol", "risk"),
     "Annualized return": ("CAGR", "annualised return"),
     "Risk-free rate": ("T-bill", "Treasury yield", "HIBOR"),
@@ -923,6 +931,7 @@ RELATED_METRICS = {
     "P&L %": ("Unrealized P&L", "Cost basis"),
     "Holding weight": ("Value in reporting currency", "Top 10 weight", "Effective number of holdings"),
     "Sector allocation": ("Holding weight", "Currency exposure"),
+    "RSI (14)": ("P&L %", "Holdings correlation"),
     "Effective number of holdings": ("Top 10 weight", "Largest holding", "Holdings correlation"),
     "Currency exposure": ("Reporting currency", "Value in reporting currency"),
     "Annualized volatility": ("Rolling 3-month volatility", "Downside deviation", "Sharpe ratio"),

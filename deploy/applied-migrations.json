@@ -12,6 +12,10 @@
   "065_onboarding_report_style.sql": {
    "sha256": "8e3b7a84cfea989d961cd07d2de16a79148b944cce3acb7a52c91171312f7c44",
    "evidence": "ibkrv2stg-bootstrap-l23sdw8 from main aa07586, status pass, 2026-10-14 about 10:25 UTC"
+  },
+  "066_crisis_scenarios.sql": {
+   "sha256": "dfecbcde08a5bd8cffb5bcac61582a1c24ffef809d38ac4e45e6e7adaf73dcbf",
+   "evidence": "ibkrv2stg-bootstrap-d7qto9d on ibkr-platform main-ba08c0f (sha256:cdf18ee2a69de687cba1e4383983772f6b3038d046fe669185acc05f0e5163ea), status pass, 2026-10-15 about 23:21 UTC"
   }
  }
 }

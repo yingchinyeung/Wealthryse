@@ -39,7 +39,8 @@ def is_month_owner(user: dict[str, Any]) -> bool:
 
 
 def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
-            allowed_accounts: Callable[[dict[str, Any]], list[str]], theme_css: str, api: Any) -> None:
+            allowed_accounts: Callable[[dict[str, Any]], list[str]], theme_css: str, api: Any,
+            render_page: Callable[..., str] | None = None) -> None:
     def month_user(user: dict[str, Any] = Depends(authorized_user)) -> dict[str, Any]:
         if not is_month_owner(user):
             raise HTTPException(status_code=404, detail="Not found")
@@ -77,6 +78,15 @@ def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
 
     @app.get("/month-end", response_class=HTMLResponse)
     def month_page(user: dict[str, Any] = Depends(month_user)) -> str:
+        if render_page is not None:  # the website's own header and navigation
+            head, rest = MONTH_PAGE.split("<main>", 1)
+            body, script = rest.split("</main>", 1)
+            style = head[head.index("<style>{THEME}") + len("<style>{THEME}"):head.index("</style>")]
+            body = body.split("</p>", 1)[1]  # the heading and description come from the shell
+            return render_page(user, active="month-end", title="Month-end", description=MONTH_DESCRIPTION,
+                               content=('<style>' + style + '</style><div class="page-view active" data-section="month-end">'
+                                        '<div class="wide" style="min-width:0">' + body + '</div></div>'),
+                               script=script.replace("</body></html>", ""))
         return MONTH_PAGE.replace("{THEME}", theme_css).replace("{VIEWER}", escape(str(user.get("email") or "")))
 
 
@@ -153,6 +163,9 @@ function render(run){
  if(steps.length)h+=`<details><summary>Every step (${steps.length})</summary><table><tbody>${steps.map(s=>`<tr><td>${esc(String(s.created_at||'').slice(0,16).replace('T',' '))}</td><td>${esc(AGENT[s.agent_name]||s.agent_name)}${s.round>1?' · round '+esc(s.round):''}</td><td>${esc(s.outcome)}</td><td>${esc(s.summary)}</td></tr>`).join('')}</tbody></table></details>`;
  return h}
 })();"""
+
+MONTH_DESCRIPTION = ("Every account the month-end team is checking, by stage. The team never releases anything: "
+                     "release each report on its Reports tab as usual.")
 
 MONTH_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Month-end</title><style>{THEME}
 .mt-table{border-collapse:collapse;width:100%;font-size:14px}.mt-table button.link{border:0;background:none;color:inherit;text-decoration:underline;cursor:pointer;padding:0;font:inherit}.mt-why ul{margin:0;padding-left:18px}.mt-table th,.mt-table td{padding:8px;border-bottom:1px solid var(--border,#dce2eb);text-align:left;vertical-align:top}

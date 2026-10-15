@@ -4887,11 +4887,16 @@ ALL_PAGE_SECTIONS = ACCOUNT_SECTIONS | PLATFORM_SECTIONS
 
 
 def _platform_navigation(user: dict[str, object], *, active: str | None = None) -> str:
+    from . import agent_web, month_team_web
+
     links = [
         ("accounts", "Accounts", "/"),
         ("combined-holdings", "Combined holdings", "/combined-holdings"),
         ("metrics-guide", "Metrics guide", "/metrics-guide"),
     ]
+    # The agents' outputs (weekly briefs, alerts, drafts, data checks) sit one click from every page.
+    if agent_web.ui_enabled_for(user):
+        links.append(("agent-inbox", "Agent inbox", "/agent-inbox"))
     operations = [("system-health", "System health", "/system-health")]
     if user.get("role", "owner") in {
         "owner",
@@ -4906,12 +4911,15 @@ def _platform_navigation(user: dict[str, object], *, active: str | None = None) 
         operations.append(
             ("account-onboarding", "Account onboarding", "/account-onboarding")
         )
+    if month_team_web.is_month_owner(user):
+        operations.append(("month-end", "Month-end", "/month-end"))
     if user.get("role", "owner") == "owner":
         operations.append(("administration", "Administration", "/administration"))
 
     def link(key: str, label: str, href: str, css: str) -> str:
         return (
             f'<a class="{css}{" active" if key == active else ""}" href="{href}"'
+            f'{" data-agent-inbox" if key == "agent-inbox" else ""}'
             f'{" aria-current=\"page\"" if key == active else ""}>{escape(label)}</a>'
         )
 
@@ -10660,6 +10668,32 @@ def _render_account_page(
         ONBOARDING_PREVIEW_SECTIONS if preview_mode else set(ACCOUNT_SECTIONS)
     )
     page_title = escape(ACCOUNT_SECTIONS[section])
+    # While the older analyst's model is off, the AI analyst tab hands over to the agents' analyst,
+    # which opens on every tab. The older chat stays in the page (its script expects it) but hidden.
+    from .agent_web import ui_enabled_for as _agent_ui_enabled_for
+
+    agent_home = not preview_mode and not AI_ANALYST_CONFIG.enabled and _agent_ui_enabled_for(user)
+    agent_home_html = (
+        '<div class="card wide" data-agent-home><div class="label">Portfolio analyst</div>'
+        f'<h2>Ask about {account_display_name}</h2>'
+        '<p class="muted">The analyst answers from this account\'s validated data and names the source of every '
+        'figure. It is on every account tab through the <strong>Ask about this account</strong> button, and it '
+        'cannot trade, approve or change anything.</p><div class="actions">'
+        '<button class="button" type="button" data-agent-open>Open the analyst</button>'
+        + "".join(
+            f'<button class="button" type="button" data-agent-open data-question="{escape(question)}">{escape(question)}</button>'
+            for question in (
+                "What changed in this account this week?",
+                "How has it done against its benchmark this year?",
+                "What if Hong Kong falls 10%?",
+            )
+        )
+        + '</div><p class="muted">Weekly briefs, alerts and draft commentary from the scheduled agents are in the '
+        '<a href="/agent-inbox">Agent inbox</a>.</p></div>'
+        if agent_home
+        else ""
+    )
+    legacy_chat_style = ' style="display:none"' if agent_home else ""
     active = {key: " active" if key == section else "" for key in ALL_PAGE_SECTIONS}
     navigation = "".join(
         f'<a class="account-nav-link{active[key]}" href="/accounts/{account}/{key}"'
@@ -10760,7 +10794,7 @@ def _render_account_page(
 <div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Sector allocation</div><div id="sector-summary" class="muted"></div><div id="sector-bars" class="sector-bars"></div><details class="sector-detail"><summary>Industries within each sector</summary><div class="table-scroll"><table><thead><tr><th class="text-col">Sector</th><th class="text-col">Industry</th><th class="text-col">Region</th><th>Holdings</th><th>Value (<span>{reporting_currency}</span>)</th><th>Weight</th></tr></thead><tbody id="sector-detail"></tbody></table></div></details><div id="sector-note" class="muted sector-note"></div></div>{HOLDINGS_CONCENTRATION_CARD}<div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-tools"><input id="holdings-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter holdings"><span id="holdings-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
 <div class="page-view{active['reports']}" data-section="reports"><div class="card wide"><div class="label">Monthly factsheets and presentations</div><div class="value">Report centre</div><div id="report-note" class="muted">Loading frozen month-end reports…</div><div class="actions"><select id="report-month" aria-label="Monthly report period"></select><button id="report-prepare" class="button" type="button" disabled>Generate secure downloads</button></div><div id="report-status" class="muted" style="margin-top:14px"></div><div id="report-downloads" class="actions"></div><div id="report-owner-review" style="display:none;margin-top:22px"><h3>Review and release files</h3><p class="muted">Tick a file to make it available to authorized users. Untick it and submit to revoke its download access. A newly approved replacement becomes the current download and withdraws the older version. The original file and approval history are retained. Review files before approving; client distribution remains prohibited.</p><div id="report-release-details" class="muted" style="margin-top:12px"></div><div id="report-release-list" style="display:grid;gap:12px;margin:16px 0"></div><button id="report-release" class="button" type="button" disabled>Submit approval changes</button><div id="report-release-status" class="muted" role="status" aria-live="polite"></div></div>{design_controls_html}</div></div>
 <div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a>{trade_export_link}<a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
-<div class="page-view{active['ai-analyst']}" data-section="ai-analyst"><div class="card wide ai-chat-card"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Saved chats</div><strong>AI Analyst</strong></div><button id="ai-new-chat" class="button" type="button">New chat</button></div><div id="ai-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="ai-chat-title">New conversation</strong><div id="agent-status" class="muted">Loading analyst…</div></div><div class="actions"><a id="ai-export-md" class="button" href="#" hidden>Save Markdown</a><a id="ai-export-json" class="button" href="#" hidden>Save JSON</a><button id="ai-archive-chat" class="button" type="button" hidden>Archive</button></div></div><div id="ai-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Live grounded analysis</div><div class="value">Ask about this portfolio</div><div id="agent-note" class="muted">The analyst uses validated portfolio tools for every figure and chart.</div><div class="ai-prompt-chips"><button class="ai-prompt-chip" type="button">Compare performance with the selected benchmark</button><button class="ai-prompt-chip" type="button">Explain the portfolio's main risks</button><button class="ai-prompt-chip" type="button">Show NAV history and key performance metrics</button></div></div></div><div class="ai-chat-composer"><textarea id="analysis-question" maxlength="1200" aria-label="Message the AI Portfolio Analyst" placeholder="Message the AI Portfolio Analyst…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Conversations save automatically</div><button id="analysis-run" class="button" type="button" disabled>Send</button></div></div></section></div></div></div>
+<div class="page-view{active['ai-analyst']}" data-section="ai-analyst">{agent_home_html}<div class="card wide ai-chat-card"{legacy_chat_style}><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Saved chats</div><strong>AI Analyst</strong></div><button id="ai-new-chat" class="button" type="button">New chat</button></div><div id="ai-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="ai-chat-title">New conversation</strong><div id="agent-status" class="muted">Loading analyst…</div></div><div class="actions"><a id="ai-export-md" class="button" href="#" hidden>Save Markdown</a><a id="ai-export-json" class="button" href="#" hidden>Save JSON</a><button id="ai-archive-chat" class="button" type="button" hidden>Archive</button></div></div><div id="ai-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Live grounded analysis</div><div class="value">Ask about this portfolio</div><div id="agent-note" class="muted">The analyst uses validated portfolio tools for every figure and chart.</div><div class="ai-prompt-chips"><button class="ai-prompt-chip" type="button">Compare performance with the selected benchmark</button><button class="ai-prompt-chip" type="button">Explain the portfolio's main risks</button><button class="ai-prompt-chip" type="button">Show NAV history and key performance metrics</button></div></div></div><div class="ai-chat-composer"><textarea id="analysis-question" maxlength="1200" aria-label="Message the AI Portfolio Analyst" placeholder="Message the AI Portfolio Analyst…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Conversations save automatically</div><button id="analysis-run" class="button" type="button" disabled>Send</button></div></div></section></div></div></div>
 <div class="page-view{active['system-health']}" data-section="system-health"><div class="card wide"><div class="label">System health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Daily portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Stage 4 acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>
 <div class="page-view{active['administration']}" data-section="administration"><div class="admin-layout"><div class="card admin-overview"><div class="label">24/7 controlled autonomy</div><div id="autonomy-status" class="value">Loading…</div><div id="autonomy-note" class="muted"></div><div id="autonomy-summary" class="status-row"></div><div id="autonomy-incidents" class="muted"></div><div id="autonomy-reviews" class="muted"></div></div><div class="card admin-actions-panel"><div class="label">Owner-approved administrator actions</div><div id="admin-status" class="value">Loading…</div><div id="admin-note" class="muted"></div><div class="actions"><select id="admin-action" aria-label="Staging administrative action"></select><button id="admin-preview" class="button" type="button" disabled>Preview action</button></div><div id="admin-preview-result" class="muted" style="margin-top:14px"></div><div class="actions"><input id="admin-confirmation" type="text" maxlength="80" aria-label="Type the exact approval phrase" placeholder="Preview an action to obtain the approval phrase" disabled><button id="admin-execute" class="button" type="button" disabled>Approve and execute once</button></div><div id="admin-result" class="muted" style="margin-top:14px"></div></div></div></div></section></main>
 {TABLE_SCRIPT}<script>
@@ -10952,11 +10986,19 @@ await renderAsOf(asOfSelect.value)
 from .agent_web import case_question_stream as _case_question_stream
 from .agent_web import install as _install_agent_web
 
+def _agent_account_names(user: dict[str, object]) -> dict[str, str]:
+    from .viewer_labels import account_card_title
+
+    return {str(item["subject_id"]): account_card_title(item) for item in _account_directory(user)}
+
+
 _install_agent_web(
     app,
     _authorized_user,
     lambda user: _authorized_subject_ids(user, feature_key="viewer_access"),
     ACCOUNT_THEME_CSS,
+    render_page=_platform_shell,
+    account_names=_agent_account_names,
 )
 
 

@@ -43,11 +43,49 @@ class AgentWebTests(unittest.TestCase):
         self.assertFalse(viewer.get("/api/agents/status").json()["enabled"])
         self.assertEqual(viewer.get("/api/agents/inbox").status_code, 404)
 
-    def test_widget_is_added_only_to_the_three_pages(self):
+    def test_widget_is_on_every_page_and_the_chat_on_every_account_tab(self):
         client = _app("owner", OWNER)
-        self.assertIn('<script src="/agents/widget.js" defer></script></body>', client.get("/accounts/U1/holdings").text)
-        self.assertNotIn("widget.js", client.get("/accounts/U1/cash").text)
+        for path in ("/accounts/U1/holdings", "/accounts/U1/cash", "/accounts/U1/risk", "/accounts/U1/ai-analyst"):
+            self.assertIn('<script src="/agents/widget.js" defer></script></body>', client.get(path).text)
         self.assertEqual(client.get("/agents/widget.js").headers["content-type"].split(";")[0], "application/javascript")
+        script = client.get("/agents/widget.js").text
+        self.assertIn(r"/^\/accounts\/([^/]+)\/([^/]+)$/", script)
+        self.assertIn("a[data-agent-inbox]", script)  # the navigation badge
+        self.assertIn("What if Hong Kong falls 10%?", script)  # a starter question on the Risk tab
+        self.assertIn("e.key==='Escape'", script)
+
+    def test_ui_enabled_for_matches_the_mode(self):
+        with mock.patch.dict(os.environ, {"AGENT_UI_MODE": "owner"}):
+            self.assertTrue(agent_web.ui_enabled_for(OWNER))
+            self.assertFalse(agent_web.ui_enabled_for(VIEWER))
+        with mock.patch.dict(os.environ, {"AGENT_UI_MODE": "all"}):
+            self.assertTrue(agent_web.ui_enabled_for(VIEWER))
+        with mock.patch.dict(os.environ, {"AGENT_UI_MODE": "off"}):
+            self.assertFalse(agent_web.ui_enabled_for(OWNER))
+
+    def test_inbox_page_uses_the_website_shell_and_account_names(self):
+        app = FastAPI()
+        shell_calls = []
+
+        def shell(user, *, active, title, description, content, script):
+            shell_calls.append(active)
+            return f"<html><body><nav>site</nav><h1>{title}</h1>{content}{script}</body></html>"
+
+        with mock.patch.dict(os.environ, {"AGENT_UI_MODE": "owner", "AGENT_API_URL": "https://agent.internal",
+                                          "AGENT_API_AUDIENCE": "api://wealthryse-agent", "MONTH_TEAM_UI": "owner"}):
+            agent_web.install(app, lambda: OWNER, lambda u: ["U1"], "", render_page=shell,
+                              account_names=lambda u: {"U1": "U1 - Growth </script>"})
+            client = TestClient(app)
+            page = client.get("/agent-inbox").text
+            month = client.get("/month-end").text
+        self.assertIn("<nav>site</nav>", page)
+        self.assertIn('const NAMES={"U1": "U1 - Growth <\\/script>"};', page)
+        self.assertIn("weekly_brief:'Weekly brief'", page)
+        self.assertIn("live_alert:'Live alert'", page)
+        self.assertIn('href="/month-end"', page)
+        self.assertEqual(shell_calls, ["agent-inbox", "month-end"])
+        self.assertIn('id="rows"', month)
+        self.assertNotIn("<title>Month-end</title>", month)
 
     def test_chat_checks_the_website_account_list_first(self):
         client = _app("all", VIEWER)

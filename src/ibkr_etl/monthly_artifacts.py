@@ -904,6 +904,41 @@ def _draw_table(
             cursor += width
 
 
+FACTSHEET_HISTORY_MONTHS_SHOWN = 36
+
+
+def _history_display(inputs: FactsheetInputs) -> tuple[str, list[list[str]]]:
+    """The Historical Performance heading and body rows printed on page one.
+
+    Up to 36 month-ends every row is shown. A longer history keeps its
+    inception row, then a "..." row, then the latest 36 month-ends; their
+    cumulative figures still run from inception.
+    """
+    def row(entry: dict[str, Any]) -> list[str]:
+        return [
+            entry["date"],
+            f"{entry['normalized_nav']:.2f}",
+            "-" if entry["monthly_return"] is None else _percent(entry["monthly_return"]),
+            "-" if entry["monthly_return"] is None else _percent(entry["cumulative_return"]),
+        ]
+
+    inception, months = inputs.history[0], inputs.history[1:]
+    end = _display_date(inputs.period_end, short=True)
+    if len(months) <= FACTSHEET_HISTORY_MONTHS_SHOWN:
+        return (
+            f"Historical Performance from {_display_date(inputs.history_start_date, short=True)} to {end}",
+            [row(entry) for entry in inputs.history],
+        )
+    return (
+        f"Historical Performance, last {FACTSHEET_HISTORY_MONTHS_SHOWN} months to {end}",
+        [
+            [f"Inception {_display_date(inception['date'], short=True)}", f"{inception['normalized_nav']:.2f}", "-", "-"],
+            ["...", "", "", ""],
+            *(row(entry) for entry in months[-FACTSHEET_HISTORY_MONTHS_SHOWN:]),
+        ],
+    )
+
+
 def _historical_performance_geometry(body_rows: int) -> tuple[float, float, float]:
     """Keep the growing history table bottom-aligned and expand it upward."""
     if body_rows < 1:
@@ -999,31 +1034,18 @@ def _draw_factsheet_page_one(
         bold_last_row=True,
     )
 
-    body_rows = len(inputs.history)
+    history_heading, history_body = _history_display(inputs)
     history_heading_y, history_table_top, body_height = _historical_performance_geometry(
-        body_rows
+        len(history_body)
     )
     c.setFont("Helvetica-Bold", 7.8)
-    c.drawString(
-        27,
-        history_heading_y,
-        f"Historical Performance from {_display_date(inputs.history_start_date, short=True)} to {_display_date(inputs.period_end, short=True)}",
-    )
+    c.drawString(27, history_heading_y, history_heading)
     history_rows = [[
         "DATE",
         "NORMALIZED NAV",
         "PERFORMANCE VS\nPREVIOUS MONTH",
         "CUMULATIVE PERFORMANCE\nFR INITIAL DATE",
-    ]]
-    for row in inputs.history:
-        history_rows.append(
-            [
-                row["date"],
-                f"{row['normalized_nav']:.2f}",
-                "-" if row["monthly_return"] is None else _percent(row["monthly_return"]),
-                "-" if row["monthly_return"] is None else _percent(row["cumulative_return"]),
-            ]
-        )
+    ], *history_body]
     _draw_table(
         c,
         x=27,
@@ -1052,6 +1074,26 @@ def _draw_factsheet_page_one(
         layout["period_date_y"],
         inputs.display_date,
     )
+
+
+def _account_chart_month_ticks(start: date, end: date) -> tuple[date, ...]:
+    """First-of-month ticks after ``start``: every odd month, thinned for long histories.
+
+    Up to three years keeps the approved Jan/Mar/May... cadence. Longer
+    histories step to Jan/Jul, then to January only, so labels stay apart.
+    """
+    month_span = (end.year - start.year) * 12 + end.month - start.month
+    month_step = 2 if month_span <= 36 else 6 if month_span <= 72 else 12
+    # Zero-based month index; January is index 0, so odd months are even indices.
+    index = start.year * 12 + start.month - 1
+    index += (-index) % month_step
+    if date(index // 12, index % 12 + 1, 1) <= start:
+        index += month_step
+    ticks: list[date] = []
+    while (tick := date(index // 12, index % 12 + 1, 1)) <= end:
+        ticks.append(tick)
+        index += month_step
+    return tuple(ticks)
 
 
 def _draw_factsheet_page_two(
@@ -1086,11 +1128,20 @@ def _draw_factsheet_page_two(
     if maximum <= minimum:
         minimum -= 5.0
         maximum += 5.0
-    first_tick = math.ceil(minimum / 10.0) * 10.0
-    last_tick = math.floor(maximum / 10.0) * 10.0
+    # Ten-point gridlines, widened for strongly trending histories so the
+    # labels never pile up (no more than ten across the plot).
+    y_step = next(
+        step
+        for step in (10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, math.inf)
+        if (maximum - minimum) / step <= 10.0
+    )
+    if not math.isfinite(y_step):
+        y_step = 10.0 ** math.ceil(math.log10((maximum - minimum) / 10.0))
+    first_tick = math.ceil(minimum / y_step) * y_step
+    last_tick = math.floor(maximum / y_step) * y_step
     y_ticks = tuple(
-        first_tick + 10.0 * index
-        for index in range(max(0, int(round((last_tick - first_tick) / 10.0))) + 1)
+        first_tick + y_step * index
+        for index in range(max(0, int(round((last_tick - first_tick) / y_step))) + 1)
     )
     c.setStrokeColor(GRID)
     c.setFillColor(MUTED)
@@ -1106,24 +1157,7 @@ def _draw_factsheet_page_two(
     end_date = date.fromisoformat(inputs.normalized_nav[-1]["date"])
     start_ordinal = start_date.toordinal()
     ordinal_span = max(1, end_date.toordinal() - start_ordinal)
-    tick_year, tick_month = start_date.year, start_date.month
-    if tick_month % 2 == 0:
-        tick_month += 1
-    while date(tick_year, tick_month, 1) <= start_date:
-        tick_month += 2
-        if tick_month > 12:
-            tick_month -= 12
-            tick_year += 1
-    date_ticks: list[date] = []
-    while True:
-        tick_date = date(tick_year, tick_month, 1)
-        if tick_date > end_date:
-            break
-        date_ticks.append(tick_date)
-        tick_month += 2
-        if tick_month > 12:
-            tick_month -= 12
-            tick_year += 1
+    date_ticks = _account_chart_month_ticks(start_date, end_date)
     c.setFont("Helvetica", 6.5)
     for tick_date in date_ticks:
         x = x0 + width * (tick_date.toordinal() - start_ordinal) / ordinal_span
@@ -2253,12 +2287,13 @@ def validate_factsheet_layout(path: str | Path, inputs: FactsheetInputs) -> None
             y=row_y,
             size=4.7,
         )
+    history_heading, history_body = _history_display(inputs)
     history_heading_y, history_table_top, _ = _historical_performance_geometry(
-        len(inputs.history)
+        len(history_body)
     )
     _require_run(
         page_one_runs,
-        f"Historical Performance from {_display_date(inputs.history_start_date, short=True)} to {_display_date(inputs.period_end, short=True)}",
+        history_heading,
         x=27,
         y=history_heading_y,
         size=7.8,

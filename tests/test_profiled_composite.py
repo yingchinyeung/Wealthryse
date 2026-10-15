@@ -247,6 +247,15 @@ class StoredInputTests(unittest.TestCase):
                 configuration_sha256,approval_status,effective_to);
             CREATE TABLE subject_nav_series(tenant_id,subject_id,snapshot_date,currency,total_text);
             CREATE TABLE risk_free_rates(tenant_id,rate_date,series_id,currency,tenor,annual_rate,quality_status);
+            CREATE TABLE synthetic_portfolio_components(tenant_id,portfolio_id,snapshot_date,component_id,
+                base_currency,contribution);
+            CREATE TABLE subject_position_series(tenant_id,subject_id,snapshot_date,conid,currency,market_value_text);
+            CREATE TABLE crisis_replay_components(tenant_id,subject_id,holdings_as_of,conid,currency,price_type,
+                mapping_method,source_symbol,current_market_value,opening_weight,proxy_reason);
+            CREATE TABLE crisis_replay_daily(tenant_id,subject_id,holdings_as_of,observation_date,calculation_version,
+                quality_status,normalized_value,drawdown);
+            CREATE TABLE market_data_prices(tenant_id,instrument_id,symbol,price_date,price,currency,price_type);
+            CREATE TABLE reference_fx_rates(tenant_id,from_currency,to_currency,rate_date,rate,provider,quality_status);
         """)
         self.definition = definition()
         self.c.execute("INSERT INTO platform_subjects VALUES ('tenant',?,'composite_portfolio','HKD','HKD',?,?)",

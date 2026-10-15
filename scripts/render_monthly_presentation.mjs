@@ -643,10 +643,13 @@ for (const row of portfolioMonthRows) {
   if (!monthlyByYear.has(year)) monthlyByYear.set(year, Array(12).fill("—"));
   monthlyByYear.get(year)[month - 1] = row.portfolio_monthly_return == null ? "—" : percent(row.portfolio_monthly_return, 1);
 }
+// The template has two year rows: the reporting year and the one before it,
+// or the first two years when the history starts in the reporting year.
+const reportingYear = Number(periodEnd.slice(0, 4));
+const firstMonthlyYear = Math.max(Math.min(reportingYear, ...monthlyByYear.keys()), reportingYear - 1);
 setTable("tb/a9srud0n", [
   ["Year", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
-  ["2025", ...(monthlyByYear.get(2025) ?? Array(12).fill("—"))],
-  ["2026", ...(monthlyByYear.get(2026) ?? Array(12).fill("—"))],
+  ...[firstMonthlyYear, firstMonthlyYear + 1].map(year => [String(year), ...(monthlyByYear.get(year) ?? Array(12).fill("—"))]),
 ]);
 setText("sh/361gvilk", `Total return ${percent(isMsHkd ? risk.total_return : portfolioTotalReturn)}  •  Annualized return ${percent(isMsHkd ? risk.annualized_return : portfolioAnnualizedReturn)}  •  Win rate ${percent(risk.win_rate)}`);
 setText("sh/25sf2d4z", isMsHkd ? 'January 2025 is a partial month from inception on 20 January. Monthly returns use observed HKD NAV.' : portfolioMonthlyNote(portfolioModel, shortDate));

@@ -23,6 +23,7 @@ from ibkr_etl.crisis_replay import (  # noqa: E402
     refresh_composite_crisis_replay,
     refresh_crisis_replay,
 )
+from ibkr_etl import crisis_scenarios  # noqa: E402
 from ibkr_etl.util import canonical_json, sha256_text  # noqa: E402
 
 
@@ -39,6 +40,40 @@ def _external_market_data_approved(connection, account_id: str) -> bool:
         (account_id,),
     ).fetchone()
     return row is not None
+
+
+def _crisis_scenario_subjects(connection) -> tuple[list[str], list[str]]:
+    """Active subjects whose owner approved sending holdings symbols to Yahoo."""
+
+    rows = connection.execute(
+        """
+        SELECT DISTINCT s.subject_id, s.subject_type
+        FROM platform_subjects s
+        JOIN account_onboarding_approvals a ON a.subject_id = s.subject_id
+        WHERE s.lifecycle_status = 'active'
+          AND a.approval_type = 'external_market_data'
+          AND a.approval_status = 'approved' AND a.revoked_at IS NULL
+          AND a.disclosure_version = 'yahoo-ticker-disclosure-v1'
+        ORDER BY s.subject_id
+        """
+    ).fetchall()
+    accounts = [str(r["subject_id"]) for r in rows
+                if r["subject_type"] in {"physical_account", "filtered_portfolio"}]
+    composites = [str(r["subject_id"]) for r in rows if r["subject_type"] == "composite_portfolio"]
+    return accounts, composites
+
+
+def _refresh_crisis_scenarios(connection) -> dict:
+    """The extra crisis scenarios; a failure here never fails the benchmark job."""
+
+    if not crisis_scenarios.website_enabled():
+        return {"status": "disabled"}
+    try:
+        accounts, composites = _crisis_scenario_subjects(connection)
+        return crisis_scenarios.refresh(connection, accounts=accounts, composites=composites)
+    except Exception as error:  # noqa: BLE001
+        connection.rollback()
+        return {"status": "failed", "error": " ".join(str(error).split())[:300]}
 
 
 def _mark_wave0_benchmark_fx_reconciled(connection, result: dict) -> None:
@@ -202,6 +237,7 @@ def main() -> int:
                         connection, account_id=account_id
                     )
             accounts.append(result)
+        scenarios = _refresh_crisis_scenarios(connection)
         result = {
             "status": "success",
             "accounts": accounts,
@@ -213,6 +249,7 @@ def main() -> int:
                 int(item.get("crisis_replay", {}).get("observations", 0))
                 for item in accounts
             ),
+            "crisis_scenarios": scenarios,
         }
         payload = canonical_json(result)
         finish_run_success(

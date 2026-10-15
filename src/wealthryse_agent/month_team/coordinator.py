@@ -292,7 +292,8 @@ class Coordinator:
         for page in figures.factsheet_commentary(pages or [], sentences):
             integrity.append({"target": "factsheet", "page": page,
                               "message": "The factsheet prints commentary; the factsheet never carries commentary."})
-        printed = page_checks.check_text(pages or [], date.fromisoformat(ctx.period_end))
+        printed = page_checks.check_text(pages or [], date.fromisoformat(ctx.period_end),
+                                         owner_layout=ctx.account_id in ALPHA_WORLD_FACTSHEETS)
         integrity += [{"target": "factsheet", **o} for o in printed.objections]
         review = Reviewer(self.model).check_files(
             account_id=ctx.account_id, period_end=ctx.period_end, snapshot=snapshot, factsheet_pages=pages,

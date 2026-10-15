@@ -320,9 +320,10 @@ DECK_REVIEW_SCHEMA = {"type": "object", "properties": {"objections": {"type": "a
 
 
 CLAIMS_SCHEMA = {"type": "object", "properties": {"findings": {"type": "array", "items": {
-    "type": "object", "properties": {"statement": {"type": "string"}, "evidence": {"type": "string"},
+    "type": "object", "properties": {"kind": {"type": "string", "enum": ["contradiction", "proofreading"]},
+                                     "statement": {"type": "string"}, "evidence": {"type": "string"},
                                      "explanation": {"type": "string"}},
-    "required": ["statement", "evidence", "explanation"], "additionalProperties": False}}},
+    "required": ["kind", "statement", "evidence", "explanation"], "additionalProperties": False}}},
     "required": ["findings"], "additionalProperties": False}
 
 
@@ -417,6 +418,10 @@ class Reviewer:
             explanation = " ".join(str(finding.get("explanation") or "").split())
             if not page_checks.quoted_in(statement, factsheet_pages):
                 set_aside.append({"statement": statement[:200], "reason": "The statement is not printed as quoted."})
+            elif finding.get("kind") == "proofreading":
+                # The evidence is the correction, so it need not be printed; the slip itself must be.
+                correction = f" should read {evidence[:160]}." if evidence else "."
+                notes.append(f'Proofreading: "{statement[:160]}"{correction} {explanation[:240]}'.strip())
             elif not evidence or not page_checks.figures_printed(evidence, factsheet_pages):
                 set_aside.append({"statement": statement[:200], "reason": "Its evidence quotes figures the page does not print."})
             else:

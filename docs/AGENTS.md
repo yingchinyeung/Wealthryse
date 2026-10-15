@@ -82,6 +82,18 @@ internal-reports, writes agent.month_* tables and agent.inbox only
   questions apply to both.
 - **Off by default.** `AGENT_UI_MODE=off` on the website. `owner` shows it to
   owners only; `all` to everyone with account access.
+- **Where people find it.** When it is on for someone: "Agent inbox" in the top
+  navigation with a count of new items; the "Ask about this account" button and
+  Explain buttons on every account tab, with starter questions for that tab.
+  While the older analyst's model (`AI_ANALYST_ENABLED`) is off, its AI analyst
+  tab is left out and old links to it open Overview with the chat open. The
+  Agent inbox and Month-end pages use the website's own header and navigation,
+  and Month-end is under Operations. System health opens with an "At a glance"
+  summary and the open incidents, each with the operations agent's diagnosis,
+  its draft fix and (for the owner) "Ask the administrator about this", which
+  opens Administration with the question filled in. In the Administration chat,
+  each update says whether the administrator, the operations agent or the
+  connection agent wrote it.
 
 ## Turning it on (each Azure step needs Ying's typed approval)
 

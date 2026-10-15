@@ -156,6 +156,12 @@ from .web_analytics_ui import (
     RISK_ANALYTICS_CARDS,
     TRADING_ACTIVITY_CARD,
 )
+from .web_modelling import (
+    MODELLING_CARDS,
+    MODELLING_CSS,
+    MODELLING_SCRIPT,
+    install as _install_modelling,
+)
 from .portfolio_analytics import (
     CORRELATION_HOLDINGS,
     holdings_concentration,
@@ -4895,6 +4901,7 @@ ACCOUNT_SECTIONS = {
     "performance": "Performance",
     "holdings": "Holdings",
     "risk": "Risk analytics",
+    "modelling": "Modelling",
     "cash": "Cash",
     "trades": "Trade history",
     "reports": "Monthly reports",
@@ -10856,6 +10863,12 @@ def _render_account_page(
             ("risk-rolling", "Rolling risk"),
             ("risk-correlation", "Correlation"),
         ),
+        "modelling": (
+            ("model-projection", "Wealth projection"),
+            ("model-whatif", "What-if"),
+            ("model-optimise", "Optimisation"),
+            ("model-factors", "Factor model"),
+        ),
     }.get(section, ())
     section_jumps = (
         '<nav class="section-jumps" aria-label="Jump to a section">'
@@ -10898,7 +10911,7 @@ def _render_account_page(
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_title} · {account_display_name} · {PLATFORM_NAME}</title>
-<style>{ACCOUNT_THEME_CSS}</style></head>
+<style>{ACCOUNT_THEME_CSS}{MODELLING_CSS}</style></head>
 <body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
 <main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>{account_display_name}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{account_display_name}</h1><div class="muted">{reporting_currency} reporting · Data from {history_start_date}</div><div id="freshness" class="freshness" hidden></div></div><div class="account-hero-controls"><label class="asof-control{' report-date-hidden' if section == 'reports' else ''}"><span class="label">As of</span><select id="asof-select" class="asof-select" aria-label="Portfolio as of date"><option>Loading…</option></select></label>{account_switcher}</div></div><div class="account-sticky"><nav class="account-nav" aria-label="{account} sections">{navigation}</nav>{section_jumps}</div><h2 class="sr-only">{page_title}</h2>
 <section class="grid" id="portfolio-grid">{preview_notice}<div class="page-view{active['overview']}" data-section="overview"><div class="card wide overview-nav"><div class="overview-nav-head"><div class="overview-nav-copy"><div class="label">Net asset value</div><div class="overview-nav-line"><span id="nav" class="value">—</span><span id="overview-day" class="overview-day"></span></div><div id="overview-asof" class="muted">{reporting_currency} reporting</div></div><svg id="overview-spark" class="overview-spark" viewBox="0 0 320 64" preserveAspectRatio="none" role="img" aria-label="NAV trend over the last year"></svg></div><div id="overview-returns" class="metrics overview-returns"><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div></div></div><div class="card overview-half"><div class="label">Top holdings · <span id="positions">—</span> positions</div><div id="overview-holdings" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">All holdings <span aria-hidden="true">→</span></a></div><div class="card overview-half"><div class="label">Sector allocation</div><div id="overview-sectors" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">Sector detail <span aria-hidden="true">→</span></a></div></div>
@@ -10909,6 +10922,7 @@ def _render_account_page(
 <div class="card wide" id="perf-benchmark"><div class="label">Comparison benchmark</div><select id="benchmark-select" aria-label="Comparison benchmark"></select><div id="benchmark" class="value">Loading…</div><div id="benchmark-note" class="muted"></div><div id="benchmark-metrics" class="metrics"></div></div>
 <div class="card wide" id="perf-flows"><div class="label">Contributions and withdrawals</div><div id="flows-totals" class="metrics"></div><div class="table-scroll"><table><thead><tr><th>Date</th><th>Type</th><th>Amount ({reporting_currency})</th></tr></thead><tbody id="flows-statement"></tbody></table></div><div id="flows-note" class="muted" style="margin-top:12px">Loading contributions and withdrawals…</div></div></div>
 <div class="page-view{active['risk']}" data-section="risk"><div class="card wide" id="risk-summary"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div><div class="card wide" id="crisis-scenarios-card" hidden><div class="label">Crisis scenarios</div><table><thead><tr><th>Crisis</th><th>Window</th><th>Maximum drawdown</th><th>Stand-ins (scaled)</th></tr></thead><tbody id="crisis-scenarios"></tbody></table><div id="crisis-scenarios-note" class="muted"></div></div>{RISK_ANALYTICS_CARDS}{CORRELATION_CARD}</div>
+<div class="page-view{active['modelling']}" data-section="modelling">{MODELLING_CARDS}</div>
 <div class="page-view{active['cash']}" data-section="cash"><div class="card wide"><div class="label"><span id="cash-kind">Cash balances</span> as of <span id="cash-asof">—</span></div><div id="cash-balances" class="metrics"></div><div id="cash-ledger-controls"><div class="label" style="margin-top:18px">Cash activity history</div><div class="muted">Choose a custom date range to view every matching IBKR cash activity. The CSV download contains the same complete filtered result.</div><div class="filter-grid"><label><span class="label">From</span><input id="cash-from" type="date" min="{history_start_date}" aria-label="Cash activity start date"></label><label><span class="label">To</span><input id="cash-to" type="date" min="{history_start_date}" aria-label="Cash activity end date"></label></div><div class="actions"><button id="cash-apply" class="button" type="button">Apply cash filters</button><a id="cash-export" class="button" href="#">Download cash activity CSV</a></div></div><div id="cash-note" class="muted" style="margin-top:12px">Loading cash activity…</div><div id="cash-ledger-table" class="table-scroll"><table><thead><tr><th>Date</th><th>Time</th><th>Type</th><th>Description</th><th>Currency</th><th>Amount</th></tr></thead><tbody id="cash-activity"></tbody></table></div></div></div>
 <div class="page-view{active['trades']}" data-section="trades">{TRADING_ACTIVITY_CARD}<div class="card wide"><div class="label">Trade history</div><div id="trade-source-title" class="value">Trade records</div><div id="trade-source-note" class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div id="trade-filter-controls" class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
 <div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Sector allocation</div><div id="sector-summary" class="muted"></div><div id="sector-bars" class="sector-bars"></div><details class="sector-detail"><summary>Industries within each sector</summary><div class="table-scroll"><table><thead><tr><th class="text-col">Sector</th><th class="text-col">Industry</th><th class="text-col">Region</th><th>Holdings</th><th>Value (<span>{reporting_currency}</span>)</th><th>Weight</th></tr></thead><tbody id="sector-detail"></tbody></table></div></details><div id="sector-note" class="muted sector-note"></div></div>{HOLDINGS_CONCENTRATION_CARD}<div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-tools"><input id="holdings-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter holdings"><span id="holdings-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th title="14-day relative strength index from daily closing marks. Above 70 is overbought, below 30 oversold.">RSI (14)</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
@@ -10998,6 +11012,7 @@ draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio
 const mergeRiskResponses=(core,details)=>{{const risk={{...core,...details}};if(core.cache_status!=='hit'||details.cache_status!=='hit'||core.snapshot_payload_sha256!==details.snapshot_payload_sha256){{risk.metrics={{}};risk.analytics_evidence={{}};risk.risk_free=null;risk.expected_tail_loss_contributors={{top:[],bottom:[]}};risk.crisis_replay=null;risk.cache_status='unavailable';risk.message=core.message||details.message||'Risk cache changed during this request; refresh to load one validated version.';}}return risk;}};
 {ACCOUNT_UI_SCRIPT}
 {ANALYTICS_SCRIPT}
+{MODELLING_SCRIPT}
 const renderAsOf=async asOf=>{{
 const grid=document.querySelector('#portfolio-grid');grid.classList.add('loading');
 try{{
@@ -11018,6 +11033,7 @@ if(activeSection==='holdings'){{void renderSectors(asOf);renderConcentration(h)}
 if(activeSection==='performance'||activeSection==='risk')void renderAnalytics(asOf);
 if(activeSection==='trades')void renderTradingActivity(asOf);
 if(activeSection==='risk')void renderCorrelation(asOf);
+if(activeSection==='modelling')renderModelling(asOf);
 document.querySelector('#holdings-asof').textContent=h.snapshot_date||'No snapshot';
 document.querySelector('#holdings-quantity-label').textContent=h.holdings.some(x=>x.holding_kind==='synthetic_exposure')?'Sleeve coefficient (not shares)':'Quantity';
 document.querySelector('#holdings-reporting-currency').textContent=h.reporting_currency||reportingCurrency;
@@ -11151,4 +11167,21 @@ onboarding_v2_web.install(
     intake_container=ONBOARDING_INTAKE_CONTAINER,
     # "Ask about this case", answered by the agent service from the case's facts (also behind that switch).
     ask_case=lambda: _case_question_stream(),
+)
+
+
+# Account Modelling tab: wealth projection, what-if, optimisation and factor model (web_modelling.py).
+_install_modelling(
+    app,
+    authorized_user=_authorized_user,
+    access_context=_portfolio_access_context,
+    parse_as_of=_parse_as_of,
+    read_database=lambda: _database(),
+    nav_values=_subject_nav_values,
+    external_flows=_subject_external_flows,
+    latest_holdings=_latest_subject_holdings,
+    enrich_holdings=_enrich_subject_holdings,
+    comparison_version=website_comparison_version,
+    tenant_id=TENANT_ID,
+    risk_analytics_version=RISK_ANALYTICS_VERSION,
 )

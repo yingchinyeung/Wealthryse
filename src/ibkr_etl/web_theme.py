@@ -334,6 +334,7 @@ select, input[type=text], input[type=search], input[type=date], input.secret-fie
 select:hover, input:hover, textarea:hover { border-color: var(--muted); }
 select:focus-visible, input:focus-visible, textarea:focus-visible { border-color: var(--ink); box-shadow: none; }
 a:focus-visible, button:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; box-shadow: none; }
+input[type=number], .page-view[data-section] input[type=number] { color: var(--ink); background: var(--surface); border: 1px solid var(--line-strong); border-radius: 0; box-shadow: none; }
 
 /* Surfaces: flat panels with hairline borders. */
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none; }

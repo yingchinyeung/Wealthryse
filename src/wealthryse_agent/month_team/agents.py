@@ -412,8 +412,9 @@ class Reviewer:
             return [], [{"statement": "", "reason": f"The claims check did not run ({error.code})."}], {}
         notes, set_aside = [], []
         for finding in result.get("findings", []):
-            statement, evidence = str(finding.get("statement") or "").strip(), str(finding.get("evidence") or "").strip()
-            explanation = str(finding.get("explanation") or "").strip()
+            statement = " ".join(str(finding.get("statement") or "").split()).strip("“”\"' ")
+            evidence = " ".join(str(finding.get("evidence") or "").split())
+            explanation = " ".join(str(finding.get("explanation") or "").split())
             if not page_checks.quoted_in(statement, factsheet_pages):
                 set_aside.append({"statement": statement[:200], "reason": "The statement is not printed as quoted."})
             elif not evidence or not page_checks.figures_printed(evidence, factsheet_pages):

@@ -630,6 +630,31 @@ class WriterReviewerTests(unittest.TestCase):
         self.assertEqual(spread, ["The benchmark adds a spread that is never stated."])
         self.assertEqual(page_checks.check_text(["HIBOR + spread of 2.00%, HKD, YTD +1.00%"], date(2026, 9, 30)).notes, [])
 
+    def test_quotes_match_with_quotation_marks_and_hyphenated_line_breaks(self):
+        from wealthryse_agent.month_team import page_checks
+
+        # Replay round 4 set aside real statements only because the model wrapped them in quotation marks.
+        pages = ["Strategy\nIt seeks alpha-\ngenerated income from a diversified\nportfolio of example holdings."]
+        self.assertTrue(page_checks.quoted_in("“It seeks alpha-generated income from a diversified portfolio”", pages))
+        self.assertTrue(page_checks.quoted_in('"...a diversified portfolio of example holdings."', pages))
+        self.assertFalse(page_checks.quoted_in("“A fully hedged portfolio.”", pages))
+        self.assertFalse(page_checks.quoted_in('""', pages))
+
+    def test_visual_qa_sets_aside_a_vague_short_period_on_a_table_ending_on_the_last_trading_day(self):
+        # Replay round 4: "does not extend through ... missing the final months", quoting no date (made-up rows).
+        pages = ["Historical Performance\n2026-04-30\n104.20\n2026-05-29\n106.80\n31 May 2026"]
+        findings = [{"page": 1, "severity": "high", "kind": "wrong_period", "description": "The historical performance "
+                     "table does not extend through the stated ending date and is missing the final months."}]
+        result = VisualQA(TeamModel(APAC, tokens_left=10**6, client=FakeModel(visual=findings))).inspect_factsheet(
+            [b"png1"], display_date="31 May 2026", period_label="ending 31 May 2026", page_text=pages, period_end="2026-05-31")
+        self.assertEqual(result.objections, [])
+        self.assertIn("reaches 2026-05-29", result.evidence["set_aside"][0]["reason"])
+        # A table that really stops early is not excused.
+        early = ["Historical Performance\n2026-03-31\n101.50\n31 May 2026"]
+        result = VisualQA(TeamModel(APAC, tokens_left=10**6, client=FakeModel(visual=findings))).inspect_factsheet(
+            [b"png1"], display_date="31 May 2026", period_label="ending 31 May 2026", page_text=early, period_end="2026-05-31")
+        self.assertEqual(len(result.objections), 1)
+
     def test_printed_text_checks_find_unevenly_spaced_chart_dates(self):
         from wealthryse_agent.month_team import page_checks
 

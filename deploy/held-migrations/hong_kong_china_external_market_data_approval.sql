@@ -1,3 +1,9 @@
+-- HELD until the 14-day scheduled-cycle watch ends (29 Oct 2026). Applying it
+-- also starts China & Hong Kong's analytics gate in the scheduled derived-daily
+-- job (benchmark, Lehman replay and sector coverage must all pass, or the job
+-- exits 1), which could fail a watch day. After the watch, move it back to
+-- migrations/postgres/ as the next number and apply it with the bootstrap job.
+--
 -- The owner approved sending China & Hong Kong's ticker symbols to Yahoo
 -- Finance on 15 October 2026, in the project thread, so that its crisis
 -- scenarios (and Alpha World MS's, which hold it as a sleeve) can be

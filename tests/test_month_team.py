@@ -654,6 +654,14 @@ class WriterReviewerTests(unittest.TestCase):
         result = VisualQA(TeamModel(APAC, tokens_left=10**6, client=FakeModel(visual=findings))).inspect_factsheet(
             [b"png1"], display_date="31 May 2026", period_label="ending 31 May 2026", page_text=early, period_end="2026-05-31")
         self.assertEqual(len(result.objections), 1)
+        # Replay round 7: "does not include an entry for" the report date, on a table whose last row is that date.
+        rows = ["Historical Performance from 20 Jan 2025 to 30 Jun 2026\n2026-05-29\n102.70\n2026-06-30\n104.90"]
+        missing = [{"page": 1, "severity": "high", "kind": "wrong_period", "description": "The historical performance "
+                    "table does not include an entry for 30 Jun 2026 despite being labeled as ending on that date."}]
+        result = VisualQA(TeamModel(APAC, tokens_left=10**6, client=FakeModel(visual=missing))).inspect_factsheet(
+            [b"png1"], display_date="30 Jun 2026", period_label="ending 30 Jun 2026", page_text=rows, period_end="2026-06-30")
+        self.assertEqual(result.objections, [])
+        self.assertIn("reaches 2026-06-30", result.evidence["set_aside"][0]["reason"])
 
     def test_printed_text_checks_find_unevenly_spaced_chart_dates(self):
         from wealthryse_agent.month_team import page_checks

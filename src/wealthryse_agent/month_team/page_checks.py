@@ -35,9 +35,12 @@ _ARITHMETIC = re.compile(r"\b(?:inconsisten\w*|does not (?:equal|match|add|recon
                          re.I)
 _ENDING = re.compile(r"\b(?:end|ends|ending|ended|through|until|last|final|latest|stops?|dated|labell?ed|period)\b", re.I)
 _CURRENCY = re.compile(r"\b(?:USD|HKD|CNY|CNH|RMB|EUR|GBP|JPY|SGD|AUD)\b|US\$|HK\$|S\$|A\$|€|£|¥")
-_SHORT_PERIOD = re.compile(r"\b(?:missing|does not (?:extend|reach|run|cover)|doesn't (?:extend|reach|run|cover)|"
+# Replay round 7 added "does not include an entry for 30 Jun 2026 ... labeled as ending", on a table whose last row
+# was 2026-06-30.
+_SHORT_PERIOD = re.compile(r"\b(?:missing|does not (?:extend|reach|run|cover|include|show)|"
+                           r"doesn't (?:extend|reach|run|cover|include|show)|has no|lacks?|omits?|"
                            r"stops? (?:short|before)|ends? (?:short|before)|incomplete)\b[^.]{0,80}?"
-                           r"\b(?:months?|rows?|through|period|end(?:ing)? date)\b", re.I)
+                           r"\b(?:months?|rows?|entry|entries|through|period|end(?:ing)? date|ending)\b", re.I)
 _YTD = re.compile(r"\bYTD\b|year[- ]to[- ]date", re.I)
 _SPREAD = re.compile(r"\+\s*spread\b", re.I)
 _AXIS_LABEL = re.compile(r"^(20\d\d)-(\d\d)$")

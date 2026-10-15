@@ -300,6 +300,7 @@ class Coordinator:
             deck_slides=slides, figure_set=run.get("figures") or {}, inception_date=(run.get("figures") or {}).get("inception_date"))
         reviewer = Reviewer(self.model)
         claim_notes, claims_aside, claims_usage = reviewer.check_claims(pages) if pages else ([], [], {})
+        claim_notes = page_checks.new_slips(printed.notes, claim_notes)
         for key, value in claims_usage.items():
             review.usage[key] = review.usage.get(key, 0) + value
         if claims_aside:

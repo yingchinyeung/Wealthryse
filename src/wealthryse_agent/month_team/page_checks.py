@@ -170,6 +170,45 @@ def quoted_in(quote: str, pages: Sequence[str]) -> bool:
     return len(core) >= 3 and core in _flat(" ".join(pages))
 
 
+def slip_printed(slip: str, pages: Sequence[str]) -> bool:
+    """Whether a proofreading slip is printed as whole words. (Replay round 6: "United State" was matched inside
+    "United States", and "professional and i" inside a sentence the model only saw cut short.)"""
+    core = _flat(slip).strip("\"' ").removeprefix("...").removesuffix("...").strip("… ")
+    return len(core) >= 3 and re.search(rf"(?<!\w){re.escape(core)}(?!\w)", _flat(" ".join(pages))) is not None
+
+
+def repeated_label(slip: str) -> bool:
+    """A label printed twice in a row with nothing between ("BENCHMARK BENCHMARK"): the owner template's text layer
+    lays the same label over itself, so the page shows it once. (Replay round 6.)"""
+    return re.fullmatch(r"(.{3,}?)\s+\1", " ".join(slip.split()), re.I) is not None
+
+
+def compact(text: str) -> str:
+    """The page text with what the model need not read twice taken out: runs of single letters (a paragraph the
+    template also draws one glyph at a time) and long lines already seen (overlaid copies of the same text). Short
+    labels are kept as printed. (Replay round 6: the disclosure pages run to 21,000 characters, mostly repeats, so
+    the model saw them cut part-way and reported the cut sentences as slips.)"""
+    out: list[str] = []
+    seen: set[str] = set()
+    run: list[str] = []
+    for line in [*text.splitlines(), None]:
+        s = line.strip() if line is not None else None
+        if s is not None and len(s) == 1:
+            run.append(s)
+            continue
+        if len(run) < 5:
+            out += run
+        run = []
+        if s is None:
+            break
+        if len(s) >= 25:
+            if s in seen:
+                continue
+            seen.add(s)
+        out.append(s)
+    return "\n".join(out)
+
+
 def figures_printed(text: str, pages: Sequence[str]) -> bool:
     """Whether every decimal or percentage quoted in ``text`` is printed on the pages."""
     printed = {_normal_figure(m.group(0)) for m in _FIGURE.finditer("\n".join(pages))}
@@ -242,6 +281,38 @@ def wording_notes(pages: Sequence[str], *, owner_layout: bool = False) -> list[s
     for slip in dict.fromkeys(slips):
         notes.append(f'Proofreading: "{slip}".')
     return notes
+
+
+def _overlaps(known: str, quoted: str) -> bool:
+    """Whether a quoted slip contains a known one, or shares three words in a row with it ("which would subject X
+    nor" and "would subject X nor any of its contractors")."""
+    if not known:
+        return False
+    if known in quoted:
+        return True
+    words = known.split()
+    return any(" ".join(words[i:i + 3]) in quoted for i in range(len(words) - 2))
+
+
+def new_slips(code_notes: Sequence[str], model_notes: Sequence[str]) -> list[str]:
+    """The model's notes without the proofreading slips the code already noted, so each slip is shown once.
+    (Replay round 6: the doubled floor and the brand's variant spelling were each noted by the code and again
+    by the model.)"""
+    known = [_flat(m) for n in code_notes if n.startswith("Proofreading:") for m in re.findall(r'"([^"]+)"', n)]
+    variants: list[str] = []
+    for note in code_notes:
+        if note.startswith("A name is printed two ways:"):
+            names = note.split(":", 1)[1].rstrip(".").split(" and ")
+            # The variant is the spelling without the internal capital (Wealthryse beside WealthRyse); case matters.
+            variants += [n.strip() for n in names if n.strip() and not _MIXED_CASE.fullmatch(n.strip())]
+    kept = []
+    for note in model_notes:
+        quoted = re.match(r'Proofreading: "([^"]*)"', note)
+        if quoted and (any(_overlaps(k, _flat(quoted.group(1))) for k in known)
+                       or any(re.search(rf"\b{re.escape(v)}\b", quoted.group(1)) for v in variants)):
+            continue
+        kept.append(note)
+    return kept
 
 
 def check_text(pages: Sequence[str], period_end: date, *, owner_layout: bool = False) -> TextFindings:

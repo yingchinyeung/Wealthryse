@@ -669,6 +669,7 @@ def factor_model(
     *,
     region_label: str,
     source_url: str | None = None,
+    labels: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Weekly Fama-French five-factor plus momentum regression of portfolio excess returns.
 
@@ -710,7 +711,7 @@ def factor_model(
         mean_factor = statistics.fmean(columns[index - 1])
         exposures.append({
             "factor": name,
-            "label": FACTOR_LABELS[name],
+            "label": (labels or FACTOR_LABELS).get(name, FACTOR_LABELS[name]),
             "beta": fit["coefficients"][index],
             "t_statistic": fit["t_statistics"][index],
             "significant": fit["t_statistics"][index] is not None and abs(fit["t_statistics"][index]) >= 2.0,

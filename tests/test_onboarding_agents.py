@@ -287,6 +287,53 @@ class DocumentRouteTests(unittest.TestCase):
         self.assertIn("Checked by agent", page)
 
 
+class AskAboutCaseTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(web.app)
+        web.app.dependency_overrides[web._onboarding_user] = lambda: OWNER
+        web.app.dependency_overrides[web._owner_user] = lambda: OWNER
+        self.addCleanup(web.app.dependency_overrides.clear)
+
+    def _ask(self, question="What is left before go-live?"):
+        return self.client.post(f"/api/onboarding-v2/cases/{CASE_ID}/ask", json={"question": question})
+
+    def test_hidden_while_switched_off_or_without_the_agent_service(self):
+        asked = []
+        with patch.dict(os.environ, AGENTS_OFF), patch.object(web, "_case_question_stream",
+                                                              return_value=lambda payload: asked.append(payload)):
+            self.assertEqual(self._ask().status_code, 404)
+        with patch.dict(os.environ, ON), patch.object(web, "_case_question_stream", return_value=None):
+            self.assertEqual(self._ask().status_code, 404)
+        self.assertEqual(asked, [])
+
+    def test_the_question_goes_to_the_agent_service_with_the_case_facts(self):
+        sent = []
+
+        def stream(payload):
+            sent.append(payload)
+            return iter([b'data: {"type": "answer", "answer": "Nothing [T1]."}\n\n'])
+
+        facts = {"case": {"ready": True}, "drafted_terms": None, "proposed_securities": []}
+        with patch.dict(os.environ, ON), patch.object(web, "_case_question_stream", return_value=stream), \
+                patch.object(web, "_database", side_effect=lambda: _database(_CaseReads())), \
+                patch.object(onboarding_agents, "case_facts", return_value=facts) as built:
+            response = self._ask()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn('"answer"', response.text)
+        self.assertEqual(built.call_args.args[1:], (web.TENANT_ID, CASE_ID))
+        self.assertEqual(sent, [{"user_object_id": "owner-oid", "case_id": CASE_ID, "question": "What is left before go-live?",
+                                 "conversation_id": None, "case_facts": facts}])
+
+    def test_only_the_owner_may_ask(self):
+        viewer = {**OWNER, "role": "operator"}
+        web.app.dependency_overrides[web._owner_user] = lambda: (_ for _ in ()).throw(
+            web.HTTPException(status_code=403, detail="Owner only"))
+        web.app.dependency_overrides[web._onboarding_user] = lambda: viewer
+        with patch.dict(os.environ, ON), patch.object(web, "_case_question_stream", return_value=lambda p: iter([])):
+            self.assertEqual(self._ask().status_code, 403)
+            self.assertIn('id="case-ask"', self.client.get(f"/account-onboarding/cases/{CASE_ID}").text)
+
+
 class ScheduledCallTests(unittest.TestCase):
     def test_the_daily_refresh_records_reconciliations_and_never_fails_on_them(self):
         import run_self_service_derived_refresh as refresh

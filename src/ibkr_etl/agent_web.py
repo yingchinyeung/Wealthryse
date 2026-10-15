@@ -12,6 +12,7 @@ screens (see month_team_web).
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -122,6 +123,19 @@ class _AgentApi:
                 client.close()
 
         return chunks()
+
+
+@functools.lru_cache(maxsize=1)
+def case_question_stream() -> Callable[[dict[str, Any]], Iterable[bytes]] | None:
+    """For the onboarding case page's "Ask about this case" box; None while the agent service is not configured.
+
+    That box is switched by ONBOARDING_AGENTS_ENABLED, not AGENT_UI_MODE (see onboarding_v2_web).
+    """
+    settings = _Settings()
+    if not settings.url or not settings.audience:
+        return None
+    api = _AgentApi(settings)
+    return lambda payload: api.stream("/v1/case-question", payload)
 
 
 def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],

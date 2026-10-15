@@ -76,6 +76,7 @@ TOOL_LABELS = {
     "get_data_freshness": "Checking how recent the data is",
     "get_nav_history": "Reading the value history",
     "get_risk_metrics": "Measuring risk",
+    "get_case": "Reading the case",
     calculator.NAME: "Calculating",
 }
 OUT_OF_SCOPE = ("I can explain your holdings and performance, but I can't recommend trades, rebalancing "

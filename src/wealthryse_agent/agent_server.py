@@ -29,7 +29,8 @@ from .auth import ServiceCaller, TokenSource, Unauthorized, verify_service_token
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings, ServiceAuthSettings
 from .database import connect
 from .month_team.store import MonthStore
-from .prompts import ANALYST
+from .prompts import ANALYST, CASE_ANALYST
+from . import calculator
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -74,6 +75,44 @@ class ChatRequest(BaseModel):
     account_id: str = Field(min_length=1, max_length=64)
     message: str = Field(min_length=1, max_length=2000)
     conversation_id: str | None = Field(default=None, max_length=36)
+
+
+class CaseQuestionRequest(BaseModel):
+    user_object_id: str = Field(pattern=USER_ID)
+    case_id: str = Field(pattern=USER_ID)
+    question: str = Field(min_length=1, max_length=2000)
+    conversation_id: str | None = Field(default=None, max_length=36)
+    # Computed by the platform from the case as it is now (the readiness pack and the agents' results).
+    case_facts: dict[str, Any]
+
+
+MAX_CASE_FACTS_BYTES = 200_000
+CASE_TOOL = "get_case"
+
+
+class CaseFacts:
+    """A one-tool client over the case facts the website sent, so the usual validator checks every figure."""
+
+    def __init__(self, case_id: str, facts: dict[str, Any]) -> None:
+        self.case_id, self.facts = case_id, facts
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        return [{"name": CASE_TOOL, "description": "Everything known about this onboarding case right now.",
+                 "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}}]
+
+    def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name != CASE_TOOL:
+            raise ToolCallFailed("unknown_tool", "That tool is not available here.")
+        return {"tool": CASE_TOOL, "account_id": None, "as_of": None, "data": self.facts,
+                "citations": [{"source": "onboarding_case", "case_id": self.case_id}]}
+
+    def close(self) -> None:
+        pass
+
+
+def case_subject(case_id: str) -> str:
+    """Case conversations sit beside account ones, keyed so they never mix."""
+    return "case:" + case_id.lower()
 
 
 class FeedbackRequest(BaseModel):
@@ -234,26 +273,7 @@ def create_app(services: Services) -> FastAPI:
             try:
                 run = services.agent().run(question=body.message, account_id=body.account_id, tools=tools, history=history,
                                            instructions=instructions)
-                for event in _with_keepalive(run, services.keepalive_seconds):
-                    if event is None:
-                        yield ": keepalive\n\n"
-                        continue
-                    if event["type"] in ("answer", "rejected"):
-                        turn = event.pop("turn")
-                        # Charts and tables ride in the citations column, so no schema change is needed.
-                        message_id = store.add_message(
-                            conversation_id, "assistant", turn.answer,
-                            citations=list(turn.citations) + [{"visual": v} for v in turn.visuals],
-                            status="ok" if event["type"] == "answer" else "rejected",
-                            correlation_id=correlation_id, usage=turn.usage)
-                        event.pop("reason", None)  # validator detail stays in logs
-                        event["message_id"] = message_id
-                        remembered = _remember(store, user, turn.remember) if event["type"] == "answer" else []
-                        yield _sse(event)
-                        if remembered:
-                            yield _sse({"type": "remembered", "memories": remembered})
-                        continue
-                    yield _sse(event)
+                yield from _answers(run, store, user, conversation_id, correlation_id, remember=True)
             except AgentError as error:
                 store.add_message(conversation_id, "assistant", error.message, status="failed",
                                   correlation_id=correlation_id)
@@ -264,6 +284,75 @@ def create_app(services: Services) -> FastAPI:
                             "message": "Something went wrong. Nothing was saved as an answer."})
             finally:
                 tools.close()
+            yield _sse({"type": "done"})
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+    def _answers(run: Iterator[dict[str, Any]], store: Store, user: str, conversation_id: str,
+                 correlation_id: str, *, remember: bool) -> Iterator[str]:
+        """The run's events as server-sent events, saving the final answer (and any memories) on the way."""
+        for event in _with_keepalive(run, services.keepalive_seconds):
+            if event is None:
+                yield ": keepalive\n\n"
+                continue
+            if event["type"] in ("answer", "rejected"):
+                turn = event.pop("turn")
+                # Charts and tables ride in the citations column, so no schema change is needed.
+                message_id = store.add_message(
+                    conversation_id, "assistant", turn.answer,
+                    citations=list(turn.citations) + [{"visual": v} for v in turn.visuals],
+                    status="ok" if event["type"] == "answer" else "rejected",
+                    correlation_id=correlation_id, usage=turn.usage)
+                event.pop("reason", None)  # validator detail stays in logs
+                event["message_id"] = message_id
+                remembered = _remember(store, user, turn.remember) if remember and event["type"] == "answer" else []
+                yield _sse(event)
+                if remembered:
+                    yield _sse({"type": "remembered", "memories": remembered})
+                continue
+            yield _sse(event)
+
+    @app.post("/v1/case-question")
+    def case_question(body: CaseQuestionRequest, _: ServiceCaller = Depends(caller)) -> StreamingResponse:
+        """The owner's question about one onboarding case, answered from the facts the website sent."""
+        correlation_id = str(uuid.uuid4())
+        user = body.user_object_id.lower()
+        if len(json.dumps(body.case_facts, default=str)) > MAX_CASE_FACTS_BYTES:
+            raise HTTPException(status_code=413, detail="This case has too much to read at once.")
+        store = services.store()
+        if store.tokens_used_today() >= services.runtime.daily_token_budget:
+            raise HTTPException(status_code=429, detail="Today's analysis budget is used up. Try again tomorrow.")
+        subject = case_subject(body.case_id)
+        if body.conversation_id:
+            conversation = store.conversation(body.conversation_id, user)
+            if conversation is None or conversation["subject_id"] != subject:
+                raise HTTPException(status_code=404, detail="Conversation not found.")
+            conversation_id = body.conversation_id
+            history = [{"role": m["role"], "content": m["content"]} for m in store.messages(conversation_id)
+                       if m["status"] == "ok"]
+        else:
+            conversation_id = store.create_conversation(user, subject, body.question.strip()[:80])
+            history = []
+        store.add_message(conversation_id, "user", body.question.strip(), correlation_id=correlation_id)
+        instructions = CASE_ANALYST.format(case_id=body.case_id.lower(), today=date.today().isoformat())
+
+        def events() -> Iterator[str]:
+            yield _sse({"type": "start", "conversation_id": conversation_id, "correlation_id": correlation_id})
+            try:
+                # The portfolio router would turn case questions away; the instructions keep it on the case.
+                run = services.agent().run(question=body.question, account_id=None, tools=CaseFacts(body.case_id, body.case_facts),
+                                           history=history, allowed_tools=[CASE_TOOL, calculator.NAME],
+                                           instructions=instructions, skip_router=True)
+                yield from _answers(run, store, user, conversation_id, correlation_id, remember=False)
+            except AgentError as error:
+                store.add_message(conversation_id, "assistant", error.message, status="failed",
+                                  correlation_id=correlation_id)
+                yield _sse({"type": "error", "code": error.code, "message": error.message})
+            except Exception:
+                LOGGER.exception("case question failed", extra={"correlation_id": correlation_id})
+                yield _sse({"type": "error", "code": "internal_error",
+                            "message": "Something went wrong. Nothing was saved as an answer."})
             yield _sse({"type": "done"})
 
         return StreamingResponse(events(), media_type="text/event-stream",

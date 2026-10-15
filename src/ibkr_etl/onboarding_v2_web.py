@@ -25,7 +25,7 @@ from datetime import date
 from typing import Any, Callable, Iterable, Literal, Mapping
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from .broker_connections import (
@@ -1363,6 +1363,12 @@ class PortfolioRequest(BaseModel):
     report_style: Literal["alpha-world-ms", "alpha-world-t"] | None = None
 
 
+class CaseQuestionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    question: str = Field(min_length=1, max_length=2000)
+    conversation_id: str | None = Field(default=None, max_length=36)
+
+
 class TrackLoginRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1390,6 +1396,7 @@ def install(
     upload_document: Callable[[str, str, bytes, str], None] | None = None,
     list_documents: Callable[[str, str], list[dict]] | None = None,
     intake_container: str = onboarding_agents.INTAKE_CONTAINER,
+    ask_case: Callable[[], Callable[[dict[str, Any]], Iterable[bytes]] | None] = lambda: None,
 ) -> None:
     """Add the new onboarding routes. Each answers 404 while the switch is off.
 
@@ -1398,7 +1405,8 @@ def install(
     download_report(container, blob) reads a stage 3 report from private storage.
     upload_document(container, blob, content, content_type) stores a case document in the private intake
     container without overwriting, and list_documents(container, prefix) lists what is there; both are used
-    only while ONBOARDING_AGENTS_ENABLED is on.
+    only while ONBOARDING_AGENTS_ENABLED is on. ask_case() gives the function that streams the agent
+    service's answer to an owner's question about a case, or None when that service is not configured.
     """
 
     def switched_on() -> None:
@@ -1475,7 +1483,24 @@ def install(
     @app.get("/api/onboarding-v2/cases/{case_id}")
     def case(case_id: uuid.UUID, user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
         detail = run(read_database, lambda c: case_detail(c, tenant_id, str(case_id)))
-        return {**detail, "may_approve": user.get("role") == "owner"}
+        owner = user.get("role") == "owner"
+        return {**detail, "may_approve": owner,
+                "may_ask": owner and onboarding_agents.agents_enabled() and ask_case() is not None}
+
+    @app.post("/api/onboarding-v2/cases/{case_id}/ask")
+    def ask_about_case(case_id: uuid.UUID, body: CaseQuestionRequest,
+                       user: dict[str, Any] = Depends(v2_owner)) -> StreamingResponse:
+        asker = ask_case() if onboarding_agents.agents_enabled() else None
+        if asker is None:
+            raise HTTPException(status_code=404, detail="Not found")
+        object_id = str(user.get("object_id") or "").lower()
+        if not object_id:
+            raise HTTPException(status_code=403, detail="Your sign-in has no Entra object ID.")
+        facts = run(read_database, lambda c: onboarding_agents.case_facts(c, tenant_id, str(case_id)))
+        stream = asker({"user_object_id": object_id, "case_id": str(case_id), "question": body.question,
+                           "conversation_id": body.conversation_id, "case_facts": facts})
+        return StreamingResponse(stream, media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
     @app.post("/api/onboarding-v2/cases")
     def start(body: StartCaseRequest, user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
@@ -1652,6 +1677,7 @@ CASE_CONTENT = """<div class="page-view active" data-section="account-onboarding
 <div class="card wide" id="case-proposals" hidden><div class="label">Proposed security master entries</div><p class="muted">Securities in this account that the security master does not have yet, as the agent proposes them. Nothing is added until you approve the account terms.</p><div id="case-proposal-list"></div></div>
 <div class="card wide" id="case-documents" hidden><div class="label">Client documents</div><p class="muted">The mandate, fee terms and side letters. The agent drafts the account terms from them, quoting each clause, for you to compare before approval 1.</p><div id="case-document-list"></div><form id="case-document-form" hidden><div class="actions"><input type="file" name="document" accept=".pdf,.docx,.txt,.md" required aria-label="Client document"><button class="button" type="submit">Add document</button></div><div class="muted" role="status"></div></form></div>
 <div class="card wide"><div class="label">Your three approvals</div><div id="case-approvals" class="status-row"></div><div id="case-term-draft" hidden></div><div id="case-readiness" hidden></div><div id="case-approval-form"></div><div id="case-result" class="muted" role="status" aria-live="polite"></div></div>
+<div class="card wide" id="case-ask" hidden><div class="label">Ask about this case</div><p class="muted">The analyst answers from this case's checks, approvals, terms and the agents' findings, and every figure it gives is checked against them. It cannot approve or change anything.</p><div id="case-ask-thread" aria-live="polite"></div><form id="case-ask-form"><textarea name="question" rows="2" maxlength="2000" required placeholder="For example: what is still stopping go-live?" aria-label="Your question" style="display:block;width:100%;min-width:0"></textarea><div class="actions"><button class="button" type="submit">Ask</button></div></form></div>
 <div class="card wide" id="case-cancel-card" hidden><div class="label">Stop this case</div><p class="muted">Cancelling frees the account or portfolio ID to be added again later. Nothing reached viewers.</p><div class="actions"><input id="case-cancel-reason" type="text" maxlength="500" placeholder="Reason" aria-label="Reason for cancelling"><button id="case-cancel" class="button" type="button">Cancel this case</button></div></div>
 </div>"""
 
@@ -1721,7 +1747,24 @@ const renderReadiness=r=>{const box=document.querySelector('#case-readiness');bo
 const renderDocuments=c=>{const card=document.querySelector('#case-documents');card.hidden=!c.agents;if(!c.agents)return;const form=document.querySelector('#case-document-form');form.hidden=!c.documents_open;
   fetch(`/api/onboarding-v2/cases/${caseId}/documents`).then(json).then(data=>{document.querySelector('#case-document-list').innerHTML=data.documents.length?data.documents.map(d=>row(d.name,`${Math.max(1,Math.round(d.byte_count/1024))} KB`,'')).join(''):'<p class="muted">No documents yet.</p>'}).catch(error=>{document.querySelector('#case-document-list').innerHTML=`<div class="warning">The documents could not be listed: ${esc(error.message)}</div>`})};
 document.querySelector('#case-document-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget,note=form.querySelector('[role=status]'),button=form.querySelector('button');button.disabled=true;note.textContent='Uploading…';try{const done=await fetch(`/api/onboarding-v2/cases/${caseId}/documents`,{method:'POST',body:new FormData(form)}).then(json);note.textContent=`Added ${done.name}. The agent drafts the terms on its next run.`;form.reset();load()}catch(error){note.textContent=`Not added: ${error.message}`}finally{button.disabled=false}});
+let askConversation=null;
+const askBubble=(who,text)=>{const box=document.querySelector('#case-ask-thread');const node=document.createElement('div');node.className='onboarding-row';node.style.display='block';node.innerHTML=`<div class="label">${esc(who)}</div><div style="white-space:pre-wrap">${esc(text)}</div>`;box.appendChild(node);return node.lastElementChild};
+document.querySelector('#case-ask-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget,button=form.querySelector('button'),question=form.question.value.trim();if(!question)return;
+  button.disabled=true;askBubble('You',question);const out=askBubble('Analyst','Reading the case…');form.reset();
+  try{const response=await fetch(`/api/onboarding-v2/cases/${caseId}/ask`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,conversation_id:askConversation})});
+    if(!response.ok)await json(response);
+    const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',answered=false;
+    for(;;){const {done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});let cut;
+      while((cut=buffer.indexOf('\n\n'))>=0){const chunk=buffer.slice(0,cut);buffer=buffer.slice(cut+2);
+        for(const line of chunk.split('\n')){if(!line.startsWith('data: '))continue;const e=JSON.parse(line.slice(6));
+          if(e.type==='start')askConversation=e.conversation_id;
+          else if(e.type==='status'&&!answered)out.textContent=e.text+'…';
+          else if(e.type==='answer'||e.type==='rejected'){answered=true;out.textContent=String(e.answer).replace(/\s?\[T\d+\]/g,'')}
+          else if(e.type==='error'){answered=true;out.textContent=e.message}}}}
+    if(!answered)out.textContent='No answer came back. Try again.'}
+  catch(error){out.textContent=`Not answered: ${error.message}`}finally{button.disabled=false}});
 const render=c=>{
+  document.querySelector('#case-ask').hidden=!c.may_ask;
   document.querySelector('#case-kicker').textContent=`Stage ${c.stage_number} of 4 · ${c.broker_label} · ${c.reporting_currency} reporting`;
   document.querySelector('#case-title').textContent=`${c.display_name} (${c.account})`;
   const portfolio=document.querySelector('#case-portfolio');portfolio.hidden=!c.composition_svg;

@@ -564,6 +564,7 @@ class AgentServerTests(unittest.TestCase):
         class FakeAgent:
             def run(self, **kwargs):
                 store.instructions.append(kwargs.get("instructions"))
+                store.last_run = kwargs
                 for event in events:
                     if event["type"] == "pause":
                         time.sleep(event["seconds"])
@@ -654,6 +655,41 @@ class AgentServerTests(unittest.TestCase):
         client.put("/v1/memory/focus", json={"user_object_id": user, "value": "drawdowns"})
         self.assertEqual(client.delete("/v1/memory", params={"user_object_id": user}).json(), {"deleted": 1})
         self.assertEqual(client.get("/v1/memory", params={"user_object_id": "not-an-id"}).status_code, 422)
+
+    def test_a_case_question_is_answered_from_the_case_facts_only(self):
+        store = _FakeStore()
+        client = self._client(store, [{"type": "answer", "answer": "Two checks are left [T1].", "citations": ["T1"],
+                                       "remember": [{"key": "answer_length", "value": "Short"}]}])
+        facts = {"ready": False, "blockers": ["Holdings and cash today has not run yet."]}
+        case_id = "33333333-3333-3333-3333-333333333333"
+        response = client.post("/v1/case-question", json={
+            "user_object_id": "22222222-2222-2222-2222-222222222222", "case_id": case_id,
+            "question": "What is left before go-live?", "case_facts": facts})
+        events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+        self.assertEqual([e["type"] for e in events], ["start", "answer", "done"])
+        self.assertEqual(store.conversations_made[0][1], "case:" + case_id)
+        run = store.last_run
+        self.assertEqual((run["account_id"], run["skip_router"], run["allowed_tools"]),
+                         (None, True, ["get_case", "calculate"]))
+        self.assertIn(f"case {case_id}", run["instructions"])
+        self.assertEqual(run["tools"].call("get_case", {})["data"], facts)
+        self.assertEqual(store.remembered, {})  # case questions never save preferences
+
+    def test_case_facts_have_a_size_limit_and_figures_are_checked_against_them(self):
+        from wealthryse_agent.agent_server import CaseFacts
+        from wealthryse_agent.validator import validate_answer
+
+        client = self._client(_FakeStore(), [])
+        response = client.post("/v1/case-question", json={
+            "user_object_id": "22222222-2222-2222-2222-222222222222",
+            "case_id": "33333333-3333-3333-3333-333333333333", "question": "Anything?",
+            "case_facts": {"blob": "x" * 200_001}})
+        self.assertEqual(response.status_code, 413)
+        facts = CaseFacts("c", {"checks": [{"label": "NAV reconciliation", "evidence": {"largest_difference_percent": 0.004}}],
+                                "history_start_date": "2025-01-02"})
+        results = {"T1": facts.call("get_case", {})}
+        self.assertTrue(validate_answer("The largest difference was 0.004% from 2025-01-02 [T1].", ["T1"], results).ok)
+        self.assertFalse(validate_answer("The largest difference was 0.9% [T1].", ["T1"], results).ok)
 
     def test_chat_refuses_accounts_the_person_cannot_see(self):
         store = _FakeStore()

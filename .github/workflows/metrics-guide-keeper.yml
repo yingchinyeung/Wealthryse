@@ -1,0 +1,128 @@
+name: Metrics guide keeper
+
+# Keeps the Metrics guide in step with the website. After each push to main,
+# weekly and on demand, it runs scripts/check_metrics_guide.py. When a website
+# figure has no definition or a calculation the guide describes has changed,
+# Claude drafts the guide update from the code (source files only, no client
+# data), the guide tests must pass, and the draft is opened as a pull request
+# for review. Nothing is merged or deployed by this workflow.
+#
+# Needs the ANTHROPIC_API_KEY secret (or CLAUDE_CODE_OAUTH_TOKEN) and the repo
+# setting "Allow GitHub Actions to create and approve pull requests". Without a
+# secret the run goes red and lists what drifted.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/ibkr_etl/**'
+      - 'src/wealthryse_agent/jobs.py'
+  schedule:
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: metrics-guide-keeper
+  cancel-in-progress: false
+
+jobs:
+  keep:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BRANCH: metrics-guide-keeper/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Install
+        run: |
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install --no-deps .
+      - name: Look for drift
+        id: audit
+        run: |
+          set +e
+          python scripts/check_metrics_guide.py --brief "$RUNNER_TEMP/metrics-guide-brief.md"
+          code=$?
+          set -e
+          if [ "$code" = 2 ]; then echo "drift=true" >> "$GITHUB_OUTPUT"; elif [ "$code" != 0 ]; then exit "$code"; fi
+          cat "$RUNNER_TEMP/metrics-guide-brief.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Skip if a keeper PR is already open
+        id: open
+        if: steps.audit.outputs.drift == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh pr list --state open --search "head:metrics-guide-keeper/" --json number --jq length)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+      - name: Check for a model credential
+        id: credential
+        if: steps.audit.outputs.drift == 'true' && steps.open.outputs.count == '0'
+        env:
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' || secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::error::The guide has drifted (see the summary) and no ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN secret is set, so no draft was made."
+            exit 1
+          fi
+      - name: Draft the guide update
+        if: steps.audit.outputs.drift == 'true' && steps.open.outputs.count == '0'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --max-turns 60
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(python scripts/check_metrics_guide.py:*),Bash(python -m unittest:*)"
+          prompt: |
+            You maintain the WealthRyse Metrics guide (src/ibkr_etl/metrics_guide.py). The brief at
+            ${{ runner.temp }}/metrics-guide-brief.md lists website figures with no definition and
+            calculations that changed since the guide was last checked. For each item:
+            - Read the calculation code it names and write or correct the definition so it states exactly
+              what the code does (meaning, calculation, interpretation, the CLIENT_CALCULATIONS line, and
+              METRIC_LOCATIONS, aliases and related links where useful). Quote constants from the code.
+            - If a changed calculation leaves the definition correct, leave the text alone.
+            - Wording that an existing definition already explains goes in LABEL_MAP in
+              src/ibkr_etl/metrics_guide_audit.py rather than a new definition.
+            Do not edit any other file. Then run `python scripts/check_metrics_guide.py --refresh` and
+            `python -m unittest tests.test_metrics_guide tests.test_metrics_guide_audit`, fix anything
+            that fails, and finish with a short summary of each change and the code line it rests on.
+      - name: Test the draft
+        if: steps.audit.outputs.drift == 'true' && steps.open.outputs.count == '0'
+        run: |
+          python scripts/check_metrics_guide.py
+          python -m unittest tests.test_metrics_guide tests.test_metrics_guide_audit
+      - name: Open the pull request
+        if: steps.audit.outputs.drift == 'true' && steps.open.outputs.count == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          changed=$(git status --porcelain -- src/ibkr_etl/metrics_guide.py src/ibkr_etl/metrics_guide_audit.py src/ibkr_etl/metrics_guide_sources.json)
+          if [ -z "$changed" ]; then echo "No changes drafted."; exit 0; fi
+          unexpected=$(git status --porcelain | grep -v -e 'src/ibkr_etl/metrics_guide.py' -e 'src/ibkr_etl/metrics_guide_audit.py' -e 'src/ibkr_etl/metrics_guide_sources.json' || true)
+          if [ -n "$unexpected" ]; then echo "::error::The draft touched other files:"; echo "$unexpected"; exit 1; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898099+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add src/ibkr_etl/metrics_guide.py src/ibkr_etl/metrics_guide_audit.py src/ibkr_etl/metrics_guide_sources.json
+          git commit -m "Metrics guide: bring definitions in line with the website"
+          git push -u origin "$BRANCH"
+          {
+            echo "Before: the Metrics guide had fallen behind the website. The drift found:"
+            echo
+            grep -e '^## ' -e '^### ' -e '^- ' -e '^Definitions to re-read' "$RUNNER_TEMP/metrics-guide-brief.md" | grep -v '^## When the guide is right'
+            echo
+            echo "After: Claude drafted the definitions from the code and the guide tests pass. Please check each change against the code before merging."
+            echo
+            echo "Drafted by the Metrics guide keeper workflow, run ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+          } > "$RUNNER_TEMP/body.md"
+          gh pr create --base main --head "$BRANCH" --title "Metrics guide: bring definitions in line with the website" --body-file "$RUNNER_TEMP/body.md"

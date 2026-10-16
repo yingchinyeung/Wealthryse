@@ -1077,6 +1077,12 @@ if sorted(_placed) != sorted(_BY_NAME):
     raise RuntimeError("Every metric definition must appear in exactly one guide section")
 
 
+def definition(name: str) -> MetricDefinition:
+    """One definition by its exact name (KeyError if the guide has no such entry)."""
+
+    return _BY_NAME[name]
+
+
 def metric_anchor(name: str) -> str:
     """Return the stable URL fragment used to deep-link one definition."""
 

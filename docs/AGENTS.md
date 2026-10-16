@@ -561,6 +561,98 @@ rerun `scripts/install_agent_schema.py` (applies `010_live_market.sql`), rebuild
 the agent and platform images, deploy `infra/agent-apps.bicep`, and grant
 accounts to the job with `--grant live_market=<account>` (or `=all`).
 
+## Modelling tools
+
+The analyst can use the website's four Modelling-tab models (`ibkr_etl.modelling`). Each one is a read-only tool
+over the same agent views:
+
+- `project_wealth`: a Monte Carlo projection with contributions, withdrawals, a target and a return assumption.
+- `run_what_if`: compares current holdings against hypothetical weights given by symbol (current holdings
+  only, with no new tickers).
+- `optimise_portfolio`: gives each holding's share of risk, plus minimum-variance, risk-parity and
+  maximum-Sharpe mixes. It flags `risk_concentrated_in` for any holding carrying at least 10% of the risk
+  and more than 1.25 times its weight.
+- `get_factor_exposures`: fits the Fama-French factors from Kenneth French's library. When that site can't be
+  reached, it uses fund stand-ins from Yahoo Finance.
+
+Cash earns 0% in these tools, because the agent has no view of the risk-free rate. Each result says so.
+
+The analyst may chain the tools: for example, optimise, then run a what-if on the minimum-variance weights,
+then project. It presents every result as a hypothetical model and never as a recommendation. Asking which
+mix to hold is still out of scope.
+
+The weekly brief calls `optimise_portfolio` once. It adds one sentence only when a holding's share of risk
+stands out.
+
+Turning it on needs a rebuild of the agent image only. There are no schema or infrastructure changes.
+
+## Risk and predictive modelling
+
+The Modelling tab gets two new cards and a stress section, all in `ibkr_etl.risk_forecasting` (standard library
+only, run on the account's daily returns):
+
+- **Risk outlook.** A GARCH(1,1) volatility forecast fitted by maximum likelihood. It falls back to EWMA
+  (λ 0.94) when there are fewer than 250 returns or GARCH fits no better. One-day and one-month 95% and 99% VaR
+  and expected tail loss come from filtered historical simulation. A VaR backtest refits every 63 days and is
+  judged with Kupiec's test. Drawdown odds (10%, 20% and 30% over three to twelve months) come from a
+  volatility-scaled block bootstrap.
+- **Market regimes.** A Gaussian hidden Markov model with two or three states, chosen by BIC. It gives today's
+  regime and its odds, and a 1, 2 and 3 month outlook simulated from the regimes. A walk-forward score shows
+  how often the 90% and 50% ranges held, and whether the direction beat a naive rule.
+- **Factor stress.** Fitted factor betas times a factor shock, from presets or custom shocks capped at ±60%.
+
+Analyst tools: `get_risk_outlook`, `get_market_regimes` and `run_factor_stress` (preset `scenario`, or `shocks`
+as `[{factor, change}]`). The analyst chains them for forward-looking risk questions. It turns plain-language
+scenarios ("rates jump and small caps sell off") into factor shocks and says which shocks it chose. The weekly
+brief adds one sentence when the regime has changed since last week.
+
+The `risk_watch` job (`ibkrv2stg-agent-risk-watch`) runs at 01:15 UTC on weekdays. For each account granted to
+it, it applies fixed rules first, then the analyst explains any alert:
+
+- **Alerts** (`risk_alert`, once per trigger): the latest day lost more than its 95% VaR forecast; the account
+  moved into its most stressed regime (at least 60% likely, and not a week ago); or forecast volatility is at
+  least 1.5 times its long-run level (once a week). An explanation that fails the figure check is left out.
+- **Model check** (`model_check`, once a month): the VaR backtest and the outlook score, with a flag when VaR
+  breaches fail Kupiec's test or the 90% range held outside 80% to 97% of the time.
+
+**Turning it on** (each step needs Ying's typed approval): rerun `scripts/install_agent_schema.py` (applies
+`014_risk_watch.sql`), grant accounts with `--grant risk_watch=<account>` (or `=all`), rebuild the agent and
+web images, and deploy `infra/agent-apps.bicep` for the new job.
+
+## Export agent
+
+Each account's Exports tab gets an export agent panel (wherever `AGENT_UI_MODE` shows the agents). The model plans; code
+builds and checks.
+
+1. **Plan.** The person describes the export in words. The agent service's planner (`wealthryse_agent.exports`,
+   `EXPORT_PLANNER`) returns a plan under a strict JSON schema: which of the four datasets (value history, holdings,
+   cash activity, trades), dates, columns, filters (cash activity types, currencies, symbol, side) and totals. It sees
+   only the account's shapes and names, never balances or rows. The website validates the plan against the account
+   (`ibkr_etl.export_agent.validate_plan`): dates outside the history move to its edges and say so; anything unknown is
+   refused, never guessed. The plan is shown in sentences written by code.
+2. **Build and check.** The website builds the files from the Exports tab's own reads (`subject_exports`), in a fixed
+   order, and totals them with Decimal, one currency at a time. Fixed checks then run: each file reads back row for row,
+   every total equals the sum of the detail file, every row is inside the plan's dates and filters, no duplicate
+   executions, dates or holdings, amounts are numbers, and ties to the books (the last value equals the account's value
+   that day; no gap over 10 days in the value history; holdings plus cash within 1% of the account's value; cash rolls
+   forward from opening to closing balances, shown as a note when it doesn't). The checker agent (`EXPORT_CHECKER`)
+   reads the results through one tool and writes the cover note; the usual validator rejects any figure not in them,
+   and a code-written note is used instead. It can add concerns, which turn a pass into a review, but can't clear a
+   failure. Each check is saved in `agent.export_checks` with a fingerprint of the files.
+3. **Download.** The website rebuilds the files and serves a zip (README with the cover note and checks,
+   `manifest.json` with SHA-256 hashes, the data and totals CSVs) only if the fingerprint matches. A failed export can't
+   be downloaded; one that needs review is released by the person, and the record says so. CSV cells that would run as
+   spreadsheet formulas are quoted; negative numbers stay numbers.
+
+**Recurring packs.** A plan can be saved to run every month, quarter or year (`agent.export_packs`). The `export_packs`
+job (`ibkrv2stg-agent-export-packs`, 01:45 UTC daily, no model) leaves one `export_pack` inbox card per pack and closed
+period, shown only to the person who saved it; the card opens the panel, which builds that period through the same
+checks. A new pack starts with the last period already closed. Nothing is emailed or sent.
+
+**Turning it on** (each step needs Ying's typed approval): rerun `scripts/install_agent_schema.py` (applies
+`015_export_agent.sql`), grant accounts with `--grant export_packs=all` (or per account), rebuild the agent and web
+images, and deploy `infra/agent-apps.bicep` for the new job.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool

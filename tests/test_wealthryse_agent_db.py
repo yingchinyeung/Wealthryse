@@ -334,6 +334,102 @@ class AgentDatabaseTests(unittest.TestCase):
         self.assertEqual(store.purge(90), 0)
         store.db.close()
 
+    # Export agent ---------------------------------------------------------------
+
+    def test_store_export_checks_and_packs(self):
+        import psycopg
+
+        from wealthryse_agent.database import connect
+        from wealthryse_agent.store import Store
+
+        store = Store(connect(self.writer_settings, search_path="agent"), TENANT)
+        plan = {"title": "Dividends", "datasets": [{"dataset": "cash-activity"}]}
+        passed = store.add_export_check(user=VIEWER, account_id="UTEST1", plan=plan, fingerprint="a" * 64, status="pass",
+                                        note="n", note_checked=True, concerns=[], checks=[{"id": "x"}],
+                                        pack_item_id=None, correlation_id="c")
+        failed = store.add_export_check(user=VIEWER, account_id="UTEST1", plan=plan, fingerprint="b" * 64, status="fail",
+                                        note="", note_checked=False, concerns=["c"], checks=[], pack_item_id=None,
+                                        correlation_id="c")
+        record = store.export_check(passed, VIEWER)
+        self.assertEqual((record["plan"], record["checks"], record["released_at"]), (plan, [{"id": "x"}], None))
+        self.assertIsNone(store.export_check(passed, OWNER))
+        self.assertFalse(store.release_export_check(passed, OWNER))
+        self.assertTrue(store.release_export_check(passed, VIEWER))
+        self.assertIsNotNone(store.export_check(passed, VIEWER)["released_at"])
+        self.assertFalse(store.release_export_check(failed, VIEWER))  # a failed export is never released
+
+        pack = store.save_export_pack(user=VIEWER, account_id="UTEST1", name="Tax pack", schedule="monthly", plan=plan)
+        self.assertEqual([p["pack_id"] for p in store.export_packs(VIEWER, "UTEST1")], [pack])
+        self.assertEqual(store.export_packs(OWNER), [])
+        self.assertEqual(store.export_pack(pack, VIEWER)["plan"], plan)
+        self.assertIn(pack, [p["pack_id"] for p in store.active_export_packs()])
+        self.assertTrue(store.add_inbox(kind="export_pack", account_id="UTEST1", period_key=f"{pack}:2026-03-31",
+                                        title="t", body="b", citations=[{"export_pack": pack}], run_id=None))
+        self.assertFalse(store.archive_export_pack(pack, OWNER))
+        self.assertTrue(store.archive_export_pack(pack, VIEWER))
+        self.assertIsNone(store.export_pack(pack, VIEWER))
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            store.save_export_pack(user=VIEWER, account_id="UTEST1", name="x", schedule="daily", plan=plan)
+        store.db.rollback()
+        store.db.close()
+
+    def test_export_source_reads_and_ties_to_the_books(self):
+        import contextlib
+
+        import psycopg
+        from psycopg.rows import dict_row
+
+        from ibkr_etl import export_agent as xa
+        from ibkr_etl.export_agent_source import PlatformExportSource
+
+        dsn = _dsn(ADMIN_DSN, self.database, "agent_test_owner")
+        with psycopg.connect(dsn, options=f"-c app.tenant_id={TENANT}") as owner:
+            # Positions on 2026-03-31 are 3,300 USD plus 42,000 HKD at 0.129, so 8,718 USD; with 3,987 USD of cash
+            # they make the account's 12,705.
+            owner.execute("INSERT INTO cash_snapshots(account_id, snapshot_date, currency, ending_cash_text, settled_cash_text, "
+                          "fx_rate_to_base_text, row_sha256, last_seen_run_id) VALUES "
+                          "('UTEST1', '2026-02-27', 'USD', '5000', '5000', '1', 'c1', 1), "
+                          "('UTEST1', '2026-03-31', 'USD', '3987', '3987', '1', 'c2', 1), "
+                          "('UTEST1', '2026-03-31', 'BASE_SUMMARY', '3987', '3987', '1', 'c3', 1) ON CONFLICT DO NOTHING")
+            owner.execute("INSERT INTO cash_transactions(account_id, source_key, event_datetime, effective_date, "
+                          "transaction_type, description, amount_text, currency, conid, row_sha256, last_seen_run_id) VALUES "
+                          "('UTEST1', 'd1', '2026-03-16', '2026-03-16', 'Dividends', 'AAPL dividend', '12', 'USD', '265598', 'd1', 1) "
+                          "ON CONFLICT DO NOTHING")
+
+        @contextlib.contextmanager
+        def database():
+            with psycopg.connect(dsn, row_factory=dict_row, options=f"-c app.tenant_id={TENANT}") as connection:
+                yield connection
+
+        access = {"subject_id": "UTEST1", "display_name": "Test one", "reporting_currency": "USD",
+                  "subject_type": "physical_account", "history_start_date": "2026-01-02"}
+        source = PlatformExportSource(database=database, tenant_id=TENANT, subject_id="UTEST1", access=access,
+                                      cash_filter=lambda start, end: (start, end),
+                                      trade_filter=lambda start, end, symbol, side: (start, end, symbol, side))
+        facts = source.facts("2026-04-01")
+        self.assertEqual((facts["latest_date"], facts["cash_transaction_types"]), ("2026-03-31", ["Dividends"]))
+        self.assertEqual(facts["currencies"], ["HKD", "USD"])
+        self.assertEqual(source.nav_on("2026-03-31"), xa.Decimal("12705"))
+        value = source.holdings_value("2026-03-31")
+        self.assertEqual((value["positions"], value["cash"], value["nav"]),
+                         (xa.Decimal("8718.000"), xa.Decimal("3987"), xa.Decimal("12705")))
+        roll = source.cash_roll("2026-03-01", "2026-03-31")
+        self.assertEqual({k: str(v) for k, v in roll["USD"].items()},
+                         {"opening": "5000", "activity": "12", "trades": "0", "closing": "3987"})
+        plan, _ = xa.validate_plan({"title": "Quarter", "datasets": [
+            {"dataset": "holdings", "to_date": "2026-03-31"},
+            {"dataset": "performance", "from_date": "2026-01-01"},
+            {"dataset": "cash-activity", "from_date": "2026-03-01", "to_date": "2026-03-31", "group_by": ["currency"]}]},
+            facts)
+        built = xa.build(plan, source.fetch, source.subject_type)
+        checks = {c["id"]: c for c in xa.run_checks(built, source.books(), source.subject_type)}
+        self.assertEqual([len(d.rows) for d in built], [2, 4, 1])
+        self.assertEqual(checks["holdings_tie_1"]["status"], "pass")
+        self.assertEqual(checks["nav_matches_books_2"]["status"], "pass")
+        self.assertEqual(checks["cash_roll_3"]["status"], "info")  # 1,025 USD went to the AAPL purchase
+        # The seed has month-end values only, so the value history's gaps are the one thing to review.
+        self.assertEqual([k for k, c in checks.items() if c["status"] not in ("pass", "info")], ["nav_gaps_2"])
+
     # Month-end team -----------------------------------------------------------
 
     def test_month_end_tools_are_for_the_team_only(self):

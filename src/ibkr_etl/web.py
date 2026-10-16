@@ -146,7 +146,7 @@ from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_
 from . import onboarding_v2_web
 from .broker_connections import onboarding_v2_enabled
 from .util import canonical_json, sha256_text, utc_now_iso
-from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS
+from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS, THEME_TOGGLE_HTML, WEB_FONT_FILES, web_font_bytes
 from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
 from .web_analytics_ui import (
     ANALYTICS_SCRIPT,
@@ -155,6 +155,12 @@ from .web_analytics_ui import (
     PERFORMANCE_ANALYTICS_CARDS,
     RISK_ANALYTICS_CARDS,
     TRADING_ACTIVITY_CARD,
+)
+from .web_modelling import (
+    MODELLING_CARDS,
+    MODELLING_CSS,
+    MODELLING_SCRIPT,
+    install as _install_modelling,
 )
 from .portfolio_analytics import (
     CORRELATION_HOLDINGS,
@@ -1017,6 +1023,18 @@ def _admin_structured_sources(connection) -> list[dict]:
             "data": action_catalog(),
         },
     ]
+
+
+@app.get("/assets/fonts/{name}", include_in_schema=False)
+def web_font(name: str) -> Response:
+    # Self-hosted so the CSP (font-src falls back to 'self') allows it.
+    if name not in WEB_FONT_FILES:
+        raise HTTPException(status_code=404, detail="Font not found")
+    return Response(
+        web_font_bytes(name),
+        media_type="font/woff2",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @app.get("/healthz")
@@ -4895,12 +4913,60 @@ ACCOUNT_SECTIONS = {
     "performance": "Performance",
     "holdings": "Holdings",
     "risk": "Risk analytics",
+    "modelling": "Modelling",
     "cash": "Cash",
     "trades": "Trade history",
     "reports": "Monthly reports",
     "exports": "Data exports",
     "ai-analyst": "AI analyst",
 }
+
+# Sections split into subpages: (slug, label, id of the card that starts the
+# subpage). A subpage is that card plus the cards after it, up to the next one.
+ACCOUNT_SUBPAGES = {
+    "performance": (
+        ("nav-chart", "NAV chart", "perf-chart"),
+        ("period-returns", "Period returns", "perf-returns"),
+        ("monthly-returns", "Monthly returns", "perf-calendar"),
+        ("attribution", "Attribution", "perf-attribution"),
+        ("benchmark", "Vs benchmark", "perf-benchmark"),
+        ("contributions", "Contributions", "perf-flows"),
+    ),
+    "risk": (
+        ("snapshot", "Risk snapshot", "risk-summary"),
+        ("statistics", "Statistics", "analytics-statistics-card"),
+        ("drawdowns", "Drawdowns", "risk-drawdowns"),
+        ("rolling", "Rolling risk", "risk-rolling"),
+        ("correlation", "Correlation", "risk-correlation"),
+    ),
+    "modelling": (
+        ("wealth-projection", "Wealth projection", "model-projection"),
+        ("risk-outlook", "Risk outlook", "model-risk"),
+        ("market-regimes", "Market regimes", "model-regimes"),
+        ("what-if", "What-if", "model-whatif"),
+        ("optimisation", "Optimisation", "model-optimise"),
+        ("factor-model", "Factor model", "model-factors"),
+        ("stress-test", "Stress test", "model-stress"),
+    ),
+}
+
+# Shows one subpage of the open section. A subpage can also start part way
+# through a card (the stress test inside the factor model card). Every card
+# stays in the page, so switching subpages needs no reload and cross-card
+# actions (such as "Try in what-if") still find their target.
+ACCOUNT_SUBPAGE_SCRIPT = r"""(()=>{const view=document.querySelector('.page-view.active');const parts=__PARTS__;const base=__BASE__;let current=__CURRENT__;
+if(!view||!parts.length)return;const anchors=parts.map(p=>p[1]);const slugOf=id=>(parts.find(p=>p[1]===id)||parts[0])[0];
+const assign=()=>{let part=null;[...view.children].forEach(c=>{if(anchors.includes(c.id))part=c.id;if(!part)return;c.dataset.part=part;const inner=[...c.children].filter(k=>k.id!==c.id&&anchors.includes(k.id));
+if(!inner.length){c.classList.toggle('part-off',part!==current);return}let sub=part;const own=[part];[...c.children].forEach(k=>{if(anchors.includes(k.id)){sub=k.id;own.push(sub)}k.classList.toggle('part-off',sub!==current)});c.classList.toggle('part-off',!own.includes(current))})};
+const mark=()=>document.querySelectorAll('[data-part-link]').forEach(a=>{if(a.dataset.partLink===current)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});
+const show=(id,url)=>{if(!anchors.includes(id))return;if(url&&location.pathname+location.hash!==url)history.pushState({part:id},'',url);if(id===current)return;current=id;assign();mark();window.scrollTo({top:0});window.dispatchEvent(new Event('resize'))};
+assign();mark();new MutationObserver(assign).observe(view,{childList:true});
+document.addEventListener('click',e=>{const a=e.target.closest('a[data-part-link]');if(!a||e.defaultPrevented||e.button||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||!anchors.includes(a.dataset.partLink))return;e.preventDefault();show(a.dataset.partLink,a.getAttribute('href'));a.blur()});
+addEventListener('popstate',()=>{const slug=location.pathname.split('/')[4];const p=parts.find(p=>p[0]===slug)||parts[0];show(p[1])});
+const toCard=el=>{const card=el&&el.closest('[data-part]');if(card&&card.dataset.part!==current)show(card.dataset.part,base+'/'+slugOf(card.dataset.part)+location.hash)};
+if(location.hash){try{toCard(document.querySelector(decodeURIComponent(location.hash)))}catch(_){}}
+addEventListener('hashchange',()=>{try{toCard(document.querySelector(decodeURIComponent(location.hash)))}catch(_){}});
+const scroll=Element.prototype.scrollIntoView;Element.prototype.scrollIntoView=function(...args){toCard(this);return scroll.apply(this,args)};})();"""
 
 # Shorter names for the account tab bar; page headings keep the full names.
 ACCOUNT_TAB_LABELS = {
@@ -4988,8 +5054,8 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
     account_cards = []
     for subject in _account_directory(user):
         account = escape(str(subject["subject_id"]))
-        from .viewer_labels import account_card_title
-        account_display_name = escape(account_card_title(subject))
+        from .viewer_labels import account_card_name
+        account_display_name = escape(account_card_name(subject))
         currency = escape(str(subject["reporting_currency"]))
         start_value = subject["history_start_date"]
         try:
@@ -5017,7 +5083,7 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Accounts · {PLATFORM_NAME}</title>
 <style>{HOME_THEME_CSS}</style></head><body>
-<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
+<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header>
 <main><section class="home-hero"><div class="eyebrow">Portfolio intelligence</div><h1>Accounts</h1><div class="lead">Select an account to open its portfolio workspace.</div><div id="accounts-summary" class="accounts-summary" aria-live="polite"></div></section><div class="accounts">{cards_html}</div></main>
 {HOME_SCRIPT}</body></html>"""
 
@@ -8574,7 +8640,7 @@ def connection_onboarding_queue_page(
     script = CONNECTION_QUEUE_PAGE_SCRIPT.replace(
         "__SOURCE_ID__", json.dumps(source_id)
     )
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Choose accounts · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header><main><div class="breadcrumbs"><a href="/">Accounts</a><span>/</span><a href="/ibkr-connections">IBKR connections</a><span>/</span><span>Choose accounts</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Connection-scoped onboarding</div><h1 id="queue-title">Loading connection…</h1><div id="queue-status" class="muted">Choose which discovered accounts to onboard and the exact order.</div></div></div><section class="grid"><div class="card wide"><div class="label">Connection policy</div><div id="queue-summary" class="status-row"></div></div><div id="queue-workspace" class="grid" style="display:contents"><div class="card wide"><div class="muted">Loading discovered accounts…</div></div></div></section></main>{script}</body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Choose accounts · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header><main><div class="breadcrumbs"><a href="/">Accounts</a><span>/</span><a href="/ibkr-connections">IBKR connections</a><span>/</span><span>Choose accounts</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Connection-scoped onboarding</div><h1 id="queue-title">Loading connection…</h1><div id="queue-status" class="muted">Choose which discovered accounts to onboard and the exact order.</div></div></div><section class="grid"><div class="card wide"><div class="label">Connection policy</div><div id="queue-summary" class="status-row"></div></div><div id="queue-workspace" class="grid" style="display:contents"><div class="card wide"><div class="muted">Loading discovered accounts…</div></div></div></section></main>{script}</body></html>"""
 
 
 ONBOARDING_STEP_PAGE_SCRIPT = r"""
@@ -8790,7 +8856,7 @@ def account_onboarding_step_page(
     script = ONBOARDING_STEP_PAGE_SCRIPT.replace(
         "__SUBJECT__", json.dumps(subject)
     ).replace("__STEP__", json.dumps(step_slug))
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header><main><div class="breadcrumbs"><a href="/">Accounts</a><span>/</span><a href="/account-onboarding">Account onboarding</a><span>/</span><span>{escape(subject)}</span><span>/</span><span>{escape(title)}</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Page {index + 1} of {len(steps)}</div><h1>{escape(title)}</h1><div class="muted">{escape(str(case["display_name"]))} · {escape(str(case["status"]).replace("_", " ").title())}</div></div></div><section class="grid"><div class="card wide"><div class="label">Page-by-page workflow</div><div class="status-row">{step_cards}</div></div><div class="card wide"><div class="label">Current page</div><div id="step-workspace"><div class="muted">Loading current evidence and permitted actions…</div></div></div><div class="card wide"><div class="label">All evidence and approval gates</div><div class="onboarding-checks">{check_cards}</div></div><div class="card wide"><div class="actions">{pager}</div></div></section></main>{script}</body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header><main><div class="breadcrumbs"><a href="/">Accounts</a><span>/</span><a href="/account-onboarding">Account onboarding</a><span>/</span><span>{escape(subject)}</span><span>/</span><span>{escape(title)}</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Page {index + 1} of {len(steps)}</div><h1>{escape(title)}</h1><div class="muted">{escape(str(case["display_name"]))} · {escape(str(case["status"]).replace("_", " ").title())}</div></div></div><section class="grid"><div class="card wide"><div class="label">Page-by-page workflow</div><div class="status-row">{step_cards}</div></div><div class="card wide"><div class="label">Current page</div><div id="step-workspace"><div class="muted">Loading current evidence and permitted actions…</div></div></div><div class="card wide"><div class="label">All evidence and approval gates</div><div class="onboarding-checks">{check_cards}</div></div><div class="card wide"><div class="actions">{pager}</div></div></section></main>{script}</body></html>"""
 
 
 @app.get("/account-onboarding", response_class=HTMLResponse)
@@ -10559,7 +10625,7 @@ fetch('/api/onboarding/{subject}/preview').then(async response=>{{const payload=
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Private onboarding preview · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body>
-<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
+<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header>
 <main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><a href="/account-onboarding">Account onboarding</a><span aria-hidden="true">/</span><span>{subject}</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Owner-only reconciliation preview</div><h1 id="preview-title">{subject}</h1><div id="preview-note" class="muted">Loading validated onboarding evidence…</div></div></div><section class="grid"><div class="card wide"><div class="label">Current onboarding stage</div><div id="preview-stage" class="value">Loading…</div><div id="preview-contract" class="status-row"></div><div class="actions"><a class="button" href="/accounts/{subject}/overview">Open account analytics preview</a></div></div><div class="card wide"><div class="label">Imported portfolio coverage</div><div id="preview-data" class="status-row"></div></div><div class="card wide"><div class="label">USD benchmark reconciliation</div><div id="preview-benchmarks" class="status-row"></div></div><div class="card wide"><div class="label">Validated report templates and examples</div><div id="preview-templates" class="status-row"></div></div><div class="card wide"><div class="label">Private historical factsheets and presentations</div><div id="preview-historical"><div class="muted">Loading the historical report batch…</div></div></div><div class="card wide"><div class="label">Deterministic website-preview validation</div><div id="preview-validation" class="onboarding-checks"><div class="muted">Validating current evidence…</div></div><div id="preview-approval"></div></div><div class="card wide"><div class="label">Fail-closed feature controls</div><div id="preview-features" class="status-row"></div></div></section></main>{script}</body></html>"""
 
 
@@ -10719,7 +10785,7 @@ def _platform_shell(
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_title} · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body>
-<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
+<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header>
 <main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>Platform</span><span aria-hidden="true">/</span><span>{page_title}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{page_title}</h1><div class="muted">{escape(description)}</div></div></div><section class="grid">{content}</section></main>{script}</body></html>"""
 
 
@@ -10746,6 +10812,19 @@ def account_root(
     return RedirectResponse(url=f"/accounts/{subject}/overview", status_code=307)
 
 
+@app.get("/accounts/{account_id}/{section}/{part}", response_class=HTMLResponse)
+def account_subpage(
+    account_id: str,
+    section: str,
+    part: str,
+    request: Request,
+    user: dict[str, str] = Depends(_authorized_user),
+):
+    if part not in {slug for slug, _label, _anchor in ACCOUNT_SUBPAGES.get(section, ())}:
+        raise HTTPException(status_code=404, detail="Account page not found")
+    return _account_page(account_id, section, user, part)
+
+
 @app.get("/accounts/{account_id}/{section}", response_class=HTMLResponse)
 def account_page(
     account_id: str,
@@ -10753,6 +10832,10 @@ def account_page(
     request: Request,
     user: dict[str, str] = Depends(_authorized_user),
 ):
+    return _account_page(account_id, section, user, None)
+
+
+def _account_page(account_id: str, section: str, user: dict[str, str], part: str | None):
     if section not in ALL_PAGE_SECTIONS:
         raise HTTPException(status_code=404, detail="Account page not found")
     if section == "system-health":
@@ -10779,7 +10862,7 @@ def account_page(
     if section == "ai-analyst" and _agent_analyst_replaces_tab(user):
         return RedirectResponse(url=f"/accounts/{urllib.parse.quote(account_id, safe='')}/overview#ask", status_code=307)
     return _render_account_page(
-        user, account_id=account_id, section=section, access=access
+        user, account_id=account_id, section=section, access=access, part=part
     )
 
 
@@ -10789,6 +10872,7 @@ def _render_account_page(
     account_id: str,
     section: str,
     access: dict[str, object] | None = None,
+    part: str | None = None,
 ) -> str:
     access = access or _portfolio_access_context(account_id, user)
     viewer = escape(user["email"] or "authorized user")
@@ -10815,12 +10899,37 @@ def _render_account_page(
         visible_sections = visible_sections - {"ai-analyst"}
     page_title = escape(ACCOUNT_SECTIONS[section])
     active = {key: " active" if key == section else "" for key in ALL_PAGE_SECTIONS}
+    subpages = ACCOUNT_SUBPAGES.get(section, ())
+    if part is None and subpages:
+        part = subpages[0][0]
+    part_anchor = next((anchor for slug, _label, anchor in subpages if slug == part), "")
+
+    def nav_item(key: str, label: str) -> str:
+        current = " aria-current=\"page\"" if key == section else ""
+        parts = ACCOUNT_SUBPAGES.get(key, ())
+        link = (
+            f'<a class="account-nav-link{active[key]}" href="/accounts/{account}/{key}"{current}>'
+            f'{escape(ACCOUNT_TAB_LABELS.get(key, label))}'
+            + ('<span class="nav-caret" aria-hidden="true">▾</span>' if parts else "")
+            + "</a>"
+        )
+        if not parts:
+            return link
+        menu = "".join(
+            f'<a href="/accounts/{account}/{key}/{slug}" data-part-link="{anchor}"'
+            + (' aria-current="page"' if key == section and slug == part else "")
+            + f">{escape(sub_label)}</a>"
+            for slug, sub_label, anchor in parts
+        )
+        return (
+            f'<div class="account-nav-item">{link}'
+            f'<div class="account-nav-menu" aria-label="{escape(label)} pages">{menu}</div></div>'
+        )
+
     navigation = "".join(
-        f'<a class="account-nav-link{active[key]}" href="/accounts/{account}/{key}"'
-        f'{" aria-current=\"page\"" if key == section else ""}>{escape(ACCOUNT_TAB_LABELS.get(key, label))}</a>'
-        for key, label in ACCOUNT_SECTIONS.items()
-        if key in visible_sections
+        nav_item(key, label) for key, label in ACCOUNT_SECTIONS.items() if key in visible_sections
     )
+
     platform_navigation = _platform_navigation(user)
     try:
         directory = [] if preview_mode else _account_directory(user)
@@ -10840,28 +10949,26 @@ def _render_account_page(
         if len(directory) > 1
         else ""
     )
-    section_jump_links = {
-        "performance": (
-            ("perf-chart", "NAV chart"),
-            ("perf-returns", "Period returns"),
-            ("perf-calendar", "Monthly returns"),
-            ("perf-attribution", "Attribution"),
-            ("perf-benchmark", "Vs benchmark"),
-            ("perf-flows", "Contributions"),
-        ),
-        "risk": (
-            ("risk-summary", "Risk snapshot"),
-            ("analytics-statistics-card", "Statistics"),
-            ("risk-drawdowns", "Drawdowns"),
-            ("risk-rolling", "Rolling risk"),
-            ("risk-correlation", "Correlation"),
-        ),
-    }.get(section, ())
+    subpage_script = (
+        "<script>"
+        + ACCOUNT_SUBPAGE_SCRIPT.replace("__BASE__", json.dumps(f"/accounts/{account_id}/{section}"))
+        .replace("__PARTS__", json.dumps([[slug, anchor] for slug, _label, anchor in subpages]))
+        .replace("__CURRENT__", json.dumps(part_anchor))
+        + "</script>"
+        if subpages
+        else ""
+    )
+    # Phones get the open section's subpages as a row under the tab bar.
     section_jumps = (
-        '<nav class="section-jumps" aria-label="Jump to a section">'
-        + "".join(f'<a href="#{target}">{escape(label)}</a>' for target, label in section_jump_links)
+        '<nav class="section-jumps subpage-row" aria-label="Pages in this section">'
+        + "".join(
+            f'<a href="/accounts/{account}/{section}/{slug}" data-part-link="{anchor}"'
+            + (' aria-current="page"' if slug == part else "")
+            + f">{escape(label)}</a>"
+            for slug, label, anchor in subpages
+        )
         + "</nav>"
-        if section_jump_links
+        if subpages
         else ""
     )
     metric_anchors_json = json.dumps(METRIC_ANCHORS, ensure_ascii=False)
@@ -10898,8 +11005,8 @@ def _render_account_page(
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_title} · {account_display_name} · {PLATFORM_NAME}</title>
-<style>{ACCOUNT_THEME_CSS}</style></head>
-<body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
+<style>{ACCOUNT_THEME_CSS}{MODELLING_CSS}</style></head>
+<body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header>
 <main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>{account_display_name}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{account_display_name}</h1><div class="muted">{reporting_currency} reporting · Data from {history_start_date}</div><div id="freshness" class="freshness" hidden></div></div><div class="account-hero-controls"><label class="asof-control{' report-date-hidden' if section == 'reports' else ''}"><span class="label">As of</span><select id="asof-select" class="asof-select" aria-label="Portfolio as of date"><option>Loading…</option></select></label>{account_switcher}</div></div><div class="account-sticky"><nav class="account-nav" aria-label="{account} sections">{navigation}</nav>{section_jumps}</div><h2 class="sr-only">{page_title}</h2>
 <section class="grid" id="portfolio-grid">{preview_notice}<div class="page-view{active['overview']}" data-section="overview"><div class="card wide overview-nav"><div class="overview-nav-head"><div class="overview-nav-copy"><div class="label">Net asset value</div><div class="overview-nav-line"><span id="nav" class="value">—</span><span id="overview-day" class="overview-day"></span></div><div id="overview-asof" class="muted">{reporting_currency} reporting</div></div><svg id="overview-spark" class="overview-spark" viewBox="0 0 320 64" preserveAspectRatio="none" role="img" aria-label="NAV trend over the last year"></svg></div><div id="overview-returns" class="metrics overview-returns"><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div></div></div><div class="card overview-half"><div class="label">Top holdings · <span id="positions">—</span> positions</div><div id="overview-holdings" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">All holdings <span aria-hidden="true">→</span></a></div><div class="card overview-half"><div class="label">Sector allocation</div><div id="overview-sectors" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">Sector detail <span aria-hidden="true">→</span></a></div></div>
 <div class="page-view{active['performance']}" data-section="performance">
@@ -10909,6 +11016,7 @@ def _render_account_page(
 <div class="card wide" id="perf-benchmark"><div class="label">Comparison benchmark</div><select id="benchmark-select" aria-label="Comparison benchmark"></select><div id="benchmark" class="value">Loading…</div><div id="benchmark-note" class="muted"></div><div id="benchmark-metrics" class="metrics"></div></div>
 <div class="card wide" id="perf-flows"><div class="label">Contributions and withdrawals</div><div id="flows-totals" class="metrics"></div><div class="table-scroll"><table><thead><tr><th>Date</th><th>Type</th><th>Amount ({reporting_currency})</th></tr></thead><tbody id="flows-statement"></tbody></table></div><div id="flows-note" class="muted" style="margin-top:12px">Loading contributions and withdrawals…</div></div></div>
 <div class="page-view{active['risk']}" data-section="risk"><div class="card wide" id="risk-summary"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div><div class="card wide" id="crisis-scenarios-card" hidden><div class="label">Crisis scenarios</div><table><thead><tr><th>Crisis</th><th>Window</th><th>Maximum drawdown</th><th>Stand-ins (scaled)</th></tr></thead><tbody id="crisis-scenarios"></tbody></table><div id="crisis-scenarios-note" class="muted"></div></div>{RISK_ANALYTICS_CARDS}{CORRELATION_CARD}</div>
+<div class="page-view{active['modelling']}" data-section="modelling">{MODELLING_CARDS}</div>
 <div class="page-view{active['cash']}" data-section="cash"><div class="card wide"><div class="label"><span id="cash-kind">Cash balances</span> as of <span id="cash-asof">—</span></div><div id="cash-balances" class="metrics"></div><div id="cash-ledger-controls"><div class="label" style="margin-top:18px">Cash activity history</div><div class="muted">Choose a custom date range to view every matching IBKR cash activity. The CSV download contains the same complete filtered result.</div><div class="filter-grid"><label><span class="label">From</span><input id="cash-from" type="date" min="{history_start_date}" aria-label="Cash activity start date"></label><label><span class="label">To</span><input id="cash-to" type="date" min="{history_start_date}" aria-label="Cash activity end date"></label></div><div class="actions"><button id="cash-apply" class="button" type="button">Apply cash filters</button><a id="cash-export" class="button" href="#">Download cash activity CSV</a></div></div><div id="cash-note" class="muted" style="margin-top:12px">Loading cash activity…</div><div id="cash-ledger-table" class="table-scroll"><table><thead><tr><th>Date</th><th>Time</th><th>Type</th><th>Description</th><th>Currency</th><th>Amount</th></tr></thead><tbody id="cash-activity"></tbody></table></div></div></div>
 <div class="page-view{active['trades']}" data-section="trades">{TRADING_ACTIVITY_CARD}<div class="card wide"><div class="label">Trade history</div><div id="trade-source-title" class="value">Trade records</div><div id="trade-source-note" class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div id="trade-filter-controls" class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
 <div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Sector allocation</div><div id="sector-summary" class="muted"></div><div id="sector-bars" class="sector-bars"></div><details class="sector-detail"><summary>Industries within each sector</summary><div class="table-scroll"><table><thead><tr><th class="text-col">Sector</th><th class="text-col">Industry</th><th class="text-col">Region</th><th>Holdings</th><th>Value (<span>{reporting_currency}</span>)</th><th>Weight</th></tr></thead><tbody id="sector-detail"></tbody></table></div></details><div id="sector-note" class="muted sector-note"></div></div>{HOLDINGS_CONCENTRATION_CARD}<div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-tools"><input id="holdings-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter holdings"><span id="holdings-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th title="14-day relative strength index from daily closing marks. Above 70 is overbought, below 30 oversold.">RSI (14)</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
@@ -10998,6 +11106,7 @@ draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio
 const mergeRiskResponses=(core,details)=>{{const risk={{...core,...details}};if(core.cache_status!=='hit'||details.cache_status!=='hit'||core.snapshot_payload_sha256!==details.snapshot_payload_sha256){{risk.metrics={{}};risk.analytics_evidence={{}};risk.risk_free=null;risk.expected_tail_loss_contributors={{top:[],bottom:[]}};risk.crisis_replay=null;risk.cache_status='unavailable';risk.message=core.message||details.message||'Risk cache changed during this request; refresh to load one validated version.';}}return risk;}};
 {ACCOUNT_UI_SCRIPT}
 {ANALYTICS_SCRIPT}
+{MODELLING_SCRIPT}
 const renderAsOf=async asOf=>{{
 const grid=document.querySelector('#portfolio-grid');grid.classList.add('loading');
 try{{
@@ -11018,6 +11127,7 @@ if(activeSection==='holdings'){{void renderSectors(asOf);renderConcentration(h)}
 if(activeSection==='performance'||activeSection==='risk')void renderAnalytics(asOf);
 if(activeSection==='trades')void renderTradingActivity(asOf);
 if(activeSection==='risk')void renderCorrelation(asOf);
+if(activeSection==='modelling')renderModelling(asOf);
 document.querySelector('#holdings-asof').textContent=h.snapshot_date||'No snapshot';
 document.querySelector('#holdings-quantity-label').textContent=h.holdings.some(x=>x.holding_kind==='synthetic_exposure')?'Sleeve coefficient (not shares)':'Quantity';
 document.querySelector('#holdings-reporting-currency').textContent=h.reporting_currency||reportingCurrency;
@@ -11099,7 +11209,7 @@ asOfSelect.addEventListener('change',()=>(rememberAsOf(asOfSelect.value),renderA
 if(!previewMode){{const savedConversations=await refreshConversations(null);if(savedConversations.length)await openConversation(savedConversations[0].conversation_id);else{{updateChatHeader(null);emptyChat()}}}}else{{updateChatHeader(null);emptyChat()}}analysisRun.disabled=!a.ai_model.enabled;
 await renderAsOf(asOfSelect.value)
 }}).catch(error=>loadFailure(error,'The figures for this account could not be loaded. Refresh the page. If this keeps happening, the daily data refresh may have failed.'));
-</script>{live_page_assets}{design_controls_script}</body></html>"""
+</script>{subpage_script}{live_page_assets}{design_controls_script}</body></html>"""
 
 
 # WealthRyse agents: chat panel, Explain buttons and inbox. Off unless
@@ -11113,6 +11223,17 @@ def _agent_account_names(user: dict[str, object]) -> dict[str, str]:
     return {str(item["subject_id"]): account_card_title(item) for item in _account_directory(user)}
 
 
+def _agent_export_source(user: dict[str, object], account_id: str):
+    """The export agent's reads for one account, after the same access check as the CSV exports."""
+    from .export_agent_source import PlatformExportSource
+
+    return PlatformExportSource(
+        database=_database, tenant_id=TENANT_ID, subject_id=account_id,
+        access=_portfolio_access_context(account_id, user),
+        cash_filter=_cash_filter_values, trade_filter=_trade_filter_values,
+    )
+
+
 _install_agent_web(
     app,
     _authorized_user,
@@ -11120,6 +11241,7 @@ _install_agent_web(
     ACCOUNT_THEME_CSS,
     render_page=_platform_shell,
     account_names=_agent_account_names,
+    export_source=_agent_export_source,
 )
 
 
@@ -11151,4 +11273,21 @@ onboarding_v2_web.install(
     intake_container=ONBOARDING_INTAKE_CONTAINER,
     # "Ask about this case", answered by the agent service from the case's facts (also behind that switch).
     ask_case=lambda: _case_question_stream(),
+)
+
+
+# Account Modelling tab: wealth projection, what-if, optimisation and factor model (web_modelling.py).
+_install_modelling(
+    app,
+    authorized_user=_authorized_user,
+    access_context=_portfolio_access_context,
+    parse_as_of=_parse_as_of,
+    read_database=lambda: _database(),
+    nav_values=_subject_nav_values,
+    external_flows=_subject_external_flows,
+    latest_holdings=_latest_subject_holdings,
+    enrich_holdings=_enrich_subject_holdings,
+    comparison_version=website_comparison_version,
+    tenant_id=TENANT_ID,
+    risk_analytics_version=RISK_ANALYTICS_VERSION,
 )

@@ -80,13 +80,13 @@ CREATE OR REPLACE VIEW agent.live_gateway AS SELECT * FROM agent.scoped_live_gat
 ALTER TABLE agent.service_grants DROP CONSTRAINT IF EXISTS service_grants_job_name_check;
 ALTER TABLE agent.service_grants ADD CONSTRAINT service_grants_job_name_check
     CHECK (job_name IN ('holdings_explainer', 'month_end_drafter', 'data_quality', 'month_team', 'onboarding',
-                        'operations', 'weekly_brief', 'live_market'));
+                        'operations', 'weekly_brief', 'live_market')) NOT VALID;
 
 ALTER TABLE agent.inbox DROP CONSTRAINT IF EXISTS inbox_kind_check;
 ALTER TABLE agent.inbox ADD CONSTRAINT inbox_kind_check CHECK (kind IN (
     'holdings_explainer', 'month_end_draft', 'data_quality',
     'month_end_report', 'month_end_hold', 'month_end_dispute',
-    'onboarding_watch', 'weekly_brief', 'live_alert'));
+    'onboarding_watch', 'weekly_brief', 'live_alert')) NOT VALID;
 
 REVOKE ALL ON agent.live_summary, agent.live_positions, agent.live_executions, agent.live_gateway FROM PUBLIC;
 REVOKE ALL ON FUNCTION agent.live_active(text), agent.scoped_live_summary(), agent.scoped_live_positions(),

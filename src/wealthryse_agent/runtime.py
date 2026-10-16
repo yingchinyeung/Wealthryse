@@ -77,6 +77,14 @@ TOOL_LABELS = {
     "get_nav_history": "Reading the value history",
     "get_risk_metrics": "Measuring risk",
     "get_case": "Reading the case",
+    "get_export_check": "Reading the export and its checks",
+    "project_wealth": "Simulating future values",
+    "run_what_if": "Comparing a different mix",
+    "optimise_portfolio": "Measuring where the risk sits",
+    "get_factor_exposures": "Fitting the factor model",
+    "get_risk_outlook": "Forecasting risk",
+    "get_market_regimes": "Reading the market regime",
+    "run_factor_stress": "Running a factor stress test",
     calculator.NAME: "Calculating",
 }
 OUT_OF_SCOPE = ("I can explain your holdings and performance, but I can't recommend trades, rebalancing "
@@ -115,6 +123,8 @@ class Turn:
     status: str = "ok"
     tool_calls: int = 0
     usage: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
+    # Fields a caller added to the answer schema (extra_fields), already through the figure check.
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 def default_model_client(settings: ModelSettings):
@@ -178,7 +188,9 @@ class Agent:
 
     def run(self, *, question: str, account_id: str, tools: ToolClient, history: Sequence[Mapping[str, str]] = (),
             allowed_tools: Sequence[str] | None = None, instructions: str | None = None,
-            skip_router: bool = False) -> Iterator[dict[str, Any]]:
+            skip_router: bool = False, extra_fields: Mapping[str, Any] | None = None) -> Iterator[dict[str, Any]]:
+        """``extra_fields`` adds lists of strings to the answer (for example a checker's concerns); their
+        figures are checked with the answer's, and they come back in ``turn.extra``."""
         question = (question or "").strip()
         if not question or len(question) > MAX_QUESTION_CHARS:
             raise AgentError("invalid_question", f"Questions must be 1 to {MAX_QUESTION_CHARS} characters.")
@@ -206,6 +218,10 @@ class Agent:
         conversation.append({"role": "user", "content": question})
         results: dict[str, Any] = {}
         retried = False
+        schema = ANSWER_SCHEMA
+        if extra_fields:
+            schema = {**ANSWER_SCHEMA, "properties": {**ANSWER_SCHEMA["properties"], **extra_fields},
+                      "required": [*ANSWER_SCHEMA["required"], *extra_fields]}
 
         while True:
             if self.clock() - started > self.settings.timeout_seconds:
@@ -214,7 +230,7 @@ class Agent:
                 model=self.settings.deployment, instructions=system, input=conversation, tools=function_tools,
                 store=False, include=["reasoning.encrypted_content"], reasoning={"effort": self.settings.reasoning_effort},
                 max_output_tokens=self.settings.max_output_tokens, parallel_tool_calls=True,
-                text={"format": {"type": "json_schema", "name": "answer", "strict": True, "schema": ANSWER_SCHEMA}},
+                text={"format": {"type": "json_schema", "name": "answer", "strict": True, "schema": schema}},
             )
             _add_usage(turn, response)
             if getattr(response, "status", "completed") == "incomplete":
@@ -240,11 +256,15 @@ class Agent:
                 answer, cited = str(parsed["answer"]).strip(), [str(c) for c in parsed["citations"]]
                 visuals = [v for v in parsed.get("visuals") or [] if isinstance(v, dict)]
                 remember = [m for m in parsed.get("remember") or [] if isinstance(m, dict)][:4]
+                extra = {k: [str(x).strip() for x in (parsed.get(k) if isinstance(parsed.get(k), list) else [])
+                             if str(x).strip()][:10]
+                         for k in (extra_fields or {})}
             except (ValueError, KeyError, TypeError, AttributeError) as error:
                 raise AgentError("invalid_model_output", "The model did not return a usable answer.") from error
-            check = validate_answer(answer, cited, results, question, visuals)
+            checked = "\n".join([answer, *(x for values in extra.values() for x in values)])
+            check = validate_answer(checked, cited, results, question, visuals)
             if check.ok:
-                turn.answer, turn.visuals, turn.remember = answer, visuals, remember
+                turn.answer, turn.visuals, turn.remember, turn.extra = answer, visuals, remember, extra
                 turn.citations = [{"id": c, "tool": results[c]["tool"], "account_id": results[c].get("account_id"),
                                    "as_of": results[c].get("as_of"), "sources": results[c].get("citations", [])}
                                   for c in dict.fromkeys(cited) if c in results]

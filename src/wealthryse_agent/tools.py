@@ -1162,6 +1162,376 @@ def get_operations_history(connection, arguments: Mapping[str, Any]) -> dict[str
                                                        _citation("autonomous_agent_runs", None)]}
 
 
+# Modelling (hypothetical; the same models as the website's Modelling tab) -------------
+
+MODEL_PRICE_DAYS = 550        # calendar days of marks, enough for 252 sessions
+MODEL_RISK_FREE_NOTE = ("Cash earns 0%: the analyst has no risk-free rate on file, so Sharpe ratios here can differ "
+                        "slightly from the website's Modelling tab.")
+
+
+def _number_argument(arguments: Mapping[str, Any], name: str, low: float, high: float) -> float | None:
+    value = arguments.get(name)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+            or not low <= value <= high:
+        raise ToolError("invalid_arguments", f"{name} must be a number between {low:g} and {high:g}.", 400)
+    return float(value)
+
+
+def _model_error(error: Exception) -> ToolError:
+    return ToolError("model_unavailable", str(error)[:300], 422)
+
+
+def _model_holdings(connection, account_id: str) -> tuple[Mapping[str, Any], str, list[dict[str, Any]], dict, dict]:
+    """Latest holdings with weights of NAV, and their daily marks for about a year and a half."""
+    from ibkr_etl.modelling import holding_return_matrix
+
+    subject = _subject(connection, account_id)
+    if str(subject["subject_type"]) == "composite_portfolio":
+        raise ToolError("not_supported", "Model portfolios have no security-level prices, so this model can't run "
+                                         "on them. The wealth projection and factor model still work.")
+    as_of = _latest_nav_date(connection, account_id, None)
+    snapshot, holdings, _, _ = _valued_holdings(connection, subject, as_of)
+    if snapshot is None or not holdings:
+        raise ToolError("no_holdings", "No holdings are recorded for this account.", 404)
+    nav = connection.execute(
+        f"SELECT total_text FROM subject_nav_series WHERE subject_id = ? AND snapshot_date = ? "
+        f"AND currency = {ACTIVE_NAV_CURRENCY_SQL}", (account_id, snapshot)).fetchone()
+    nav_value = _float(nav["total_text"]) if nav else None
+    if not nav_value or nav_value <= 0:
+        raise ToolError("no_valuation", "There is no NAV on the holdings date to weight the holdings by.", 404)
+    held = []
+    for h in holdings:
+        value = _float(h.get("market_value_text"))
+        if value is None or value <= 0 or str(h.get("symbol") or "").upper().endswith(".REC"):
+            continue  # shorts, receivables and unpriced lines stay outside the model, like cash
+        held.append({"conid": str(h["conid"]), "symbol": str(h.get("symbol") or h["conid"]),
+                     "description": h.get("description") or "", "weight": value / nav_value})
+    start = (date.fromisoformat(snapshot) - timedelta(days=MODEL_PRICE_DAYS)).isoformat()
+    keys = {h["conid"] for h in held}
+    prices: dict[str, dict[str, float]] = {}
+    for row in connection.execute(
+            "SELECT snapshot_date, conid, mark_price_text FROM subject_position_series "
+            "WHERE subject_id = ? AND snapshot_date >= ? AND snapshot_date <= ?", (account_id, start, snapshot)).fetchall():
+        conid, mark = str(row["conid"]), _float(row["mark_price_text"])
+        if conid in keys and mark is not None:
+            prices.setdefault(conid, {})[str(row["snapshot_date"])[:10]] = mark
+    return subject, snapshot, held, prices, holding_return_matrix(prices)
+
+
+def _model_benchmark(connection, subject: Mapping[str, Any], snapshot: str, dates: list[str]):
+    mapping = _benchmark_for(connection, subject, snapshot)
+    if not mapping or not dates:
+        return None, None
+    levels = _BenchmarkLevels(connection, str(mapping["benchmark_id"]), dates[0], dates[-1])
+    returns = {}
+    for previous, current in zip(dates, dates[1:]):
+        a, b = levels.level(previous), levels.level(current)
+        if a and b:
+            returns[current] = b / a - 1.0
+    return mapping, returns
+
+
+def project_wealth(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Monte Carlo projection of the account's value from its own history."""
+    from ibkr_etl.modelling import ModellingInputError, project_wealth as model
+
+    account_id = str(arguments["account_id"])
+    years = int(arguments.get("years") or 10)
+    flow = _number_argument(arguments, "monthly_flow", -1e12, 1e12) or 0.0
+    target = _number_argument(arguments, "target", 0.0, 1e15)
+    assumed = _number_argument(arguments, "annual_return", -0.49, 0.99)
+    subject = _subject(connection, account_id)
+    end = _latest_nav_date(connection, account_id, None)
+    nav, flows = _series_inputs(connection, subject, end)
+    dates = _window(nav, None, end)
+    returns = daily_returns(nav, flows, dates)
+    try:
+        result = model([r for _, r in returns], start_value=nav[end], start_date=end, years=years,
+                       monthly_flow=flow, target=target or None, annual_return=assumed)
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    yearly = [point for i, point in enumerate(result["series"]) if i % 12 == 0 or i == len(result["series"]) - 1]
+    return {
+        "as_of": end,
+        "data": {"currency": _reporting_currency(subject), "start_value": result["start_value"], "start_date": end,
+                 "years": result["years"], "monthly_flow": flow, "total_flows": result["total_flows"],
+                 "target": result["target"], "history_from": dates[0],
+                 "summary": result["summary"], "assumptions": result["assumptions"],
+                 "yearly_percentiles": yearly, "warnings": result["warnings"],
+                 "method": result["method"] + " Values are fractions where they are rates.",
+                 "disclaimer": result["disclaimer"]},
+        "citations": [_citation("subject_nav_series", account_id, from_date=dates[0], to_date=end)],
+    }
+
+
+def _weight_changes(value: Any, held: list[dict[str, Any]]) -> dict[str, float]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 25:
+        raise ToolError("invalid_arguments", "changes must list 1 to 25 holdings.", 400)
+    by_symbol: dict[str, list[str]] = {}
+    for h in held:
+        by_symbol.setdefault(h["symbol"].upper(), []).append(h["conid"])
+    changes: dict[str, float] = {}
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) - {"symbol", "weight"}:
+            raise ToolError("invalid_arguments", "Each change needs only a symbol and a weight.", 400)
+        symbol = str(item.get("symbol") or "").strip().upper()
+        weight = item.get("weight")
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 <= weight <= 2:
+            raise ToolError("invalid_arguments", "Each weight must be a fraction of NAV between 0 and 2.", 400)
+        conids = by_symbol.get(symbol)
+        if not conids:
+            raise ToolError("invalid_arguments", f"{symbol[:20]} is not a current holding. The what-if changes "
+                                                 "current holdings only.", 400)
+        if len(conids) > 1:
+            raise ToolError("invalid_arguments", f"{symbol[:20]} matches more than one holding.", 400)
+        changes[conids[0]] = float(weight)
+    return changes
+
+
+def run_what_if(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Risk and return of current holdings against hypothetical weights, over the same year of prices."""
+    from ibkr_etl.modelling import ModellingInputError, what_if
+
+    account_id = str(arguments["account_id"])
+    subject, snapshot, held, _, matrix = _model_holdings(connection, account_id)
+    current = {h["conid"]: h["weight"] for h in held}
+    proposed = {**current, **_weight_changes(arguments.get("changes"), held)}
+    mapping, benchmark = _model_benchmark(connection, subject, snapshot, matrix["dates"])
+    try:
+        result = what_if(current, proposed, matrix, risk_free=0.0, benchmark=benchmark or None)
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    holdings = sorted(held, key=lambda h: -h["weight"])
+    return {
+        "as_of": snapshot,
+        "data": {"currency": _reporting_currency(subject), "holdings_date": snapshot,
+                 "window_start": result["window_start"], "window_end": result["window_end"],
+                 "observations": result["observations"],
+                 "holdings": [{"symbol": h["symbol"], "current_weight": h["weight"],
+                               "proposed_weight": proposed[h["conid"]],
+                               "modelled": h["conid"] in matrix["returns"]} for h in holdings[:40]],
+                 "current": result["current"], "proposed": result["proposed"], "difference": result["difference"],
+                 "benchmark": {"id": mapping["benchmark_id"], "name": mapping["name"]} if mapping else None,
+                 "not_modelled": [h["symbol"] for h in holdings if h["conid"] not in matrix["returns"]],
+                 "method": "Both mixes are replayed over the same daily marks of current holdings, each in its own "
+                           "currency; weights are fractions of NAV and the rest is cash. Holdings with too little "
+                           "price history are carried at 0%. " + MODEL_RISK_FREE_NOTE,
+                 "disclaimer": result["disclaimer"]},
+        "citations": [_citation("subject_position_series", account_id, from_date=result["window_start"], to_date=snapshot)]
+                     + ([_citation("benchmark_prices", None, benchmark_id=mapping["benchmark_id"], through=snapshot)]
+                        if mapping else []),
+    }
+
+
+def optimise_portfolio(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Each holding's share of risk, and minimum-variance, risk-parity and maximum-Sharpe mixes of them."""
+    from ibkr_etl.modelling import ModellingInputError, optimise
+
+    account_id = str(arguments["account_id"])
+    cap = _number_argument(arguments, "max_weight", 0.01, 1.0) or 0.25
+    subject, snapshot, held, _, matrix = _model_holdings(connection, account_id)
+    current = {h["conid"]: h["weight"] for h in held}
+    labels = {h["conid"]: {"symbol": h["symbol"], "description": h["description"]} for h in held}
+    try:
+        result = optimise(current, labels, matrix, risk_free=0.0, cap=cap)
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    names = ("current", "minimum_variance", "risk_parity", "maximum_sharpe")
+    rows = [{"symbol": h["symbol"], "annual_volatility": h["annual_volatility"],
+             **{f"{name}_weight": h[f"{name}_weight"] for name in names},
+             **{f"{name}_risk_share": h[f"{name}_risk"] for name in names},
+             "risk_share_minus_weight": h["current_risk"] - h["current_weight"]} for h in result["holdings"]]
+    concentrated = [r["symbol"] for r in rows if r["current_risk_share"] > 1.25 * r["current_weight"]
+                    and r["current_risk_share"] >= 0.1]
+    return {
+        "as_of": snapshot,
+        "data": {"currency": _reporting_currency(subject), "holdings_date": snapshot,
+                 "window_start": result["window_start"], "window_end": result["window_end"],
+                 "maximum_weight": result["maximum_weight"], "sleeve_weight": result["sleeve_weight"],
+                 "holdings": rows, "portfolios": result["portfolios"],
+                 "risk_concentrated_in": concentrated,
+                 "not_optimised": [labels[k]["symbol"] for k in result["excluded"]],
+                 "method": result["method"] + " Weights are fractions of the holdings optimised (sleeve_weight of "
+                           "NAV); risk_share is each holding's share of the sleeve's volatility. risk_concentrated_in "
+                           "lists holdings carrying at least 10% of the risk and over 1.25 times their weight. "
+                           + MODEL_RISK_FREE_NOTE,
+                 "disclaimer": result["disclaimer"]},
+        "citations": [_citation("subject_position_series", account_id, from_date=result["window_start"], to_date=snapshot)],
+    }
+
+
+def get_factor_exposures(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Fama-French five-factor plus momentum regression of the account's weekly returns."""
+    from ibkr_etl import fama_french
+    from ibkr_etl.modelling import ModellingInputError, factor_model
+
+    account_id = str(arguments["account_id"])
+    region = str(arguments.get("region") or fama_french.DEFAULT_REGION)
+    if region not in fama_french.REGIONS:
+        raise ToolError("invalid_arguments", "region must be developed, us or asia_pacific_ex_japan.", 400)
+    subject = _subject(connection, account_id)
+    end = _latest_nav_date(connection, account_id, None)
+    nav, flows = _series_inputs(connection, subject, end)
+    returns = daily_returns(nav, flows, _window(nav, None, end))
+    try:
+        factors = fama_french.load_factor_data(region)
+    except fama_french.FactorDataError as error:
+        raise ToolError("factor_data_unavailable", "The factor data could not be downloaded right now.", 503) from error
+    try:
+        result = factor_model(returns, factors["factors"], region_label=factors["region_label"],
+                              source_url=factors["source_url"], labels=factors.get("labels"))
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    return {
+        "as_of": end,
+        "data": {"currency": _reporting_currency(subject), "region": result["region"],
+                 "factor_source": factors.get("source", "kenneth_french"), "factor_data_through": factors["latest_date"],
+                 **{k: result[k] for k in ("window_start", "window_end", "weeks", "alpha_annual", "alpha_t_statistic",
+                                           "r_squared", "adjusted_r_squared", "residual_volatility_annual",
+                                           "exposures", "momentum_included", "disclaimer")},
+                 "notes": " ".join(x for x in (factors.get("momentum_note"), factors.get("source_note")) if x),
+                 "method": result["method"] + " Factor returns are in US dollars; the account is measured in its "
+                           "reporting currency."},
+        "citations": [_citation("subject_nav_series", account_id, from_date=result["window_start"], to_date=end),
+                      _citation("factor_library" if factors.get("source") != "etf_proxy" else "yahoo_finance", None,
+                                region=region, through=factors["latest_date"])],
+    }
+
+
+def _account_returns(connection, account_id: str) -> tuple[Mapping[str, Any], str, dict[str, float], list[tuple[str, float]]]:
+    subject = _subject(connection, account_id)
+    end = _latest_nav_date(connection, account_id, None)
+    nav, flows = _series_inputs(connection, subject, end)
+    return subject, end, nav, daily_returns(nav, flows, _window(nav, None, end))
+
+
+def get_risk_outlook(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Volatility forecast, forward VaR and expected tail loss, their backtest, and drawdown odds."""
+    from ibkr_etl import risk_forecasting
+    from ibkr_etl.modelling import ModellingInputError
+
+    account_id = str(arguments["account_id"])
+    subject, end, nav, returns = _account_returns(connection, account_id)
+    try:
+        forecast = risk_forecasting.volatility_forecast(returns)
+        values = [r for _, r in returns]
+        history = forecast["long_run_volatility_annual"]
+        scale = forecast["forecast_volatility_next_month_annual"] / history if history else 1.0
+        historical = risk_forecasting.drawdown_odds(values)
+        current = risk_forecasting.drawdown_odds(values, volatility_scale=scale)
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    backtest = forecast["backtest"]
+    latest = None
+    if backtest.get("available") and backtest["series"]:
+        row = backtest["series"][-1]
+        latest = {"date": row["date"], "return": row["return"] + _mean(values), "var_95": row["var"],
+                  "breached": row["return"] < -row["var"]}
+    return {
+        "as_of": end,
+        "data": {"currency": _reporting_currency(subject), "nav": nav[end], "model": forecast["method_name"],
+                 "window_start": forecast["window_start"], "window_end": forecast["window_end"],
+                 **{k: forecast[k] for k in ("forecast_volatility_annual", "forecast_volatility_next_month_annual",
+                                             "long_run_volatility_annual", "realised_volatility_last_year",
+                                             "shock_half_life_days", "one_day", "one_month")},
+                 "volatility_vs_long_run": (forecast["forecast_volatility_next_month_annual"] / history) if history else None,
+                 "backtest": {k: v for k, v in backtest.items() if k != "series"},
+                 "latest_day": latest,
+                 "drawdown_odds_next_year": {"at_historical_volatility": historical, "at_forecast_volatility": current},
+                 "method": forecast["method"] + " VaR and tail loss are fractions of NAV; latest_day compares the "
+                           "last return with the VaR forecast the day before.",
+                 "disclaimer": forecast["disclaimer"]},
+        "citations": [_citation("subject_nav_series", account_id, from_date=forecast["window_start"], to_date=end)],
+    }
+
+
+def _mean(values: list[float]) -> float:
+    return math.fsum(values) / len(values) if values else 0.0
+
+
+def get_market_regimes(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Calm, normal and stressed regimes from the account's own returns, and a scored 1-3 month outlook."""
+    from ibkr_etl import risk_forecasting
+    from ibkr_etl.modelling import ModellingInputError
+
+    account_id = str(arguments["account_id"])
+    subject, end, nav, returns = _account_returns(connection, account_id)
+    try:
+        result = risk_forecasting.regime_outlook(returns)
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    value = nav[end]
+    outlook = [{**row, **{f"{band}_value": value * (1.0 + row[band]) for band in ("p5", "p50", "p95")}}
+               for row in result["outlook"]]
+    return {
+        "as_of": end,
+        "data": {"currency": _reporting_currency(subject), "nav": value,
+                 **{k: result[k] for k in ("window_start", "window_end", "states", "current_regime",
+                                           "current_probability", "regime_a_week_ago", "regimes", "transition",
+                                           "score", "method", "disclaimer")},
+                 "outlook": outlook,
+                 "stressed_probability_last_8_weeks": result["timeline"][-8:]},
+        "citations": [_citation("subject_nav_series", account_id, from_date=result["window_start"], to_date=end)],
+    }
+
+
+def run_factor_stress(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Move of the account implied by its factor betas for a preset or custom set of factor shocks."""
+    from ibkr_etl import fama_french, risk_forecasting
+    from ibkr_etl.modelling import FACTOR_NAMES, ModellingInputError, factor_model
+
+    account_id = str(arguments["account_id"])
+    region = str(arguments.get("region") or fama_french.DEFAULT_REGION)
+    if region not in fama_french.REGIONS:
+        raise ToolError("invalid_arguments", "region must be developed, us or asia_pacific_ex_japan.", 400)
+    scenario = arguments.get("scenario")
+    raw = arguments.get("shocks")
+    if bool(scenario) == bool(raw):
+        raise ToolError("invalid_arguments", "Give either a preset scenario or a list of factor shocks.", 400)
+    if scenario:
+        if scenario not in risk_forecasting.STRESS_PRESETS:
+            raise ToolError("invalid_arguments", "Unknown scenario.", 400)
+        label, shocks = risk_forecasting.STRESS_PRESETS[scenario]
+    else:
+        if not isinstance(raw, list) or not 1 <= len(raw) <= len(FACTOR_NAMES):
+            raise ToolError("invalid_arguments", "shocks must list 1 to 6 factors.", 400)
+        label, shocks = "Custom shocks", {}
+        for item in raw:
+            if not isinstance(item, Mapping) or item.get("factor") not in FACTOR_NAMES or set(item) - {"factor", "change"}:
+                raise ToolError("invalid_arguments", "Each shock needs a factor (" + ", ".join(FACTOR_NAMES)
+                                + ") and a change.", 400)
+            change = item.get("change")
+            if isinstance(change, bool) or not isinstance(change, (int, float)):
+                raise ToolError("invalid_arguments", "Each change must be a fraction, -0.2 for a 20% fall.", 400)
+            shocks[item["factor"]] = float(change)
+    subject, end, nav, returns = _account_returns(connection, account_id)
+    try:
+        factors = fama_french.load_factor_data(region)
+    except fama_french.FactorDataError as error:
+        raise ToolError("factor_data_unavailable", "The factor data could not be downloaded right now.", 503) from error
+    try:
+        model = factor_model(returns, factors["factors"], region_label=factors["region_label"],
+                             source_url=factors["source_url"], labels=factors.get("labels"))
+        result = risk_forecasting.factor_stress(model, shocks)
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    return {
+        "as_of": end,
+        "data": {"currency": _reporting_currency(subject), "scenario": scenario, "scenario_label": label,
+                 "shocks_applied": shocks, "nav": nav[end], "impact": result["impact"],
+                 "impact_value": result["impact"] * nav[end], "factors": result["factors"],
+                 "factors_not_in_model": result["factors_not_in_model"], "r_squared": result["r_squared"],
+                 "unexplained_monthly_range": result["unexplained_monthly_range"],
+                 "factor_source": factors.get("source", "kenneth_french"), "method": result["method"],
+                 "disclaimer": result["disclaimer"]},
+        "citations": [_citation("subject_nav_series", account_id, to_date=end),
+                      _citation("factor_library" if factors.get("source") != "etf_proxy" else "yahoo_finance", None,
+                                region=region, through=factors["latest_date"])],
+    }
+
+
 # Registry ------------------------------------------------------------------
 
 
@@ -1250,6 +1620,57 @@ TOOLS: tuple[ToolSpec, ...] = (
                                    "currency code, sector, asset class or symbol; ignored for all"},
                          "change": {"type": "number", "description": "fraction, -0.1 means a 10% fall"}}}}},
                      ["account_id", "shocks"]), run_stress_test),
+    ToolSpec("project_wealth", "Monte Carlo projection of the account's value over 1 to 30 years from its own "
+             "history, with optional monthly contributions (positive) or withdrawals (negative), a target value and "
+             "a return assumption. Returns the 5th, 50th and 95th percentile outcomes and the chances of reaching the "
+             "target, running out and ending below the money put in. Hypothetical, not a forecast.",
+             _schema({"account_id": _ACCOUNT, "years": {"type": "integer", "minimum": 1, "maximum": 30},
+                      "monthly_flow": {"type": "number", "description": "reporting currency a month; negative to withdraw"},
+                      "target": {"type": "number", "description": "reporting currency"},
+                      "annual_return": {"type": "number", "description": "fraction a year, e.g. 0.05; omit for history"}},
+                     ["account_id"]), project_wealth),
+    ToolSpec("run_what_if", "Compare the risk and return of the current holdings with hypothetical weights for some "
+             "of them, over the same year of daily prices: return, volatility, Sharpe, VaR, expected tail loss, "
+             "maximum drawdown, worst month and beta. Weights are fractions of NAV; holdings not listed keep their "
+             "weight and the rest is cash. Hypothetical, not a recommendation.",
+             _schema({"account_id": _ACCOUNT, "changes": {
+                 "type": "array", "minItems": 1, "maxItems": 25, "items": {
+                     "type": "object", "additionalProperties": False, "required": ["symbol", "weight"],
+                     "properties": {"symbol": {"type": "string", "description": "a current holding's symbol"},
+                                    "weight": {"type": "number", "description": "fraction of NAV, 0 removes it"}}}}},
+                     ["account_id", "changes"]), run_what_if),
+    ToolSpec("optimise_portfolio", "Each holding's share of the portfolio's risk next to its weight, and three "
+             "alternative mixes of the same holdings: minimum variance, risk parity and maximum Sharpe, with their "
+             "expected return, volatility and Sharpe. Illustrative, not a recommendation.",
+             _schema({"account_id": _ACCOUNT, "max_weight": {"type": "number", "description": "cap per holding as a "
+                      "fraction, default 0.25"}}, ["account_id"]), optimise_portfolio),
+    ToolSpec("get_factor_exposures", "Fama-French factor model: the account's sensitivity to the market, size, "
+             "value, profitability, investment and momentum factors, with t-statistics, alpha and R-squared, from "
+             "weekly returns over up to three years.",
+             _schema({"account_id": _ACCOUNT, "region": {"type": "string", "description": "developed (default), us "
+                      "or asia_pacific_ex_japan"}}, ["account_id"]), get_factor_exposures),
+    ToolSpec("get_risk_outlook", "Forward-looking risk: a GARCH volatility forecast against the long-run level, "
+             "one-day and one-month VaR and expected tail loss at 95% and 99%, a backtest of how often past losses "
+             "broke the VaR line, whether the latest day did, and the chance of a 10%, 20% or 30% fall within a year.",
+             _schema({"account_id": _ACCOUNT}, ["account_id"]), get_risk_outlook),
+    ToolSpec("get_market_regimes", "The account's calm, normal and stressed regimes from its own returns: which one "
+             "it is in now and a week ago, the odds of switching, a 1 to 3 month range for its value, and a score "
+             "of how well past ranges and their direction held up. Hypothetical, not a forecast.",
+             _schema({"account_id": _ACCOUNT}, ["account_id"]), get_market_regimes),
+    ToolSpec("run_factor_stress", "Move of the account implied by its Fama-French factor betas for a one-off shock: "
+             "a preset scenario, or custom changes to the market (Mkt-RF), size (SMB), value (HML), profitability "
+             "(RMW), investment (CMA) and momentum (MOM) factors. Use it to model a scenario the person describes "
+             "in words, and state the shocks you assumed.",
+             _schema({"account_id": _ACCOUNT, "region": {"type": "string", "description": "developed (default), us "
+                      "or asia_pacific_ex_japan"},
+                      "scenario": {"type": "string", "enum": ["market_down_20", "growth_selloff", "flight_to_quality",
+                                                              "small_cap_rally", "value_rotation"]},
+                      "shocks": {"type": "array", "minItems": 1, "maxItems": 6, "items": {
+                          "type": "object", "additionalProperties": False, "required": ["factor", "change"],
+                          "properties": {"factor": {"type": "string", "enum": ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM"]},
+                                         "change": {"type": "number", "description": "fraction, -0.2 is a 20% fall; "
+                                                    "between -0.6 and 0.6"}}}}},
+                     ["account_id"]), run_factor_stress),
     ToolSpec("list_broker_logins", "The IBKR logins added for onboarding, with the latest check of each: its "
              "status, IBKR's error code if it failed, how many accounts it found, and what its Flex query lacks.", _schema({}, []),
              list_broker_logins, False, only_jobs=ONBOARDING),
@@ -1280,6 +1701,10 @@ def validate_arguments(spec: ToolSpec, arguments: Mapping[str, Any]) -> dict[str
             raise ToolError("invalid_arguments", f"{name} must be a short string.", 400)
         if kind == "integer" and (isinstance(value, bool) or not isinstance(value, int)):
             raise ToolError("invalid_arguments", f"{name} must be a whole number.", 400)
+        if kind == "integer" and not properties[name].get("minimum", value) <= value <= properties[name].get("maximum", value):
+            raise ToolError("invalid_arguments", f"{name} is out of range.", 400)
+        if kind == "number" and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)):
+            raise ToolError("invalid_arguments", f"{name} must be a number.", 400)
     return clean
 
 

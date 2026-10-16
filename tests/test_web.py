@@ -26,6 +26,7 @@ from ibkr_etl.web import (
     _security_audit_event,
     SECURITY_HEADERS,
     account_page,
+    account_subpage,
     account_root,
     cash_activity,
     home,
@@ -1028,8 +1029,8 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("WealthRyse Portfolio Data Platform", page)
         self.assertNotIn(">IBKR Portfolio Platform<", page)
         self.assertIn('href="/accounts/U16088571/overview"', page)
-        self.assertIn("U16088571-U.S. Technology and Biotechnology", page)
-        self.assertNotIn("U16088571 (U.S. Technology and Biotechnology)", page)
+        self.assertIn('<div class="account-id">U.S. Technology and Biotechnology</div>', page)
+        self.assertNotIn("U16088571-U.S. Technology and Biotechnology", page)
         self.assertIn("Select an account to open its portfolio workspace", page)
         self.assertIn('class="company-logo"', page)
         self.assertIn('alt="Sprout Asset Management (Asia) Limited company logo"', page)
@@ -1201,6 +1202,7 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("grid-template-columns: repeat(4, minmax(0, 1fr))", page)
         self.assertIn("@media (max-width: 650px)", page)
         self.assertIn("WealthRyse Portfolio Data Platform", page)
+        self.assertNotIn('class="brand-title"', page)
         self.assertNotIn(">IBKR Portfolio Platform<", page)
         self.assertIn('href="/accounts/U16088571/performance"', page)
         self.assertIn('href="/accounts/U16088571/trades"', page)
@@ -1330,6 +1332,35 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn('class="page-view active" data-section="risk"', risk_page)
         self.assertIn('<h2 class="sr-only">Risk analytics</h2>', risk_page)
         self.assertEqual(risk_page.count('class="page-view active"'), 1)
+
+        modelling_page = account_page(
+            "U16088571",
+            "modelling",
+            None,
+            {"email": "analyst@example.com"},
+        )
+        self.assertIn('class="page-view active" data-section="modelling"', modelling_page)
+        self.assertIn('href="/accounts/U16088571/modelling"', modelling_page)
+        for card in ("model-projection", "model-risk", "model-regimes", "model-whatif", "model-optimise",
+                     "model-factors", "model-stress"):
+            self.assertIn(f'id="{card}"', modelling_page)
+            self.assertIn(f'data-part-link="{card}"', modelling_page)
+        self.assertIn("if(activeSection==='modelling')renderModelling(asOf);", modelling_page)
+
+    def test_account_sections_split_into_subpages(self) -> None:
+        user = {"email": "analyst@example.com"}
+        what_if = account_subpage("U16088571", "modelling", "what-if", None, user)
+        self.assertIn('href="/accounts/U16088571/modelling/what-if" data-part-link="model-whatif" aria-current="page"', what_if)
+        self.assertIn('href="/accounts/U16088571/risk/drawdowns"', what_if)
+        self.assertIn('class="account-nav-menu"', what_if)
+        self.assertIn('"model-whatif"', what_if)
+        risk = account_page("U16088571", "risk", None, user)
+        self.assertIn('href="/accounts/U16088571/risk/snapshot" data-part-link="risk-summary" aria-current="page"', risk)
+        for account_id, section, part in (("U16088571", "modelling", "nope"), ("U16088571", "cash", "snapshot"),
+                                          ("ANOTHER_ACCOUNT", "risk", "snapshot")):
+            with self.subTest(section=section, part=part), self.assertRaises(HTTPException) as raised:
+                account_subpage(account_id, section, part, None, user)
+            self.assertEqual(raised.exception.status_code, 404)
 
     def test_account_subpages_reject_unknown_accounts_and_sections(self) -> None:
         for account_id, section in (

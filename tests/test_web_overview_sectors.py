@@ -224,14 +224,14 @@ class PerformanceRiskLayoutTests(unittest.TestCase):
 
     def test_section_jumps_and_no_repeated_header(self):
         performance = web._render_account_page(self.OWNER, account_id="U16088571", section="performance")
-        self.assertIn('<a href="#perf-chart">NAV chart</a>', performance)
+        self.assertIn('href="/accounts/U16088571/performance/nav-chart" data-part-link="perf-chart"', performance)
         self.assertIn('<h2 class="sr-only">Performance</h2>', performance)
         self.assertNotIn("Account workspace", performance)
         self.assertLess(performance.index('id="asof-select"'), performance.index('class="account-sticky"'))
         risk = web._render_account_page(self.OWNER, account_id="U16088571", section="risk")
-        self.assertIn('<a href="#risk-drawdowns">Drawdowns</a>', risk)
+        self.assertIn('href="/accounts/U16088571/risk/drawdowns" data-part-link="risk-drawdowns"', risk)
         cash = web._render_account_page(self.OWNER, account_id="U16088571", section="cash")
-        self.assertNotIn('class="section-jumps"', cash)
+        self.assertNotIn('class="section-jumps', cash)
         guide = web._render_platform_page(self.OWNER, section="metrics-guide")
         self.assertNotIn("Platform workspace", guide)
 
@@ -263,13 +263,43 @@ class FailureStateTests(unittest.TestCase):
 
 
 class DarkModeTests(unittest.TestCase):
-    def test_dark_theme_follows_the_computer_setting_on_every_page(self):
-        from ibkr_etl.web_theme import ACCOUNT_THEME_CSS, DARK_THEME_CSS, HOME_THEME_CSS
-        self.assertIn("@media screen and (prefers-color-scheme: dark)", DARK_THEME_CSS)
-        self.assertTrue(ACCOUNT_THEME_CSS.endswith(DARK_THEME_CSS))
-        self.assertTrue(HOME_THEME_CSS.endswith(DARK_THEME_CSS))
+    def test_screens_use_the_dark_mission_theme_on_every_page(self):
+        from ibkr_etl.web_theme import (
+            ACCOUNT_THEME_CSS, DARK_THEME_CSS, HOME_THEME_CSS, MISSION_THEME_CSS, WEB_FONT_FILES,
+        )
+        self.assertIn("@media screen {", DARK_THEME_CSS)
+        self.assertNotIn("prefers-color-scheme", DARK_THEME_CSS)
+        self.assertTrue(ACCOUNT_THEME_CSS.endswith(DARK_THEME_CSS + MISSION_THEME_CSS))
+        self.assertIn(DARK_THEME_CSS + MISSION_THEME_CSS, HOME_THEME_CSS)
         for token in ("--bg:", "--surface:", "--ink:", "--chart-grid:", "--chart-text:"):
             self.assertIn(token, DARK_THEME_CSS)
+            self.assertIn(token, MISSION_THEME_CSS)
+        for name in WEB_FONT_FILES:
+            self.assertIn(f"/assets/fonts/{name}", MISSION_THEME_CSS)
+
+    def test_every_platform_page_offers_the_light_dark_switch(self):
+        from ibkr_etl.web_theme import MISSION_THEME_CSS, THEME_TOGGLE_HTML
+        owner = {"email": "o@example.com", "role": "owner"}
+        pages = (web.home(None, owner),
+                 web._render_account_page(owner, account_id="U16088571", section="overview"),
+                 web._render_platform_page(owner, section="system-health"))
+        for page in pages:
+            self.assertIn(THEME_TOGGLE_HTML, page)
+        self.assertIn('data-theme-toggle', THEME_TOGGLE_HTML)
+        self.assertIn("localStorage.getItem(key)==='light'", THEME_TOGGLE_HTML)
+        self.assertIn("rule.media.mediaText==='screen'", THEME_TOGGLE_HTML)
+        # Light-mode values sit outside the dark "@media screen" block.
+        self.assertLess(MISSION_THEME_CSS.index("--bg: #fff;"), MISSION_THEME_CSS.index("@media screen {"))
+
+    def test_mission_font_is_served_from_the_package(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(web.app)
+        response = client.get("/assets/fonts/barlow-600.woff2")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "font/woff2")
+        self.assertTrue(response.content.startswith(b"wOF2"))
+        self.assertEqual(client.get("/assets/fonts/..%2Fweb.py").status_code, 404)
+        self.assertEqual(client.get("/assets/fonts/other.woff2").status_code, 404)
 
     def test_chart_lines_and_labels_use_theme_colours(self):
         for source in (web._render_account_page({"email": "o@example.com", "role": "owner"},

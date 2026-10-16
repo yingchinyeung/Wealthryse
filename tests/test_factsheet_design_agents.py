@@ -393,6 +393,9 @@ class WebTests(Files):
         versions = self.client.get(f"{self.base}/{draft_id}").json()["versions"]
         self.assertEqual(versions[0]["spec_sha256"], versions[2]["spec_sha256"])
         self.assertEqual([v["source"] for v in versions], ["builder", "editor", "undo"])
+        # Undoing again steps further back, not forward to the edit: version 1 is the first.
+        again = self.client.post(f"{self.base}/{draft_id}/undo", json={"expected_version": 3})
+        self.assertEqual(again.status_code, 409, again.text)
 
         answered = self.client.post(f"{self.base}/{draft_id}/answers",
                                     json={"question": 0, "answer": "", "expected_version": 3}).json()
@@ -427,6 +430,45 @@ class WebTests(Files):
         self.assertFalse(state["agents_available"])
         edit = self.client.post(f"{self.base}/{draft_id}/edits", json={"request": "bigger", "expected_version": 1})
         self.assertEqual(edit.status_code, 503)
+
+    def test_an_unreachable_agent_service_keeps_the_draft_and_explains_the_edit(self):
+        import httpx
+
+        class Down(FakeApi):
+            def request(self, method, path, timeout=30.0, **kwargs):
+                self.calls.append((path, kwargs["json"]))
+                raise httpx.ConnectError("connection refused")
+
+        self.api = Down()
+        draft_id = self.create()
+        state = self.client.get(f"{self.base}/{draft_id}").json()
+        self.assertIn("unavailable", state["checker"])
+        edit = self.client.post(f"{self.base}/{draft_id}/edits", json={"request": "bigger", "expected_version": 1})
+        self.assertEqual(edit.status_code, 502, edit.text)
+
+    def test_the_agent_calls_share_one_time_budget(self):
+        agent = web.WebDesignAgent(FakeApi(), "u", "S1", budget_seconds=0)
+        self.assertEqual(agent.build_step({})["edits"], [])
+        with self.assertRaises(web.HTTPException) as raised:
+            agent.check({})
+        self.assertEqual(raised.exception.status_code, 504)
+        timeouts = []
+
+        class Timed(FakeApi):
+            def request(self, method, path, timeout=30.0, **kwargs):
+                timeouts.append(timeout)
+                return super().request(method, path, timeout=timeout, **kwargs)
+
+        web.WebDesignAgent(Timed(), "u", "S1").check({})
+        self.assertLessEqual(timeouts[0], web.AGENT_SECONDS)
+
+    def test_the_designer_page_is_not_taken_by_the_account_page_route(self):
+        import ibkr_etl.web as site
+        from starlette.routing import Match
+
+        scope = {"type": "http", "path": "/accounts/S1/factsheet-designer", "method": "GET"}
+        first = next(r for r in site.app.router.routes if r.matches(scope)[0] == Match.FULL)
+        self.assertEqual(first.endpoint.__name__, "designer_page")
 
 
 def _final(payload):

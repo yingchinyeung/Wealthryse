@@ -242,10 +242,115 @@ class Store:
         self._commit()
         return row is not None
 
+    # Export agent ----------------------------------------------------------
+
+    def add_export_check(self, *, user: str, account_id: str, plan: dict[str, Any], fingerprint: str, status: str,
+                         note: str, note_checked: bool, concerns: Sequence[str], checks: Sequence[Any],
+                         pack_item_id: int | None, correlation_id: str) -> str:
+        check_id = str(uuid.uuid4())
+        self.db.execute(
+            "INSERT INTO agent.export_checks(check_id, tenant_id, user_object_id, subject_id, plan, fingerprint, status, "
+            "note, note_checked, concerns, checks, pack_item_id, correlation_id) VALUES (?::uuid, ?::uuid, ?, ?, ?::jsonb, "
+            "?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?)",
+            (check_id, self.tenant_id, user.lower(), account_id, json.dumps(plan, default=str), fingerprint, status,
+             note[:6000], note_checked, json.dumps(list(concerns)), json.dumps(list(checks), default=str), pack_item_id,
+             correlation_id),
+        )
+        self._commit()
+        return check_id
+
+    def export_check(self, check_id: str, user: str) -> dict[str, Any] | None:
+        try:
+            uuid.UUID(check_id)
+        except ValueError:
+            return None
+        row = self.db.execute(
+            "SELECT check_id::text AS check_id, subject_id, plan, fingerprint, status, note, note_checked, concerns, "
+            "checks, pack_item_id, created_at, released_at, released_after_review FROM agent.export_checks "
+            "WHERE check_id = ?::uuid AND tenant_id = ?::uuid AND user_object_id = ?",
+            (check_id, self.tenant_id, user.lower()),
+        ).fetchone()
+        self.db.rollback()
+        return _json_columns(dict(row), "plan", "concerns", "checks") if row else None
+
+    def release_export_check(self, check_id: str, user: str) -> bool:
+        """Record that the person downloaded the files; a failed export can't be released."""
+        row = self.db.execute(
+            "UPDATE agent.export_checks SET released_at = COALESCE(released_at, now()), "
+            "released_after_review = released_after_review OR status = 'review' "
+            "WHERE check_id = ?::uuid AND tenant_id = ?::uuid AND user_object_id = ? AND status <> 'fail' "
+            "RETURNING check_id", (check_id, self.tenant_id, user.lower()),
+        ).fetchone()
+        self._commit()
+        return row is not None
+
+    def save_export_pack(self, *, user: str, account_id: str, name: str, schedule: str, plan: dict[str, Any]) -> str:
+        pack_id = str(uuid.uuid4())
+        self.db.execute(
+            "INSERT INTO agent.export_packs(pack_id, tenant_id, user_object_id, subject_id, name, schedule, plan) "
+            "VALUES (?::uuid, ?::uuid, ?, ?, ?, ?, ?::jsonb)",
+            (pack_id, self.tenant_id, user.lower(), account_id, name[:80], schedule, json.dumps(plan, default=str)),
+        )
+        self._commit()
+        return pack_id
+
+    def export_packs(self, user: str, account_id: str | None = None) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT pack_id::text AS pack_id, subject_id, name, schedule, plan, created_at FROM agent.export_packs "
+            "WHERE tenant_id = ?::uuid AND user_object_id = ? AND (?::text IS NULL OR subject_id = ?) "
+            "AND archived_at IS NULL ORDER BY created_at DESC LIMIT 50",
+            (self.tenant_id, user.lower(), account_id, account_id),
+        ).fetchall()
+        self.db.rollback()
+        return [_json_columns(dict(r), "plan") for r in rows]
+
+    def export_pack(self, pack_id: str, user: str) -> dict[str, Any] | None:
+        try:
+            uuid.UUID(pack_id)
+        except ValueError:
+            return None
+        row = self.db.execute(
+            "SELECT pack_id::text AS pack_id, subject_id, name, schedule, plan, created_at FROM agent.export_packs "
+            "WHERE pack_id = ?::uuid AND tenant_id = ?::uuid AND user_object_id = ? AND archived_at IS NULL",
+            (pack_id, self.tenant_id, user.lower()),
+        ).fetchone()
+        self.db.rollback()
+        return _json_columns(dict(row), "plan") if row else None
+
+    def archive_export_pack(self, pack_id: str, user: str) -> bool:
+        try:
+            uuid.UUID(pack_id)
+        except ValueError:
+            return False
+        row = self.db.execute(
+            "UPDATE agent.export_packs SET archived_at = now() WHERE pack_id = ?::uuid AND tenant_id = ?::uuid "
+            "AND user_object_id = ? AND archived_at IS NULL RETURNING pack_id",
+            (pack_id, self.tenant_id, user.lower()),
+        ).fetchone()
+        self._commit()
+        return row is not None
+
+    def active_export_packs(self) -> list[dict[str, Any]]:
+        """Every saved pack, for the export_packs job (which checks each account against its own grants)."""
+        rows = self.db.execute(
+            "SELECT pack_id::text AS pack_id, user_object_id, subject_id, name, schedule, created_at "
+            "FROM agent.export_packs WHERE tenant_id = ?::uuid AND archived_at IS NULL ORDER BY created_at",
+            (self.tenant_id,),
+        ).fetchall()
+        self.db.rollback()
+        return [dict(r) for r in rows]
+
     def purge(self, days: int) -> int:
         row = self.db.execute("SELECT agent.purge_conversations(?) AS removed", (days,)).fetchone()
         self._commit()
         return int(row["removed"])
+
+
+def _json_columns(row: dict[str, Any], *names: str) -> dict[str, Any]:
+    for name in names:
+        if isinstance(row.get(name), str):
+            row[name] = json.loads(row[name])
+    return row
 
 
 def _split_visuals(message: dict[str, Any]) -> dict[str, Any]:

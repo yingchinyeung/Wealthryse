@@ -11,6 +11,8 @@ records); nothing is sent, published or released.
                                                          # the stressed regime or a volatility jump, with an
                                                          # explanation; once a month, check the risk models
                                                          # against what actually happened
+    python -m wealthryse_agent.jobs export_packs         # daily: an inbox card for each saved export pack
+                                                         # whose period has closed (no model, no files)
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
     python -m wealthryse_agent.jobs month_team --replay --round 2 --from 2026-01-31
@@ -30,6 +32,7 @@ Azure telemetry, never client data.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import sys
 import uuid
@@ -339,6 +342,46 @@ def data_quality(store: Store, tools: ToolClient, accounts: list[str], retention
     return written
 
 
+def export_packs(store: Store, tools: ToolClient, accounts: list[str]) -> int:
+    """One card per saved pack and closed period, for the person who saved it.
+
+    A period is closed once the account has data on or after its last day. A new pack starts with the
+    last period closed when it was saved, never earlier ones. The card only says the pack is ready: the
+    person builds, checks and releases the files on the website.
+    """
+    from ibkr_etl.export_agent import period_for
+
+    latest: dict[str, str | None] = {}
+    written = 0
+    for pack in store.active_export_packs():
+        account_id = pack["subject_id"]
+        if account_id not in accounts:
+            continue
+        if account_id not in latest:
+            latest[account_id] = tools.call("get_data_freshness", {"account_id": account_id})["data"].get(
+                "latest_valuation_date")
+        if not latest[account_id]:
+            continue
+        period = period_for(pack["schedule"], latest[account_id])
+        created = pack["created_at"]
+        created_day = (created.date() if isinstance(created, datetime) else date.fromisoformat(str(created)[:10]))
+        first = period_for(pack["schedule"], created_day.isoformat())
+        if period is None or first is None or period[1] < first[1]:
+            continue
+        from_day, to_day, label = period
+        owner = hashlib.sha256(str(pack["user_object_id"]).lower().encode()).hexdigest()
+        if store.add_inbox(
+                kind="export_pack", account_id=account_id, period_key=f"{pack['pack_id']}:{to_day}",
+                title=f"{pack['name']}: {label} is ready to check",
+                body=(f"The {pack['schedule']} export pack {pack['name']} can now be built for {from_day} to {to_day}. "
+                      "Open it to build the files, see the checks and the cover note, and download them."),
+                citations=[{"export_pack": pack["pack_id"], "owner_sha256": owner, "from_date": from_day,
+                            "to_date": to_day, "label": label}],
+                run_id=None):
+            written += 1
+    return written
+
+
 def replay_targets(tools: ToolClient, accounts: list[str], start: str, end: str) -> list[tuple[str, str]]:
     """Every account and month in the range whose factsheet was released."""
     from .month_team.coordinator import RELEASED
@@ -457,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team",
                                                   "onboarding", "operations", "weekly_brief", "live_market",
-                                                  "risk_watch"])
+                                                  "risk_watch", "export_packs"])
     parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
@@ -495,6 +538,8 @@ def main(argv: list[str] | None = None) -> int:
         accounts = [a["account_id"] for a in tools.call("list_accounts", {})["data"]["accounts"]]
         if args.job == "data_quality":
             written = data_quality(store, tools, accounts, runtime.retention_days)
+        elif args.job == "export_packs":
+            written = export_packs(store, tools, accounts)
         elif args.job == "month_team":
             written = month_team(store, tools, accounts, usage, args, correlation_id)
         else:

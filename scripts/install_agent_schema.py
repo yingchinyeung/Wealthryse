@@ -52,7 +52,7 @@ SCHEMAS = tuple(sorted((ROOT / "migrations" / "agent").glob("*.sql")))
 PLATFORM_READS = ("agent.onboarding_reviews, agent.onboarding_term_drafts, agent.onboarding_reconciliations, "
                   "agent.ops_investigations, agent.connection_reports")
 JOBS = {"holdings_explainer", "month_end_drafter", "data_quality", "month_team", "onboarding", "operations",
-        "weekly_brief", "live_market", "risk_watch"}
+        "weekly_brief", "live_market", "risk_watch", "export_packs"}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}\Z")
 
 

@@ -249,6 +249,9 @@ var jobs = [
   // 09:15 HKT on weekdays, after the morning account sync: alerts on a VaR breach, a switch into the
   // stressed regime or a volatility jump, and once a month a check of the risk models' backtests.
   { name: 'ibkrv2stg-agent-risk-watch', job: 'risk_watch', cron: '15 1 * * 1-5' }
+  // 09:45 HKT daily: an inbox card for each saved export pack whose month, quarter or year has closed
+  // and whose data is in. No model and no files: the person builds, checks and releases it on the website.
+  { name: 'ibkrv2stg-agent-export-packs', job: 'export_packs', cron: '45 1 * * *' }
 ]
 
 resource agentJobs 'Microsoft.App/jobs@2024-03-01' = [for j in jobs: {

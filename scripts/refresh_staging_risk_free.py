@@ -18,6 +18,7 @@ from ibkr_etl.db import (  # noqa: E402
     finish_run_success,
     start_run,
 )
+from ibkr_etl import raw_capture  # noqa: E402
 from ibkr_etl.risk_free import refresh_treasury_3m_rates  # noqa: E402
 from ibkr_etl.util import canonical_json, sha256_text  # noqa: E402
 
@@ -34,6 +35,7 @@ def main() -> int:
     start = date.fromisoformat(os.environ.get("RISK_FREE_START_DATE", "2025-01-20"))
     connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
     run_id = start_run(connection, "staging-us-treasury-risk-free", start.isoformat(), None)
+    raw_capture.set_job_run_id(run_id)
     try:
         result = refresh_treasury_3m_rates(connection, start_date=start)
         if os.environ.get('HIBOR_LICENSE_SCOPE_CONFIRMED','').lower() == 'true':

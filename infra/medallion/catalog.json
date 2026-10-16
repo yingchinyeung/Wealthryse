@@ -1175,8 +1175,8 @@
    "layer": "bronze",
    "declared_in": null,
    "new": true,
-   "holds": "Planned: raw responses from Yahoo, US Treasury, HKMA/HKAB and sector lookups.",
-   "plan": "New container so every external feed keeps its raw copy."
+   "holds": "Raw responses from Yahoo, US Treasury, HKMA/HKAB and sector lookups, named <feed>/<yyyy>/<mm>/<dd>/<request-key>-<sha256 prefix>.<ext> (src/ibkr_etl/raw_capture.py).",
+   "plan": "New container so every external feed keeps its raw copy. Capture is built and stays off until MARKET_DATA_RAW_CONTAINER is set on the job."
   },
   "ibkrv2stgauhecwc4itaoo/report-drafts": {
    "layer": "gold",
@@ -1404,7 +1404,7 @@
     "analytics"
    ],
    "schedule": "08:30 UTC",
-   "note": "No raw copy kept today."
+   "note": "Raw copy to bronze-market-data when MARKET_DATA_RAW_CONTAINER is set (off by default)."
   },
   "ibkrv2stg-bootstrap": {
    "hops": [
@@ -1429,7 +1429,8 @@
    "hops": [
     "analytics"
    ],
-   "schedule": "09:20 UTC"
+   "schedule": "09:20 UTC",
+   "note": "Fetches Yahoo crisis-window history; raw copy to bronze-market-data when MARKET_DATA_RAW_CONTAINER is set (off by default)."
   },
   "ibkrv2stg-derived-daily": {
    "hops": [
@@ -1516,7 +1517,7 @@
     "conform"
    ],
    "schedule": "23:00 UTC",
-   "note": "No raw copy kept today."
+   "note": "Raw copy to bronze-market-data when MARKET_DATA_RAW_CONTAINER is set (off by default)."
   },
   "ibkrv2stg-risk-snapshots": {
    "hops": [
@@ -1530,7 +1531,7 @@
     "conform"
    ],
    "schedule": "08:45 UTC",
-   "note": "No raw copy kept today."
+   "note": "Raw copy to bronze-market-data when MARKET_DATA_RAW_CONTAINER is set (off by default)."
   },
   "ibkrv2stg-template-intake": {
    "hops": [

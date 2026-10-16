@@ -11,6 +11,7 @@ from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import raw_capture
 from .db import is_postgres, transaction
 
 
@@ -71,7 +72,9 @@ def _chart_url(symbol: str, start_date: date, end_date: date) -> str:
     return f"{YAHOO_CHART_URL.format(symbol=urllib.parse.quote(symbol, safe=''))}?{query}"
 
 
-def _download_json(url: str, timeout: int = 30, attempts: int = 3) -> dict[str, Any]:
+def _download_json(
+    url: str, timeout: int = 30, attempts: int = 3, *, capture_key: str | None = None
+) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(attempts):
         request = urllib.request.Request(
@@ -79,10 +82,17 @@ def _download_json(url: str, timeout: int = 30, attempts: int = 3) -> dict[str, 
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
         )
         try:
+            requested_at = raw_capture.utc_now()
             with urllib.request.urlopen(
                 request, timeout=timeout, context=_ssl_context()
             ) as response:
-                return json.loads(response.read().decode("utf-8"))
+                body = response.read()
+                status = getattr(response, "status", None)
+            if capture_key:
+                raw_capture.capture_http("yahoo-chart", "Yahoo Finance chart API", url=url,
+                                         body=body, key=capture_key, status=status,
+                                         extension="json", requested_at=requested_at)
+            return json.loads(body.decode("utf-8"))
         except Exception as error:  # network and malformed-response failures retry alike
             last_error = error
             if attempt + 1 < attempts:
@@ -100,7 +110,13 @@ def fetch_daily_closes(
     """Return unadjusted daily closes using each exchange's local trading date."""
 
     url = _chart_url(instrument.symbol, start_date, end_date)
-    payload = _download_json(url, timeout=timeout)
+    payload = _download_json(
+        url,
+        timeout=timeout,
+        capture_key=raw_capture.request_key(
+            instrument.symbol, start_date.isoformat(), end_date.isoformat(), "1d"
+        ),
+    )
     chart = payload.get("chart") or {}
     if chart.get("error"):
         raise RuntimeError(

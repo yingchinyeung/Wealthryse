@@ -10,6 +10,16 @@ param tenantId string = '00000000-0000-0000-0000-000000000001'
 param classificationAccountIds string = ''
 param classificationAsOf string = ''
 param actionGroupName string = 'ibkr-v11-daily-alerts'
+// S2 raw market-data capture. Empty keeps capture off and leaves this job's
+// environment exactly as before. To switch on, set it to 'bronze-market-data' after
+// granting this job's identity Storage Blob Data Contributor on that container.
+param rawMarketDataContainer string = ''
+param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
+var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [
+  { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
+  { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
+  { name: 'AZURE_CLIENT_ID', value: jobIdentity.properties.clientId }
+]
 
 var tags = {
   application: 'ibkr-portfolio-platform'
@@ -80,14 +90,14 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           image: '${registry.properties.loginServer}/ibkr-platform@${imageDigest}'
           command: ['python']
           args: ['scripts/refresh_staging_sector_classifications.py']
-          env: [
+          env: concat([
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'DEPLOYMENT_ENVIRONMENT', value: 'internal-production' }
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'SECTOR_CLASSIFICATION_ACCOUNT_IDS', value: classificationAccountIds }
             { name: 'SECTOR_CLASSIFICATION_AS_OF', value: classificationAsOf }
             { name: 'SECTOR_CLASSIFICATION_WORKERS', value: '4' }
-          ]
+          ], rawMarketDataEnv)
           resources: {
             cpu: json('0.5')
             memory: '1Gi'

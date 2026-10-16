@@ -7,6 +7,16 @@ param keyVaultName string
 param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
+// S2 raw market-data capture. Empty keeps capture off and leaves this job's
+// environment exactly as before. To switch on, set it to 'bronze-market-data' after
+// granting this job's identity Storage Blob Data Contributor on that container.
+param rawMarketDataContainer string = ''
+param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
+var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [
+  { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
+  { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
+  { name: 'AZURE_CLIENT_ID', value: jobIdentity.properties.clientId }
+]
 
 var tags = {
   application: 'ibkr-portfolio-platform'
@@ -75,13 +85,13 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           image: '${registry.properties.loginServer}/ibkr-platform@${imageDigest}'
           command: ['python']
           args: ['scripts/refresh_crisis_scenarios.py']
-          env: [
+          env: concat([
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'DEPLOYMENT_ENVIRONMENT', value: 'internal-production' }
             // Same switch as the website: the job stores scenarios only while the website shows them.
             { name: 'CRISIS_SCENARIOS_ENABLED', value: 'true' }
-          ]
+          ], rawMarketDataEnv)
           resources: {
             cpu: json('0.5')
             memory: '1Gi'

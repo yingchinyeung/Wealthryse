@@ -83,12 +83,12 @@ class _AgentApi:
         token = self._credential.get_token(self.settings.audience.rstrip("/") + "/.default").token
         return {"Authorization": "Bearer " + token}
 
-    def request(self, method: str, path: str, **kwargs: Any) -> Any:
+    def request(self, method: str, path: str, timeout: float = 30.0, **kwargs: Any) -> Any:
         import httpx
 
         if not self.settings.url or not self.settings.audience:
             raise HTTPException(status_code=503, detail="The analyst is not configured.")
-        response = httpx.request(method, self.settings.url + path, headers=self._headers(), timeout=30.0, **kwargs)
+        response = httpx.request(method, self.settings.url + path, headers=self._headers(), timeout=timeout, **kwargs)
         if response.status_code >= 400:
             try:
                 detail = response.json().get("detail")
@@ -149,12 +149,15 @@ def case_question_stream() -> Callable[[dict[str, Any]], Iterable[bytes]] | None
 def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
             allowed_accounts: Callable[[dict[str, Any]], list[str]], theme_css: str = "",
             render_page: Callable[..., str] | None = None,
-            account_names: Callable[[dict[str, Any]], dict[str, str]] | None = None) -> None:
+            account_names: Callable[[dict[str, Any]], dict[str, str]] | None = None,
+            export_source: Callable[[dict[str, Any], str], Any] | None = None) -> None:
     """Add the agent routes and the widget to the website. No-op routes when off.
 
     render_page is the website's page shell (logo, navigation, sign-out), called as
     render_page(user, active=, title=, description=, content=, script=); without it the agent
     pages stand alone. account_names gives the display name of each account the person can see.
+    export_source(user, account_id) gives the export agent the account's rows and books (see
+    export_agent_web); without it the Exports tab has no export agent panel.
     """
     settings = _Settings()
     api = _AgentApi(settings)
@@ -259,6 +262,11 @@ def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
     month_team_web.install(app, authorized_user, allowed_accounts, theme_css, api, render_page)
     widget = b'<script src="/agents/widget.js" defer></script>' if settings.mode != "off" else b""
     scripts = []
+    if export_source is not None and settings.mode != "off":
+        from . import export_agent_web
+
+        export_agent_web.install(app, agent_user, allowed_accounts, api, export_source)
+        scripts.append((export_agent_web.PANEL_PATHS, b'<script src="/agents/exports.js" defer></script>'))
     if month_team_web.enabled():
         scripts.append((month_team_web.PANEL_PATHS, b'<script src="/agents/month-team.js" defer></script>'))
     if not widget and not scripts:
@@ -461,13 +469,14 @@ INBOX_SCRIPT = r"""<script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const md=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').split(/\n{2,}/).map(p=>'<p>'+p.replace(/\n/g,'<br>')+'</p>').join('');
 const NAMES={NAMES};
-const kinds={weekly_brief:'Weekly brief',holdings_explainer:'What changed',live_alert:'Live alert',risk_alert:'Risk alert',model_check:'Model check',month_end_draft:'Draft commentary',data_quality:'Data check',month_end_report:'Month-end report',month_end_hold:'Account blocked',month_end_dispute:'Agents disagree'};
+const kinds={export_pack:'Export pack',weekly_brief:'Weekly brief',holdings_explainer:'What changed',live_alert:'Live alert',risk_alert:'Risk alert',model_check:'Model check',month_end_draft:'Draft commentary',data_quality:'Data check',month_end_report:'Month-end report',month_end_hold:'Account blocked',month_end_dispute:'Agents disagree'};
 const kindLabel=k=>kinds[k]||String(k||'Update').replace(/_/g,' ').replace(/^./,c=>c.toUpperCase());
 const statuses={new:'New',read:'Read',approved:'Approved',dismissed:'Dismissed'};
 const choices={month_end_hold:[['approved','Proceed'],['dismissed','Hold']],month_end_dispute:[['approved',"Keep the writer's text"],['dismissed','Agree with the reviewer']]};
 const decided={month_end_hold:{approved:'You chose to proceed.',dismissed:'You chose to hold this account.'},month_end_dispute:{approved:"You kept the writer's text.",dismissed:'You agreed with the reviewer.'}};
 const accountName=id=>NAMES[id]||id;
-const link=x=>{const c=(x.citations||[]).find(c=>c&&typeof c.link==='string'&&/^\/accounts\/[^/]+\/reports$/.test(c.link));
+const link=x=>{if(x.kind==='export_pack')return `<a class="button" href="/accounts/${encodeURIComponent(x.subject_id)}/exports?pack_item=${encodeURIComponent(x.item_id)}">${x.status==='approved'?'Build again':'Build and check'}</a>`;
+ const c=(x.citations||[]).find(c=>c&&typeof c.link==='string'&&/^\/accounts\/[^/]+\/reports$/.test(c.link));
  return c?`<a class="button" href="${esc(c.link)}">Open the Reports tab</a>`:(x.subject_id&&NAMES[x.subject_id]?`<a class="button" href="/accounts/${encodeURIComponent(x.subject_id)}/overview">Open account</a>`:'')};
 const buttons=x=>{if(choices[x.kind]){const done=(decided[x.kind]||{})[x.status];return (done?`<span>${esc(done)}</span>`:choices[x.kind].map(([d,l])=>`<button class="button" data-d="${d}">${esc(l)}</button>`).join(''))+link(x)}
  return (x.status==='new'?'<button class="button" data-d="read">Mark read</button>':'')+(x.kind==='month_end_draft'&&x.status!=='approved'?'<button class="button" data-d="approved">Approve draft</button>':'')+link(x)+(x.status!=='dismissed'?'<button class="button" data-d="dismissed">Dismiss</button>':'')};

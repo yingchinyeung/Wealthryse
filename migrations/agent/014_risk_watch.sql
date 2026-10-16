@@ -10,16 +10,16 @@
 -- month, saying whether the VaR backtest and the outlook's ranges still match
 -- what happened.
 --
--- This file now sets the full lists of jobs and inbox kinds and validates
--- them; 010_live_market.sql adds its shorter lists NOT VALID.
+-- Its lists of jobs and inbox kinds are added NOT VALID, because
+-- 015_export_agent.sql now sets the full lists.
 
 ALTER TABLE agent.service_grants DROP CONSTRAINT IF EXISTS service_grants_job_name_check;
 ALTER TABLE agent.service_grants ADD CONSTRAINT service_grants_job_name_check
     CHECK (job_name IN ('holdings_explainer', 'month_end_drafter', 'data_quality', 'month_team', 'onboarding',
-                        'operations', 'weekly_brief', 'live_market', 'risk_watch'));
+                        'operations', 'weekly_brief', 'live_market', 'risk_watch')) NOT VALID;
 
 ALTER TABLE agent.inbox DROP CONSTRAINT IF EXISTS inbox_kind_check;
 ALTER TABLE agent.inbox ADD CONSTRAINT inbox_kind_check CHECK (kind IN (
     'holdings_explainer', 'month_end_draft', 'data_quality',
     'month_end_report', 'month_end_hold', 'month_end_dispute',
-    'onboarding_watch', 'weekly_brief', 'live_alert', 'risk_alert', 'model_check'));
+    'onboarding_watch', 'weekly_brief', 'live_alert', 'risk_alert', 'model_check')) NOT VALID;

@@ -224,14 +224,14 @@ class PerformanceRiskLayoutTests(unittest.TestCase):
 
     def test_section_jumps_and_no_repeated_header(self):
         performance = web._render_account_page(self.OWNER, account_id="U16088571", section="performance")
-        self.assertIn('<a href="#perf-chart">NAV chart</a>', performance)
+        self.assertIn('href="/accounts/U16088571/performance/nav-chart" data-part-link="perf-chart"', performance)
         self.assertIn('<h2 class="sr-only">Performance</h2>', performance)
         self.assertNotIn("Account workspace", performance)
         self.assertLess(performance.index('id="asof-select"'), performance.index('class="account-sticky"'))
         risk = web._render_account_page(self.OWNER, account_id="U16088571", section="risk")
-        self.assertIn('<a href="#risk-drawdowns">Drawdowns</a>', risk)
+        self.assertIn('href="/accounts/U16088571/risk/drawdowns" data-part-link="risk-drawdowns"', risk)
         cash = web._render_account_page(self.OWNER, account_id="U16088571", section="cash")
-        self.assertNotIn('class="section-jumps"', cash)
+        self.assertNotIn('class="section-jumps', cash)
         guide = web._render_platform_page(self.OWNER, section="metrics-guide")
         self.assertNotIn("Platform workspace", guide)
 

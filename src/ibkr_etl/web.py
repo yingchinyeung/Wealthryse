@@ -4921,6 +4921,53 @@ ACCOUNT_SECTIONS = {
     "ai-analyst": "AI analyst",
 }
 
+# Sections split into subpages: (slug, label, id of the card that starts the
+# subpage). A subpage is that card plus the cards after it, up to the next one.
+ACCOUNT_SUBPAGES = {
+    "performance": (
+        ("nav-chart", "NAV chart", "perf-chart"),
+        ("period-returns", "Period returns", "perf-returns"),
+        ("monthly-returns", "Monthly returns", "perf-calendar"),
+        ("attribution", "Attribution", "perf-attribution"),
+        ("benchmark", "Vs benchmark", "perf-benchmark"),
+        ("contributions", "Contributions", "perf-flows"),
+    ),
+    "risk": (
+        ("snapshot", "Risk snapshot", "risk-summary"),
+        ("statistics", "Statistics", "analytics-statistics-card"),
+        ("drawdowns", "Drawdowns", "risk-drawdowns"),
+        ("rolling", "Rolling risk", "risk-rolling"),
+        ("correlation", "Correlation", "risk-correlation"),
+    ),
+    "modelling": (
+        ("wealth-projection", "Wealth projection", "model-projection"),
+        ("risk-outlook", "Risk outlook", "model-risk"),
+        ("market-regimes", "Market regimes", "model-regimes"),
+        ("what-if", "What-if", "model-whatif"),
+        ("optimisation", "Optimisation", "model-optimise"),
+        ("factor-model", "Factor model", "model-factors"),
+        ("stress-test", "Stress test", "model-stress"),
+    ),
+}
+
+# Shows one subpage of the open section. A subpage can also start part way
+# through a card (the stress test inside the factor model card). Every card
+# stays in the page, so switching subpages needs no reload and cross-card
+# actions (such as "Try in what-if") still find their target.
+ACCOUNT_SUBPAGE_SCRIPT = r"""(()=>{const view=document.querySelector('.page-view.active');const parts=__PARTS__;const base=__BASE__;let current=__CURRENT__;
+if(!view||!parts.length)return;const anchors=parts.map(p=>p[1]);const slugOf=id=>(parts.find(p=>p[1]===id)||parts[0])[0];
+const assign=()=>{let part=null;[...view.children].forEach(c=>{if(anchors.includes(c.id))part=c.id;if(!part)return;c.dataset.part=part;const inner=[...c.children].filter(k=>k.id!==c.id&&anchors.includes(k.id));
+if(!inner.length){c.classList.toggle('part-off',part!==current);return}let sub=part;const own=[part];[...c.children].forEach(k=>{if(anchors.includes(k.id)){sub=k.id;own.push(sub)}k.classList.toggle('part-off',sub!==current)});c.classList.toggle('part-off',!own.includes(current))})};
+const mark=()=>document.querySelectorAll('[data-part-link]').forEach(a=>{if(a.dataset.partLink===current)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});
+const show=(id,url)=>{if(!anchors.includes(id))return;if(url&&location.pathname+location.hash!==url)history.pushState({part:id},'',url);if(id===current)return;current=id;assign();mark();window.scrollTo({top:0});window.dispatchEvent(new Event('resize'))};
+assign();mark();new MutationObserver(assign).observe(view,{childList:true});
+document.addEventListener('click',e=>{const a=e.target.closest('a[data-part-link]');if(!a||e.defaultPrevented||e.button||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||!anchors.includes(a.dataset.partLink))return;e.preventDefault();show(a.dataset.partLink,a.getAttribute('href'));a.blur()});
+addEventListener('popstate',()=>{const slug=location.pathname.split('/')[4];const p=parts.find(p=>p[0]===slug)||parts[0];show(p[1])});
+const toCard=el=>{const card=el&&el.closest('[data-part]');if(card&&card.dataset.part!==current)show(card.dataset.part,base+'/'+slugOf(card.dataset.part)+location.hash)};
+if(location.hash){try{toCard(document.querySelector(decodeURIComponent(location.hash)))}catch(_){}}
+addEventListener('hashchange',()=>{try{toCard(document.querySelector(decodeURIComponent(location.hash)))}catch(_){}});
+const scroll=Element.prototype.scrollIntoView;Element.prototype.scrollIntoView=function(...args){toCard(this);return scroll.apply(this,args)};})();"""
+
 # Shorter names for the account tab bar; page headings keep the full names.
 ACCOUNT_TAB_LABELS = {
     "risk": "Risk",
@@ -10765,6 +10812,19 @@ def account_root(
     return RedirectResponse(url=f"/accounts/{subject}/overview", status_code=307)
 
 
+@app.get("/accounts/{account_id}/{section}/{part}", response_class=HTMLResponse)
+def account_subpage(
+    account_id: str,
+    section: str,
+    part: str,
+    request: Request,
+    user: dict[str, str] = Depends(_authorized_user),
+):
+    if part not in {slug for slug, _label, _anchor in ACCOUNT_SUBPAGES.get(section, ())}:
+        raise HTTPException(status_code=404, detail="Account page not found")
+    return _account_page(account_id, section, user, part)
+
+
 @app.get("/accounts/{account_id}/{section}", response_class=HTMLResponse)
 def account_page(
     account_id: str,
@@ -10772,6 +10832,10 @@ def account_page(
     request: Request,
     user: dict[str, str] = Depends(_authorized_user),
 ):
+    return _account_page(account_id, section, user, None)
+
+
+def _account_page(account_id: str, section: str, user: dict[str, str], part: str | None):
     if section not in ALL_PAGE_SECTIONS:
         raise HTTPException(status_code=404, detail="Account page not found")
     if section == "system-health":
@@ -10798,7 +10862,7 @@ def account_page(
     if section == "ai-analyst" and _agent_analyst_replaces_tab(user):
         return RedirectResponse(url=f"/accounts/{urllib.parse.quote(account_id, safe='')}/overview#ask", status_code=307)
     return _render_account_page(
-        user, account_id=account_id, section=section, access=access
+        user, account_id=account_id, section=section, access=access, part=part
     )
 
 
@@ -10808,6 +10872,7 @@ def _render_account_page(
     account_id: str,
     section: str,
     access: dict[str, object] | None = None,
+    part: str | None = None,
 ) -> str:
     access = access or _portfolio_access_context(account_id, user)
     viewer = escape(user["email"] or "authorized user")
@@ -10834,12 +10899,37 @@ def _render_account_page(
         visible_sections = visible_sections - {"ai-analyst"}
     page_title = escape(ACCOUNT_SECTIONS[section])
     active = {key: " active" if key == section else "" for key in ALL_PAGE_SECTIONS}
+    subpages = ACCOUNT_SUBPAGES.get(section, ())
+    if part is None and subpages:
+        part = subpages[0][0]
+    part_anchor = next((anchor for slug, _label, anchor in subpages if slug == part), "")
+
+    def nav_item(key: str, label: str) -> str:
+        current = " aria-current=\"page\"" if key == section else ""
+        parts = ACCOUNT_SUBPAGES.get(key, ())
+        link = (
+            f'<a class="account-nav-link{active[key]}" href="/accounts/{account}/{key}"{current}>'
+            f'{escape(ACCOUNT_TAB_LABELS.get(key, label))}'
+            + ('<span class="nav-caret" aria-hidden="true">▾</span>' if parts else "")
+            + "</a>"
+        )
+        if not parts:
+            return link
+        menu = "".join(
+            f'<a href="/accounts/{account}/{key}/{slug}" data-part-link="{anchor}"'
+            + (' aria-current="page"' if key == section and slug == part else "")
+            + f">{escape(sub_label)}</a>"
+            for slug, sub_label, anchor in parts
+        )
+        return (
+            f'<div class="account-nav-item">{link}'
+            f'<div class="account-nav-menu" aria-label="{escape(label)} pages">{menu}</div></div>'
+        )
+
     navigation = "".join(
-        f'<a class="account-nav-link{active[key]}" href="/accounts/{account}/{key}"'
-        f'{" aria-current=\"page\"" if key == section else ""}>{escape(ACCOUNT_TAB_LABELS.get(key, label))}</a>'
-        for key, label in ACCOUNT_SECTIONS.items()
-        if key in visible_sections
+        nav_item(key, label) for key, label in ACCOUNT_SECTIONS.items() if key in visible_sections
     )
+
     platform_navigation = _platform_navigation(user)
     try:
         directory = [] if preview_mode else _account_directory(user)
@@ -10859,37 +10949,26 @@ def _render_account_page(
         if len(directory) > 1
         else ""
     )
-    section_jump_links = {
-        "performance": (
-            ("perf-chart", "NAV chart"),
-            ("perf-returns", "Period returns"),
-            ("perf-calendar", "Monthly returns"),
-            ("perf-attribution", "Attribution"),
-            ("perf-benchmark", "Vs benchmark"),
-            ("perf-flows", "Contributions"),
-        ),
-        "risk": (
-            ("risk-summary", "Risk snapshot"),
-            ("analytics-statistics-card", "Statistics"),
-            ("risk-drawdowns", "Drawdowns"),
-            ("risk-rolling", "Rolling risk"),
-            ("risk-correlation", "Correlation"),
-        ),
-        "modelling": (
-            ("model-projection", "Wealth projection"),
-            ("model-risk", "Risk outlook"),
-            ("model-regimes", "Market regimes"),
-            ("model-whatif", "What-if"),
-            ("model-optimise", "Optimisation"),
-            ("model-factors", "Factor model"),
-            ("model-stress", "Stress test"),
-        ),
-    }.get(section, ())
+    subpage_script = (
+        "<script>"
+        + ACCOUNT_SUBPAGE_SCRIPT.replace("__BASE__", json.dumps(f"/accounts/{account_id}/{section}"))
+        .replace("__PARTS__", json.dumps([[slug, anchor] for slug, _label, anchor in subpages]))
+        .replace("__CURRENT__", json.dumps(part_anchor))
+        + "</script>"
+        if subpages
+        else ""
+    )
+    # Phones get the open section's subpages as a row under the tab bar.
     section_jumps = (
-        '<nav class="section-jumps" aria-label="Jump to a section">'
-        + "".join(f'<a href="#{target}">{escape(label)}</a>' for target, label in section_jump_links)
+        '<nav class="section-jumps subpage-row" aria-label="Pages in this section">'
+        + "".join(
+            f'<a href="/accounts/{account}/{section}/{slug}" data-part-link="{anchor}"'
+            + (' aria-current="page"' if slug == part else "")
+            + f">{escape(label)}</a>"
+            for slug, label, anchor in subpages
+        )
         + "</nav>"
-        if section_jump_links
+        if subpages
         else ""
     )
     metric_anchors_json = json.dumps(METRIC_ANCHORS, ensure_ascii=False)
@@ -11130,7 +11209,7 @@ asOfSelect.addEventListener('change',()=>(rememberAsOf(asOfSelect.value),renderA
 if(!previewMode){{const savedConversations=await refreshConversations(null);if(savedConversations.length)await openConversation(savedConversations[0].conversation_id);else{{updateChatHeader(null);emptyChat()}}}}else{{updateChatHeader(null);emptyChat()}}analysisRun.disabled=!a.ai_model.enabled;
 await renderAsOf(asOfSelect.value)
 }}).catch(error=>loadFailure(error,'The figures for this account could not be loaded. Refresh the page. If this keeps happening, the daily data refresh may have failed.'));
-</script>{live_page_assets}{design_controls_script}</body></html>"""
+</script>{subpage_script}{live_page_assets}{design_controls_script}</body></html>"""
 
 
 # WealthRyse agents: chat panel, Explain buttons and inbox. Off unless

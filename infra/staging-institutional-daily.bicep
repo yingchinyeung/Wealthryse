@@ -69,8 +69,10 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
       replicaTimeout: 3000
       replicaRetryLimit: 0
       scheduleTriggerConfig: {
-        // One fail-closed statement generation per active Flex query at 16:00 HKT.
-        cronExpression: '0 8 * * *'
+        // One fail-closed statement generation per active Flex query at 16:20 HKT,
+        // after account-sync (16:10) and before the benchmark job (16:30). It asks
+        // up to yesterday HKT, as v1.1's pull does.
+        cronExpression: '20 8 * * *'
         parallelism: 1
         replicaCompletionCount: 1
       }
@@ -104,6 +106,10 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${storageAccountName}.blob.${environment().suffixes.storage}' }
             { name: 'AZURE_RAW_CONTAINER', value: 'ibkr-raw' }
             { name: 'INSTITUTIONAL_FLEX_LOOKBACK_DAYS', value: '14' }
+            { name: 'INSTITUTIONAL_DISPATCH_RUN_DATE', value: 'previous_hkt_day' }
+            // The app login cannot create tables, so the import must not try migrations
+            // (the v1.1 job sets the same).
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
           ]
           resources: {
             cpu: json('0.5')
@@ -117,4 +123,4 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
 }
 
 output jobName string = job.name
-output scheduleHongKong string = 'Daily at 16:00 Asia/Hong_Kong (UTC+8)'
+output scheduleHongKong string = 'Daily at 16:20 Asia/Hong_Kong (UTC+8)'

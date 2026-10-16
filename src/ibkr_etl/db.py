@@ -127,6 +127,10 @@ class PostgresConnection:
     def rollback(self) -> None:
         self._connection.rollback()
 
+    def transaction(self):
+        # psycopg's block: a savepoint inside an open transaction, which the caller commits.
+        return self._connection.transaction()
+
     def close(self) -> None:
         self._connection.close()
 

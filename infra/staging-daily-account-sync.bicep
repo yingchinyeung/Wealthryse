@@ -9,6 +9,8 @@ param productionStorageAccountName string = 'ibkrv115rcc62xxqblay'
 param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
+// false on the day v2 makes its own Flex pull: the job stays, but only starts by hand.
+param scheduleEnabled bool = true
 param pilotAccountId string = 'U16088571'
 param pilotStartDate string = '2025-01-20'
 param wave0AccountId string = 'U16088606'
@@ -59,12 +61,16 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
   properties: {
     environmentId: managedEnvironment.id
     configuration: {
-      triggerType: 'Schedule'
+      triggerType: scheduleEnabled ? 'Schedule' : 'Manual'
       replicaTimeout: 1800
       replicaRetryLimit: 0
-      scheduleTriggerConfig: {
+      scheduleTriggerConfig: scheduleEnabled ? {
         // 16:10 HKT, ten minutes after the production IBKR export starts.
         cronExpression: '10 8 * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      } : null
+      manualTriggerConfig: scheduleEnabled ? null : {
         parallelism: 1
         replicaCompletionCount: 1
       }

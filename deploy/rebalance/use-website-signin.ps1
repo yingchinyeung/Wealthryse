@@ -57,9 +57,11 @@ $appObjectId = AzRun ad app show --id $clientId --query id -o tsv
 Write-Host '== Adding the rebalancing site''s address to the main sign-in app'
 $fqdn = AzRun containerapp show -n $AppName -g $ResourceGroup --query properties.configuration.ingress.fqdn -o tsv
 $callback = "https://$fqdn/.auth/login/aad/callback"
-$uris = @((AzRun ad app show --id $clientId --query 'web.redirectUris' -o json) | ConvertFrom-Json)
+# One address per line; Windows PowerShell's ConvertFrom-Json would nest the list.
+[string[]]$uris = @((AzRun ad app show --id $clientId --query 'web.redirectUris' -o tsv) -split "`r?`n" | Where-Object { $_ })
 if ($uris -notcontains $callback) {
-    GraphCall PATCH "https://graph.microsoft.com/v1.0/applications/$appObjectId" @{ web = @{ redirectUris = @($uris + $callback) } }
+    [string[]]$all = $uris + $callback
+    GraphCall PATCH "https://graph.microsoft.com/v1.0/applications/$appObjectId" @{ web = @{ redirectUris = $all } }
 }
 
 Write-Host '== Adding a separate secret for the rebalancing site'

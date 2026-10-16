@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable, Mapping
 
 from .config import Settings
 from .db import DEFAULT_TENANT_ID, initialize
+from .loader import LEGACY_KEY_COMPAT_ENV
 from .parser import parse_flex_xml
 from .pilot_snapshot import ACCOUNT_TABLES, validate_pilot_snapshot
 from .provisional_benchmark import _external_flows, _is_external_cash_transaction
@@ -381,6 +382,9 @@ def unexplained(tables: Mapping[str, Mapping[str, Any]], *, missing_fails: bool 
         for name in ("different", "rekeyed", "extra_in_v2") + (("missing_in_v2",) if missing_fails else ()):
             if result.get(name):
                 failures.append(f"{table}: {result[name]} {name.replace('_', ' ')}")
+        if result.get("rekeyed"):
+            failures.append(f"{table}: the first pull would duplicate the rekeyed rows unless "
+                            f"{LEGACY_KEY_COMPAT_ENV} is on for institutional-daily")
     return failures
 
 

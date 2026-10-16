@@ -1028,8 +1028,8 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("WealthRyse Portfolio Data Platform", page)
         self.assertNotIn(">IBKR Portfolio Platform<", page)
         self.assertIn('href="/accounts/U16088571/overview"', page)
-        self.assertIn("U16088571-U.S. Technology and Biotechnology", page)
-        self.assertNotIn("U16088571 (U.S. Technology and Biotechnology)", page)
+        self.assertIn('<div class="account-id">U.S. Technology and Biotechnology</div>', page)
+        self.assertNotIn("U16088571-U.S. Technology and Biotechnology", page)
         self.assertIn("Select an account to open its portfolio workspace", page)
         self.assertIn('class="company-logo"', page)
         self.assertIn('alt="Sprout Asset Management (Asia) Limited company logo"', page)
@@ -1201,7 +1201,7 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("grid-template-columns: repeat(4, minmax(0, 1fr))", page)
         self.assertIn("@media (max-width: 650px)", page)
         self.assertIn("WealthRyse Portfolio Data Platform", page)
-        self.assertIn('<strong class="brand-title">WealthRyse</strong>', page)
+        self.assertNotIn('class="brand-title"', page)
         self.assertNotIn(">IBKR Portfolio Platform<", page)
         self.assertIn('href="/accounts/U16088571/performance"', page)
         self.assertIn('href="/accounts/U16088571/trades"', page)
@@ -1340,8 +1340,10 @@ class PortfolioWebTests(unittest.TestCase):
         )
         self.assertIn('class="page-view active" data-section="modelling"', modelling_page)
         self.assertIn('href="/accounts/U16088571/modelling"', modelling_page)
-        for card in ("model-projection", "model-whatif", "model-optimise", "model-factors"):
+        for card in ("model-projection", "model-risk", "model-regimes", "model-whatif", "model-optimise",
+                     "model-factors", "model-stress"):
             self.assertIn(f'id="{card}"', modelling_page)
+            self.assertIn(f'href="#{card}"', modelling_page)
         self.assertIn("if(activeSection==='modelling')renderModelling(asOf);", modelling_page)
 
     def test_account_subpages_reject_unknown_accounts_and_sections(self) -> None:

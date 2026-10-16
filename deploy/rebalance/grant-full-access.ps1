@@ -8,7 +8,10 @@ param(
     [string]$ResourceGroup = 'rg-ibkr-database-v11',
     [string]$Subscription = '3956e821-cee4-403f-8708-e84e2ed490eb',
     [string]$AppName = 'ibkrv2stg-rebalance',
-    [string]$EntraAppName = 'WealthRyse Rebalance'
+    [string]$EntraAppName = 'WealthRyse Rebalance',
+    # Aiden's Contributor role on the whole resource group would let him change
+    # the main website, jobs and (through a job) the database. Pass this to remove it.
+    [switch]$RemoveAidenGroupContributor
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,8 +64,20 @@ foreach ($name in $people.Keys) {
     }
 }
 
+if ($RemoveAidenGroupContributor) {
+    Write-Host '== Removing Aiden''s Contributor role on the resource group'
+    $rgId = AzRun group show -n $ResourceGroup --query id -o tsv
+    $ids = AzRun role assignment list --assignee $people['Aiden'] --scope $rgId --role Contributor --query '[].id' -o tsv
+    foreach ($assignmentId in ($ids -split "`n" | Where-Object { $_ })) {
+        AzRun role assignment delete --ids $assignmentId | Out-Null
+    }
+}
+
 Write-Host ''
 Write-Host '== Check'
+$rgId = AzRun group show -n $ResourceGroup --query id -o tsv
+$aidenGroupRoles = (AzRun role assignment list --assignee $people['Aiden'] --scope $rgId --include-inherited --query '[].roleDefinitionName' -o tsv) -split "`n" | Where-Object { $_ } | Sort-Object -Unique
+Write-Host ("Aiden's roles on the whole resource group: {0}" -f $(if ($aidenGroupRoles) { $aidenGroupRoles -join ', ' } else { 'none' }))
 $assigned = AzRun rest --method GET --url "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo" --query 'value[].principalId' -o tsv
 $appOwners = AzRun ad app owner list --id $entraAppId --query '[].id' -o tsv
 foreach ($name in $people.Keys) {

@@ -703,17 +703,19 @@ th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: l
 .metric-expand[aria-pressed="true"] { color: #fff; background: var(--brand-deep); border-color: var(--brand-deep); }
 .metric-copy.copied { color: #067647; background: rgba(6, 118, 71, .08); border-color: rgba(6, 118, 71, .22); }
 .metric-jump { display: flex; gap: 6px; overflow-x: auto; margin-top: 10px; padding-bottom: 2px; scrollbar-width: thin; -webkit-overflow-scrolling: touch; }
-.metric-jump a { flex: 0 0 auto; padding: 6px 10px; color: var(--muted-strong); background: rgba(248, 250, 252, .92); border: 1px solid var(--line); border-radius: 999px; font-size: 12px; font-weight: 640; text-decoration: none; white-space: nowrap; }
+.metric-jump a { flex: 0 0 auto; padding: 6px 10px; color: var(--muted-strong); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; font-size: 12px; font-weight: 640; text-decoration: none; white-space: nowrap; }
 .metric-jump a:hover, .metric-jump a:focus-visible { color: var(--ink); border-color: rgba(8, 120, 249, .32); }
 .metric-jump a span { margin-left: 4px; color: var(--accent); font-weight: 720; }
 .metric-jump a.empty { opacity: .45; }
+@media (min-width: 900px) { .metric-jump { flex-wrap: wrap; overflow-x: visible; } }
 .metric-guide-section, .metric-definition { scroll-margin-top: 220px; }
 .metric-guide-section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .metric-guide-section-head h2 { margin: 0; }
 .metric-guide-count { color: var(--muted); font-size: 12px; white-space: nowrap; }
-.metric-aliases, .metric-related { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; font-size: 12px; }
-.metric-aliases span, .metric-related span { color: var(--muted); font-size: 11px; font-weight: 760; letter-spacing: .06em; text-transform: uppercase; }
+.metric-where, .metric-aliases, .metric-related { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; font-size: 12px; }
+.metric-where span, .metric-aliases span, .metric-related span { color: var(--muted); font-size: 11px; font-weight: 760; letter-spacing: .06em; text-transform: uppercase; }
 .metric-aliases em { padding: 2px 8px; color: var(--ink-soft); background: rgba(103, 92, 255, .07); border-radius: 999px; font-style: normal; font-weight: 600; }
+.metric-where { margin-top: 8px; color: var(--ink-soft); font-weight: 600; }
 .metric-related { padding-top: 12px; border-top: 1px dashed var(--line); }
 .metric-related a { color: var(--brand-deep); font-weight: 600; text-decoration-color: rgba(8, 120, 249, .32); text-underline-offset: 3px; }
 .metric-related a:not(:last-child)::after { margin-left: 6px; color: var(--muted); content: "·"; }

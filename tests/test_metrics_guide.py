@@ -55,6 +55,37 @@ class MetricsGuideCoverageTest(unittest.TestCase):
             self.assertIn(name, guide.METRIC_ANCHORS)
             self.assertIn(name, guide.CLIENT_CALCULATIONS)
 
+    def test_features_added_with_modelling_exports_and_the_risk_watch_are_defined(self):
+        for name in ("Crisis scenario maximum drawdown", "Wealth projection range", "Forecast volatility",
+                     "Forward VaR", "VaR backtest", "Drawdown odds (next 12 months)", "Market regime",
+                     "Outlook score", "What-if comparison", "What-if crisis replay", "Share of risk",
+                     "Maximum Sharpe portfolio", "Factor beta", "Factor stress test impact",
+                     "Export check result", "Export pack", "Risk alert", "Risk model check"):
+            self.assertIn(name, guide.METRIC_ANCHORS)
+            self.assertIn(name, guide.CLIENT_CALCULATIONS)
+
+    def test_every_definition_says_where_it_appears_using_real_subpages(self):
+        from ibkr_etl.web import ACCOUNT_SECTIONS, ACCOUNT_SUBPAGES
+
+        places = set(ACCOUNT_SECTIONS.values()) | {"Agent inbox", "System health", "Account page header"}
+        places |= {f"{ACCOUNT_SECTIONS[key].split()[0]} › {label}"
+                   for key, parts in ACCOUNT_SUBPAGES.items() for _slug, label, _anchor in parts}
+        for section in guide.METRIC_SECTIONS:
+            self.assertTrue(section.location, section.key)
+            for metric in section.metrics:
+                location = guide.METRIC_LOCATIONS.get(metric.name, section.location)
+                for place in location.split(" · "):
+                    self.assertIn(place.split(",")[0], places, metric.name)
+
+    def test_modelling_and_crisis_cards_link_to_existing_definitions(self):
+        anchors = set(guide.METRIC_ANCHORS.values())
+        modelling = (SRC / "web_modelling.py").read_text(encoding="utf-8")
+        links = re.findall(r'href="/metrics-guide#(metric-[a-z0-9-]+)"', modelling)
+        self.assertEqual(len(links), 7)
+        self.assertEqual(sorted(set(links) - anchors), [])
+        self.assertIn("METRIC_ANCHORS['Crisis scenario maximum drawdown']",
+                      (SRC / "web.py").read_text(encoding="utf-8"))
+
     def test_definitions_do_not_hard_code_one_account(self):
         for section in guide.METRIC_SECTIONS:
             self.assertNotIn("U16088571", section.introduction)
@@ -66,8 +97,9 @@ class MetricsGuideCoverageTest(unittest.TestCase):
 
     def test_sections_follow_the_website_tabs_and_place_each_metric_once(self):
         keys = [section.key for section in guide.METRIC_SECTIONS]
-        self.assertEqual(keys, ["overview", "benchmark", "statistics", "holdings", "risk",
-                                "cash-trades", "reports", "system"])
+        self.assertEqual(keys, ["overview", "benchmark", "holdings", "risk", "statistics",
+                                "modelling-outlook", "modelling-portfolio", "cash-trades", "reports",
+                                "exports", "agents", "system"])
         names = [metric.name for section in guide.METRIC_SECTIONS for metric in section.metrics]
         self.assertEqual(len(names), len(set(names)))
         self.assertEqual(set(names), set(guide.CLIENT_CALCULATIONS))

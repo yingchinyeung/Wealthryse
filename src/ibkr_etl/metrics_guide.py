@@ -21,6 +21,7 @@ class MetricSection:
     title: str
     introduction: str
     metrics: tuple[MetricDefinition, ...]
+    location: str = ""
 
 
 _DEFINITIONS = (
@@ -624,69 +625,362 @@ _DEFINITIONS = (
         "Group holdings by their stored sector classification and divide each group's absolute market value by gross holdings value; cash is excluded. Classification coverage is the share of gross holdings value that has a sector, and unclassified holdings are named.",
         "Classifications come from an external provider and are for internal analysis. Low coverage means the chart describes only part of the portfolio.",
     ),
+    # Risk tab: stored crisis scenarios (holdings-crisis-scenarios-v1).
+    MetricDefinition(
+        "Crisis scenario maximum drawdown",
+        "Hypothetical worst fall from a high if today's holdings had been held through one of four historical sell-offs.",
+        "Windows: Lehman collapse and global financial crisis (15/9/2008–9/3/2009), China and Hong Kong market crash (12/6/2015–11/2/2016), COVID-19 crash (19/2/2020–23/3/2020) and rate rises and technology sell-off (3/1/2022–31/10/2022), on SPY's trading calendar. Holdings at the latest holdings date keep fixed units from their opening market-value-to-NAV weights; cash stays flat; no rebalancing, financing or trading costs. A holding with Yahoo Finance adjusted closes on at least 90% of the window's sessions uses its own prices; otherwise it uses its recorded stand-in ETF, scaled by the holding's beta to that ETF on weekly returns over the two years to the holdings date (kept between 0.25 and 3). Composites combine their sleeves' paths with the Hang Seng and SPY hedges and HKD FX the way their own NAV combines them. Result = most negative value ÷ running peak − 1.",
+        "Not the account's actual performance in those periods. Stand-ins and provisional Yahoo prices drive much of the result, so read it with the Stand-ins column. Internal and shareholder use only.",
+    ),
+    MetricDefinition(
+        "Crisis scenario stand-ins (scaled)",
+        "How many holdings in a crisis scenario were replayed on a stand-in fund instead of their own prices, and how many of those were scaled by beta.",
+        "Count of holdings (including composite sleeve components) replayed by the market-proxy method; the bracketed figure counts those whose beta was not 1. Holdings on their own prices and hedge closes are not counted.",
+        "The larger the count relative to the number of holdings, the more the scenario describes the stand-ins rather than the holdings themselves.",
+    ),
+    # Modelling tab: wealth projection, risk outlook and market regimes (portfolio-modelling-v1).
+    MetricDefinition(
+        "Wealth projection range",
+        "The spread of possible future portfolio values after regular contributions or withdrawals, from thousands of simulated futures.",
+        "Monthly returns are the compounded returns of every overlapping 21-session window of the portfolio's cash-flow-adjusted daily returns (a block bootstrap; at least 63 daily returns). Each of 2,000 paths draws one such month at random for every month of the 1–30 year horizon, applies it and then adds the monthly contribution (negative to withdraw) at month end; a path that reaches zero stays there. Bands are the 5th (weak case), 25th, 50th (median), 75th and 95th (strong case) percentiles of value at each month. An optional return assumption shifts every sampled month in log terms so the average compounds to that annual rate while keeping the historical spread. The random seed is fixed by the inputs, so the same inputs give the same result.",
+        "The median is the middle outcome, not an expected or promised value; only 1 path in 20 ends below the weak case or above the strong case. A short history or a historical growth rate above 20% a year can make the range look too good, and the page warns when either applies.",
+    ),
+    MetricDefinition(
+        "Chance of reaching the target",
+        "Share of simulated futures in which the portfolio ends the horizon at or above the target value entered.",
+        "Count of the 2,000 wealth-projection paths whose final value ≥ target ÷ 2,000. Blank when no target is entered.",
+        "A model-based likelihood from past monthly returns, not a guarantee. Try a lower return assumption to see how sensitive it is.",
+    ),
+    MetricDefinition(
+        "Chance of running out",
+        "Share of simulated futures in which withdrawals take the portfolio's value to zero before the horizon ends.",
+        "Count of wealth-projection paths whose value reaches zero in any month ÷ 2,000. Such a path stays at zero for the rest of the horizon.",
+        "Mainly relevant when the monthly amount is a withdrawal. A small percentage is not zero risk.",
+    ),
+    MetricDefinition(
+        "Chance of ending below money put in",
+        "Share of simulated futures that end below the starting value plus all contributions, net of withdrawals.",
+        "Count of wealth-projection paths with final value < starting value + monthly amount × number of months, ÷ 2,000.",
+        "A plain-language measure of the chance of losing money over the whole horizon, after the money added or taken out.",
+    ),
+    MetricDefinition(
+        "Projection return and volatility used",
+        "The annual growth rate and volatility built into the wealth projection's sampled months.",
+        "Return used = exp(12 × mean of the log monthly returns sampled) − 1, labelled historical or your assumption. Volatility used = sample standard deviation of the sampled monthly returns × √12.",
+        "Check these before reading the fan: if the historical return looks unusually high, the projection inherits it.",
+    ),
+    MetricDefinition(
+        "Forecast volatility",
+        "How volatile the portfolio is expected to be from today, annualised, given how recent moves compare with its normal level.",
+        "Daily cash-flow-adjusted returns minus their average (at least 126). With at least 250 returns a GARCH(1,1) model σ²ₜ₊₁ = ω + α·r²ₜ + β·σ²ₜ is fitted by maximum likelihood with variance targeting: ω = sample variance × (1 − α − β). With less history, or when GARCH fits no better than constant volatility, an EWMA with λ = 0.94 is used. Next-day forecast = σₜ₊₁ × √252. Next-month forecast = √(average expected daily variance over the next 21 sessions × 252), where expected variance moves back toward the long-run level by the factor α + β each day (EWMA stays flat).",
+        "Above the long-run level means recent moves have been larger than usual and the model expects that to fade. It is a model estimate, not a measured figure, and says nothing about direction.",
+    ),
+    MetricDefinition(
+        "Long-run volatility",
+        "The portfolio's normal level of volatility, which the volatility forecast drifts back to.",
+        "√(mean of squared demeaned daily returns over the whole history × 252). The page also shows realised volatility over the latest 252 returns for comparison.",
+        "The daily risk watch raises an alert when next-month forecast volatility reaches 1.5 times this level.",
+    ),
+    MetricDefinition(
+        "Shock half-life",
+        "How many trading days it takes for half of a volatility spike to fade, according to the fitted model.",
+        "ln(0.5) ÷ ln(α + β) from the GARCH(1,1) fit. Unavailable when the EWMA fallback is used, because EWMA does not revert to a long-run level.",
+        "A longer half-life means turbulence tends to linger. It describes the past fit, not a promise about the next shock.",
+    ),
+    MetricDefinition(
+        "Forward VaR",
+        "The loss the portfolio is expected to exceed on about 1 day in 20 (95%) or 1 day in 100 (99%), and in about 1 month in 20, at today's forecast volatility.",
+        "Filtered historical simulation: divide each past demeaned return by that day's model volatility to get standardised returns. One-day VaR = −(5th or 1st percentile of standardised returns) × next-day forecast volatility. One-month VaR: 2,000 simulated 21-session paths, each day drawing a standardised return at random and rescaling it by the path's evolving GARCH volatility; VaR is the loss at the 5th percentile of compounded path returns.",
+        "Shown as a positive loss. Unlike the Risk tab's historical VaR it moves with current conditions, so it rises after turbulent days. It does not say how large losses beyond it can be.",
+    ),
+    MetricDefinition(
+        "Forward expected tail loss",
+        "The average loss on the days (or months) that go beyond the forward VaR.",
+        "Mean of the standardised returns at or below the VaR cutoff × next-day forecast volatility for one day; mean of the simulated 21-session returns at or below the 5th percentile for one month. Shown as a positive loss.",
+        "Always at least as large as the matching forward VaR. Like any simulation from history, it can understate a crisis unlike anything in the data.",
+    ),
+    MetricDefinition(
+        "VaR backtest",
+        "Whether the 95% one-day VaR line would have held in the past: how often losses actually broke it compared with the 5% expected.",
+        "Expanding window: after the first 250 returns (at least 63 more are needed to test), each day's VaR uses only earlier returns, with the model refitted every 63 sessions. A breach is a return below −VaR. Kupiec's proportion-of-failures test compares breaches with the expected 5% (likelihood ratio, chi-squared with one degree of freedom); p ≥ 0.05 is in line with the model.",
+        "More breaches than expected means the VaR has been too low; fewer means it has been cautious. The monthly risk model check in the Agent inbox repeats this verdict.",
+    ),
+    MetricDefinition(
+        "Drawdown odds (next 12 months)",
+        "The chance of a fall of at least 10%, 20% or 30% from a high at some point in the next year, with the typical and bad-case worst fall.",
+        "2,000 simulated 252-session paths built from random overlapping 21-session stretches of the portfolio's own daily returns; each path records its worst value ÷ running peak − 1. Probability = share of paths whose worst fall reaches the threshold; typical worst fall = median, bad case = 5th percentile. Shown twice: at historical volatility, and with each return's distance from the average rescaled by next-month forecast volatility ÷ long-run volatility.",
+        "Differs from the Risk tab's expected maximum drawdown, which uses five-session blocks and 5,000 paths over benchmark-aligned dates. A gap between the two rows shows how much today's conditions change the picture.",
+    ),
+    MetricDefinition(
+        "Market regime",
+        "Whether the portfolio is in a calm, normal or stressed period, judged from the pattern of its own daily returns.",
+        "A Gaussian hidden Markov model with two or three states, fitted by Baum-Welch to up to five years (1,260 sessions; at least 252) of cash-flow-adjusted daily returns. The number of states with the lower BIC is used, provided every state covers at least 3% of the time; states are named by volatility. Chance now = filtered probability using data up to today only; chance in a month = today's probabilities moved 21 steps through the fitted transition matrix; typical length = 1 ÷ (1 − probability of staying); share of time = average filtered probability.",
+        "A description of the portfolio's own behaviour, not a market call. Stressed means stressed relative to this portfolio's history, and labels can shift when the model is refitted on new data.",
+    ),
+    MetricDefinition(
+        "Regime outlook range",
+        "A range for the portfolio's return over the next one, two and three months that allows for switching between regimes.",
+        "2,000 simulated paths start from today's regime probabilities, switch regime each day with the fitted odds and draw each day's return from past days assigned to that regime (from the regime's normal distribution when it has fewer than 20 days). Bands are the 5th (weak case), 25th, 50th (middle), 75th and 95th (strong case) percentiles of compounded return after 21, 42 and 63 sessions; chance of a loss = share of paths below zero.",
+        "Read the range, not the middle line, unless the outlook score shows directional skill.",
+    ),
+    MetricDefinition(
+        "Outlook score",
+        "How well past one-month outlooks would have held up: how often the actual result landed in the range, and whether the middle line called the direction.",
+        "Walk-forward: after two years of history, at each later 21-session step (at least 12 tested), refit on the data available then (every 63 sessions), simulate 500 paths and compare with the next 21 sessions' actual return. 90% range held = share inside the 5th–95th percentiles (80%–97% counts as well calibrated); middle 50% range held = share inside the 25th–75th. Direction right = share where the median's sign matched the outcome, against simply assuming the more common past direction; directional skill needs more hits than that rule and a one-sided binomial p below 0.1.",
+        "A guard against over-trusting the model. No reliable directional skill is a common, honest result: use the range only.",
+    ),
+    # Modelling tab: what-if, optimisation, factor model and stress test (portfolio-modelling-v1).
+    MetricDefinition(
+        "What-if comparison",
+        "Risk and return of a proposed set of weights against today's, both replayed over the same year of daily prices.",
+        "Holding price returns over the latest 252 shared dates (at least 63). A date without a mark counts as 0%, so the next return covers the whole move; one-day moves above 50% (likely splits) are dropped; holdings with returns on fewer than 60% of dates are left out and listed. Each mix's daily return = Σ weight × holding return + (1 − Σ weights) × daily risk-free rate (a negative remainder is borrowing at that rate). Weights are shares of NAV, long only, up to 200% in total; up to five tickers not held can be added from Yahoo Finance. Measures: annual return (growth^(252 ÷ N) − 1), volatility (standard deviation × √252), Sharpe ((annual return − risk-free) ÷ volatility), daily VaR and expected tail loss (95%), maximum drawdown, worst 21-session month and beta to the benchmark (at least 40 common dates).",
+        "Both columns use holding prices, not the account's NAV, so the current column can differ from the Risk tab. A lower-risk proposal over one past year is not evidence it will be lower risk in future, and nothing here is a recommendation.",
+    ),
+    MetricDefinition(
+        "Worst month (21 sessions)",
+        "The weakest return over any run of 21 trading sessions in the what-if window.",
+        "Minimum of the compounded returns of every overlapping 21-session window of the mix's daily returns.",
+        "Rolling 21-session windows can start mid-month, so this can be worse than the worst calendar month.",
+    ),
+    MetricDefinition(
+        "What-if crisis replay",
+        "How today's mix and the proposed mix would each have fared through the stored crisis scenarios.",
+        "For each crisis scenario, each holding reuses the price path the stored scenario used (its own prices, or its beta-scaled stand-in). A ticker added in the what-if uses its own prices if it traded through the window, otherwise SPY at a beta of 1, as does a holding the stored run did not cover. Weights are shares of NAV; the rest is flat cash. Worst fall = most negative value ÷ running peak − 1; whole window = value at the end of the window − 1.",
+        "Hypothetical, with the same stand-in and provisional-price limits as the crisis scenarios on the Risk tab.",
+    ),
+    MetricDefinition(
+        "Share of risk",
+        "How much of the portfolio's total volatility each holding is responsible for.",
+        "wᵢ × (Σw)ᵢ ÷ w′Σw, which sums to 100%. Σ is the annualised covariance of daily price returns over the latest 252 shared dates, with off-diagonal terms shrunk 20% toward zero. Weights are shares of the invested sleeve for up to the 20 largest holdings with enough price history; cash and the rest stay outside.",
+        "A holding can carry far more risk than its weight when it is volatile or moves with the rest. The weekly brief mentions a holding whose share of risk stands out.",
+    ),
+    MetricDefinition(
+        "Expected return (optimisation)",
+        "The return assumption the optimiser uses for each holding and each mix.",
+        "Each holding's average daily price return over the window × 252, shrunk 50% toward the average across the holdings, because one year of averages is noisy. A mix's expected return = Σ weight × holding expected return.",
+        "A modelling input, not a forecast. Shrinking stops one strong year from dominating the optimised mixes.",
+    ),
+    MetricDefinition(
+        "Minimum variance portfolio",
+        "The mix of the current holdings with the lowest modelled volatility.",
+        "Minimise w′Σw subject to long only, fully invested and at most the chosen cap per holding (default 25%, raised to at least 1 ÷ number of holdings), solved by accelerated projected gradient.",
+        "Lowest risk on this covariance estimate, not necessarily the best return. A hypothetical alternative, not a recommendation.",
+    ),
+    MetricDefinition(
+        "Risk parity portfolio",
+        "The mix of the current holdings in which each holding carries an equal share of risk.",
+        "Equal-risk-contribution weights by cyclical coordinate descent on Σ, long only and fully invested. The per-holding cap does not apply.",
+        "Gives more weight to calmer holdings. Equal risk shares are not equal weights.",
+    ),
+    MetricDefinition(
+        "Maximum Sharpe portfolio",
+        "The mix of the current holdings with the best expected return per unit of risk on the efficient frontier.",
+        "The frontier point with the highest (expected return − risk-free rate) ÷ volatility, under the same long-only, fully invested and capped constraints.",
+        "The most sensitive of the three mixes to the expected-return assumption; small changes in inputs can move it a lot.",
+    ),
+    MetricDefinition(
+        "Efficient frontier",
+        "The curve of the lowest modelled volatility available for each level of expected return from the current holdings.",
+        "Up to 30 points minimising w′Σw − λ·μ′w for increasing λ, long only, fully invested and capped. The chart also marks today's mix and the three optimised mixes.",
+        "A mix to the right of the curve takes more risk than needed for its expected return, on these estimates.",
+    ),
+    MetricDefinition(
+        "Factor beta",
+        "The portfolio's sensitivity to each of six well-known return drivers: market, size, value, profitability, investment style and momentum.",
+        "Weekly ordinary least squares with an intercept: portfolio weekly return (cash-flow-adjusted, compounded Monday to Friday) minus the risk-free rate, regressed on weekly Fama-French five-factor plus momentum returns over the latest 26–156 complete weeks. Factors come from Kenneth French's data library for the chosen region (United States, Developed markets or Asia Pacific ex Japan), or, when it cannot be reached, from long-short ETF stand-ins on Yahoo Finance; the page says which.",
+        "A beta of 1.1 to the market means the portfolio has tended to move 1.1% for each 1% market move beyond cash. Weekly data avoids mismatched closing times across markets.",
+    ),
+    MetricDefinition(
+        "Factor t-statistic",
+        "How clearly each factor beta is distinguished from zero.",
+        "Beta ÷ its standard error from the regression. |t| ≥ 2 is marked significant.",
+        "A large beta with a small t-statistic may be noise. Significance is about the past window only.",
+    ),
+    MetricDefinition(
+        "Alpha (factor model)",
+        "The average annual return the six factors do not explain.",
+        "The regression intercept × 52, with its t-statistic.",
+        "Positive alpha with |t| below 2 is not strong evidence of skill. Alpha also absorbs fees and anything the factors miss.",
+    ),
+    MetricDefinition(
+        "Explained by factors (R²)",
+        "The share of the portfolio's weekly return variation that the factors explain.",
+        "1 − sum of squared residuals ÷ total sum of squares; the adjusted R² is also kept.",
+        "Low R² means the factor betas and stress tests describe only part of the portfolio's behaviour.",
+    ),
+    MetricDefinition(
+        "Unexplained volatility",
+        "Annualised volatility of the part of weekly returns the factors do not explain.",
+        "Standard deviation of the regression residuals × √52.",
+        "Higher means more stock-specific or unmodelled risk.",
+    ),
+    MetricDefinition(
+        "Factor return contribution",
+        "How much of the portfolio's annual return over the window came from each factor exposure.",
+        "Factor beta × the factor's average weekly return over the window × 52.",
+        "Separates return from broad drivers from what is left in alpha. It describes the window, not future returns.",
+    ),
+    MetricDefinition(
+        "Factor stress test impact",
+        "The instant portfolio move implied by its factor betas for a one-off shock to the factors.",
+        "Σ factor beta × shock, using preset scenarios (market falls 20%; growth and momentum sell-off; flight to quality; small-cap and value rally; rotation from growth to value) or custom shocks between −60% and +60%. Alpha and the risk-free rate are left out; factors not in the fitted model are ignored and listed.",
+        "Only as good as the factor fit: read it with R² and the typical unexplained move. Not a prediction that the scenario will happen.",
+    ),
+    MetricDefinition(
+        "Typical unexplained move in a month",
+        "How far the real outcome of a stress test could differ from the factor estimate, either way, in a typical month.",
+        "1.645 × annual unexplained volatility ÷ √12, roughly the 90% range of the monthly residual.",
+        "A reminder that the stress test explains only part of the portfolio's moves.",
+    ),
+    # Exports tab: the export agent's checks before download.
+    MetricDefinition(
+        "Export check result",
+        "Whether an export built from a plain-language request passed the checks that run before it can be downloaded.",
+        "Every file is read back and checked: Fail if any check fails, Review if any needs review, otherwise Pass. Info and Not checked lines explain what was or could not be tied out and do not change the result. Download rebuilds the files and serves them only if they match the checked fingerprint byte for byte; a failed export cannot be downloaded and one needing review is downloaded only after a person releases it.",
+        "Pass means the file ties to the website's own records, not that it has been reviewed for client distribution.",
+    ),
+    MetricDefinition(
+        "Last value matches the books",
+        "Whether the last account value in an exported performance file equals the account's value on that day.",
+        "Compare the final total value in the file with the stored validated NAV for that date; they must be equal. Not checked when the books have no value for that day.",
+        "A mismatch fails the export, because the file would disagree with the website.",
+    ),
+    MetricDefinition(
+        "Holdings and cash add up to the account's value",
+        "Whether exported holdings plus cash reconcile to the account's value on the holdings date.",
+        "Positions + cash − NAV on the snapshot date; pass when the difference is within the larger of 1 unit or 1% of NAV, otherwise review. Not checked for composites or for files holding only some currencies or symbols.",
+        "Accrued interest and dividends make up most of a small difference.",
+    ),
+    MetricDefinition(
+        "Cash balances roll forward",
+        "Whether opening cash plus cash activity and trades reaches closing cash in each currency over an exported period.",
+        "Closing − opening − cash activity − trade cash per currency; pass within the larger of 1 unit or 0.5% of closing cash, otherwise shown as information. Broker accounts only, and only when the file holds every kind of cash activity.",
+        "Currency conversions booked elsewhere on the statement are the usual reason for a residue, so it is shown rather than held.",
+    ),
+    MetricDefinition(
+        "Totals tie to the file",
+        "Whether the totals file in an export equals the sums of its detail file.",
+        "Every total is recomputed from the detail file (or the selected rows, when the file leaves out columns the totals need) with exact decimal arithmetic and compared with the written totals.",
+        "Any difference fails the export.",
+    ),
+    MetricDefinition(
+        "No long gaps in the value history",
+        "Whether an exported value history skips more than ten days between values.",
+        "Largest number of calendar days between consecutive values in the file; review when it is more than 10.",
+        "Long gaps usually mean missing valuations for that stretch, worth checking before the file is used.",
+    ),
+    MetricDefinition(
+        "Export pack",
+        "A saved export request that is re-run every month, quarter or year.",
+        "When a pack's period closes, a daily job leaves an Agent inbox card; opening it re-runs the plan for the new dates on the Exports tab, with the same checks before download.",
+        "Nothing is built or sent automatically; a person still checks and downloads each run.",
+    ),
+    # Agent inbox: the daily risk watch.
+    MetricDefinition(
+        "Risk alert",
+        "An Agent inbox card raised on weekday mornings when an account's risk models flag a notable change.",
+        "Three fixed rules, checked in code: a VaR breach (the latest day's return broke the 95% one-day VaR that the VaR backtest forecast the day before from earlier data); a move into the stressed regime (the regime model puts the account in its stressed regime at least 60% likely, when it was not there a week ago); and a volatility jump (next-month forecast volatility at least 1.5 times long-run volatility, at most once a week). An agent then writes an explanation from the account's figures; if the explanation cannot be checked against them it is left out.",
+        "A prompt to look, not an instruction to trade. Open the Modelling tab's Risk outlook and Market regimes for the detail.",
+    ),
+    MetricDefinition(
+        "Risk model check",
+        "A monthly Agent inbox card saying whether each account's risk models have held up against what actually happened.",
+        "Lists an issue when the VaR backtest's Kupiec p-value is below 0.05, or when the regime outlook's 90% range held the next month's outcome outside 80%–97% of the time; otherwise the check reads in line. It also says whether the outlook shows directional skill.",
+        "When the check lists an issue, treat the matching forward VaR, tail-loss or outlook figures with caution until it is back in line.",
+    ),
 )
 
 
-# Sections follow the website's own tabs so a reader can find a number where
-# they saw it.  Names are the deep-link keys used by metric cards; renaming one
-# breaks existing links, so regroup rather than rename.
+# Sections follow the website's own tabs and subpages so a reader can find a
+# number where they saw it.  Keys are the section deep-link keys; metric anchors
+# come from the metric names, so regroup rather than rename.  Each section names
+# where its figures appear; METRIC_LOCATIONS narrows that for single metrics.
 _LAYOUT = (
     (
         "overview",
         "Overview",
         "Overview and period returns",
-        "Account value, day change, period returns, the money-weighted return and external flows shown on Overview and in the Performance tab's period returns table (performance-periods-v1).",
+        "Account value, day change, period returns, the money-weighted return and external flows shown on Overview and on the Performance tab's Period returns and Contributions pages (performance-periods-v1).",
+        "Overview · Performance › Period returns",
         ("As of", "Data freshness", "Net asset value (NAV)", "Day change", "Time-weighted return (TWR)",
          "TWR annualised", "IRR annualised", "Net external flows", "Positions", "Reporting currency",
          "Observations"),
     ),
     (
         "benchmark",
-        "Benchmark",
-        "Performance: benchmark comparison",
-        "The comparison chart and statistics use only dates on which both the portfolio and the benchmark have validated values (benchmark-comparison-v1). Portfolio returns adjust for external cash flows; benchmark returns use closing levels.",
+        "Performance",
+        "Performance: NAV chart, monthly returns, attribution and benchmark",
+        "The Performance tab's NAV chart, Monthly returns, Attribution and Vs benchmark pages. Benchmark comparisons use only dates on which both the portfolio and the benchmark have validated values (benchmark-comparison-v1); portfolio returns adjust for external cash flows and benchmark returns use closing levels. Monthly returns and attribution use every validated NAV date (portfolio-analytics-v1).",
+        "Performance › Vs benchmark",
         ("Cash-flow-adjusted daily portfolio return", "Daily benchmark return", "Benchmark return basis",
          "Rebased portfolio or benchmark level", "Portfolio total return", "Benchmark total return",
          "Excess total return", "Tracking error", "Information ratio", "Beta", "Correlation",
-         "Relative win rate", "Rolling beta and correlation"),
-    ),
-    (
-        "statistics",
-        "Statistics",
-        "Performance: return statistics, calendar and drawdowns",
-        "Institutional statistics on the Performance tab (portfolio-analytics-v1). They use every validated NAV date and the same cash-flow-adjusted returns as the period returns table, so they can differ slightly from the benchmark-aligned Risk tab.",
-        ("Sortino ratio", "Calmar ratio", "Maximum drawdown (since inception)", "Current drawdown",
-         "Drawdown episode", "Downside deviation", "Skewness", "Excess kurtosis", "Best and worst day",
-         "Best and worst month", "Positive months", "Average gain and loss month", "Gain/loss ratio",
-         "Monthly return", "Rolling 3-month volatility", "Trailing 12-month return",
-         "Contribution to return"),
+         "Relative win rate", "Monthly return", "Contribution to return"),
     ),
     (
         "holdings",
         "Holdings",
         "Holdings and concentration",
         "Position values from the latest validated holdings snapshot on or before As of, converted into the reporting currency with dated FX (holdings-view-v1), plus the concentration measures on the Holdings tab.",
+        "Holdings",
         ("Quantity", "Market value", "Value in reporting currency", "Cost basis", "Unrealized P&L", "P&L %",
          "Holding weight", "RSI (14)", "Sector allocation", "Currency exposure", "Largest holding", "Top 5 weight",
          "Top 10 weight", "Effective number of holdings"),
     ),
     (
         "risk",
-        "Risk",
-        "Risk and tail-loss analytics",
-        "Risk metrics on the Risk tab use validated, cash-flow-adjusted returns aligned to the primary benchmark's trading dates through As of (benchmark-comparison-v1). The contributor tables explain which unchanged USD positions drove Expected Tail Loss on historical tail days.",
+        "Risk snapshot",
+        "Risk: snapshot, tail loss and crisis scenarios",
+        "The Risk tab's Risk snapshot page. Its metrics use validated, cash-flow-adjusted returns aligned to the primary benchmark's trading dates through As of (benchmark-comparison-v1). The contributor tables explain which unchanged USD positions drove Expected Tail Loss on historical tail days, and the crisis scenarios replay today's holdings through four past sell-offs (holdings-crisis-scenarios-v1).",
+        "Risk › Risk snapshot",
         ("Total return", "Annualized return", "Annualized volatility", "Risk-free rate", "Sharpe ratio",
          "Expected maximum drawdown (1 year)", "Actual maximum drawdown (1 year)",
          "Tail maximum drawdown (1 year)", "Crisis maximum drawdown (15/9/2008–9/3/2009)",
          "VaR 95% — daily", "Daily Expected Tail Loss (95%)", "Win rate", "BLUE mean daily return",
          "Expected Tail Loss contribution", "Top 5 ETL contributors", "Bottom 5 ETL contributors",
-         "ETL residual contribution", "Holdings correlation"),
+         "ETL residual contribution", "Crisis scenario maximum drawdown", "Crisis scenario stand-ins (scaled)"),
+    ),
+    (
+        "statistics",
+        "Risk statistics",
+        "Risk: statistics, drawdowns, rolling risk and correlation",
+        "The Risk tab's Statistics, Drawdowns, Rolling risk and Correlation pages (portfolio-analytics-v1). They use every validated NAV date and the same cash-flow-adjusted returns as the period returns table, so they can differ slightly from the benchmark-aligned Risk snapshot.",
+        "Risk › Statistics",
+        ("Sortino ratio", "Calmar ratio", "Maximum drawdown (since inception)", "Current drawdown",
+         "Drawdown episode", "Downside deviation", "Skewness", "Excess kurtosis", "Best and worst day",
+         "Best and worst month", "Positive months", "Average gain and loss month", "Gain/loss ratio",
+         "Rolling 3-month volatility", "Trailing 12-month return", "Rolling beta and correlation",
+         "Holdings correlation"),
+    ),
+    (
+        "modelling-outlook",
+        "Modelling: outlook",
+        "Modelling: wealth projection, risk outlook and market regimes",
+        "The Modelling tab's forward-looking pages (portfolio-modelling-v1). Every figure is a hypothetical model built from the portfolio's own cash-flow-adjusted daily returns. None is a forecast, a guarantee or investment advice, and nothing is written to the database. Simulations use a seed fixed by the inputs, so the same data gives the same result.",
+        "Modelling › Risk outlook",
+        ("Wealth projection range", "Chance of reaching the target", "Chance of running out",
+         "Chance of ending below money put in", "Projection return and volatility used", "Forecast volatility",
+         "Long-run volatility", "Shock half-life", "Forward VaR", "Forward expected tail loss", "VaR backtest",
+         "Drawdown odds (next 12 months)", "Market regime", "Regime outlook range", "Outlook score"),
+    ),
+    (
+        "modelling-portfolio",
+        "Modelling: portfolio",
+        "Modelling: what-if, optimisation, factor model and stress test",
+        "The Modelling tab's pages that work from the holdings' own prices or from factor data (portfolio-modelling-v1). They are hypothetical and are not recommendations. Holdings models are not available for composite sleeves, which have no security-level price history.",
+        "Modelling › What-if",
+        ("What-if comparison", "Worst month (21 sessions)", "What-if crisis replay", "Share of risk",
+         "Expected return (optimisation)", "Minimum variance portfolio", "Risk parity portfolio",
+         "Maximum Sharpe portfolio", "Efficient frontier", "Factor beta", "Factor t-statistic",
+         "Alpha (factor model)", "Explained by factors (R²)", "Unexplained volatility",
+         "Factor return contribution", "Factor stress test impact", "Typical unexplained move in a month"),
     ),
     (
         "cash-trades",
         "Cash and trades",
         "Cash and trades",
         "Cash balances, cash events and executed trades imported from the daily IBKR refresh, and the trading-activity measures built from them.",
+        "Cash · Trade history",
         ("Ending cash", "Settled cash", "Cash activity amount", "Trade proceeds", "Commission", "Net cash",
          "Realized P&L", "Trading activity", "Portfolio turnover", "Commissions / NAV"),
     ),
@@ -695,25 +989,88 @@ _LAYOUT = (
         "Reports",
         "Reports and data quality",
         "Operational labels that decide whether data or report files may be used.",
+        "Monthly reports",
         ("Ready", "Ready for review", "Generation pending", "Quality status", "Return observations"),
+    ),
+    (
+        "exports",
+        "Exports",
+        "Data exports and the checks before download",
+        "The Data exports tab. The export agent turns a plain-language request into a plan, but every row, total and check is produced by code from the same reads as the CSV buttons, and the files are checked against the books before anyone can download them.",
+        "Data exports",
+        ("Export check result", "Last value matches the books", "Holdings and cash add up to the account's value",
+         "Cash balances roll forward", "Totals tie to the file", "No long gaps in the value history",
+         "Export pack"),
+    ),
+    (
+        "agents",
+        "Agent inbox",
+        "Agent inbox: risk alerts and model checks",
+        "Cards the daily risk watch leaves in the Agent inbox. The rules that raise them are fixed in code; an agent only writes the explanation, and nothing is sent, published or traded.",
+        "Agent inbox",
+        ("Risk alert", "Risk model check"),
     ),
     (
         "system",
         "System",
         "System health and administration",
         "Platform-level operating indicators. They monitor process health but do not replace financial reconciliation.",
+        "System health",
         ("Tracked NAV subjects", "Latest portfolio date", "Latest ingestion run", "Benchmark observations",
          "Assurance checks passed / warnings / failures", "Consecutive passing days", "Open incidents",
          "Portal failure count", "Rollback threshold", "Production authority", "Monthly review due",
          "Last-known-good revision"),
     ),
 )
+
+# Where a single metric appears when it is not on its section's main page.
+METRIC_LOCATIONS = {
+    "Net external flows": "Overview · Performance › Contributions",
+    "Data freshness": "Account page header · System health",
+    "Rebased portfolio or benchmark level": "Performance › NAV chart · Performance › Vs benchmark",
+    "Monthly return": "Performance › Monthly returns",
+    "Contribution to return": "Performance › Attribution",
+    "Holding weight": "Holdings · Overview",
+    "Sector allocation": "Holdings · Overview",
+    "Crisis scenario maximum drawdown": "Risk › Risk snapshot, Crisis scenarios",
+    "Crisis scenario stand-ins (scaled)": "Risk › Risk snapshot, Crisis scenarios",
+    "Drawdown episode": "Risk › Drawdowns",
+    "Rolling 3-month volatility": "Risk › Rolling risk",
+    "Trailing 12-month return": "Risk › Rolling risk",
+    "Rolling beta and correlation": "Risk › Rolling risk",
+    "Holdings correlation": "Risk › Correlation",
+    "Wealth projection range": "Modelling › Wealth projection",
+    "Chance of reaching the target": "Modelling › Wealth projection",
+    "Chance of running out": "Modelling › Wealth projection",
+    "Chance of ending below money put in": "Modelling › Wealth projection",
+    "Projection return and volatility used": "Modelling › Wealth projection",
+    "VaR backtest": "Modelling › Risk outlook · Agent inbox",
+    "Market regime": "Modelling › Market regimes",
+    "Regime outlook range": "Modelling › Market regimes",
+    "Outlook score": "Modelling › Market regimes · Agent inbox",
+    "Share of risk": "Modelling › Optimisation",
+    "Expected return (optimisation)": "Modelling › Optimisation",
+    "Minimum variance portfolio": "Modelling › Optimisation",
+    "Risk parity portfolio": "Modelling › Optimisation",
+    "Maximum Sharpe portfolio": "Modelling › Optimisation",
+    "Efficient frontier": "Modelling › Optimisation",
+    "Factor beta": "Modelling › Factor model",
+    "Factor t-statistic": "Modelling › Factor model",
+    "Alpha (factor model)": "Modelling › Factor model",
+    "Explained by factors (R²)": "Modelling › Factor model",
+    "Unexplained volatility": "Modelling › Factor model",
+    "Factor return contribution": "Modelling › Factor model",
+    "Factor stress test impact": "Modelling › Stress test",
+    "Typical unexplained move in a month": "Modelling › Stress test",
+    "Export pack": "Data exports · Agent inbox",
+    "Return observations": "Risk › Statistics · Monthly reports",
+}
 _BY_NAME = {metric.name: metric for metric in _DEFINITIONS}
 if len(_BY_NAME) != len(_DEFINITIONS):
     raise RuntimeError("Metric guide names must be unique")
 METRIC_SECTIONS = tuple(
-    MetricSection(key, short_title, title, introduction, tuple(_BY_NAME[name] for name in names))
-    for key, short_title, title, introduction, names in _LAYOUT
+    MetricSection(key, short_title, title, introduction, tuple(_BY_NAME[name] for name in names), location)
+    for key, short_title, title, introduction, location, names in _LAYOUT
 )
 _placed = [metric.name for section in METRIC_SECTIONS for metric in section.metrics]
 if sorted(_placed) != sorted(_BY_NAME):
@@ -841,6 +1198,49 @@ CLIENT_CALCULATIONS = {
     "Holding weight": "Divide each holding's value by the total value of the portfolio.",
     "RSI (14)": "Compare the size of the holding's recent daily price rises with its recent falls and score the balance from 0 to 100.",
     "Sector allocation": "Group the holdings by sector and add up each sector's share of the holdings value.",
+    "Crisis scenario maximum drawdown": "Keep today's holdings at fixed units and replay them through each past crisis on their own prices, or on a similar fund scaled to how strongly the holding moves with it, then find the biggest fall from a high.",
+    "Crisis scenario stand-ins (scaled)": "Count the holdings that had no prices of their own for the crisis and were replayed on a similar fund, and in brackets how many of those were scaled up or down.",
+    "Wealth projection range": "Build thousands of possible futures by stringing together real months from the portfolio's own history at random, adding the monthly contribution each month, and show the range of where the value could end up.",
+    "Chance of reaching the target": "Count the simulated futures that end at or above the target and divide by all of them.",
+    "Chance of running out": "Count the simulated futures in which withdrawals use up the whole portfolio and divide by all of them.",
+    "Chance of ending below money put in": "Count the simulated futures that end below the starting value plus everything added, and divide by all of them.",
+    "Projection return and volatility used": "Show the yearly growth rate and the spread of monthly returns the simulation is built on, from history or from your own return assumption.",
+    "Forecast volatility": "Look at how big recent daily moves have been compared with normal, and estimate how volatile the portfolio is likely to be next, assuming unusual calm or turbulence gradually fades back to normal.",
+    "Long-run volatility": "Measure how much the portfolio's daily returns have typically varied over its whole history and scale it to a year.",
+    "Shock half-life": "Estimate how many trading days it takes for half of a burst of volatility to die away.",
+    "Forward VaR": "Take the portfolio's own past days, adjust each one to today's level of volatility, and find the loss that is beaten on only 1 day in 20 (or 1 in 100), and the same for a month.",
+    "Forward expected tail loss": "Average the losses on the days or months that go beyond the forward VaR.",
+    "VaR backtest": "Go back through history and, using only the data available at each point, check how often the next day's loss broke the VaR line compared with the 1 day in 20 expected.",
+    "Drawdown odds (next 12 months)": "Simulate thousands of possible next years from the portfolio's own month-long stretches of returns and count how often each one falls 10%, 20% or 30% from a high.",
+    "Market regime": "Let the model sort the portfolio's history into calm and stressed periods from the size of its daily moves, then estimate which one it is in today and how likely a switch is.",
+    "Regime outlook range": "Simulate thousands of next few months that can switch between calm and stressed periods with the odds seen in the past, and show the range of outcomes.",
+    "Outlook score": "Replay the outlook at past month-ends, using only data available then, and check how often the next month landed inside the range and whether the middle line got the direction right.",
+    "What-if comparison": "Replay today's weights and your proposed weights over the same year of daily prices, with any money not invested held as cash, and compare their risk and return.",
+    "Worst month (21 sessions)": "Find the weakest stretch of 21 trading days in the year being compared.",
+    "What-if crisis replay": "Replay both today's mix and the proposed mix through each stored crisis on the same price paths, and compare their worst fall and their return over the whole window.",
+    "Share of risk": "Work out how much of the portfolio's ups and downs come from each holding, allowing for how the holdings move together.",
+    "Expected return (optimisation)": "Take each holding's average return over the past year and pull it halfway toward the average of all the holdings, so one strong year does not dominate.",
+    "Minimum variance portfolio": "Find the mix of the same holdings with the smallest expected ups and downs, with a cap on any single holding.",
+    "Risk parity portfolio": "Find the mix of the same holdings in which each one contributes the same amount of risk.",
+    "Maximum Sharpe portfolio": "Find the mix of the same holdings with the most expected return for each unit of risk, with a cap on any single holding.",
+    "Efficient frontier": "Plot the lowest-risk mix of the same holdings for each level of expected return.",
+    "Factor beta": "Compare the portfolio's weekly returns with six well-known market drivers and measure how strongly it has moved with each one.",
+    "Factor t-statistic": "Divide each sensitivity by its uncertainty to see whether it is clearly different from zero.",
+    "Alpha (factor model)": "Take the part of the portfolio's average return the six drivers do not explain and express it per year.",
+    "Explained by factors (R²)": "Measure how much of the portfolio's weekly ups and downs the six drivers account for.",
+    "Unexplained volatility": "Measure how much the portfolio's weekly returns vary in ways the six drivers do not explain, scaled to a year.",
+    "Factor return contribution": "Multiply each sensitivity by how much that driver returned over the period, per year.",
+    "Factor stress test impact": "Multiply each driver's shock by the portfolio's sensitivity to it and add the results.",
+    "Typical unexplained move in a month": "Estimate how far the real result could differ from the stress-test figure in a typical month, either way, because of moves the drivers do not explain.",
+    "Export check result": "Run every check on the built files; the export fails if any check fails, needs review if any needs review, and passes otherwise.",
+    "Last value matches the books": "Compare the last value in the exported file with the account's recorded value on that day.",
+    "Holdings and cash add up to the account's value": "Add up the exported holdings and the cash and compare the total with the account's value on that day.",
+    "Cash balances roll forward": "Start from the opening cash, add the cash activity and trades in the file and check that it reaches the closing cash in each currency.",
+    "Totals tie to the file": "Add up the detail file again and check every figure in the totals file matches.",
+    "No long gaps in the value history": "Look for the longest stretch between two values in the exported history.",
+    "Export pack": "Save an export request once and have it offered again each month, quarter or year, with the same checks each time.",
+    "Risk alert": "Check each account every weekday morning for a loss beyond its VaR, a switch into its stressed period or a jump in forecast volatility, and explain what happened when one occurs.",
+    "Risk model check": "Once a month, check whether each account's VaR line and outlook ranges have held up against what actually happened.",
 }
 
 # Extra words a reader might type: abbreviations, synonyms and common names.
@@ -890,6 +1290,34 @@ METRIC_ALIASES = {
     "Realized P&L": ("realised profit", "closed P&L"),
     "Settled cash": ("liquidity",),
     "Quality status": ("pass", "warning", "failure", "data quality"),
+    "Crisis scenario maximum drawdown": ("stress test", "Lehman", "COVID", "2022 sell-off", "China crash", "scenario analysis"),
+    "Wealth projection range": ("Monte Carlo", "fan chart", "projection", "retirement plan", "block bootstrap"),
+    "Chance of reaching the target": ("probability of success", "goal probability"),
+    "Chance of running out": ("depletion risk", "ruin probability", "sequence risk"),
+    "Forecast volatility": ("GARCH", "EWMA", "conditional volatility", "volatility forecast"),
+    "Long-run volatility": ("unconditional volatility", "realised volatility"),
+    "Forward VaR": ("filtered historical simulation", "FHS", "99% VaR", "monthly VaR"),
+    "Forward expected tail loss": ("forward CVaR", "forward expected shortfall"),
+    "VaR backtest": ("Kupiec", "breaches", "exceptions", "proportion of failures"),
+    "Drawdown odds (next 12 months)": ("probability of drawdown", "chance of a fall"),
+    "Market regime": ("hidden Markov model", "HMM", "calm", "stressed", "regime switching"),
+    "Regime outlook range": ("outlook", "1-3 month range", "scenario range"),
+    "Outlook score": ("walk-forward", "calibration", "coverage", "directional skill"),
+    "What-if comparison": ("rebalancing", "scenario weights", "proposed portfolio", "pro forma"),
+    "Share of risk": ("risk budget", "risk contribution", "marginal risk"),
+    "Minimum variance portfolio": ("min variance", "lowest risk"),
+    "Risk parity portfolio": ("equal risk contribution", "ERC"),
+    "Maximum Sharpe portfolio": ("tangency portfolio", "max Sharpe"),
+    "Efficient frontier": ("mean-variance", "Markowitz", "optimisation", "optimization"),
+    "Factor beta": ("Fama-French", "factor exposure", "smart beta", "size", "value", "momentum"),
+    "Alpha (factor model)": ("Jensen's alpha", "unexplained return"),
+    "Explained by factors (R²)": ("R-squared", "R2", "goodness of fit"),
+    "Unexplained volatility": ("residual volatility", "idiosyncratic risk", "specific risk"),
+    "Factor stress test impact": ("scenario shock", "what if markets fall", "factor shock"),
+    "Export check result": ("export agent", "checker", "download checks"),
+    "Export pack": ("scheduled export", "recurring export", "monthly pack"),
+    "Risk alert": ("risk watch", "inbox alert", "VaR breach", "volatility jump"),
+    "Risk model check": ("model validation", "model monitoring"),
 }
 
 # Closely linked definitions shown as "See also" links under each entry.
@@ -946,6 +1374,42 @@ RELATED_METRICS = {
     "Commissions / NAV": ("Commission", "Portfolio turnover"),
     "Realized P&L": ("Unrealized P&L", "Trading activity"),
     "Return observations": ("Observations",),
+    "Crisis maximum drawdown (15/9/2008–9/3/2009)": ("Crisis scenario maximum drawdown",),
+    "Crisis scenario maximum drawdown": ("Crisis scenario stand-ins (scaled)", "Crisis maximum drawdown (15/9/2008–9/3/2009)", "What-if crisis replay"),
+    "Crisis scenario stand-ins (scaled)": ("Crisis scenario maximum drawdown",),
+    "Wealth projection range": ("Projection return and volatility used", "Chance of reaching the target", "Chance of ending below money put in"),
+    "Chance of reaching the target": ("Wealth projection range",),
+    "Chance of running out": ("Wealth projection range", "Chance of ending below money put in"),
+    "Chance of ending below money put in": ("Wealth projection range",),
+    "Projection return and volatility used": ("Wealth projection range", "Annualized return"),
+    "Forecast volatility": ("Long-run volatility", "Shock half-life", "Forward VaR", "Annualized volatility"),
+    "Long-run volatility": ("Forecast volatility", "Risk alert"),
+    "Shock half-life": ("Forecast volatility",),
+    "Forward VaR": ("Forward expected tail loss", "VaR backtest", "VaR 95% — daily"),
+    "Forward expected tail loss": ("Forward VaR", "Daily Expected Tail Loss (95%)"),
+    "VaR backtest": ("Forward VaR", "Risk model check"),
+    "Drawdown odds (next 12 months)": ("Expected maximum drawdown (1 year)", "Forecast volatility"),
+    "Market regime": ("Regime outlook range", "Outlook score", "Risk alert"),
+    "Regime outlook range": ("Market regime", "Outlook score"),
+    "Outlook score": ("Regime outlook range", "Risk model check"),
+    "What-if comparison": ("Worst month (21 sessions)", "What-if crisis replay", "Share of risk"),
+    "What-if crisis replay": ("Crisis scenario maximum drawdown", "What-if comparison"),
+    "Share of risk": ("Holding weight", "Risk parity portfolio", "Expected Tail Loss contribution"),
+    "Minimum variance portfolio": ("Efficient frontier", "Risk parity portfolio"),
+    "Risk parity portfolio": ("Share of risk", "Minimum variance portfolio"),
+    "Maximum Sharpe portfolio": ("Efficient frontier", "Expected return (optimisation)", "Sharpe ratio"),
+    "Efficient frontier": ("Minimum variance portfolio", "Maximum Sharpe portfolio"),
+    "Factor beta": ("Factor t-statistic", "Factor return contribution", "Beta"),
+    "Factor t-statistic": ("Factor beta", "Alpha (factor model)"),
+    "Alpha (factor model)": ("Explained by factors (R²)", "Excess total return"),
+    "Explained by factors (R²)": ("Unexplained volatility", "Factor stress test impact"),
+    "Unexplained volatility": ("Explained by factors (R²)", "Typical unexplained move in a month"),
+    "Factor stress test impact": ("Factor beta", "Typical unexplained move in a month", "Crisis scenario maximum drawdown"),
+    "Typical unexplained move in a month": ("Factor stress test impact", "Unexplained volatility"),
+    "Export check result": ("Last value matches the books", "Holdings and cash add up to the account's value", "Cash balances roll forward"),
+    "Export pack": ("Export check result",),
+    "Risk alert": ("Forward VaR", "Market regime", "Forecast volatility"),
+    "Risk model check": ("VaR backtest", "Outlook score"),
 }
 for _name, _targets in (*METRIC_ALIASES.items(), *RELATED_METRICS.items()):
     if _name not in _BY_NAME:
@@ -954,6 +1418,9 @@ for _name, _targets in RELATED_METRICS.items():
     for _target in _targets:
         if _target not in _BY_NAME or _target == _name:
             raise RuntimeError(f"Invalid related metric for {_name}: {_target}")
+for _name in METRIC_LOCATIONS:
+    if _name not in _BY_NAME:
+        raise RuntimeError(f"Unknown metric in guide locations: {_name}")
 
 
 METHODOLOGY_VERSIONS = (
@@ -961,6 +1428,8 @@ METHODOLOGY_VERSIONS = (
     ("performance-periods-v1", "period returns, IRR and flows"),
     ("portfolio-analytics-v1", "Performance statistics, calendar, rolling and concentration"),
     ("holdings-view-v1", "holdings values, P&L and weights"),
+    ("holdings-crisis-scenarios-v1", "crisis scenarios on the Risk tab"),
+    ("portfolio-modelling-v1", "Modelling tab models and the risk watch"),
 )
 
 # Conventions that apply across the guide, so individual entries need not
@@ -971,21 +1440,24 @@ CALCULATION_CONVENTIONS = (
     ("Currency", "Portfolio-level figures are in the reporting currency, converted with the dated FX rate on or before each valuation date."),
     ("Dates", "Benchmark comparisons and the Risk tab use only dates both series share, and unmatched dates are not filled. Performance statistics use every validated NAV date."),
     ("Missing data", "If required data is missing, stale or invalid, the website shows the metric as unavailable instead of estimating it."),
+    ("Models", "Modelling figures, crisis scenarios and risk alerts are hypothetical models built from history. They are not forecasts, guarantees or investment advice, and each states its method and the data it used."),
     ("Display", "A stored decimal of 0.05 is displayed as 5.00%. VaR and Expected Tail Loss are shown as positive loss percentages; drawdowns are shown as negative percentages."),
 )
 
 ALIASES_SHOWN = 4
 
 
-def _definition_row(metric: MetricDefinition) -> str:
+def _definition_row(metric: MetricDefinition, section: MetricSection) -> str:
     client_calculation = CLIENT_CALCULATIONS[metric.name]
     anchor = METRIC_ANCHORS[metric.name]
     aliases = METRIC_ALIASES.get(metric.name, ())
     related = RELATED_METRICS.get(metric.name, ())
+    location = METRIC_LOCATIONS.get(metric.name, section.location)
     search_text = " ".join(
         (
             metric.name,
             *aliases,
+            location,
             metric.meaning,
             client_calculation,
             metric.calculation,
@@ -1016,6 +1488,7 @@ def _definition_row(metric: MetricDefinition) -> str:
         f'<h3>{escape(metric.name)}</h3>'
         f'<button type="button" class="metric-copy" data-anchor="{escape(anchor, quote=True)}" '
         f'aria-label="Copy a link to {escape(metric.name, quote=True)}">Copy link</button></div>'
+        f'<div class="metric-where"><span>Where you see it</span>{escape(location)}</div>'
         f'{alias_html}'
         '<div class="metric-explanation-grid">'
         '<div><div class="metric-explanation-label">What it tells you</div>'
@@ -1037,7 +1510,7 @@ def _section_id(section: MetricSection) -> str:
 def render_metrics_guide() -> str:
     sections = []
     for section in METRIC_SECTIONS:
-        rows = "".join(_definition_row(metric) for metric in section.metrics)
+        rows = "".join(_definition_row(metric, section) for metric in section.metrics)
         section_id = escape(_section_id(section), quote=True)
         sections.append(
             f'<section id="{section_id}" class="card wide metric-guide-section" '
@@ -1072,7 +1545,7 @@ def render_metrics_guide() -> str:
         '<p class="muted">Each definition starts with the business meaning, explains '
         'the calculation without jargon and gives a practical interpretation. Open '
         'the technical panel only when you need the exact formula or methodology. '
-        'Sections follow the website tabs, so you can find a number where you saw it.</p>'
+        'Sections follow the website tabs and their pages, and each definition says where you see it.</p>'
         '<div class="methodology-callout"><strong>A simple way to read this guide</strong><br>'
         '“What it tells you” explains the purpose. “How we work it out” describes the '
         'calculation in everyday language. “How to explain it” highlights the main '
@@ -1087,7 +1560,7 @@ def render_metrics_guide() -> str:
         '<div class="metric-guide-toolbar-row">'
         '<label class="metric-search-label"><span class="visually-hidden">Find a metric or term</span>'
         '<input id="metric-search" type="search" autocomplete="off" '
-        'placeholder="Try Sharpe, TWR, IRR, drawdown, CVaR or HHI" '
+        'placeholder="Try Sharpe, TWR, GARCH, regime, what-if or CVaR" '
         'aria-describedby="metric-search-status"></label>'
         '<button type="button" id="metric-expand" class="metric-expand" aria-pressed="false">Show all formulas</button>'
         '</div>'

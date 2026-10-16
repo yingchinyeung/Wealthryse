@@ -11248,6 +11248,24 @@ _install_agent_web(
 )
 
 
+# Factsheet designer: upload a template, review the design agents' draft, edit it in plain
+# words and submit it as a design request. Every route answers 404 unless
+# FACTSHEET_DESIGN_AGENTS_ENABLED is true; see factsheet_design_web.py.
+from . import factsheet_design_web as _factsheet_design_web
+from .agent_web import design_api as _design_api
+
+_factsheet_design_web.install(
+    app,
+    owner_user=_owner_user,
+    check_subject=_report_design_owner,
+    write_database=lambda: _approval_database(),
+    portable=_portable_database_connection,
+    render_page=_platform_shell,
+    tenant_id=TENANT_ID,
+    agent_api=_design_api,
+)
+
+
 def _upload_intake_document(container: str, blob: str, content: bytes, content_type: str) -> None:
     if not AZURE_STORAGE_ACCOUNT_URL:
         raise RuntimeError("Private intake storage is unavailable")

@@ -38,6 +38,7 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
 SWITCHES_NEEDING_MIGRATIONS = {
     'ONBOARDING_V2_ENABLED': ('064_broker_connections_and_onboarding_cases.sql', '065_onboarding_report_style.sql'),
     'CRISIS_SCENARIOS_ENABLED': ('066_crisis_scenarios.sql',),
+    'FACTSHEET_DESIGN_AGENTS_ENABLED': ('067_factsheet_design_agents.sql',),
 }
 # Migrations confirmed applied in production (this workflow cannot reach the database).
 APPLIED_MIGRATIONS = Path(__file__).resolve().parent / 'applied-migrations.json'

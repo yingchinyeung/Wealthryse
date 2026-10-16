@@ -12,16 +12,16 @@ Status: the catalog is in place. Nothing has moved yet, and every table is still
 
 | Layer | Holds | Rule |
 |---|---|---|
-| Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, live TWS snapshots, uploads | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
+| Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
 | Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmarks, FX closes, risk-free rates), sectors, derived and composite portfolios | Built only from bronze and rebuildable from it. Corrections happen here and keep a link to the raw record. |
-| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built only from silver. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. Each gold figure maps to an entry in the Metrics guide. |
+| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built only from silver. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
 | Ops | Runs, approvals, audit, access, onboarding workflow, configuration, agent state | Control plane, not a data layer. Stays in `public`. |
 | Platform | `tenants`, `schema_migrations`, row-level security helpers | Stays in `public`. |
 
 ## Where each layer lives
 
 - **Postgres:**
-  - Target schemas are `bronze` (13 tables), `silver` (26 tables and 8 read views) and
+  - Target schemas are `bronze` (14 tables), `silver` (26 tables and 8 read views) and
     `gold` (8 tables).
   - `public` keeps the platform and ops objects, so only the data tables move.
   - The `agent` schema stays as it is: agent state plus account-scoped views over silver
@@ -75,9 +75,12 @@ Each batch is one migration:
 4. **S3:** move the tables in three batches (gold, bronze, silver), rehearsed first on a
    restored copy.
 5. **S4:** narrow access by layer once storage logs show nothing needs the wider roles.
-6. **S5:** v2 makes its own Flex pull into bronze. It runs as a shadow, compared daily
-   with today's data, before the switch.
+6. **S5:** v2 makes its own Flex pull into bronze with v1.1's query, and v1.1 stops. The
+   switch is rehearsed first on a restored copy of the database, with v2's loader run over
+   v1.1's archived statements and compared with what was imported.
 7. **S6:** typed silver views, a replay that rebuilds silver from bronze, and promotion
    gates recorded in the workflow evidence ledger.
 8. **S7:** gold tables for every Metrics guide figure, so each surface reads the same
-   stored number.
+   stored number. The factsheet design bindings (`src/ibkr_etl/factsheet_spec/bindings.py`)
+   already name a Metrics guide entry for every figure a design can print, so they are the
+   list of figures the factsheet surface needs from gold.

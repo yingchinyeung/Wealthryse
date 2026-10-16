@@ -769,9 +769,9 @@
   },
   "public.factsheet_design_files": {
    "kind": "table",
-   "layer": "ops",
-   "target_schema": "public",
-   "note": "Uploaded factsheet template files for the design agents, stored by sha256. Workflow input, not portfolio data."
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Owners' uploaded factsheet templates and examples, exactly as received and keyed by sha256. Insert and read only, so it takes the bronze lock with no exception. Moves with the bronze batch."
   },
   "public.factsheet_design_drafts": {
    "kind": "table",

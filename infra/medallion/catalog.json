@@ -767,6 +767,30 @@
    "target_schema": "silver",
    "note": "Latest position_snapshots."
   },
+  "public.factsheet_design_files": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Uploaded factsheet template files for the design agents, stored by sha256. Workflow input, not portfolio data."
+  },
+  "public.factsheet_design_drafts": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Design-agent drafts of a new account's factsheet renderer."
+  },
+  "public.factsheet_design_versions": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Versions of a design-agent renderer draft."
+  },
+  "public.factsheet_design_proposals": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Design-agent proposals awaiting owner review."
+  },
   "agent.connection_reports": {
    "kind": "table",
    "layer": "ops",

@@ -52,7 +52,11 @@ responses are bronze even when one job fetches and parses them in the same run.
    `public`:
    - The compatibility views use `security_invoker`, so row-level security still applies
      to the caller.
-   - The layer schemas come first in `search_path`.
+   - The runtime logins list the layer schemas first in `search_path`.
+   - The migration login keeps `public` first. Otherwise `db.py` would create a second,
+     empty `schema_migrations` in a layer schema.
+   - A migration that changes a moved table uses the layer name and re-creates its
+     compatibility view, because a view fixes its column list when it is created.
    - The bootstrap grants are extended to the layer schemas.
 5. **M4:** storage roles scoped to containers instead of the whole account.
 6. **M5:** v2 makes its own Flex pull into bronze and stops reading the v1.1 export.

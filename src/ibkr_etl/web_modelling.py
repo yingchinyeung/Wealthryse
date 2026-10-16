@@ -708,10 +708,10 @@ MODELLING_CARDS = r"""
 <div class="actions"><button id="projection-run" class="button" type="button">Run projection</button></div>
 <div id="projection-metrics" class="metrics"></div><div class="chart-wrap"><canvas id="projection-chart" width="1100" height="300" aria-label="Projected NAV range"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div><div id="projection-note" class="muted">Loading…</div></div>
 <div class="card wide" id="model-risk"><div class="label">Risk outlook</div><div class="muted">How volatile the portfolio is likely to be from here, how much it could lose on a bad day or month, whether that measure has held up in the past, and the chance of a large fall over the next year. <a class="metric-guide-inline" href="/metrics-guide#metric-forecast-volatility">How it is worked out <span aria-hidden="true">↗</span></a></div>
-<div id="risk-metrics" class="metrics"></div>
+<div id="model-risk-metrics" class="metrics"></div>
 <div class="label model-subhead">Has the VaR line held? Daily returns against the 95% one-day VaR</div><div class="chart-wrap"><canvas id="risk-backtest-chart" width="1100" height="280" aria-label="Daily returns against the forecast VaR"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div><div id="risk-backtest" class="muted"></div>
 <div class="label model-subhead">Chance of a fall from a high within the next 12 months</div><div class="table-scroll"><table><thead><tr><th class="text-col">Fall of at least</th><th>At its historical volatility</th><th>At today's forecast volatility</th></tr></thead><tbody id="risk-drawdown"></tbody></table></div>
-<div id="risk-note" class="muted">Loading…</div></div>
+<div id="model-risk-note" class="muted">Loading…</div></div>
 <div class="card wide" id="model-regimes"><div class="label">Market regime and outlook</div><div class="muted">Sorts the portfolio's history into calm and stressed periods from its own returns, shows which one it is in now and how likely a switch is, and gives a range for its value one to three months ahead, scored against how past ranges turned out. <a class="metric-guide-inline" href="/metrics-guide#metric-market-regime">How it is worked out <span aria-hidden="true">↗</span></a></div>
 <div id="regime-metrics" class="metrics"></div>
 <div class="table-scroll"><table><thead><tr><th class="text-col">Regime</th><th>Return (a year)</th><th>Volatility</th><th>Share of time</th><th>Typical length</th><th>Chance now</th><th>Chance in a month</th></tr></thead><tbody id="regime-table"></tbody></table></div>
@@ -850,7 +850,7 @@ document.querySelector('#factor-run').addEventListener('click',()=>void runFacto
 document.querySelector('#projection-run').addEventListener('click',()=>void runProjection());
 const riskPair=(x,nav)=>`${pct2(x)}${nav?`<div class="muted">${modelMoney(x*nav)}</div>`:''}`;
 const runRisk=async()=>{
-  const note=document.querySelector('#risk-note'),metrics=document.querySelector('#risk-metrics');note.textContent='Forecasting volatility and backtesting…';
+  const note=document.querySelector('#model-risk-note'),metrics=document.querySelector('#model-risk-metrics');note.textContent='Forecasting volatility and backtesting…';
   let r;try{r=await modelFetch('risk-outlook',{as_of:modelState.asOf})}catch(error){note.textContent=error.message;metrics.innerHTML='';document.querySelector('#risk-drawdown').innerHTML='';document.querySelector('#risk-backtest').textContent='';draw('#risk-backtest-chart',[],[],{emptyMessage:'No forecast.'});return}
   const d1=r.one_day['95'],d99=r.one_day['99'],m1=r.one_month['95'];
   metrics.innerHTML=[

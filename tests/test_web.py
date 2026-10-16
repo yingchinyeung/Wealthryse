@@ -1201,6 +1201,7 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("grid-template-columns: repeat(4, minmax(0, 1fr))", page)
         self.assertIn("@media (max-width: 650px)", page)
         self.assertIn("WealthRyse Portfolio Data Platform", page)
+        self.assertIn('<strong class="brand-title">WealthRyse</strong>', page)
         self.assertNotIn(">IBKR Portfolio Platform<", page)
         self.assertIn('href="/accounts/U16088571/performance"', page)
         self.assertIn('href="/accounts/U16088571/trades"', page)

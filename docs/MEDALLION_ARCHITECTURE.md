@@ -64,6 +64,22 @@ Each batch is one migration:
 - A normal bootstrap applies every migration on `main`. So a batch's migration merges
   on the day the batch runs.
 
+## Raw market data and freshness checks
+
+- **Raw capture** (`src/ibkr_etl/raw_capture.py`):
+  - Each market-data fetch stores the provider's response, before parsing, in
+    `bronze-market-data` as `<feed>/<yyyy>/<mm>/<dd>/<request-key>-<sha256 prefix>.<ext>`.
+    It never overwrites a blob.
+  - It is off unless the job sets `MARKET_DATA_RAW_CONTAINER` and
+    `AZURE_STORAGE_ACCOUNT_URL`.
+  - It is fail-soft: the first storage error, or a time budget running out, turns
+    capture off for the rest of the run, and the job carries on.
+- **Freshness checks** (`src/ibkr_etl/layer_freshness.py`):
+  - The autonomous administrator runs explicit read-only rules for each layer and
+    raises `layer_freshness:<check>` warnings.
+  - It is off unless `LAYER_FRESHNESS_ENABLED=true`.
+  - `python -m ibkr_etl.layer_freshness` prints the same checks for a dry run.
+
 ## Stages
 
 1. **S0:** this catalog and test (repo only).

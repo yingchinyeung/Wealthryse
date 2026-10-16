@@ -25,6 +25,7 @@ from ibkr_etl.admin_actions import (  # noqa: E402
 )
 from ibkr_etl.admin_chat import SYSTEM_UPDATES_SOURCE_KEY  # noqa: E402
 from ibkr_etl.ai_analyst import AIAnalystConfig, AIAnalystError  # noqa: E402
+from ibkr_etl import layer_freshness  # noqa: E402
 from ibkr_etl.autonomous_admin import (  # noqa: E402
     AutonomyControl,
     ROLLBACK_ACTION,
@@ -32,6 +33,7 @@ from ibkr_etl.autonomous_admin import (  # noqa: E402
     authority_review_current,
     diagnose_findings,
     evaluate_supervisor_state,
+    layer_freshness_findings,
     plan_safe_repairs,
 )
 from ibkr_etl.burn_in import now_hkt_date, portal_boundary_check  # noqa: E402
@@ -292,6 +294,23 @@ def _recovery_context(
     )
 
 
+def _layer_freshness_findings(database_url: str, tenant_id: str) -> list:
+    """Late medallion layers as findings, off unless LAYER_FRESHNESS_ENABLED. Read-only
+    on its own connection; any problem is printed and skipped, never failing the run."""
+    if not layer_freshness.enabled():
+        return []
+    try:
+        results = layer_freshness.run_read_only(
+            os.environ.get("LAYER_FRESHNESS_DATABASE_URL") or database_url, tenant_id
+        )
+        print("LAYER_FRESHNESS " + canonical_json(layer_freshness.summary(results)), flush=True)
+        return layer_freshness_findings(results)
+    except Exception as error:  # noqa: BLE001
+        print("LAYER_FRESHNESS " + canonical_json({"status": "failed", "error_code": type(error).__name__}),
+              flush=True)
+        return []
+
+
 def _sync_incidents(connection, findings, now_iso: str) -> tuple[dict[str, int], set[str]]:
     existing = {
         str(row["incident_key"]): int(row["incident_id"])
@@ -547,6 +566,13 @@ def main() -> int:
         findings = evaluate_supervisor_state(
             state, today_hkt=now_hkt_date(), portal_failure=portal_failure
         )
+        stage = "check_layer_freshness"
+        layer_findings = _layer_freshness_findings(database_url, tenant_id)
+        if layer_findings:
+            findings = sorted(
+                [*findings, *layer_findings],
+                key=lambda item: (item.severity != "critical", item.incident_key),
+            )
         now_iso = utc_now_iso()
         stage = "synchronize_incidents"
         incident_ids, new_keys = _sync_incidents(connection, findings, now_iso)

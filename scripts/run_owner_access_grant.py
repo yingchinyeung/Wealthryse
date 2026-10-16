@@ -1,4 +1,4 @@
-"""Inspect/grant/verify the owner role for one existing registered user, as the owner decided."""
+"""Probe, grant and verify the owner role for one existing registered user, in one job execution."""
 import asyncio
 import hashlib
 import json
@@ -9,8 +9,6 @@ from urllib.parse import urlparse
 
 import psycopg
 from psycopg.rows import dict_row
-from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobServiceClient, ContentSettings
 
 TENANT = '00000000-0000-0000-0000-000000000001'
 TARGET_EMAIL = 'chloe.yoo@wealthryse.ai'
@@ -124,26 +122,18 @@ def runtime_checks(state, target, now):
     return checks
 
 
+def emit(kind, value):
+    # The controller reads these lines from the job's console logs; storage is private-network only.
+    print('OWNER_GRANT ' + kind + ' ' + canonical(value), flush=True)
+
+
 def main():
-    require(CONFIG['phase'] in ('probe', 'apply', 'verify'), 'Unsupported phase')
+    require(CONFIG['mode'] in ('probe', 'grant'), 'Unsupported mode')
     value = urlparse(os.environ['DATABASE_URL'])
     require(value.scheme == 'postgresql' and value.hostname == 'ibkrv2stg-pg-auhecwc4itaoo.postgres.database.azure.com'
             and value.path == '/ibkr_staging' and 'sslmode=require' in value.query, 'Unapproved database target')
-    phase = CONFIG['phase']
     web_source = Path('/app/src/ibkr_etl/web.py').read_bytes()
-    web_sha256 = hashlib.sha256(web_source).hexdigest()
-    require((phase == 'probe' and CONFIG['web_sha256'] is None) or web_sha256 == CONFIG['web_sha256'],
-            'Installed website source differs')
     web_symbols = {name: name.encode() in web_source for name in WEB_SYMBOLS}
-    service = BlobServiceClient(os.environ['AZURE_STORAGE_ACCOUNT_URL'], credential=DefaultAzureCredential(
-        exclude_interactive_browser_credential=True))
-    prior = None
-    if phase != 'probe':
-        blob = service.get_blob_client('internal-reports', CONFIG['probe_blob'])
-        content = blob.download_blob().readall()
-        require(hashlib.sha256(content).hexdigest() == CONFIG['probe_sha256'], 'Bound private probe differs')
-        prior = json.loads(content)
-        require(prior['status'] == 'probe_passed' and prior['web_sha256'] == web_sha256, 'Bound probe did not pass on this website source')
     now = datetime.now(timezone.utc)
     with psycopg.connect(os.environ['DATABASE_URL'], row_factory=dict_row, connect_timeout=25,
                         options='-c default_transaction_read_only=on -c statement_timeout=120000 -c lock_timeout=10000') as c:
@@ -157,80 +147,63 @@ def main():
                                                     (table, kind)).fetchone()['allowed'] for table, kind in PRIVILEGES}
         blockers = []
         target = owners = None
-        if phase != 'verify':
-            try:
-                target, owners = inspect(state, now)
-            except ValueError as error:
-                if phase != 'probe':
-                    raise
-                blockers.append(str(error))
-        if phase == 'probe':
-            if not all(privileges.values()):
-                blockers.append('Restricted job cannot write the role registry; do not escalate its role')
-            if not all(web_symbols.values()):
-                blockers.append('Installed website lacks the authorization entry points used for verification')
+        try:
+            target, owners = inspect(state, now)
+        except ValueError as error:
+            blockers.append(str(error))
+        if not all(privileges.values()):
+            blockers.append('Restricted job cannot write the role registry; do not escalate its role')
+        if not all(web_symbols.values()):
+            blockers.append('Installed website lacks the authorization entry points used for verification')
         c.commit()
-        granted = False
-        if phase == 'apply':
-            require(all(privileges.values()), 'Restricted job cannot write the role registry; do not escalate its role')
-            c.execute('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE')
-            c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (TENANT + ':owner-access-grant',))
-            require(canonical(capture()) == canonical(prior['state']), 'Authorization registry drift; refuse writes')
-            target_id = target['entra_object_id']
-            require(target_id == prior['target_object_id'] and owners == prior['owners'], 'Bound target or owner differs')
-            c.execute("INSERT INTO public.app_user_roles(tenant_id,entra_object_id,role_name,role_status,effective_from,"
-                      "granted_by_identity_sha256,reason) VALUES(%s,%s,'owner','active',now(),%s,%s)",
-                      (TENANT, target_id, hashlib.sha256(b'claude-owner-authorized-owner-access-grant').hexdigest(),
-                       'Owner asked that this user have the same website access as the owner'))
-            c.execute("UPDATE public.app_users SET role_name='owner',updated_at=%s WHERE tenant_id=%s AND entra_object_id=%s",
-                      (now.isoformat(), TENANT, target_id))
-            after = capture()
-            require(canonical(after['access']) == canonical(state['access'])
-                    and canonical(after['subjects']) == canonical(state['subjects']), 'Write outside the role registry')
-            require(all(row in after['roles'] for row in state['roles']) and len(after['roles']) == len(state['roles']) + 1,
-                    'Existing roles were changed')
-            added = [row for row in after['roles'] if row not in state['roles']]
-            require(len(added) == 1 and added[0]['role_name'] == 'owner' and added[0]['entra_object_id'] == target_id,
-                    'Scope exceeded one owner role for the target')
-            changed = [row for row in after['users'] if row not in state['users']]
-            require(len(after['users']) == len(state['users']) and len(changed) == 1
-                    and changed[0]['entra_object_id'] == target_id and changed[0]['role_name'] == 'owner',
-                    'Scope exceeded the target user row')
-            c.execute("INSERT INTO public.audit_events(tenant_id,occurred_at,actor_type,actor_id,event_type,subject_id,outcome,details_json) "
-                      "VALUES(%s,now(),'agent','claude-owner-authorized-owner-access','owner_role_granted',NULL,'succeeded',%s)",
-                      (TENANT, canonical({'target_identity_sha256': hashlib.sha256(target_id.encode()).hexdigest(),
-                                          'probe_sha256': CONFIG['probe_sha256'], 'entitlements_changed': False,
-                                          'existing_roles_preserved': True})))
-            c.commit()
-            state = after
-            granted = True
-        checks = []
-        if phase == 'verify':
-            require(all(canonical(state[k]) == canonical(prior['state'][k]) for k in ('access', 'subjects')),
-                    'Entitlements or subjects changed after probe')
-            roles = current_roles(state, now)
-            target = next(u for u in state['users'] if str(u['email']).lower() == TARGET_EMAIL)
-            owners = sorted(oid for oid, names in roles.items() if 'owner' in names)
-            require(owners == sorted(prior['owners'] + [prior['target_object_id']]), 'Owner set is not the prior owner plus the target')
-            require(target['status'] == 'active' and target['role_name'] == 'owner', 'Target user row is not an active owner')
-            checks = runtime_checks(state, target, now)
+        emit('PROBE', {'status': 'probe_blocked' if blockers else 'probe_passed', 'blockers': blockers,
+                       'privileges': privileges, 'diagnostics': diagnostics(state, now),
+                       'web_sha256': hashlib.sha256(web_source).hexdigest()})
+        if blockers or CONFIG['mode'] == 'probe':
+            c.rollback()
+            return
+        c.execute('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE')
+        c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (TENANT + ':owner-access-grant',))
+        require(canonical(capture()) == canonical(state), 'Authorization registry drift; refuse writes')
+        target_id = target['entra_object_id']
+        c.execute("INSERT INTO public.app_user_roles(tenant_id,entra_object_id,role_name,role_status,effective_from,"
+                  "granted_by_identity_sha256,reason) VALUES(%s,%s,'owner','active',now(),%s,%s)",
+                  (TENANT, target_id, hashlib.sha256(b'claude-owner-authorized-owner-access-grant').hexdigest(),
+                   'Owner asked that this user have the same website access as the owner'))
+        c.execute("UPDATE public.app_users SET role_name='owner',updated_at=%s WHERE tenant_id=%s AND entra_object_id=%s",
+                  (now.isoformat(), TENANT, target_id))
+        after = capture()
+        require(canonical(after['access']) == canonical(state['access'])
+                and canonical(after['subjects']) == canonical(state['subjects']), 'Write outside the role registry')
+        require(all(row in after['roles'] for row in state['roles']) and len(after['roles']) == len(state['roles']) + 1,
+                'Existing roles were changed')
+        added = [row for row in after['roles'] if row not in state['roles']]
+        require(len(added) == 1 and added[0]['role_name'] == 'owner' and added[0]['entra_object_id'] == target_id,
+                'Scope exceeded one owner role for the target')
+        changed = [row for row in after['users'] if row not in state['users']]
+        require(len(after['users']) == len(state['users']) and len(changed) == 1
+                and changed[0]['entra_object_id'] == target_id and changed[0]['role_name'] == 'owner',
+                'Scope exceeded the target user row')
+        c.execute("INSERT INTO public.audit_events(tenant_id,occurred_at,actor_type,actor_id,event_type,subject_id,outcome,details_json) "
+                  "VALUES(%s,now(),'agent','claude-owner-authorized-owner-access','owner_role_granted',NULL,'succeeded',%s)",
+                  (TENANT, canonical({'target_identity_sha256': hashlib.sha256(target_id.encode()).hexdigest(),
+                                      'entitlements_changed': False, 'existing_roles_preserved': True})))
+        c.commit()
+        emit('APPLY', {'status': 'apply_passed', 'owner_role_granted': True})
+        state = capture()
         c.rollback()
-    status = phase + ('_blocked' if blockers else '_passed')
-    result = {'status': status, 'phase': phase, 'state': state, 'blockers': blockers,
-              'target_object_id': target['entra_object_id'] if target else None, 'owners': owners,
-              'diagnostics': diagnostics(state, now), 'web_sha256': web_sha256, 'web_symbols': web_symbols,
-              'privileges': privileges, 'owner_role_granted': granted, 'configuration': CONFIG,
-              'runtime_checks': checks, 'entitlements_subjects_unchanged': True,
-              'real_browser_sign_in_tested': False,
-              'identity_claims_simulated_only_inside_non_ingress_job': phase == 'verify'}
-    content = canonical(result).encode()
-    blob = service.get_blob_client('internal-reports', CONFIG['output_blob'])
-    digest = hashlib.sha256(content).hexdigest()
-    blob.upload_blob(content, overwrite=False, metadata={'sha256': digest}, content_settings=ContentSettings(content_type='application/json'))
-    require(blob.download_blob().readall() == content, 'Protected private result readback differs')
-    print(json.dumps({'status': status, 'blockers': blockers, 'owner_role_granted': granted,
-                      'privileges': privileges, 'runtime_checks': len(checks)}), flush=True)
+    later = datetime.now(timezone.utc)
+    roles = current_roles(state, later)
+    new_owners = sorted(oid for oid, names in roles.items() if 'owner' in names)
+    require(new_owners == sorted(owners + [str(target['entra_object_id']).lower()]), 'Owner set is not the prior owner plus the target')
+    checks = runtime_checks(state, target, later)
+    emit('VERIFY', {'status': 'verify_passed', 'runtime_checks': checks, 'owner_count': len(new_owners),
+                    'real_browser_sign_in_tested': False})
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as error:
+        emit('FAIL', {'error_type': type(error).__name__, 'message': str(error)[:300]})
+        raise

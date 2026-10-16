@@ -1,170 +1,149 @@
-"""Bound one-time owner-role grant for one registered user; never changes job configuration.
+"""Dispatch the one-time owner-role grant job and read its result from the job's console logs.
 
-`run` performs probe -> apply -> verify in order, waiting for each execution and
-stopping at the first phase that does not pass.
+Storage is reachable only from the private network, so nothing here reads or
+writes blobs. Only Azure management calls and a Log Analytics query are used,
+and the job's persisted configuration is never changed.
 """
 import argparse
-import hashlib
+import base64
+import gzip
 import json
+import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 from azure.identity import AzureCliCredential
-from azure.storage.blob import BlobServiceClient
-import run_ms_website_input_probe as p
-from read_ms_website_input_probe import verify_env
 
-FOLDER = p.ROOT / '.work/owner-access-chloe-20261016-v1'
-PREFIX = 'review/owner-access/chloe-20261016-v1/'
-WEB_PATH = p.release.BASE + 'Microsoft.App/containerApps/ibkrv2stg-web'
-PHASES = ('probe', 'apply', 'verify')
-
-
-def live_website_image():
-    website = p.request('GET', WEB_PATH + p.release.API)
-    container = website['properties']['template']['containers'][0]
-    mode = [e for e in container['env'] if e['name'] == 'AUTHORIZATION_MODE']
-    if len(mode) != 1 or mode[0].get('value') != 'database' or mode[0].get('secretRef'):
-        raise ValueError('Website is not in database-only authorization')
-    return container['image']
+ROOT = Path(__file__).resolve().parents[1]
+FOLDER = ROOT / '.work/owner-access-chloe-20261016-v2'
+SUB = '3956e821-cee4-403f-8708-e84e2ed490eb'
+BASE = f'/subscriptions/{SUB}/resourceGroups/rg-ibkr-database-v11/providers/Microsoft.App/'
+JOB = 'ibkrv2stg-onboard-render'
+WEB = 'ibkrv2stg-web'
+API = '?api-version=2024-03-01'
+WORKSPACE = '5264a124-10cd-45f6-93a5-6d65c37e9bfb'
+TERMINAL = {'Succeeded', 'Failed', 'Stopped', 'Canceled', 'Cancelled'}
+CREDENTIAL = AzureCliCredential()
 
 
-def frozen(phase, job):
-    config = {'phase': phase, 'web_sha256': None, 'output_blob': PREFIX + phase + '.json',
-              'authorization': 'Owner asked that chloe.yoo@wealthryse.ai have the same website access as the owner',
-              'probe_blob': None, 'probe_sha256': None}
-    if phase != 'probe':
-        prior = p.release.read(FOLDER / 'probe', 'qualified')
-        p.verify_protected(prior)
-        if prior['status'] != 'probe_passed' or prior['proof_sha256'] != p.sha(FOLDER / 'probe/proof.json'):
-            raise ValueError('Passed probe required before any grant')
-        config.update(probe_blob=PREFIX + 'probe.json', probe_sha256=prior['proof_sha256'],
-                      web_sha256=p.release.read(FOLDER / 'probe', 'proof')['web_sha256'])
-    if phase == 'verify':
-        applied = p.release.read(FOLDER / 'apply', 'qualified')
-        p.verify_protected(applied)
-        if applied['status'] != 'apply_passed' or applied['owner_role_granted'] is not True:
-            raise ValueError('Inspect the grant transaction before verification')
-    image = live_website_image()
-    if phase != 'probe' and image != p.release.read(FOLDER / 'probe', 'intent')['execution_image']:
-        raise ValueError('Website image changed since the probe; start a new attempt')
-    source_path = p.ROOT / 'scripts/run_owner_access_grant.py'
-    source = "import sys\nsys.path[:0]=['/app/src','/app/scripts']\nCONFIG=" + repr(config) + '\n' + source_path.read_text(encoding='utf-8')
-    template = p.corrected_template(job, source)
-    template['containers'][0]['image'] = image
-    if phase == 'verify':
-        # The reporting worker defaults to legacy authorization; copy only the website's nonsecret setting.
-        env = template['containers'][0]['env']
-        if any(e['name'] == 'AUTHORIZATION_MODE' for e in env):
-            raise ValueError('Preserve reporting-worker authorization; unexpected explicit override')
-        env.append({'name': 'AUTHORIZATION_MODE', 'value': 'database'})
-    return config, template, image, source_path
+def arm(method, path, data=None):
+    token = CREDENTIAL.get_token('https://management.azure.com/.default').token
+    response = requests.request(method, 'https://management.azure.com' + path + API,
+                                headers={'Authorization': 'Bearer ' + token}, json=data, timeout=60)
+    if not response.ok:
+        # Never print response bodies; they can echo configuration.
+        raise RuntimeError(f'Azure {method} failed HTTP {response.status_code}')
+    return response.json() if response.content else {}
 
 
-def stage_once(stage_name, phase):
-    stage = FOLDER / phase
-    job = p.request('GET', p.release.path(p.JOB) + p.release.API)
-    p.release.scope(job, p.JOB)
-    config, template, image, source_path = frozen(phase, job)
-    if stage_name == 'prepare':
-        if stage.exists():
-            raise ValueError('Preserve prior phase evidence')
-        p.release.window()
-        p.release.idle(p.JOB)
-        stage.mkdir(parents=True)
-        record = {'phase': phase, 'template': template, 'job_settings_sha256': p.release.settings_invariant(job),
-                  'installed_job_image': job['properties']['template']['containers'][0]['image'],
-                  'execution_image': image, 'website_authorization_mode': 'database',
-                  'source_sha256': p.sha(source_path), 'controller_sha256': p.sha(Path(__file__)), 'config': config,
-                  'persistent_owner_role_requested': phase == 'apply', 'entitlements_unchanged': True}
-        p.release.build.save(stage, 'intent', {**record, 'protected_receipt': p.retain(record, 'owner-access-' + phase + '-intent-v1')})
-        print('PREPARED ' + phase, flush=True)
-        return None
-    intent = p.release.read(stage, 'intent')
-    p.verify_protected(intent)
-    if (intent['template'] != template or intent['config'] != config or intent['controller_sha256'] != p.sha(Path(__file__)) or
-            intent['source_sha256'] != p.sha(source_path) or intent['job_settings_sha256'] != p.release.settings_invariant(job)):
-        raise ValueError('Frozen workflow or persisted job changed')
-    if stage_name == 'dispatch':
-        if (stage / 'dispatch-intent.json').exists():
-            raise ValueError('Inspect rather than repeat one-time dispatch')
-        p.release.window()
-        p.release.idle(p.JOB)
-        p.no_matching_execution(p.JOB, [template['containers'][0]['args']])
-        p.release.build.save(stage, 'dispatch-intent', {'phase': phase, 'intent_sha256': p.sha(stage / 'intent.json')})
-        ack = p.request('POST', p.release.path(p.JOB) + '/start' + p.release.API, data=template)
-        if not ack.get('name'):
-            raise ValueError('Unknown dispatch outcome; do not repeat')
-        p.release.build.save(stage, 'dispatch', {'execution': ack['name']})
-        print(json.dumps({'execution': ack['name'], 'phase': phase}), flush=True)
-        return None
-    name = p.release.read(stage, 'dispatch')['execution']
-    run = p.request('GET', p.release.path(p.JOB) + '/executions/' + name + p.release.API)
-    status = run['properties']['status']
-    print(json.dumps({'execution': name, 'status': status}), flush=True)
-    if status != 'Succeeded':
-        return status
-    actual = run['properties']['template']['containers']
-    expected = template['containers']
-    if len(actual) != 1 or any(actual[0].get(k) != expected[0].get(k) for k in ('name', 'image', 'command', 'args')):
-        raise ValueError('Executed website image or source differs')
-    verify_env(expected[0]['env'], actual[0]['env'], job)
-    blob = BlobServiceClient('https://ibkrv2stgauhecwc4itaoo.blob.core.windows.net', credential=AzureCliCredential()).get_blob_client(
-        'internal-reports', config['output_blob'])
-    content = blob.download_blob().readall()
-    digest = hashlib.sha256(content).hexdigest()
-    proof = json.loads(content)
-    if proof['configuration'] != config or blob.get_blob_properties().metadata.get('sha256') != digest:
-        raise ValueError('Private phase result differs')
-    if not (stage / 'proof.json').exists():
-        with (stage / 'proof.json').open('xb') as stream:
-            stream.write(content)
-    elif (stage / 'proof.json').read_bytes() != content:
-        raise ValueError('Original proof changed')
-    record = {'status': proof['status'], 'phase': phase, 'execution': name, 'proof_sha256': digest,
-              'owner_role_granted': proof['owner_role_granted'], 'privileges': proof['privileges'],
-              'runtime_checks': len(proof['runtime_checks']), 'blockers': proof['blockers'],
-              'diagnostics': proof['diagnostics'], 'web_symbols_present': all(proof['web_symbols'].values()),
-              'settings_preserved': True, 'real_browser_sign_in_tested': False}
-    if not (stage / 'qualified.json').exists():
-        p.release.build.save(stage, 'qualified', {**record, 'protected_receipt': p.retain(record, 'owner-access-' + phase + '-result-v1')})
-    print(json.dumps(record), flush=True)
-    if proof['status'] != phase + '_passed':
-        raise ValueError(phase + ' did not pass; stop and report')
-    return status
+def console_lines(execution):
+    token = CREDENTIAL.get_token('https://api.loganalytics.io/.default').token
+    query = ('union isfuzzy=true ContainerAppConsoleLogs_CL, ContainerAppConsoleLogs '
+             '| extend group=coalesce(column_ifexists("ContainerGroupName_s",""), column_ifexists("ContainerGroupName","")), '
+             'line=coalesce(column_ifexists("Log_s",""), column_ifexists("Log","")) '
+             f'| where group startswith "{execution}" and line has "OWNER_GRANT" '
+             '| project TimeGenerated, line | order by TimeGenerated asc')
+    response = requests.post(f'https://api.loganalytics.io/v1/workspaces/{WORKSPACE}/query',
+                             headers={'Authorization': 'Bearer ' + token}, json={'query': query, 'timespan': 'PT6H'},
+                             timeout=60)
+    if not response.ok:
+        raise RuntimeError(f'Log Analytics query failed HTTP {response.status_code}')
+    rows = response.json()['tables'][0]['rows']
+    return [row[1] for row in rows]
 
 
-def run_all():
-    for phase in PHASES:
-        stage = FOLDER / phase
-        if (stage / 'qualified.json').exists():
-            stage_once('inspect', phase)
-            continue
-        if not stage.exists():
-            stage_once('prepare', phase)
-        if not (stage / 'dispatch-intent.json').exists():
-            stage_once('dispatch', phase)
-        for _ in range(60):
-            status = stage_once('inspect', phase)
-            if status == 'Succeeded':
-                break
-            if status in ('Failed', 'Stopped', 'Degraded'):
-                raise ValueError(phase + ' execution ended ' + status + '; stop and report')
-            time.sleep(20)
-        else:
-            raise ValueError(phase + ' execution still running after 20 minutes; re-run to keep inspecting')
-    print('OWNER ACCESS GRANT COMPLETE', flush=True)
+def require(ok, message):
+    if not ok:
+        raise ValueError(message)
+
+
+def template(job, image, mode):
+    source = ("import sys\nsys.path[:0]=['/app/src','/app/scripts']\nCONFIG=" + repr({'mode': mode}) + '\n'
+              + (ROOT / 'scripts/run_owner_access_grant.py').read_text(encoding='utf-8'))
+    encoded = base64.b64encode(gzip.compress(source.encode(), mtime=0)).decode()
+    value = {k: v for k, v in job['properties']['template'].items() if v is not None}
+    require(len(value['containers']) == 1, 'Single installed worker required')
+    container = value['containers'][0]
+    for env in container.get('env', []):
+        if env.get('secretRef') and env.get('value') == '':
+            env.pop('value')
+    require(any(e['name'] == 'DATABASE_URL' and e.get('secretRef') for e in container.get('env', [])),
+            'Job has no database credential reference')
+    container['env'] = [e for e in container.get('env', []) if e['name'] != 'AUTHORIZATION_MODE']
+    container['env'].append({'name': 'AUTHORIZATION_MODE', 'value': 'database'})
+    container.update(image=image, command=['python'], args=[
+        '-c', "import base64,gzip;exec(compile(gzip.decompress(base64.b64decode('" + encoded + "')),'owner-access-grant','exec'))"])
+    return value
+
+
+def log(message):
+    FOLDER.mkdir(parents=True, exist_ok=True)
+    line = datetime.now(timezone.utc).isoformat() + ' ' + message
+    with (FOLDER / 'commands.log').open('a', encoding='utf-8') as stream:
+        stream.write(line + '\n')
+    print(line, flush=True)
+
+
+def run(mode):
+    now = datetime.now(timezone.utc)
+    require(not 8 * 60 <= now.hour * 60 + now.minute < 9 * 60 + 30, 'Withheld around the 08:00-09:30 UTC daily cycle')
+    marker = FOLDER / (mode + '-dispatch.json')
+    if marker.exists():
+        execution = json.loads(marker.read_text(encoding='utf-8'))['execution']
+        log('Resuming inspection of ' + execution)
+    else:
+        job = arm('GET', BASE + 'jobs/' + JOB)
+        website = arm('GET', BASE + 'containerApps/' + WEB)
+        container = website['properties']['template']['containers'][0]
+        mode_env = [e for e in container['env'] if e['name'] == 'AUTHORIZATION_MODE']
+        require(len(mode_env) == 1 and mode_env[0].get('value') == 'database', 'Website is not in database-only authorization')
+        runs = arm('GET', BASE + 'jobs/' + JOB + '/executions').get('value', [])
+        require(all(r['properties']['status'] in TERMINAL for r in runs), 'Another execution of the job is running; try later')
+        body = template(job, container['image'], mode)
+        ack = arm('POST', BASE + 'jobs/' + JOB + '/start', data=body)
+        execution = ack.get('name')
+        require(bool(execution), 'Unknown dispatch outcome; do not repeat')
+        FOLDER.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({'execution': execution, 'image': container['image']}), encoding='utf-8')
+        log(f'{mode} started {execution} on {container["image"]}')
+    require(re.fullmatch(re.escape(JOB) + '-[a-z0-9]{7}', execution), 'Unexpected execution name')
+    for _ in range(60):
+        status = arm('GET', BASE + 'jobs/' + JOB + '/executions/' + execution)['properties']['status']
+        if status in TERMINAL:
+            break
+        time.sleep(20)
+    else:
+        raise ValueError('Execution still running after 20 minutes; run the same command again to keep inspecting')
+    log(f'{execution} status={status}')
+    lines = []
+    for _ in range(30):
+        # Console logs reach Log Analytics a few minutes after the execution ends.
+        lines = console_lines(execution)
+        final_kind = 'VERIFY' if mode == 'grant' else 'PROBE'
+        if any(('OWNER_GRANT ' + final_kind + ' ') in l or 'probe_blocked' in l or 'OWNER_GRANT FAIL ' in l for l in lines):
+            break
+        time.sleep(20)
+    for line in lines:
+        log('job log: ' + line)
+    (FOLDER / (mode + '-result.json')).write_text(json.dumps({'execution': execution, 'status': status, 'lines': lines}),
+                                                  encoding='utf-8')
+    require(status == 'Succeeded', 'Job execution ' + status + '; nothing beyond the logged steps happened')
+    require(not any('probe_blocked' in l for l in lines), 'Probe blocked the grant; nothing changed (see the log lines above)')
+    require(not any('OWNER_GRANT FAIL ' in l for l in lines), 'Job stopped with an error; see the log lines above')
+    done = 'VERIFY' if mode == 'grant' else 'PROBE'
+    final = [l for l in lines if ('OWNER_GRANT ' + done + ' ') in l]
+    require(bool(final), 'Result line not in the logs yet; run the same command again to re-read them')
+    result = json.loads(final[-1].split('OWNER_GRANT ' + done + ' ', 1)[1])
+    require(result['status'] == done.lower() + '_passed', done.lower() + ' did not pass; see the log lines above')
+    log('OWNER ACCESS GRANT COMPLETE' if mode == 'grant' else 'OWNER ACCESS PROBE PASSED (nothing changed)')
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('stage', choices=('prepare', 'dispatch', 'inspect', 'run'))
-    parser.add_argument('--phase', choices=PHASES, default='probe')
-    args = parser.parse_args()
-    if args.stage == 'run':
-        run_all()
-    else:
-        stage_once(args.stage, args.phase)
+    parser.add_argument('mode', choices=('probe', 'grant'), nargs='?', default='grant')
+    run(parser.parse_args().mode)
 
 
 if __name__ == '__main__':

@@ -1340,8 +1340,10 @@ class PortfolioWebTests(unittest.TestCase):
         )
         self.assertIn('class="page-view active" data-section="modelling"', modelling_page)
         self.assertIn('href="/accounts/U16088571/modelling"', modelling_page)
-        for card in ("model-projection", "model-whatif", "model-optimise", "model-factors"):
+        for card in ("model-projection", "model-risk", "model-regimes", "model-whatif", "model-optimise",
+                     "model-factors", "model-stress"):
             self.assertIn(f'id="{card}"', modelling_page)
+            self.assertIn(f'href="#{card}"', modelling_page)
         self.assertIn("if(activeSection==='modelling')renderModelling(asOf);", modelling_page)
 
     def test_account_subpages_reject_unknown_accounts_and_sections(self) -> None:

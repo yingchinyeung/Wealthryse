@@ -220,7 +220,8 @@ def main() -> int:
                 lockout = isinstance(error, FlexError) and (
                     error.lockout or is_lockout_error(error.code, str(error))
                 )
-                if claim.flex_source_id:
+                # A preflight block sent nothing; never weaken the circuit it found.
+                if claim.flex_source_id and isinstance(error, FlexError):
                     source = _work_source(connection, str(claim.flex_source_id))
                     connection.execute(
                         """

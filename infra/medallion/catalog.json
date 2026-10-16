@@ -1436,7 +1436,7 @@
     "conform"
    ],
    "schedule": "08:50 UTC",
-   "note": "Also reads reference_data.json from v1.1 analytics-reports."
+   "note": "Also reads reference_data.json from v1.1 analytics-reports. REFERENCE_DATA_SOURCE=database reads silver instrument_classifications and risk_free_rates instead."
   },
   "ibkrv2stg-flex-discovery": {
    "hops": [

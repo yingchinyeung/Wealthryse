@@ -11,6 +11,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from . import raw_capture
 from .benchmark_analytics import (
     BenchmarkContract,
     build_comparison,
@@ -182,7 +183,7 @@ def fetch_benchmark_yfinance(
         import yfinance as yf
 
         ticker_factory = yf.Ticker
-    frame = ticker_factory(spec.symbol).history(
+    request = dict(
         start=start_date.isoformat(),
         end=(end_date + timedelta(days=1)).isoformat(),
         interval="1d",
@@ -190,6 +191,16 @@ def fetch_benchmark_yfinance(
         repair=False,
         actions=False,
         timeout=30,
+    )
+    requested_at = raw_capture.utc_now()
+    frame = ticker_factory(spec.symbol).history(**request)
+    raw_capture.capture_frame(
+        "yahoo-fx-history" if spec.mapping_type == "fx" else "yahoo-benchmark-history",
+        PROVIDER,
+        frame=frame,
+        request={"symbol": spec.symbol, "method": "history", **request},
+        key=raw_capture.request_key(spec.symbol, request["start"], request["end"], request["interval"]),
+        requested_at=requested_at,
     )
     observations = [
         row for row in normalize_yfinance_history(frame)

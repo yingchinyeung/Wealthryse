@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Callable, Iterable, Mapping
 
+from . import raw_capture
 from .provisional_benchmark import (
     convert_levels_to_reporting_currency,
     fetch_fx_to_reporting_yfinance,
@@ -94,7 +95,7 @@ def fetch_adjusted_history(
         import yfinance as yf
 
         ticker_factory = yf.Ticker
-    frame = ticker_factory(symbol).history(
+    request = dict(
         start=start_date.isoformat(),
         end=(end_date + timedelta(days=1)).isoformat(),
         interval="1d",
@@ -102,6 +103,16 @@ def fetch_adjusted_history(
         repair=False,
         actions=False,
         timeout=30,
+    )
+    requested_at = raw_capture.utc_now()
+    frame = ticker_factory(symbol).history(**request)
+    raw_capture.capture_frame(
+        "yahoo-crisis-history",
+        PROVIDER,
+        frame=frame,
+        request={"symbol": symbol, "method": "history", **request},
+        key=raw_capture.request_key(symbol, request["start"], request["end"], request["interval"]),
+        requested_at=requested_at,
     )
     return _normalized_adjusted_history(
         frame,

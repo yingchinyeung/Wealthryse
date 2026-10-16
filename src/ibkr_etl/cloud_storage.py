@@ -23,7 +23,7 @@ def content_type_for_path(path: Path) -> str:
     )
 
 
-def _service(account_url: str):
+def _service(account_url: str, **client_options):
     if not account_url:
         return None
     try:
@@ -34,7 +34,14 @@ def _service(account_url: str):
             "Azure Blob mode requires azure-identity and azure-storage-blob."
         ) from error
     credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
-    return BlobServiceClient(account_url=account_url, credential=credential)
+    return BlobServiceClient(account_url=account_url, credential=credential, **client_options)
+
+
+def container_client(account_url: str, container: str, **client_options):
+    """One reusable container client. Best-effort writers pass short timeouts and
+    retry_total=0 so a storage problem cannot hold up their job."""
+    service = _service(account_url, **client_options)
+    return None if service is None else service.get_container_client(container)
 
 
 def upload_bytes(
@@ -51,6 +58,20 @@ def upload_bytes(
     if service is None:
         return None
     client = service.get_blob_client(container=container, blob=blob_name)
+    return upload_with_client(
+        client, content, overwrite=overwrite, content_type=content_type, metadata=metadata
+    )
+
+
+def upload_with_client(
+    client,
+    content: bytes,
+    *,
+    overwrite: bool = False,
+    content_type: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> str:
+    """Upload through an existing blob client (see container_client)."""
     upload_options = {"overwrite": overwrite}
     if metadata is not None:
         upload_options["metadata"] = metadata
@@ -105,6 +126,20 @@ def list_blobs(account_url: str, container: str, prefix: str) -> list[dict]:
         return []
     client = service.get_container_client(container)
     return [{"name": blob.name, "size": int(blob.size or 0)} for blob in client.list_blobs(name_starts_with=prefix)]
+
+
+def newest_blob_time(client, prefix: str, *, limit: int = 500):
+    """Latest last-modified time among the first `limit` blobs under prefix, or None.
+
+    `client` is a container client (see container_client). Read-only."""
+    newest = None
+    for index, blob in enumerate(client.list_blobs(name_starts_with=prefix, results_per_page=limit)):
+        if index >= limit:
+            break
+        modified = getattr(blob, "last_modified", None)
+        if modified is not None and (newest is None or modified > newest):
+            newest = modified
+    return newest
 
 
 def blob_exists(account_url: str, container: str, blob_name: str) -> bool:

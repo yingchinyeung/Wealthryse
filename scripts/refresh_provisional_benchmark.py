@@ -23,7 +23,7 @@ from ibkr_etl.crisis_replay import (  # noqa: E402
     refresh_composite_crisis_replay,
     refresh_crisis_replay,
 )
-from ibkr_etl import crisis_scenarios  # noqa: E402
+from ibkr_etl import crisis_scenarios, raw_capture  # noqa: E402
 from ibkr_etl.util import canonical_json, sha256_text  # noqa: E402
 
 
@@ -213,6 +213,7 @@ def main() -> int:
     run_id = start_run(
         connection, "staging-yfinance-benchmark", start.isoformat(), None
     )
+    raw_capture.set_job_run_id(run_id)
     try:
         accounts: list[dict] = []
         for account_id in account_ids:

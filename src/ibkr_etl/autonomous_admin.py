@@ -251,6 +251,43 @@ def evaluate_supervisor_state(
     return sorted(findings, key=lambda item: (item.severity != "critical", item.incident_key))
 
 
+LAYER_FRESHNESS_CHECK = "layer_freshness"
+
+
+def layer_freshness_findings(results: Sequence[Mapping[str, Any]]) -> list[Finding]:
+    """Late required layers (see layer_freshness.RULES) as warnings. Report only: no
+    autonomous action, so the repair policy never acts on them."""
+    findings: list[Finding] = []
+    for result in results:
+        if not result.get("late"):
+            continue
+        source = result.get("feed") or result.get("target")
+        findings.append(
+            Finding(
+                incident_key=f"{LAYER_FRESHNESS_CHECK}:{result['check_id']}",
+                check_id=LAYER_FRESHNESS_CHECK,
+                severity="warning",
+                description=(
+                    f"{str(result.get('layer', '')).capitalize()} layer is late: {source} is "
+                    f"{result.get('state')} (newest {result.get('observed') or 'none'}, "
+                    f"expected from {result.get('earliest_expected') or result.get('due')})"
+                ),
+                evidence=dict(result),
+            )
+        )
+    if results and all(result.get("state") == "unavailable" for result in results):
+        findings.append(
+            Finding(
+                incident_key=f"{LAYER_FRESHNESS_CHECK}:unavailable",
+                check_id=LAYER_FRESHNESS_CHECK,
+                severity="warning",
+                description="The layer freshness check could not read any layer",
+                evidence={"checked": len(results)},
+            )
+        )
+    return findings
+
+
 def plan_safe_repairs(
     findings: Sequence[Finding],
     control: AutonomyControl,

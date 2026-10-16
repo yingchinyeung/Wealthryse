@@ -7,6 +7,7 @@ import urllib.request
 from collections import defaultdict
 from typing import Any, Callable, Mapping
 
+from . import raw_capture
 from .util import canonical_json, sha256_text, utc_now_iso
 
 
@@ -159,21 +160,33 @@ def _fetch_yahoo_search(symbol: str, timeout: int) -> Mapping[str, Any]:
             "enableFuzzyQuery": "false",
         }
     )
+    url = f"{YAHOO_SEARCH_URL}?{query}"
     request = urllib.request.Request(
-        f"{YAHOO_SEARCH_URL}?{query}",
+        url,
         headers={
             "Accept": "application/json",
             "User-Agent": "IBKR-Portfolio-Platform-Staging/2.0",
         },
     )
+    requested_at = raw_capture.utc_now()
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+        body = response.read()
+        status = getattr(response, "status", None)
+    raw_capture.capture_http("yahoo-sector-search", YAHOO_PROVIDER, url=url, body=body,
+                             key=symbol, status=status, extension="json",
+                             requested_at=requested_at)
+    return json.loads(body.decode("utf-8"))
 
 
 def _fetch_yfinance_profile(symbol: str) -> Mapping[str, Any]:
     import yfinance as yf
 
-    return yf.Ticker(symbol).get_info()
+    requested_at = raw_capture.utc_now()
+    profile = yf.Ticker(symbol).get_info()
+    raw_capture.capture_document("yahoo-sector-profile", "Yahoo Finance via yfinance",
+                                 payload=profile, request={"symbol": symbol, "method": "get_info"},
+                                 key=raw_capture.request_key(symbol, "info"), requested_at=requested_at)
+    return profile
 
 
 def lookup_classification(

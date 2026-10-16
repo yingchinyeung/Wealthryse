@@ -163,6 +163,18 @@ def case_question_stream() -> Callable[[dict[str, Any]], Iterable[bytes]] | None
     return lambda payload: api.stream("/v1/case-question", payload)
 
 
+@functools.lru_cache(maxsize=1)
+def design_api() -> _AgentApi | None:
+    """The agent service client for the factsheet designer's agents; None while the service is not configured.
+
+    The designer is switched by FACTSHEET_DESIGN_AGENTS_ENABLED, not AGENT_UI_MODE (see factsheet_design_web).
+    """
+    settings = _Settings()
+    if not settings.url or not settings.audience:
+        return None
+    return _AgentApi(settings)
+
+
 def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
             allowed_accounts: Callable[[dict[str, Any]], list[str]], theme_css: str = "",
             render_page: Callable[..., str] | None = None,

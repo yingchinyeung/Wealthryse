@@ -30,6 +30,8 @@ from .config import DatabaseSettings, ModelSettings, RuntimeSettings, ServiceAut
 from .database import connect
 from .exports import MAX_FACTS_BYTES as MAX_EXPORT_FACTS_BYTES
 from .exports import check_note, plan_export
+from .factsheet_design import MAX_FACTS_BYTES as MAX_DESIGN_FACTS_BYTES
+from .factsheet_design import build_step, check_design, edit_design
 from .month_team.store import MonthStore
 from .prompts import (ANALYST, CASE_ANALYST, GUIDE_ACCOUNT_STEPS, GUIDE_ANALYST, GUIDE_NO_ACCOUNT_STEPS,
                       METRIC_EXPLAINER)
@@ -163,6 +165,14 @@ class ExportPlanRequest(BaseModel):
     account_id: str = Field(min_length=1, max_length=64)
     request: str = Field(min_length=1, max_length=1000)
     # Computed by the website: the account's datasets, columns, cash activity types, currencies and dates.
+    facts: dict[str, Any]
+
+
+class FactsheetDesignRequest(BaseModel):
+    user_object_id: str = Field(pattern=USER_ID)
+    # The account or portfolio the design is for; the website has already checked the person owns it.
+    subject_id: str = Field(min_length=1, max_length=64)
+    # Built by the website: the spec, the reader's fields, the comparison, the checks or the request.
     facts: dict[str, Any]
 
 
@@ -692,6 +702,38 @@ def create_app(services: Services) -> FastAPI:
         if not services.store().archive_export_pack(pack_id, user_object_id):
             raise HTTPException(status_code=404, detail="Export pack not found.")
         return {"deleted": True}
+
+    # Factsheet design agents ------------------------------------------------------------------
+
+    def _design_call(job: str, body: FactsheetDesignRequest, fn: Callable[..., Any]) -> dict[str, Any]:
+        """One builder, checker or editor answer; the website applies and checks whatever comes back."""
+        correlation_id = str(uuid.uuid4())
+        if len(json.dumps(body.facts, default=str)) > MAX_DESIGN_FACTS_BYTES:
+            raise HTTPException(status_code=413, detail="This design has too much to describe at once.")
+        store = services.store()
+        if store.tokens_used_today() >= services.runtime.daily_token_budget:
+            raise HTTPException(status_code=429, detail="Today's analysis budget is used up. Try again tomorrow.")
+        try:
+            answer, turn = fn(services.agent(), body.facts)
+        except AgentError as error:
+            _record_usage(store, job, correlation_id, {}, False, error.code)
+            raise HTTPException(status_code=422, detail=error.message) from error
+        _record_usage(store, job, correlation_id, turn.usage, True)
+        LOGGER.info("factsheet design agent answered", extra={"correlation_id": correlation_id, "job": job,
+                                                               "subject_id": body.subject_id})
+        return {"answer": answer, "correlation_id": correlation_id}
+
+    @app.post("/v1/factsheet-designs/build-step")
+    def factsheet_build_step(body: FactsheetDesignRequest, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        return _design_call("factsheet_builder", body, build_step)
+
+    @app.post("/v1/factsheet-designs/check")
+    def factsheet_check(body: FactsheetDesignRequest, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        return _design_call("factsheet_checker", body, check_design)
+
+    @app.post("/v1/factsheet-designs/edit")
+    def factsheet_edit(body: FactsheetDesignRequest, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        return _design_call("factsheet_editor", body, edit_design)
 
     @app.get("/v1/month-end/runs")
     def month_runs(user_object_id: str, period_end: str | None = Query(default=None, pattern=PERIOD),

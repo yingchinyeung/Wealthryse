@@ -3,12 +3,22 @@ from html import escape
 from urllib.parse import quote
 
 
+def designer_link(subject_id):
+    """A link to the factsheet designer while FACTSHEET_DESIGN_AGENTS_ENABLED is on; nothing otherwise."""
+    from .factsheet_design_web import enabled
+    if not enabled():
+        return ''
+    href=escape('/accounts/'+quote(subject_id,safe='')+'/factsheet-designer',quote=True)
+    return (f'<p><a class="button" href="{href}">Design a new factsheet from a template</a> '
+            '<span class="muted">Upload the template; the design agents draft it and you review it.</span></p>')
+
+
 def controls(subject_id):
     endpoint=escape('/api/accounts/'+quote(subject_id,safe='')+'/reporting/design-updates',quote=True)
     return f'''<section id="report-design-controls" data-endpoint="{endpoint}" style="margin-top:28px;border-top:1px solid #dce2eb;padding-top:20px">
 <h3>Report design updates</h3>
 <p class="muted">Request changes after onboarding. A qualified renderer/template can regenerate all historical months and apply to future reports. Replacements become current downloads only after you review and approve them. Prior files remain archived for audit and rollback. Original IBKR data stays unchanged.</p>
-<form id="report-design-request-form"><label for="report-design-description">Describe your layout or wording changes</label>
+{designer_link(subject_id)}<form id="report-design-request-form"><label for="report-design-description">Describe your layout or wording changes</label>
 <textarea id="report-design-description" minlength="10" maxlength="4000" rows="4" required style="display:block;width:100%;margin:10px 0" placeholder="For example: change the chart legend font and update the disclaimer spacing."></textarea>
 <button class="button" type="submit">Request design changes</button></form>
 <div id="report-design-message" class="muted" role="status" aria-live="polite" style="margin-top:12px"></div>

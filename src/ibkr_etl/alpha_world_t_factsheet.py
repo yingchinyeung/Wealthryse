@@ -152,8 +152,18 @@ def _page_one(c, snapshot, inputs, header_values=None):
         c.drawString(80.,62.,'Limited history: indicative bootstrap only, not a forecast; parameter uncertainty is not shown.')
 
 
-def _allocation(c):
+ALLOCATION_LABELS = {
+    'parents': ('70%','30%'),
+    'headings': ('130% LONG','70% SHORT','150% LONG','150% SHORT'),
+    'captions': (('Greater China','Portfolio'),('Hang Seng Index',),
+                 ('US Technology &','Biotechnology'),('S&P500',)),
+    'branches': ('91%','-49%','45%','-45%'),
+}
+
+
+def _allocation(c, labels=None):
     from .monthly_artifacts import ALPHA_WORLD_MS_ALLOCATION_LAYOUT as layout
+    labels = labels or ALLOCATION_LABELS
     centers = [x+layout['child_width']/2 for x in layout['child_x']]
     parents = [(centers[i]+centers[i+1])/2 for i in (0,2)]
     c.setStrokeColor(black); c.setLineWidth(.6)
@@ -163,15 +173,13 @@ def _allocation(c):
     for parent in parents: c.rect(parent-70.,710.,140.,41.,fill=1,stroke=0)
     for x in layout['child_x']: c.rect(x,612.,91.,55.,fill=1,stroke=0)
     c.setFillColor(white); c.setFont('Helvetica-Bold',12.)
-    for center,label in zip(parents,('70%','30%')): c.drawCentredString(center,726.2,label)
-    captions = (('Greater China','Portfolio'),('Hang Seng Index',),
-                ('US Technology &','Biotechnology'),('S&P500',))
-    for center,heading,lines in zip(centers,('130% LONG','70% SHORT','150% LONG','150% SHORT'),captions):
+    for center,label in zip(parents,labels['parents']): c.drawCentredString(center,726.2,label)
+    for center,heading,lines in zip(centers,labels['headings'],labels['captions']):
         c.setFont('Helvetica-Bold',10.8); c.drawCentredString(center,649.,heading)
         c.setFont('Helvetica',9.4)
         for i,text in enumerate(lines): c.drawCentredString(center,627.5+((len(lines)-1)/2-i)*11.,text)
     c.setFillColor(black); c.setFont('Helvetica-Bold',10.8)
-    for i,(child,label) in enumerate(zip(centers,('91%','-49%','45%','-45%'))):
+    for i,(child,label) in enumerate(zip(centers,labels['branches'])):
         offset = -35. if i%2==0 else 35.
         c.drawCentredString((parents[i//2]+child)/2+offset,687.,label)
 

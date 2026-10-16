@@ -82,6 +82,7 @@ def main() -> int:
     params.update(user=ROLE, password=password)
     with psycopg.connect(conninfo.make_conninfo(**params)) as reader:
         tenants = reader.execute("SELECT count(*) FROM tenants").fetchone()[0]
+        reader.rollback()  # READ WRITE must be the first statement of a transaction.
         try:
             reader.execute("SET TRANSACTION READ WRITE")
             reader.execute("UPDATE tenants SET tenant_id = tenant_id WHERE false")

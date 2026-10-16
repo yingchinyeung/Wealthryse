@@ -19,7 +19,7 @@ LIVE_CSS = r"""
 .live-source { display: inline-block; padding: 1px 7px; border-radius: 8px; font-size: 11px; font-weight: 650; color: var(--muted-strong); background: rgba(15, 23, 42, .06); }
 .live-source.delayed, .live-flag { color: #8a5a00; background: rgba(194, 137, 0, .12); }
 .live-flag { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 8px; font-size: 11px; font-weight: 650; }
-@media screen and (prefers-color-scheme: dark) {
+@media screen {
   .live-source { background: rgba(255, 255, 255, .08); }
   .live-source.delayed, .live-flag { color: #fcd34d; background: rgba(252, 211, 77, .12); }
 }

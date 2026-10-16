@@ -10878,9 +10878,12 @@ def _render_account_page(
         ),
         "modelling": (
             ("model-projection", "Wealth projection"),
+            ("model-risk", "Risk outlook"),
+            ("model-regimes", "Market regimes"),
             ("model-whatif", "What-if"),
             ("model-optimise", "Optimisation"),
             ("model-factors", "Factor model"),
+            ("model-stress", "Stress test"),
         ),
     }.get(section, ())
     section_jumps = (

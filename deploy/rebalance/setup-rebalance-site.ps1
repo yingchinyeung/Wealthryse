@@ -31,6 +31,17 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 # Windows PowerShell treats az warnings on stderr as errors under 'Stop',
 # so az runs under 'Continue' and its exit code decides.
 $azExe = (Get-Command az -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+# Error messages must never show passwords, client secrets or connection strings.
+function HideSecrets($list) {
+    $shown = @(); $hide = $false
+    foreach ($a in $list) {
+        $s = "$a"
+        if ($s -like '--*') { $hide = $s -in @('--client-secret', '--password', '--secrets', '--password1'); $shown += $s; continue }
+        if ($hide -or $s -match '://[^/\s]*@' ) { $shown += '***'; continue }
+        $shown += $s
+    }
+    return ($shown -join ' ')
+}
 function AzRun {
     $ErrorActionPreference = 'Continue'
     $global:LASTEXITCODE = 0
@@ -39,7 +50,7 @@ function AzRun {
     $text = ($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n"
     if ($code -ne 0) {
         $all = ($out | ForEach-Object { "$_" }) -join "`n"
-        throw "az $($args -join ' ') failed (exit $code, az at $azExe): $all"
+        throw "az $(HideSecrets $args) failed (exit $code, az at $azExe): $all"
     }
     return $text
 }
@@ -190,9 +201,9 @@ foreach ($user in @($aidenId, $meId)) {
         Remove-Item $bodyFile -Force
     }
 }
-$clientSecret = AzRun ad app credential reset --id $entraAppId --display-name rebalance-container-app --years 1 --append --query password -o tsv
+$clientSecret = AzRun ad app credential reset --id $entraAppId --display-name rebalance-container-app --years 1 --query password -o tsv
 AzRun containerapp auth microsoft update -n $AppName -g $ResourceGroup --client-id $entraAppId --client-secret $clientSecret `
-    --tenant-id $tenantId --issuer "https://login.microsoftonline.com/$tenantId/v2.0" --yes | Out-Null
+    --issuer "https://login.microsoftonline.com/$tenantId/v2.0" --yes | Out-Null
 AzRun containerapp auth update -n $AppName -g $ResourceGroup --enabled true --unauthenticated-client-action RedirectToLoginPage --redirect-provider azureactivedirectory | Out-Null
 
 # --- 5. Aiden's Azure rights: his app only ---------------------------------

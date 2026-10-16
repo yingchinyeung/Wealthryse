@@ -142,7 +142,7 @@ class AlreadyLiveFilesTest(unittest.TestCase):
 
 
 class PrepareTest(unittest.TestCase):
-    def run_prepare(self, changed, env=(), applied=None, migrations=None):
+    def run_prepare(self, changed, env=(), applied=None, migrations=None, pyproject=None):
         app = {"properties": {"template": {"containers": [{"image": "reg/ibkr-platform:web-" + DEPLOYED, "env": list(env)}]},
                               "configuration": {"ingress": {"fqdn": "site.example"}}}}
 
@@ -151,6 +151,8 @@ class PrepareTest(unittest.TestCase):
                 return HEAD + "\n"
             if args[0] == "diff":
                 return "\n".join(changed)
+            if args[0] == "show" and args[1].endswith(":pyproject.toml"):
+                return pyproject[args[1].split(":")[0]]
             if args[0] == "show" and args[1].startswith(HEAD + ":migrations/postgres/"):
                 return (migrations or {})[args[1].rsplit("/", 1)[1]]
             raise AssertionError(args)
@@ -177,6 +179,20 @@ class PrepareTest(unittest.TestCase):
     def test_the_license_file_does_not_stop_the_release(self):
         state = self.run_prepare(["LICENSE", "src/ibkr_etl/web.py"])
         self.assertEqual(state["changed_files"], ["src/ibkr_etl/web.py"])
+
+    PYPROJECT = ('[project]\nname = "ibkr-etl"\ndependencies = ["psycopg>=3"]\n\n'
+                 '[tool.setuptools.package-data]\nibkr_etl = ["assets/a.pdf"]\n')
+
+    def test_a_pyproject_change_to_package_data_only_does_not_stop_the_release(self):
+        head = self.PYPROJECT.replace('["assets/a.pdf"]', '["assets/a.pdf", "metrics_guide_sources.json"]')
+        state = self.run_prepare(["pyproject.toml", "src/ibkr_etl/web.py"],
+                                 pyproject={DEPLOYED: self.PYPROJECT, HEAD: head})
+        self.assertEqual(state["changed_files"], ["src/ibkr_etl/web.py"])
+
+    def test_a_pyproject_dependency_change_still_stops_the_release(self):
+        head = self.PYPROJECT.replace('"psycopg>=3"', '"psycopg>=3", "httpx"')
+        with self.assertRaises(SystemExit):
+            self.run_prepare(["pyproject.toml", "src/ibkr_etl/web.py"], pyproject={DEPLOYED: self.PYPROJECT, HEAD: head})
 
     def test_other_image_files_still_stop_the_release(self):
         with self.assertRaises(SystemExit):

@@ -11,7 +11,7 @@ Steps, each a subcommand so the workflow can show and stop at each one:
                    the assurance job itself is not changed
 State passes between steps in release-state.json.
 """
-import ast, base64, difflib, gzip, hashlib, json, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import ast, base64, difflib, gzip, hashlib, json, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
 from pathlib import Path
 
 RG = 'rg-ibkr-database-v11'
@@ -140,6 +140,23 @@ def unapplied_migrations(switches, commit):
             != hashlib.sha256(git('show', f'{commit}:migrations/postgres/{m}', binary=True)).hexdigest()]
 
 
+def pyproject_change_is_package_data_only(deployed, head):
+    """True when pyproject.toml differs only in [tool.setuptools.package-data].
+
+    That table lists the non-Python files installed with each package. This path ships only the
+    .py files of src/ibkr_etl and keeps everything else the live image has, so such a change
+    (for example a data file the agent image needs) has nothing to release here. A change to
+    dependencies or any other setting still stops the release.
+    """
+
+    def settings(commit):
+        data = tomllib.loads(git('show', f'{commit}:pyproject.toml'))
+        data.get('tool', {}).get('setuptools', {}).pop('package-data', None)
+        return data
+
+    return settings(deployed) == settings(head)
+
+
 def prepare():
     head = git('rev-parse', 'HEAD').strip()
     app = az('containerapp', 'show', '-n', APP, '-g', RG)
@@ -173,8 +190,12 @@ def prepare():
     if migrations:
         print('Not part of the website release (database migrations; apply them with the bootstrap job '
               'before switching the website if the new code needs them):\n  ' + '\n  '.join(migrations))
+    packaging = [p for p in changed if p == 'pyproject.toml' and pyproject_change_is_package_data_only(deployed, head)]
+    if packaging:
+        print('Not part of the website release (pyproject.toml lists other package data only; this path '
+              'ships the .py files of src/ibkr_etl)')
     image_changes = [p for p in changed if not p.startswith(IGNORED_PREFIXES) and not p.endswith('.md')
-                     and p not in skipped and p not in migrations]
+                     and p not in skipped and p not in migrations and p not in packaging]
     unsupported = [p for p in image_changes if not p.startswith(PACKAGE + '/')]
     if unsupported:
         raise SystemExit('This release path only ships src/ibkr_etl. Other image files changed:\n  ' + '\n  '.join(unsupported))

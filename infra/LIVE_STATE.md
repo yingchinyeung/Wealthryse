@@ -64,3 +64,11 @@ These files describe one-off upgrade jobs that no longer exist in Azure:
 - **Stale job manifest:** the job manifest inside ibkrv2stg-institutional-shadow
   lists the month-end factsheet schedule as `0 9 1-7 * *`, but the live job
   runs `0 9 * * *`.
+
+## Rebalancing website (Aiden)
+
+`ibkrv2stg-rebalance` is set up by `deploy/rebalance/setup-rebalance-site.ps1`,
+not Bicep, because Aiden owns the app's code and deploys it himself. It uses
+the read-only Postgres login `ibkr_rebalance_reader`, registry tokens scoped to
+the `rebalance` image, and Entra sign-in limited to assigned users. Aiden's
+Azure rights cover that app only (plus "join" on ibkrv2stg-env).

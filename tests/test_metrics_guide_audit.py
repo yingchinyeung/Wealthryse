@@ -102,6 +102,14 @@ class CommandAndWorkflowTest(unittest.TestCase):
                                     cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
+    def test_fingerprints_leave_out_empty_fields_so_python_versions_agree(self):
+        import ast
+
+        text = audit._canonical(ast.parse("def f(x):\n    return x + 1\n").body[0])
+        self.assertNotIn("None", text)
+        self.assertNotIn("[]", text)
+        self.assertNotIn("type_params", text)
+
     def test_ci_warns_and_the_manifest_ships_with_the_package(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("python scripts/check_metrics_guide.py --warn", ci)

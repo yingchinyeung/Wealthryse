@@ -199,6 +199,25 @@ def function_source(root: Path, source: str) -> str:
     raise LookupError(f"{source} not found")
 
 
+def _canonical(node: object) -> str:
+    """``ast.dump`` without empty fields, so the hash is the same on every Python version.
+
+    Python 3.13 stopped printing ``None`` and ``[]`` fields that 3.12 prints, and new versions add
+    fields with empty defaults (``type_params``); leaving all empty fields out keeps both stable.
+    """
+
+    if isinstance(node, ast.AST):
+        fields = []
+        for name, value in ast.iter_fields(node):
+            if value is None or value == []:
+                continue
+            fields.append(f"{name}={_canonical(value)}")
+        return f"{type(node).__name__}({', '.join(fields)})"
+    if isinstance(node, list):
+        return "[" + ", ".join(_canonical(item) for item in node) + "]"
+    return repr(node)
+
+
 def fingerprint(root: Path, source: str) -> str:
     """Hash of a function's syntax tree plus the module constants it reads."""
 
@@ -218,8 +237,8 @@ def fingerprint(root: Path, source: str) -> str:
         raise LookupError(f"{source} not found")
     _strip_docstrings(target)
     used = sorted({n.id for n in ast.walk(target) if isinstance(n, ast.Name) and n.id in constants})
-    parts = [ast.dump(target, include_attributes=False)]
-    parts += [f"{name}={ast.dump(constants[name], include_attributes=False)}" for name in used]
+    parts = [_canonical(target)]
+    parts += [f"{name}={_canonical(constants[name])}" for name in used]
     return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
 
 

@@ -28,14 +28,22 @@ $ErrorActionPreference = 'Stop'
 $work = Join-Path $env:TEMP 'wr-rebalance-setup'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 
-# Windows PowerShell treats az warnings on stderr as errors under 'Stop'.
+# Windows PowerShell treats az warnings on stderr as errors under 'Stop',
+# so az runs under 'Continue' and its exit code decides.
+$azExe = (Get-Command az -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 function AzRun {
     $ErrorActionPreference = 'Continue'
-    $out = & az @args 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "az $($args -join ' ') failed: $out" }
-    return ($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"
+    $global:LASTEXITCODE = 0
+    $out = @(& $azExe @args 2>&1)
+    $code = $LASTEXITCODE
+    $text = ($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n"
+    if ($code -ne 0) {
+        $all = ($out | ForEach-Object { "$_" }) -join "`n"
+        throw "az $($args -join ' ') failed (exit $code, az at $azExe): $all"
+    }
+    return $text
 }
-function AzOk { $ErrorActionPreference = 'Continue'; & az @args 2>$null | Out-Null; return ($LASTEXITCODE -eq 0) }
+function AzOk { $ErrorActionPreference = 'Continue'; & $azExe @args 2>$null | Out-Null; return ($LASTEXITCODE -eq 0) }
 function Step($text) { Write-Host "== $text" }
 function NewPassword($length) {
     $chars = [char[]]'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
@@ -44,7 +52,10 @@ function NewPassword($length) {
     return -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
 }
 
-AzRun account set --subscription $Subscription | Out-Null
+Write-Host "PowerShell $($PSVersionTable.PSVersion), az at $azExe"
+if ((AzRun account show --query id -o tsv) -ne $Subscription) {
+    AzRun account set --subscription $Subscription | Out-Null
+}
 $tenantId = AzRun account show --query tenantId -o tsv
 $rgId = AzRun group show -n $ResourceGroup --query id -o tsv
 

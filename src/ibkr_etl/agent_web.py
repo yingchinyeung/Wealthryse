@@ -30,6 +30,8 @@ from . import month_team_web
 # The chat panel opens on every account tab; the script also runs on every other page so the
 # navigation's "Agent inbox" link can show how many items are new.
 WIDGET_PATHS = re.compile(r"^/accounts/[^/]+/[^/]+$")
+# "Ask the guide" and "Work it through with my numbers" on the Metrics guide.
+GUIDE_PATHS = re.compile(r"^/metrics-guide/?$")
 MODES = {"off", "owner", "all"}
 
 
@@ -47,6 +49,20 @@ class ChatBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     account_id: str = Field(min_length=1, max_length=64)
     message: str = Field(min_length=1, max_length=2000)
+    conversation_id: str | None = Field(default=None, max_length=36)
+
+
+class ExplainMetricBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    account_id: str = Field(min_length=1, max_length=64)
+    metric: str = Field(min_length=1, max_length=120)
+    conversation_id: str | None = Field(default=None, max_length=36)
+
+
+class GuideQuestionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    question: str = Field(min_length=1, max_length=2000)
+    account_id: str | None = Field(default=None, min_length=1, max_length=64)
     conversation_id: str | None = Field(default=None, max_length=36)
 
 
@@ -187,6 +203,40 @@ def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
         return StreamingResponse(stream, media_type="text/event-stream",
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
+    def stream(path: str, payload: dict[str, Any]) -> StreamingResponse:
+        return StreamingResponse(api.stream(path, payload), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+    @app.post("/api/agents/explain-metric")
+    def agent_explain_metric(body: ExplainMetricBody, user: dict[str, Any] = Depends(agent_user)) -> StreamingResponse:
+        from .metrics_guide import METRIC_ANCHORS
+
+        if body.account_id not in allowed_accounts(user):
+            raise HTTPException(status_code=403, detail="You do not have access to that account.")
+        if body.metric not in METRIC_ANCHORS:
+            raise HTTPException(status_code=404, detail="The Metrics guide has no definition called that.")
+        return stream("/v1/explain-metric", {"user_object_id": oid(user), **body.model_dump()})
+
+    @app.post("/api/agents/guide-question")
+    def agent_guide_question(body: GuideQuestionBody, user: dict[str, Any] = Depends(agent_user)) -> StreamingResponse:
+        if body.account_id and body.account_id not in allowed_accounts(user):
+            raise HTTPException(status_code=403, detail="You do not have access to that account.")
+        return stream("/v1/guide-question", {"user_object_id": oid(user), **body.model_dump()})
+
+    @app.get("/api/agents/guide-accounts")
+    def agent_guide_accounts(user: dict[str, Any] = Depends(agent_user)) -> dict[str, Any]:
+        names: dict[str, str] = {}
+        if account_names is not None:
+            try:
+                names = {str(k): str(v) for k, v in account_names(user).items()}
+            except Exception:  # names are a nicety; the picker still works with account IDs
+                names = {}
+        return {"accounts": [{"id": a, "name": names.get(a, a)} for a in allowed_accounts(user)]}
+
+    @app.get("/agents/guide.js")
+    def agent_guide_script() -> Response:
+        return Response(GUIDE_JS, media_type="application/javascript", headers={"Cache-Control": "no-store"})
+
     @app.get("/api/agents/memory")
     def agent_memory(user: dict[str, Any] = Depends(agent_user)) -> Any:
         return api.request("GET", "/v1/memory", params={"user_object_id": oid(user)})
@@ -267,6 +317,8 @@ def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
 
         export_agent_web.install(app, agent_user, allowed_accounts, api, export_source)
         scripts.append((export_agent_web.PANEL_PATHS, b'<script src="/agents/exports.js" defer></script>'))
+    if settings.mode != "off":
+        scripts.append((GUIDE_PATHS, b'<script src="/agents/guide.js" defer></script>'))
     if month_team_web.enabled():
         scripts.append((month_team_web.PANEL_PATHS, b'<script src="/agents/month-team.js" defer></script>'))
     if not widget and not scripts:
@@ -293,7 +345,7 @@ WIDGET_JS = r"""(()=>{
 const m=location.pathname.match(/^\/accounts\/([^/]+)\/([^/]+)$/);
 const account=m?decodeURIComponent(m[1]):null,section=m?m[2]:'';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const md=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\[(T\d+)\]/g,'<sup class="wr-cite">$1</sup>')
+const md=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\[([^\]\n]{1,120})\]\((\/metrics-guide#metric-[a-z0-9-]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>').replace(/\[(T\d+)\]/g,'<sup class="wr-cite">$1</sup>')
  .split(/\n{2,}/).map(p=>/^\s*[-•] /m.test(p)?'<ul>'+p.split('\n').filter(l=>l.trim()).map(l=>'<li>'+l.replace(/^\s*[-•] /,'')+'</li>').join('')+'</ul>':'<p>'+p.replace(/\n/g,'<br>')+'</p>').join('');
 const PALETTE=['var(--accent,#1f6feb)','#e8833a','#2e9e6b','#9b59b6','#d64550','#1aa3b8','#b8860b','#6c757d'];
 const fmt=(v,u,c)=>{if(v===null||v===undefined||!isFinite(v))return '–';if(u==='percent')return (v*100).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+'%';
@@ -325,6 +377,7 @@ function vPie(v){const s=v.series[0],vals=s.values.map(x=>x!==null&&x>0?x:0),tot
    :`<path d="M${p(a,r)} A${r} ${r} 0 ${big} 1 ${p(b,r)} L${p(b,r2)} A${r2} ${r2} 0 ${big} 0 ${p(a,r2)} Z" fill="${PALETTE[i%8]}"><title>${esc(v.labels[i])}: ${fmt(s.values[i],s.unit,v.currency)}</title></path>`;a=b});
  return `<div class="wr-pie"><svg viewBox="0 0 160 160" class="wr-chart" role="img" aria-label="${esc(v.title)}">${g}</svg><div class="wr-legend wr-col">`+
   v.labels.map((l,i)=>`<span><i style="background:${PALETTE[i%8]}"></i>${esc(l)}: ${fmt(s.values[i],s.unit,v.currency)}</span>`).join('')+'</div></div>'}
+const guideLinks=l=>l&&l.length?'<div class="wr-sources">In the Metrics guide: '+l.filter(x=>/^\/metrics-guide#metric-[a-z0-9-]+$/.test(x.link)).map(x=>`<a href="${esc(x.link)}" target="_blank" rel="noopener">${esc(x.name)}</a>`).join(' · ')+'</div>':'';
 const visuals=list=>(list||[]).map(v=>{try{if(!v||!Array.isArray(v.labels)||!Array.isArray(v.series)||!v.series.length)return '';
  const body={table:vTable,bar:vBar,line:vLine,pie:vPie}[v.kind];return body?'<figure class="wr-visual"><figcaption>'+esc(v.title)+'</figcaption>'+body(v)+(v.sources&&v.sources.length?'<div class="wr-sources">From '+v.sources.map(esc).join(', ')+'</div>':'')+'</figure>':''}catch(e){return ''}}).join('');
 const store={get(k){try{return sessionStorage.getItem(k)}catch(e){return null}},set(k,v){try{v?sessionStorage.setItem(k,v):sessionStorage.removeItem(k)}catch(e){}}};
@@ -402,7 +455,7 @@ function init(){
     while((i=buf.indexOf('\n\n'))>=0){const line=buf.slice(0,i);buf=buf.slice(i+2);if(!line.startsWith('data: '))continue;const e=JSON.parse(line.slice(6));
      if(e.type==='start'){conversation=e.conversation_id;store.set(key,conversation)}
      else if(e.type==='status'){status.textContent=e.text+'…'}
-     else if(e.type==='answer'||e.type==='rejected'){status.className='wr-msg wr-bot';status.innerHTML=md(e.answer)+visuals(e.visuals)+sources(e.citations);rate(status,e.message_id)}
+     else if(e.type==='answer'||e.type==='rejected'){status.className='wr-msg wr-bot';status.innerHTML=md(e.answer)+visuals(e.visuals)+sources(e.citations)+guideLinks(e.guide_links);rate(status,e.message_id)}
      else if(e.type==='remembered'){add('wr-bot wr-status','I will remember: '+e.memories.map(x=>esc(x.label)+': '+esc(x.value)).join('; ')+'. Change it under What I remember.')}
      else if(e.type==='error'){status.className='wr-msg wr-bot';status.textContent=e.message}}}
   }catch(e){status.className='wr-msg wr-bot';status.textContent='The connection dropped. Try again.'}
@@ -501,3 +554,66 @@ document.querySelector('#filter').addEventListener('change',render);document.que
 INBOX_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Agent inbox</title><style>{THEME}</style></head>
 <body><header><strong class="brand-title">Agent inbox</strong><div class="session">{VIEWER} · <a href="/">Accounts</a></div></header>
 <main><h1>Agent inbox</h1><section class="grid">{CONTENT}</section></main>{SCRIPT}</body></html>"""
+
+# On /metrics-guide: an "Ask the guide" box, and a "Work it through with my numbers" button on each
+# definition. Both stream validated answers from the agent service; the page works the same without them.
+GUIDE_JS = r"""(()=>{
+'use strict';
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const inline=s=>s.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\[([^\]\n]{1,120})\]\((\/metrics-guide#metric-[a-z0-9-]+)\)/g,'<a href="$2">$1</a>').replace(/\[(T\d+)\]/g,'<sup class="wr-cite">$1</sup>');
+const md=s=>esc(s).split(/\n{2,}/).map(p=>/^\s*(?:[-•]|\d+\.) /m.test(p)?'<ul>'+p.split('\n').filter(l=>l.trim()).map(l=>'<li>'+inline(l.replace(/^\s*(?:[-•]|\d+\.) /,''))+'</li>').join('')+'</ul>':'<p>'+inline(p).replace(/\n/g,'<br>')+'</p>').join('');
+const num=(v,u)=>v===null||v===undefined||!isFinite(v)?'–':u==='percent'?(v*100).toFixed(2)+'%':v.toLocaleString(undefined,{maximumFractionDigits:Math.abs(v)>=1000?0:4});
+const tables=list=>(list||[]).map(v=>{try{return '<figure class="wr-guide-table"><figcaption>'+esc(v.title)+'</figcaption><table><thead><tr><th>'+esc(v.x_label||'')+'</th>'+v.series.map(s=>'<th>'+esc(s.name)+'</th>').join('')+'</tr></thead><tbody>'+
+ v.labels.map((l,i)=>'<tr><th>'+esc(l)+'</th>'+v.series.map(s=>'<td>'+num(s.values[i],s.unit)+'</td>').join('')+'</tr>').join('')+'</tbody></table></figure>'}catch(e){return ''}}).join('');
+const sources=c=>c&&c.length?'<div class="wr-guide-sources">Sources: '+c.map(x=>esc(x.id)+' '+esc((x.tool||'').replace(/_/g,' '))+(x.as_of?' ('+esc(x.as_of)+')':'')).join(' · ')+'</div>':'';
+const links=l=>l&&l.length?'<div class="wr-guide-sources">Definitions used: '+l.filter(x=>/^\/metrics-guide#metric-[a-z0-9-]+$/.test(x.link)).map(x=>`<a href="${esc(x.link)}">${esc(x.name)}</a>`).join(' · ')+'</div>':'';
+const css=`.wr-guide textarea{width:100%;min-height:56px;resize:vertical;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--border,#ccc);background:transparent;color:inherit;box-sizing:border-box}
+.wr-guide-form{display:grid;gap:8px;margin-top:8px}.wr-guide-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.wr-guide-row select{font:inherit;padding:4px 8px;border-radius:8px;border:1px solid var(--border,#ccc);background:var(--surface,transparent);color:inherit;max-width:100%}
+.wr-guide-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.wr-guide-chips button,.metric-work{font:inherit;font-size:12px;border:1px solid var(--border,#ccc);background:var(--surface,transparent);color:inherit;border-radius:999px;padding:3px 10px;cursor:pointer}
+.wr-guide-chips button:hover,.metric-work:hover{border-color:var(--accent,#1f6feb)}.metric-work{margin-left:6px}
+.wr-guide-out{margin-top:10px;line-height:1.5}.wr-guide-out:empty{display:none}.wr-guide-out p{margin:0 0 8px}.wr-guide-out ul{margin:4px 0 8px 18px;padding:0}
+.wr-guide-work{margin-top:10px;padding:10px 12px;border-radius:10px;background:var(--surface,#f4f5f7);line-height:1.5}.wr-guide-work p{margin:0 0 6px}.wr-guide-work ul{margin:4px 0 6px 18px;padding:0}
+.wr-guide-status{font-size:12px;opacity:.75}.wr-guide-sources{font-size:11px;opacity:.75;margin-top:6px}.wr-cite{font-size:10px;opacity:.75}
+.wr-guide-table{margin:8px 0;overflow:auto}.wr-guide-table figcaption{font-weight:600;font-size:13px}.wr-guide-table table{border-collapse:collapse;font-size:12px}.wr-guide-table th,.wr-guide-table td{padding:3px 8px;border-bottom:1px solid var(--border,#ddd);text-align:right}.wr-guide-table th:first-child{text-align:left}`;
+const STARTERS=['Why did my risk go up?','What is the difference between TWR and IRR?','How is expected tail loss worked out?','What does the market regime mean?'];
+const remembered={get(){try{return sessionStorage.getItem('wr-guide-account')||''}catch(e){return ''}},set(v){try{sessionStorage.setItem('wr-guide-account',v)}catch(e){}}};
+async function run(url,payload,out,onStart){out.innerHTML='<div class="wr-guide-status">Thinking… working a figure through can take a minute.</div>';const status=out.firstChild;
+ try{const r=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  if(!r.ok){let d='The guide assistant could not answer.';try{d=(await r.json()).detail||d}catch(e){}out.textContent=d;return}
+  const reader=r.body.getReader(),dec=new TextDecoder();let buf='';
+  for(;;){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
+   while((i=buf.indexOf('\n\n'))>=0){const line=buf.slice(0,i);buf=buf.slice(i+2);if(!line.startsWith('data: '))continue;const e=JSON.parse(line.slice(6));
+    if(e.type==='start'){onStart&&onStart(e.conversation_id)}
+    else if(e.type==='status'){status.textContent=e.text+'…'}
+    else if(e.type==='answer'||e.type==='rejected'){out.innerHTML=md(e.answer)+tables(e.visuals)+sources(e.citations)+links(e.guide_links)}
+    else if(e.type==='error'){out.textContent=e.message}}}
+ }catch(e){out.textContent='The connection dropped. Try again.'}}
+fetch('/api/agents/status',{credentials:'same-origin'}).then(r=>r.ok?r.json():{enabled:false}).then(async s=>{if(!s.enabled)return;
+ const toolbar=document.querySelector('.metric-guide-toolbar');if(!toolbar)return;
+ const style=document.createElement('style');style.textContent=css;document.head.appendChild(style);
+ let accounts=[];try{const r=await fetch('/api/agents/guide-accounts',{credentials:'same-origin'});if(r.ok)accounts=(await r.json()).accounts||[]}catch(e){}
+ const wanted=new URLSearchParams(location.search).get('account')||remembered.get();
+ const box=document.createElement('section');box.className='card wide wr-guide';box.setAttribute('aria-labelledby','wr-guide-title');
+ box.innerHTML=`<h2 class="label" id="wr-guide-title">Ask the guide</h2><p class="muted">Ask in plain words. ${accounts.length?'Pick an account to bring in your own figures. ':''}Every figure is checked against the data before it is shown, and answers link to the definitions they use.</p>
+<form class="wr-guide-form">${accounts.length?`<div class="wr-guide-row"><label>Account <select data-account><option value="">None, definitions only</option>${accounts.map(a=>`<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('')}</select></label></div>`:''}
+<textarea maxlength="2000" aria-label="Your question about the metrics" placeholder="For example: why did my risk go up?"></textarea><div class="wr-guide-row"><button type="submit" class="button">Ask</button><span class="wr-guide-status">Answers explain the figures; they are not advice.</span></div></form>
+<div class="wr-guide-chips">${STARTERS.map(q=>`<button type="button">${esc(q)}</button>`).join('')}</div><div class="wr-guide-out" aria-live="polite"></div>`;
+ toolbar.after(box);
+ const select=box.querySelector('[data-account]'),form=box.querySelector('form'),input=form.querySelector('textarea'),out=box.querySelector('.wr-guide-out');
+ if(select&&accounts.some(a=>a.id===wanted))select.value=wanted;
+ let conversation=null,busy=false;
+ const account=()=>select?select.value:'';
+ if(select)select.addEventListener('change',()=>{conversation=null;remembered.set(select.value)});
+ const ask=async q=>{if(busy||!q.trim())return;busy=true;try{await run('/api/agents/guide-question',{question:q.trim(),account_id:account()||null,conversation_id:conversation},out,id=>{conversation=id})}finally{busy=false}};
+ form.addEventListener('submit',e=>{e.preventDefault();ask(input.value)});
+ input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
+ box.querySelectorAll('.wr-guide-chips button').forEach(b=>b.addEventListener('click',()=>{input.value=b.textContent;ask(b.textContent)}));
+ if(!accounts.length)return;
+ document.querySelectorAll('.metric-definition').forEach(row=>{const head=row.querySelector('.metric-definition-heading'),name=(row.querySelector('h3')||{}).textContent;if(!head||!name)return;
+  const b=document.createElement('button');b.type='button';b.className='metric-work';b.textContent='Work it through with my numbers';b.setAttribute('aria-label',`Work ${name} through with an account's numbers`);head.appendChild(b);
+  b.addEventListener('click',async()=>{let out=row.querySelector('.wr-guide-work');if(!out){out=document.createElement('div');out.className='wr-guide-work';out.setAttribute('aria-live','polite');row.appendChild(out)}
+   const id=account()||(accounts.length===1?accounts[0].id:'');
+   if(!id){out.innerHTML='Pick an account under <a href="#wr-guide-title">Ask the guide</a> first.';select&&select.focus();return}
+   b.disabled=true;try{await run('/api/agents/explain-metric',{account_id:id,metric:name},out)}finally{b.disabled=false}})});
+}).catch(()=>{});
+})();"""

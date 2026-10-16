@@ -31,8 +31,10 @@ from .database import connect
 from .exports import MAX_FACTS_BYTES as MAX_EXPORT_FACTS_BYTES
 from .exports import check_note, plan_export
 from .month_team.store import MonthStore
-from .prompts import ANALYST, CASE_ANALYST
-from . import calculator
+from .prompts import (ANALYST, CASE_ANALYST, GUIDE_ACCOUNT_STEPS, GUIDE_ANALYST, GUIDE_NO_ACCOUNT_STEPS,
+                      METRIC_EXPLAINER)
+from . import calculator, guide_tools
+from ibkr_etl.metrics_guide import METRIC_ANCHORS
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -86,6 +88,25 @@ class CaseQuestionRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=36)
     # Computed by the platform from the case as it is now (the readiness pack and the agents' results).
     case_facts: dict[str, Any]
+
+
+class ExplainMetricRequest(BaseModel):
+    user_object_id: str = Field(pattern=USER_ID)
+    account_id: str = Field(min_length=1, max_length=64)
+    metric: str = Field(min_length=1, max_length=120)
+    conversation_id: str | None = Field(default=None, max_length=36)
+
+
+class GuideQuestionRequest(BaseModel):
+    user_object_id: str = Field(pattern=USER_ID)
+    question: str = Field(min_length=1, max_length=2000)
+    account_id: str | None = Field(default=None, min_length=1, max_length=64)
+    conversation_id: str | None = Field(default=None, max_length=36)
+
+
+def guide_subject(account_id: str | None) -> str:
+    """Guide conversations sit beside account ones, keyed so they never mix."""
+    return "guide:" + (account_id or "general")
 
 
 MAX_CASE_FACTS_BYTES = 200_000
@@ -315,7 +336,7 @@ def create_app(services: Services) -> FastAPI:
 
         def events() -> Iterator[str]:
             yield _sse({"type": "start", "conversation_id": conversation_id, "correlation_id": correlation_id})
-            tools = services.tools_for(user, correlation_id)
+            tools = guide_tools.GuideTools(services.tools_for(user, correlation_id))
             try:
                 run = services.agent().run(question=body.message, account_id=body.account_id, tools=tools, history=history,
                                            instructions=instructions)
@@ -352,6 +373,9 @@ def create_app(services: Services) -> FastAPI:
                     correlation_id=correlation_id, usage=turn.usage)
                 event.pop("reason", None)  # validator detail stays in logs
                 event["message_id"] = message_id
+                links = guide_tools.guide_links(turn.citations) if event["type"] == "answer" else []
+                if links:
+                    event["guide_links"] = links
                 remembered = _remember(store, user, turn.remember) if remember and event["type"] == "answer" else []
                 yield _sse(event)
                 if remembered:
@@ -403,6 +427,92 @@ def create_app(services: Services) -> FastAPI:
 
         return StreamingResponse(events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+    def _open_conversation(store: Store, user: str, subject: str, first_text: str,
+                           conversation_id: str | None) -> tuple[str, list[dict[str, Any]]]:
+        if store.tokens_used_today() >= services.runtime.daily_token_budget:
+            raise HTTPException(status_code=429, detail="Today's analysis budget is used up. Try again tomorrow.")
+        if conversation_id:
+            conversation = store.conversation(conversation_id, user)
+            if conversation is None or conversation["subject_id"] != subject:
+                raise HTTPException(status_code=404, detail="Conversation not found.")
+            return conversation_id, [{"role": m["role"], "content": m["content"]}
+                                     for m in store.messages(conversation_id) if m["status"] == "ok"]
+        return store.create_conversation(user, subject, first_text[:80]), []
+
+    def _stream(run: Callable[[], Iterator[dict[str, Any]]], store: Store, user: str, conversation_id: str,
+                correlation_id: str, tools: Any) -> StreamingResponse:
+        def events() -> Iterator[str]:
+            yield _sse({"type": "start", "conversation_id": conversation_id, "correlation_id": correlation_id})
+            try:
+                yield from _answers(run(), store, user, conversation_id, correlation_id, remember=False)
+            except AgentError as error:
+                store.add_message(conversation_id, "assistant", error.message, status="failed",
+                                  correlation_id=correlation_id)
+                yield _sse({"type": "error", "code": error.code, "message": error.message})
+            except Exception:
+                LOGGER.exception("guide answer failed", extra={"correlation_id": correlation_id})
+                yield _sse({"type": "error", "code": "internal_error",
+                            "message": "Something went wrong. Nothing was saved as an answer."})
+            finally:
+                tools.close()
+            yield _sse({"type": "done"})
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+    @app.post("/v1/explain-metric")
+    def explain_metric(body: ExplainMetricRequest, _: ServiceCaller = Depends(caller)) -> StreamingResponse:
+        """Work one Metrics guide definition through with the account's own numbers."""
+        if body.metric not in METRIC_ANCHORS:
+            raise HTTPException(status_code=404, detail="The Metrics guide has no definition called that.")
+        correlation_id = str(uuid.uuid4())
+        user = body.user_object_id.lower()
+        if body.account_id not in accounts_for(user, correlation_id):
+            raise HTTPException(status_code=403, detail="You do not have access to that account.")
+        store = services.store()
+        question = f"Work through {body.metric} for this account with its own numbers."
+        conversation_id, history = _open_conversation(store, user, body.account_id, question, body.conversation_id)
+        store.add_message(conversation_id, "user", question, correlation_id=correlation_id)
+        link = f"/metrics-guide#{METRIC_ANCHORS[body.metric]}"
+        instructions = METRIC_EXPLAINER.format(metric=body.metric, account_id=body.account_id, link=link,
+                                               today=date.today().isoformat())
+        allowed = [*guide_tools.NAMES, *guide_tools.tools_for_metric(body.metric), calculator.NAME]
+        tools = guide_tools.GuideTools(services.tools_for(user, correlation_id))
+        # The question is fixed by the website, so the router has nothing to decide.
+        return _stream(lambda: services.agent().run(
+            question=question, account_id=body.account_id, tools=tools, history=history, allowed_tools=allowed,
+            instructions=instructions, skip_router=True), store, user, conversation_id, correlation_id, tools)
+
+    @app.post("/v1/guide-question")
+    def guide_question(body: GuideQuestionRequest, _: ServiceCaller = Depends(caller)) -> StreamingResponse:
+        """A plain-language question about the metrics, answered from the guide and, with an account, its figures."""
+        correlation_id = str(uuid.uuid4())
+        user = body.user_object_id.lower()
+        if body.account_id and body.account_id not in accounts_for(user, correlation_id):
+            raise HTTPException(status_code=403, detail="You do not have access to that account.")
+        store = services.store()
+        question = body.question.strip()
+        conversation_id, history = _open_conversation(store, user, guide_subject(body.account_id), question,
+                                                      body.conversation_id)
+        store.add_message(conversation_id, "user", question, correlation_id=correlation_id)
+        if body.account_id:
+            instructions = GUIDE_ANALYST.format(account_clause=f" and account {body.account_id}'s own figures",
+                                                account_steps=GUIDE_ACCOUNT_STEPS.format(account_id=body.account_id),
+                                                today=date.today().isoformat())
+            tools = guide_tools.GuideTools(services.tools_for(user, correlation_id))
+            allowed = [*guide_tools.NAMES, *sorted({t for names in guide_tools.SECTION_TOOLS.values() for t in names}),
+                       calculator.NAME]
+        else:
+            instructions = GUIDE_ANALYST.format(account_clause="", account_steps=GUIDE_NO_ACCOUNT_STEPS,
+                                                today=date.today().isoformat())
+            tools = guide_tools.GuideTools()
+            allowed = [*guide_tools.NAMES]
+        # Definition questions ("what is CVaR?") are not portfolio questions, so the router is skipped;
+        # the instructions keep the answer on the guide.
+        return _stream(lambda: services.agent().run(
+            question=question, account_id=body.account_id, tools=tools, history=history, allowed_tools=allowed,
+            instructions=instructions, skip_router=True), store, user, conversation_id, correlation_id, tools)
 
     @app.get("/v1/memory")
     def memories(user_object_id: str = Query(pattern=USER_ID), _: ServiceCaller = Depends(caller)) -> dict[str, Any]:

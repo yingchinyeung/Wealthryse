@@ -1,36 +1,40 @@
 # Medallion architecture
 
-The platform's data is organised in three layers, plus a control plane beside them.
+The platform's data is organised in three layers, with a control plane beside them.
 `infra/medallion/catalog.json` records the layer of every database table and view,
 blob container and job. `tests/test_medallion_catalog.py` fails when a migration adds a
 table or view, or Bicep adds a container, without a catalog entry.
 
-Status: the catalog is in place. Nothing has moved yet; every table is still in `public`.
-The moves happen in stages, each approved separately (see "Stages" below).
+Status: the catalog is in place. Nothing has moved yet, and every table is still in
+`public`. The moves happen in stages, each approved separately (see "Stages" below).
 
 ## Layers
 
 | Layer | Holds | Rule |
 |---|---|---|
-| Bronze | IBKR Flex statements, hand-off files, market data as fetched, live TWS snapshots, uploads | Append only, never edited. Data received from IBKR must not be modified; the same applies to every source. |
-| Silver | Accounts, securities, trades, positions, cash, NAV, FX, benchmarks, sectors, derived and composite portfolios | Built only from bronze and rebuildable from it. Corrections happen here and keep a link to the raw record. |
-| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built only from silver. The website, renderers and agents read gold (and silver read contracts), never bronze. |
-| Ops | Runs, approvals, audit, access, onboarding workflow, configuration, agent state | Control plane, not a data layer. |
+| Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, live TWS snapshots, uploads | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
+| Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmarks, FX closes, risk-free rates), sectors, derived and composite portfolios | Built only from bronze and rebuildable from it. Corrections happen here and keep a link to the raw record. |
+| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built only from silver. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. Each gold figure maps to an entry in the Metrics guide. |
+| Ops | Runs, approvals, audit, access, onboarding workflow, configuration, agent state | Control plane, not a data layer. Stays in `public`. |
 | Platform | `tenants`, `schema_migrations`, row-level security helpers | Stays in `public`. |
 
 ## Where each layer lives
 
-- **Postgres:** target schemas `bronze`, `silver`, `gold` and `ops`. `public` keeps the
-  platform objects. The `agent` schema stays as it is: agent state plus account-scoped
-  views over silver and gold.
+- **Postgres:**
+  - Target schemas are `bronze` (13 tables), `silver` (26 tables and 8 read views) and
+    `gold` (8 tables).
+  - `public` keeps the platform and ops objects, so only the data tables move.
+  - The `agent` schema stays as it is: agent state plus account-scoped views over silver
+    and gold.
 - **Blob storage:**
-  - Bronze: `ibkr-raw`, `onboarding-intake`, `input-snapshots` (until v1.1 retires), and
-    a planned `market-raw`.
+  - Bronze: `ibkr-raw`, `onboarding-intake`, `input-snapshots` (until v1.1 retires),
+    and a planned `bronze-market-data`.
   - Gold: `internal-reports` and `report-drafts`.
-  - Ops: the release and audit containers.
+  - Ops: the release and audit containers, and a planned `ops-qa`.
   - Containers that database rows point to keep their names and get a layer label.
-- **Jobs:** each job's hops (ingest, conform, analytics, quality-gate, publish, serve, ops)
-  are recorded in the catalog. Job names stay; a tag carries the hop.
+  - New containers are named `<layer>-<content>`.
+- **Jobs:** the catalog records each job's hops (ingest, conform, analytics,
+  quality-gate, publish, serve, ops). Job names stay, and a tag carries the hop.
 
 ## Adding a table, view or container
 
@@ -40,26 +44,40 @@ Add an entry to `infra/medallion/catalog.json` in the same PR:
   optional `note`.
 - Containers are keyed `account/container`, with `layer`, `holds` and `plan`.
 
-Choose the layer by what the object holds, not by which job writes it. Raw provider
-responses are bronze even when one job fetches and parses them in the same run.
+Choose the layer by what the object holds, not by which job writes it. A raw provider
+response is bronze. The table it is parsed into is silver.
+
+## How a table moves
+
+Each batch is one migration:
+
+- `ALTER TABLE public.<name> SET SCHEMA <layer>` keeps the table's data, indexes,
+  constraints, row-level security policies, triggers and grants. Views bound to the
+  table, such as the agent views, keep working.
+- A view with the old name stays in `public` so that existing SQL keeps working. It is
+  `security_invoker`, so row-level security and grants apply to the caller.
+- The runtime logins list the layer schemas first in `search_path`.
+- The migration login keeps `public` first. Otherwise `db.py` would create a second,
+  empty `schema_migrations` in a layer schema.
+- A migration that changes a moved table names it by its layer and re-creates its
+  compatibility view, because a view fixes its column list when it is created.
+- A normal bootstrap applies every migration on `main`. So a batch's migration merges
+  on the day the batch runs.
 
 ## Stages
 
-1. **M0:** this catalog and test.
-2. **M1:** keep all raw IBKR data (copy the v1.1 raw statements into `ibkr-raw`).
-3. **M2:** raw copies of market-data responses.
-4. **M3:** move tables into layer schemas in four batches, leaving compatibility views in
-   `public`:
-   - The compatibility views use `security_invoker`, so row-level security still applies
-     to the caller.
-   - The runtime logins list the layer schemas first in `search_path`.
-   - The migration login keeps `public` first. Otherwise `db.py` would create a second,
-     empty `schema_migrations` in a layer schema.
-   - A migration that changes a moved table uses the layer name and re-creates its
-     compatibility view, because a view fixes its column list when it is created.
-   - The bootstrap grants are extended to the layer schemas.
-5. **M4:** storage roles scoped to containers instead of the whole account.
-6. **M5:** v2 makes its own Flex pull into bronze and stops reading the v1.1 export.
-7. **M6:** typed silver views, validated market data, and a replay that rebuilds silver
-   from bronze.
-8. **M7:** gold marts, so every surface reads the same stored figures.
+1. **S0:** this catalog and test (repo only).
+2. **S1:** keep all raw data. Copy the v1.1 raw statements into `ibkr-raw`, add the new
+   containers and their labels, and add container-scoped storage roles next to the
+   current ones.
+3. **S2:** keep raw copies of market-data responses, and add freshness checks for each
+   layer.
+4. **S3:** move the tables in three batches (gold, bronze, silver), rehearsed first on a
+   restored copy.
+5. **S4:** narrow access by layer once storage logs show nothing needs the wider roles.
+6. **S5:** v2 makes its own Flex pull into bronze. It runs as a shadow, compared daily
+   with today's data, before the switch.
+7. **S6:** typed silver views, a replay that rebuilds silver from bronze, and promotion
+   gates recorded in the workflow evidence ledger.
+8. **S7:** gold tables for every Metrics guide figure, so each surface reads the same
+   stored number.

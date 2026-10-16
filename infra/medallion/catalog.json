@@ -5,7 +5,7 @@
   "bronze": "Raw data exactly as received from IBKR, market-data providers and people's uploads. Append-only, never edited; corrections happen in silver.",
   "silver": "Cleaned, validated and conformed records: accounts, securities, trades, positions, cash, NAV, FX, benchmarks and derived portfolios. Rebuildable from bronze.",
   "gold": "Reporting-ready analytics and frozen report payloads that feed the factsheets, decks, website and agents.",
-  "ops": "Control plane, not a data layer: runs, approvals, audit, access, onboarding workflow, agent state and configuration.",
+  "ops": "Control plane, not a data layer: runs, approvals, audit, access, onboarding workflow, agent state and configuration. Stays in public.",
   "platform": "Database plumbing that stays in public: tenants, the migration ledger and the row-level-security helpers."
  },
  "hops": {
@@ -21,27 +21,27 @@
   "public.account_onboarding_approvals": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.account_onboarding_cases": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.account_onboarding_checks": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.account_onboarding_queue_items": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.account_onboarding_queues": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.accounts": {
    "kind": "table",
@@ -52,33 +52,33 @@
   "public.active_report_designs": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.admin_chat_conversations": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.admin_chat_messages": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.agent_tool_audit": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Unused. Retirement candidate."
   },
   "public.ai_analyst_conversations": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.ai_analyst_messages": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.analytics_daily": {
    "kind": "table",
@@ -89,52 +89,52 @@
   "public.app_user_roles": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.app_users": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.approved_actions": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.audit_events": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.autonomous_actions": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.autonomous_agent_runs": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.autonomy_authority_reviews": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.autonomy_control": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.autonomy_recovery_state": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.autonomy_release_baselines": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.benchmark_master": {
    "kind": "table",
@@ -144,49 +144,49 @@
   },
   "public.benchmark_prices": {
    "kind": "table",
-   "layer": "bronze",
-   "target_schema": "bronze",
-   "note": "Provider benchmark levels with a quality flag. Read directly as silver today."
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Parsed provider benchmark levels with a quality flag. Raw responses: bronze-market-data."
   },
   "public.broker_connection_accounts": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.broker_connections": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.broker_onboarding_approvals": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.broker_onboarding_cases": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.broker_onboarding_checks": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.broker_onboarding_events": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.burn_in_acceptance_windows": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.burn_in_daily_results": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.cash_snapshots": {
    "kind": "table",
@@ -227,7 +227,7 @@
   "public.data_quality_results": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Quality-gate results between layers."
   },
   "public.derived_portfolio_cash_balances": {
@@ -263,19 +263,19 @@
   "public.derived_portfolios": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Configuration: filtered-portfolio definitions."
   },
   "public.flex_request_state": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.flex_rows": {
    "kind": "table",
    "layer": "bronze",
    "target_schema": "bronze",
-   "note": "Every Flex record as raw JSON; the database copy of the raw statement."
+   "note": "Every Flex record as raw JSON; the database copy of the raw statement. Only last_seen_run_id changes after insert."
   },
   "public.fx_evidence_batches": {
    "kind": "table",
@@ -322,58 +322,58 @@
   "public.ibkr_credential_circuit_state": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.ibkr_flex_credentials": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.ibkr_flex_queries": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.ibkr_flex_source_accounts": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.ibkr_flex_source_run_accounts": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.ibkr_flex_source_runs": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.ibkr_flex_source_validation_requests": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.identity_registry_revisions": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.ingestion_runs": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Load log for bronze batches (raw_sha256, raw_path)."
   },
   "public.institutional_shadow_reconciliations": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.institutional_work_items": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.instrument_classifications": {
    "kind": "table",
@@ -414,7 +414,7 @@
   "public.live_gateway_status": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.live_positions": {
    "kind": "table",
@@ -430,19 +430,19 @@
   },
   "public.market_data_prices": {
    "kind": "table",
-   "layer": "bronze",
-   "target_schema": "bronze",
-   "note": "Yahoo prices as fetched. Read directly as silver today."
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Parsed Yahoo prices. The raw responses will be kept in the bronze-market-data container."
   },
   "public.master_account_definitions": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.master_account_memberships": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.metric_definitions": {
    "kind": "table",
@@ -459,33 +459,33 @@
   "public.onboarding_historical_report_batches": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.onboarding_historical_report_items": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Points at rendered files by container and blob name."
   },
   "public.onboarding_source_accounts": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.owner_codex_sessions": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.owner_codex_task_events": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.owner_codex_tasks": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.performance_comparison_daily": {
    "kind": "table",
@@ -502,13 +502,13 @@
   "public.portfolio_analyst_assurance_findings": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Quality gate on gold."
   },
   "public.portfolio_analyst_assurance_runs": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Quality gate on gold."
   },
   "public.portfolio_benchmark_mapping": {
@@ -526,7 +526,7 @@
   "public.qualified_report_designs": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.raw_reports": {
    "kind": "table",
@@ -536,35 +536,35 @@
   },
   "public.reference_fx_rates": {
    "kind": "table",
-   "layer": "bronze",
-   "target_schema": "bronze",
-   "note": "Provider FX closes with a quality flag. Read directly as silver today."
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Parsed provider FX closes with a quality flag. Raw responses: bronze-market-data."
   },
   "public.report_artifact_releases": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Points at released files by container and blob name."
   },
   "public.report_design_update_requests": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.report_generation_runs": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.report_release_decisions": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.report_runs": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Legacy daily report log. Retirement candidate."
   },
   "public.reporting_snapshots": {
@@ -581,9 +581,9 @@
   },
   "public.risk_free_rates": {
    "kind": "table",
-   "layer": "bronze",
-   "target_schema": "bronze",
-   "note": "US Treasury and HIBOR series as fetched. Read directly as silver today."
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Parsed US Treasury and HIBOR series. Raw responses: bronze-market-data."
   },
   "public.schema_migrations": {
    "kind": "table",
@@ -606,63 +606,63 @@
   "public.specialist_audit_events": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.specialist_daily_reports": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.specialist_observation_controls": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.specialist_observation_grants": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.specialist_report_deliveries": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.subject_calculation_definitions": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Configuration: versioned calculation definitions."
   },
   "public.subject_calculation_runs": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.subject_dependencies": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.subject_feature_states": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.subject_flex_source_bindings": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.subject_operating_registrations": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.subject_report_template_assets": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "Points at uploaded template files by container and blob name."
   },
   "public.synthetic_portfolio_components": {
@@ -674,7 +674,7 @@
   "public.system_incidents": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.tenants": {
    "kind": "table",
@@ -691,33 +691,33 @@
   "public.user_account_access": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.workflow_cycle_date_policies": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.workflow_lease_events": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.workflow_outbox": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops",
+   "target_schema": "public",
    "note": "No writer. Retirement candidate."
   },
   "public.workflow_shadow_decisions": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.workflow_stage_evidence": {
    "kind": "table",
    "layer": "ops",
-   "target_schema": "ops"
+   "target_schema": "public"
   },
   "public.subject_cash_activity_series": {
    "kind": "view",
@@ -1147,7 +1147,7 @@
    "holds": "Portal uploads as received: report templates and onboarding case documents.",
    "plan": "Keep the name (database rows point at it); label it bronze."
   },
-  "ibkrv2stgauhecwc4itaoo/market-raw": {
+  "ibkrv2stgauhecwc4itaoo/bronze-market-data": {
    "layer": "bronze",
    "declared_in": null,
    "new": true,
@@ -1189,6 +1189,13 @@
    "declared_in": null,
    "holds": "Audit checkpoints. Under legal hold.",
    "plan": "Declare in Bicep; label ops."
+  },
+  "ibkrv2stgauhecwc4itaoo/ops-qa": {
+   "layer": "ops",
+   "declared_in": null,
+   "new": true,
+   "holds": "Planned: QA manifests now under internal-reports/qa-*.",
+   "plan": "New container so gold holds only reports."
   },
   "ibkrv2stgauhecwc4itaoo/upgrade-g04-reports-20261010": {
    "layer": "ops",

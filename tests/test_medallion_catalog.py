@@ -22,7 +22,8 @@ CREATE = re.compile(
 )
 # Created by src/ibkr_etl/db.py at runtime, not by a migration file.
 RUNTIME_OBJECTS = {"public.schema_migrations"}
-TARGET_SCHEMA = {"bronze": "bronze", "silver": "silver", "gold": "gold", "ops": "ops", "platform": "public"}
+# Only the data layers move; the control plane (ops) stays in public with the platform objects.
+TARGET_SCHEMA = {"bronze": "bronze", "silver": "silver", "gold": "gold", "ops": "public", "platform": "public"}
 
 
 def _catalog() -> dict:
@@ -36,6 +37,8 @@ def _migration_objects() -> dict[str, str]:
         for path in sorted((MIGRATIONS / folder).glob("*.sql")):
             for kind, name in CREATE.findall(path.read_text(encoding="utf-8")):
                 name = name.lower()
+                if name.endswith("."):
+                    continue  # a format() placeholder in dynamic SQL, e.g. public.%I
                 if "." not in name:
                     name = f"{schema}.{name}"
                 found.setdefault(name, "view" if "VIEW" in kind.upper() else "table")

@@ -13,6 +13,12 @@ records); nothing is sent, published or released.
                                                          # against what actually happened
     python -m wealthryse_agent.jobs export_packs         # daily: an inbox card for each saved export pack
                                                          # whose period has closed (no model, no files)
+    python -m wealthryse_agent.jobs guide_check          # Mondays: recompute each account's statistics from
+                                                         # the Metrics guide's formulas and flag any figure
+                                                         # the website or the analyst shows differently
+    python -m wealthryse_agent.jobs guide_keeper         # Mondays: find website figures and calculations the
+                                                         # Metrics guide has fallen behind on, and draft the
+                                                         # update for the owner (code only, no client data)
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
     python -m wealthryse_agent.jobs month_team --replay --round 2 --from 2026-01-31
@@ -44,7 +50,8 @@ from .auth import TokenSource
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings
 from .database import connect
 from .month_team.agents import BudgetExhausted
-from .prompts import HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, RISK_ALERT, WEEKLY_BRIEF
+from . import guide_tools
+from .prompts import GUIDE_CHECKER, GUIDE_KEEPER, HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, RISK_ALERT, WEEKLY_BRIEF
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -297,6 +304,84 @@ def risk_watch(store: Store, tools: ToolClient, agent: Agent, accounts: list[str
     return written
 
 
+def guide_check_summary(data: dict[str, Any]) -> list[str]:
+    """One line per mismatch, from the conformance facts alone (used when the explanation fails its check)."""
+    return [f"{c['metric']} ({c['source']}): guide formula {c['guide_formula_value']}, shown {c['shown_value']}"
+            for c in data["checks"] if c["status"] == "mismatch"]
+
+
+def guide_check(store: Store, tools: ToolClient, agent: Agent, accounts: list[str], usage: dict,
+                today: date | None = None) -> int:
+    """Weekly: compare each account's figures with an independent implementation of the Metrics guide.
+
+    A card each week that something differs, with the analyst's explanation; otherwise one all-clear a month.
+    """
+    today = today or date.today()
+    year, week, _ = today.isocalendar()
+    week_key, month_key = f"{year}-W{week:02d}", today.strftime("%Y-%m")
+    guided = guide_tools.GuideTools(tools)
+    written = 0
+    for account_id in accounts:
+        if store.inbox_exists("guide_check", account_id, week_key):
+            continue
+        try:
+            result = tools.call("get_guide_conformance", {"account_id": account_id})
+        except ToolCallFailed:
+            continue  # too little history to check
+        data = result["data"]
+        citations = result.get("citations") or [{"source": "subject_nav_series", "account_id": account_id}]
+        if not data["mismatches"]:
+            if store.inbox_exists("guide_check", account_id, month_key):
+                continue
+            if store.add_inbox(kind="guide_check", account_id=account_id, period_key=month_key,
+                               title=f"Metrics guide check: all {data['checked']} figures match",
+                               body=(f"Every figure checked matched the Metrics guide's formulas, recomputed separately "
+                                     f"over {data['observations']} daily returns from {data['period_start']} to "
+                                     f"{data['period_end']}."), citations=citations, run_id=None):
+                written += 1
+            continue
+        answer, cited, used, ok = _run_agent(
+            agent, guided, account_id, GUIDE_CHECKER.format(account_id=account_id, count=data["mismatches"]),
+            ["get_guide_conformance", "get_metric_definition", "calculate"])
+        _sum_usage(usage, used)
+        body = answer if ok else "\n".join(
+            ["The explanation could not be checked against the figures, so only the facts are shown:"]
+            + [f"- {line}" for line in guide_check_summary(data)])
+        if store.add_inbox(kind="guide_check", account_id=account_id, period_key=week_key,
+                           title=f"Metrics guide check: {data['mismatches']} of {data['checked']} figures differ",
+                           body=body, citations=cited if ok else citations, run_id=None):
+            written += 1
+    return written
+
+
+def guide_keeper(store: Store, agent: Agent, usage: dict, report: Any = None) -> int:
+    """Weekly: audit the deployed code against the Metrics guide and post one drafted update per drift."""
+    from ibkr_etl import metrics_guide_audit as audit
+
+    report = report or audit.audit()
+    if report.clean:
+        return 0
+    key = audit.drift_key(report)
+    if store.inbox_exists("guide_keeper", guide_tools.PLATFORM_SUBJECT, key):
+        return 0
+    count = (len(report.uncovered_labels) + len(report.changed_sources) + len(report.unrecorded_sources)
+             + len(report.missing_sources))
+    answer, cited, used, ok = "", [], {}, False
+    for event in agent.run(question="Draft the Metrics guide update.", account_id=None,
+                           tools=guide_tools.DriftFacts(audit.drift_facts(report)),
+                           allowed_tools=[guide_tools.DRIFT], instructions=GUIDE_KEEPER, skip_router=True):
+        if event["type"] in ("answer", "rejected"):
+            turn = event["turn"]
+            answer, cited, used, ok = turn.answer, turn.citations, turn.usage, event["type"] == "answer"
+    _sum_usage(usage, used)
+    body = answer if ok else ("The draft could not be checked against the code, so only what drifted is "
+                              "shown:\n\n" + audit.brief(report).split("## When the guide is right")[0])
+    added = store.add_inbox(kind="guide_keeper", account_id=guide_tools.PLATFORM_SUBJECT, period_key=key,
+                            title=f"Metrics guide keeper: {count} item(s) to update", body=body,
+                            citations=cited if ok else [{"source": "deployed_source_code"}], run_id=None)
+    return 1 if added else 0
+
+
 def data_quality_findings(freshness: dict[str, Any], today: date) -> list[str]:
     """Plain-language findings from the freshness tool. Deterministic; no model."""
     findings = []
@@ -500,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team",
                                                   "onboarding", "operations", "weekly_brief", "live_market",
-                                                  "risk_watch", "export_packs"])
+                                                  "risk_watch", "export_packs", "guide_check", "guide_keeper"])
     parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
@@ -535,6 +620,14 @@ def main(argv: list[str] | None = None) -> int:
             store.finish_run(run_id, status="succeeded", items=written, usage=usage)
             LOGGER.info("operations investigated %s incident(s)", written)
             return 0
+        if args.job == "guide_keeper":
+            if store.tokens_used_today() >= runtime.daily_token_budget:
+                store.finish_run(run_id, status="failed", items=0, usage=usage, error_code="budget_exhausted")
+                return 1
+            written = guide_keeper(store, Agent(ModelSettings.from_env()), usage)
+            store.finish_run(run_id, status="succeeded", items=written, usage=usage)
+            LOGGER.info("guide_keeper wrote %s inbox items", written)
+            return 0
         accounts = [a["account_id"] for a in tools.call("list_accounts", {})["data"]["accounts"]]
         if args.job == "data_quality":
             written = data_quality(store, tools, accounts, runtime.retention_days)
@@ -548,7 +641,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             agent = Agent(ModelSettings.from_env())
             job = {"holdings_explainer": holdings_explainer, "weekly_brief": weekly_brief,
-                   "live_market": live_market, "risk_watch": risk_watch}.get(args.job, month_end_drafter)
+                   "live_market": live_market, "risk_watch": risk_watch,
+                   "guide_check": guide_check}.get(args.job, month_end_drafter)
             written = job(store, tools, agent, accounts, usage)
         store.finish_run(run_id, status="succeeded", items=written, usage=usage)
         LOGGER.info("%s wrote %s inbox items", args.job, written)

@@ -252,6 +252,12 @@ var jobs = [
   // 09:45 HKT daily: an inbox card for each saved export pack whose month, quarter or year has closed
   // and whose data is in. No model and no files: the person builds, checks and releases it on the website.
   { name: 'ibkrv2stg-agent-export-packs', job: 'export_packs', cron: '45 1 * * *' }
+  // 10:00 HKT on Mondays: recomputes each granted account's statistics from the Metrics guide's formulas
+  // with a separate implementation and posts a card when the website or the analyst shows a figure differently.
+  { name: 'ibkrv2stg-agent-guide-check', job: 'guide_check', cron: '0 2 * * 1' }
+  // 10:30 HKT on Mondays: checks the deployed code against the Metrics guide and, when a figure or a
+  // calculation has moved on, drafts the guide update for the owner's inbox. Reads code only, no client data.
+  { name: 'ibkrv2stg-agent-guide-keeper', job: 'guide_keeper', cron: '30 2 * * 1' }
 ]
 
 resource agentJobs 'Microsoft.App/jobs@2024-03-01' = [for j in jobs: {

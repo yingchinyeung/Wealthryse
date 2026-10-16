@@ -1535,12 +1535,37 @@ def run_factor_stress(connection, arguments: Mapping[str, Any]) -> dict[str, Any
 # Registry ------------------------------------------------------------------
 
 
+def get_guide_conformance(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """The website's figures and the analyst's against an independent implementation of the Metrics guide."""
+    from ibkr_etl import metrics_guide_reference
+
+    account_id = str(arguments["account_id"])
+    subject = _subject(connection, account_id)
+    end = _latest_nav_date(connection, account_id, None)
+    nav, flows = _series_inputs(connection, subject, end)
+    if len(nav) < MIN_RISK_OBSERVATIONS:
+        raise ToolError("not_enough_history", f"The check needs at least {MIN_RISK_OBSERVATIONS} valuations.", 404)
+    try:
+        analyst = get_risk_metrics(connection, {"account_id": account_id})["data"]
+    except ToolError:
+        analyst = None
+    try:
+        data = metrics_guide_reference.conformance(nav, flows, analyst)
+    except (ValueError, PerformanceInputError) as error:
+        raise ToolError("conformance_unavailable", "The recorded values could not be checked as a series.") from error
+    data["currency"] = _reporting_currency(subject)
+    return {"as_of": data["period_end"], "data": data,
+            "citations": [_citation("subject_nav_series", account_id, from_date=data["period_start"], to_date=end),
+                          _citation("metrics_guide", None, version=data["reference_version"])]}
+
+
 def _schema(properties: Mapping[str, Any], required: list[str]) -> dict[str, Any]:
     return {"type": "object", "properties": dict(properties), "required": required, "additionalProperties": False}
 
 
 _ACCOUNT = {"type": "string", "description": "account_id from list_accounts"}
 MONTH_TEAM = frozenset({"month_team"})
+GUIDE_CHECK = frozenset({"guide_check"})
 ONBOARDING = frozenset({"onboarding"})
 OPERATIONS = frozenset({"operations"})
 _DATE = {"type": "string", "description": "YYYY-MM-DD"}
@@ -1671,6 +1696,11 @@ TOOLS: tuple[ToolSpec, ...] = (
                                          "change": {"type": "number", "description": "fraction, -0.2 is a 20% fall; "
                                                     "between -0.6 and 0.6"}}}}},
                      ["account_id"]), run_factor_stress),
+    ToolSpec("get_guide_conformance", "Recompute the account's statistics (returns, volatility, downside deviation, "
+             "Sortino, Calmar, skewness, kurtosis, drawdowns, win rate, VaR and expected tail loss) from the Metrics "
+             "guide's formulas with a separate implementation, and compare each with the website's figure and the "
+             "analyst's get_risk_metrics. Lists every check with both values and whether they match.",
+             _schema({"account_id": _ACCOUNT}, ["account_id"]), get_guide_conformance, only_jobs=GUIDE_CHECK),
     ToolSpec("list_broker_logins", "The IBKR logins added for onboarding, with the latest check of each: its "
              "status, IBKR's error code if it failed, how many accounts it found, and what its Flex query lacks.", _schema({}, []),
              list_broker_logins, False, only_jobs=ONBOARDING),

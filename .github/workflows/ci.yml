@@ -26,6 +26,10 @@ jobs:
       # Fails only on failures not listed in tests/known_failures.txt.
       - name: Test
         run: python scripts/ci_run_tests.py
+      # Warns (never fails) when a website figure has no Metrics guide entry or a
+      # calculation the guide describes has changed. The guide_keeper agent job drafts the fix.
+      - name: Metrics guide drift
+        run: python scripts/check_metrics_guide.py --warn
 
   # Agent schema, account isolation and tool figures, onboarding schema rules,
   # and the live IBKR tables and collector role, against a real PostgreSQL

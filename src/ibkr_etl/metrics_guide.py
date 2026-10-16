@@ -1077,6 +1077,12 @@ if sorted(_placed) != sorted(_BY_NAME):
     raise RuntimeError("Every metric definition must appear in exactly one guide section")
 
 
+def definition(name: str) -> MetricDefinition:
+    """One definition by its exact name (KeyError if the guide has no such entry)."""
+
+    return _BY_NAME[name]
+
+
 def metric_anchor(name: str) -> str:
     """Return the stable URL fragment used to deep-link one definition."""
 
@@ -1443,6 +1449,86 @@ CALCULATION_CONVENTIONS = (
     ("Models", "Modelling figures, crisis scenarios and risk alerts are hypothetical models built from history. They are not forecasts, guarantees or investment advice, and each states its method and the data it used."),
     ("Display", "A stored decimal of 0.05 is displayed as 5.00%. VaR and Expected Tail Loss are shown as positive loss percentages; drawdowns are shown as negative percentages."),
 )
+
+_SECTION_OF = {metric.name: section for section in METRIC_SECTIONS for metric in section.metrics}
+_FIGURE = re.compile(r"(?<![\w.])\d{1,3}(?:,\d{3})+(?:\.\d+)?|(?<![\w.])\d+(?:\.\d+)?")
+
+
+def metric_location(name: str) -> str:
+    """Where the website shows a metric, such as "Modelling › Risk outlook"."""
+
+    return METRIC_LOCATIONS.get(name, _SECTION_OF[name].location)
+
+
+def definition_payload(name: str) -> dict:
+    """One definition as data, for the agents (and so for the figure check).
+
+    ``figures_in_text`` lists the numbers the wording quotes (252 sessions, 95%, 2,000 paths) so
+    an answer may repeat them.
+    """
+
+    metric = _BY_NAME[name]
+    section = _SECTION_OF[name]
+    texts = (metric.meaning, metric.calculation, metric.interpretation, CLIENT_CALCULATIONS[name])
+    figures = sorted({float(match.replace(",", "")) for text in texts for match in _FIGURE.findall(text)})
+    return {
+        "name": name,
+        "section": section.title,
+        "where_you_see_it": metric_location(name),
+        "link": f"/metrics-guide#{METRIC_ANCHORS[name]}",
+        "what_it_tells_you": metric.meaning,
+        "how_we_work_it_out": CLIENT_CALCULATIONS[name],
+        "technical_method": metric.calculation,
+        "how_to_explain_it": metric.interpretation,
+        "also_called": list(METRIC_ALIASES.get(name, ())),
+        "see_also": list(RELATED_METRICS.get(name, ())),
+        "figures_in_text": figures,
+    }
+
+
+def _words(text: str) -> set[str]:
+    """Lower-case words, long ones cut to six letters so "concentrated" meets "concentration"."""
+
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    return {word[:6] for word in re.findall(r"[a-z0-9]+", ascii_text) if len(word) > 1}
+
+
+_STOP_WORDS = frozenset("""the and for why did does what how is are was my our this that with of to in on it its
+    an be me can you your from mean means do when which who will would should account portfolio go up get got
+    has have had am""".split())
+
+
+def search(query: str, limit: int = 5) -> list[dict]:
+    """Definitions that best match a plain-language question, best first.
+
+    An exact name or alias in the query counts most, then words in the name and aliases, then
+    words in the explanations.
+    """
+
+    text = query.lower()
+    words = _words(query) - _STOP_WORDS
+    scored = []
+    for name, metric in _BY_NAME.items():
+        aliases = METRIC_ALIASES.get(name, ())
+        score = 0.0
+        for term in (name, *aliases):
+            pattern = r"(?<![a-z0-9])" + re.escape(term.lower()) + r"(?![a-z0-9])"
+            if re.search(pattern, text):
+                score += 10 + len(term) / 10
+        heading = _words(" ".join((name, *aliases)))
+        body = _words(" ".join((metric.meaning, CLIENT_CALCULATIONS[name], metric.interpretation)))
+        own = _words(name)
+        # Of two names that both match, the one the query covers more of comes first ("regime" → Market regime).
+        score += 3 * len(words & heading) + 4 * len(words & own) / max(len(own), 1) + 0.5 * len(words & body)
+        if score > 0:
+            scored.append((score, name))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [
+        {"name": name, "where_you_see_it": metric_location(name), "link": f"/metrics-guide#{METRIC_ANCHORS[name]}",
+         "how_we_work_it_out": CLIENT_CALCULATIONS[name]}
+        for _, name in scored[:max(1, min(limit, 10))]
+    ]
+
 
 ALIASES_SHOWN = 4
 

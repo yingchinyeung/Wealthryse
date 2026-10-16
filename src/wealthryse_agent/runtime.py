@@ -85,6 +85,10 @@ TOOL_LABELS = {
     "get_risk_outlook": "Forecasting risk",
     "get_market_regimes": "Reading the market regime",
     "run_factor_stress": "Running a factor stress test",
+    "get_metric_definition": "Reading the Metrics guide",
+    "search_metrics_guide": "Searching the Metrics guide",
+    "get_guide_conformance": "Checking figures against the Metrics guide",
+    "get_guide_drift": "Reading what changed in the code",
     calculator.NAME: "Calculating",
 }
 OUT_OF_SCOPE = ("I can explain your holdings and performance, but I can't recommend trades, rebalancing "

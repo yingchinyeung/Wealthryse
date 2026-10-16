@@ -5008,8 +5008,8 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
     account_cards = []
     for subject in _account_directory(user):
         account = escape(str(subject["subject_id"]))
-        from .viewer_labels import account_card_title
-        account_display_name = escape(account_card_title(subject))
+        from .viewer_labels import account_card_name
+        account_display_name = escape(account_card_name(subject))
         currency = escape(str(subject["reporting_currency"]))
         start_value = subject["history_start_date"]
         try:

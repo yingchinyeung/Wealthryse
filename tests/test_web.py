@@ -26,6 +26,7 @@ from ibkr_etl.web import (
     _security_audit_event,
     SECURITY_HEADERS,
     account_page,
+    account_subpage,
     account_root,
     cash_activity,
     home,
@@ -1343,8 +1344,23 @@ class PortfolioWebTests(unittest.TestCase):
         for card in ("model-projection", "model-risk", "model-regimes", "model-whatif", "model-optimise",
                      "model-factors", "model-stress"):
             self.assertIn(f'id="{card}"', modelling_page)
-            self.assertIn(f'href="#{card}"', modelling_page)
+            self.assertIn(f'data-part-link="{card}"', modelling_page)
         self.assertIn("if(activeSection==='modelling')renderModelling(asOf);", modelling_page)
+
+    def test_account_sections_split_into_subpages(self) -> None:
+        user = {"email": "analyst@example.com"}
+        what_if = account_subpage("U16088571", "modelling", "what-if", None, user)
+        self.assertIn('href="/accounts/U16088571/modelling/what-if" data-part-link="model-whatif" aria-current="page"', what_if)
+        self.assertIn('href="/accounts/U16088571/risk/drawdowns"', what_if)
+        self.assertIn('class="account-nav-menu"', what_if)
+        self.assertIn('"model-whatif"', what_if)
+        risk = account_page("U16088571", "risk", None, user)
+        self.assertIn('href="/accounts/U16088571/risk/snapshot" data-part-link="risk-summary" aria-current="page"', risk)
+        for account_id, section, part in (("U16088571", "modelling", "nope"), ("U16088571", "cash", "snapshot"),
+                                          ("ANOTHER_ACCOUNT", "risk", "snapshot")):
+            with self.subTest(section=section, part=part), self.assertRaises(HTTPException) as raised:
+                account_subpage(account_id, section, part, None, user)
+            self.assertEqual(raised.exception.status_code, 404)
 
     def test_account_subpages_reject_unknown_accounts_and_sections(self) -> None:
         for account_id, section in (

@@ -390,6 +390,27 @@ tbody tr:hover { background: var(--mission-hover); }
   main { width: min(100% - 32px, 1320px); }
 }
 
+/* Account subpages: one subpage of a section shows at a time, and the tab bar
+   lists each section's subpages in a SpaceX-style dropdown. */
+.part-off { display: none !important; }
+.account-nav-item { position: relative; display: flex; flex: 0 0 auto; }
+.nav-caret { display: inline-block; margin-left: 6px; font-size: 9px; letter-spacing: 0; opacity: .7; transition: transform .2s ease; }
+.account-nav-menu { position: absolute; top: 100%; left: 0; z-index: 60; display: none; min-width: 220px; padding: 10px 0 12px; background: var(--bg); border: 1px solid var(--line); border-top: 0; box-shadow: 0 18px 36px rgba(0, 0, 0, .35); }
+.account-nav-menu a { display: block; padding: 9px 18px; color: var(--muted-strong); font-size: 12px; font-weight: 600; letter-spacing: .16em; text-decoration: none; text-transform: uppercase; white-space: nowrap; }
+.account-nav-menu a:hover, .account-nav-menu a:focus-visible { color: var(--ink); }
+.account-nav-menu a[aria-current="page"] { color: var(--ink); box-shadow: inset 2px 0 0 var(--ink); }
+.subpage-row { display: none; }
+.subpage-row a[aria-current="page"] { color: var(--ink); box-shadow: inset 0 -2px 0 var(--ink); }
+@media (min-width: 651px) {
+  .account-nav { overflow: visible; }
+  .account-nav-item:hover .account-nav-menu, .account-nav-item:focus-within .account-nav-menu { display: block; }
+  .account-nav-item:hover .nav-caret, .account-nav-item:focus-within .nav-caret { transform: rotate(180deg); }
+}
+@media (max-width: 650px) {
+  .subpage-row { display: flex; }
+  .nav-caret { display: none; }
+}
+
 /* Portfolio analyst chat: its own styles assume a light card and a blue accent with white text,
    so restate them on the mission colours. "body" outranks the chat's later-loaded rules. */
 body .wr-panel { background: var(--bg); color: var(--ink); border: 1px solid var(--line-strong); border-radius: var(--radius-lg); box-shadow: 0 18px 48px rgba(0, 0, 0, .45); font-family: var(--font-mission); }

@@ -33,11 +33,10 @@ def _json(value: Any) -> Any:
 
 
 def put_file(connection, tenant_id: str, sha256: str, content: bytes, content_type: str = "application/pdf") -> None:
-    found = connection.execute("SELECT sha256 FROM factsheet_design_files WHERE tenant_id=? AND sha256=?",
-                               (tenant_id, sha256)).fetchone()
-    if found is None:
-        connection.execute("""INSERT INTO factsheet_design_files(tenant_id, sha256, content_type, byte_count, content,
-            created_at) VALUES (?,?,?,?,?,?)""", (tenant_id, sha256, content_type, len(content), content, utc_now_iso()))
+    # Files are keyed by content, so two uploads of the same PDF at once store it once.
+    connection.execute("""INSERT INTO factsheet_design_files(tenant_id, sha256, content_type, byte_count, content,
+        created_at) VALUES (?,?,?,?,?,?) ON CONFLICT (tenant_id, sha256) DO NOTHING""",
+                       (tenant_id, sha256, content_type, len(content), content, utc_now_iso()))
 
 
 def get_file(connection, tenant_id: str, sha256: str) -> bytes:
@@ -119,8 +118,13 @@ def version(connection, draft_id: str, number: int) -> dict[str, Any]:
 
 def add_version(connection, tenant_id: str, draft_id: str, *, spec: Mapping[str, Any], spec_sha256: str,
                 source: str, summary: str, changes: list[str], checks: Any, actor: str,
-                expected_version: int) -> int:
-    """A new current version on top of ``expected_version``; refuses if someone else moved the draft first."""
+                expected_version: int, parent_version: int | None = None) -> int:
+    """A new current version on top of ``expected_version``; refuses if someone else moved the draft first.
+
+    ``parent_version`` is what undoing the new version returns to: the version it
+    replaced unless given (an undo passes the restored version's own parent, so
+    undoing again steps further back).
+    """
     current = draft(connection, tenant_id, draft_id)
     if current is None:
         raise DesignStoreError("Design not found")
@@ -131,7 +135,8 @@ def add_version(connection, tenant_id: str, draft_id: str, *, spec: Mapping[str,
     latest = connection.execute("SELECT MAX(version) AS v FROM factsheet_design_versions WHERE draft_id=?",
                                 (str(draft_id),)).fetchone()
     number = int(dict(latest)["v"]) + 1
-    _insert_version(connection, str(draft_id), number, spec, spec_sha256, int(expected_version), source, summary,
+    parent = int(expected_version) if parent_version is None and source != "undo" else parent_version
+    _insert_version(connection, str(draft_id), number, spec, spec_sha256, parent, source, summary,
                     changes, checks, actor)
     updated = connection.execute("""UPDATE factsheet_design_drafts SET current_version=?, updated_at=?
         WHERE tenant_id=? AND draft_id=? AND current_version=?""",

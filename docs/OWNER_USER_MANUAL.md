@@ -217,9 +217,9 @@ All times below are **Hong Kong Time (HKT, UTC+8)**. Azure Container Apps stores
 | HKT schedule | Azure job | Purpose |
 |---|---|---|
 | 07:00 daily | `ibkrv2stg-risk-free-daily` | Refresh validated U.S. Treasury 3-month rate, when the source has a new observation. |
-| 16:00 daily | `ibkr-v11-daily` | Existing production IBKR Flex import, checks, derived portfolios, dashboard and exports. |
-| 16:00 daily | `ibkrv2stg-institutional-daily` | Process active website-managed Flex connections with one statement-generation attempt per source, archive the raw response, partition selected accounts and enqueue downstream work. |
-| 16:10 daily | `ibkrv2stg-account-sync-daily` | Validate the production manifest/hash and idempotently synchronize U16088571 into the website database. It has no Flex access. |
+| 16:00 daily | `ibkr-v11-daily` | Existing production IBKR Flex import, checks, derived portfolios, dashboard and exports. Stops on the day v2 makes its own daily Flex pull. |
+| 16:10 daily | `ibkrv2stg-account-sync-daily` | Validate the production manifest/hash and idempotently synchronize U16088571 into the website database. It has no Flex access. Stops on the day v2 makes its own daily Flex pull. |
+| 16:20 daily | `ibkrv2stg-institutional-daily` | Process active website-managed Flex connections with one statement-generation attempt per source, asking for data up to the previous HKT day, archive the raw response, partition selected accounts and enqueue downstream work. From the switch day (`scripts/cutover_v11_accounts_to_flex.py`) it is the one daily IBKR request. |
 | 16:30 daily | `ibkrv2stg-benchmark-daily` | Refresh provisional Yahoo benchmarks and crisis data. |
 | 16:45 daily | `ibkrv2stg-sector-classification` | Refresh provisional holdings-sector classifications. |
 | 16:50 daily | `ibkrv2stg-derived-daily` | Recalculate every active filtered or composite portfolio in dependency order after its physical sources and market data are available. |

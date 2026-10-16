@@ -38,8 +38,11 @@ def main():
     for name in HEARTBEATS:
         if by_name[name]['trigger'] != 'Schedule' or by_name[name]['cron'] != '*/5 * * * *':
             raise RuntimeError('Heartbeat schedule drift: ' + name)
-    rules = [
+    # With IBKR_DAILY_FEED=direct_flex v1.1's pull has stopped, so it has no rule;
+    # disable or delete the deployed ibkr-v11-daily-schedule-watchdog separately.
+    rules = ([
         {'name': 'ibkr-v11-daily-schedule-watchdog', 'workspaceName': 'ibkrv11-logs', 'query': daily_query(DAILY_V1)},
+    ] if DAILY_V1 else []) + [
         {'name': 'ibkr-v2-daily-schedule-watchdog', 'workspaceName': 'ibkrv2stg-logs', 'query': daily_query(DAILY_V2)},
         {'name': 'ibkr-v2-background-heartbeat-watchdog', 'workspaceName': 'ibkrv2stg-logs', 'query': heartbeat_query()},
     ]
@@ -67,7 +70,8 @@ def main():
         empty = 'datatable(TimeGenerated:datetime,JobName_s:string,Reason_s:string,ExecutionName_s:string)[]'
         simulated = az('monitor', 'log-analytics', 'query', '-w', workspace,
                        '--analytics-query', rule['query'].replace('ContainerAppSystemLogs_CL', empty))
-        expected = 1 if rule['workspaceName'] == 'ibkrv11-logs' else (2 if 'heartbeat' in rule['name'] else 10)
+        expected = (len(DAILY_V1) if rule['workspaceName'] == 'ibkrv11-logs'
+                    else len(HEARTBEATS) if 'heartbeat' in rule['name'] else len(DAILY_V2))
         if len(simulated) != expected:
             raise RuntimeError('Synthetic missing-telemetry detection failed')
         evidence['queries'].append({'name': rule['name'], 'live_issues': rows, 'synthetic_issues': len(simulated)})

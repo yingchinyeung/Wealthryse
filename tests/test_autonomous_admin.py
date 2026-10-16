@@ -67,6 +67,32 @@ class AutonomousAdminTests(unittest.TestCase):
         self.assertEqual(actions["sp500_benchmark_freshness"], "refresh_provisional_benchmarks")
         self.assertEqual(actions["risk_free_freshness"], "refresh_risk_free_rate")
 
+    def test_flex_feed_accepts_yesterdays_pull_and_flags_a_missed_day(self) -> None:
+        def flex(completed):
+            run = {"status": "success", "completed_at": completed}
+            state = self._state()
+            state.update(
+                daily_feed="ibkr_flex",
+                latest_import=run,
+                latest_nav_run={**run, "run_type": "institutional-flex-daily"},
+            )
+            return state
+
+        # Runs every five minutes: on the 22nd it still accepts the 21st's pull.
+        findings = evaluate_supervisor_state(flex("2026-10-21T08:31:00+00:00"), today_hkt=date(2026, 10, 22))
+        self.assertNotIn("account_import_status", {finding.check_id for finding in findings})
+        findings = evaluate_supervisor_state(flex("2026-10-20T08:31:00+00:00"), today_hkt=date(2026, 10, 22))
+        imports = [finding for finding in findings if finding.check_id == "account_import_status"]
+        self.assertEqual(len(imports), 1)
+        self.assertEqual(imports[0].severity, "critical")
+        self.assertIsNone(imports[0].autonomous_action)
+        self.assertIn("Institutional Flex import has not completed", imports[0].description)
+        # The v1.1 import status is no longer what decides it.
+        state = flex("2026-10-21T08:31:00+00:00")
+        state["latest_import"] = {"status": "failed", "completed_at": "2026-10-21T08:31:00+00:00"}
+        findings = evaluate_supervisor_state(state, today_hkt=date(2026, 10, 21))
+        self.assertIn("account_import_status", {finding.check_id for finding in findings})
+
     def test_policy_allows_at_most_one_action_and_honors_cooldown(self) -> None:
         now = datetime(2026, 9, 24, 8, tzinfo=timezone.utc)
         findings = [

@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from .ai_analyst import AIAnalystConfig, AIAnalystError, _default_client
-from .burn_in import freshness_check
+from .burn_in import flex_import_failures, freshness_check
 from .util import canonical_json
 
 
@@ -154,7 +154,30 @@ def evaluate_supervisor_state(
             findings.append(finding)
 
     latest_import = state.get("latest_import") or {}
-    if latest_import.get("status") != "success":
+    if state.get("daily_feed") == "ibkr_flex":
+        # This runs every five minutes, so it accepts yesterday's pull; the
+        # 17:15 HKT burn-in check requires today's.
+        failures = flex_import_failures(state, today_hkt=today_hkt, maximum_age_days=1)
+        if failures:
+            nav_run = state.get("latest_nav_run") or {}
+            findings.append(
+                Finding(
+                    incident_key="account_import_status",
+                    check_id="account_import_status",
+                    severity="critical",
+                    description="; ".join(failures),
+                    evidence={
+                        "daily_feed": "ibkr_flex",
+                        "status": latest_import.get("status"),
+                        "completed_at": latest_import.get("completed_at"),
+                        "latest_nav_run_type": nav_run.get("run_type"),
+                        "latest_nav_run_completed_at": nav_run.get("completed_at"),
+                    },
+                    # Deliberately no automatic retry: this path calls IBKR Flex.
+                    autonomous_action=None,
+                )
+            )
+    elif latest_import.get("status") != "success":
         findings.append(
             Finding(
                 incident_key="account_import_status",

@@ -34,7 +34,7 @@ from ibkr_etl.autonomous_admin import (  # noqa: E402
     evaluate_supervisor_state,
     plan_safe_repairs,
 )
-from ibkr_etl.burn_in import now_hkt_date, portal_boundary_check  # noqa: E402
+from ibkr_etl.burn_in import collect_import_state, now_hkt_date, portal_boundary_check  # noqa: E402
 from ibkr_etl.ops_agent_posts import post_connection_reports, post_new_diagnoses  # noqa: E402
 from ibkr_etl.util import canonical_json, utc_now_iso  # noqa: E402
 
@@ -132,7 +132,7 @@ def _activate_web_revision(
     return f"revision-activated:{app_name}:{revision_name}"
 
 
-def _database_state(connection, account_id: str) -> dict:
+def _database_state(connection, account_id: str, today_hkt) -> dict:
     dates = connection.execute(
         """
         SELECT
@@ -146,14 +146,7 @@ def _database_state(connection, account_id: str) -> dict:
         """,
         (account_id,),
     ).fetchone()
-    latest_import = connection.execute(
-        """
-        SELECT run_id, status, requested_to, completed_at
-        FROM ingestion_runs
-        WHERE run_type = 'staging-snapshot-import'
-        ORDER BY run_id DESC LIMIT 1
-        """
-    ).fetchone()
+    imports = collect_import_state(connection, account_id, as_of=today_hkt)
     latest_snapshot = connection.execute(
         """
         SELECT snapshot_id, period_end, data_as_of, status, quality_status
@@ -188,7 +181,7 @@ def _database_state(connection, account_id: str) -> dict:
     ).fetchone()
     return {
         **dict(dates),
-        "latest_import": None if latest_import is None else dict(latest_import),
+        **imports,
         "latest_snapshot": None if latest_snapshot is None else dict(latest_snapshot),
         "ready_report_types": ready_report_types,
         "client_approval_count": int(client_approvals["n"]),
@@ -530,7 +523,7 @@ def main() -> int:
         connection.commit()
 
         stage = "collect_database_state"
-        state = _database_state(connection, account_id)
+        state = _database_state(connection, account_id, now_hkt_date())
         stage = "check_portal_boundary"
         portal_failure = _portal_failure(portal_url, entra_tenant_id)
         stage = "update_recovery_state"

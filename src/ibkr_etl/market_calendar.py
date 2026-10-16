@@ -222,6 +222,23 @@ The 35min allowance is our operational policy, not a Yahoo delivery guarantee.
             "expected_date":expected.isoformat(), "producer_cutoff_date":cap.isoformat()}
 
 
+# Exchanges publish next-year holidays late (SSE in December, TWSE after the
+# DGPA calendar). Warn well before an uncovered year starts failing closed.
+COVERAGE_RENEWAL_DAYS = 90
+
+
+def calendar_coverage(today: date, *, renewal_days: int = COVERAGE_RENEWAL_DAYS) -> list[dict]:
+    """Report each benchmark market's coverage end; never extends coverage."""
+    rows = []
+    for market in sorted(set(BENCHMARK_MARKETS.values())):
+        end = CALENDARS[market].coverage_end
+        remaining = (end - today).days
+        rows.append({"market":market, "coverage_end":end.isoformat(), "days_remaining":remaining,
+                     "state":"expired" if remaining < 0 else "renewal_due" if remaining <= renewal_days
+                     else "covered"})
+    return rows
+
+
 def check_benchmark_dates(evidence):
     """Shadow-only checks; no global all-data-fresh conclusion is returned."""
     now = datetime.fromisoformat(str(evidence["capture"]["captured_at"]))
@@ -249,5 +266,6 @@ def check_benchmark_dates(evidence):
             item["state"] = "calendar_unverified"
         checks.append(item)
     return {"mode":"shadow", "checks":checks,
+            "calendar_coverage":calendar_coverage(now.astimezone(HKT).date()),
             "unverified_scopes":["IBKR NAV publication calendar", "FX provider calendar", "Treasury publication calendar",
                                  "unregistered emergency exchange closures", "provider data corrections"]}

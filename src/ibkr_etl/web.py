@@ -10825,6 +10825,25 @@ def account_subpage(
     return _account_page(account_id, section, user, part)
 
 
+# Factsheet designer: upload a template, review the design agents' draft, edit it in plain
+# words and submit it as a design request. Every route answers 404 unless
+# FACTSHEET_DESIGN_AGENTS_ENABLED is true; see factsheet_design_web.py. Installed before the
+# /accounts/{account_id}/{section} page route, which would otherwise answer the designer's page.
+from . import factsheet_design_web as _factsheet_design_web
+from .agent_web import design_api as _design_api
+
+_factsheet_design_web.install(
+    app,
+    owner_user=_owner_user,
+    check_subject=_report_design_owner,
+    write_database=lambda: _approval_database(),
+    portable=_portable_database_connection,
+    render_page=_platform_shell,
+    tenant_id=TENANT_ID,
+    agent_api=_design_api,
+)
+
+
 @app.get("/accounts/{account_id}/{section}", response_class=HTMLResponse)
 def account_page(
     account_id: str,
@@ -11245,24 +11264,6 @@ _install_agent_web(
     render_page=_platform_shell,
     account_names=_agent_account_names,
     export_source=_agent_export_source,
-)
-
-
-# Factsheet designer: upload a template, review the design agents' draft, edit it in plain
-# words and submit it as a design request. Every route answers 404 unless
-# FACTSHEET_DESIGN_AGENTS_ENABLED is true; see factsheet_design_web.py.
-from . import factsheet_design_web as _factsheet_design_web
-from .agent_web import design_api as _design_api
-
-_factsheet_design_web.install(
-    app,
-    owner_user=_owner_user,
-    check_subject=_report_design_owner,
-    write_database=lambda: _approval_database(),
-    portable=_portable_database_connection,
-    render_page=_platform_shell,
-    tenant_id=TENANT_ID,
-    agent_api=_design_api,
 )
 
 

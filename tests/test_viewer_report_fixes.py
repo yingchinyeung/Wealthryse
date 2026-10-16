@@ -2,7 +2,7 @@ import copy
 import unittest
 from unittest.mock import patch
 from fastapi import HTTPException
-from ibkr_etl.viewer_labels import account_card_title
+from ibkr_etl.viewer_labels import account_card_name, account_card_title
 from ibkr_etl.subject_exports import subject_export, PERFORMANCE, EXPOSURES, TRADES
 from ibkr_etl.ai_analyst import prepare_model_context,AIAnalystError,AIAnalystConfig,generate_grounded_narrative,_deterministic_outputs,ANALYSIS_TOOLS
 from ibkr_etl.agent_tools import AgentToolContext
@@ -22,6 +22,9 @@ class ViewerFixTests(unittest.TestCase):
     def test_card_names(self):
         for sid,name,expected in [('U16088571','U16088571-U.S. Technology','U16088571 - U.S. Technology'),('U16088606','U16088606 - Greater China','U16088606 - Greater China'),('hong-kong-china','China & Hong Kong','hong-kong-china - China & Hong Kong'),('alpha-world-ms','Alpha World MS','alpha-world-ms - Alpha World MS')]:
             self.assertEqual(account_card_title({'subject_id':sid,'display_name':name}),expected)
+    def test_home_card_shows_only_the_name(self):
+        for sid,name,expected in [('U16088571','U16088571-U.S. Technology','U.S. Technology'),('alpha-world-t','alpha-world-t - Alpha World T','Alpha World T'),('hong-kong-china','China & Hong Kong','China & Hong Kong'),('U16088606','U16088606','U16088606')]:
+            self.assertEqual(account_card_name({'subject_id':sid,'display_name':name}),expected)
     def test_derived_performance_reads_scoped_view(self):
         connection=Connection([[{'latest':'2026-10-07'}],[{'snapshot_date':'2026-10-07','currency':'USD','total_text':'100'}]])
         columns,rows,end,start=subject_export(connection,**self.args())

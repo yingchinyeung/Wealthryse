@@ -390,6 +390,34 @@ tbody tr:hover { background: var(--mission-hover); }
   main { width: min(100% - 32px, 1320px); }
 }
 
+/* Portfolio analyst chat: its own styles assume a light card and a blue accent with white text,
+   so restate them on the mission colours. "body" outranks the chat's later-loaded rules. */
+body .wr-panel { background: var(--bg); color: var(--ink); border: 1px solid var(--line-strong); border-radius: var(--radius-lg); box-shadow: 0 18px 48px rgba(0, 0, 0, .45); font-family: var(--font-mission); }
+body .wr-head { padding: 14px 16px 8px; }
+body .wr-title strong { font-size: 13px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+body .wr-sub { color: var(--muted); opacity: 1; }
+body .wr-icons button:hover { background: var(--mission-hover); }
+body .wr-bar { border-bottom-color: var(--line); }
+body .wr-bar a, body .wr-bar button, body .wr-explain, body .wr-rate button { color: var(--ink); background: transparent; border-color: var(--line-strong); border-radius: 0; }
+body .wr-bar a:hover, body .wr-bar button:hover, body .wr-chip:hover, body .wr-explain:hover { border-color: var(--ink); }
+body .wr-msg { border-radius: var(--radius-md); font-size: 15px; line-height: 1.55; }
+body .wr-bot { background: var(--mission-raised); color: var(--ink); border: 1px solid var(--line); }
+body .wr-user { background: var(--ink); color: var(--bg); }
+body .wr-chip { background: var(--bg); color: var(--ink); border-color: var(--line-strong); border-radius: 0; font-size: 14px; }
+body .wr-status, body .wr-cite, body .wr-sources, body .wr-hint { color: var(--muted-strong); opacity: 1; }
+body .wr-form { border-top-color: var(--line); }
+body .wr-form textarea { color: var(--ink); background: var(--surface-soft); border-color: var(--line-strong); border-radius: 0; font-size: 15px; }
+body .wr-form textarea::placeholder { color: var(--muted); }
+body .wr-fab, body .wr-form button { background: var(--ink); color: var(--bg); border: 1px solid var(--ink); border-radius: 0; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+body .wr-fab { font-size: 12px; box-shadow: 0 8px 24px rgba(0, 0, 0, .35); }
+body .wr-form button { font-size: 12px; }
+body .wr-fab:hover, body .wr-form button:hover:not(:disabled) { background: var(--bg); color: var(--ink); }
+body .wr-form button:disabled { opacity: .45; }
+body .wr-fab:focus-visible, body .wr-panel button:focus-visible, body .wr-panel a:focus-visible { outline-color: var(--ink); }
+body .wr-alert { color: var(--warn-ink); }
+body .wr-table th, body .wr-table td { border-bottom-color: var(--line); }
+body .wr-table thead th { background: var(--mission-raised); }
+
 /* Dark mode, the default. Every "@media screen" block is the dark theme, which
    the header's theme switch turns off for people who choose light mode. */
 @media screen {
@@ -447,7 +475,7 @@ HOME_MISSION_CSS = MISSION_THEME_CSS + r"""
 .account-card .loss { color: var(--loss); }
 .account-card .behind { color: var(--warn-ink); }
 .account-badge { margin-bottom: 14px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .22em; }
-.account-id { font-size: clamp(22px, 2.6vw, 32px); font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.account-id { font-size: clamp(22px, 2.6vw, 32px); font-weight: 600; letter-spacing: .01em; }
 .account-stats { margin-top: 22px; padding-top: 0; border-top: 0; }
 .account-nav-value { font-size: clamp(34px, 4vw, 52px); font-weight: 500; letter-spacing: 0; }
 .account-returns { gap: 26px; font-size: 16px; }

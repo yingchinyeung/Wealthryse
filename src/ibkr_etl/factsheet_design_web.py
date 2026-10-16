@@ -30,6 +30,7 @@ import io
 import os
 import re
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from html import escape
@@ -48,6 +49,10 @@ from .factsheet_spec.spec import spec_sha256
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_MORE_EXAMPLES = 6
+# The website's ingress ends a request after about 240 seconds; the agent calls in one
+# request share this budget, leaving time to read, render and stress-test the design.
+AGENT_SECONDS = 150.0
+MIN_CALL_SECONDS = 20.0
 SUBJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 CURRENCY = re.compile(r"^[A-Z]{3}$")
 
@@ -89,12 +94,26 @@ class WebDesignAgent:
     owner's error to see.
     """
 
-    def __init__(self, api: Any, user_object_id: str, subject_id: str) -> None:
+    def __init__(self, api: Any, user_object_id: str, subject_id: str, budget_seconds: float = AGENT_SECONDS) -> None:
         self.api, self.user, self.subject = api, user_object_id, subject_id
+        # One website request may make several agent calls (the builder's rounds, then the
+        # checker); together they stay inside this budget so the page answers before the
+        # ingress cuts the request off.
+        self.deadline = time.monotonic() + budget_seconds
 
     def _call(self, path: str, facts: Mapping[str, Any]) -> Mapping[str, Any]:
+        import httpx
+
+        remaining = self.deadline - time.monotonic()
+        if remaining < MIN_CALL_SECONDS:
+            raise HTTPException(status_code=504, detail="The design agents ran out of time for this request.")
         body = {"user_object_id": self.user, "subject_id": self.subject, "facts": dict(facts)}
-        return self.api.request("POST", f"/v1/factsheet-designs/{path}", timeout=180.0, json=body)["answer"]
+        try:
+            return self.api.request("POST", f"/v1/factsheet-designs/{path}", timeout=remaining, json=body)["answer"]
+        except httpx.TimeoutException as error:
+            raise HTTPException(status_code=504, detail="The design agents took too long to answer.") from error
+        except httpx.HTTPError as error:
+            raise HTTPException(status_code=502, detail="The design agents could not be reached.") from error
 
     def build_step(self, facts: Mapping[str, Any]) -> Mapping[str, Any]:
         try:
@@ -214,6 +233,16 @@ def install(app: FastAPI, *, owner_user: Callable[..., dict[str, Any]],
                 yield portable(connection)
         except store.DesignStoreError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
+        except HTTPException:
+            raise
+        except Exception as error:
+            # Two changes to one design at once: the second one's version number is taken.
+            if any(kind.__name__ == "IntegrityError" for kind in type(error).__mro__):
+                raise HTTPException(status_code=409, detail="The design changed since you opened it. "
+                                                            "Reload and try again.") from error
+            if any(kind.__module__.startswith("psycopg") for kind in type(error).__mro__[:-1]):
+                raise HTTPException(status_code=503, detail="The design store is not available.") from error
+            raise
 
     def sample(subject_id: str, currency: str) -> Mapping[str, Any]:
         found = snapshot_for(subject_id, currency) if snapshot_for else None
@@ -458,10 +487,11 @@ def install(app: FastAPI, *, owner_user: Callable[..., dict[str, Any]],
             if current["parent_version"] is None:
                 raise HTTPException(status_code=409, detail="This is the first version; there is nothing to undo.")
             parent = store.version(connection, str(draft_id), current["parent_version"])
+            # The undo version takes the restored version's own parent, so undoing again steps further back.
             number = store.add_version(
                 connection, tenant_id, str(draft_id), spec=parent["spec"], spec_sha256=parent["spec_sha256"],
                 source="undo", summary=f"Back to version {parent['version']}", changes=[], checks=parent["checks"],
-                actor=actor(user), expected_version=body.expected_version)
+                actor=actor(user), expected_version=body.expected_version, parent_version=parent["parent_version"])
         return {"current_version": number}
 
     @app.post("/api/factsheet-designs/{subject_id}/drafts/{draft_id}/submit")
@@ -479,8 +509,11 @@ def install(app: FastAPI, *, owner_user: Callable[..., dict[str, Any]],
                 raise HTTPException(status_code=409, detail="This version fails its checks; fix it before submitting.")
             description = (f"New factsheet design from the factsheet designer: {row['title']}. "
                            f"Draft {draft_id}, version {current['version']}, spec {current['spec_sha256']}.")
-            request = report_design_updates.create_request(connection, tenant_id, subject_id, uuid.uuid4(),
-                                                           description, actor(user))
+            try:
+                request = report_design_updates.create_request(connection, tenant_id, subject_id, uuid.uuid4(),
+                                                               description, actor(user))
+            except ValueError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
             store.set_status(connection, tenant_id, str(draft_id), "submitted")
         return {"status": "submitted", "request_id": str(request["request_id"])}
 

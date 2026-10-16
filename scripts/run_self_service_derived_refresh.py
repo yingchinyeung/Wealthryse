@@ -30,6 +30,12 @@ from ibkr_etl.onboarding_agents import run_reconciliations  # noqa: E402
 from ibkr_etl.onboarding_dry_run import record_history_build, run_portfolio_dry_runs  # noqa: E402
 from ibkr_etl.profiled_composite import is_profiled  # noqa: E402
 from ibkr_etl.provisional_benchmark import refresh_and_materialize  # noqa: E402
+from ibkr_etl.reference_data_source import (  # noqa: E402
+    BLOB as REFERENCE_FROM_BLOB,
+    DATABASE as REFERENCE_FROM_DATABASE,
+    materialize_database_reference,
+    reference_data_source,
+)
 from ibkr_etl.risk_snapshots import build_risk_snapshot  # noqa: E402
 from ibkr_etl.sector_classification import (  # noqa: E402
     refresh_sector_classifications_range,
@@ -40,15 +46,10 @@ from ibkr_etl.subject_onboarding import (  # noqa: E402
 from ibkr_etl.util import canonical_json  # noqa: E402
 
 
-def _download_reference_data(settings, destination: Path) -> dict:
-    """Load the governed reference cache, preferring the website archive.
+def _reference_sources(settings) -> list[tuple[str, str, str]]:
+    """Where the published file is looked for, in order."""
 
-    The current production reference artifact is still published by v1.1.  The
-    explicit read-only fallback keeps the derived migration reproducible until
-    the institutional importer publishes the same artifact into v2 storage.
-    """
-
-    sources = [
+    return [
         (
             settings.azure_storage_account_url,
             settings.azure_report_container,
@@ -60,8 +61,18 @@ def _download_reference_data(settings, destination: Path) -> dict:
             "legacy-production",
         ),
     ]
+
+
+def _download_reference_data(settings, destination: Path) -> dict:
+    """Load the governed reference cache, preferring the website archive.
+
+    The current production reference artifact is still published by v1.1.  The
+    explicit read-only fallback keeps the derived migration reproducible until
+    the institutional importer publishes the same artifact into v2 storage.
+    """
+
     blob_name = f"{settings.tenant_id}/reference/reference_data.json"
-    for account_url, container, source in sources:
+    for account_url, container, source in _reference_sources(settings):
         if not account_url or not container:
             continue
         snapshot = download_blob_snapshot(account_url, container, blob_name)
@@ -76,6 +87,14 @@ def _download_reference_data(settings, destination: Path) -> dict:
                 **manifest,
             }
     raise RuntimeError("Published reference_data.json is missing")
+
+
+def _load_reference_input(settings, connection, destination: Path, source: str = REFERENCE_FROM_BLOB) -> dict:
+    """The published file by default; v2's own tables when REFERENCE_DATA_SOURCE=database."""
+
+    if source == REFERENCE_FROM_DATABASE:
+        return materialize_database_reference(connection, settings.tenant_id, destination)
+    return _download_reference_data(settings, destination)
 
 
 def _approved_targets(connection) -> list[dict]:
@@ -436,6 +455,7 @@ def main() -> int:
         raise RuntimeError("Self-service derived refresh requires DATABASE_URL")
     if not settings.azure_storage_account_url:
         raise RuntimeError("Self-service derived refresh requires AZURE_STORAGE_ACCOUNT_URL")
+    reference_kind = reference_data_source()
     connection = connect(
         settings.database_path, settings.database_url, settings.tenant_id
     )
@@ -460,7 +480,9 @@ def main() -> int:
 
         def reference() -> dict:
             if "source" not in downloaded:
-                downloaded["source"] = _download_reference_data(settings, reference_path)
+                downloaded["source"] = _load_reference_input(
+                    settings, connection, reference_path, reference_kind
+                )
             return downloaded["source"]
 
         portfolio_cases = _dry_run_portfolio_cases(connection, settings.tenant_id, reference_path, reference)

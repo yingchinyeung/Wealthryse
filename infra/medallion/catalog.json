@@ -769,9 +769,9 @@
   },
   "public.factsheet_design_files": {
    "kind": "table",
-   "layer": "ops",
-   "target_schema": "public",
-   "note": "Uploaded factsheet template files for the design agents, stored by sha256. Workflow input, not portfolio data."
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Owners' uploaded factsheet templates and examples, exactly as received and keyed by sha256. Insert and read only, so it takes the bronze lock with no exception. Moves with the bronze batch."
   },
   "public.factsheet_design_drafts": {
    "kind": "table",
@@ -1436,7 +1436,7 @@
     "conform"
    ],
    "schedule": "08:50 UTC",
-   "note": "Also reads reference_data.json from v1.1 analytics-reports."
+   "note": "Also reads reference_data.json from v1.1 analytics-reports. REFERENCE_DATA_SOURCE=database reads silver instrument_classifications and risk_free_rates instead."
   },
   "ibkrv2stg-flex-discovery": {
    "hops": [

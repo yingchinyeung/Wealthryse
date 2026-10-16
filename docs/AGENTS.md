@@ -619,6 +619,40 @@ it, it applies fixed rules first, then the analyst explains any alert:
 `014_risk_watch.sql`), grant accounts with `--grant risk_watch=<account>` (or `=all`), rebuild the agent and
 web images, and deploy `infra/agent-apps.bicep` for the new job.
 
+## Export agent
+
+Each account's Exports tab gets an export agent panel (wherever `AGENT_UI_MODE` shows the agents). The model plans; code
+builds and checks.
+
+1. **Plan.** The person describes the export in words. The agent service's planner (`wealthryse_agent.exports`,
+   `EXPORT_PLANNER`) returns a plan under a strict JSON schema: which of the four datasets (value history, holdings,
+   cash activity, trades), dates, columns, filters (cash activity types, currencies, symbol, side) and totals. It sees
+   only the account's shapes and names, never balances or rows. The website validates the plan against the account
+   (`ibkr_etl.export_agent.validate_plan`): dates outside the history move to its edges and say so; anything unknown is
+   refused, never guessed. The plan is shown in sentences written by code.
+2. **Build and check.** The website builds the files from the Exports tab's own reads (`subject_exports`), in a fixed
+   order, and totals them with Decimal, one currency at a time. Fixed checks then run: each file reads back row for row,
+   every total equals the sum of the detail file, every row is inside the plan's dates and filters, no duplicate
+   executions, dates or holdings, amounts are numbers, and ties to the books (the last value equals the account's value
+   that day; no gap over 10 days in the value history; holdings plus cash within 1% of the account's value; cash rolls
+   forward from opening to closing balances, shown as a note when it doesn't). The checker agent (`EXPORT_CHECKER`)
+   reads the results through one tool and writes the cover note; the usual validator rejects any figure not in them,
+   and a code-written note is used instead. It can add concerns, which turn a pass into a review, but can't clear a
+   failure. Each check is saved in `agent.export_checks` with a fingerprint of the files.
+3. **Download.** The website rebuilds the files and serves a zip (README with the cover note and checks,
+   `manifest.json` with SHA-256 hashes, the data and totals CSVs) only if the fingerprint matches. A failed export can't
+   be downloaded; one that needs review is released by the person, and the record says so. CSV cells that would run as
+   spreadsheet formulas are quoted; negative numbers stay numbers.
+
+**Recurring packs.** A plan can be saved to run every month, quarter or year (`agent.export_packs`). The `export_packs`
+job (`ibkrv2stg-agent-export-packs`, 01:45 UTC daily, no model) leaves one `export_pack` inbox card per pack and closed
+period, shown only to the person who saved it; the card opens the panel, which builds that period through the same
+checks. A new pack starts with the last period already closed. Nothing is emailed or sent.
+
+**Turning it on** (each step needs Ying's typed approval): rerun `scripts/install_agent_schema.py` (applies
+`015_export_agent.sql`), grant accounts with `--grant export_packs=all` (or per account), rebuild the agent and web
+images, and deploy `infra/agent-apps.bicep` for the new job.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool

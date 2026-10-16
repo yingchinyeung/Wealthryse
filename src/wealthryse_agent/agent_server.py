@@ -28,6 +28,8 @@ from . import memory
 from .auth import ServiceCaller, TokenSource, Unauthorized, verify_service_token
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings, ServiceAuthSettings
 from .database import connect
+from .exports import MAX_FACTS_BYTES as MAX_EXPORT_FACTS_BYTES
+from .exports import check_note, plan_export
 from .month_team.store import MonthStore
 from .prompts import ANALYST, CASE_ANALYST
 from . import calculator
@@ -133,6 +135,50 @@ class ArchiveRequest(BaseModel):
 class DecisionRequest(BaseModel):
     user_object_id: str = Field(pattern=USER_ID)
     decision: str = Field(pattern="^(read|approved|dismissed)$")
+
+
+class ExportPlanRequest(BaseModel):
+    user_object_id: str = Field(pattern=USER_ID)
+    account_id: str = Field(min_length=1, max_length=64)
+    request: str = Field(min_length=1, max_length=1000)
+    # Computed by the website: the account's datasets, columns, cash activity types, currencies and dates.
+    facts: dict[str, Any]
+
+
+class ExportCheckRequest(BaseModel):
+    user_object_id: str = Field(pattern=USER_ID)
+    account_id: str = Field(min_length=1, max_length=64)
+    plan: dict[str, Any]
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    status: str = Field(pattern="^(pass|review|fail)$")
+    # Computed by the website from the built files: row counts, totals and every check's result.
+    facts: dict[str, Any]
+    pack_item_id: int | None = Field(default=None, ge=1)
+
+
+class ExportPackRequest(BaseModel):
+    user_object_id: str = Field(pattern=USER_ID)
+    account_id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=80)
+    schedule: str = Field(pattern="^(monthly|quarterly|yearly)$")
+    plan: dict[str, Any]
+
+
+MAX_PLAN_BYTES = 20_000
+
+
+def _owner_digest(user: str) -> str:
+    return hashlib.sha256(user.lower().encode()).hexdigest()
+
+
+def _visible(item: dict[str, Any], user: str) -> bool:
+    """An export pack's card belongs to the person who saved the pack, not everyone who sees the account."""
+    if item.get("kind") != "export_pack":
+        return True
+    citations = item.get("citations") or []
+    if isinstance(citations, str):
+        citations = json.loads(citations)
+    return any(isinstance(c, dict) and c.get("owner_sha256") == _owner_digest(user) for c in citations)
 
 
 class _LockedStore:
@@ -411,15 +457,130 @@ def create_app(services: Services) -> FastAPI:
     @app.get("/v1/inbox")
     def inbox(user_object_id: str, status: str | None = None, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
         accounts = accounts_for(user_object_id.lower(), str(uuid.uuid4()))
-        return {"items": services.store().inbox(accounts, status)}
+        return {"items": [i for i in services.store().inbox(accounts, status) if _visible(i, user_object_id)]}
 
     @app.post("/v1/inbox/{item_id}/decision")
     def decide(item_id: int, body: DecisionRequest, _: ServiceCaller = Depends(caller)) -> dict[str, bool]:
         user = body.user_object_id.lower()
         accounts = accounts_for(user, str(uuid.uuid4()))
-        if not services.store().decide(item_id, accounts, body.decision, hashlib.sha256(user.encode()).hexdigest()):
+        store = services.store()
+        hidden = [i for i in store.inbox(accounts) if i["item_id"] == item_id and not _visible(i, user)]
+        if hidden or not store.decide(item_id, accounts, body.decision, hashlib.sha256(user.encode()).hexdigest()):
             raise HTTPException(status_code=404, detail="Item not found.")
         return {"saved": True}
+
+    # Export agent ------------------------------------------------------------------------------
+
+    def _export_account(user: str, account_id: str, correlation_id: str) -> None:
+        if account_id not in accounts_for(user, correlation_id):
+            raise HTTPException(status_code=403, detail="You do not have access to that account.")
+
+    def _record_usage(store: Store, job: str, correlation_id: str, usage: dict[str, int], ok: bool, code: str | None = None) -> None:
+        """Planner and checker tokens count against the daily budget with chat and the jobs."""
+        run_id = store.start_run(job, correlation_id)
+        store.finish_run(run_id, status="succeeded" if ok else "failed", items=1 if ok else 0, usage=usage,
+                         error_code=code)
+
+    @app.post("/v1/exports/plan")
+    def export_plan(body: ExportPlanRequest, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        correlation_id = str(uuid.uuid4())
+        user = body.user_object_id.lower()
+        _export_account(user, body.account_id, correlation_id)
+        if len(json.dumps(body.facts, default=str)) > MAX_EXPORT_FACTS_BYTES:
+            raise HTTPException(status_code=413, detail="This account has too much to describe at once.")
+        store = services.store()
+        if store.tokens_used_today() >= services.runtime.daily_token_budget:
+            raise HTTPException(status_code=429, detail="Today's analysis budget is used up. Try again tomorrow.")
+        try:
+            plan, turn = plan_export(services.agent(), account_id=body.account_id, request=body.request.strip(),
+                                     facts=body.facts)
+        except AgentError as error:
+            _record_usage(store, "export_planner", correlation_id, {}, False, error.code)
+            raise HTTPException(status_code=422, detail=error.message) from error
+        _record_usage(store, "export_planner", correlation_id, turn.usage, True)
+        return {"plan": plan, "correlation_id": correlation_id}
+
+    @app.post("/v1/exports/checks")
+    def export_check(body: ExportCheckRequest, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        """The checker's cover note over the website's check results, saved as the export's check record."""
+        correlation_id = str(uuid.uuid4())
+        user = body.user_object_id.lower()
+        _export_account(user, body.account_id, correlation_id)
+        if len(json.dumps(body.facts, default=str)) > MAX_EXPORT_FACTS_BYTES:
+            raise HTTPException(status_code=413, detail="This export has too much to check at once.")
+        if len(json.dumps(body.plan, default=str)) > MAX_PLAN_BYTES:
+            raise HTTPException(status_code=413, detail="This export plan is too large.")
+        store = services.store()
+        if body.pack_item_id is not None and not any(
+                i["item_id"] == body.pack_item_id and i["kind"] == "export_pack" and _visible(i, user)
+                for i in store.inbox([body.account_id])):
+            raise HTTPException(status_code=404, detail="Export pack card not found.")
+        note, concerns, note_checked = "", [], False
+        if store.tokens_used_today() < services.runtime.daily_token_budget:
+            try:
+                note, concerns, note_checked, turn = check_note(services.agent(), account_id=body.account_id,
+                                                                facts=body.facts)
+                _record_usage(store, "export_checker", correlation_id, turn.usage, note_checked)
+            except AgentError as error:
+                _record_usage(store, "export_checker", correlation_id, {}, False, error.code)
+            except Exception:
+                # The fixed checks stand on their own; without a note the website writes one from them.
+                LOGGER.exception("export checker failed", extra={"correlation_id": correlation_id})
+        # The checker can only make an export stricter: a concern turns a pass into a review.
+        status = "review" if body.status == "pass" and concerns else body.status
+        check_id = store.add_export_check(
+            user=user, account_id=body.account_id, plan=body.plan, fingerprint=body.fingerprint, status=status,
+            note=note, note_checked=note_checked, concerns=concerns, checks=body.facts.get("checks") or [],
+            pack_item_id=body.pack_item_id, correlation_id=correlation_id)
+        return {"check_id": check_id, "status": status, "note": note, "note_checked": note_checked,
+                "concerns": concerns}
+
+    @app.get("/v1/exports/checks/{check_id}")
+    def export_check_record(check_id: str, user_object_id: str = Query(pattern=USER_ID),
+                            _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        found = services.store().export_check(check_id, user_object_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="Export not found.")
+        return found
+
+    @app.post("/v1/exports/checks/{check_id}/release")
+    def release_export(check_id: str, body: ArchiveRequest, _: ServiceCaller = Depends(caller)) -> dict[str, bool]:
+        if not services.store().release_export_check(check_id, body.user_object_id):
+            raise HTTPException(status_code=409, detail="This export can't be released.")
+        return {"released": True}
+
+    @app.get("/v1/exports/packs")
+    def export_packs(user_object_id: str = Query(pattern=USER_ID), account_id: str | None = None,
+                     _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        return {"packs": services.store().export_packs(user_object_id, account_id)}
+
+    @app.post("/v1/exports/packs")
+    def save_export_pack(body: ExportPackRequest, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        user = body.user_object_id.lower()
+        _export_account(user, body.account_id, str(uuid.uuid4()))
+        if len(json.dumps(body.plan, default=str)) > MAX_PLAN_BYTES:
+            raise HTTPException(status_code=413, detail="This export plan is too large.")
+        store = services.store()
+        if len(store.export_packs(user)) >= 50:
+            raise HTTPException(status_code=409, detail="You have 50 saved export packs. Delete one first.")
+        pack_id = store.save_export_pack(user=user, account_id=body.account_id, name=body.name.strip(),
+                                         schedule=body.schedule, plan=body.plan)
+        return {"pack": store.export_pack(pack_id, user)}
+
+    @app.get("/v1/exports/packs/{pack_id}")
+    def export_pack(pack_id: str, user_object_id: str = Query(pattern=USER_ID),
+                    _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
+        found = services.store().export_pack(pack_id, user_object_id)
+        if found is None:
+            raise HTTPException(status_code=404, detail="Export pack not found.")
+        return found
+
+    @app.delete("/v1/exports/packs/{pack_id}")
+    def delete_export_pack(pack_id: str, user_object_id: str = Query(pattern=USER_ID),
+                           _: ServiceCaller = Depends(caller)) -> dict[str, bool]:
+        if not services.store().archive_export_pack(pack_id, user_object_id):
+            raise HTTPException(status_code=404, detail="Export pack not found.")
+        return {"deleted": True}
 
     @app.get("/v1/month-end/runs")
     def month_runs(user_object_id: str, period_end: str | None = Query(default=None, pattern=PERIOD),

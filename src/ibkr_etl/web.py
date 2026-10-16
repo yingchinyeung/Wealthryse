@@ -11142,6 +11142,17 @@ def _agent_account_names(user: dict[str, object]) -> dict[str, str]:
     return {str(item["subject_id"]): account_card_title(item) for item in _account_directory(user)}
 
 
+def _agent_export_source(user: dict[str, object], account_id: str):
+    """The export agent's reads for one account, after the same access check as the CSV exports."""
+    from .export_agent_source import PlatformExportSource
+
+    return PlatformExportSource(
+        database=_database, tenant_id=TENANT_ID, subject_id=account_id,
+        access=_portfolio_access_context(account_id, user),
+        cash_filter=_cash_filter_values, trade_filter=_trade_filter_values,
+    )
+
+
 _install_agent_web(
     app,
     _authorized_user,
@@ -11149,6 +11160,7 @@ _install_agent_web(
     ACCOUNT_THEME_CSS,
     render_page=_platform_shell,
     account_names=_agent_account_names,
+    export_source=_agent_export_source,
 )
 
 

@@ -1,0 +1,1561 @@
+{
+ "about": "Medallion layer for every database table and view, blob container and job. tests/test_medallion_catalog.py fails when a migration adds a table or view, or Bicep adds a container, without an entry here. See docs/MEDALLION_ARCHITECTURE.md.",
+ "version": 1,
+ "layers": {
+  "bronze": "Raw data exactly as received from IBKR, market-data providers and people's uploads. Append-only, never edited; corrections happen in silver.",
+  "silver": "Cleaned, validated and conformed records: accounts, securities, trades, positions, cash, NAV, FX, benchmarks and derived portfolios. Rebuildable from bronze.",
+  "gold": "Reporting-ready analytics and frozen report payloads that feed the factsheets, decks, website and agents.",
+  "ops": "Control plane, not a data layer: runs, approvals, audit, access, onboarding workflow, agent state and configuration.",
+  "platform": "Database plumbing that stays in public: tenants, the migration ledger and the row-level-security helpers."
+ },
+ "hops": {
+  "ingest": "Source to bronze.",
+  "conform": "Bronze to silver.",
+  "analytics": "Silver to gold.",
+  "quality-gate": "Checks between layers; blocks promotion on failure.",
+  "publish": "Gold to rendered files and releases.",
+  "serve": "Gold and silver to the website and agents.",
+  "ops": "Control plane."
+ },
+ "postgres": {
+  "public.account_onboarding_approvals": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.account_onboarding_cases": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.account_onboarding_checks": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.account_onboarding_queue_items": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.account_onboarding_queues": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.accounts": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Dimension."
+  },
+  "public.active_report_designs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.admin_chat_conversations": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.admin_chat_messages": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.agent_tool_audit": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Unused. Retirement candidate."
+  },
+  "public.ai_analyst_conversations": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.ai_analyst_messages": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.analytics_daily": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Legacy; no writer. Retirement candidate."
+  },
+  "public.app_user_roles": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.app_users": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.approved_actions": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.audit_events": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.autonomous_actions": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.autonomous_agent_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.autonomy_authority_reviews": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.autonomy_control": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.autonomy_recovery_state": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.autonomy_release_baselines": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.benchmark_master": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Benchmark dimension and effective-dated subject mapping."
+  },
+  "public.benchmark_prices": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Provider benchmark levels with a quality flag. Read directly as silver today."
+  },
+  "public.broker_connection_accounts": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.broker_connections": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.broker_onboarding_approvals": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.broker_onboarding_cases": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.broker_onboarding_checks": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.broker_onboarding_events": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.burn_in_acceptance_windows": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.burn_in_daily_results": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.cash_snapshots": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Typed Flex sections; values are still stored as text and cast on read."
+  },
+  "public.cash_transactions": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Typed Flex sections; values are still stored as text and cast on read."
+  },
+  "public.corporate_actions": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Typed Flex sections; values are still stored as text and cast on read."
+  },
+  "public.crisis_replay_components": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Historical crisis replay."
+  },
+  "public.crisis_replay_daily": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Historical crisis replay."
+  },
+  "public.crisis_scenario_results": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Hypothetical crisis scenarios."
+  },
+  "public.data_quality_results": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Quality-gate results between layers."
+  },
+  "public.derived_portfolio_cash_balances": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Filtered and composite subjects, conformed to the same shape as account data."
+  },
+  "public.derived_portfolio_cash_ledger": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Filtered and composite subjects, conformed to the same shape as account data."
+  },
+  "public.derived_portfolio_exclusions": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Filtered and composite subjects, conformed to the same shape as account data."
+  },
+  "public.derived_portfolio_nav": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Filtered and composite subjects, conformed to the same shape as account data."
+  },
+  "public.derived_portfolio_positions": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Filtered and composite subjects, conformed to the same shape as account data."
+  },
+  "public.derived_portfolios": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Configuration: filtered-portfolio definitions."
+  },
+  "public.flex_request_state": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.flex_rows": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Every Flex record as raw JSON; the database copy of the raw statement."
+  },
+  "public.fx_evidence_batches": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Append-only, versioned raw FX evidence (not yet activated)."
+  },
+  "public.fx_evidence_legacy_aliases": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Append-only, versioned raw FX evidence (not yet activated)."
+  },
+  "public.fx_evidence_observations": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Append-only, versioned raw FX evidence (not yet activated)."
+  },
+  "public.fx_evidence_runs": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Append-only, versioned raw FX evidence (not yet activated)."
+  },
+  "public.fx_evidence_versions": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Append-only, versioned raw FX evidence (not yet activated)."
+  },
+  "public.fx_rates": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Typed Flex sections; values are still stored as text and cast on read."
+  },
+  "public.fx_transactions": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Typed Flex sections; values are still stored as text and cast on read."
+  },
+  "public.ibkr_credential_circuit_state": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.ibkr_flex_credentials": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.ibkr_flex_queries": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.ibkr_flex_source_accounts": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.ibkr_flex_source_run_accounts": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.ibkr_flex_source_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.ibkr_flex_source_validation_requests": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.identity_registry_revisions": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.ingestion_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Load log for bronze batches (raw_sha256, raw_path)."
+  },
+  "public.institutional_shadow_reconciliations": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.institutional_work_items": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.instrument_classifications": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Sector and industry enrichment."
+  },
+  "public.instruments": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Dimension."
+  },
+  "public.live_account_values": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Raw TWS API snapshots with a retention period. Flex stays the book of record."
+  },
+  "public.live_contracts": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Raw TWS API snapshots with a retention period. Flex stays the book of record."
+  },
+  "public.live_daily_bars": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Raw TWS API snapshots with a retention period. Flex stays the book of record."
+  },
+  "public.live_executions": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Raw TWS API snapshots with a retention period. Flex stays the book of record."
+  },
+  "public.live_gateway_status": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.live_positions": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Raw TWS API snapshots with a retention period. Flex stays the book of record."
+  },
+  "public.live_quotes": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Raw TWS API snapshots with a retention period. Flex stays the book of record."
+  },
+  "public.market_data_prices": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Yahoo prices as fetched. Read directly as silver today."
+  },
+  "public.master_account_definitions": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.master_account_memberships": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.metric_definitions": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Metric catalogue (semantic layer); seeded, no reader in code yet."
+  },
+  "public.nav_snapshots": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Typed Flex sections; values are still stored as text and cast on read."
+  },
+  "public.onboarding_historical_report_batches": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.onboarding_historical_report_items": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Points at rendered files by container and blob name."
+  },
+  "public.onboarding_source_accounts": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.owner_codex_sessions": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.owner_codex_task_events": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.owner_codex_tasks": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.performance_comparison_daily": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Portfolio vs benchmark returns."
+  },
+  "public.platform_subjects": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Subject dimension (also holds lifecycle state)."
+  },
+  "public.portfolio_analyst_assurance_findings": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Quality gate on gold."
+  },
+  "public.portfolio_analyst_assurance_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Quality gate on gold."
+  },
+  "public.portfolio_benchmark_mapping": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Benchmark dimension and effective-dated subject mapping."
+  },
+  "public.position_snapshots": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Typed Flex sections; values are still stored as text and cast on read."
+  },
+  "public.qualified_report_designs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.raw_reports": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Pointer and sha256 for each archived raw Flex XML file in blob storage."
+  },
+  "public.reference_fx_rates": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Provider FX closes with a quality flag. Read directly as silver today."
+  },
+  "public.report_artifact_releases": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Points at released files by container and blob name."
+  },
+  "public.report_design_update_requests": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.report_generation_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.report_release_decisions": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.report_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Legacy daily report log. Retirement candidate."
+  },
+  "public.reporting_snapshots": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Frozen month-end report payload; immutable once frozen."
+  },
+  "public.risk_analytics_snapshots": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Versioned risk payload per subject and date."
+  },
+  "public.risk_free_rates": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "US Treasury and HIBOR series as fetched. Read directly as silver today."
+  },
+  "public.schema_migrations": {
+   "kind": "table",
+   "layer": "platform",
+   "target_schema": "public",
+   "note": "Migration ledger, created by db.py at runtime."
+  },
+  "public.security_identifiers": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Cross-broker security identity (no writer yet)."
+  },
+  "public.security_master": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Cross-broker security identity (no writer yet)."
+  },
+  "public.specialist_audit_events": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.specialist_daily_reports": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.specialist_observation_controls": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.specialist_observation_grants": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.specialist_report_deliveries": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.subject_calculation_definitions": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Configuration: versioned calculation definitions."
+  },
+  "public.subject_calculation_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.subject_dependencies": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.subject_feature_states": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.subject_flex_source_bindings": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.subject_operating_registrations": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.subject_report_template_assets": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "Points at uploaded template files by container and blob name."
+  },
+  "public.synthetic_portfolio_components": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Composite constituents by day."
+  },
+  "public.system_incidents": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.tenants": {
+   "kind": "table",
+   "layer": "platform",
+   "target_schema": "public",
+   "note": "Anchor for row-level security."
+  },
+  "public.trades": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Typed Flex sections; values are still stored as text and cast on read."
+  },
+  "public.user_account_access": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.workflow_cycle_date_policies": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.workflow_lease_events": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.workflow_outbox": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops",
+   "note": "No writer. Retirement candidate."
+  },
+  "public.workflow_shadow_decisions": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.workflow_stage_evidence": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "ops"
+  },
+  "public.subject_cash_activity_series": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Read contract: cash activity."
+  },
+  "public.subject_cash_balance_series": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Read contract: cash balances."
+  },
+  "public.subject_live_positions": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Latest live positions per subject."
+  },
+  "public.subject_live_summary": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Latest live snapshot per subject."
+  },
+  "public.subject_nav_series": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Read contract: NAV for accounts and derived subjects."
+  },
+  "public.subject_position_series": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Read contract: positions for accounts and derived subjects."
+  },
+  "public.v_daily_nav": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "NAV TOTAL cast to numbers."
+  },
+  "public.v_latest_positions": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Latest position_snapshots."
+  },
+  "agent.connection_reports": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.conversations": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.eval_cases": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.export_checks": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.export_packs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.feedback": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.inbox": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.memories": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.messages": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.month_objections": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.month_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.month_steps": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.onboarding_reconciliations": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.onboarding_reviews": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.onboarding_term_drafts": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.ops_investigations": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.service_grants": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.tool_calls": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state."
+  },
+  "agent.accounts": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.benchmark_master": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.benchmark_prices": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
+  },
+  "agent.broker_logins": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
+  },
+  "agent.derived_portfolio_cash_ledger": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.flex_rows": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
+  },
+  "agent.fx_rates": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.ingestion_runs": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
+  },
+  "agent.instrument_classifications": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.instruments": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.live_executions": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
+  },
+  "agent.live_gateway": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
+  },
+  "agent.live_positions": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
+  },
+  "agent.live_summary": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
+  },
+  "agent.month_end_packages": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.month_end_snapshots": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_activity": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_broker_cases": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_cash": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_corporate_actions": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_fx_rates": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_instruments": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_intake_cases": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_live_cases": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_nav": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_positions": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.onboarding_report_cases": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.open_incidents": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.platform_subjects": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.portfolio_benchmark_mapping": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.recent_admin_actions": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.recent_admin_runs": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.recent_ingestion_runs": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.security_identifiers": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.subject_calculation_definitions": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.subject_nav_series": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.subject_position_series": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  },
+  "agent.synthetic_portfolio_components": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read."
+  }
+ },
+ "blob_containers": {
+  "ibkrv115rcc62xxqblay/raw-statements": {
+   "layer": "bronze",
+   "declared_in": "infra/main.bicep",
+   "holds": "Raw IBKR Flex XML from the v1.1 daily job, since Jan 2025. Under legal hold.",
+   "plan": "Copy into ibkr-raw under v11-archive/ with sha256 checks before v1.1 is retired."
+  },
+  "ibkrv115rcc62xxqblay/analytics-reports": {
+   "layer": "gold",
+   "declared_in": "infra/main.bicep",
+   "holds": "v1.1 outputs: latest analyst SQLite and manifest, HTML dashboard, reference_data.json.",
+   "plan": "Today it is v2's main daily feed. Retires when v2 pulls Flex itself into bronze."
+  },
+  "ibkrv115rcc62xxqblay/source-protection-probes": {
+   "layer": "ops",
+   "declared_in": null,
+   "holds": "Immutability probes. Under legal hold.",
+   "plan": "Declare in Bicep; retires with v1.1."
+  },
+  "ibkrv2stgauhecwc4itaoo/ibkr-raw": {
+   "layer": "bronze",
+   "declared_in": null,
+   "holds": "Raw IBKR Flex XML from v2's own Flex pulls. Under legal hold.",
+   "plan": "The single raw Flex landing. Declare in Bicep with its legal hold."
+  },
+  "ibkrv2stgauhecwc4itaoo/input-snapshots": {
+   "layer": "bronze",
+   "declared_in": "infra/staging.bicep",
+   "holds": "Per-account SQLite cut from the v1.1 export, plus recovery-drill files.",
+   "plan": "Retires with the v1.1 hand-off; recovery drills move to an ops container."
+  },
+  "ibkrv2stgauhecwc4itaoo/onboarding-intake": {
+   "layer": "bronze",
+   "declared_in": "infra/staging-onboarding-intake.bicep",
+   "holds": "Portal uploads as received: report templates and onboarding case documents.",
+   "plan": "Keep the name (database rows point at it); label it bronze."
+  },
+  "ibkrv2stgauhecwc4itaoo/market-raw": {
+   "layer": "bronze",
+   "declared_in": null,
+   "new": true,
+   "holds": "Planned: raw responses from Yahoo, US Treasury, HKMA/HKAB and sector lookups.",
+   "plan": "New container so every external feed keeps its raw copy."
+  },
+  "ibkrv2stgauhecwc4itaoo/report-drafts": {
+   "layer": "gold",
+   "declared_in": "infra/staging.bicep",
+   "holds": "Frozen reporting-snapshot JSON and the September first-cycle drafts.",
+   "plan": "Keep; label gold."
+  },
+  "ibkrv2stgauhecwc4itaoo/internal-reports": {
+   "layer": "gold",
+   "declared_in": "infra/staging-internal-release.bicep",
+   "holds": "Rendered factsheets and decks (review/ and released/), plus approved templates and QA manifests.",
+   "plan": "Keep the name (website, agents and database rows point at it). New templates go to silver config, QA output to ops."
+  },
+  "ibkrv2stgauhecwc4itaoo/approved-reports": {
+   "layer": "gold",
+   "declared_in": "infra/staging.bicep",
+   "holds": "Nothing: never written.",
+   "plan": "Retire."
+  },
+  "ibkrv2stgauhecwc4itaoo/release-sources": {
+   "layer": "ops",
+   "declared_in": "infra/release-archive-foundation.bicep",
+   "holds": "Code archives by digest.",
+   "plan": "Keep; label ops."
+  },
+  "ibkrv2stgauhecwc4itaoo/release-evidence": {
+   "layer": "ops",
+   "declared_in": "infra/release-archive-foundation.bicep",
+   "holds": "Release receipts.",
+   "plan": "Keep; label ops."
+  },
+  "ibkrv2stgauhecwc4itaoo/specialist-audit-checkpoints": {
+   "layer": "ops",
+   "declared_in": null,
+   "holds": "Audit checkpoints. Under legal hold.",
+   "plan": "Declare in Bicep; label ops."
+  },
+  "ibkrv2stgauhecwc4itaoo/upgrade-g04-reports-20261010": {
+   "layer": "ops",
+   "declared_in": null,
+   "holds": "QA outputs from the October upgrade.",
+   "plan": "Retire once the review thread confirms it is no longer needed."
+  },
+  "ibkrv2stgauhecwc4itaoo/ibkr-reports": {
+   "layer": "gold",
+   "declared_in": null,
+   "referenced_only": true,
+   "holds": "Probably does not exist; derived-daily falls back to v1.1 analytics-reports.",
+   "plan": "Remove the reference: read reference data from silver tables instead."
+  }
+ },
+ "jobs": {
+  "agent-audit": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "see LIVE_STATE.md",
+   "note": "Inline program, no Bicep."
+  },
+  "agent-data-quality": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-export-packs": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-guide-check": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-guide-keeper": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-holdings": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-live-market": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-month-end": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-month-team": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-onboarding": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-ops": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-risk-watch": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "agent-weekly-brief": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "see infra/agent-apps.bicep",
+   "note": "Reads the agent views; writes agent state."
+  },
+  "authority": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "see LIVE_STATE.md",
+   "note": "Inline program, no Bicep."
+  },
+  "ibkr-v11-bootstrap": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "manual",
+   "note": "Legacy schema setup."
+  },
+  "ibkr-v11-daily": {
+   "hops": [
+    "ingest",
+    "conform",
+    "analytics",
+    "publish"
+   ],
+   "schedule": "08:00 UTC",
+   "note": "Legacy. One job does every hop; its export is v2's main daily input."
+  },
+  "ibkr-v11-history-backfill": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "manual",
+   "note": "Legacy."
+  },
+  "ibkrv2stg-account-sync-daily": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "08:10 UTC",
+   "note": "Reads v1.1 gold (the export) into v2 bronze and silver. Inverted layering; retires with v1.1."
+  },
+  "ibkrv2stg-agent": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "app"
+  },
+  "ibkrv2stg-agent-tools": {
+   "hops": [
+    "serve"
+   ],
+   "schedule": "app"
+  },
+  "ibkrv2stg-analyst-assurance": {
+   "hops": [
+    "quality-gate"
+   ],
+   "schedule": "09:10 UTC"
+  },
+  "ibkrv2stg-autonomous-admin": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "every 5 minutes"
+  },
+  "ibkrv2stg-autonomy-review": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "monthly"
+  },
+  "ibkrv2stg-benchmark-daily": {
+   "hops": [
+    "ingest",
+    "conform",
+    "analytics"
+   ],
+   "schedule": "08:30 UTC",
+   "note": "No raw copy kept today."
+  },
+  "ibkrv2stg-bootstrap": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "manual",
+   "note": "Applies database migrations."
+  },
+  "ibkrv2stg-burn-in-monitor": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "09:15 UTC"
+  },
+  "ibkrv2stg-credential-broker": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "app"
+  },
+  "ibkrv2stg-crisis-scenarios-daily": {
+   "hops": [
+    "analytics"
+   ],
+   "schedule": "09:20 UTC"
+  },
+  "ibkrv2stg-derived-daily": {
+   "hops": [
+    "conform"
+   ],
+   "schedule": "08:50 UTC",
+   "note": "Also reads reference_data.json from v1.1 analytics-reports."
+  },
+  "ibkrv2stg-flex-discovery": {
+   "hops": [
+    "ingest",
+    "ops"
+   ],
+   "schedule": "every 5 minutes"
+  },
+  "ibkrv2stg-ibkr-gateway (VM)": {
+   "hops": [
+    "ingest"
+   ],
+   "schedule": "streaming",
+   "note": "Writes live_* tables directly."
+  },
+  "ibkrv2stg-import-u16088571": {
+   "hops": [
+    "conform"
+   ],
+   "schedule": "manual"
+  },
+  "ibkrv2stg-institutional-daily": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "08:00 UTC",
+   "note": "v2's own Flex pull into ibkr-raw, then the loader."
+  },
+  "ibkrv2stg-institutional-shadow": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "manual"
+  },
+  "ibkrv2stg-internal-release": {
+   "hops": [
+    "publish"
+   ],
+   "schedule": "manual"
+  },
+  "ibkrv2stg-month-end-factsheet": {
+   "hops": [
+    "analytics",
+    "publish"
+   ],
+   "schedule": "09:00 UTC",
+   "note": "Freezes reporting_snapshots, then renders the factsheet."
+  },
+  "ibkrv2stg-onboard-analytics": {
+   "hops": [
+    "analytics"
+   ],
+   "schedule": "manual (from the website)"
+  },
+  "ibkrv2stg-onboard-render": {
+   "hops": [
+    "publish"
+   ],
+   "schedule": "manual (from the website)"
+  },
+  "ibkrv2stg-report-snapshot": {
+   "hops": [
+    "analytics"
+   ],
+   "schedule": "manual"
+  },
+  "ibkrv2stg-review-registration": {
+   "hops": [
+    "publish"
+   ],
+   "schedule": "manual"
+  },
+  "ibkrv2stg-risk-free-daily": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "23:00 UTC",
+   "note": "No raw copy kept today."
+  },
+  "ibkrv2stg-risk-snapshots": {
+   "hops": [
+    "analytics"
+   ],
+   "schedule": "08:55 UTC"
+  },
+  "ibkrv2stg-sector-classification": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "08:45 UTC",
+   "note": "No raw copy kept today."
+  },
+  "ibkrv2stg-template-intake": {
+   "hops": [
+    "conform"
+   ],
+   "schedule": "manual",
+   "note": "Uploads to registered templates."
+  },
+  "ibkrv2stg-verify-u16088571": {
+   "hops": [
+    "quality-gate"
+   ],
+   "schedule": "manual"
+  },
+  "ibkrv2stg-web": {
+   "hops": [
+    "serve",
+    "publish"
+   ],
+   "schedule": "app",
+   "note": "Reads silver, gold and ops; writes uploads (bronze) and release approvals."
+  },
+  "inbox-acceptance": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "see LIVE_STATE.md",
+   "note": "Inline program, no Bicep."
+  },
+  "inbox-acceptance-r2": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "see LIVE_STATE.md",
+   "note": "Inline program, no Bicep."
+  },
+  "metadata-monitor": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "see LIVE_STATE.md",
+   "note": "Inline program, no Bicep."
+  },
+  "observe-reader": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "see LIVE_STATE.md",
+   "note": "Inline program, no Bicep."
+  },
+  "secret-metadata": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "see LIVE_STATE.md",
+   "note": "Inline program, no Bicep."
+  }
+ }
+}

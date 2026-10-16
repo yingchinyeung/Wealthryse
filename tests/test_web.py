@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from unittest.mock import MagicMock, patch
 import hashlib
@@ -1346,6 +1347,11 @@ class PortfolioWebTests(unittest.TestCase):
             self.assertIn(f'id="{card}"', modelling_page)
             self.assertIn(f'data-part-link="{card}"', modelling_page)
         self.assertIn("if(activeSection==='modelling')renderModelling(asOf);", modelling_page)
+        # Every section is in one page, so a reused element ID sends one card's results into another.
+        for page_html in (risk_page, modelling_page):
+            ids = re.findall(r'\bid="([^"]+)"', page_html)
+            self.assertEqual(sorted({x for x in ids if ids.count(x) > 1}), [])
+        self.assertIn("document.querySelector('#model-risk-note')", modelling_page)
 
     def test_account_sections_split_into_subpages(self) -> None:
         user = {"email": "analyst@example.com"}

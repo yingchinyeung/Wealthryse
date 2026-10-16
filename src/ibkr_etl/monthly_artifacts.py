@@ -666,7 +666,15 @@ def _factsheet_sector_rows(
     return tuple(rows)
 
 
-def factsheet_inputs(snapshot: dict[str, Any]) -> FactsheetInputs:
+def factsheet_inputs(
+    snapshot: dict[str, Any], *, reporting_currencies: Iterable[str] | None = None
+) -> FactsheetInputs:
+    """The validated values every account-design factsheet prints.
+
+    ``reporting_currencies`` lets a design spec that is qualified for other
+    currencies use the same builder; left out, the approved rule applies
+    (HKD for Alpha World MS, USD for every other subject).
+    """
     required = {
         "period_end",
         "data_as_of",
@@ -682,9 +690,13 @@ def factsheet_inputs(snapshot: dict[str, Any]) -> FactsheetInputs:
     if missing:
         raise MonthlyArtifactError(f"Snapshot is missing: {', '.join(missing)}")
     subject_id = str(snapshot["subject_id"] or "").strip()
-    expected_currency = 'HKD' if subject_id == 'alpha-world-ms' else 'USD'
-    if not subject_id or snapshot["reporting_currency"] != expected_currency:
-        raise MonthlyArtifactError('Factsheet renderer requires a subject id and ' + expected_currency + ' reporting')
+    allowed_currencies = (
+        tuple(reporting_currencies) if reporting_currencies is not None
+        else ('HKD',) if subject_id == 'alpha-world-ms' else ('USD',)
+    )
+    if not subject_id or snapshot["reporting_currency"] not in allowed_currencies:
+        raise MonthlyArtifactError(
+            'Factsheet renderer requires a subject id and ' + ' or '.join(allowed_currencies) + ' reporting')
     performance_series = list(snapshot["performance"].get("series") or [])
     history_start_date = str(
         snapshot.get("period_start")
@@ -1116,11 +1128,18 @@ def _draw_factsheet_page_two(
         f"Historical Performance ({_display_date(inputs.history_start_date, short=True)} to {_display_date(inputs.period_end, short=True)})",
     )
 
-    x0 = layout["chart_x"]
-    y0 = layout["chart_y"]
-    width = layout["chart_width"]
-    height = layout["chart_height"]
-    values = [float(row["value"]) for row in inputs.normalized_nav]
+    _draw_account_nav_chart(
+        c, inputs.normalized_nav,
+        box=(layout["chart_x"], layout["chart_y"], layout["chart_width"], layout["chart_height"]),
+    )
+
+
+def _draw_account_nav_chart(
+    c: canvas.Canvas, normalized_nav: tuple[dict[str, Any], ...], *, box: tuple[float, float, float, float]
+) -> None:
+    """The account design's page-two NAV line chart; also a design-spec component."""
+    x0, y0, width, height = box
+    values = [float(row["value"]) for row in normalized_nav]
     value_range = max(values) - min(values)
     padding = max(2.0, value_range * 0.05)
     minimum = min(values) - padding
@@ -1153,8 +1172,8 @@ def _draw_factsheet_page_two(
         c.line(x0, y, x0 + width, y)
         c.setDash()
         c.drawRightString(x0 - 5, y - 2.2, f"{value:.0f}")
-    start_date = date.fromisoformat(inputs.normalized_nav[0]["date"])
-    end_date = date.fromisoformat(inputs.normalized_nav[-1]["date"])
+    start_date = date.fromisoformat(normalized_nav[0]["date"])
+    end_date = date.fromisoformat(normalized_nav[-1]["date"])
     start_ordinal = start_date.toordinal()
     ordinal_span = max(1, end_date.toordinal() - start_ordinal)
     date_ticks = _account_chart_month_ticks(start_date, end_date)
@@ -1186,7 +1205,7 @@ def _draw_factsheet_page_two(
     c.setStrokeColor(HexColor("#4054ff"))
     c.setLineWidth(0.75)
     path = c.beginPath()
-    for index, row in enumerate(inputs.normalized_nav):
+    for index, row in enumerate(normalized_nav):
         observed = date.fromisoformat(row["date"])
         x = x0 + width * (observed.toordinal() - start_ordinal) / ordinal_span
         y = y0 + height * (float(row["value"]) - minimum) / (maximum - minimum)
@@ -2039,9 +2058,19 @@ def _draw_alpha_world_page_one(
             c.drawString(80,58,"Limited history: indicative bootstrap only, not a forecast; parameter uncertainty is not shown.")
 
 
-def _draw_alpha_world_ms_allocation(c: canvas.Canvas) -> None:
+ALPHA_WORLD_MS_ALLOCATION_LABELS = {
+    "parents": ("70%", "30%"),
+    "headings": ("130% LONG", "70% SHORT", "150% LONG", "150% SHORT"),
+    "captions": (("China & Hong Kong", "Portfolio"), ("Hang Seng Index",),
+                 ("US Technology &", "BioTechnology"), ("S&P500",)),
+    "branches": ("91%", "-49%", "45%", "-45%"),
+}
+
+
+def _draw_alpha_world_ms_allocation(c: canvas.Canvas, labels: dict[str, Any] | None = None) -> None:
     """Owner-requested geometry only; preserve all wording and percentages."""
     layout = ALPHA_WORLD_MS_ALLOCATION_LAYOUT
+    labels = labels or ALPHA_WORLD_MS_ALLOCATION_LABELS
     c.saveState()
     c.setFillColor(white)
     c.rect(*layout['clear'], fill=1, stroke=0)
@@ -2060,12 +2089,9 @@ def _draw_alpha_world_ms_allocation(c: canvas.Canvas) -> None:
         c.rect(x, layout['child_y'], layout['child_width'], layout['child_height'], fill=1, stroke=0)
     c.setFillColor(white)
     c.setFont('Helvetica-Bold', 12.0)
-    for center, label in zip(parents, ('70%', '30%')):
+    for center, label in zip(parents, labels['parents']):
         c.drawCentredString(center, layout['parent_caption_y'], label)
-    headings = ('130% LONG', '70% SHORT', '150% LONG', '150% SHORT')
-    captions = (('China & Hong Kong', 'Portfolio'), ('Hang Seng Index',),
-        ('US Technology &', 'BioTechnology'), ('S&P500',))
-    for center, heading, lines in zip(centers, headings, captions):
+    for center, heading, lines in zip(centers, labels['headings'], labels['captions']):
         c.setFont('Helvetica-Bold', 10.8)
         c.drawCentredString(center, layout['heading_y'], heading)
         c.setFont('Helvetica', 9.4)
@@ -2074,7 +2100,7 @@ def _draw_alpha_world_ms_allocation(c: canvas.Canvas) -> None:
             c.drawCentredString(center, y, text)
     c.setFillColor(black)
     c.setFont('Helvetica-Bold', 10.8)
-    for i, (child, label) in enumerate(zip(centers, ('91%', '-49%', '45%', '-45%'))):
+    for i, (child, label) in enumerate(zip(centers, labels['branches'])):
         parent = parents[i//2]
         offset = -layout['branch_label_offset'] if i%2 == 0 else layout['branch_label_offset']
         c.drawCentredString((parent+child)/2+offset, layout['branch_label_y'], label)

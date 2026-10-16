@@ -290,6 +290,14 @@ def main() -> int:
             connection.execute(sql.SQL(
                 "GRANT SELECT, INSERT, UPDATE ON TABLE report_design_update_requests TO {}"
             ).format(sql.Identifier(approval_role)))
+            # Factsheet design drafts (067): files and versions only append; drafts and edit
+            # proposals change status. Nothing here is deleted.
+            connection.execute(sql.SQL(
+                "GRANT SELECT, INSERT ON TABLE factsheet_design_files, factsheet_design_versions TO {}"
+            ).format(sql.Identifier(approval_role)))
+            connection.execute(sql.SQL(
+                "GRANT SELECT, INSERT, UPDATE ON TABLE factsheet_design_drafts, factsheet_design_proposals TO {}"
+            ).format(sql.Identifier(approval_role)))
             design_privileges = connection.execute(
                 """SELECT has_table_privilege(%s, 'public.report_design_update_requests', 'INSERT')
                     AND has_table_privilege(%s, 'public.qualified_report_designs', 'SELECT')

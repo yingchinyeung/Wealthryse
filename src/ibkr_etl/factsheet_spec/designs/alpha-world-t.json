@@ -1,0 +1,887 @@
+{
+ "spec_version": 1,
+ "design_id": "alpha-world-t",
+ "title": "Alpha World T factsheet",
+ "notes": "The Alpha World T design: the owner's T template with its variable content removed, the approved MS static sections merged in, and T's identity drawn in the template's own fonts. Ported from alpha_world_t_factsheet.render. Private qualification only: the inputs refuse any snapshot that allows publication.",
+ "inputs": "alpha_world_t",
+ "base": "template",
+ "template_sha256": "c7c3c2f199532cdfaf8c2ecac589186b1493a44d5194b97a05d40ed5a2d34291",
+ "page_size": [
+  594.75,
+  842.25
+ ],
+ "currencies": [
+  "HKD"
+ ],
+ "owner_text": {
+  "t_inception_label": {
+   "label": "Header: inception month",
+   "value": "January 2025",
+   "guarded": true
+  },
+  "t_benchmark": {
+   "label": "Header: benchmark",
+   "value": "HIBOR + Spread",
+   "guarded": true
+  },
+  "t_strategy": {
+   "label": "Header: strategy",
+   "value": "Multi-Tranche (including Taiwan)",
+   "guarded": true
+  },
+  "allocation_parent_1": {
+   "label": "Allocation diagram: first top-level weight",
+   "value": "70%",
+   "guarded": true
+  },
+  "allocation_parent_2": {
+   "label": "Allocation diagram: second top-level weight",
+   "value": "30%",
+   "guarded": true
+  },
+  "allocation_heading_1": {
+   "label": "Allocation diagram: sleeve 1 heading",
+   "value": "130% LONG",
+   "guarded": true
+  },
+  "allocation_heading_2": {
+   "label": "Allocation diagram: sleeve 2 heading",
+   "value": "70% SHORT",
+   "guarded": true
+  },
+  "allocation_heading_3": {
+   "label": "Allocation diagram: sleeve 3 heading",
+   "value": "150% LONG",
+   "guarded": true
+  },
+  "allocation_heading_4": {
+   "label": "Allocation diagram: sleeve 4 heading",
+   "value": "150% SHORT",
+   "guarded": true
+  },
+  "allocation_caption_1_1": {
+   "label": "Allocation diagram: sleeve 1 caption line 1",
+   "value": "Greater China"
+  },
+  "allocation_caption_1_2": {
+   "label": "Allocation diagram: sleeve 1 caption line 2",
+   "value": "Portfolio"
+  },
+  "allocation_caption_2_1": {
+   "label": "Allocation diagram: sleeve 2 caption line 1",
+   "value": "Hang Seng Index"
+  },
+  "allocation_caption_3_1": {
+   "label": "Allocation diagram: sleeve 3 caption line 1",
+   "value": "US Technology &"
+  },
+  "allocation_caption_3_2": {
+   "label": "Allocation diagram: sleeve 3 caption line 2",
+   "value": "Biotechnology"
+  },
+  "allocation_caption_4_1": {
+   "label": "Allocation diagram: sleeve 4 caption line 1",
+   "value": "S&P500"
+  },
+  "allocation_branch_1": {
+   "label": "Allocation diagram: sleeve 1 weight",
+   "value": "91%",
+   "guarded": true
+  },
+  "allocation_branch_2": {
+   "label": "Allocation diagram: sleeve 2 weight",
+   "value": "-49%",
+   "guarded": true
+  },
+  "allocation_branch_3": {
+   "label": "Allocation diagram: sleeve 3 weight",
+   "value": "45%",
+   "guarded": true
+  },
+  "allocation_branch_4": {
+   "label": "Allocation diagram: sleeve 4 weight",
+   "value": "-45%",
+   "guarded": true
+  }
+ },
+ "pages": [
+  {
+   "layers": [
+    {
+     "kind": "remove",
+     "id": "p1.remove",
+     "boxes": [
+      [
+       490.0,
+       780.0,
+       100.0,
+       43.0
+      ],
+      [
+       20.0,
+       707.0,
+       558.0,
+       42.0
+      ],
+      [
+       20.0,
+       519.0,
+       358.0,
+       182.0
+      ],
+      [
+       386.0,
+       510.0,
+       204.0,
+       191.0
+      ],
+      [
+       205.0,
+       485.0,
+       371.0,
+       23.0
+      ],
+      [
+       20.0,
+       318.0,
+       556.0,
+       163.0
+      ],
+      [
+       70.0,
+       65.0,
+       505.0,
+       209.0
+      ],
+      [
+       0.0,
+       0.0,
+       595.0,
+       58.0
+      ]
+     ],
+     "images": true
+    },
+    {
+     "kind": "overlay",
+     "id": "p1.masks",
+     "ops": [
+      {
+       "id": "p1.mask.1",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        490.0,
+        780.0,
+        100.0,
+        43.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.mask.2",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        20.0,
+        707.0,
+        558.0,
+        42.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.mask.3",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        20.0,
+        519.0,
+        358.0,
+        182.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.mask.4",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        386.0,
+        510.0,
+        204.0,
+        191.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.mask.5",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        205.0,
+        485.0,
+        371.0,
+        23.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.mask.6",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        20.0,
+        318.0,
+        556.0,
+        163.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.mask.7",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        70.0,
+        65.0,
+        505.0,
+        209.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.mask.8",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        0.0,
+        0.0,
+        595.0,
+        58.0
+       ],
+       "color": "#ffffff"
+      }
+     ]
+    },
+    {
+     "kind": "component",
+     "id": "p1.sections",
+     "name": "alpha_world_t.static_sections"
+    },
+    {
+     "kind": "overlay",
+     "id": "p1",
+     "ops": [
+      {
+       "id": "p1.date",
+       "op": "component",
+       "role": "date",
+       "name": "alpha_world_ms.date_header",
+       "params": {
+        "date": "{period_end|date_mdy}",
+        "baseline_y": 792.0
+       }
+      },
+      {
+       "id": "p1.header.inception",
+       "op": "text",
+       "role": "identity",
+       "x": 22.84536,
+       "y": 725.86359,
+       "font": "Helvetica",
+       "size": 9.15,
+       "color": "#000000",
+       "value": "{t_inception_label}"
+      },
+      {
+       "id": "p1.header.currency",
+       "op": "text",
+       "role": "identity",
+       "x": 154.7593,
+       "y": 725.86359,
+       "font": "Helvetica",
+       "size": 9.15,
+       "color": "#000000",
+       "value": "{reporting_currency}"
+      },
+      {
+       "id": "p1.header.benchmark",
+       "op": "text",
+       "role": "identity",
+       "x": 299.5008,
+       "y": 725.86359,
+       "font": "Helvetica",
+       "size": 9.15,
+       "color": "#000000",
+       "value": "{t_benchmark}"
+      },
+      {
+       "id": "p1.header.strategy",
+       "op": "text",
+       "role": "identity",
+       "x": 430.9917,
+       "y": 725.86359,
+       "font": "Helvetica",
+       "size": 9.15,
+       "color": "#000000",
+       "value": "{t_strategy}"
+      },
+      {
+       "id": "p1.mask.kpi.annualized_return",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        516.0,
+        648.5,
+        46.0,
+        10.5
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.kpi.annualized_return",
+       "op": "text",
+       "role": "kpi",
+       "x": 558.0,
+       "y": 650.5,
+       "align": "right",
+       "font": "Helvetica-Bold",
+       "size": 7.0,
+       "color": "#2d7168",
+       "value": {
+        "bind": "annualized_return",
+        "format": {
+         "kind": "percent",
+         "digits": 2,
+         "signed": true
+        }
+       }
+      },
+      {
+       "id": "p1.mask.kpi.annualized_volatility",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        516.0,
+        633.5,
+        46.0,
+        10.5
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.kpi.annualized_volatility",
+       "op": "text",
+       "role": "kpi",
+       "x": 558.0,
+       "y": 635.5,
+       "align": "right",
+       "font": "Helvetica-Bold",
+       "size": 7.0,
+       "color": "#2d7168",
+       "value": {
+        "bind": "annualized_volatility",
+        "format": {
+         "kind": "percent",
+         "digits": 2,
+         "signed": true
+        }
+       }
+      },
+      {
+       "id": "p1.mask.kpi.sharpe_ratio",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        516.0,
+        618.5,
+        46.0,
+        10.5
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.kpi.sharpe_ratio",
+       "op": "text",
+       "role": "kpi",
+       "x": 558.0,
+       "y": 620.5,
+       "align": "right",
+       "font": "Helvetica-Bold",
+       "size": 7.0,
+       "color": "#121925",
+       "value": {
+        "bind": "sharpe_ratio",
+        "format": {
+         "kind": "number",
+         "digits": 2
+        }
+       }
+      },
+      {
+       "id": "p1.mask.kpi.maximum_drawdown",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        516.0,
+        603.5,
+        46.0,
+        10.5
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.kpi.maximum_drawdown",
+       "op": "text",
+       "role": "kpi",
+       "x": 558.0,
+       "y": 605.5,
+       "align": "right",
+       "font": "Helvetica-Bold",
+       "size": 7.0,
+       "color": "#c93642",
+       "value": {
+        "bind": "maximum_drawdown",
+        "format": {
+         "kind": "percent",
+         "digits": 2,
+         "signed": true
+        }
+       }
+      },
+      {
+       "id": "p1.mask.kpi.var_95_daily",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        516.0,
+        588.5,
+        46.0,
+        10.5
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.kpi.var_95_daily",
+       "op": "text",
+       "role": "kpi",
+       "x": 558.0,
+       "y": 590.5,
+       "align": "right",
+       "font": "Helvetica-Bold",
+       "size": 7.0,
+       "color": "#c93642",
+       "value": {
+        "bind": "var_95_daily",
+        "format": {
+         "kind": "percent",
+         "digits": 2,
+         "signed": true,
+         "negate_abs": true
+        }
+       }
+      },
+      {
+       "id": "p1.mask.kpi.cvar_95_daily",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        516.0,
+        573.5,
+        46.0,
+        10.5
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.kpi.cvar_95_daily",
+       "op": "text",
+       "role": "kpi",
+       "x": 558.0,
+       "y": 575.5,
+       "align": "right",
+       "font": "Helvetica-Bold",
+       "size": 7.0,
+       "color": "#c93642",
+       "value": {
+        "bind": "cvar_95_daily",
+        "format": {
+         "kind": "percent",
+         "digits": 2,
+         "signed": true,
+         "negate_abs": true
+        }
+       }
+      },
+      {
+       "id": "p1.mask.kpi.win_rate",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        516.0,
+        558.5,
+        46.0,
+        10.5
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.kpi.win_rate",
+       "op": "text",
+       "role": "kpi",
+       "x": 558.0,
+       "y": 560.5,
+       "align": "right",
+       "font": "Helvetica-Bold",
+       "size": 7.0,
+       "color": "#2d7168",
+       "value": {
+        "bind": "win_rate",
+        "format": {
+         "kind": "percent",
+         "digits": 2
+        }
+       }
+      },
+      {
+       "id": "p1.mask.kpi.total_return",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        516.0,
+        543.5,
+        46.0,
+        10.5
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.kpi.total_return",
+       "op": "text",
+       "role": "kpi",
+       "x": 558.0,
+       "y": 545.5,
+       "align": "right",
+       "font": "Helvetica-Bold",
+       "size": 7.0,
+       "color": "#2d7168",
+       "value": {
+        "bind": "total_return",
+        "format": {
+         "kind": "percent",
+         "digits": 2,
+         "signed": true
+        }
+       }
+      },
+      {
+       "id": "p1.mask.risk_free",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        438.0,
+        529.0,
+        124.0,
+        10.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p1.risk_free",
+       "op": "text",
+       "role": "kpi",
+       "x": 558.0,
+       "y": 532.0,
+       "align": "right",
+       "font": "Helvetica-Oblique",
+       "size": 4.1,
+       "color": "#5d6878",
+       "value": "* Risk-Free Rate (1M HIBOR, period average): {risk_free_annual_rate|percent2}"
+      },
+      {
+       "id": "p1.period",
+       "op": "text",
+       "role": "period",
+       "x": 260.44,
+       "y": 494.0,
+       "align": "center",
+       "font": "Helvetica",
+       "size": 6.5,
+       "color": "#000000",
+       "value": "({history_start_date|date_short} - {data_as_of|date_long})"
+      },
+      {
+       "id": "p1.period_rule",
+       "op": "fill",
+       "role": "rule",
+       "box": [
+        321.2,
+        497.25,
+        251.5,
+        0.75
+       ],
+       "color": "#a9a9a9"
+      },
+      {
+       "id": "p1.capital_chart",
+       "op": "component",
+       "role": "chart",
+       "name": "alpha_world.line_chart",
+       "box": [
+        42.0,
+        350.0,
+        252.0,
+        124.0
+       ],
+       "params": {
+        "value_field": "value",
+        "title": "Capital Path",
+        "y_label": "{reporting_currency}",
+        "baseline_label": "Initial {reporting_currency} 100,000",
+        "authority_style": true,
+        "value_scale": 1000.0,
+        "avoid_date_label_overlap": true
+       }
+      },
+      {
+       "id": "p1.rebased_chart",
+       "op": "component",
+       "role": "chart",
+       "name": "alpha_world.line_chart",
+       "box": [
+        310.0,
+        350.0,
+        251.0,
+        124.0
+       ],
+       "params": {
+        "value_field": "value",
+        "title": "Rebased to 100",
+        "y_label": "Index (Start = 100)",
+        "baseline_label": "Base = 100",
+        "authority_style": true,
+        "avoid_date_label_overlap": true
+       }
+      },
+      {
+       "id": "p1.distribution",
+       "op": "component",
+       "role": "chart",
+       "name": "alpha_world.return_distribution",
+       "box": [
+        80.0,
+        90.0,
+        463.0,
+        153.0
+       ],
+       "params": {
+        "authority_style": true
+       }
+      },
+      {
+       "id": "p1.notes",
+       "op": "component",
+       "role": "note",
+       "name": "alpha_world_t.notes"
+      },
+      {
+       "id": "p1.synthetic",
+       "op": "component",
+       "role": "note",
+       "name": "alpha_world_t.synthetic_label"
+      }
+     ]
+    },
+    {
+     "kind": "component",
+     "id": "p1.native",
+     "name": "alpha_world_t.native_text"
+    }
+   ]
+  },
+  {
+   "layers": [
+    {
+     "kind": "remove",
+     "id": "p2.remove",
+     "boxes": [
+      [
+       490.0,
+       798.0,
+       100.0,
+       40.0
+      ],
+      [
+       95.0,
+       602.0,
+       411.0,
+       152.0
+      ],
+      [
+       18.0,
+       78.0,
+       565.0,
+       510.0
+      ],
+      [
+       0.0,
+       0.0,
+       595.0,
+       58.0
+      ]
+     ],
+     "images": true
+    },
+    {
+     "kind": "overlay",
+     "id": "p2.masks",
+     "ops": [
+      {
+       "id": "p2.mask.1",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        490.0,
+        798.0,
+        100.0,
+        40.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p2.mask.2",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        95.0,
+        602.0,
+        411.0,
+        152.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p2.mask.3",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        18.0,
+        78.0,
+        565.0,
+        510.0
+       ],
+       "color": "#ffffff"
+      },
+      {
+       "id": "p2.mask.4",
+       "op": "fill",
+       "role": "mask",
+       "box": [
+        0.0,
+        0.0,
+        595.0,
+        58.0
+       ],
+       "color": "#ffffff"
+      }
+     ]
+    },
+    {
+     "kind": "component",
+     "id": "p2.sections",
+     "name": "alpha_world_t.static_sections"
+    },
+    {
+     "kind": "overlay",
+     "id": "p2",
+     "ops": [
+      {
+       "id": "p2.date",
+       "op": "component",
+       "role": "date",
+       "name": "alpha_world_ms.date_header",
+       "params": {
+        "date": "{period_end|date_mdy}",
+        "baseline_y": 809.0
+       }
+      },
+      {
+       "id": "p2.allocation",
+       "op": "component",
+       "role": "diagram",
+       "name": "alpha_world_t.allocation_diagram",
+       "box": [
+        95.0,
+        607.0,
+        410.0,
+        148.0
+       ],
+       "params": {
+        "parents": [
+         "{allocation_parent_1}",
+         "{allocation_parent_2}"
+        ],
+        "headings": [
+         "{allocation_heading_1}",
+         "{allocation_heading_2}",
+         "{allocation_heading_3}",
+         "{allocation_heading_4}"
+        ],
+        "captions": [
+         [
+          "{allocation_caption_1_1}",
+          "{allocation_caption_1_2}"
+         ],
+         [
+          "{allocation_caption_2_1}"
+         ],
+         [
+          "{allocation_caption_3_1}",
+          "{allocation_caption_3_2}"
+         ],
+         [
+          "{allocation_caption_4_1}"
+         ]
+        ],
+        "branches": [
+         "{allocation_branch_1}",
+         "{allocation_branch_2}",
+         "{allocation_branch_3}",
+         "{allocation_branch_4}"
+        ]
+       }
+      },
+      {
+       "id": "p2.synthetic",
+       "op": "component",
+       "role": "note",
+       "name": "alpha_world_t.synthetic_label"
+      }
+     ]
+    },
+    {
+     "kind": "component",
+     "id": "p2.native",
+     "name": "alpha_world_t.native_text"
+    }
+   ]
+  }
+ ],
+ "post": [
+  {
+   "name": "alpha_world_t.calculation_metadata"
+  }
+ ],
+ "metadata": {
+  "/Title": "Alpha World T Factsheet - {period_end}",
+  "/LayoutFamily": "alpha-world-t-owner-template",
+  "/ChartStyleVersion": "alpha-world-t-owner-template-hkd-hibor-v7",
+  "/LayoutAuthoritySHA256": "c7c3c2f199532cdfaf8c2ecac589186b1493a44d5194b97a05d40ed5a2d34291"
+ },
+ "validators": [
+  {
+   "name": "alpha_world_t.pdf_accuracy"
+  }
+ ]
+}

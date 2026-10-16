@@ -572,17 +572,53 @@ class ModellingToolTests(unittest.TestCase):
         with self.assertRaises(ToolError):
             self._run("get_factor_exposures", {"region": "mars"})
 
+    def test_risk_outlook_and_regimes(self):
+        risk = self._run("get_risk_outlook", {})["data"]
+        self.assertIn(risk["model"], ("GARCH(1,1)", "EWMA (λ = 0.94)"))
+        self.assertIn("breached", risk["latest_day"])
+        self.assertNotIn("series", risk["backtest"])
+        self.assertEqual(len(risk["drawdown_odds_next_year"]["at_forecast_volatility"]["probabilities"]), 3)
+        regimes = self._run("get_market_regimes", {})["data"]
+        self.assertIn(regimes["current_regime"], ("Calm", "Normal", "Stressed"))
+        self.assertIn(regimes["regime_a_week_ago"], ("Calm", "Normal", "Stressed"))
+        self.assertAlmostEqual(regimes["outlook"][0]["p50_value"], regimes["nav"] * (1 + regimes["outlook"][0]["p50"]))
+
+    def test_factor_stress_from_preset_or_custom_shocks(self):
+        from unittest import mock
+
+        from ibkr_etl import fama_french
+
+        factors = {d: {"Mkt-RF": (self.nav[d] / self.nav[p] - 1), "SMB": 0.0001 * (i % 3), "HML": 0.0002 * (i % 5 - 2),
+                       "RMW": 0.0001 * (i % 7 - 3), "CMA": 0.0001 * (i % 2), "RF": 0.0}
+                   for i, (p, d) in enumerate(zip(self.days, self.days[1:]))}
+        loaded = {"region_label": "United States", "source_url": "u", "factors": factors, "latest_date": self.days[-1],
+                  "momentum_note": "", "source": "kenneth_french", "labels": None, "source_note": ""}
+        with mock.patch.object(fama_french, "load_factor_data", return_value=loaded):
+            preset = self._run("run_factor_stress", {"scenario": "market_down_20"})["data"]
+            custom = self._run("run_factor_stress", {"shocks": [{"factor": "Mkt-RF", "change": -0.1},
+                                                                {"factor": "MOM", "change": 0.05}]})["data"]
+            with self.assertRaises(ToolError):
+                self._run("run_factor_stress", {})
+            with self.assertRaises(ToolError):
+                self._run("run_factor_stress", {"shocks": [{"factor": "Gold", "change": 0.1}]})
+        self.assertAlmostEqual(preset["impact"], -0.2, delta=0.01)  # the portfolio is the market here
+        self.assertAlmostEqual(preset["impact_value"], preset["impact"] * preset["nav"])
+        self.assertEqual(custom["factors_not_in_model"], ["MOM"])
+
     def test_modelling_tools_are_labelled_and_in_the_weekly_brief(self):
         import inspect
 
         from wealthryse_agent import jobs, prompts
         from wealthryse_agent.runtime import TOOL_LABELS
 
-        for name in ("project_wealth", "run_what_if", "optimise_portfolio", "get_factor_exposures"):
+        for name in ("project_wealth", "run_what_if", "optimise_portfolio", "get_factor_exposures",
+                     "get_risk_outlook", "get_market_regimes", "run_factor_stress"):
             self.assertIn(name, TOOL_LABELS)
             self.assertFalse(REGISTRY[name].only_jobs)
         self.assertIn('"optimise_portfolio"', inspect.getsource(jobs.weekly_brief))
         self.assertIn("risk_concentrated_in", prompts.WEEKLY_BRIEF)
+        self.assertIn('"get_market_regimes"', inspect.getsource(jobs.weekly_brief))
+        self.assertIn("regime_a_week_ago", prompts.WEEKLY_BRIEF)
         self.assertIn("not forecasts", prompts.ANALYST)
 
 

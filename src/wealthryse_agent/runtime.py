@@ -81,6 +81,9 @@ TOOL_LABELS = {
     "run_what_if": "Comparing a different mix",
     "optimise_portfolio": "Measuring where the risk sits",
     "get_factor_exposures": "Fitting the factor model",
+    "get_risk_outlook": "Forecasting risk",
+    "get_market_regimes": "Reading the market regime",
+    "run_factor_stress": "Running a factor stress test",
     calculator.NAME: "Calculating",
 }
 OUT_OF_SCOPE = ("I can explain your holdings and performance, but I can't recommend trades, rebalancing "

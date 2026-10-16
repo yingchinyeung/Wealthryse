@@ -461,7 +461,7 @@ INBOX_SCRIPT = r"""<script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const md=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').split(/\n{2,}/).map(p=>'<p>'+p.replace(/\n/g,'<br>')+'</p>').join('');
 const NAMES={NAMES};
-const kinds={weekly_brief:'Weekly brief',holdings_explainer:'What changed',live_alert:'Live alert',month_end_draft:'Draft commentary',data_quality:'Data check',month_end_report:'Month-end report',month_end_hold:'Account blocked',month_end_dispute:'Agents disagree'};
+const kinds={weekly_brief:'Weekly brief',holdings_explainer:'What changed',live_alert:'Live alert',risk_alert:'Risk alert',model_check:'Model check',month_end_draft:'Draft commentary',data_quality:'Data check',month_end_report:'Month-end report',month_end_hold:'Account blocked',month_end_dispute:'Agents disagree'};
 const kindLabel=k=>kinds[k]||String(k||'Update').replace(/_/g,' ').replace(/^./,c=>c.toUpperCase());
 const statuses={new:'New',read:'Read',approved:'Approved',dismissed:'Dismissed'};
 const choices={month_end_hold:[['approved','Proceed'],['dismissed','Hold']],month_end_dispute:[['approved',"Keep the writer's text"],['dismissed','Agree with the reviewer']]};

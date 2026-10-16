@@ -7,6 +7,10 @@ records); nothing is sent, published or released.
     python -m wealthryse_agent.jobs weekly_brief         # Saturdays: each account's weekly brief
     python -m wealthryse_agent.jobs live_market          # every 15 minutes in trading hours: alert on big
                                                          # live moves, with an explanation
+    python -m wealthryse_agent.jobs risk_watch           # weekday mornings: alert on a VaR breach, a switch into
+                                                         # the stressed regime or a volatility jump, with an
+                                                         # explanation; once a month, check the risk models
+                                                         # against what actually happened
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
     python -m wealthryse_agent.jobs month_team --replay --round 2 --from 2026-01-31
@@ -37,7 +41,7 @@ from .auth import TokenSource
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings
 from .database import connect
 from .month_team.agents import BudgetExhausted
-from .prompts import HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, WEEKLY_BRIEF
+from .prompts import HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, RISK_ALERT, WEEKLY_BRIEF
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -118,7 +122,7 @@ def weekly_brief(store: Store, tools: ToolClient, agent: Agent, accounts: list[s
         answer, citations, used, ok = _run_agent(
             agent, tools, account_id, task,
             ["get_performance", "compare_to_benchmark", "get_holdings_changes", "get_cash_flows", "get_data_freshness",
-             "optimise_portfolio"])
+             "optimise_portfolio", "get_market_regimes"])
         _sum_usage(usage, used)
         if ok and store.add_inbox(kind="weekly_brief", account_id=account_id, period_key=period,
                                   title=f"Your week to {end}", body=answer, citations=citations, run_id=None):
@@ -185,6 +189,108 @@ def live_market(store: Store, tools: ToolClient, agent: Agent, accounts: list[st
                                citations=citations if ok else [{"source": "live_account_values",
                                                                 "account_id": account_id}], run_id=None):
                 written += 1
+    return written
+
+
+VOLATILITY_JUMP = 1.5        # forecast volatility at least 1.5 times its long-run level
+STRESSED_PROBABILITY = 0.6   # how sure the regime model must be before an alert
+
+
+def risk_triggers(outlook: dict[str, Any], regimes: dict[str, Any] | None) -> list[tuple[str, str, str]]:
+    """(key, title, trigger in words) for each risk alert the latest data warrants. Deterministic; no model."""
+    out = []
+    latest = outlook.get("latest_day")
+    if latest and latest.get("breached"):
+        out.append((f"var_breach:{latest['date']}",
+                    f"A loss beyond the 95% VaR on {latest['date']}",
+                    f"on {latest['date']} the account returned {latest['return']:.2%}, beyond its 95% one-day VaR "
+                    f"of {latest['var_95']:.2%} forecast the day before"))
+    if regimes:
+        stressed = regimes["regimes"][-1]["regime"]
+        if (regimes["current_regime"] == stressed and regimes["regime_a_week_ago"] != stressed
+                and regimes["current_probability"] >= STRESSED_PROBABILITY):
+            out.append((f"regime:{stressed.lower()}:{regimes['window_end']}",
+                        f"The account has moved into its {stressed.lower()} regime",
+                        f"the regime model now puts the account in its {stressed.lower()} regime "
+                        f"({regimes['current_probability']:.0%} likely), up from {regimes['regime_a_week_ago'].lower()} "
+                        "a week ago"))
+    ratio = outlook.get("volatility_vs_long_run")
+    if ratio is not None and ratio >= VOLATILITY_JUMP:
+        year, week, _ = date.fromisoformat(outlook["window_end"]).isocalendar()
+        out.append((f"volatility:{year}-W{week:02d}", "Forecast volatility is well above normal",
+                    f"forecast volatility for the next month is {outlook['forecast_volatility_next_month_annual']:.1%} "
+                    f"a year, {ratio:.1f} times its long-run level of {outlook['long_run_volatility_annual']:.1%}"))
+    return out
+
+
+def model_check_findings(outlook: dict[str, Any], regimes: dict[str, Any] | None) -> tuple[list[str], list[str]]:
+    """(problems, passes) from the models' own backtests. Deterministic; no model."""
+    problems, passes = [], []
+    backtest = outlook.get("backtest") or {}
+    if backtest.get("available"):
+        line = backtest["verdict"]
+        if backtest.get("kupiec_p_value") is not None and backtest["kupiec_p_value"] < 0.05:
+            problems.append(line + " Treat the VaR and tail-loss figures with caution until it is back in line.")
+        else:
+            passes.append(line)
+    else:
+        passes.append(backtest.get("reason") or "The VaR backtest is not available yet.")
+    score = (regimes or {}).get("score") or {}
+    if score.get("available"):
+        coverage = score["coverage_90"]
+        line = (f"The outlook's 90% range held the next month's outcome {coverage:.0%} of the time over "
+                f"{score['tested_months']} months.")
+        (passes if 0.8 <= coverage <= 0.97 else problems).append(
+            line if 0.8 <= coverage <= 0.97 else line + " That is outside 80% to 97%, so the ranges are off.")
+        passes.append("The outlook shows directional skill." if score["directional_skill"] else
+                      "The outlook shows no reliable directional skill; read its range, not its middle.")
+    elif regimes is not None:
+        passes.append(score.get("reason") or "The outlook cannot be scored yet.")
+    return problems, passes
+
+
+def risk_watch(store: Store, tools: ToolClient, agent: Agent, accounts: list[str], usage: dict,
+               today: date | None = None) -> int:
+    """Daily risk alerts with an explanation, and a monthly check of the risk models against what happened."""
+    today = today or date.today()
+    written = 0
+    for account_id in accounts:
+        try:
+            outlook = tools.call("get_risk_outlook", {"account_id": account_id})["data"]
+        except ToolCallFailed:
+            continue  # too little history, or no valuations: nothing to watch yet
+        try:
+            regimes = tools.call("get_market_regimes", {"account_id": account_id})["data"]
+        except ToolCallFailed:
+            regimes = None
+        end = outlook["window_end"]
+        start = (date.fromisoformat(end) - timedelta(days=7)).isoformat()
+        for key, title, trigger in risk_triggers(outlook, regimes):
+            if store.inbox_exists("risk_alert", account_id, key):
+                continue
+            answer, citations, used, ok = _run_agent(
+                agent, tools, account_id, RISK_ALERT.format(account_id=account_id, trigger=trigger, from_date=start,
+                                                            to_date=end),
+                ["get_risk_outlook", "get_market_regimes", "get_holdings_changes", "get_factor_exposures",
+                 "get_sector_allocation"])
+            _sum_usage(usage, used)
+            body = answer if ok else (f"The risk watch found that {trigger}. The explanation could not be checked "
+                                      "against the figures, so it is left out; open the Modelling tab for detail.")
+            if store.add_inbox(kind="risk_alert", account_id=account_id, period_key=key, title=title, body=body,
+                               citations=citations if ok else [{"source": "subject_nav_series",
+                                                                "account_id": account_id}], run_id=None):
+                written += 1
+        month = today.strftime("%Y-%m")
+        if store.inbox_exists("model_check", account_id, month):
+            continue
+        problems, passes = model_check_findings(outlook, regimes)
+        title = (f"Risk model check for {month}: {len(problems)} issue(s)" if problems
+                 else f"Risk model check for {month}: in line")
+        body = "\n".join([f"- {p}" for p in problems] + [f"- {p}" for p in passes])
+        if store.add_inbox(kind="model_check", account_id=account_id, period_key=month, title=title, body=body,
+                           citations=[{"source": "subject_nav_series", "account_id": account_id, "to_date": end}],
+                           run_id=None):
+            written += 1
     return written
 
 
@@ -350,7 +456,8 @@ def operations(store: Store, tools: ToolClient, usage: dict, correlation_id: str
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team",
-                                                  "onboarding", "operations", "weekly_brief", "live_market"])
+                                                  "onboarding", "operations", "weekly_brief", "live_market",
+                                                  "risk_watch"])
     parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
@@ -396,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             agent = Agent(ModelSettings.from_env())
             job = {"holdings_explainer": holdings_explainer, "weekly_brief": weekly_brief,
-                   "live_market": live_market}.get(args.job, month_end_drafter)
+                   "live_market": live_market, "risk_watch": risk_watch}.get(args.job, month_end_drafter)
             written = job(store, tools, agent, accounts, usage)
         store.finish_run(run_id, status="succeeded", items=written, usage=usage)
         LOGGER.info("%s wrote %s inbox items", args.job, written)

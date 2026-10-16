@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException
 
-from . import crisis_scenarios, fama_french
+from . import crisis_scenarios, fama_french, risk_forecasting
 from .modelling import (
     ModellingInputError,
     factor_model,
@@ -89,6 +89,46 @@ def _yahoo_closes(symbol: str, start: date, end: date) -> dict[str, float]:
     if not closes:
         raise RuntimeError(f"No prices were found for {symbol}")
     return closes
+
+
+# Forward-looking models are slower; keep the latest results per portfolio and data.
+FORECAST_CACHE_LIMIT = 64
+_forecast_cache: dict[tuple, dict[str, Any]] = {}
+_forecast_lock = threading.Lock()
+
+
+def _cached(key: tuple, build: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    with _forecast_lock:
+        if key in _forecast_cache:
+            return _forecast_cache[key]
+    result = build()
+    with _forecast_lock:
+        if len(_forecast_cache) >= FORECAST_CACHE_LIMIT:
+            _forecast_cache.pop(next(iter(_forecast_cache)))
+        _forecast_cache[key] = result
+    return result
+
+
+def _shocks(text: str | None) -> dict[str, float]:
+    """``Mkt-RF:-0.2,HML:0.05`` as fractions."""
+
+    shocks = {}
+    for part in (text or "").split(","):
+        if not part.strip():
+            continue
+        name, _, raw = part.partition(":")
+        name = name.strip()
+        if name not in risk_forecasting_factor_names():
+            raise HTTPException(status_code=400, detail=f"{name[:20]} is not a factor")
+        shocks[name] = _number(raw, "Each factor shock", low=-risk_forecasting.MAX_FACTOR_SHOCK,
+                               high=risk_forecasting.MAX_FACTOR_SHOCK) or 0.0
+    return shocks
+
+
+def risk_forecasting_factor_names() -> tuple[str, ...]:
+    from .modelling import FACTOR_NAMES
+
+    return FACTOR_NAMES
 
 
 # Crisis replays of the what-if ---------------------------------------------------------
@@ -534,21 +574,77 @@ def install(
         return {"account_id": account_id, "snapshot_date": snapshot,
                 "risk_free_available": risk_free is not None, **result}
 
-    @app.get("/api/portfolio/{account_id}/modelling/factors")
-    def modelling_factors(
+    def returns_key(account_id: str, returns: list[tuple[str, float]], kind: str) -> tuple:
+        return (kind, tenant_id, account_id, returns[0][0] if returns else None, returns[-1][0] if returns else None,
+                len(returns), round(math.fsum(r for _, r in returns), 12))
+
+    @app.get("/api/portfolio/{account_id}/modelling/risk-outlook")
+    def modelling_risk_outlook(
         account_id: str,
         as_of: str | None = None,
-        region: str = fama_french.DEFAULT_REGION,
         user: dict[str, str] = Depends(authorized_user),
     ) -> dict:
-        """Fama-French five-factor plus momentum exposures of the portfolio's returns."""
+        """Volatility forecast, forward VaR and expected tail loss with a backtest, and drawdown odds."""
         access = access_context(account_id, user)
         requested = parse_as_of(as_of)
+        with read_database() as connection:
+            try:
+                nav, returns = portfolio_returns(connection, account_id, access, requested)
+            except PerformanceInputError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+
+        def build() -> dict[str, Any]:
+            forecast = risk_forecasting.volatility_forecast(returns)
+            forecast.pop("_fit", None)
+            values = [r for _, r in returns]
+            history = forecast["long_run_volatility_annual"]
+            scale = forecast["forecast_volatility_next_month_annual"] / history if history else 1.0
+            forecast["drawdown_odds"] = {
+                "historical": risk_forecasting.drawdown_odds(values),
+                "current_volatility": risk_forecasting.drawdown_odds(values, volatility_scale=scale),
+            }
+            return forecast
+
+        try:
+            result = _cached(returns_key(account_id, returns, "risk"), build)
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        last_day = next(reversed(nav)) if nav else None
+        return {"account_id": account_id, "currency": access["reporting_currency"], "as_of": last_day,
+                "nav": float(nav[last_day]) if last_day else None, **result}
+
+    @app.get("/api/portfolio/{account_id}/modelling/regimes")
+    def modelling_regimes(
+        account_id: str,
+        as_of: str | None = None,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Market regimes from the portfolio's own returns and a scored one-to-three-month outlook."""
+        access = access_context(account_id, user)
+        requested = parse_as_of(as_of)
+        with read_database() as connection:
+            try:
+                nav, returns = portfolio_returns(connection, account_id, access, requested)
+            except PerformanceInputError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            result = _cached(returns_key(account_id, returns, "regimes"),
+                             lambda: risk_forecasting.regime_outlook(returns))
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        last_day = next(reversed(nav)) if nav else None
+        value = float(nav[last_day]) if last_day else None
+        outlook = [{**row, **{f"{band}_value": value * (1.0 + row[band]) for band in ("p5", "p25", "p50", "p75", "p95")}}
+                   for row in result["outlook"]] if value else result["outlook"]
+        return {"account_id": account_id, "currency": access["reporting_currency"], "as_of": last_day,
+                "nav": value, **result, "outlook": outlook}
+
+    def fitted_factors(account_id: str, access: dict, requested: str | None, region: str):
         if region not in fama_french.REGIONS:
             raise HTTPException(status_code=400, detail="Unknown factor region")
         with read_database() as connection:
             try:
-                _, returns = portfolio_returns(connection, account_id, access, requested)
+                nav, returns = portfolio_returns(connection, account_id, access, requested)
             except PerformanceInputError as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
         try:
@@ -560,6 +656,46 @@ def install(
                                   source_url=factors["source_url"], labels=factors.get("labels"))
         except ModellingInputError as error:
             raise model_error(error) from error
+        return factors, result, (float(nav[next(reversed(nav))]) if nav else None)
+
+    @app.get("/api/portfolio/{account_id}/modelling/factor-stress")
+    def modelling_factor_stress(
+        account_id: str,
+        as_of: str | None = None,
+        region: str = fama_french.DEFAULT_REGION,
+        scenario: str | None = None,
+        shocks: str | None = None,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Portfolio move implied by its factor betas for a preset or custom set of factor shocks."""
+        access = access_context(account_id, user)
+        requested = parse_as_of(as_of)
+        if scenario:
+            if scenario not in risk_forecasting.STRESS_PRESETS:
+                raise HTTPException(status_code=400, detail="Unknown stress scenario")
+            label, chosen = risk_forecasting.STRESS_PRESETS[scenario]
+        else:
+            label, chosen = "Custom shocks", _shocks(shocks)
+        factors, model, value = fitted_factors(account_id, access, requested, region)
+        try:
+            result = risk_forecasting.factor_stress(model, chosen)
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        return {"account_id": account_id, "currency": access["reporting_currency"], "scenario": scenario,
+                "scenario_label": label, "region": model["region"], "factor_source": factors.get("source", "kenneth_french"),
+                "nav": value, "impact_value": value * result["impact"] if value else None,
+                "presets": {k: v[0] for k, v in risk_forecasting.STRESS_PRESETS.items()}, **result}
+
+    @app.get("/api/portfolio/{account_id}/modelling/factors")
+    def modelling_factors(
+        account_id: str,
+        as_of: str | None = None,
+        region: str = fama_french.DEFAULT_REGION,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Fama-French five-factor plus momentum exposures of the portfolio's returns."""
+        access = access_context(account_id, user)
+        factors, result, _ = fitted_factors(account_id, access, parse_as_of(as_of), region)
         return {"account_id": account_id, "currency": access["reporting_currency"],
                 "factor_data_through": factors["latest_date"], "momentum_note": factors["momentum_note"],
                 "source": factors.get("source", "kenneth_french"), "source_note": factors.get("source_note", ""),
@@ -571,6 +707,18 @@ MODELLING_CARDS = r"""
 <div class="filter-grid"><label><span class="label">Horizon</span><select id="projection-years" aria-label="Projection horizon"><option value="1">1 year</option><option value="3">3 years</option><option value="5">5 years</option><option value="10" selected>10 years</option><option value="20">20 years</option><option value="30">30 years</option></select></label><label><span class="label">Monthly contribution (<span class="model-ccy"></span>, negative to withdraw)</span><input id="projection-flow" type="number" step="any" value="0" aria-label="Monthly contribution or withdrawal"></label><label><span class="label">Target value (<span class="model-ccy"></span>, optional)</span><input id="projection-target" type="number" step="any" min="0" aria-label="Target value"></label><label><span class="label">Return assumption (% a year, blank for history)</span><input id="projection-return" type="number" step="0.1" min="-50" max="100" aria-label="Annual return assumption"></label></div>
 <div class="actions"><button id="projection-run" class="button" type="button">Run projection</button></div>
 <div id="projection-metrics" class="metrics"></div><div class="chart-wrap"><canvas id="projection-chart" width="1100" height="300" aria-label="Projected NAV range"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div><div id="projection-note" class="muted">Loading…</div></div>
+<div class="card wide" id="model-risk"><div class="label">Risk outlook</div><div class="muted">How volatile the portfolio is likely to be from here, how much it could lose on a bad day or month, whether that measure has held up in the past, and the chance of a large fall over the next year.</div>
+<div id="risk-metrics" class="metrics"></div>
+<div class="label model-subhead">Has the VaR line held? Daily returns against the 95% one-day VaR</div><div class="chart-wrap"><canvas id="risk-backtest-chart" width="1100" height="280" aria-label="Daily returns against the forecast VaR"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div><div id="risk-backtest" class="muted"></div>
+<div class="label model-subhead">Chance of a fall from a high within the next 12 months</div><div class="table-scroll"><table><thead><tr><th class="text-col">Fall of at least</th><th>At its historical volatility</th><th>At today's forecast volatility</th></tr></thead><tbody id="risk-drawdown"></tbody></table></div>
+<div id="risk-note" class="muted">Loading…</div></div>
+<div class="card wide" id="model-regimes"><div class="label">Market regime and outlook</div><div class="muted">Sorts the portfolio's history into calm and stressed periods from its own returns, shows which one it is in now and how likely a switch is, and gives a range for its value one to three months ahead, scored against how past ranges turned out.</div>
+<div id="regime-metrics" class="metrics"></div>
+<div class="table-scroll"><table><thead><tr><th class="text-col">Regime</th><th>Return (a year)</th><th>Volatility</th><th>Share of time</th><th>Typical length</th><th>Chance now</th><th>Chance in a month</th></tr></thead><tbody id="regime-table"></tbody></table></div>
+<div class="label model-subhead">Chance of being in the stressed regime</div><div class="chart-wrap"><canvas id="regime-chart" width="1100" height="260" aria-label="Probability of the stressed regime over time"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div>
+<div class="label model-subhead">Range for the portfolio's value</div><div class="table-scroll"><table><thead><tr><th class="text-col">Horizon</th><th>Weak case (5th)</th><th>25th</th><th>Middle</th><th>75th</th><th>Strong case (95th)</th><th>Chance of a loss</th></tr></thead><tbody id="regime-outlook"></tbody></table></div>
+<div class="label model-subhead">How past outlooks held up</div><div id="regime-score-metrics" class="metrics"></div><div id="regime-score" class="muted"></div>
+<div id="regime-note" class="muted">Loading…</div></div>
 <div class="card wide" id="model-whatif"><div class="label">What-if rebalancing</div><div class="muted">Change the weight of any holding, or add a ticker you do not hold, and compare the risk of the proposed portfolio with today's over the same year of daily prices. Weights are shares of NAV; whatever is left over is cash.</div>
 <div class="table-scroll"><table><thead><tr><th class="text-col">Holding</th><th>Current weight</th><th>Proposed weight (%)</th><th>Price history</th></tr></thead><tbody id="whatif-holdings"></tbody></table></div>
 <div class="filter-grid"><label><span class="label">Add a ticker (Yahoo Finance symbol)</span><input id="whatif-add-symbol" type="text" maxlength="20" autocomplete="off" placeholder="e.g. VOO or 0700.HK" aria-label="Ticker to add"></label><label><span class="label">Weight (%)</span><input id="whatif-add-weight" type="number" step="0.1" min="0" max="200" aria-label="Weight of the added ticker"></label></div>
@@ -586,7 +734,12 @@ MODELLING_CARDS = r"""
 <div class="card wide" id="model-factors"><div class="label">Factor model</div><div class="muted">Splits the portfolio's weekly returns into exposure to the market, company size, value, profitability, investment style and momentum (Fama-French five factors plus momentum), and the return those factors do not explain (alpha).</div>
 <div class="filter-grid"><label><span class="label">Factor region</span><select id="factor-region" aria-label="Factor region"><option value="developed" selected>Developed markets</option><option value="us">United States</option><option value="asia_pacific_ex_japan">Asia Pacific ex Japan</option></select></label></div>
 <div class="actions"><button id="factor-run" class="button" type="button">Run factor model</button></div>
-<div id="factor-metrics" class="metrics"></div><div class="table-scroll"><table><thead><tr><th class="text-col">Factor</th><th>Beta</th><th>t-statistic</th><th>Factor return (a year)</th><th>Return contribution (a year)</th></tr></thead><tbody id="factor-exposures"></tbody></table></div><div id="factor-note" class="muted">Loading…</div></div>
+<div id="factor-metrics" class="metrics"></div><div class="table-scroll"><table><thead><tr><th class="text-col">Factor</th><th>Beta</th><th>t-statistic</th><th>Factor return (a year)</th><th>Return contribution (a year)</th></tr></thead><tbody id="factor-exposures"></tbody></table></div><div id="factor-note" class="muted">Loading…</div>
+<div class="label model-subhead">Factor stress test</div><div class="muted">Moves the portfolio through its fitted factor betas for a one-off shock to the factors.</div>
+<div class="filter-grid"><label><span class="label">Scenario</span><select id="stress-scenario" aria-label="Stress scenario"><option value="market_down_20">Market falls 20%</option><option value="growth_selloff">Growth and momentum sell-off</option><option value="flight_to_quality">Flight to quality</option><option value="small_cap_rally">Small-cap and value rally</option><option value="value_rotation">Rotation from growth to value</option><option value="custom">Custom shocks</option></select></label></div>
+<div id="stress-custom" class="filter-grid" hidden><label><span class="label">Market (%)</span><input type="number" step="1" min="-60" max="60" data-factor="Mkt-RF" aria-label="Market shock"></label><label><span class="label">Size (%)</span><input type="number" step="1" min="-60" max="60" data-factor="SMB" aria-label="Size shock"></label><label><span class="label">Value (%)</span><input type="number" step="1" min="-60" max="60" data-factor="HML" aria-label="Value shock"></label><label><span class="label">Profitability (%)</span><input type="number" step="1" min="-60" max="60" data-factor="RMW" aria-label="Profitability shock"></label><label><span class="label">Investment (%)</span><input type="number" step="1" min="-60" max="60" data-factor="CMA" aria-label="Investment shock"></label><label><span class="label">Momentum (%)</span><input type="number" step="1" min="-60" max="60" data-factor="MOM" aria-label="Momentum shock"></label></div>
+<div class="actions"><button id="stress-run" class="button" type="button">Run stress test</button></div>
+<div id="stress-metrics" class="metrics"></div><div class="table-scroll"><table><thead><tr><th class="text-col">Factor</th><th>Shock</th><th>Beta</th><th>Effect on the portfolio</th></tr></thead><tbody id="stress-table"></tbody></table></div><div id="stress-note" class="muted"></div></div>
 """
 
 MODELLING_CSS = """
@@ -695,5 +848,53 @@ const runFactors=async()=>{
 };
 document.querySelector('#factor-run').addEventListener('click',()=>void runFactors());
 document.querySelector('#projection-run').addEventListener('click',()=>void runProjection());
-const renderModelling=asOf=>{modelState.asOf=asOf;modelState.added={};void runProjection();void runWhatif(false).then(()=>runOptimise());void runFactors()};
+const riskPair=(x,nav)=>`${pct2(x)}${nav?`<div class="muted">${modelMoney(x*nav)}</div>`:''}`;
+const runRisk=async()=>{
+  const note=document.querySelector('#risk-note'),metrics=document.querySelector('#risk-metrics');note.textContent='Forecasting volatility and backtesting…';
+  let r;try{r=await modelFetch('risk-outlook',{as_of:modelState.asOf})}catch(error){note.textContent=error.message;metrics.innerHTML='';document.querySelector('#risk-drawdown').innerHTML='';document.querySelector('#risk-backtest').textContent='';draw('#risk-backtest-chart',[],[],{emptyMessage:'No forecast.'});return}
+  const d1=r.one_day['95'],d99=r.one_day['99'],m1=r.one_month['95'];
+  metrics.innerHTML=[
+    modelTile('Forecast volatility (next month, a year)',pct2(r.forecast_volatility_next_month_annual),`Long-run ${pct2(r.long_run_volatility_annual)}; last year ${pct2(r.realised_volatility_last_year)}`),
+    modelTile('Long-run volatility',pct2(r.long_run_volatility_annual)),
+    modelTile('One-day VaR (95%)',riskPair(d1.var,r.nav),'A loss this large or larger is expected on about 1 day in 20.'),
+    modelTile('One-day expected tail loss (95%)',riskPair(d1.expected_tail_loss,r.nav),'The average loss on those worst 1-in-20 days.'),
+    modelTile('One-day VaR (99%)',riskPair(d99.var,r.nav),'About 1 day in 100.'),
+    modelTile('One-month VaR (95%)',riskPair(m1.var,r.nav),'A 21-session loss this large or larger in about 1 month in 20.'),
+    modelTile('One-month expected tail loss (95%)',riskPair(m1.expected_tail_loss,r.nav)),
+    modelTile('Shock half-life',r.shock_half_life_days==null?'—':`${Math.round(r.shock_half_life_days)} sessions`,'How long it takes half of a volatility spike to fade.'),
+  ].join('');
+  const b=r.backtest;
+  draw('#risk-backtest-chart',b.available?b.series.map(x=>({date:x.date,ret:100*x.return,limit:-100*x.var})):[],[{key:'ret',color:chartColors.portfolio,label:'Daily return'},{key:'limit',color:chartColors.benchmark,label:'95% VaR line'}],{yLabel:'Daily return (%)',unit:'%',emptyMessage:b.available?'No backtest.':b.reason});
+  document.querySelector('#risk-backtest').textContent=b.available?`${b.verdict}${b.kupiec_p_value!=null?` Kupiec test p-value ${ratio(b.kupiec_p_value)}.`:''}`:b.reason;
+  const h=r.drawdown_odds.historical,c=r.drawdown_odds.current_volatility;
+  document.querySelector('#risk-drawdown').innerHTML=h.probabilities.map((x,i)=>`<tr><td class="text-col">${weightPct(x.threshold)}</td><td>${pct2(x.probability)}</td><td>${pct2(c.probabilities[i].probability)}</td></tr>`).join('')+`<tr><td class="text-col">Typical worst fall (median)</td><td>${pct2(h.median_worst_fall)}</td><td>${pct2(c.median_worst_fall)}</td></tr><tr><td class="text-col">Bad-case worst fall (1 in 20)</td><td>${pct2(h.bad_case_worst_fall)}</td><td>${pct2(c.bad_case_worst_fall)}</td></tr>`;
+  note.textContent=`${r.method_name}, fitted on ${r.observations} daily returns from ${analyticsDate(r.window_start)} to ${analyticsDate(r.window_end)}. ${r.method} Today's-volatility column replays history scaled by ${ratio(c.volatility_scale)}×. ${r.disclaimer}`;
+};
+const runRegimes=async()=>{
+  const note=document.querySelector('#regime-note'),metrics=document.querySelector('#regime-metrics');note.textContent='Fitting regimes and scoring past outlooks…';
+  let r;try{r=await modelFetch('regimes',{as_of:modelState.asOf})}catch(error){note.textContent=error.message;['#regime-metrics','#regime-table','#regime-outlook','#regime-score-metrics'].forEach(x=>document.querySelector(x).innerHTML='');document.querySelector('#regime-score').textContent='';draw('#regime-chart',[],[],{emptyMessage:'No regimes.'});return}
+  const stressed=r.regimes[r.regimes.length-1];
+  metrics.innerHTML=[modelTile('Regime now',esc(r.current_regime),`${pct2(r.current_probability)} likely`),modelTile(`Chance of ${stressed.regime.toLowerCase()} now`,pct2(stressed.probability_now)),modelTile(`Chance of ${stressed.regime.toLowerCase()} in a month`,pct2(stressed.probability_in_a_month)),modelTile('Chance of a loss over 3 months',pct2(r.outlook[r.outlook.length-1].probability_loss))].join('');
+  document.querySelector('#regime-table').innerHTML=r.regimes.map(x=>`<tr><td class="text-col"><strong>${esc(x.regime)}</strong>${x.regime===r.current_regime?' <span class="muted">(now)</span>':''}</td><td>${signedPct(x.annual_return)}</td><td>${pct2(x.annual_volatility)}</td><td>${pct2(x.share_of_time)}</td><td>${x.expected_duration_days==null?'—':`${Math.round(x.expected_duration_days)} sessions`}</td><td>${pct2(x.probability_now)}</td><td>${pct2(x.probability_in_a_month)}</td></tr>`).join('');
+  draw('#regime-chart',r.timeline.map(x=>({date:x.date,p:100*x.stressed_probability})),[{key:'p',color:chartColors.benchmark,label:`Chance of ${stressed.regime.toLowerCase()}`}],{yLabel:'Probability (%)',unit:'%',emptyMessage:'No regimes.'});
+  const cell=(row,band)=>`${row[`${band}_value`]!=null?modelMoney(row[`${band}_value`]):'—'}<div class="muted">${signedPct(row[band])}</div>`;
+  document.querySelector('#regime-outlook').innerHTML=r.outlook.map(x=>`<tr><td class="text-col">${x.months} ${x.months===1?'month':'months'}</td>${['p5','p25','p50','p75','p95'].map(b=>`<td>${cell(x,b)}</td>`).join('')}<td>${pct2(x.probability_loss)}</td></tr>`).join('');
+  const s=r.score;
+  document.querySelector('#regime-score-metrics').innerHTML=s.available?[modelTile('90% range held the outcome',pct2(s.coverage_90),'Should be close to 90%.'),modelTile('Middle 50% range held it',pct2(s.coverage_50),'Should be close to 50%.'),modelTile('Direction right',pct2(s.direction_hit_rate),`Against ${pct2(s.naive_hit_rate)} for assuming the more common past direction.`),modelTile('Directional skill',s.directional_skill?'Some':'None shown')].join(''):'';
+  document.querySelector('#regime-score').textContent=s.available?s.verdict:s.reason;
+  note.textContent=`${r.states} regimes from ${r.observations} daily returns, ${analyticsDate(r.window_start)} to ${analyticsDate(r.window_end)}. ${r.method} ${r.disclaimer}`;
+};
+const stressScenario=document.querySelector('#stress-scenario');
+stressScenario.addEventListener('change',()=>{document.querySelector('#stress-custom').hidden=stressScenario.value!=='custom'});
+const runStress=async()=>{
+  const note=document.querySelector('#stress-note'),metrics=document.querySelector('#stress-metrics'),body=document.querySelector('#stress-table');note.textContent='Running the stress test…';
+  const params={as_of:modelState.asOf,region:document.querySelector('#factor-region').value};
+  if(stressScenario.value==='custom'){const shocks=[...document.querySelectorAll('#stress-custom input[data-factor]')].filter(i=>i.value!=='').map(i=>`${i.dataset.factor}:${Number(i.value)/100}`);if(!shocks.length){note.textContent='Enter at least one factor shock.';metrics.innerHTML='';body.innerHTML='';return}params.shocks=shocks.join(',')}else params.scenario=stressScenario.value;
+  let r;try{r=await modelFetch('factor-stress',params)}catch(error){note.textContent=error.message;metrics.innerHTML='';body.innerHTML='';return}
+  metrics.innerHTML=[modelTile(`Portfolio move: ${esc(r.scenario_label)}`,toned(signedPct(r.impact),r.impact)),modelTile('In money',r.impact_value==null?'—':toned(modelMoney(r.impact_value),r.impact_value)),modelTile('Typical unexplained move in a month',r.unexplained_monthly_range==null?'—':`± ${pct2(r.unexplained_monthly_range)}`),modelTile('Explained by factors (R²)',pct2(r.r_squared))].join('');
+  body.innerHTML=r.factors.map(x=>`<tr><td class="text-col"><strong>${esc(x.label)}</strong>${x.significant?'':' <span class="muted">(beta not significant)</span>'}</td><td>${signedPct(x.shock)}</td><td>${ratio(x.beta)}</td><td>${toned(signedPct(x.impact),x.impact)}</td></tr>`).join('');
+  note.textContent=`${r.method}${r.factors_not_in_model.length?` Not in the fitted model, so left out: ${r.factors_not_in_model.join(', ')}.`:''} ${r.disclaimer}`;
+};
+document.querySelector('#stress-run').addEventListener('click',()=>void runStress());
+const renderModelling=asOf=>{modelState.asOf=asOf;modelState.added={};void runProjection();void runRisk();void runRegimes();void runWhatif(false).then(()=>runOptimise());void runFactors().then(()=>runStress())};
 """

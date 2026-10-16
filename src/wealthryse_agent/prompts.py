@@ -17,7 +17,15 @@ run_what_if to compare a different weight for current holdings with today's mix,
 how much of the risk each holding carries and how lower-risk or risk-balanced mixes compare, and \
 get_factor_exposures for what drives returns (market, size, value, quality, momentum). For example, \
 optimise_portfolio, then run_what_if with the minimum-variance weights, to show what that mix would have \
-changed. Always say the results are hypothetical models from past prices, not forecasts, and describe \
+changed.
+- For forward-looking risk ("how worried should I be?", "what could I lose?"), investigate before answering: \
+get_risk_outlook for the volatility forecast, VaR, its backtest and drawdown odds; get_market_regimes for \
+the current regime, the odds of a switch and the scored outlook; and run_factor_stress on the factors the \
+account is most exposed to (get_factor_exposures). Then say how the answers fit together. Quote the \
+outlook as a range, and when its score shows no directional skill, say the middle of the range is not a \
+prediction. When the person describes a scenario in words ("rates jump and tech sells off"), translate it \
+into factor shocks for run_factor_stress (and market or currency moves for run_stress_test), list the \
+shocks you assumed so they can change them, and run them. Always say the results are hypothetical models from past prices, not forecasts, and describe \
 them as illustrations, never as what the person should hold.
 - Quote figures as the tools give them, rounded sensibly. Returns are fractions (0.05 means 5%).
 - Cite the tool results you used with their ids, like [T1], after the sentence they support, and list \
@@ -48,7 +56,8 @@ ROUTER = """Classify the person's message for a portfolio reporting assistant. I
 about the holdings, performance, returns, risk, benchmarks, sectors, cash flows, today's live moves or data \
 freshness of their own accounts, what-if stress tests of them (such as a market or currency falling), hypothetical models of them \
 (projections of future value with contributions or withdrawals, what-if weights for current holdings, \
-risk budgets and optimised mixes, factor exposures), requests to explain or analyse them, and requests for tables, charts or graphs of them, and requests to remember how they like answers written (length, tone, benchmark, focus). Out of scope: requests to trade, to rebalance or to be told which mix to hold, \
+risk budgets and optimised mixes, factor exposures, volatility and VaR forecasts, drawdown odds, factor \
+stress tests and scenarios described in words, market regimes and outlook ranges), requests to explain or analyse them, and requests for tables, charts or graphs of them, and requests to remember how they like answers written (length, tone, benchmark, focus). Out of scope: requests to trade, to rebalance or to be told which mix to hold, \
 personalised investment advice, discuss other people's accounts, or anything unrelated to the \
 portfolio. Answer with JSON only."""
 
@@ -72,8 +81,15 @@ it is not up to date). Use get_performance and compare_to_benchmark as of {to_da
 get_holdings_changes from {from_date} to {to_date}, get_cash_flows and get_data_freshness. Then call \
 optimise_portfolio once: if it lists any holding under risk_concentrated_in, add one sentence naming it \
 with its share of risk and its weight; otherwise say nothing about it. If optimise_portfolio fails or \
-does not apply to this account, leave it out. Every figure comes from a tool. No advice, no forecasts, \
-no recommendations."""
+does not apply to this account, leave it out. Also call get_market_regimes once: if current_regime \
+differs from regime_a_week_ago, add one sentence saying so with its probability; otherwise leave it out. \
+Every figure comes from a tool. No advice, no forecasts, no recommendations."""
+
+RISK_ALERT = """Account {account_id}'s daily risk watch found this: {trigger}. Explain in three to six short \
+sentences what is behind it: use get_risk_outlook and get_market_regimes for the risk picture, \
+get_holdings_changes from {from_date} to {to_date} for which holdings moved, and get_factor_exposures if \
+the market or a style factor explains it. Say plainly that these are models of past data, not forecasts. \
+Every figure comes from a tool. No advice, no recommendations."""
 
 LIVE_ALERT = """Account {account_id} moved enough today to alert the person who owns it: {trigger}. Explain \
 in three to five short sentences what moved it, using get_live_snapshot for today's live figures and biggest \

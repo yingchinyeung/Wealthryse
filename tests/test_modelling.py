@@ -486,6 +486,39 @@ class RouteTests(unittest.TestCase):
         self.assertIn("small caps", body["exposures"][1]["label"])
         self.assertEqual(self.client.get("/api/portfolio/A/modelling/factors", params={"region": "mars"}).status_code, 400)
 
+    def test_risk_outlook_and_regime_routes(self) -> None:
+        risk = self.client.get("/api/portfolio/A/modelling/risk-outlook")
+        self.assertEqual(risk.status_code, 200, risk.text)
+        body = risk.json()
+        self.assertNotIn("_fit", body)
+        self.assertGreater(body["one_day"]["95"]["var"], 0)
+        self.assertEqual(len(body["drawdown_odds"]["historical"]["probabilities"]), 3)
+        self.assertFalse(body["backtest"]["available"])  # 300 sessions is too short to backtest
+        self.assertEqual(self.client.get("/api/portfolio/A/modelling/risk-outlook").json(), body)  # cached
+        regimes = self.client.get("/api/portfolio/A/modelling/regimes")
+        self.assertEqual(regimes.status_code, 200, regimes.text)
+        result = regimes.json()
+        self.assertIn(result["current_regime"], ("Calm", "Normal", "Stressed"))
+        self.assertAlmostEqual(result["outlook"][0]["p50_value"], result["nav"] * (1 + result["outlook"][0]["p50"]))
+        self.assertFalse(result["score"]["available"])
+
+    def test_factor_stress_route(self) -> None:
+        preset = self.client.get("/api/portfolio/A/modelling/factor-stress", params={"scenario": "market_down_20"})
+        self.assertEqual(preset.status_code, 200, preset.text)
+        body = preset.json()
+        market = next(x for x in body["factors"] if x["factor"] == "Mkt-RF")
+        self.assertAlmostEqual(body["impact"], market["beta"] * -0.2)
+        self.assertAlmostEqual(body["impact_value"], body["impact"] * body["nav"])
+        custom = self.client.get("/api/portfolio/A/modelling/factor-stress", params={"shocks": "Mkt-RF:-0.1,MOM:0.05"})
+        self.assertEqual(custom.status_code, 200, custom.text)
+        self.assertEqual(custom.json()["factors_not_in_model"], ["MOM"])
+        self.assertEqual(self.client.get("/api/portfolio/A/modelling/factor-stress",
+                                         params={"shocks": "Gold:0.1"}).status_code, 400)
+        self.assertEqual(self.client.get("/api/portfolio/A/modelling/factor-stress",
+                                         params={"scenario": "aliens"}).status_code, 400)
+        self.assertEqual(self.client.get("/api/portfolio/A/modelling/factor-stress",
+                                         params={"shocks": "Mkt-RF:-0.9"}).status_code, 400)
+
     def test_crisis_what_if_route(self) -> None:
         params = {"weights": "1000:0.4,1001:0", "add": "spy:0.1"}
         off = self.client.get("/api/portfolio/A/modelling/what-if-crisis", params=params)

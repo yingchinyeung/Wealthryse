@@ -1400,6 +1400,138 @@ def get_factor_exposures(connection, arguments: Mapping[str, Any]) -> dict[str, 
     }
 
 
+def _account_returns(connection, account_id: str) -> tuple[Mapping[str, Any], str, dict[str, float], list[tuple[str, float]]]:
+    subject = _subject(connection, account_id)
+    end = _latest_nav_date(connection, account_id, None)
+    nav, flows = _series_inputs(connection, subject, end)
+    return subject, end, nav, daily_returns(nav, flows, _window(nav, None, end))
+
+
+def get_risk_outlook(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Volatility forecast, forward VaR and expected tail loss, their backtest, and drawdown odds."""
+    from ibkr_etl import risk_forecasting
+    from ibkr_etl.modelling import ModellingInputError
+
+    account_id = str(arguments["account_id"])
+    subject, end, nav, returns = _account_returns(connection, account_id)
+    try:
+        forecast = risk_forecasting.volatility_forecast(returns)
+        values = [r for _, r in returns]
+        history = forecast["long_run_volatility_annual"]
+        scale = forecast["forecast_volatility_next_month_annual"] / history if history else 1.0
+        historical = risk_forecasting.drawdown_odds(values)
+        current = risk_forecasting.drawdown_odds(values, volatility_scale=scale)
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    backtest = forecast["backtest"]
+    latest = None
+    if backtest.get("available") and backtest["series"]:
+        row = backtest["series"][-1]
+        latest = {"date": row["date"], "return": row["return"] + _mean(values), "var_95": row["var"],
+                  "breached": row["return"] < -row["var"]}
+    return {
+        "as_of": end,
+        "data": {"currency": _reporting_currency(subject), "nav": nav[end], "model": forecast["method_name"],
+                 "window_start": forecast["window_start"], "window_end": forecast["window_end"],
+                 **{k: forecast[k] for k in ("forecast_volatility_annual", "forecast_volatility_next_month_annual",
+                                             "long_run_volatility_annual", "realised_volatility_last_year",
+                                             "shock_half_life_days", "one_day", "one_month")},
+                 "volatility_vs_long_run": (forecast["forecast_volatility_next_month_annual"] / history) if history else None,
+                 "backtest": {k: v for k, v in backtest.items() if k != "series"},
+                 "latest_day": latest,
+                 "drawdown_odds_next_year": {"at_historical_volatility": historical, "at_forecast_volatility": current},
+                 "method": forecast["method"] + " VaR and tail loss are fractions of NAV; latest_day compares the "
+                           "last return with the VaR forecast the day before.",
+                 "disclaimer": forecast["disclaimer"]},
+        "citations": [_citation("subject_nav_series", account_id, from_date=forecast["window_start"], to_date=end)],
+    }
+
+
+def _mean(values: list[float]) -> float:
+    return math.fsum(values) / len(values) if values else 0.0
+
+
+def get_market_regimes(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Calm, normal and stressed regimes from the account's own returns, and a scored 1-3 month outlook."""
+    from ibkr_etl import risk_forecasting
+    from ibkr_etl.modelling import ModellingInputError
+
+    account_id = str(arguments["account_id"])
+    subject, end, nav, returns = _account_returns(connection, account_id)
+    try:
+        result = risk_forecasting.regime_outlook(returns)
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    value = nav[end]
+    outlook = [{**row, **{f"{band}_value": value * (1.0 + row[band]) for band in ("p5", "p50", "p95")}}
+               for row in result["outlook"]]
+    return {
+        "as_of": end,
+        "data": {"currency": _reporting_currency(subject), "nav": value,
+                 **{k: result[k] for k in ("window_start", "window_end", "states", "current_regime",
+                                           "current_probability", "regime_a_week_ago", "regimes", "transition",
+                                           "score", "method", "disclaimer")},
+                 "outlook": outlook,
+                 "stressed_probability_last_8_weeks": result["timeline"][-8:]},
+        "citations": [_citation("subject_nav_series", account_id, from_date=result["window_start"], to_date=end)],
+    }
+
+
+def run_factor_stress(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Move of the account implied by its factor betas for a preset or custom set of factor shocks."""
+    from ibkr_etl import fama_french, risk_forecasting
+    from ibkr_etl.modelling import FACTOR_NAMES, ModellingInputError, factor_model
+
+    account_id = str(arguments["account_id"])
+    region = str(arguments.get("region") or fama_french.DEFAULT_REGION)
+    if region not in fama_french.REGIONS:
+        raise ToolError("invalid_arguments", "region must be developed, us or asia_pacific_ex_japan.", 400)
+    scenario = arguments.get("scenario")
+    raw = arguments.get("shocks")
+    if bool(scenario) == bool(raw):
+        raise ToolError("invalid_arguments", "Give either a preset scenario or a list of factor shocks.", 400)
+    if scenario:
+        if scenario not in risk_forecasting.STRESS_PRESETS:
+            raise ToolError("invalid_arguments", "Unknown scenario.", 400)
+        label, shocks = risk_forecasting.STRESS_PRESETS[scenario]
+    else:
+        if not isinstance(raw, list) or not 1 <= len(raw) <= len(FACTOR_NAMES):
+            raise ToolError("invalid_arguments", "shocks must list 1 to 6 factors.", 400)
+        label, shocks = "Custom shocks", {}
+        for item in raw:
+            if not isinstance(item, Mapping) or item.get("factor") not in FACTOR_NAMES or set(item) - {"factor", "change"}:
+                raise ToolError("invalid_arguments", "Each shock needs a factor (" + ", ".join(FACTOR_NAMES)
+                                + ") and a change.", 400)
+            change = item.get("change")
+            if isinstance(change, bool) or not isinstance(change, (int, float)):
+                raise ToolError("invalid_arguments", "Each change must be a fraction, -0.2 for a 20% fall.", 400)
+            shocks[item["factor"]] = float(change)
+    subject, end, nav, returns = _account_returns(connection, account_id)
+    try:
+        factors = fama_french.load_factor_data(region)
+    except fama_french.FactorDataError as error:
+        raise ToolError("factor_data_unavailable", "The factor data could not be downloaded right now.", 503) from error
+    try:
+        model = factor_model(returns, factors["factors"], region_label=factors["region_label"],
+                             source_url=factors["source_url"], labels=factors.get("labels"))
+        result = risk_forecasting.factor_stress(model, shocks)
+    except ModellingInputError as error:
+        raise _model_error(error) from error
+    return {
+        "as_of": end,
+        "data": {"currency": _reporting_currency(subject), "scenario": scenario, "scenario_label": label,
+                 "shocks_applied": shocks, "nav": nav[end], "impact": result["impact"],
+                 "impact_value": result["impact"] * nav[end], "factors": result["factors"],
+                 "factors_not_in_model": result["factors_not_in_model"], "r_squared": result["r_squared"],
+                 "unexplained_monthly_range": result["unexplained_monthly_range"],
+                 "factor_source": factors.get("source", "kenneth_french"), "method": result["method"],
+                 "disclaimer": result["disclaimer"]},
+        "citations": [_citation("subject_nav_series", account_id, to_date=end),
+                      _citation("factor_library" if factors.get("source") != "etf_proxy" else "yahoo_finance", None,
+                                region=region, through=factors["latest_date"])],
+    }
+
+
 # Registry ------------------------------------------------------------------
 
 
@@ -1517,6 +1649,28 @@ TOOLS: tuple[ToolSpec, ...] = (
              "weekly returns over up to three years.",
              _schema({"account_id": _ACCOUNT, "region": {"type": "string", "description": "developed (default), us "
                       "or asia_pacific_ex_japan"}}, ["account_id"]), get_factor_exposures),
+    ToolSpec("get_risk_outlook", "Forward-looking risk: a GARCH volatility forecast against the long-run level, "
+             "one-day and one-month VaR and expected tail loss at 95% and 99%, a backtest of how often past losses "
+             "broke the VaR line, whether the latest day did, and the chance of a 10%, 20% or 30% fall within a year.",
+             _schema({"account_id": _ACCOUNT}, ["account_id"]), get_risk_outlook),
+    ToolSpec("get_market_regimes", "The account's calm, normal and stressed regimes from its own returns: which one "
+             "it is in now and a week ago, the odds of switching, a 1 to 3 month range for its value, and a score "
+             "of how well past ranges and their direction held up. Hypothetical, not a forecast.",
+             _schema({"account_id": _ACCOUNT}, ["account_id"]), get_market_regimes),
+    ToolSpec("run_factor_stress", "Move of the account implied by its Fama-French factor betas for a one-off shock: "
+             "a preset scenario, or custom changes to the market (Mkt-RF), size (SMB), value (HML), profitability "
+             "(RMW), investment (CMA) and momentum (MOM) factors. Use it to model a scenario the person describes "
+             "in words, and state the shocks you assumed.",
+             _schema({"account_id": _ACCOUNT, "region": {"type": "string", "description": "developed (default), us "
+                      "or asia_pacific_ex_japan"},
+                      "scenario": {"type": "string", "enum": ["market_down_20", "growth_selloff", "flight_to_quality",
+                                                              "small_cap_rally", "value_rotation"]},
+                      "shocks": {"type": "array", "minItems": 1, "maxItems": 6, "items": {
+                          "type": "object", "additionalProperties": False, "required": ["factor", "change"],
+                          "properties": {"factor": {"type": "string", "enum": ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM"]},
+                                         "change": {"type": "number", "description": "fraction, -0.2 is a 20% fall; "
+                                                    "between -0.6 and 0.6"}}}}},
+                     ["account_id"]), run_factor_stress),
     ToolSpec("list_broker_logins", "The IBKR logins added for onboarding, with the latest check of each: its "
              "status, IBKR's error code if it failed, how many accounts it found, and what its Flex query lacks.", _schema({}, []),
              list_broker_logins, False, only_jobs=ONBOARDING),

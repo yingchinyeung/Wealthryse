@@ -566,13 +566,14 @@ def create_app(services: Services) -> FastAPI:
 
     @app.get("/v1/inbox")
     def inbox(user_object_id: str, status: str | None = None, _: ServiceCaller = Depends(caller)) -> dict[str, Any]:
-        accounts = accounts_for(user_object_id.lower(), str(uuid.uuid4()))
+        # Cards about the whole website come back too; the website shows them to owners only.
+        accounts = [*accounts_for(user_object_id.lower(), str(uuid.uuid4())), guide_tools.PLATFORM_SUBJECT]
         return {"items": [i for i in services.store().inbox(accounts, status) if _visible(i, user_object_id)]}
 
     @app.post("/v1/inbox/{item_id}/decision")
     def decide(item_id: int, body: DecisionRequest, _: ServiceCaller = Depends(caller)) -> dict[str, bool]:
         user = body.user_object_id.lower()
-        accounts = accounts_for(user, str(uuid.uuid4()))
+        accounts = [*accounts_for(user, str(uuid.uuid4())), guide_tools.PLATFORM_SUBJECT]
         store = services.store()
         hidden = [i for i in store.inbox(accounts) if i["item_id"] == item_id and not _visible(i, user)]
         if hidden or not store.decide(item_id, accounts, body.decision, hashlib.sha256(user.encode()).hexdigest()):

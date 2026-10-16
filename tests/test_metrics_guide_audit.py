@@ -43,11 +43,11 @@ class DriftTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp)
-        files = {f"src/ibkr_etl/{name}" for name, *_ in audit.LABEL_SOURCES}
-        files |= {"src/" + source.split(":")[0].replace(".", "/") + ".py" for source in audit.WATCHED_SOURCES}
+        files = {f"ibkr_etl/{name}" for name, *_ in audit.LABEL_SOURCES}
+        files |= {source.split(":")[0].replace(".", "/") + ".py" for source in audit.WATCHED_SOURCES}
         for relative in files:
             (self.tmp / relative).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(ROOT / relative, self.tmp / relative)
+            shutil.copy(ROOT / "src" / relative, self.tmp / relative)
         self.manifest = self.tmp / "manifest.json"
         audit.write_manifest(self.tmp, self.manifest)
 
@@ -61,14 +61,14 @@ class DriftTest(unittest.TestCase):
         self.assertTrue(audit.audit(self.tmp, self.manifest).clean)
 
     def test_comments_and_docstrings_do_not_count_as_changes(self):
-        self._edit("src/ibkr_etl/risk_forecasting.py", "def var_backtest(",
+        self._edit("ibkr_etl/risk_forecasting.py", "def var_backtest(",
                    "# A comment about the backtest\ndef var_backtest(")
-        self._edit("src/ibkr_etl/risk_forecasting.py", "each day's VaR uses only earlier returns",
+        self._edit("ibkr_etl/risk_forecasting.py", "each day's VaR uses only earlier returns",
                    "each day's VaR is fitted on earlier returns only")
         self.assertTrue(audit.audit(self.tmp, self.manifest).clean)
 
     def test_a_changed_calculation_names_the_definitions_to_reread(self):
-        self._edit("src/ibkr_etl/risk_forecasting.py", "def var_backtest(returns: Sequence[float], dates: Sequence[str], *, level: float = 0.95,",
+        self._edit("ibkr_etl/risk_forecasting.py", "def var_backtest(returns: Sequence[float], dates: Sequence[str], *, level: float = 0.95,",
                    "def var_backtest(returns: Sequence[float], dates: Sequence[str], *, level: float = 0.99,")
         report = audit.audit(self.tmp, self.manifest)
         self.assertEqual(report.changed_sources, {"ibkr_etl.risk_forecasting:var_backtest": ("VaR backtest",)})
@@ -78,19 +78,19 @@ class DriftTest(unittest.TestCase):
         self.assertIn("--refresh", brief)
 
     def test_a_changed_module_constant_counts_as_a_change(self):
-        self._edit("src/ibkr_etl/modelling.py", "PROJECTION_PATHS = 2000", "PROJECTION_PATHS = 4000")
+        self._edit("ibkr_etl/modelling.py", "PROJECTION_PATHS = 2000", "PROJECTION_PATHS = 4000")
         report = audit.audit(self.tmp, self.manifest)
         self.assertIn("ibkr_etl.modelling:project_wealth", report.changed_sources)
 
     def test_a_new_tile_without_a_definition_is_reported(self):
-        self._edit("src/ibkr_etl/web_modelling.py", "modelTile('Regime now'",
+        self._edit("ibkr_etl/web_modelling.py", "modelTile('Regime now'",
                    "modelTile('Regime stickiness',1),modelTile('Regime now'")
         report = audit.audit(self.tmp, self.manifest)
         self.assertEqual(report.uncovered_labels, {"Regime stickiness": "src/ibkr_etl/web_modelling.py"})
         self.assertIn("`Regime stickiness`", audit.brief(report, self.tmp))
 
     def test_a_renamed_function_is_reported(self):
-        self._edit("src/ibkr_etl/modelling.py", "def risk_contributions(", "def risk_shares(")
+        self._edit("ibkr_etl/modelling.py", "def risk_contributions(", "def risk_shares(")
         self.assertEqual(audit.audit(self.tmp, self.manifest).missing_sources,
                          ["ibkr_etl.modelling:risk_contributions"])
 
@@ -102,15 +102,22 @@ class CommandAndWorkflowTest(unittest.TestCase):
                                     cwd=ROOT, capture_output=True, text=True)
             self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
-    def test_ci_warns_and_keeper_only_opens_a_pull_request_for_guide_files(self):
+    def test_ci_warns_and_the_manifest_ships_with_the_package(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("python scripts/check_metrics_guide.py --warn", ci)
-        keeper = (ROOT / ".github/workflows/metrics-guide-keeper.yml").read_text(encoding="utf-8")
-        self.assertIn("anthropics/claude-code-action@v1", keeper)
-        self.assertIn("gh pr create", keeper)
-        self.assertIn("The draft touched other files", keeper)
-        self.assertNotIn("gh pr merge", keeper)
-        self.assertNotIn("azure/login", keeper)
+        self.assertIn("metrics_guide_sources.json", (ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertFalse((ROOT / ".github/workflows/metrics-guide-keeper.yml").exists())
+
+    def test_drift_facts_carry_the_code_definitions_and_their_numbers(self):
+        report = audit.AuditReport(changed_sources={"ibkr_etl.risk_forecasting:var_backtest": ("VaR backtest",)})
+        facts = audit.drift_facts(report)
+        item = facts["changed_calculations"][0]
+        self.assertIn("def var_backtest(", item["code"])
+        self.assertEqual(item["definitions"][0]["name"], "VaR backtest")
+        self.assertIn(0.95, facts["figures_in_source"])
+        self.assertIn(63.0, facts["figures_in_source"])
+        self.assertEqual(len(audit.drift_key(report)), 16)
+        self.assertNotEqual(audit.drift_key(report), audit.drift_key(audit.AuditReport()))
 
 
 if __name__ == "__main__":

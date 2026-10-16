@@ -9,6 +9,10 @@
 -- accounts granted to it. It writes one inbox kind and nothing else: a card the
 -- week something differs, with the analyst's explanation, and otherwise one
 -- all-clear a month.
+--
+-- The guide_keeper job needs no grant: it reads only the deployed code and the
+-- guide, and posts its drafts as guide_keeper cards under the 'platform'
+-- subject, which the website shows to owners only.
 
 ALTER TABLE agent.service_grants DROP CONSTRAINT IF EXISTS service_grants_job_name_check;
 ALTER TABLE agent.service_grants ADD CONSTRAINT service_grants_job_name_check
@@ -20,4 +24,4 @@ ALTER TABLE agent.inbox ADD CONSTRAINT inbox_kind_check CHECK (kind IN (
     'holdings_explainer', 'month_end_draft', 'data_quality',
     'month_end_report', 'month_end_hold', 'month_end_dispute',
     'onboarding_watch', 'weekly_brief', 'live_alert', 'risk_alert', 'model_check', 'export_pack',
-    'guide_check'));
+    'guide_check', 'guide_keeper'));

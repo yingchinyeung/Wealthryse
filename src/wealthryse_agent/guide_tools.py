@@ -14,6 +14,9 @@ from ibkr_etl import metrics_guide as guide
 
 from .tool_client import ToolCallFailed
 
+# Inbox cards about the whole website (not one account) use this subject; only owners see them.
+PLATFORM_SUBJECT = "platform"
+DRIFT = "get_guide_drift"
 DEFINITION = "get_metric_definition"
 SEARCH = "search_metrics_guide"
 NAMES = (DEFINITION, SEARCH)
@@ -120,3 +123,24 @@ def guide_links(citations: list[dict[str, Any]]) -> list[dict[str, str]]:
             if source.get("source") == "metrics_guide" and source.get("metric") in guide.METRIC_ANCHORS:
                 seen.setdefault(source["metric"], f"/metrics-guide#{guide.METRIC_ANCHORS[source['metric']]}")
     return [{"name": name, "link": link} for name, link in seen.items()]
+
+
+class DriftFacts:
+    """A one-tool client over the guide keeper's audit facts, so the usual validator checks the draft."""
+
+    def __init__(self, facts: dict[str, Any]) -> None:
+        self.facts = facts
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        return [{"name": DRIFT, "description": "Where the Metrics guide has fallen behind the deployed website: "
+                 "figure labels with no definition, and changed calculation code with the definitions that "
+                 "describe it.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}}]
+
+    def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name != DRIFT:
+            raise ToolCallFailed("unknown_tool", "That tool is not available here.")
+        return {"tool": DRIFT, "account_id": None, "as_of": None, "data": self.facts,
+                "citations": [{"source": "deployed_source_code"}]}
+
+    def close(self) -> None:
+        pass

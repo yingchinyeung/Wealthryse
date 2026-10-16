@@ -9,6 +9,9 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+
 os.environ.setdefault("AGENT_TOOLS_AUTOSTART", "0")
 
 from ibkr_etl import metrics_guide as guide  # noqa: E402
@@ -162,6 +165,62 @@ class GuideCheckWiringTest(unittest.TestCase):
         earlier = (ROOT / "migrations/agent/015_export_agent.sql").read_text(encoding="utf-8")
         self.assertEqual(earlier.count("NOT VALID;"), 2)
         self.assertEqual(sorted(p.name for p in (ROOT / "migrations/agent").glob("*.sql"))[-1], "016_guide_check.sql")
+
+
+
+class GuideKeeperJobTest(unittest.TestCase):
+    def _report(self):
+        from ibkr_etl import metrics_guide_audit as audit
+
+        return audit.AuditReport(uncovered_labels={"Regime stickiness": "src/ibkr_etl/web_modelling.py"},
+                                 changed_sources={"ibkr_etl.risk_forecasting:var_backtest": ("VaR backtest",)})
+
+    def test_drift_gets_one_owner_card_with_the_models_draft(self):
+        store, agent = _Store(), _Agent()
+        self.assertEqual(jobs.guide_keeper(store, agent, {}, self._report()), 1)
+        (kind, subject, key), (title, body, _) = next(iter(store.items.items()))
+        self.assertEqual((kind, subject, len(key)), ("guide_keeper", "platform", 16))
+        self.assertEqual(title, "Metrics guide keeper: 2 item(s) to update")
+        run = agent.calls[0]
+        self.assertEqual((run["account_id"], run["allowed_tools"], run["skip_router"]), (None, ["get_guide_drift"], True))
+        facts = run["tools"].call("get_guide_drift", {})["data"]
+        self.assertEqual(facts["labels_without_definition"][0]["label"], "Regime stickiness")
+        self.assertIn("def var_backtest(", facts["changed_calculations"][0]["code"])
+        self.assertEqual(jobs.guide_keeper(store, agent, {}, self._report()), 0)  # the same drift, once
+
+    def test_an_unchecked_draft_falls_back_to_the_list_and_a_clean_audit_posts_nothing(self):
+        from ibkr_etl import metrics_guide_audit as audit
+
+        store = _Store()
+        jobs.guide_keeper(store, _Agent(ok=False), {}, self._report())
+        body = next(iter(store.items.values()))[1]
+        self.assertIn("`Regime stickiness`", body)
+        self.assertNotIn("--refresh", body)
+        agent = _Agent()
+        self.assertEqual(jobs.guide_keeper(_Store(), agent, {}, audit.AuditReport()), 0)
+        self.assertEqual(agent.calls, [])
+
+    def test_platform_cards_are_for_owners_only_on_the_website(self):
+        from ibkr_etl import agent_web
+
+        items = [{"item_id": 1, "kind": "guide_keeper", "subject_id": "platform", "status": "new"},
+                 {"item_id": 2, "kind": "weekly_brief", "subject_id": "U1", "status": "new"}]
+        seen = {}
+        for role in ("owner", "viewer"):
+            app = FastAPI()
+            def make(user):
+                def signed_in(request: Request) -> dict:
+                    return user
+                return signed_in
+
+            signed_in = make({"object_id": "11111111-1111-1111-1111-111111111111", "role": role})
+
+            with mock.patch.dict(os.environ, {"AGENT_UI_MODE": "all", "AGENT_API_URL": "https://agent.internal",
+                                              "AGENT_API_AUDIENCE": "api://x", "MONTH_TEAM_UI": "off"}):
+                agent_web.install(app, signed_in, lambda u: ["U1"], "")
+            with mock.patch.object(agent_web._AgentApi, "request", return_value={"items": items}):
+                seen[role] = [x["item_id"] for x in TestClient(app).get("/api/agents/inbox").json()["items"]]
+        self.assertEqual(seen, {"owner": [1, 2], "viewer": [2]})
 
 
 if __name__ == "__main__":

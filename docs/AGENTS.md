@@ -658,15 +658,16 @@ images, and deploy `infra/agent-apps.bicep` for the new job.
 Four pieces keep the Metrics guide (`ibkr_etl/metrics_guide.py`) right and put it to work. All of them read
 only, and none sends anything to a client.
 
-- **Keeper (self-maintaining guide).** `scripts/check_metrics_guide.py` reads the website's source for every
-  figure label it renders (metric cards, Modelling tiles, the what-if table) and checks each one against the
+- **Keeper (self-maintaining guide).** `ibkr_etl/metrics_guide_audit.py` reads the source for every figure
+  label the website renders (metric cards, Modelling tiles, the what-if table) and checks each one against the
   guide's names, aliases and `LABEL_MAP`. It also fingerprints the calculation functions each definition
-  describes (`WATCHED_SOURCES` in `metrics_guide_audit.py`) against `metrics_guide_sources.json`. CI runs it as
-  a warning. The `Metrics guide keeper` workflow runs it after pushes to main and on Mondays. On drift it has
-  Claude draft the definitions from the code (source files only), runs the guide tests and opens a pull
-  request for review. It needs the `ANTHROPIC_API_KEY` (or `CLAUDE_CODE_OAUTH_TOKEN`) secret and the repo
-  setting that lets Actions open pull requests. Without a secret the run goes red and lists the drift. After
-  updating the guide by hand, run `python scripts/check_metrics_guide.py --refresh`.
+  describes (`WATCHED_SOURCES`) against `metrics_guide_sources.json`. CI runs it as a warning
+  (`scripts/check_metrics_guide.py --warn`). On Azure, the `guide_keeper` job (`ibkrv2stg-agent-guide-keeper`,
+  02:30 UTC on Mondays) runs the same audit on the deployed code. On drift, the analyst model drafts the update
+  from the code (`GUIDE_KEEPER`, one-tool client `DriftFacts`, under the figure check). The job posts one
+  `guide_keeper` card per drift under the `platform` subject, which the website shows to owners only. It reads
+  code only, never client data, and needs no grant. To apply a draft, ask Claude to turn it into a pull
+  request, then run `python scripts/check_metrics_guide.py --refresh` with the change.
 - **Explain with your numbers.** Each definition on `/metrics-guide` gets a "Work it through with my numbers"
   button. `/v1/explain-metric` runs `METRIC_EXPLAINER` with `get_metric_definition`, the account tools for that
   definition's section (`guide_tools.SECTION_TOOLS`) and the calculator. The analyst recomputes the figure step
@@ -689,7 +690,8 @@ only, and none sends anything to a client.
 **Turning it on.** Explain with your numbers and Ask the guide ship with the website and agent images, wherever
 `AGENT_UI_MODE` shows the agents. The guide check needs Ying's typed approval for each step: rerun
 `scripts/install_agent_schema.py` (applies `016_guide_check.sql`), grant accounts with `--grant guide_check=all`
-(or per account), rebuild the agent image, and deploy `infra/agent-apps.bicep` for the new job.
+(or per account), rebuild the agent image, and deploy `infra/agent-apps.bicep` for the new jobs (`guide_check`
+and `guide_keeper`).
 
 ## Cost drivers
 

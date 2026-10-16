@@ -16,6 +16,9 @@ records); nothing is sent, published or released.
     python -m wealthryse_agent.jobs guide_check          # Mondays: recompute each account's statistics from
                                                          # the Metrics guide's formulas and flag any figure
                                                          # the website or the analyst shows differently
+    python -m wealthryse_agent.jobs guide_keeper         # Mondays: find website figures and calculations the
+                                                         # Metrics guide has fallen behind on, and draft the
+                                                         # update for the owner (code only, no client data)
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
     python -m wealthryse_agent.jobs month_team --replay --round 2 --from 2026-01-31
@@ -48,7 +51,7 @@ from .config import DatabaseSettings, ModelSettings, RuntimeSettings
 from .database import connect
 from .month_team.agents import BudgetExhausted
 from . import guide_tools
-from .prompts import GUIDE_CHECKER, HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, RISK_ALERT, WEEKLY_BRIEF
+from .prompts import GUIDE_CHECKER, GUIDE_KEEPER, HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, RISK_ALERT, WEEKLY_BRIEF
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -351,6 +354,34 @@ def guide_check(store: Store, tools: ToolClient, agent: Agent, accounts: list[st
     return written
 
 
+def guide_keeper(store: Store, agent: Agent, usage: dict, report: Any = None) -> int:
+    """Weekly: audit the deployed code against the Metrics guide and post one drafted update per drift."""
+    from ibkr_etl import metrics_guide_audit as audit
+
+    report = report or audit.audit()
+    if report.clean:
+        return 0
+    key = audit.drift_key(report)
+    if store.inbox_exists("guide_keeper", guide_tools.PLATFORM_SUBJECT, key):
+        return 0
+    count = (len(report.uncovered_labels) + len(report.changed_sources) + len(report.unrecorded_sources)
+             + len(report.missing_sources))
+    answer, cited, used, ok = "", [], {}, False
+    for event in agent.run(question="Draft the Metrics guide update.", account_id=None,
+                           tools=guide_tools.DriftFacts(audit.drift_facts(report)),
+                           allowed_tools=[guide_tools.DRIFT], instructions=GUIDE_KEEPER, skip_router=True):
+        if event["type"] in ("answer", "rejected"):
+            turn = event["turn"]
+            answer, cited, used, ok = turn.answer, turn.citations, turn.usage, event["type"] == "answer"
+    _sum_usage(usage, used)
+    body = answer if ok else ("The draft could not be checked against the code, so only what drifted is "
+                              "shown:\n\n" + audit.brief(report).split("## When the guide is right")[0])
+    added = store.add_inbox(kind="guide_keeper", account_id=guide_tools.PLATFORM_SUBJECT, period_key=key,
+                            title=f"Metrics guide keeper: {count} item(s) to update", body=body,
+                            citations=cited if ok else [{"source": "deployed_source_code"}], run_id=None)
+    return 1 if added else 0
+
+
 def data_quality_findings(freshness: dict[str, Any], today: date) -> list[str]:
     """Plain-language findings from the freshness tool. Deterministic; no model."""
     findings = []
@@ -554,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team",
                                                   "onboarding", "operations", "weekly_brief", "live_market",
-                                                  "risk_watch", "export_packs", "guide_check"])
+                                                  "risk_watch", "export_packs", "guide_check", "guide_keeper"])
     parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
@@ -588,6 +619,14 @@ def main(argv: list[str] | None = None) -> int:
             written = operations(store, tools, usage, correlation_id, runtime.managed_identity_client_id)
             store.finish_run(run_id, status="succeeded", items=written, usage=usage)
             LOGGER.info("operations investigated %s incident(s)", written)
+            return 0
+        if args.job == "guide_keeper":
+            if store.tokens_used_today() >= runtime.daily_token_budget:
+                store.finish_run(run_id, status="failed", items=0, usage=usage, error_code="budget_exhausted")
+                return 1
+            written = guide_keeper(store, Agent(ModelSettings.from_env()), usage)
+            store.finish_run(run_id, status="succeeded", items=written, usage=usage)
+            LOGGER.info("guide_keeper wrote %s inbox items", written)
             return 0
         accounts = [a["account_id"] for a in tools.call("list_accounts", {})["data"]["accounts"]]
         if args.job == "data_quality":

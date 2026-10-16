@@ -27,7 +27,7 @@ jobs:
       - name: Test
         run: python scripts/ci_run_tests.py
       # Warns (never fails) when a website figure has no Metrics guide entry or a
-      # calculation the guide describes has changed. The keeper workflow drafts the fix.
+      # calculation the guide describes has changed. The guide_keeper agent job drafts the fix.
       - name: Metrics guide drift
         run: python scripts/check_metrics_guide.py --warn
 

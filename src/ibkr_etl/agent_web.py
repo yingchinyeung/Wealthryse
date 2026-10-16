@@ -32,6 +32,7 @@ from . import month_team_web
 WIDGET_PATHS = re.compile(r"^/accounts/[^/]+/[^/]+$")
 # "Ask the guide" and "Work it through with my numbers" on the Metrics guide.
 GUIDE_PATHS = re.compile(r"^/metrics-guide/?$")
+PLATFORM_SUBJECT = "platform"  # wealthryse_agent.guide_tools.PLATFORM_SUBJECT
 MODES = {"off", "owner", "all"}
 
 
@@ -273,6 +274,9 @@ def install(app: FastAPI, authorized_user: Callable[..., dict[str, Any]],
     def inbox_items(user: dict[str, Any]) -> list[dict[str, Any]]:
         items = api.request("GET", "/v1/inbox", params={"user_object_id": oid(user)})["items"]
         # The month-end team's cards ask the owner to decide; nobody else sees them.
+        # Cards about the whole website (the Metrics guide keeper's drafts) are for owners only.
+        if user.get("role") != "owner":
+            items = [x for x in items if x.get("subject_id") != PLATFORM_SUBJECT]
         if month_team_web.is_month_owner(user):
             return items
         return [x for x in items if x.get("kind") not in month_team_web.MONTH_TEAM_KINDS]
@@ -522,12 +526,12 @@ INBOX_SCRIPT = r"""<script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const md=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').split(/\n{2,}/).map(p=>'<p>'+p.replace(/\n/g,'<br>')+'</p>').join('');
 const NAMES={NAMES};
-const kinds={export_pack:'Export pack',weekly_brief:'Weekly brief',holdings_explainer:'What changed',live_alert:'Live alert',risk_alert:'Risk alert',model_check:'Model check',guide_check:'Guide check',month_end_draft:'Draft commentary',data_quality:'Data check',month_end_report:'Month-end report',month_end_hold:'Account blocked',month_end_dispute:'Agents disagree'};
+const kinds={export_pack:'Export pack',weekly_brief:'Weekly brief',holdings_explainer:'What changed',live_alert:'Live alert',risk_alert:'Risk alert',model_check:'Model check',guide_check:'Guide check',guide_keeper:'Guide update draft',month_end_draft:'Draft commentary',data_quality:'Data check',month_end_report:'Month-end report',month_end_hold:'Account blocked',month_end_dispute:'Agents disagree'};
 const kindLabel=k=>kinds[k]||String(k||'Update').replace(/_/g,' ').replace(/^./,c=>c.toUpperCase());
 const statuses={new:'New',read:'Read',approved:'Approved',dismissed:'Dismissed'};
 const choices={month_end_hold:[['approved','Proceed'],['dismissed','Hold']],month_end_dispute:[['approved',"Keep the writer's text"],['dismissed','Agree with the reviewer']]};
 const decided={month_end_hold:{approved:'You chose to proceed.',dismissed:'You chose to hold this account.'},month_end_dispute:{approved:"You kept the writer's text.",dismissed:'You agreed with the reviewer.'}};
-const accountName=id=>NAMES[id]||id;
+const accountName=id=>NAMES[id]||(id==='platform'?'Whole website':id);
 const link=x=>{if(x.kind==='export_pack')return `<a class="button" href="/accounts/${encodeURIComponent(x.subject_id)}/exports?pack_item=${encodeURIComponent(x.item_id)}">${x.status==='approved'?'Build again':'Build and check'}</a>`;
  const c=(x.citations||[]).find(c=>c&&typeof c.link==='string'&&/^\/accounts\/[^/]+\/reports$/.test(c.link));
  return c?`<a class="button" href="${esc(c.link)}">Open the Reports tab</a>`:(x.subject_id&&NAMES[x.subject_id]?`<a class="button" href="/accounts/${encodeURIComponent(x.subject_id)}/overview">Open account</a>`:'')};

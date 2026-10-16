@@ -11,8 +11,9 @@ Two checks, both read only the repository's source files (no client data):
   the guide was last checked against, so a changed calculation names the
   definitions to re-read.
 
-``scripts/check_metrics_guide.py`` runs the audit in CI, and the Metrics guide
-keeper workflow hands its brief to an agent that drafts the update as a PR.
+``scripts/check_metrics_guide.py`` runs the audit in CI as a warning. On Azure, the weekly
+``guide_keeper`` agent job runs it on the deployed code, has the analyst model draft the update from
+the facts in ``drift_facts`` and posts the draft to the Agent inbox for the owner.
 """
 from __future__ import annotations
 
@@ -26,7 +27,9 @@ from pathlib import Path
 
 from ibkr_etl import metrics_guide as guide
 
-ROOT = Path(__file__).resolve().parents[2]
+# The directory holding the ibkr_etl and wealthryse_agent packages: src/ in the repository, or
+# site-packages in the agent image.
+ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = Path(__file__).with_name("metrics_guide_sources.json")
 
 # (file under src/ibkr_etl, start marker, end marker, label pattern). With no
@@ -155,7 +158,7 @@ def website_labels(root: Path = ROOT) -> dict[str, str]:
 
     found: dict[str, str] = {}
     for name, start, end, pattern in LABEL_SOURCES:
-        path = root / "src/ibkr_etl" / name
+        path = root / "ibkr_etl" / name
         source = path.read_text(encoding="utf-8")
         chunks = [source]
         if start is not None:
@@ -172,7 +175,7 @@ def website_labels(root: Path = ROOT) -> dict[str, str]:
 
 
 def _module_path(root: Path, module: str) -> Path:
-    return root / "src" / Path(*module.split(".")).with_suffix(".py")
+    return root / Path(*module.split(".")).with_suffix(".py")
 
 
 def _strip_docstrings(node: ast.AST) -> ast.AST:
@@ -311,8 +314,43 @@ def brief(report: AuditReport, root: Path = ROOT) -> str:
     return "\n".join(lines)
 
 
-def definition_text(name: str) -> str:
+_FIGURE = re.compile(r"(?<![\w.])\d+(?:\.\d+)?")
+
+
+def drift_key(report: AuditReport) -> str:
+    """A short fingerprint of what drifted, so one drift gets one inbox card."""
+
+    return hashlib.sha256(json.dumps(report.as_dict(), sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def drift_facts(report: AuditReport, root: Path = ROOT) -> dict:
+    """What a drafting agent needs: each drift item with the code and the current definitions.
+
+    ``figures_in_source`` lists every number in that code and those definitions, so a drafted
+    definition may quote them and nothing else.
+    """
+
+    figures: set[float] = set()
+    labels = [{"label": label, "file": path} for label, path in report.uncovered_labels.items()]
+    changed = []
+    for source, metrics in report.changed_sources.items():
+        code = function_source(root, source)
+        definitions = [{"name": name, **_definition_fields(name)} for name in metrics]
+        figures.update(float(x) for x in _FIGURE.findall(code))
+        for item in definitions:
+            figures.update(float(x) for value in item.values() for x in _FIGURE.findall(str(value)))
+        changed.append({"function": source, "code": code, "definitions": definitions})
+    return {"labels_without_definition": labels, "changed_calculations": changed,
+            "watch_list_not_recorded": report.unrecorded_sources, "watch_list_missing": report.missing_sources,
+            "sections": [{"key": s.key, "title": s.title, "where": s.location} for s in guide.METRIC_SECTIONS],
+            "figures_in_source": sorted(figures)}
+
+
+def _definition_fields(name: str) -> dict:
     metric = guide.definition(name)
-    return "\n".join((f"Meaning: {metric.meaning}", f"Calculation: {metric.calculation}",
-                      f"Interpretation: {metric.interpretation}",
-                      f"Client explanation: {guide.CLIENT_CALCULATIONS[name]}"))
+    return {"what_it_tells_you": metric.meaning, "technical_method": metric.calculation,
+            "how_to_explain_it": metric.interpretation, "how_we_work_it_out": guide.CLIENT_CALCULATIONS[name]}
+
+
+def definition_text(name: str) -> str:
+    return "\n".join(f"{key}: {value}" for key, value in _definition_fields(name).items())

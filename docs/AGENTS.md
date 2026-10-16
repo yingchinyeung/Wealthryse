@@ -561,6 +561,31 @@ rerun `scripts/install_agent_schema.py` (applies `010_live_market.sql`), rebuild
 the agent and platform images, deploy `infra/agent-apps.bicep`, and grant
 accounts to the job with `--grant live_market=<account>` (or `=all`).
 
+## Modelling tools
+
+The analyst can use the website's four Modelling-tab models (`ibkr_etl.modelling`). Each one is a read-only tool
+over the same agent views:
+
+- `project_wealth`: a Monte Carlo projection with contributions, withdrawals, a target and a return assumption.
+- `run_what_if`: compares current holdings against hypothetical weights given by symbol (current holdings
+  only, with no new tickers).
+- `optimise_portfolio`: gives each holding's share of risk, plus minimum-variance, risk-parity and
+  maximum-Sharpe mixes. It flags `risk_concentrated_in` for any holding carrying at least 10% of the risk
+  and more than 1.25 times its weight.
+- `get_factor_exposures`: fits the Fama-French factors from Kenneth French's library. When that site can't be
+  reached, it uses fund stand-ins from Yahoo Finance.
+
+Cash earns 0% in these tools, because the agent has no view of the risk-free rate. Each result says so.
+
+The analyst may chain the tools: for example, optimise, then run a what-if on the minimum-variance weights,
+then project. It presents every result as a hypothetical model and never as a recommendation. Asking which
+mix to hold is still out of scope.
+
+The weekly brief calls `optimise_portfolio` once. It adds one sentence only when a holding's share of risk
+stands out.
+
+Turning it on needs a rebuild of the agent image only. There are no schema or infrastructure changes.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool

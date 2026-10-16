@@ -444,6 +444,148 @@ class EvaluationTests(unittest.TestCase):
         self.assertFalse(evaluate.summary(bad)[1])
 
 
+class ModellingToolTests(unittest.TestCase):
+    """The four modelling tools over a synthetic account, with the database helpers patched."""
+
+    def setUp(self):
+        import random
+        from datetime import timedelta
+        from unittest import mock
+
+        from wealthryse_agent import tools as t
+
+        generator = random.Random(4)
+        self.days = [d for d in ((date(2025, 1, 6) + timedelta(days=i)) for i in range(560)) if d.weekday() < 5]
+        self.days = [d.isoformat() for d in self.days]
+        market = [generator.gauss(0.0004, 0.01) for _ in self.days]
+        marks, level = {}, {"1": 100.0, "2": 50.0, "3": 20.0}
+        for i, day in enumerate(self.days):
+            for conid, scale in (("1", 1.6), ("2", 0.6), ("3", 1.0)):
+                level[conid] *= 1 + scale * market[i] + generator.gauss(0, 0.006)
+                marks.setdefault(conid, {})[day] = level[conid]
+        nav, value = {}, 1_000_000.0
+        for i, day in enumerate(self.days):
+            value *= 1 + market[i]
+            nav[day] = value
+        self.nav, self.snapshot = nav, self.days[-1]
+        holdings = [{"conid": "1", "symbol": "AAA", "description": "A", "market_value_text": "500000"},
+                    {"conid": "2", "symbol": "BBB", "description": "B", "market_value_text": "300000"},
+                    {"conid": "3", "symbol": "CCC", "description": "C", "market_value_text": "100000"},
+                    {"conid": "4", "symbol": "CASH.REC", "description": "", "market_value_text": "5000"}]
+
+        class Connection:
+            def execute(self, sql, params=()):
+                if "total_text" in sql:
+                    rows = [{"total_text": "1000000"}]
+                else:
+                    rows = [{"snapshot_date": d, "conid": c, "mark_price_text": str(v)}
+                            for c, series in marks.items() for d, v in series.items()]
+                return SimpleNamespace(fetchone=lambda: rows[0], fetchall=lambda: rows)
+
+        level_value, levels = 100.0, {}
+        for day, move in zip(self.days, market):
+            level_value *= 1 + move
+            levels[day] = level_value
+
+        class Levels:
+            def __init__(self, *args):
+                pass
+
+            def level(self, day):
+                return levels.get(day)
+
+        self.connection = Connection()
+        self.subject = {"subject_id": "U1", "subject_type": "physical_account", "reporting_currency": "USD",
+                        "base_currency": "USD"}
+        self.patches = [
+            mock.patch.object(t, "_subject", side_effect=lambda c, a: self.subject),
+            mock.patch.object(t, "_latest_nav_date", return_value=self.snapshot),
+            mock.patch.object(t, "_valued_holdings", return_value=(self.snapshot, holdings, {}, False)),
+            mock.patch.object(t, "_series_inputs", return_value=(nav, {})),
+            mock.patch.object(t, "_benchmark_for", return_value={"benchmark_id": "B", "name": "Bench"}),
+            mock.patch.object(t, "_BenchmarkLevels", Levels),
+        ]
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.t = t
+
+    def _run(self, name, arguments):
+        from wealthryse_agent.tools import run_tool
+
+        result = run_tool(self.connection, name, {"account_id": "U1", **arguments})
+        json.dumps(result)  # plain JSON for the tool server
+        return result
+
+    def test_projection_returns_yearly_percentiles(self):
+        data = self._run("project_wealth", {"years": 5, "monthly_flow": 1000, "target": 2_000_000})["data"]
+        self.assertEqual(len(data["yearly_percentiles"]), 6)
+        self.assertAlmostEqual(data["start_value"], self.nav[self.snapshot])
+        self.assertIsNotNone(data["summary"]["probability_target"])
+        self.assertEqual(data["total_flows"], 60_000)
+        with self.assertRaises(ToolError):
+            self._run("project_wealth", {"years": 50})
+        with self.assertRaises(ToolError):
+            self._run("project_wealth", {"annual_return": "lots"})
+
+    def test_what_if_by_symbol(self):
+        data = self._run("run_what_if", {"changes": [{"symbol": "aaa", "weight": 0.25}]})["data"]
+        self.assertAlmostEqual(data["current"]["cash_weight"], 0.1)
+        self.assertAlmostEqual(data["proposed"]["cash_weight"], 0.35)
+        self.assertLess(data["proposed"]["annual_volatility"], data["current"]["annual_volatility"])
+        self.assertIsNotNone(data["current"]["beta"])
+        self.assertEqual([h["symbol"] for h in data["holdings"]], ["AAA", "BBB", "CCC"])
+        with self.assertRaises(ToolError):
+            self._run("run_what_if", {"changes": [{"symbol": "ZZZ", "weight": 0.1}]})
+        with self.assertRaises(ToolError):
+            self._run("run_what_if", {"changes": [{"symbol": "AAA", "weight": -0.1}]})
+
+    def test_optimise_flags_risk_concentration(self):
+        data = self._run("optimise_portfolio", {"max_weight": 0.6})["data"]
+        self.assertEqual(data["maximum_weight"], 0.6)
+        self.assertIn("AAA", data["risk_concentrated_in"])  # the high-beta holding carries more risk than weight
+        self.assertAlmostEqual(sum(h["minimum_variance_weight"] for h in data["holdings"]), 1.0, places=6)
+        self.assertIn("minimum_variance", data["portfolios"])
+        self.subject = {**self.subject, "subject_type": "composite_portfolio"}
+        with self.assertRaises(ToolError):
+            self._run("optimise_portfolio", {})
+
+    def test_factor_exposures_use_the_fallback_loader(self):
+        from unittest import mock
+
+        from ibkr_etl import fama_french
+
+        factors = {d: {"Mkt-RF": (self.nav[d] / self.nav[p] - 1), "SMB": 0.0001 * (i % 3), "HML": 0.0002 * (i % 5 - 2),
+                       "RMW": 0.0001 * (i % 7 - 3), "CMA": 0.0001 * (i % 2), "RF": 0.0}
+                   for i, (p, d) in enumerate(zip(self.days, self.days[1:]))}
+        loaded = {"region_label": "United States", "source_url": "https://finance.yahoo.com", "factors": factors,
+                  "latest_date": self.days[-1], "momentum_note": "", "source": "etf_proxy",
+                  "labels": fama_french.PROXY_LABELS, "source_note": "Stand-ins."}
+        with mock.patch.object(fama_french, "load_factor_data", return_value=loaded):
+            data = self._run("get_factor_exposures", {"region": "us"})["data"]
+        self.assertEqual(data["factor_source"], "etf_proxy")
+        self.assertAlmostEqual(data["exposures"][0]["beta"], 1.0, places=3)
+        self.assertEqual(data["notes"], "Stand-ins.")
+        with mock.patch.object(fama_french, "load_factor_data", side_effect=fama_french.FactorDataError("down")):
+            with self.assertRaises(ToolError):
+                self._run("get_factor_exposures", {})
+        with self.assertRaises(ToolError):
+            self._run("get_factor_exposures", {"region": "mars"})
+
+    def test_modelling_tools_are_labelled_and_in_the_weekly_brief(self):
+        import inspect
+
+        from wealthryse_agent import jobs, prompts
+        from wealthryse_agent.runtime import TOOL_LABELS
+
+        for name in ("project_wealth", "run_what_if", "optimise_portfolio", "get_factor_exposures"):
+            self.assertIn(name, TOOL_LABELS)
+            self.assertFalse(REGISTRY[name].only_jobs)
+        self.assertIn('"optimise_portfolio"', inspect.getsource(jobs.weekly_brief))
+        self.assertIn("risk_concentrated_in", prompts.WEEKLY_BRIEF)
+        self.assertIn("not forecasts", prompts.ANALYST)
+
+
 class AuthTests(unittest.TestCase):
     def test_unconfigured_service_refuses(self):
         with self.assertRaises(auth.Unauthorized):

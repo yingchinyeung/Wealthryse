@@ -246,6 +246,9 @@ var jobs = [
   // market is open): alerts on big live moves of granted accounts whose live view is on. Reads only
   // what PR 58's collector stored; never the gateway.
   { name: 'ibkrv2stg-agent-live-market', job: 'live_market', cron: '*/15 1-8,13-21 * * 1-5' }
+  // 09:15 HKT on weekdays, after the morning account sync: alerts on a VaR breach, a switch into the
+  // stressed regime or a volatility jump, and once a month a check of the risk models' backtests.
+  { name: 'ibkrv2stg-agent-risk-watch', job: 'risk_watch', cron: '15 1 * * 1-5' }
 ]
 
 resource agentJobs 'Microsoft.App/jobs@2024-03-01' = [for j in jobs: {

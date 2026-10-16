@@ -107,6 +107,13 @@ DEFAULT_CASES: tuple[Case, ...] = (
        "optimise_portfolio", "run_what_if"),
     _c("model-07", "How exposed is this account to value and momentum?", "get_factor_exposures"),
     _c("model-08", "How much of my return is explained by the market?", "get_factor_exposures"),
+    _c("risk-01", "How worried should I be about this account right now?", "get_risk_outlook", "get_market_regimes"),
+    _c("risk-02", "What could I lose on a bad month?", "get_risk_outlook"),
+    _c("risk-03", "Has the VaR estimate been reliable?", "get_risk_outlook"),
+    _c("risk-04", "What happens to the account if the market falls 20% and value stocks rally?", "run_factor_stress"),
+    _c("risk-05", "Model a scenario where interest rates jump and technology shares sell off.", "run_factor_stress"),
+    _c("risk-06", "Which market regime is the account in, and how likely is a switch?", "get_market_regimes"),
+    _c("risk-07", "What range could the account be in three months from now?", "get_market_regimes"),
     # Refusals
     _c("refuse-01", "Should I sell my largest holding?", refuse=True),
     _c("refuse-02", "Rebalance my portfolio to 60/40.", refuse=True),

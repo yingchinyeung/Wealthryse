@@ -586,6 +586,39 @@ stands out.
 
 Turning it on needs a rebuild of the agent image only. There are no schema or infrastructure changes.
 
+## Risk and predictive modelling
+
+The Modelling tab gets two new cards and a stress section, all in `ibkr_etl.risk_forecasting` (standard library
+only, run on the account's daily returns):
+
+- **Risk outlook.** A GARCH(1,1) volatility forecast fitted by maximum likelihood. It falls back to EWMA
+  (λ 0.94) when there are fewer than 250 returns or GARCH fits no better. One-day and one-month 95% and 99% VaR
+  and expected tail loss come from filtered historical simulation. A VaR backtest refits every 63 days and is
+  judged with Kupiec's test. Drawdown odds (10%, 20% and 30% over three to twelve months) come from a
+  volatility-scaled block bootstrap.
+- **Market regimes.** A Gaussian hidden Markov model with two or three states, chosen by BIC. It gives today's
+  regime and its odds, and a 1, 2 and 3 month outlook simulated from the regimes. A walk-forward score shows
+  how often the 90% and 50% ranges held, and whether the direction beat a naive rule.
+- **Factor stress.** Fitted factor betas times a factor shock, from presets or custom shocks capped at ±60%.
+
+Analyst tools: `get_risk_outlook`, `get_market_regimes` and `run_factor_stress` (preset `scenario`, or `shocks`
+as `[{factor, change}]`). The analyst chains them for forward-looking risk questions. It turns plain-language
+scenarios ("rates jump and small caps sell off") into factor shocks and says which shocks it chose. The weekly
+brief adds one sentence when the regime has changed since last week.
+
+The `risk_watch` job (`ibkrv2stg-agent-risk-watch`) runs at 01:15 UTC on weekdays. For each account granted to
+it, it applies fixed rules first, then the analyst explains any alert:
+
+- **Alerts** (`risk_alert`, once per trigger): the latest day lost more than its 95% VaR forecast; the account
+  moved into its most stressed regime (at least 60% likely, and not a week ago); or forecast volatility is at
+  least 1.5 times its long-run level (once a week). An explanation that fails the figure check is left out.
+- **Model check** (`model_check`, once a month): the VaR backtest and the outlook score, with a flag when VaR
+  breaches fail Kupiec's test or the 90% range held outside 80% to 97% of the time.
+
+**Turning it on** (each step needs Ying's typed approval): rerun `scripts/install_agent_schema.py` (applies
+`014_risk_watch.sql`), grant accounts with `--grant risk_watch=<account>` (or `=all`), rebuild the agent and
+web images, and deploy `infra/agent-apps.bicep` for the new job.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool

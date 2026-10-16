@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from ibkr_etl import db as db_module
 from ibkr_etl.db import connect, initialize
 from ibkr_etl.derived_portfolio import refresh_filtered_portfolio
 from ibkr_etl.reference_data import refresh_reference_data
@@ -177,11 +178,18 @@ def load_source_account(connection) -> None:
     connection.commit()
 
 
+def initialize_sqlite(database: Path) -> None:
+    """v1.1's SQLite schema from this checkout; CI's database job runs against an installed package."""
+
+    with patch.object(db_module, "SQLITE_MIGRATION", ROOT / "migrations" / "001_init.sql"):
+        initialize(database)
+
+
 def v11_reference_file(folder: Path) -> bytes:
     """reference_data.json as v1.1's daily job builds it, from the fake providers."""
 
     database = folder / "v11.db"
-    initialize(database)
+    initialize_sqlite(database)
     connection = connect(database)
     try:
         load_source_account(connection)
@@ -265,7 +273,7 @@ class EquivalenceTests(unittest.TestCase):
 
     def test_the_filtered_portfolio_is_identical_from_either_source(self):
         database = self.folder / "derived.db"
-        initialize(database)
+        initialize_sqlite(database)
         connection = connect(database)
         self.addCleanup(connection.close)
         load_source_account(connection)

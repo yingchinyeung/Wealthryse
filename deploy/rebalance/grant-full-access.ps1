@@ -1,5 +1,6 @@
 # Gives Aiden and the person running this full control of the rebalancing
-# website: Owner on the ibkrv2stg-rebalance container app, owner of its
+# website: checks their Azure roles on the ibkrv2stg-rebalance container app,
+# makes them owners of its
 # "WealthRyse Rebalance" sign-in app, and sign-in to the site. The database
 # login stays read-only. Safe to re-run. Prints what each person has at the end.
 
@@ -44,11 +45,9 @@ $spId = AzRun ad sp list --filter "appId eq '$entraAppId'" --query '[0].id' -o t
 foreach ($name in $people.Keys) {
     $id = $people[$name]
     Write-Host "== $name"
-    # Azure: Owner on the website's container app only.
-    $has = AzRun role assignment list --assignee $id --scope $appId --role Owner --query '[0].id' -o tsv
-    if (-not $has) {
-        AzRun role assignment create --assignee-object-id $id --assignee-principal-type User --role Owner --scope $appId | Out-Null
-    }
+    # Azure: the existing Contributor (or higher) roles already give full control
+    # of the app. Owner is not granted: role-assignment rights here are limited
+    # by an ABAC condition and full control does not need them.
     # Sign-in settings: owner of the app registration and its enterprise app.
     if ((AzRun ad app owner list --id $entraAppId --query '[].id' -o tsv) -notmatch $id) {
         AzRun ad app owner add --id $entraAppId --owner-object-id $id | Out-Null

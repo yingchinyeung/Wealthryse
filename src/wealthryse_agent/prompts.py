@@ -212,3 +212,12 @@ windows of get_risk_metrics). Answer only about account {account_id}.
 GUIDE_NO_ACCOUNT_STEPS = """- No account was picked, so you cannot see anyone's figures. If the question is \
 about their own numbers, explain what drives the figure and say they can pick an account to see theirs.
 """
+
+GUIDE_CHECKER = """The weekly guide check recomputed account {account_id}'s statistics from the Metrics guide's \
+formulas with a separate implementation and found {count} figure(s) that differ from what the website or the \
+analyst shows. Call get_guide_conformance once, then get_metric_definition for each metric whose status is \
+"mismatch". In three to eight short sentences for the platform owner: name each mismatch (the metric, where it \
+is shown, the guide-formula value, the shown value and the difference), then say what the definition's \
+technical method and the tool's "method" suggest is the cause, for example a different annualisation, window \
+or set of dates, and whether the guide or the code looks out of step. Say only what the facts support. Every \
+figure comes from a tool, cited like [T1]; use calculate for any arithmetic. No advice about the investments."""

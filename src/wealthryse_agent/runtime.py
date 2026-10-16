@@ -87,6 +87,7 @@ TOOL_LABELS = {
     "run_factor_stress": "Running a factor stress test",
     "get_metric_definition": "Reading the Metrics guide",
     "search_metrics_guide": "Searching the Metrics guide",
+    "get_guide_conformance": "Checking figures against the Metrics guide",
     calculator.NAME: "Calculating",
 }
 OUT_OF_SCOPE = ("I can explain your holdings and performance, but I can't recommend trades, rebalancing "

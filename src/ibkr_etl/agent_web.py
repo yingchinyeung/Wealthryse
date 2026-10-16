@@ -522,7 +522,7 @@ INBOX_SCRIPT = r"""<script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const md=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').split(/\n{2,}/).map(p=>'<p>'+p.replace(/\n/g,'<br>')+'</p>').join('');
 const NAMES={NAMES};
-const kinds={export_pack:'Export pack',weekly_brief:'Weekly brief',holdings_explainer:'What changed',live_alert:'Live alert',risk_alert:'Risk alert',model_check:'Model check',month_end_draft:'Draft commentary',data_quality:'Data check',month_end_report:'Month-end report',month_end_hold:'Account blocked',month_end_dispute:'Agents disagree'};
+const kinds={export_pack:'Export pack',weekly_brief:'Weekly brief',holdings_explainer:'What changed',live_alert:'Live alert',risk_alert:'Risk alert',model_check:'Model check',guide_check:'Guide check',month_end_draft:'Draft commentary',data_quality:'Data check',month_end_report:'Month-end report',month_end_hold:'Account blocked',month_end_dispute:'Agents disagree'};
 const kindLabel=k=>kinds[k]||String(k||'Update').replace(/_/g,' ').replace(/^./,c=>c.toUpperCase());
 const statuses={new:'New',read:'Read',approved:'Approved',dismissed:'Dismissed'};
 const choices={month_end_hold:[['approved','Proceed'],['dismissed','Hold']],month_end_dispute:[['approved',"Keep the writer's text"],['dismissed','Agree with the reviewer']]};
@@ -570,7 +570,7 @@ const links=l=>l&&l.length?'<div class="wr-guide-sources">Definitions used: '+l.
 const css=`.wr-guide textarea{width:100%;min-height:56px;resize:vertical;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--border,#ccc);background:transparent;color:inherit;box-sizing:border-box}
 .wr-guide-form{display:grid;gap:8px;margin-top:8px}.wr-guide-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.wr-guide-row select{font:inherit;padding:4px 8px;border-radius:8px;border:1px solid var(--border,#ccc);background:var(--surface,transparent);color:inherit;max-width:100%}
 .wr-guide-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.wr-guide-chips button,.metric-work{font:inherit;font-size:12px;border:1px solid var(--border,#ccc);background:var(--surface,transparent);color:inherit;border-radius:999px;padding:3px 10px;cursor:pointer}
-.wr-guide-chips button:hover,.metric-work:hover{border-color:var(--accent,#1f6feb)}.metric-work{margin-left:6px}
+.wr-guide-chips button:hover,.metric-work:hover{border-color:var(--accent,#1f6feb)}.metric-work{margin-left:auto;margin-right:6px}
 .wr-guide-out{margin-top:10px;line-height:1.5}.wr-guide-out:empty{display:none}.wr-guide-out p{margin:0 0 8px}.wr-guide-out ul{margin:4px 0 8px 18px;padding:0}
 .wr-guide-work{margin-top:10px;padding:10px 12px;border-radius:10px;background:var(--surface,#f4f5f7);line-height:1.5}.wr-guide-work p{margin:0 0 6px}.wr-guide-work ul{margin:4px 0 6px 18px;padding:0}
 .wr-guide-status{font-size:12px;opacity:.75}.wr-guide-sources{font-size:11px;opacity:.75;margin-top:6px}.wr-cite{font-size:10px;opacity:.75}
@@ -610,7 +610,7 @@ fetch('/api/agents/status',{credentials:'same-origin'}).then(r=>r.ok?r.json():{e
  box.querySelectorAll('.wr-guide-chips button').forEach(b=>b.addEventListener('click',()=>{input.value=b.textContent;ask(b.textContent)}));
  if(!accounts.length)return;
  document.querySelectorAll('.metric-definition').forEach(row=>{const head=row.querySelector('.metric-definition-heading'),name=(row.querySelector('h3')||{}).textContent;if(!head||!name)return;
-  const b=document.createElement('button');b.type='button';b.className='metric-work';b.textContent='Work it through with my numbers';b.setAttribute('aria-label',`Work ${name} through with an account's numbers`);head.appendChild(b);
+  const b=document.createElement('button');b.type='button';b.className='metric-work';b.textContent='Work it through with my numbers';b.setAttribute('aria-label',`Work ${name} through with an account's numbers`);head.insertBefore(b,head.querySelector('.metric-copy'));
   b.addEventListener('click',async()=>{let out=row.querySelector('.wr-guide-work');if(!out){out=document.createElement('div');out.className='wr-guide-work';out.setAttribute('aria-live','polite');row.appendChild(out)}
    const id=account()||(accounts.length===1?accounts[0].id:'');
    if(!id){out.innerHTML='Pick an account under <a href="#wr-guide-title">Ask the guide</a> first.';select&&select.focus();return}

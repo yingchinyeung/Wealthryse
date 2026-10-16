@@ -61,13 +61,15 @@ CREATE INDEX IF NOT EXISTS export_checks_owner ON agent.export_checks (tenant_id
 REVOKE ALL ON agent.export_packs, agent.export_checks FROM PUBLIC;
 GRANT SELECT, INSERT, UPDATE ON agent.export_packs, agent.export_checks TO agent_writer;
 
+-- Its lists of jobs and inbox kinds are added NOT VALID, because
+-- 016_guide_check.sql now sets the full lists.
 ALTER TABLE agent.service_grants DROP CONSTRAINT IF EXISTS service_grants_job_name_check;
 ALTER TABLE agent.service_grants ADD CONSTRAINT service_grants_job_name_check
     CHECK (job_name IN ('holdings_explainer', 'month_end_drafter', 'data_quality', 'month_team', 'onboarding',
-                        'operations', 'weekly_brief', 'live_market', 'risk_watch', 'export_packs'));
+                        'operations', 'weekly_brief', 'live_market', 'risk_watch', 'export_packs')) NOT VALID;
 
 ALTER TABLE agent.inbox DROP CONSTRAINT IF EXISTS inbox_kind_check;
 ALTER TABLE agent.inbox ADD CONSTRAINT inbox_kind_check CHECK (kind IN (
     'holdings_explainer', 'month_end_draft', 'data_quality',
     'month_end_report', 'month_end_hold', 'month_end_dispute',
-    'onboarding_watch', 'weekly_brief', 'live_alert', 'risk_alert', 'model_check', 'export_pack'));
+    'onboarding_watch', 'weekly_brief', 'live_alert', 'risk_alert', 'model_check', 'export_pack')) NOT VALID;

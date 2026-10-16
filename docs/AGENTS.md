@@ -653,6 +653,44 @@ checks. A new pack starts with the last period already closed. Nothing is emaile
 `015_export_agent.sql`), grant accounts with `--grant export_packs=all` (or per account), rebuild the agent and web
 images, and deploy `infra/agent-apps.bicep` for the new job.
 
+## Metrics guide agents
+
+Four pieces keep the Metrics guide (`ibkr_etl/metrics_guide.py`) right and put it to work. All of them read
+only, and none sends anything to a client.
+
+- **Keeper (self-maintaining guide).** `scripts/check_metrics_guide.py` reads the website's source for every
+  figure label it renders (metric cards, Modelling tiles, the what-if table) and checks each one against the
+  guide's names, aliases and `LABEL_MAP`. It also fingerprints the calculation functions each definition
+  describes (`WATCHED_SOURCES` in `metrics_guide_audit.py`) against `metrics_guide_sources.json`. CI runs it as
+  a warning. The `Metrics guide keeper` workflow runs it after pushes to main and on Mondays. On drift it has
+  Claude draft the definitions from the code (source files only), runs the guide tests and opens a pull
+  request for review. It needs the `ANTHROPIC_API_KEY` (or `CLAUDE_CODE_OAUTH_TOKEN`) secret and the repo
+  setting that lets Actions open pull requests. Without a secret the run goes red and lists the drift. After
+  updating the guide by hand, run `python scripts/check_metrics_guide.py --refresh`.
+- **Explain with your numbers.** Each definition on `/metrics-guide` gets a "Work it through with my numbers"
+  button. `/v1/explain-metric` runs `METRIC_EXPLAINER` with `get_metric_definition`, the account tools for that
+  definition's section (`guide_tools.SECTION_TOOLS`) and the calculator. The analyst recomputes the figure step
+  by step and says where the tool's own figure differs. The definition's numbers (`figures_in_text`) count as
+  tool figures, so the guide's constants pass the figure check.
+- **Ask the guide.** A box at the top of `/metrics-guide` answers plain-language questions through
+  `/v1/guide-question` (`GUIDE_ANALYST`). The person can pick an account, or none for definitions only. The
+  answer links to the definitions it used (`guide_links` on the answer event). The account chat also has
+  `search_metrics_guide` and `get_metric_definition`. The guide tools wrap the tool client in the agent service
+  (`guide_tools.GuideTools`), so the tool server is unchanged.
+- **Independent formula checker.** The `guide_check` job (`ibkr_etl/metrics_guide_reference.py`,
+  `ibkrv2stg-agent-guide-check`) runs at 02:00 UTC on Mondays. Its job-only tool `get_guide_conformance` recomputes
+  each granted account's statistics from the guide's technical formulas with a separate implementation. It
+  compares them with the website's figures (Performance statistics, drawdowns, win rate, VaR and expected tail
+  loss) and with the analyst's `get_risk_metrics` over its own window. When anything differs (beyond 1e-6
+  relative), a `guide_check` inbox card lists it, with the analyst's explanation from the definitions. When
+  everything matches, one all-clear card goes up a month. The analyst annualises volatility by valuations a year
+  rather than the guide's 252, so expect that difference on its rows.
+
+**Turning it on.** Explain with your numbers and Ask the guide ship with the website and agent images, wherever
+`AGENT_UI_MODE` shows the agents. The guide check needs Ying's typed approval for each step: rerun
+`scripts/install_agent_schema.py` (applies `016_guide_check.sql`), grant accounts with `--grant guide_check=all`
+(or per account), rebuild the agent image, and deploy `infra/agent-apps.bicep` for the new job.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool

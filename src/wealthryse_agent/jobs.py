@@ -13,6 +13,9 @@ records); nothing is sent, published or released.
                                                          # against what actually happened
     python -m wealthryse_agent.jobs export_packs         # daily: an inbox card for each saved export pack
                                                          # whose period has closed (no model, no files)
+    python -m wealthryse_agent.jobs guide_check          # Mondays: recompute each account's statistics from
+                                                         # the Metrics guide's formulas and flag any figure
+                                                         # the website or the analyst shows differently
     python -m wealthryse_agent.jobs month_team           # hourly, 2nd–7th: the month-end team
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
     python -m wealthryse_agent.jobs month_team --replay --round 2 --from 2026-01-31
@@ -44,7 +47,8 @@ from .auth import TokenSource
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings
 from .database import connect
 from .month_team.agents import BudgetExhausted
-from .prompts import HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, RISK_ALERT, WEEKLY_BRIEF
+from . import guide_tools
+from .prompts import GUIDE_CHECKER, HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, RISK_ALERT, WEEKLY_BRIEF
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -297,6 +301,56 @@ def risk_watch(store: Store, tools: ToolClient, agent: Agent, accounts: list[str
     return written
 
 
+def guide_check_summary(data: dict[str, Any]) -> list[str]:
+    """One line per mismatch, from the conformance facts alone (used when the explanation fails its check)."""
+    return [f"{c['metric']} ({c['source']}): guide formula {c['guide_formula_value']}, shown {c['shown_value']}"
+            for c in data["checks"] if c["status"] == "mismatch"]
+
+
+def guide_check(store: Store, tools: ToolClient, agent: Agent, accounts: list[str], usage: dict,
+                today: date | None = None) -> int:
+    """Weekly: compare each account's figures with an independent implementation of the Metrics guide.
+
+    A card each week that something differs, with the analyst's explanation; otherwise one all-clear a month.
+    """
+    today = today or date.today()
+    year, week, _ = today.isocalendar()
+    week_key, month_key = f"{year}-W{week:02d}", today.strftime("%Y-%m")
+    guided = guide_tools.GuideTools(tools)
+    written = 0
+    for account_id in accounts:
+        if store.inbox_exists("guide_check", account_id, week_key):
+            continue
+        try:
+            result = tools.call("get_guide_conformance", {"account_id": account_id})
+        except ToolCallFailed:
+            continue  # too little history to check
+        data = result["data"]
+        citations = result.get("citations") or [{"source": "subject_nav_series", "account_id": account_id}]
+        if not data["mismatches"]:
+            if store.inbox_exists("guide_check", account_id, month_key):
+                continue
+            if store.add_inbox(kind="guide_check", account_id=account_id, period_key=month_key,
+                               title=f"Metrics guide check: all {data['checked']} figures match",
+                               body=(f"Every figure checked matched the Metrics guide's formulas, recomputed separately "
+                                     f"over {data['observations']} daily returns from {data['period_start']} to "
+                                     f"{data['period_end']}."), citations=citations, run_id=None):
+                written += 1
+            continue
+        answer, cited, used, ok = _run_agent(
+            agent, guided, account_id, GUIDE_CHECKER.format(account_id=account_id, count=data["mismatches"]),
+            ["get_guide_conformance", "get_metric_definition", "calculate"])
+        _sum_usage(usage, used)
+        body = answer if ok else "\n".join(
+            ["The explanation could not be checked against the figures, so only the facts are shown:"]
+            + [f"- {line}" for line in guide_check_summary(data)])
+        if store.add_inbox(kind="guide_check", account_id=account_id, period_key=week_key,
+                           title=f"Metrics guide check: {data['mismatches']} of {data['checked']} figures differ",
+                           body=body, citations=cited if ok else citations, run_id=None):
+            written += 1
+    return written
+
+
 def data_quality_findings(freshness: dict[str, Any], today: date) -> list[str]:
     """Plain-language findings from the freshness tool. Deterministic; no model."""
     findings = []
@@ -500,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("job", choices=["holdings_explainer", "month_end_drafter", "data_quality", "month_team",
                                                   "onboarding", "operations", "weekly_brief", "live_market",
-                                                  "risk_watch", "export_packs"])
+                                                  "risk_watch", "export_packs", "guide_check"])
     parser.add_argument("--period", help="month_team: the month end to work on (default: last month)")
     parser.add_argument("--replay", action="store_true", help="month_team: re-check months already released")
     parser.add_argument("--from", dest="from_period", default="1900-01-01", help="month_team --replay: first month end")
@@ -548,7 +602,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             agent = Agent(ModelSettings.from_env())
             job = {"holdings_explainer": holdings_explainer, "weekly_brief": weekly_brief,
-                   "live_market": live_market, "risk_watch": risk_watch}.get(args.job, month_end_drafter)
+                   "live_market": live_market, "risk_watch": risk_watch,
+                   "guide_check": guide_check}.get(args.job, month_end_drafter)
             written = job(store, tools, agent, accounts, usage)
         store.finish_run(run_id, status="succeeded", items=written, usage=usage)
         LOGGER.info("%s wrote %s inbox items", args.job, written)

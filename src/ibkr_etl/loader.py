@@ -1,11 +1,38 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+from dataclasses import replace
 from decimal import Decimal
 from typing import Iterable
 
 from .parser import FlexRow, ParsedReport
 from .util import canonical_json, decimal_text, parse_date_text, pick, sha256_text, utc_now_iso
+
+
+# Off unless set: reuse the key of an existing event row that has identical raw
+# IBKR attributes, so rows imported by another path are updated, not duplicated.
+LEGACY_KEY_COMPAT_ENV = "IBKR_FLEX_LEGACY_KEY_COMPAT"
+
+
+def legacy_key_compat_enabled() -> bool:
+    return os.environ.get(LEGACY_KEY_COMPAT_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _legacy_key(connection, table: str, row: FlexRow, unavailable: set[tuple[str, str]]) -> str | None:
+    if connection.execute(
+        f"SELECT 1 FROM {table} WHERE account_id = ? AND source_key = ?",
+        (row.account_id, row.source_key),
+    ).fetchone() is not None:
+        return None
+    matches = connection.execute(
+        f"SELECT source_key FROM {table} WHERE account_id = ? AND row_sha256 = ? AND source_key <> ?",
+        (row.account_id, row.row_sha256, row.source_key),
+    ).fetchall()
+    if len(matches) != 1:
+        return None  # none, or ambiguous: keep the parser's key
+    legacy = str(matches[0][0])
+    return None if (row.account_id, legacy) in unavailable else legacy
 
 
 def _resolve_conid(connection: sqlite3.Connection, row: FlexRow) -> str | None:
@@ -406,8 +433,31 @@ def _upsert_fx_rate(connection: sqlite3.Connection, row: FlexRow, run_id: int) -
     )
 
 
-def load_report(connection: sqlite3.Connection, report: ParsedReport, run_id: int) -> dict[str, int]:
+def load_report(
+    connection: sqlite3.Connection,
+    report: ParsedReport,
+    run_id: int,
+    *,
+    legacy_key_compat: bool | None = None,
+) -> dict[str, int]:
     counts: dict[str, int] = {}
+    if legacy_key_compat is None:
+        legacy_key_compat = legacy_key_compat_enabled()
+    # A legacy key is never taken over if this report uses it, or twice.
+    unavailable = {(row.account_id, row.source_key) for row in report.rows} if legacy_key_compat else set()
+    reused = 0
+
+    def compatible(table: str, row: FlexRow) -> FlexRow:
+        nonlocal reused
+        if not legacy_key_compat:
+            return row
+        legacy = _legacy_key(connection, table, row, unavailable)
+        if legacy is None:
+            return row
+        unavailable.add((row.account_id, legacy))
+        reused += 1
+        return replace(row, source_key=legacy)
+
     # Instrument details can appear after trades in a Flex document. Load all
     # dimensions first so security resolution is independent of XML section order.
     for row in report.rows:
@@ -424,11 +474,11 @@ def load_report(connection: sqlite3.Connection, report: ParsedReport, run_id: in
         kind = row.record_type.lower()
         section = row.section.lower()
         if kind == "trade" or section == "trades" and "trade" in kind:
-            _upsert_trade(connection, row, run_id)
+            _upsert_trade(connection, compatible("trades", row), run_id)
         elif "cashtransaction" in kind:
-            _upsert_cash_transaction(connection, row, run_id)
+            _upsert_cash_transaction(connection, compatible("cash_transactions", row), run_id)
         elif "corporateaction" in kind:
-            _upsert_corporate_action(connection, row, run_id)
+            _upsert_corporate_action(connection, compatible("corporate_actions", row), run_id)
         elif "openposition" in kind:
             _upsert_position(connection, row, run_id)
         elif "cashreportcurrency" in kind or kind == "cashreport":
@@ -438,5 +488,7 @@ def load_report(connection: sqlite3.Connection, report: ParsedReport, run_id: in
         elif "conversionrate" in kind or kind in {"fxrate", "currencyconversionrate"}:
             _upsert_fx_rate(connection, row, run_id)
         elif kind == "fxtransaction":
-            _upsert_fx_transaction(connection, row, run_id)
+            _upsert_fx_transaction(connection, compatible("fx_transactions", row), run_id)
+    if reused:
+        counts["legacy_source_keys_reused"] = reused
     return counts

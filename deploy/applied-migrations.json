@@ -24,6 +24,10 @@
   "068_medallion_gold_layer.sql": {
    "sha256": "02165f9fe18dc77ad3b7bf429be0b1b21b4415ad431c1f77bbd4cfe22615964b",
    "evidence": "ibkrv2stg-bootstrap-gp3actj on ibkr-platform main-b832403 (sha256:cd122bca9a155c72db99520a632f18e81a67cf3e3e4a0372b74f355880c1978f), 068 only (embedded from main 39dba35) with bootstrap_postgres.py --only-migration, Medallion S3a gold batch, status pass with 0 failed checks, 2026-10-17 about 11:49 UTC"
+  },
+  "069_medallion_bronze_layer.sql": {
+   "sha256": "92ca8cd271b023d913a6fc73dbfe4870b2588f99d304170d9c23fb61472cde8f",
+   "evidence": "ibkrv2stg-bootstrap-rrt4pwu on ibkr-platform main-b832403 (sha256:cd122bca9a155c72db99520a632f18e81a67cf3e3e4a0372b74f355880c1978f), 069 only (embedded from main 5bc56db) with bootstrap_postgres.py --only-migration, Medallion S3b bronze batch, status pass with 0 failed checks, 2026-10-17 about 12:28 UTC"
   }
  }
 }

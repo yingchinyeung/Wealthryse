@@ -200,13 +200,18 @@ def install(app: FastAPI, *, owner_user: Callable[..., dict[str, Any]],
             check_subject: Callable[[str, dict[str, Any]], None], write_database: Callable[[], Any],
             portable: Callable[[Any], Any], render_page: Callable[..., str], tenant_id: str,
             agent_api: Callable[[], Any | None] = lambda: None,
-            snapshot_for: Callable[[str, str], Mapping[str, Any] | None] | None = None) -> None:
+            snapshot_for: Callable[[str, str], Mapping[str, Any] | None] | None = None,
+            onboarding_case: Callable[[str], Mapping[str, Any] | None] = lambda subject_id: None) -> None:
     """Add the designer's routes. Each answers 404 while the switch is off.
 
     check_subject(subject_id, user) raises when the owner may not design for that
     account; write_database() opens the website's write connection and
     portable(connection) adapts it to ``?`` placeholders; agent_api() gives the
-    agent service client, or None when it is not configured.
+    agent service client, or None when it is not configured. onboarding_case(subject_id)
+    gives the open onboarding case (case_id, reporting_currency) of a subject that is
+    still being onboarded, else None: its submitted design is what its historical
+    factsheets are rendered from (designed_reports.py), so submitting it opens no
+    report design request.
     """
 
     def design_user(user: dict[str, Any] = Depends(owner_user)) -> dict[str, Any]:
@@ -274,7 +279,11 @@ def install(app: FastAPI, *, owner_user: Callable[..., dict[str, Any]],
     @app.get("/accounts/{subject_id}/factsheet-designer", response_class=HTMLResponse)
     def designer_page(subject_id: str, user: dict[str, Any] = Depends(design_user)) -> HTMLResponse:
         subject(subject_id, user)
-        content = PAGE_BODY.replace("{SUBJECT}", escape(subject_id))
+        case = onboarding_case(subject_id)
+        currency = str(case["reporting_currency"]) if case and CURRENCY.fullmatch(str(case["reporting_currency"])) else "USD"
+        content = ((ONBOARDING_NOTE.replace("{CASE_PAGE}", escape(f"/account-onboarding/cases/{case['case_id']}", quote=True))
+                    if case else "")
+                   + PAGE_BODY.replace("{SUBJECT}", escape(subject_id)).replace("{CURRENCY}", currency))
         script = PAGE_SCRIPT.replace("{SUBJECT_JSON}", '"' + subject_id + '"')
         return HTMLResponse(render_page(user, active="accounts", title="Factsheet designer",
                                         description="Upload a factsheet template; the design agents draft it, "
@@ -507,6 +516,10 @@ def install(app: FastAPI, *, owner_user: Callable[..., dict[str, Any]],
             current = store.version(connection, str(draft_id), body.expected_version)
             if (current["checks"] or {}).get("status") == "fail":
                 raise HTTPException(status_code=409, detail="This version fails its checks; fix it before submitting.")
+            if onboarding_case(subject_id) is not None:
+                # Still being onboarded: the onboarding run renders its historical factsheets from this design.
+                store.set_status(connection, tenant_id, str(draft_id), "submitted")
+                return {"status": "submitted", "used_for": "onboarding"}
             description = (f"New factsheet design from the factsheet designer: {row['title']}. "
                            f"Draft {draft_id}, version {current['version']}, spec {current['spec_sha256']}.")
             try:
@@ -518,9 +531,12 @@ def install(app: FastAPI, *, owner_user: Callable[..., dict[str, Any]],
         return {"status": "submitted", "request_id": str(request["request_id"])}
 
 
+ONBOARDING_NOTE = """<div class="card wide"><div class="label">Part of onboarding</div><p>This account is still being onboarded. The design you submit here is the one its historical factsheets are rendered from, for you to review and approve on the <a href="{CASE_PAGE}">onboarding case</a>. Until you approve them there, submitting a newer design renders them again.</p></div>
+"""
+
 PAGE_BODY = """<div class="card wide fd"><div class="label">New design for {SUBJECT}</div>
 <form id="fd-new" class="fd-form"><label>Title <input name="title" required maxlength="120" placeholder="For example: Greater China factsheet"></label>
-<label>Currency <input name="currency" value="USD" maxlength="3" pattern="[A-Za-z]{3}" style="width:5em"></label>
+<label>Currency <input name="currency" value="{CURRENCY}" maxlength="3" pattern="[A-Za-z]{3}" style="width:5em"></label>
 <label>Template (PDF, required) <input type="file" name="template" accept="application/pdf" required></label>
 <label>Completed example (PDF, optional) <input type="file" name="example" accept="application/pdf"></label>
 <label>Other months' examples (PDF, optional, up to 6) <input type="file" name="more_examples" accept="application/pdf" multiple></label>
@@ -560,7 +576,7 @@ async function open(id){state=await call(`${base}/${id}`);box.hidden=false;const
  box.querySelector('#fd-ask').addEventListener('click',async e=>{const out=box.querySelector('#fd-proposal');e.target.disabled=true;out.textContent='Working out the change…';
   try{show(await post(`${base}/${s.draft_id}/edits`,{request:box.querySelector('#fd-req').value,expected_version:s.current_version}))}catch(err){out.textContent=err.message}finally{e.target.disabled=false}});
  box.querySelector('#fd-undo').addEventListener('click',async()=>{try{await post(`${base}/${s.draft_id}/undo`,{expected_version:s.current_version});open(s.draft_id)}catch(e){alert(e.message)}});
- box.querySelector('#fd-submit').addEventListener('click',async()=>{if(!confirm('Submit this version for release? The release service still checks it before any report changes.'))return;
+ box.querySelector('#fd-submit').addEventListener('click',async()=>{if(!confirm('Submit this version? It is checked again before any report uses it.'))return;
   try{await post(`${base}/${s.draft_id}/submit`,{expected_version:s.current_version});open(s.draft_id);list()}catch(e){alert(e.message)}})}
 function show(p){const out=box.querySelector('#fd-proposal'),s=state;
  if(p.status==='question'){out.innerHTML=`<p><strong>Before I change anything:</strong> ${esc(p.question)}</p>`;return}

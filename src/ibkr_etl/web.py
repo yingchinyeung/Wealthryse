@@ -3633,6 +3633,36 @@ def _report_design_owner(subject_id,user):
         raise HTTPException(status_code=409,detail='Design updates are available after onboarding')
 
 
+def _onboarding_design_case(subject_id):
+    """The open new-onboarding case of a subject that reports in its owner's own design, or None.
+
+    Its factsheets are rendered from the design submitted in the factsheet designer
+    (designed_reports.py), so the designer opens for it before it goes live.
+    """
+    if not onboarding_v2_enabled():
+        return None
+    try:
+        with _database() as connection:
+            row = connection.execute(
+                """SELECT case_id, reporting_currency FROM broker_onboarding_cases
+                WHERE tenant_id = %s AND subject_id = %s AND report_style IS NULL AND status <> 'cancelled'
+                  AND stage IN ('request', 'load_and_reconcile', 'build_history')
+                ORDER BY created_at DESC LIMIT 1""",
+                (TENANT_ID, subject_id),
+            ).fetchone()
+    except PostgresError:
+        return None
+    return {"case_id": str(row["case_id"]), "reporting_currency": str(row["reporting_currency"])} if row else None
+
+
+def _factsheet_designer_owner(subject_id, user):
+    """The owner designs for a live subject, or for one their open onboarding case is building."""
+    if user.get('role') != 'owner':
+        raise HTTPException(status_code=403, detail='Owner access is required')
+    if _portfolio_access_context(subject_id, user)['preview_mode'] and _onboarding_design_case(subject_id) is None:
+        raise HTTPException(status_code=409, detail='Design updates are available after onboarding')
+
+
 @app.get('/api/accounts/{subject_id}/reporting/design-updates')
 def list_report_design_updates(subject_id: str,user: dict=Depends(_owner_user)):
     _report_design_owner(subject_id,user)
@@ -10835,12 +10865,13 @@ from .agent_web import design_api as _design_api
 _factsheet_design_web.install(
     app,
     owner_user=_owner_user,
-    check_subject=_report_design_owner,
+    check_subject=_factsheet_designer_owner,
     write_database=lambda: _approval_database(),
     portable=_portable_database_connection,
     render_page=_platform_shell,
     tenant_id=TENANT_ID,
     agent_api=_design_api,
+    onboarding_case=_onboarding_design_case,
 )
 
 

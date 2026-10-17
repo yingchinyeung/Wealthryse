@@ -1,11 +1,12 @@
-"""Stage 3 reports for new-onboarding composites in the Alpha World MS or T design.
+"""Stage 3 reports for new-onboarding cases: composites in the Alpha World MS or T
+design, and every other case in the design its owner made in the factsheet designer.
 
 The month-end report job runs this after its packages, in the same image and
 with the same private storage. It renders factsheets only, as per-account decks
 are no longer built. It does nothing until
 migration 064 exists, or while no composite case is waiting on its reports.
 Each case's outcome is recorded on its reports_rendered check; see
-ibkr_etl/composite_reports.py.
+ibkr_etl/composite_reports.py and ibkr_etl/designed_reports.py.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from azure.core.exceptions import ResourceExistsError  # noqa: E402
 from ibkr_etl.cloud_storage import download_blob_bytes, upload_bytes  # noqa: E402
 from ibkr_etl.composite_reports import HONG_KONG, run_composite_report_cases  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
+from ibkr_etl.designed_reports import run_designed_report_cases  # noqa: E402
 
 
 def _required(name: str) -> str:
@@ -62,11 +64,15 @@ def main() -> int:
         if connection.execute("SELECT to_regclass('public.broker_onboarding_cases')").fetchone()[0] is None:
             print(json.dumps({"status": "not_installed", "cases": []}, sort_keys=True))
             return 0
+        today = datetime.now(HONG_KONG).date()
         results = run_composite_report_cases(connection, tenant_id, container=container,
-                                             today=datetime.now(HONG_KONG).date(), fetch=fetch, store=store)
+                                             today=today, fetch=fetch, store=store)
+        # Every other case reports in the design its owner made in the factsheet designer.
+        designed = run_designed_report_cases(connection, tenant_id, container=container,
+                                             today=today, fetch=fetch, store=store)
     finally:
         connection.close()
-    print(json.dumps({"status": "success", "cases": results}, sort_keys=True))
+    print(json.dumps({"status": "success", "cases": results, "designed_cases": designed}, sort_keys=True))
     return 0
 
 

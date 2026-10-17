@@ -110,6 +110,24 @@ class FontTests(unittest.TestCase):
             pf.title_run("Alpha Wörld", self.fonts, "alpha-world-t")
 
 
+class MonthEndSourceTests(unittest.TestCase):
+    def test_a_t_completed_example_downloaded_to_its_own_file_is_the_same_source(self):
+        """The month-end run writes the T completed example beside the template; same bytes, one source."""
+        with tempfile.TemporaryDirectory() as root:
+            template, example = Path(root) / "template.pdf", Path(root) / "example.pdf"
+            template.write_bytes(b"%PDF-1.4 made-up T owner template")
+            example.write_bytes(template.read_bytes())
+            target = Path(root) / "composite.pdf"
+            with self.assertRaisesRegex(MonthlyArtifactError, "approved design authority"):
+                render_factsheet(payload("alpha-world-t"), template_path=template, design_model_path=example,
+                                 output_path=target)
+            example.write_bytes(b"%PDF-1.4 a different file")
+            with self.assertRaisesRegex(MonthlyArtifactError, "one source"):
+                render_factsheet(payload("alpha-world-t"), template_path=template, design_model_path=example,
+                                 output_path=target)
+            self.assertFalse(target.exists())
+
+
 @unittest.skipUnless(SOURCES, "private MS and T design sources are not in this checkout")
 class RenderTests(unittest.TestCase):
     def test_each_design_renders_the_composites_identity_numbers_and_tree(self):
@@ -127,6 +145,8 @@ class RenderTests(unittest.TestCase):
                     self.assertEqual(result["title_font"], "synthetic-bold-georgia" if name else "georgia-bold")
                     self.assertFalse(result["publication_allowed"])
                     self.assertEqual(result["release_scope"], "internal_shareholder")
+                    # The month-end run refuses a factsheet not bound to its completed example.
+                    self.assertEqual(result["completed_example_sha256"], pf.DESIGNS[style]["authority"])
                     reader = PdfReader(result["output_path"])
                     first, second = (" ".join(page.extract_text().split()) for page in reader.pages)
                     display = name or "Alpha World Asia"

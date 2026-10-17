@@ -171,9 +171,42 @@ def deploy(provision=False):
     request('PUT',job_path(name)+'?api-version=2024-03-01',data=definition_value)
 
 
+def update():
+    """Give the installed reader this checkout's code. Everything else about the job (image,
+    identity, credential bindings, limits) must already match the reviewed definition, so
+    the PUT changes only the bundled code and its payloadSha256 tag."""
+    current=request('GET',job_path(JOB)+'?api-version=2024-03-01')
+    if current.get('tags',{}).get('purpose')!=PURPOSE:
+        raise ValueError('Unregistered observation job')
+    wanted=definition();digest=wanted['tags']['payloadSha256']
+    containers=current['properties']['template'].get('containers') or []
+    before=current.get('tags',{}).get('payloadSha256')
+    if before==digest:
+        validate(current)
+        print(json.dumps({'updated':False,'job':JOB,'payload_sha256':digest}))
+        return
+    candidate=json.loads(json.dumps(current))
+    if len(containers)==1:
+        candidate['properties']['template']['containers'][0]['args']=wanted['properties']['template']['containers'][0]['args']
+    validate(candidate)
+    idle(JOB)
+    wanted['tags']={**current['tags'],'payloadSha256':digest}
+    if current['properties'].get('workloadProfileName'):
+        wanted['properties']['workloadProfileName']=current['properties']['workloadProfileName']
+    FOLDER.mkdir(parents=True,exist_ok=True)
+    (FOLDER/(JOB+'-before-'+str(before)[:12]+'.json')).write_text(json.dumps(current,indent=2),encoding='utf-8')
+    (FOLDER/(JOB+'-definition-'+digest[:12]+'.json')).write_text(json.dumps(wanted,indent=2),encoding='utf-8')
+    request('PUT',job_path(JOB)+'?api-version=2024-03-01',data=wanted)
+    after=request('GET',job_path(JOB)+'?api-version=2024-03-01')
+    validate(after)
+    if after.get('tags',{}).get('payloadSha256')!=digest:
+        raise ValueError('Observation job readback differs from the update')
+    print(json.dumps({'updated':True,'job':JOB,'payload_sha256_before':before,'payload_sha256':digest,'image':IMAGE}))
+
+
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('stage',choices=['prepare','provision','install','test','verify','cleanup-provisioner'])
+    parser.add_argument('stage',choices=['prepare','provision','install','update','test','verify','cleanup-provisioner'])
     parser.add_argument('--execution')
     args=parser.parse_args()
     if az('account','show','--query','id')!=SUB: raise ValueError('Unexpected subscription')
@@ -184,6 +217,7 @@ def main():
         idle(name)
         if args.stage=='test': verify_cloud_identity()
         print(json.dumps({'execution':request('POST',job_path(name)+'/start?api-version=2024-03-01')['name']}))
+    elif args.stage=='update': update()
     elif args.stage=='install':
         verify_execution(PROVISION,args.execution)
         deploy()

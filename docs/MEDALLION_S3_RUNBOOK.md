@@ -40,6 +40,9 @@ Three batches, one a day, each at about 10:00 UTC, outside the daily load:
    (`public.<table>`; its gold tables from S3a, its silver tables from S3c, and it has no
    USAGE on the layer schemas). If either runs in production, change it to read the
    layer tables before the batch that moves them.
+   The metadata monitor runs every 30 minutes and names its tables without a schema, so
+   its login gets the layer schemas first in its `search_path` just before a batch that
+   moves one of its tables (gold and silver), as the runtime logins do.
 
 ## Each batch day
 

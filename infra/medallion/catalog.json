@@ -1175,7 +1175,7 @@
    "layer": "bronze",
    "declared_in": null,
    "new": true,
-   "holds": "Raw responses from Yahoo, US Treasury, HKMA/HKAB and sector lookups, named <feed>/<yyyy>/<mm>/<dd>/<request-key>-<sha256 prefix>.<ext> (src/ibkr_etl/raw_capture.py).",
+   "holds": "Raw responses from Yahoo, US Treasury, HKMA/HKAB and sector lookups, named <feed>/<yyyy>/<mm>/<dd>/<request-key>-<sha256 prefix>.<ext>, or <feed>/history/<request-key>-<sha256 prefix>.<ext> for windows that ended over a week ago, stored once (src/ibkr_etl/raw_capture.py).",
    "plan": "New container so every external feed keeps its raw copy. Capture is built and stays off until MARKET_DATA_RAW_CONTAINER is set on the job."
   },
   "ibkrv2stgauhecwc4itaoo/report-drafts": {
@@ -1389,7 +1389,8 @@
    "hops": [
     "ops"
    ],
-   "schedule": "every 5 minutes"
+   "schedule": "every 5 minutes",
+   "note": "Layer freshness checks when LAYER_FRESHNESS_ENABLED is set; the bronze-market-data file checks also need LAYER_FRESHNESS_BLOB_CHECKS (both off by default)."
   },
   "ibkrv2stg-autonomy-review": {
    "hops": [
@@ -1430,7 +1431,7 @@
     "analytics"
    ],
    "schedule": "09:20 UTC",
-   "note": "Fetches Yahoo crisis-window history; raw copy to bronze-market-data when MARKET_DATA_RAW_CONTAINER is set (off by default)."
+   "note": "Fetches Yahoo crisis-window history; raw copy to bronze-market-data history/ when MARKET_DATA_RAW_CONTAINER is set (off by default)."
   },
   "ibkrv2stg-derived-daily": {
    "hops": [

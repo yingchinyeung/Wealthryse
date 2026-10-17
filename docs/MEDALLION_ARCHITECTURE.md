@@ -70,14 +70,27 @@ Each batch is one migration:
   - Each market-data fetch stores the provider's response, before parsing, in
     `bronze-market-data` as `<feed>/<yyyy>/<mm>/<dd>/<request-key>-<sha256 prefix>.<ext>`.
     It never overwrites a blob.
+  - A window that ended over a week ago (a past Treasury year, a crisis window) is
+    stored once as `<feed>/history/<request-key>-<sha256 prefix>.<ext>`. Asking again
+    finds the existing blob, so nothing new is kept under the legal hold.
   - It is off unless the job sets `MARKET_DATA_RAW_CONTAINER` and
     `AZURE_STORAGE_ACCOUNT_URL`.
-  - It is fail-soft: the first storage error, or a time budget running out, turns
-    capture off for the rest of the run, and the job carries on.
+  - It is fail-soft:
+    - it uses managed identity only, with short timeouts and no retries;
+    - every thread shares one time budget, which is a hard limit;
+    - the first storage error or timeout turns capture off for the rest of the run,
+      and the job carries on.
 - **Freshness checks** (`src/ibkr_etl/layer_freshness.py`):
-  - The autonomous administrator runs explicit read-only rules for each layer and
-    raises `layer_freshness:<check>` warnings.
-  - It is off unless `LAYER_FRESHNESS_ENABLED=true`.
+  - The autonomous administrator runs explicit rules for each layer in one READ ONLY
+    transaction, within a hard 15-second limit. By default it uses its own
+    `DATABASE_URL`; `LAYER_FRESHNESS_DATABASE_URL` overrides it.
+  - Results:
+    - a late layer raises a `layer_freshness:<check>` warning, which closes only when
+      that check comes back fresh;
+    - a required check that cannot be read is recorded as info, and becomes a
+      warning after an hour.
+  - It is off unless `LAYER_FRESHNESS_ENABLED=true`. The `bronze-market-data` file
+    checks also need `LAYER_FRESHNESS_BLOB_CHECKS=true`, for once capture is on.
   - `python -m ibkr_etl.layer_freshness` prints the same checks for a dry run.
 
 ## Stages

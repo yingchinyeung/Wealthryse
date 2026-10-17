@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -67,6 +68,29 @@ def _layer_statements(connection, statements, layers, role) -> None:
                 schema=sql.Identifier(layer), role=sql.Identifier(role)))
 
 
+# A layer batch (068 to 070) that finds one of its tables busy stops within seconds and
+# changes nothing (SQLSTATE 55P03). With --only-migration, bootstrap tries it again a
+# minute later, holding no lock in between, up to three tries in all.
+BUSY_TRIES = 3
+BUSY_PAUSE_SECONDS = 60
+
+
+def _when_tables_free(apply, only_migration):
+    import psycopg
+
+    for attempt in range(1, BUSY_TRIES + 1):
+        try:
+            return apply()
+        except psycopg.errors.LockNotAvailable as error:
+            if not only_migration or attempt == BUSY_TRIES:
+                raise
+            print(f"{only_migration}: a table was busy, so nothing changed "
+                  f"({error.diag.message_primary or error}). Trying again in "
+                  f"{BUSY_PAUSE_SECONDS} seconds (try {attempt} of {BUSY_TRIES}).", flush=True)
+            time.sleep(BUSY_PAUSE_SECONDS)
+    raise AssertionError("unreachable")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply migrations and set the database logins' rights.")
     parser.add_argument(
@@ -106,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     previous = os.environ.get("IBKR_RUN_MIGRATIONS")
     os.environ["IBKR_RUN_MIGRATIONS"] = "true"
     try:
-        applied = initialize(
+        applied = _when_tables_free(lambda: initialize(
             settings.database_path,
             admin_url,
             settings.tenant_id,
@@ -115,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_pending=allow_pending,
             allow_applied_without_file=args.allow_applied_without_file,
             set_tenant_name=True,
-        )
+        ), args.only_migration)
     finally:
         if previous is None:
             os.environ.pop("IBKR_RUN_MIGRATIONS", None)

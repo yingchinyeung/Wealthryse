@@ -30,6 +30,16 @@ Three batches, one a day, each at about 10:00 UTC, outside the daily load:
    `infra/`. The Flex discovery and institutional Flex jobs reach it through
    `ingest_content` with the app login. Set the variable on them, or confirm that login
    cannot create in `public`, before a batch's migration reaches their image.
+5. A login with only column grants cannot read through a view in `public`: PostgreSQL
+   checks every column of a security_invoker view on the table behind it (tested). The
+   approval login's freshness check names its tables unqualified, so it reads the layer
+   tables, which come first in its `search_path`. Two readers name `public` and are
+   refused once their tables move (tested on a rehearsal database): the specialist
+   observation reader (`SET LOCAL search_path TO public`; `accounts`, `nav_snapshots`,
+   `platform_subjects` and `derived_portfolio_nav` from S3c) and the metadata monitor
+   (`public.<table>`; its gold tables from S3a, its silver tables from S3c, and it has no
+   USAGE on the layer schemas). If either runs in production, change it to read the
+   layer tables before the batch that moves them.
 
 ## Each batch day
 

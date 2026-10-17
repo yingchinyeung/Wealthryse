@@ -67,7 +67,7 @@ def latest_expected_fixing(*, now: datetime):
         'publication_policy_version':PUBLICATION_POLICY_VERSION}
 
 
-def _read_official(getter, url, timeout, *, feed=None, key=None):
+def _read_official(getter, url, timeout, *, feed=None, key=None, history=False):
     requested_at = raw_capture.utc_now()
     try:
         payload = getter(url, timeout=timeout)
@@ -81,7 +81,7 @@ def _read_official(getter, url, timeout, *, feed=None, key=None):
         raise HiborTransportError('Official HIBOR endpoint transport unavailable', allow_owner_fallback=True) from None
     if feed:
         raw_capture.capture_http(feed, PROVIDER, url=url, body=payload, key=key,
-                                 extension='json', requested_at=requested_at)
+                                 extension='json', requested_at=requested_at, history=history)
     return payload
 
 
@@ -181,7 +181,7 @@ def fetch(start: date, end: date, *, getter=_get, timeout=45, cached_observation
         official = OWNER_URL + '?' + urlencode({'year':day.year,'month':day.month,'day':day.day})
         transport['hkab_requests']+=1
         by_date[day.isoformat()] = _parse_owner(_read_official(getter,official,timeout,
-            feed='hkab-hibor',key=day.isoformat()),day)
+            feed='hkab-hibor',key=day.isoformat(),history=raw_capture.settled(day)),day)
         transport['hkab_dates'].append(day.isoformat())
         observed_dates.add(day.isoformat())
     rows = [by_date[k] for k in sorted(by_date)]

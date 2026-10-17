@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import mimetypes
+import os
 from pathlib import Path
 
 
@@ -23,7 +24,7 @@ def content_type_for_path(path: Path) -> str:
     )
 
 
-def _service(account_url: str, **client_options):
+def _service(account_url: str, credential=None, **client_options):
     if not account_url:
         return None
     try:
@@ -33,14 +34,29 @@ def _service(account_url: str, **client_options):
         raise RuntimeError(
             "Azure Blob mode requires azure-identity and azure-storage-blob."
         ) from error
-    credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+    if credential is None:
+        credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
     return BlobServiceClient(account_url=account_url, credential=credential, **client_options)
 
 
-def container_client(account_url: str, container: str, **client_options):
-    """One reusable container client. Best-effort writers pass short timeouts and
-    retry_total=0 so a storage problem cannot hold up their job."""
-    service = _service(account_url, **client_options)
+def best_effort_credential(*, connection_timeout: float, read_timeout: float):
+    """Managed identity only (AZURE_CLIENT_ID picks the user-assigned one): one token
+    request with short timeouts and no retries, so a hung identity endpoint fails in
+    seconds instead of walking DefaultAzureCredential's chain."""
+    from azure.identity import ManagedIdentityCredential
+
+    return ManagedIdentityCredential(
+        client_id=os.environ.get("AZURE_CLIENT_ID", "").strip() or None,
+        connection_timeout=connection_timeout,
+        read_timeout=read_timeout,
+        retry_total=0,
+    )
+
+
+def container_client(account_url: str, container: str, *, credential=None, **client_options):
+    """One reusable container client. Best-effort writers pass best_effort_credential,
+    short timeouts and retry_total=0 so a storage problem cannot hold up their job."""
+    service = _service(account_url, credential, **client_options)
     return None if service is None else service.get_container_client(container)
 
 

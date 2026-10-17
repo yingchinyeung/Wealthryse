@@ -16,7 +16,7 @@ for folder in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
     if str(folder) not in sys.path:
         sys.path.insert(0, str(folder))
 
-from ibkr_etl import crisis_scenarios  # noqa: E402
+from ibkr_etl import crisis_scenarios, raw_capture  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.util import canonical_json  # noqa: E402
 from refresh_provisional_benchmark import _crisis_scenario_subjects  # noqa: E402
@@ -44,6 +44,7 @@ def main() -> int:
     connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
     try:
         # No ingestion_runs row: other jobs read the latest run there, and this job is not an ingestion.
+        raw_capture.set_job_run_id(raw_capture.new_run_id("crisis-scenarios"))
         code, result = run(connection)
         print(canonical_json(result), flush=True)
         return code

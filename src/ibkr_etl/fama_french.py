@@ -199,7 +199,8 @@ def load_proxy_factors(
         from .crisis_replay import fetch_adjusted_history
 
         def fetch_history(symbol: str, start: date, end: date) -> Mapping[str, float]:
-            return fetch_adjusted_history(symbol, start_date=start, end_date=end)
+            # No raw capture: these are factor stand-ins, not crisis windows.
+            return fetch_adjusted_history(symbol, start_date=start, end_date=end, capture_feed=None)
 
     end = today or date.today()
     start = end - timedelta(days=PROXY_HISTORY_DAYS)

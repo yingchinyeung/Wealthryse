@@ -4,12 +4,18 @@ Each fetch hands over the provider response as received, before parsing. Capture
 off unless MARKET_DATA_RAW_CONTAINER and AZURE_STORAGE_ACCOUNT_URL are both set.
 
 It is best effort and never raises into the job:
-- uploads use short timeouts and no retries;
-- the first storage error logs one warning and switches capture off for the process;
-- the total time a process may spend capturing is capped (MARKET_DATA_RAW_BUDGET_SECONDS).
+- storage calls use managed identity only, short timeouts and no retries;
+- each upload runs in a daemon thread that the caller waits on for a bounded time;
+- every thread draws on one time budget per process (MARKET_DATA_RAW_BUDGET_SECONDS),
+  so the total time callers wait on capture never exceeds it;
+- the first storage error or timeout, or the budget running out, logs one warning and
+  switches capture off for the rest of the process.
 
-Blob names: <feed>/<yyyy>/<mm>/<dd>/<request-key>-<sha256 prefix>.<ext>, dated by the UTC
-request time, written with overwrite=False (the container is under a legal hold).
+Blob names, written with overwrite=False (the container is under a legal hold):
+- <feed>/<yyyy>/<mm>/<dd>/<request-key>-<sha256 prefix>.<ext>, dated by the UTC request
+  time, for responses that can change from day to day;
+- <feed>/history/<request-key>-<sha256 prefix>.<ext> for windows that ended over a week
+  ago (see settled), so the same answer is stored once and a repeat is "existing".
 """
 from __future__ import annotations
 
@@ -22,7 +28,8 @@ import re
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -35,6 +42,9 @@ EXECUTION_ENV = "CONTAINER_APP_JOB_EXECUTION_NAME"
 DEFAULT_BUDGET_SECONDS = 30.0
 CONNECTION_TIMEOUT_SECONDS = 3
 READ_TIMEOUT_SECONDS = 5
+# The longest one upload may hold up its caller (token plus upload share it).
+WRITE_WAIT_SECONDS = float(CONNECTION_TIMEOUT_SECONDS + READ_TIMEOUT_SECONDS)
+SETTLED_AFTER_DAYS = 7
 SHA_PREFIX = 16
 MAX_KEY_LENGTH = 120
 MAX_METADATA_VALUE = 1024
@@ -74,6 +84,27 @@ def request_key(*parts: Any) -> str:
     return cleaned[:MAX_KEY_LENGTH] or "request"
 
 
+def settled(end: date | datetime | str, *, now: datetime | None = None) -> bool:
+    """True when a requested window ended more than SETTLED_AFTER_DAYS before now. Its
+    answer should no longer change, so it is filed once under <feed>/history/."""
+    try:
+        if isinstance(end, datetime):
+            end_day = end.date()
+        elif isinstance(end, date):
+            end_day = end
+        else:
+            end_day = date.fromisoformat(str(end).strip()[:10])
+        today = (now or utc_now()).astimezone(timezone.utc).date()
+        return end_day < today - timedelta(days=SETTLED_AFTER_DAYS)
+    except (TypeError, ValueError):
+        return False
+
+
+def new_run_id(job: str) -> str:
+    """A run id for jobs without an ingestion run, such as crisis-scenarios-20261016T092000Z-1a2b3c4d."""
+    return f"{job}-{utc_now():%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
+
+
 def safe_url(url: str) -> str:
     """The URL without user info or credential-like query parameters."""
     parts = urlsplit(str(url))
@@ -99,11 +130,14 @@ def _extension(content_type: str | None, default: str) -> str:
 
 
 def _default_uploader(account_url: str, container: str) -> Callable[..., str]:
-    from .cloud_storage import container_client, upload_with_client
+    from .cloud_storage import best_effort_credential, container_client, upload_with_client
 
     client = container_client(
         account_url,
         container,
+        credential=best_effort_credential(
+            connection_timeout=CONNECTION_TIMEOUT_SECONDS, read_timeout=READ_TIMEOUT_SECONDS
+        ),
         connection_timeout=CONNECTION_TIMEOUT_SECONDS,
         read_timeout=READ_TIMEOUT_SECONDS,
         retry_total=0,
@@ -121,7 +155,7 @@ def _default_uploader(account_url: str, container: str) -> Callable[..., str]:
     return upload
 
 
-def _already_exists(error: Exception) -> bool:
+def _already_exists(error: BaseException) -> bool:
     try:
         from azure.core.exceptions import ResourceExistsError
     except ImportError:  # pragma: no cover - the SDK is installed in every image
@@ -139,24 +173,26 @@ class RawCapture:
         account_url: str = "",
         budget_seconds: float = DEFAULT_BUDGET_SECONDS,
         uploader_factory: Callable[[str, str], Callable[..., str]] = _default_uploader,
-        clock: Callable[[], float] = time.monotonic,
         job_execution: str = "",
+        write_wait_seconds: float = WRITE_WAIT_SECONDS,
     ) -> None:
         self.container = container.strip()
         self.account_url = account_url.strip()
         self.enabled = bool(self.container and self.account_url)
         self.budget_seconds = budget_seconds
+        self.write_wait_seconds = write_wait_seconds
         self.job_execution = job_execution
         self.job_run_id = ""
         self.disabled_reason: str | None = None
         self.stats = {"written": 0, "existing": 0, "failed": 0, "skipped": 0}
         self._uploader_factory = uploader_factory
         self._uploader: Callable[..., str] | None = None
-        self._clock = clock
-        self._spent = 0.0
+        self._spent = 0.0  # seconds callers have waited on storage, all threads together
+        self._reserved = 0.0  # seconds claimed by uploads still in flight
         self._names: set[str] = set()
         self._warned: set[str] = set()
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # stats and budget; never held while waiting
+        self._factory_lock = threading.Lock()  # only taken in upload threads
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> "RawCapture":
@@ -176,9 +212,10 @@ class RawCapture:
 
     def http(self, feed: str, provider: str, *, url: str, body: bytes, key: str,
              status: int | None = None, content_type: str | None = None,
-             extension: str | None = None, requested_at: datetime | None = None) -> str | None:
+             extension: str | None = None, requested_at: datetime | None = None,
+             history: bool = False) -> str | None:
         """An HTTP response body exactly as received, with its status and URL."""
-        if not self.enabled:
+        if not self._open():
             return None
         try:
             if status is None:
@@ -189,7 +226,7 @@ class RawCapture:
             return self._write(
                 feed, provider, bytes(body), extension,
                 content_type or _CONTENT_TYPES.get(extension, "application/octet-stream"),
-                key, requested_at,
+                key, requested_at, history,
                 {"source_url": safe_url(url), "http_status": "" if status is None else status,
                  "content_format": "http-body"},
             )
@@ -198,16 +235,16 @@ class RawCapture:
             return None
 
     def frame(self, feed: str, provider: str, *, frame: Any, request: Mapping[str, Any],
-              key: str, requested_at: datetime | None = None) -> str | None:
+              key: str, requested_at: datetime | None = None, history: bool = False) -> str | None:
         """A yfinance DataFrame as CSV with its index, plus the request parameters."""
-        if not self.enabled:
+        if not self._open():
             return None
         try:
             # Python float repr is shortest round-trip, so the CSV is lossless;
             # read it back with pandas.read_csv(..., float_precision="round_trip").
             content = frame.to_csv().encode("utf-8")
             return self._write(
-                feed, provider, content, "csv", _CONTENT_TYPES["csv"], key, requested_at,
+                feed, provider, content, "csv", _CONTENT_TYPES["csv"], key, requested_at, history,
                 {"request": json.dumps(dict(request), sort_keys=True, default=str),
                  "content_format": "pandas-csv-with-index"},
             )
@@ -216,14 +253,14 @@ class RawCapture:
             return None
 
     def document(self, feed: str, provider: str, *, payload: Any, request: Mapping[str, Any],
-                 key: str, requested_at: datetime | None = None) -> str | None:
+                 key: str, requested_at: datetime | None = None, history: bool = False) -> str | None:
         """A provider object (for example yfinance get_info) as JSON."""
-        if not self.enabled:
+        if not self._open():
             return None
         try:
             content = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
             return self._write(
-                feed, provider, content, "json", _CONTENT_TYPES["json"], key, requested_at,
+                feed, provider, content, "json", _CONTENT_TYPES["json"], key, requested_at, history,
                 {"request": json.dumps(dict(request), sort_keys=True, default=str),
                  "content_format": "json"},
             )
@@ -232,30 +269,61 @@ class RawCapture:
             return None
 
     def summary(self) -> dict[str, Any]:
-        return {"container": self.container, **self.stats,
-                "seconds": round(self._spent, 3), "disabled": self.disabled_reason}
+        with self._lock:
+            return {"container": self.container, **self.stats,
+                    "seconds": round(self._spent, 3), "disabled": self.disabled_reason}
 
     # Internals -----------------------------------------------------------------------
 
+    def _open(self) -> bool:
+        """Cheap check before serialising: on, not switched off, budget left."""
+        if not self.enabled:
+            return False
+        with self._lock:
+            if self.disabled_reason is None:
+                return True
+            self.stats["skipped"] += 1
+            return False
+
+    def _reserve(self) -> float:
+        """Claim up to one write's wait from the shared budget; 0 means skip this one."""
+        with self._lock:
+            if self.disabled_reason is not None:
+                return 0.0
+            left = self.budget_seconds - self._spent
+            if left <= 0:
+                self._disable("time budget of %g seconds used" % self.budget_seconds)
+                return 0.0
+            free = left - self._reserved
+            if free <= 0:
+                return 0.0  # uploads in flight hold the rest of the budget for now
+            claim = min(free, self.write_wait_seconds)
+            self._reserved += claim
+            return claim
+
+    def _release(self, claim: float, elapsed: float) -> None:
+        with self._lock:
+            self._reserved = max(0.0, self._reserved - claim)
+            self._spent += elapsed
+            if self._spent >= self.budget_seconds:
+                self._disable("time budget of %g seconds used" % self.budget_seconds)
+
     def _write(self, feed: str, provider: str, content: bytes, extension: str,
-               content_type: str, key: str, requested_at: datetime | None,
+               content_type: str, key: str, requested_at: datetime | None, history: bool,
                extra: Mapping[str, Any]) -> str | None:
         if feed not in FEEDS:
             raise ValueError(f"Unknown raw market-data feed {feed!r}")
-        with self._lock:
-            if self.disabled_reason is not None:
+        claim = self._reserve()
+        if claim <= 0:
+            with self._lock:
                 self.stats["skipped"] += 1
-                return None
-            if self._spent >= self.budget_seconds:
-                self._disable("time budget of %.0f seconds used" % self.budget_seconds)
-                self.stats["skipped"] += 1
-                return None
-        started = self._clock()
+            return None
+        started = time.monotonic()
         try:
             requested = (requested_at or utc_now()).astimezone(timezone.utc)
             digest = hashlib.sha256(content).hexdigest()
-            name = (f"{feed}/{requested:%Y/%m/%d}/{request_key(key)}"
-                    f"-{digest[:SHA_PREFIX]}.{extension}")
+            folder = "history" if history else f"{requested:%Y/%m/%d}"
+            name = f"{feed}/{folder}/{request_key(key)}-{digest[:SHA_PREFIX]}.{extension}"
             with self._lock:
                 if name in self._names:
                     self.stats["existing"] += 1
@@ -273,15 +341,14 @@ class RawCapture:
             }
             metadata = {k: _metadata_value(v) for k, v in metadata.items()}
             try:
-                upload = self._upload_function()
-                upload(name, content, content_type=content_type, metadata=metadata)
+                self._upload_within(claim - (time.monotonic() - started), name, content,
+                                    content_type=content_type, metadata=metadata)
             except Exception as error:  # noqa: BLE001
-                if _already_exists(error):
-                    with self._lock:
+                with self._lock:
+                    if _already_exists(error):
                         self._names.add(name)
                         self.stats["existing"] += 1
-                    return name
-                with self._lock:
+                        return name
                     self.stats["failed"] += 1
                     self._disable(f"{type(error).__name__}: {' '.join(str(error).split())[:200]}")
                 return None
@@ -290,18 +357,38 @@ class RawCapture:
                 self.stats["written"] += 1
             return name
         finally:
-            elapsed = self._clock() - started
-            with self._lock:
-                self._spent += elapsed
+            self._release(claim, time.monotonic() - started)
+
+    def _upload_within(self, timeout: float, name: str, content: bytes, **options: Any) -> None:
+        """Upload in a daemon thread and wait at most `timeout`; a hung call is left behind."""
+        outcome: dict[str, BaseException] = {}
+        done = threading.Event()
+
+        def work() -> None:
+            try:
+                self._upload_function()(name, content, **options)
+            except BaseException as error:  # noqa: BLE001 - handed back to the caller
+                outcome["error"] = error
+            finally:
+                done.set()
+
+        threading.Thread(target=work, name="raw-market-data-upload", daemon=True).start()
+        if not done.wait(max(0.0, timeout)):
+            limit = ""
+            if timeout < self.write_wait_seconds - 0.01:
+                limit = f", the rest of the {self.budget_seconds:g}-second time budget"
+            raise TimeoutError(f"storage did not answer within {max(0.0, timeout):.1f} seconds{limit}")
+        if "error" in outcome:
+            raise outcome["error"]
 
     def _upload_function(self) -> Callable[..., str]:
-        with self._lock:
+        with self._factory_lock:
             if self._uploader is None:
                 self._uploader = self._uploader_factory(self.account_url, self.container)
             return self._uploader
 
     def _disable(self, reason: str) -> None:
-        # Called with the lock held.
+        # Called with self._lock held.
         if self.disabled_reason is None:
             self.disabled_reason = reason
             LOGGER.warning("Raw market-data capture is off for the rest of this run: %s", reason)
@@ -344,8 +431,9 @@ def reset(capture: RawCapture | None = None) -> None:
 
 def _report_at_exit(capture: RawCapture) -> None:
     try:
-        if any(capture.stats.values()) or capture.disabled_reason:
-            sys.stderr.write("MARKET_DATA_RAW_CAPTURE " + json.dumps(capture.summary(), sort_keys=True) + "\n")
+        summary = capture.summary()
+        if any(summary[key] for key in capture.stats) or summary["disabled"]:
+            sys.stderr.write("MARKET_DATA_RAW_CAPTURE " + json.dumps(summary, sort_keys=True) + "\n")
     except Exception:  # noqa: BLE001
         pass
 

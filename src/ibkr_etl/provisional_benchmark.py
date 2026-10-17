@@ -201,6 +201,7 @@ def fetch_benchmark_yfinance(
         request={"symbol": spec.symbol, "method": "history", **request},
         key=raw_capture.request_key(spec.symbol, request["start"], request["end"], request["interval"]),
         requested_at=requested_at,
+        history=raw_capture.settled(end_date, now=requested_at),
     )
     observations = [
         row for row in normalize_yfinance_history(frame)

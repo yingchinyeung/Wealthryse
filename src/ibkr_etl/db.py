@@ -19,8 +19,22 @@ POSTGRES_MIGRATIONS_DIR = ROOT / "migrations" / "postgres"
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
-def apply_postgres_migrations(connection) -> list[str]:
-    """Apply ordered PostgreSQL migrations once and reject checksum drift."""
+
+def apply_postgres_migrations(
+    connection,
+    only: str | None = None,
+    allow_pending: Sequence[str] = (),
+    allow_applied_without_file: Sequence[str] = (),
+) -> list[str]:
+    """Apply ordered PostgreSQL migrations once and reject checksum drift.
+
+    With only, apply that one migration and nothing else (see _apply_only).
+    """
+    # Migrations name tables as they were in public. A login whose search_path lists
+    # the medallion layer schemas first (bootstrap_postgres.py sets that for the
+    # runtime logins) would otherwise find, or create, a second schema_migrations
+    # there and run every migration again. This lasts until the transaction ends.
+    connection.execute("SELECT set_config('search_path', '\"$user\", public', true)")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -30,6 +44,8 @@ def apply_postgres_migrations(connection) -> list[str]:
         )
         """
     )
+    if only is not None:
+        return _apply_only(connection, only, allow_pending, allow_applied_without_file)
     applied: list[str] = []
     for path in sorted(POSTGRES_MIGRATIONS_DIR.glob("*.sql")):
         version = path.name
@@ -51,6 +67,57 @@ def apply_postgres_migrations(connection) -> list[str]:
         )
         applied.append(version)
     return applied
+
+
+def _apply_only(
+    connection, only: str, allow_pending: Sequence[str], allow_applied_without_file: Sequence[str] = ()
+) -> list[str]:
+    """Apply one named migration; refuse, changing nothing, if anything else differs.
+
+    Refuses when the file is missing, when any applied migration's checksum differs
+    from its file, when an applied migration has no file and is not listed in
+    allow_applied_without_file, or when a migration other than the named one is
+    pending and not listed in allow_pending. Applying it again is a no-op.
+    """
+    files = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in sorted(POSTGRES_MIGRATIONS_DIR.glob("*.sql"))
+    }
+    if only not in files:
+        raise RuntimeError(f"Migration {only} is not in {POSTGRES_MIGRATIONS_DIR.name}")
+    digests = {
+        name: hashlib.sha256(text.encode("utf-8")).hexdigest()
+        for name, text in files.items()
+    }
+    applied = {
+        row[0]: row[1]
+        for row in connection.execute(
+            "SELECT version, sha256 FROM schema_migrations"
+        ).fetchall()
+    }
+    changed = sorted(name for name, digest in applied.items() if name in digests and digests[name] != digest)
+    unknown = sorted(
+        name for name in applied
+        if name not in digests and name not in set(allow_applied_without_file)
+    )
+    unexpected = sorted(
+        name for name in digests
+        if name not in applied and name != only and name not in set(allow_pending)
+    )
+    if changed or unknown or unexpected:
+        raise RuntimeError(
+            f"Refusing to apply only {only}: checksum changed {changed}, "
+            f"applied but not in the repository {unknown}, "
+            f"pending and not allowed {unexpected}"
+        )
+    if only in applied:
+        return []
+    connection.execute(files[only])
+    connection.execute(
+        "INSERT INTO schema_migrations(version, sha256, applied_at) VALUES (?, ?, ?)",
+        (only, digests[only], utc_now_iso()),
+    )
+    return [only]
 
 
 class HybridRow(Mapping[str, Any]):
@@ -127,6 +194,10 @@ class PostgresConnection:
     def rollback(self) -> None:
         self._connection.rollback()
 
+    def transaction(self):
+        # psycopg's block: a savepoint inside an open transaction, which the caller commits.
+        return self._connection.transaction()
+
     def close(self) -> None:
         self._connection.close()
 
@@ -167,15 +238,30 @@ def initialize(
     database_url: str = "",
     tenant_id: str = DEFAULT_TENANT_ID,
     tenant_name: str = "Own Portfolio",
-) -> None:
+    only_migration: str | None = None,
+    allow_pending: Sequence[str] = (),
+    allow_applied_without_file: Sequence[str] = (),
+    set_tenant_name: bool = False,
+) -> list[str]:
+    """Prepare the database and make sure the tenant row exists.
+
+    An existing tenant keeps its name unless set_tenant_name is true (bootstrap sets it);
+    a job that only loads data must never rename the tenant as a side effect.
+    """
     if database_url.startswith(("postgres://", "postgresql://")):
         connection = connect(database_path, database_url, tenant_id)
+        applied: list[str] = []
         try:
             migrations_enabled = os.environ.get(
                 "IBKR_RUN_MIGRATIONS", "true"
             ).strip().lower() in {"1", "true", "yes", "on"}
             if migrations_enabled:
-                apply_postgres_migrations(connection)
+                applied = apply_postgres_migrations(
+                    connection,
+                    only=only_migration,
+                    allow_pending=allow_pending,
+                    allow_applied_without_file=allow_applied_without_file,
+                )
             elif connection.execute(
                 "SELECT to_regclass('public.tenants')"
             ).fetchone()[0] is None:
@@ -186,8 +272,8 @@ def initialize(
                 """
                 INSERT INTO tenants(tenant_id, name, status, created_at)
                 VALUES (?, ?, 'active', ?)
-                ON CONFLICT(tenant_id) DO UPDATE SET name = excluded.name
-                """,
+                ON CONFLICT(tenant_id) DO """
+                + ("UPDATE SET name = excluded.name" if set_tenant_name else "NOTHING"),
                 (tenant_id, tenant_name, utc_now_iso()),
             )
             connection.commit()
@@ -196,7 +282,7 @@ def initialize(
             raise
         finally:
             connection.close()
-        return
+        return applied
 
     sql = SQLITE_MIGRATION.read_text(encoding="utf-8")
     connection = connect(database_path)
@@ -204,6 +290,7 @@ def initialize(
         connection.executescript(sql)
     finally:
         connection.close()
+    return []
 
 
 @contextmanager

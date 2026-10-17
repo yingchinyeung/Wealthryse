@@ -24,6 +24,23 @@ param aiProcessingScope string = 'apac-data-zone'
 param azureSubscriptionId string
 param portfolioTenantId string = '00000000-0000-0000-0000-000000000001'
 param pilotAccountId string = 'U16088571'
+// Medallion layer freshness (src/ibkr_etl/layer_freshness.py). Off by default, which
+// leaves the supervisor's environment exactly as before. The bronze-market-data file
+// checks have their own switch, for once raw capture is on; they also need the
+// container name and Storage Blob Data Reader on it for the diagnostics identity.
+param layerFreshnessEnabled bool = false
+param layerFreshnessBlobChecks bool = false
+param rawMarketDataContainer string = ''
+param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
+var layerFreshnessBlobEnv = !layerFreshnessBlobChecks ? [] : concat([
+  { name: 'LAYER_FRESHNESS_BLOB_CHECKS', value: 'true' }
+], empty(rawMarketDataContainer) ? [] : [
+  { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
+  { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
+])
+var layerFreshnessEnv = !layerFreshnessEnabled ? [] : concat([
+  { name: 'LAYER_FRESHNESS_ENABLED', value: 'true' }
+], layerFreshnessBlobEnv)
 
 var tags = {
   application: 'wealthryse-portfolio-data-platform'
@@ -193,7 +210,7 @@ resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
           image: '${registry.properties.loginServer}/ibkr-portfolio@${imageDigest}'
           command: ['python']
           args: ['scripts/run_autonomous_administrator.py']
-          env: [
+          env: concat([
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'PORTAL_URL', value: portalUrl }
             { name: 'ENTRA_TENANT_ID', value: entraTenantId }
@@ -210,7 +227,8 @@ resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'AZURE_AI_REGION', value: aiRegion }
             { name: 'AZURE_AI_PROCESSING_SCOPE', value: aiProcessingScope }
             { name: 'AI_ADMIN_ENABLED', value: 'true' }
-          ]
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
+          ], layerFreshnessEnv)
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -28,14 +28,26 @@ def _required(name: str) -> str:
     return value
 
 
+RUN_DATE_MODES = ("current_hkt_day", "previous_hkt_day")
+
+
+def default_run_date(hkt_today: date, mode: str) -> date:
+    """The data date to request. previous_hkt_day asks up to yesterday, as v1.1 does."""
+
+    if mode not in RUN_DATE_MODES:
+        raise RuntimeError(f"Unsupported INSTITUTIONAL_DISPATCH_RUN_DATE: {mode}")
+    return hkt_today if mode == "current_hkt_day" else hkt_today - timedelta(days=1)
+
+
 def main() -> int:
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() != "internal-production":
         raise RuntimeError("Institutional dispatch is restricted to internal production")
     database_url = _required("DATABASE_URL")
     tenant_id = os.environ.get("PORTFOLIO_TENANT_ID", DEFAULT_TENANT_ID)
     hkt_today = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
+    mode = os.environ.get("INSTITUTIONAL_DISPATCH_RUN_DATE", "current_hkt_day").strip().lower()
     run_date = date.fromisoformat(
-        os.environ.get("WORK_RUN_DATE", hkt_today.isoformat())
+        os.environ.get("WORK_RUN_DATE", default_run_date(hkt_today, mode).isoformat())
     )
     connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
     try:
@@ -49,6 +61,7 @@ def main() -> int:
         summary = {
             "status": "queued",
             "run_date": run_date.isoformat(),
+            "run_date_mode": mode,
             "source_count": len(
                 {
                     item.flex_source_id

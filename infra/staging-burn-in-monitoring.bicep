@@ -139,6 +139,7 @@ resource monitorJob 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'ENTRA_TENANT_ID', value: entraTenantId }
             { name: 'PORTFOLIO_TENANT_ID', value: portfolioTenantId }
             { name: 'PILOT_ACCOUNT_ID', value: pilotAccountId }
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
           ]
           resources: {
             cpu: json('0.25')

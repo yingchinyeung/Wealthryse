@@ -10,6 +10,8 @@ param imageTag string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
 param tenantName string = 'Own Portfolio'
 param scheduleUtc string = '0 8 * * *'
+// false once v2 makes its own Flex pull: the job stays, but only starts by hand.
+param scheduleEnabled bool = true
 param alertEmail string = ''
 param tags object = {
   application: 'ibkr-portfolio-database'
@@ -50,11 +52,15 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
   properties: {
     environmentId: managedEnvironment.id
     configuration: {
-      triggerType: 'Schedule'
+      triggerType: scheduleEnabled ? 'Schedule' : 'Manual'
       replicaTimeout: 3600
       replicaRetryLimit: 0
-      scheduleTriggerConfig: {
+      scheduleTriggerConfig: scheduleEnabled ? {
         cronExpression: scheduleUtc
+        parallelism: 1
+        replicaCompletionCount: 1
+      } : null
+      manualTriggerConfig: scheduleEnabled ? null : {
         parallelism: 1
         replicaCompletionCount: 1
       }

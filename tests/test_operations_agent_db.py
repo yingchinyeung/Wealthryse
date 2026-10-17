@@ -85,8 +85,8 @@ class OperationsAgentDatabaseTests(unittest.TestCase):
                 connection.commit()
         connection.close()
         with psycopg.connect(_dsn(ADMIN_DSN, cls.database, OWNER_ROLE), options=f"-c app.tenant_id={TENANT}") as owner:
-            for path in sorted((ROOT / "migrations" / "agent").glob("*.sql")):
-                owner.execute(path.read_text(encoding="utf-8"))
+            for text in _script("install_agent_schema").agent_schema_sql(owner):
+                owner.execute(text)
             # The website and administrator's own access, as the platform role has it.
             owner.execute(f"GRANT SELECT, UPDATE ON system_incidents TO {PLATFORM}")
             owner.execute(f"GRANT SELECT, INSERT, UPDATE ON admin_chat_conversations, admin_chat_messages TO {PLATFORM}")

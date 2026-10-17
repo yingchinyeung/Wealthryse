@@ -9,6 +9,7 @@ from datetime import date
 from psycopg.rows import dict_row
 
 from ibkr_etl.burn_in import (
+    collect_import_state,
     consecutive_pass_days,
     evaluate_database_state,
     now_hkt_date,
@@ -49,7 +50,7 @@ def _portal_check(url: str, tenant_id: str) -> tuple[dict, str | None]:
     return portal_boundary_check(status, location, tenant_id=tenant_id)
 
 
-def _database_state(database_url: str, tenant_id: str, account_id: str) -> dict:
+def _database_state(database_url: str, tenant_id: str, account_id: str, today_hkt: date) -> dict:
     import psycopg
 
     with psycopg.connect(database_url, row_factory=dict_row) as connection:
@@ -67,14 +68,7 @@ def _database_state(database_url: str, tenant_id: str, account_id: str) -> dict:
             """,
             (account_id,),
         ).fetchone()
-        latest_import = connection.execute(
-            """
-            SELECT run_id, status, requested_to, completed_at
-            FROM ingestion_runs
-            WHERE run_type = 'staging-snapshot-import'
-            ORDER BY run_id DESC LIMIT 1
-            """
-        ).fetchone()
+        imports = collect_import_state(connection, account_id, as_of=today_hkt)
         latest_snapshot = connection.execute(
             """
             SELECT snapshot_id, period_end, data_as_of, status, quality_status
@@ -120,7 +114,7 @@ def _database_state(database_url: str, tenant_id: str, account_id: str) -> dict:
         ).fetchone()
         return {
             **dict(dates),
-            "latest_import": None if latest_import is None else dict(latest_import),
+            **imports,
             "latest_snapshot": None if latest_snapshot is None else dict(latest_snapshot),
             "ready_report_types": ready_report_types,
             "client_approval_count": int(client_approvals["n"]),
@@ -237,7 +231,7 @@ def main() -> int:
         failures.append(portal_failure)
     today_hkt = now_hkt_date()
     database, database_failures = evaluate_database_state(
-        _database_state(database_url, tenant_id, account_id),
+        _database_state(database_url, tenant_id, account_id, today_hkt),
         today_hkt=today_hkt,
     )
     failures.extend(database_failures)

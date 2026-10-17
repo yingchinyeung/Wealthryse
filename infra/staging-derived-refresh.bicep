@@ -7,6 +7,10 @@ param keyVaultName string
 param storageAccountName string
 param referenceStorageAccountName string = 'ibkrv115rcc62xxqblay'
 param referenceStorageContainer string = 'analytics-reports'
+// 'blob' reads reference_data.json published by v1.1 (today). 'database' builds
+// it from v2's own instrument_classifications and risk_free_rates tables.
+@allowed(['blob', 'database'])
+param referenceDataSource string = 'blob'
 param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
@@ -87,8 +91,10 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'AZURE_REPORT_CONTAINER', value: reportContainer }
             { name: 'REFERENCE_STORAGE_ACCOUNT_URL', value: 'https://${referenceStorageAccountName}.blob.${environment().suffixes.storage}' }
             { name: 'REFERENCE_STORAGE_CONTAINER', value: referenceStorageContainer }
+            { name: 'REFERENCE_DATA_SOURCE', value: referenceDataSource }
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
             { name: 'ALLOW_UNLICENSED_BENCHMARK', value: 'true' }
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
           ]
           resources: {
             cpu: json('0.5')

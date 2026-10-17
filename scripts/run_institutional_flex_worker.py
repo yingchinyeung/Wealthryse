@@ -4,8 +4,9 @@ import os
 import sys
 import uuid
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +39,7 @@ def _work_source(connection, flex_source_id: str) -> dict:
     row = connection.execute(
         """
         SELECT q.flex_source_id, q.query_id, q.credential_id,
+               q.schedule_time_zone, q.schedule_hour, q.schedule_minute,
                c.key_vault_secret_name
         FROM ibkr_flex_queries q
         JOIN ibkr_flex_credentials c
@@ -50,6 +52,28 @@ def _work_source(connection, flex_source_id: str) -> dict:
     if row is None:
         raise RuntimeError("The queued Flex source is no longer active")
     return dict(row)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _send_block(source: dict, now: datetime) -> str | None:
+    """Why no IBKR request may be sent now, or None.
+
+    Nothing is sent unless INSTITUTIONAL_FLEX_SENDS_ENABLED=true, and never
+    before the source's scheduled time on that day.
+    """
+    if os.environ.get("INSTITUTIONAL_FLEX_SENDS_ENABLED", "").strip().lower() != "true":
+        return "institutional_flex_sends_disabled"
+    local = now.astimezone(ZoneInfo(str(source["schedule_time_zone"])))
+    scheduled = local.replace(
+        hour=int(source["schedule_hour"]), minute=int(source["schedule_minute"]),
+        second=0, microsecond=0,
+    )
+    if local < scheduled:
+        return "before_scheduled_send_time"
+    return None
 
 
 def _update_payload(connection, work_item_id: str, evidence: dict) -> None:
@@ -65,7 +89,12 @@ def _update_payload(connection, work_item_id: str, evidence: dict) -> None:
 
 def _request_statement(connection, claim, *, database_url: str, tenant_id: str) -> dict:
     source = _work_source(connection, str(claim.flex_source_id))
+    blocked = _send_block(source, _now())
+    if blocked:
+        # Ends as any blocked send: no lock, no circuit change, no IBKR request.
+        raise ValidationBlocked(blocked)
     request = {**source, "flex_source_id": claim.flex_source_id}
+    # Commits the send record before the request, so a crash cannot lose it.
     _authorize_send(connection, tenant_id, request)
     token = ""
     try:
@@ -158,16 +187,20 @@ def _process_non_request(connection, claim) -> dict:
         raise RuntimeError("Downstream Flex work has no subject")
     evidence = _subject_evidence(connection, claim.subject_id)
     if claim.work_kind == "account_import":
+        # A subject can have more than one onboarding case (an existing_v11 case and an
+        # ibkr_flex one, for example), so this joins rather than expecting a single case.
         connection.execute(
             """
-            UPDATE account_onboarding_checks
+            UPDATE account_onboarding_checks AS checks
             SET status = 'pass',
                 message = 'The IBKR data import and row-count reconciliation passed.',
                 evidence_json = ?::jsonb, checked_at = now()
-            WHERE case_id = (
-                SELECT case_id FROM account_onboarding_cases
-                WHERE target_subject_id = ?
-            ) AND check_id = 'data_import_reconciled'
+            FROM account_onboarding_cases AS cases
+            WHERE checks.tenant_id = cases.tenant_id
+              AND checks.case_id = cases.case_id
+              AND checks.check_id = 'data_import_reconciled'
+              AND cases.target_subject_id = ?
+              AND cases.status <> 'cancelled'
             """,
             (canonical_json(evidence), claim.subject_id),
         )
@@ -220,7 +253,8 @@ def main() -> int:
                 lockout = isinstance(error, FlexError) and (
                     error.lockout or is_lockout_error(error.code, str(error))
                 )
-                if claim.flex_source_id:
+                # A preflight block sent nothing; never weaken the circuit it found.
+                if claim.flex_source_id and isinstance(error, FlexError):
                     source = _work_source(connection, str(claim.flex_source_id))
                     connection.execute(
                         """

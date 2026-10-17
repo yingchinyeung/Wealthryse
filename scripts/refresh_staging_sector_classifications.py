@@ -11,6 +11,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from ibkr_etl import raw_capture  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.sector_classification import (  # noqa: E402
     refresh_sector_classifications_range,
@@ -143,6 +144,7 @@ def main() -> int:
             "SECTOR_CLASSIFICATION_ACCOUNT_IDS must contain unique account IDs"
         )
     workers = int(os.environ.get("SECTOR_CLASSIFICATION_WORKERS", "4"))
+    raw_capture.set_job_run_id(raw_capture.new_run_id("sector-classification"))
 
     try:
         results: list[dict] = []

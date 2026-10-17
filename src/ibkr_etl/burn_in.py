@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 
 HKT = timezone(timedelta(hours=8), name="Asia/Hong_Kong")
+FLEX_DAILY_RUN_TYPE = "institutional-flex-daily"
 
 
 def _date_value(value: Any) -> date | None:
@@ -15,6 +17,173 @@ def _date_value(value: Any) -> date | None:
         return date.fromisoformat(str(value))
     except ValueError:
         return None
+
+
+def _hkt_date(value: Any) -> date | None:
+    """The HKT date of a stored UTC timestamp (ingestion_runs keeps ISO text)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        moment = value
+    else:
+        try:
+            moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(HKT).date()
+
+
+def collect_import_state(connection, account_id: str, *, as_of: date) -> dict[str, Any]:
+    """Which feed loads the account's daily data, and that feed's latest import.
+
+    The feed is the account's active daily_ingestion registration on as_of. Until
+    it says ibkr_flex, this returns exactly today's v1.1 import evidence. On the
+    Flex path the latest import is the latest finished statement request of the
+    account's own bound source, so another source's pull never counts.
+    connection: psycopg with a dict row factory and the tenant set.
+    """
+    registration = connection.execute(
+        """
+        SELECT configuration_json ->> 'source' AS source, effective_from
+        FROM subject_operating_registrations
+        WHERE subject_id = %s AND capability = 'daily_ingestion'
+          AND operating_state = 'active'
+          AND effective_from <= %s
+          AND (effective_to IS NULL OR effective_to >= %s)
+        ORDER BY effective_from DESC LIMIT 1
+        """,
+        (account_id, as_of, as_of),
+    ).fetchone()
+    if registration is None or registration["source"] != "ibkr_flex":
+        latest_import = connection.execute(
+            """
+            SELECT run_id, status, requested_to, completed_at
+            FROM ingestion_runs
+            WHERE run_type = 'staging-snapshot-import'
+            ORDER BY run_id DESC LIMIT 1
+            """
+        ).fetchone()
+        return {"latest_import": None if latest_import is None else dict(latest_import)}
+    source = connection.execute(
+        """
+        SELECT q.flex_source_id, q.schedule_time_zone, q.schedule_hour, q.schedule_minute
+        FROM subject_flex_source_bindings b
+        JOIN ibkr_flex_queries q
+          ON q.tenant_id = b.tenant_id AND q.flex_source_id = b.flex_source_id
+        WHERE b.subject_id = %s AND b.is_primary AND b.status = 'active'
+          AND b.effective_from <= %s
+          AND (b.effective_to IS NULL OR b.effective_to >= %s)
+        ORDER BY b.effective_from DESC LIMIT 1
+        """,
+        (account_id, as_of, as_of),
+    ).fetchone()
+    latest_import = None
+    if source is not None:
+        pull = connection.execute(
+            """
+            SELECT payload_json -> 'result' ->> 'ingestion_run_id' AS run_id,
+                   status, payload_json ->> 'run_date' AS requested_to, completed_at
+            FROM institutional_work_items
+            WHERE work_kind = 'flex_statement_request' AND flex_source_id = %s
+              AND status IN ('succeeded', 'failed', 'dead_letter', 'cancelled')
+            ORDER BY completed_at DESC LIMIT 1
+            """,
+            (source["flex_source_id"],),
+        ).fetchone()
+        if pull is not None:
+            latest_import = {
+                **dict(pull),
+                "status": "success" if pull["status"] == "succeeded" else pull["status"],
+            }
+    # The run that last wrote the account's newest NAV row.
+    latest_nav_run = connection.execute(
+        """
+        SELECT n.snapshot_date, r.run_id, r.run_type, r.status, r.completed_at
+        FROM nav_snapshots n
+        JOIN ingestion_runs r ON r.run_id = n.last_seen_run_id
+        WHERE n.account_id = %s
+        ORDER BY n.snapshot_date DESC, (upper(n.asset_class) = 'TOTAL') DESC
+        LIMIT 1
+        """,
+        (account_id,),
+    ).fetchone()
+    return {
+        "daily_feed": "ibkr_flex",
+        "daily_feed_effective_from": registration["effective_from"],
+        "daily_feed_source": None if source is None else {
+            "flex_source_id": str(source["flex_source_id"]),
+            "schedule_time_zone": source["schedule_time_zone"],
+            "schedule_hour": source["schedule_hour"],
+            "schedule_minute": source["schedule_minute"],
+        },
+        "latest_import": latest_import,
+        "latest_nav_run": None if latest_nav_run is None else dict(latest_nav_run),
+    }
+
+
+def first_flex_pull_due(
+    state: dict[str, Any], *, today_hkt: date, now_utc: datetime | None, grace_minutes: int = 60
+) -> datetime | None:
+    """On the switch day, until v2's first Flex pull is due, when it is due.
+
+    That is: the Flex registration became effective yesterday (the first
+    previous-day pull runs today), no pull of its source has finished today,
+    and now_utc is before the source's scheduled time plus grace_minutes.
+    Returns None otherwise, and always when now_utc is None.
+    """
+    if now_utc is None or state.get("daily_feed") != "ibkr_flex":
+        return None
+    effective = _date_value(state.get("daily_feed_effective_from"))
+    if effective is None or effective + timedelta(days=1) != today_hkt:
+        return None
+    finished = _hkt_date((state.get("latest_import") or {}).get("completed_at"))
+    if finished is not None and finished >= today_hkt:
+        return None
+    source = state.get("daily_feed_source") or {}
+    try:
+        scheduled = datetime.combine(
+            today_hkt,
+            time(int(source["schedule_hour"]), int(source["schedule_minute"])),
+            tzinfo=ZoneInfo(str(source["schedule_time_zone"])),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    deadline = scheduled + timedelta(minutes=grace_minutes)
+    return deadline if now_utc < deadline else None
+
+
+def flex_import_failures(
+    state: dict[str, Any], *, today_hkt: date, maximum_age_days: int = 0
+) -> list[str]:
+    """Checks for an account fed by v2's own Flex pull.
+
+    The newest finished pull of the account's source must have succeeded and
+    finished within maximum_age_days HKT days (0: today), and the account's
+    newest NAV row must have been written by an institutional-flex-daily run
+    in that window.
+    """
+    failures: list[str] = []
+    window = "the current HKT date" if maximum_age_days == 0 else f"the last {maximum_age_days + 1} HKT days"
+
+    def current(run: dict[str, Any]) -> bool:
+        finished = _hkt_date(run.get("completed_at"))
+        return finished is not None and 0 <= (today_hkt - finished).days <= maximum_age_days
+
+    latest = state.get("latest_import") or {}
+    if latest.get("status") != "success":
+        failures.append("Latest institutional Flex import is not successful")
+    elif not current(latest):
+        failures.append(f"Institutional Flex import has not completed for {window}")
+    nav_run = state.get("latest_nav_run") or {}
+    if (
+        nav_run.get("run_type") != FLEX_DAILY_RUN_TYPE
+        or nav_run.get("status") != "success"
+        or not current(nav_run)
+    ):
+        failures.append(f"Latest NAV row was not loaded by an institutional Flex import within {window}")
+    return failures
 
 
 def freshness_check(
@@ -89,7 +258,11 @@ def evaluate_database_state(
 
     latest_import = state.get("latest_import") or {}
     checks["latest_import"] = latest_import
-    if latest_import.get("status") != "success":
+    if state.get("daily_feed") == "ibkr_flex":
+        checks["daily_feed"] = "ibkr_flex"
+        checks["latest_nav_run"] = state.get("latest_nav_run") or {}
+        failures.extend(flex_import_failures(state, today_hkt=today_hkt))
+    elif latest_import.get("status") != "success":
         failures.append("Latest account-only portal import is not successful")
 
     latest_snapshot = state.get("latest_snapshot") or {}

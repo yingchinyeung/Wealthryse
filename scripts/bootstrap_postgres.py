@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -13,12 +15,105 @@ if str(SOURCE_ROOT) not in sys.path:
 from ibkr_etl.config import load_settings  # noqa: E402
 from ibkr_etl.db import connect, initialize, transaction  # noqa: E402
 from ibkr_etl.evidence_acl import quarantine_evidence_objects  # noqa: E402
+from ibkr_etl.medallion_layers import (  # noqa: E402
+    mirror_privileges,
+    mismatches,
+    present_layers,
+    runtime_search_path,
+)
 from ibkr_etl.reference_subject_rename import (  # noqa: E402
     reconcile_china_hong_kong_display_name,
 )
 
+# The schema-wide rights each login has on public, repeated for each medallion layer
+# schema once migrations 068 to 070 have created it.
+APP_LAYER_STATEMENTS = (
+    "GRANT USAGE ON SCHEMA {schema} TO {role}",
+    "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO {role}",
+    "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO {role}",
+    "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} TO {role}",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT USAGE, SELECT ON SEQUENCES TO {role}",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}",
+)
+WEB_LAYER_STATEMENTS = (
+    "GRANT USAGE ON SCHEMA {schema} TO {role}",
+    "GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO {role}",
+    "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} TO {role}",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT ON TABLES TO {role}",
+    "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}",
+)
+# The approval login gets nothing schema-wide. Its named grants below reach the
+# public views, and mirror_privileges copies them onto the tables behind them.
+APPROVAL_LAYER_STATEMENTS = (
+    "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {schema} FROM {role}",
+    "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {schema} FROM {role}",
+)
+# The columns the approval login reads for the layer freshness check (medallion S2).
+FRESHNESS_COLUMNS = (
+    ("raw_reports", ("tenant_id", "received_at")),
+    ("flex_rows", ("tenant_id", "flex_row_id", "first_seen_run_id")),
+    ("risk_analytics_snapshots", ("tenant_id", "as_of_date")),
+    ("crisis_scenario_results", ("tenant_id", "holdings_as_of")),
+    ("crisis_replay_daily", ("tenant_id", "holdings_as_of")),
+)
 
-def main() -> int:
+
+def _layer_statements(connection, statements, layers, role) -> None:
+    from psycopg import sql
+
+    for layer in layers:
+        for statement in statements:
+            connection.execute(sql.SQL(statement).format(
+                schema=sql.Identifier(layer), role=sql.Identifier(role)))
+
+
+# A layer batch (068 to 070) that finds one of its tables busy stops within seconds and
+# changes nothing (SQLSTATE 55P03). With --only-migration, bootstrap tries it again a
+# minute later, holding no lock in between, up to three tries in all.
+BUSY_TRIES = 3
+BUSY_PAUSE_SECONDS = 60
+
+
+def _when_tables_free(apply, only_migration):
+    import psycopg
+
+    for attempt in range(1, BUSY_TRIES + 1):
+        try:
+            return apply()
+        except psycopg.errors.LockNotAvailable as error:
+            if not only_migration or attempt == BUSY_TRIES:
+                raise
+            print(f"{only_migration}: a table was busy, so nothing changed "
+                  f"({error.diag.message_primary or error}). Trying again in "
+                  f"{BUSY_PAUSE_SECONDS} seconds (try {attempt} of {BUSY_TRIES}).", flush=True)
+            time.sleep(BUSY_PAUSE_SECONDS)
+    raise AssertionError("unreachable")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Apply migrations and set the database logins' rights.")
+    parser.add_argument(
+        "--only-migration",
+        help="apply only this migration file (for example 068_medallion_gold_layer.sql) and refuse, "
+             "changing nothing, if any other migration differs or is pending outside --allow-pending",
+    )
+    parser.add_argument(
+        "--allow-pending", action="append", default=[],
+        help="with --only-migration: migrations that may stay pending (comma-separated, repeatable)",
+    )
+    parser.add_argument(
+        "--allow-applied-without-file", action="append", default=[], metavar="VERSION",
+        help="with --only-migration: a version recorded as applied that has no file here, "
+             "such as one applied outside the repository (repeatable, one version each)",
+    )
+    args = parser.parse_args(argv)
+    allow_pending = [name for value in args.allow_pending for name in value.split(",") if name]
+    if allow_pending and not args.only_migration:
+        parser.error("--allow-pending needs --only-migration")
+    if args.allow_applied_without_file and not args.only_migration:
+        parser.error("--allow-applied-without-file needs --only-migration")
+
     admin_url = os.environ.get("DATABASE_ADMIN_URL", "")
     app_password = os.environ.get("DATABASE_APP_PASSWORD", "")
     app_role = os.environ.get("DATABASE_APP_ROLE", "ibkr_app")
@@ -35,12 +130,16 @@ def main() -> int:
     previous = os.environ.get("IBKR_RUN_MIGRATIONS")
     os.environ["IBKR_RUN_MIGRATIONS"] = "true"
     try:
-        initialize(
+        applied = _when_tables_free(lambda: initialize(
             settings.database_path,
             admin_url,
             settings.tenant_id,
             settings.tenant_name,
-        )
+            only_migration=args.only_migration,
+            allow_pending=allow_pending,
+            allow_applied_without_file=args.allow_applied_without_file,
+            set_tenant_name=True,
+        ), args.only_migration)
     finally:
         if previous is None:
             os.environ.pop("IBKR_RUN_MIGRATIONS", None)
@@ -123,6 +222,9 @@ def main() -> int:
                 "REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON schema_migrations FROM {}"
             ).format(sql.Identifier(app_role))
         )
+        layers = present_layers(connection)  # empty until migration 068 has run
+        managed_roles = [app_role]
+        _layer_statements(connection, APP_LAYER_STATEMENTS, layers, app_role)
 
         if web_password:
             if len(web_password) < 12:
@@ -174,6 +276,8 @@ def main() -> int:
                     "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO {}"
                 ).format(sql.Identifier(web_role))
             )
+            managed_roles.append(web_role)
+            _layer_statements(connection, WEB_LAYER_STATEMENTS, layers, web_role)
 
         if approval_password:
             if len(approval_password) < 20:
@@ -215,6 +319,8 @@ def main() -> int:
                     sql.Identifier(approval_role)
                 )
             )
+            managed_roles.append(approval_role)
+            _layer_statements(connection, APPROVAL_LAYER_STATEMENTS, layers, approval_role)
             connection.execute(
                 sql.SQL(
                     "GRANT SELECT, INSERT, UPDATE ON TABLE approved_actions TO {}"
@@ -298,6 +404,12 @@ def main() -> int:
             connection.execute(sql.SQL(
                 "GRANT SELECT, INSERT, UPDATE ON TABLE factsheet_design_drafts, factsheet_design_proposals TO {}"
             ).format(sql.Identifier(approval_role)))
+            # The autonomous administrator's layer freshness check reads only when rows
+            # arrived, never their content (flex_rows.data_json stays unreadable).
+            for table, columns in FRESHNESS_COLUMNS:
+                connection.execute(sql.SQL("GRANT SELECT ({}) ON TABLE {} TO {}").format(
+                    sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+                    sql.Identifier(table), sql.Identifier(approval_role)))
             design_privileges = connection.execute(
                 """SELECT has_table_privilege(%s, 'public.report_design_update_requests', 'INSERT')
                     AND has_table_privilege(%s, 'public.qualified_report_designs', 'SELECT')
@@ -401,10 +513,27 @@ def main() -> int:
 
         quarantine_evidence_objects(connection)
 
+        if layers:
+            # The FX evidence tables are in bronze once migration 069 has run.
+            for layer in layers:
+                quarantine_evidence_objects(connection, schema=layer)
+            mirror_privileges(connection, managed_roles)
+            problems = mismatches(connection, managed_roles)
+            if problems:
+                raise RuntimeError("Layer table rights differ from their public views: " + "; ".join(problems))
+            # Runtime logins find the layer tables first. This migration login keeps
+            # public first, and apply_postgres_migrations sets it for its own transaction.
+            for role in managed_roles:
+                connection.execute(sql.SQL("ALTER ROLE {} SET search_path = {}").format(
+                    sql.Identifier(role), sql.SQL(runtime_search_path(layers))))
+
     print(
         "PostgreSQL schema and least-privilege application roles are ready. "
         f"Reference-subject display reconciliation: {rename_result['status']}."
     )
+    if args.only_migration or layers:
+        print(f"Migrations applied: {', '.join(applied) or 'none'}. "
+              f"Layer schemas: {', '.join(layers) or 'none'}.")
     return 0
 
 

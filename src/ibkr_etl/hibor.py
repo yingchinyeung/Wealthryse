@@ -9,6 +9,7 @@ import statistics
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 
+from . import raw_capture
 from .market_calendar import HK_BANK_CALENDAR, HKT
 from .reference_data import _get
 
@@ -66,9 +67,10 @@ def latest_expected_fixing(*, now: datetime):
         'publication_policy_version':PUBLICATION_POLICY_VERSION}
 
 
-def _read_official(getter, url, timeout):
+def _read_official(getter, url, timeout, *, feed=None, key=None, history=False):
+    requested_at = raw_capture.utc_now()
     try:
-        return getter(url, timeout=timeout)
+        payload = getter(url, timeout=timeout)
     except HTTPError as error:
         # Invalid requests and denied access need investigation. Availability
         # errors permit one request per date to the other licensed official source.
@@ -77,6 +79,10 @@ def _read_official(getter, url, timeout):
         raise HiborTransportError('Official HIBOR endpoint unavailable HTTP ' + str(error.code), allow_owner_fallback=True) from None
     except (URLError, TimeoutError, ConnectionError, OSError):
         raise HiborTransportError('Official HIBOR endpoint transport unavailable', allow_owner_fallback=True) from None
+    if feed:
+        raw_capture.capture_http(feed, PROVIDER, url=url, body=payload, key=key,
+                                 extension='json', requested_at=requested_at, history=history)
+    return payload
 
 
 def _parse_owner(payload, day):
@@ -146,7 +152,7 @@ def fetch(start: date, end: date, *, getter=_get, timeout=45, cached_observation
             'sortby':'end_of_day', 'sortorder':'desc', 'offset':offset})
         try:
             transport['hkma_requests']+=1
-            payload = _read_official(getter, url, timeout)
+            payload = _read_official(getter, url, timeout, feed='hkma-hibor', key=f'offset-{offset}')
         except HiborTransportError as error:
             if not error.allow_owner_fallback:
                 raise
@@ -174,7 +180,8 @@ def fetch(start: date, end: date, *, getter=_get, timeout=45, cached_observation
     for day in missing:
         official = OWNER_URL + '?' + urlencode({'year':day.year,'month':day.month,'day':day.day})
         transport['hkab_requests']+=1
-        by_date[day.isoformat()] = _parse_owner(_read_official(getter,official,timeout),day)
+        by_date[day.isoformat()] = _parse_owner(_read_official(getter,official,timeout,
+            feed='hkab-hibor',key=day.isoformat(),history=raw_capture.settled(day)),day)
         transport['hkab_dates'].append(day.isoformat())
         observed_dates.add(day.isoformat())
     rows = [by_date[k] for k in sorted(by_date)]

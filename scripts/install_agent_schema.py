@@ -63,6 +63,27 @@ def _pair(value: str) -> tuple[str, str]:
     return left, right
 
 
+def agent_schema_sql(connection) -> list[str]:
+    """The migrations/agent files to run, in name order.
+
+    Once migrations 068-070 have moved platform tables into the bronze, silver and
+    gold schemas, public.<table> in these files is replaced by its layer name. The
+    views and functions then stay bound to the tables and their row types, as when
+    they were first installed, instead of to the compatibility views in public
+    (replacing a function with a different row type fails).
+    """
+    row = connection.execute(
+        "SELECT json_object_agg(c.relname, n.nspname) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname IN ('bronze', 'silver', 'gold') AND c.relkind IN ('r', 'p', 'v')").fetchone()
+    moved = (row[0] if row else None) or {}
+    texts = [path.read_text(encoding="utf-8") for path in SCHEMAS]
+    if not moved:
+        return texts
+    return [re.sub(r"\bpublic\.([a-z_][a-z0-9_]*)\b",
+                   lambda match: f"{moved.get(match.group(1), 'public')}.{match.group(1)}", text)
+            for text in texts]
+
+
 def _role_name(value: str) -> str:
     if not NAME.match(value):
         raise argparse.ArgumentTypeError(f"bad role name: {value}")
@@ -103,8 +124,8 @@ def main(argv: list[str] | None = None) -> int:
 
     with psycopg.connect(args.database_url, options=f"-c app.tenant_id={args.tenant_id}") as connection:
         if not args.logins_only:
-            for schema in SCHEMAS:
-                connection.execute(schema.read_text(encoding="utf-8"))
+            for text in agent_schema_sql(connection):
+                connection.execute(text)
         for name, role in args.principal:
             exists = connection.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (name,)).fetchone()
             if not exists:

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Callable, Iterable, Mapping
 
+from . import raw_capture
 from .provisional_benchmark import (
     convert_levels_to_reporting_currency,
     fetch_fx_to_reporting_yfinance,
@@ -18,6 +19,9 @@ CRISIS_START = date(2008, 9, 15)
 CRISIS_END = date(2009, 3, 9)
 CRISIS_OPENING_LOOKBACK_DAYS = 10
 PROVIDER = "Yahoo Finance via yfinance"
+# Raw-capture feed for crisis-window prices. Callers name it explicitly, so other
+# users of fetch_adjusted_history (such as fama_french) never file under it.
+RAW_FEED = "yahoo-crisis-history"
 PRICE_TYPE = "adjusted_close"
 CALCULATION_VERSION = "as-of-holdings-crisis-replay-v3"
 
@@ -89,12 +93,13 @@ def fetch_adjusted_history(
     *,
     start_date: date = CRISIS_START,
     end_date: date = CRISIS_END,
+    capture_feed: str | None = None,
 ) -> dict[str, float]:
     if ticker_factory is None:
         import yfinance as yf
 
         ticker_factory = yf.Ticker
-    frame = ticker_factory(symbol).history(
+    request = dict(
         start=start_date.isoformat(),
         end=(end_date + timedelta(days=1)).isoformat(),
         interval="1d",
@@ -103,6 +108,18 @@ def fetch_adjusted_history(
         actions=False,
         timeout=30,
     )
+    requested_at = raw_capture.utc_now()
+    frame = ticker_factory(symbol).history(**request)
+    if capture_feed:
+        raw_capture.capture_frame(
+            capture_feed,
+            PROVIDER,
+            frame=frame,
+            request={"symbol": symbol, "method": "history", **request},
+            key=raw_capture.request_key(symbol, request["start"], request["end"], request["interval"]),
+            requested_at=requested_at,
+            history=raw_capture.settled(end_date, now=requested_at),
+        )
     return _normalized_adjusted_history(
         frame,
         start_date=start_date,
@@ -385,6 +402,7 @@ def refresh_composite_crisis_replay(
                 ticker_factory,
                 start_date=start_date,
                 end_date=CRISIS_END,
+                capture_feed=RAW_FEED,
             )
             cache[symbol] = {**fetched, **(current or {})}
         return cache[symbol]
@@ -687,7 +705,7 @@ def refresh_crisis_replay(
 
     def load_prices(symbol: str) -> dict[str, float]:
         if symbol not in cache:
-            cache[symbol] = fetch_adjusted_history(symbol, ticker_factory)
+            cache[symbol] = fetch_adjusted_history(symbol, ticker_factory, capture_feed=RAW_FEED)
         return cache[symbol]
 
     def prices_in_usd(symbol: str, currency: str) -> dict[str, float]:

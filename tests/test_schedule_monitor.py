@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 from ibkr_etl.schedule_monitor import (DAILY_V1, DAILY_V2, daily_issue, daily_query,
-                                      due_daily, execution_name, heartbeat_query)
+                                      daily_schedules, due_daily, execution_name, heartbeat_query)
 
 
 class ScheduleMonitorTests(unittest.TestCase):
@@ -48,6 +48,19 @@ class ScheduleMonitorTests(unittest.TestCase):
         self.assertIn('ago(20m)', heartbeat_query())
         self.assertIn('ago(35m)', heartbeat_query())
         self.assertNotIn('Log_s', heartbeat_query())
+
+    def test_direct_flex_feed_drops_v11_pull_and_account_sync(self):
+        v1, v2 = daily_schedules('direct_flex')
+        self.assertEqual(v1, ())
+        names = {name for name, _, _ in v2}
+        self.assertNotIn('ibkrv2stg-account-sync-daily', names)
+        self.assertEqual(len(v2), 9)
+        self.assertEqual(daily_schedules('v11_export'), (DAILY_V1, DAILY_V2))
+        # institutional-daily: 08:00 UTC as its Bicep defaults, 08:20 from the switch day.
+        self.assertIn(('ibkrv2stg-institutional-daily', 480, 50), DAILY_V2)
+        self.assertIn(('ibkrv2stg-institutional-daily', 500, 50), v2)
+        with self.assertRaises(ValueError):
+            daily_schedules('both')
 
     def test_invalid_schedule_and_naive_time_fail(self):
         with self.assertRaises(ValueError):

@@ -21,7 +21,10 @@ DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
 def apply_postgres_migrations(
-    connection, only: str | None = None, allow_pending: Sequence[str] = ()
+    connection,
+    only: str | None = None,
+    allow_pending: Sequence[str] = (),
+    allow_applied_without_file: Sequence[str] = (),
 ) -> list[str]:
     """Apply ordered PostgreSQL migrations once and reject checksum drift.
 
@@ -42,7 +45,7 @@ def apply_postgres_migrations(
         """
     )
     if only is not None:
-        return _apply_only(connection, only, allow_pending)
+        return _apply_only(connection, only, allow_pending, allow_applied_without_file)
     applied: list[str] = []
     for path in sorted(POSTGRES_MIGRATIONS_DIR.glob("*.sql")):
         version = path.name
@@ -66,11 +69,14 @@ def apply_postgres_migrations(
     return applied
 
 
-def _apply_only(connection, only: str, allow_pending: Sequence[str]) -> list[str]:
+def _apply_only(
+    connection, only: str, allow_pending: Sequence[str], allow_applied_without_file: Sequence[str] = ()
+) -> list[str]:
     """Apply one named migration; refuse, changing nothing, if anything else differs.
 
     Refuses when the file is missing, when any applied migration's checksum differs
-    from its file or has no file, or when a migration other than the named one is
+    from its file, when an applied migration has no file and is not listed in
+    allow_applied_without_file, or when a migration other than the named one is
     pending and not listed in allow_pending. Applying it again is a no-op.
     """
     files = {
@@ -90,7 +96,10 @@ def _apply_only(connection, only: str, allow_pending: Sequence[str]) -> list[str
         ).fetchall()
     }
     changed = sorted(name for name, digest in applied.items() if name in digests and digests[name] != digest)
-    unknown = sorted(name for name in applied if name not in digests)
+    unknown = sorted(
+        name for name in applied
+        if name not in digests and name not in set(allow_applied_without_file)
+    )
     unexpected = sorted(
         name for name in digests
         if name not in applied and name != only and name not in set(allow_pending)
@@ -231,6 +240,7 @@ def initialize(
     tenant_name: str = "Own Portfolio",
     only_migration: str | None = None,
     allow_pending: Sequence[str] = (),
+    allow_applied_without_file: Sequence[str] = (),
 ) -> list[str]:
     if database_url.startswith(("postgres://", "postgresql://")):
         connection = connect(database_path, database_url, tenant_id)
@@ -241,7 +251,10 @@ def initialize(
             ).strip().lower() in {"1", "true", "yes", "on"}
             if migrations_enabled:
                 applied = apply_postgres_migrations(
-                    connection, only=only_migration, allow_pending=allow_pending
+                    connection,
+                    only=only_migration,
+                    allow_pending=allow_pending,
+                    allow_applied_without_file=allow_applied_without_file,
                 )
             elif connection.execute(
                 "SELECT to_regclass('public.tenants')"

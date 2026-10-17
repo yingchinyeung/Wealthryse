@@ -6,13 +6,14 @@ such a view needs the privilege on the view and on the table behind it.
 
 bootstrap_postgres.py keeps granting on public as before, which now reaches the
 views. mirror_privileges then gives each managed login exactly the same rights on
-the table behind each view, so every login keeps today's rights. Everything here
-does nothing until a layer schema exists.
+the table behind each view, column grants included, so every login keeps today's
+rights. Everything here does nothing until a layer schema exists.
 """
 from __future__ import annotations
 
 LAYERS = ("bronze", "silver", "gold")
 PRIVILEGES = ("SELECT", "INSERT", "UPDATE", "DELETE")
+COLUMN_PRIVILEGES = ("SELECT", "INSERT", "UPDATE")
 
 PAIRS_QUERY = """
 SELECT n.nspname AS layer, c.relname AS name
@@ -31,6 +32,14 @@ SELECT a.privilege_type
  ORDER BY 1
 """
 
+COLUMN_QUERY = """
+SELECT p.privilege_type, a.attname
+  FROM pg_attribute a, aclexplode(a.attacl) p
+ WHERE a.attrelid = %s::regclass AND a.attnum > 0 AND NOT a.attisdropped
+   AND p.grantee = %s::regrole AND p.privilege_type = ANY(%s)
+ ORDER BY 1, 2
+"""
+
 
 def present_layers(connection) -> list[str]:
     rows = connection.execute(
@@ -45,8 +54,12 @@ def compatibility_pairs(connection) -> list[tuple[str, str]]:
     return [(row[0], row[1]) for row in connection.execute(PAIRS_QUERY, (list(LAYERS),)).fetchall()]
 
 
-def _direct(connection, relation: str, role: str) -> list[str]:
-    return [row[0] for row in connection.execute(DIRECT_QUERY, (relation, role, list(PRIVILEGES))).fetchall()]
+def _direct(connection, relation: str, role: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """The role's own grants on a relation: table privileges, and (privilege, column) pairs."""
+    table = [row[0] for row in connection.execute(DIRECT_QUERY, (relation, role, list(PRIVILEGES))).fetchall()]
+    columns = [(row[0], row[1]) for row in connection.execute(
+        COLUMN_QUERY, (relation, role, list(COLUMN_PRIVILEGES))).fetchall()]
+    return table, columns
 
 
 def runtime_search_path(layers: list[str]) -> str:
@@ -65,15 +78,19 @@ def mirror_privileges(connection, roles: list[str]) -> dict[str, int]:
         for layer, name in pairs:
             table = sql.Identifier(layer, name)
             wanted = _direct(connection, f'public."{name}"', role)
+            if wanted[0] or wanted[1]:
+                needs.add(layer)  # a column grant needs the schema too
             if _direct(connection, f'"{layer}"."{name}"', role) == wanted:
-                if wanted:
-                    needs.add(layer)
                 continue
+            # REVOKE ALL on a table also removes its column grants.
             connection.execute(sql.SQL("REVOKE ALL ON TABLE {} FROM {}").format(table, sql.Identifier(role)))
-            if wanted:
+            if wanted[0]:
                 connection.execute(sql.SQL("GRANT {} ON TABLE {} TO {}").format(
-                    sql.SQL(", ").join(sql.SQL(p) for p in wanted), table, sql.Identifier(role)))
-                needs.add(layer)
+                    sql.SQL(", ").join(sql.SQL(p) for p in wanted[0]), table, sql.Identifier(role)))
+            for privilege in sorted({p for p, _ in wanted[1]}):
+                connection.execute(sql.SQL("GRANT {} ({}) ON TABLE {} TO {}").format(
+                    sql.SQL(privilege), sql.SQL(", ").join(sql.Identifier(c) for p, c in wanted[1] if p == privilege),
+                    table, sql.Identifier(role)))
             changed += 1
         for layer in present_layers(connection):
             verb = "GRANT USAGE ON SCHEMA {} TO {}" if layer in needs else "REVOKE USAGE ON SCHEMA {} FROM {}"
@@ -82,12 +99,14 @@ def mirror_privileges(connection, roles: list[str]) -> dict[str, int]:
 
 
 def mismatches(connection, roles: list[str]) -> list[str]:
-    """Each role's direct rights on a layer table must equal its rights on the public view."""
+    """Each role's direct rights on a layer table, column grants included, must equal those on the public view."""
     found = []
     for role in roles:
         for layer, name in compatibility_pairs(connection):
             view = _direct(connection, f'public."{name}"', role)
             table = _direct(connection, f'"{layer}"."{name}"', role)
-            if view != table:
-                found.append(f"{role}: public.{name} {view} but {layer}.{name} {table}")
+            if view[0] != table[0]:
+                found.append(f"{role}: public.{name} {view[0]} but {layer}.{name} {table[0]}")
+            if view[1] != table[1]:
+                found.append(f"{role}: public.{name} columns {view[1]} but {layer}.{name} columns {table[1]}")
     return found

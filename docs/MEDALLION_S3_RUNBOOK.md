@@ -30,6 +30,16 @@ Three batches, one a day, each at about 10:00 UTC, outside the daily load:
    `infra/`. The Flex discovery and institutional Flex jobs reach it through
    `ingest_content` with the app login. Set the variable on them, or confirm that login
    cannot create in `public`, before a batch's migration reaches their image.
+5. A login with only column grants cannot read through a view in `public`: PostgreSQL
+   checks every column of a security_invoker view on the table behind it (tested). The
+   approval login's freshness check names its tables unqualified, so it reads the layer
+   tables, which come first in its `search_path`. Two readers name `public` and are
+   refused once their tables move (tested on a rehearsal database): the specialist
+   observation reader (`SET LOCAL search_path TO public`; `accounts`, `nav_snapshots`,
+   `platform_subjects` and `derived_portfolio_nav` from S3c) and the metadata monitor
+   (`public.<table>`; its gold tables from S3a, its silver tables from S3c, and it has no
+   USAGE on the layer schemas). If either runs in production, change it to read the
+   layer tables before the batch that moves them.
 
 ## Each batch day
 
@@ -44,8 +54,10 @@ with `DATABASE_ADMIN_URL` set:
    python scripts/medallion_layers.py snapshot --account <pilot account> --out before-<batch>.json
    ```
 
-   `pending_migrations` lists what is unapplied. Any `checksum_changed` or
-   `not_in_repository` entry stops the day. Row-level security applies to the admin
+   `pending_migrations` lists what is unapplied. Any `checksum_changed` entry stops the
+   day, and so does any `not_in_repository` entry other than
+   `067_hong_kong_china_external_market_data_approval.sql`, which was applied outside the
+   repository. Row-level security applies to the admin
    login, so the counts are for the tenant given by `--tenant` (the default tenant
    unless set).
 3. Run the bootstrap job once with its arguments set to
@@ -53,11 +65,13 @@ with `DATABASE_ADMIN_URL` set:
    ```
    scripts/bootstrap_postgres.py --only-migration <the day's migration>
        --allow-pending <the held-back files still pending, comma-separated>
+       --allow-applied-without-file 067_hong_kong_china_external_market_data_approval.sql
    ```
 
    for example `--allow-pending 054_shadow_workflow_evidence.sql,055_fx_evidence_versions.sql,059_owner_codex_tasks.sql,060_shadow_workflow_date_policies.sql,061_shadow_workflow_leases.sql`.
    It refuses, changing nothing, if any other migration is pending, if an applied
-   migration's checksum changed, or if an applied migration has no file. It ends with
+   migration's checksum changed, or if an applied migration other than the one named
+   has no file. It ends with
    `Migrations applied: <the day's migration>. Layer schemas: ...`. A second run applies
    nothing. The migration waits at most 20 seconds for each table's lock and then fails
    whole, so a run that meets a long transaction can simply be repeated.

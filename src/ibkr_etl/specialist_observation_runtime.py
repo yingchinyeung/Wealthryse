@@ -1,7 +1,7 @@
 """Fixed restricted NAV reader connection; does not enroll or enable agents."""
 from contextlib import contextmanager
 from urllib.parse import urlsplit,parse_qs
-from .specialist_observation_access import ROLE,verify_permissions
+from .specialist_observation_access import ROLE,SEARCH_PATH,verify_permissions
 
 LOGIN='ibkr_specialist_observation_login'
 HOST='ibkrv2stg-pg-auhecwc4itaoo.postgres.database.azure.com'
@@ -24,7 +24,7 @@ def bind_observation_session(c):
     if c.execute('SELECT session_user::text AS login').fetchone()['login']!=LOGIN:
         raise ValueError('Restricted authenticated observation login required')
     c.execute('SET LOCAL ROLE ibkr_specialist_observation_reader')
-    c.execute('SET LOCAL search_path TO public')
+    c.execute('SET LOCAL search_path TO '+SEARCH_PATH)
     c.execute("SELECT set_config('app.tenant_id',%s,true)",(TENANT,))
     c.execute("SET LOCAL statement_timeout='15s'")
     c.execute("SET LOCAL lock_timeout='2s'")

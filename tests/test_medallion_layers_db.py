@@ -447,7 +447,8 @@ class BatchRehearsalTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        _drop(cls.database, (APP, WEB, APPROVAL, COLLECTOR, "ibkr_specialist_observation_trial"))
+        _drop(cls.database, (APP, WEB, APPROVAL, COLLECTOR, "ibkr_specialist_observation_trial",
+                             "ibkr_specialist_observation_reader"))
 
     @classmethod
     def _bootstrap(cls, *args) -> str:
@@ -827,6 +828,30 @@ class BatchRehearsalTests(unittest.TestCase):
             result = verify_permissions(owner, TRIAL_ROLE)
             owner.rollback()
         self.assertEqual(result["nav_view_sha256"], NAV_VIEW_SHA256)
+
+    def test_the_specialist_observation_reader_reads_the_layer_tables(self):
+        """Its column grants are refused through a view in public, so its session finds the layer tables first."""
+        import psycopg
+        from psycopg.rows import dict_row
+
+        from ibkr_etl import specialist_observation_runtime as runtime
+        from ibkr_etl.specialist_observation_access import COLUMNS, ROLE, grant_statements, layer_grant_statements
+
+        with _connect(self.database, row_factory=dict_row, autocommit=True) as owner:
+            owner.execute(f"CREATE ROLE {ROLE} NOLOGIN NOINHERIT")
+            for statement in grant_statements(ROLE) + layer_grant_statements(owner, ROLE):
+                owner.execute(statement)
+            owner.execute(f"GRANT {ROLE} TO CURRENT_USER WITH INHERIT FALSE, SET TRUE")
+        worker = _script("run_specialist_observation_worker")
+        # The owner stands in for the observation login, which only ever sets the reader role.
+        with _connect(self.database, tenant=None, row_factory=dict_row, autocommit=True) as c, \
+                patch.object(runtime, "LOGIN", OWNER):
+            with c.transaction():
+                runtime.bind_observation_session(c)
+                self.assertEqual(c.execute("SELECT current_user::text AS role").fetchone()["role"], ROLE)
+                self.assertEqual(worker.check_relations(c), len(COLUMNS))
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege), c.transaction():
+                    c.execute("SELECT tenant_id, account_id FROM public.accounts LIMIT 0")
 
     def test_the_live_collector_login_is_provisioned_on_the_bronze_tables(self):
         from ibkr_etl.live_collector_access import least_privilege_problems, privilege_report, provision

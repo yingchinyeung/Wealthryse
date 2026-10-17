@@ -20,6 +20,11 @@ COLUMNS={
     'derived_portfolio_nav':'tenant_id portfolio_id snapshot_date currency total_nav',
     'subject_nav_series':'tenant_id subject_id source_kind snapshot_date currency total_text',
 }
+# Migrations 068 to 070 moved some registry tables into the layer schemas and left a view of the same
+# name in public. A view checks every column it reads against the table behind it, so a reader with
+# column grants is refused through it: the reader names its tables unqualified and finds the layer
+# table first. A schema that does not exist yet, or that the role cannot use, is skipped.
+SEARCH_PATH='bronze, silver, gold, public'
 DENIED_COLUMNS=(('raw_reports','file_path'),('ibkr_flex_credentials','key_vault_secret_name'),
     ('nav_snapshots','cash_text'),('specialist_observation_grants','enabled'))
 

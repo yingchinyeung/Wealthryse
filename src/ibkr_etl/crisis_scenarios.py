@@ -22,7 +22,7 @@ import math
 from typing import Any, Callable, Iterable, Mapping
 
 from .crisis_replay import (
-    CRISIS_END, CRISIS_START, PROVIDER, PROXY_BY_CURRENCY, PROXY_BY_SYMBOL,
+    CRISIS_END, CRISIS_START, PROVIDER, PROXY_BY_CURRENCY, PROXY_BY_SYMBOL, RAW_FEED,
     _execute, _fx_rate_as_of, fetch_adjusted_history, resolve_holdings_as_of,
 )
 from .provisional_benchmark import convert_levels_to_reporting_currency, fetch_fx_to_reporting_yfinance
@@ -146,7 +146,8 @@ class Prices:
         key = ("price", symbol, start.isoformat(), end.isoformat())
         if key not in self.cache:
             try:
-                self.cache[key] = fetch_adjusted_history(symbol, self.ticker_factory, start_date=start, end_date=end)
+                self.cache[key] = fetch_adjusted_history(symbol, self.ticker_factory, start_date=start,
+                                                         end_date=end, capture_feed=RAW_FEED)
             except Exception:  # an unknown or delisted ticker has no history, nothing more
                 self.cache[key] = {}
         return self.cache[key]

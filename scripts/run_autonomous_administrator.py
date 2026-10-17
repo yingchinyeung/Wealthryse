@@ -27,14 +27,16 @@ from ibkr_etl.admin_chat import SYSTEM_UPDATES_SOURCE_KEY  # noqa: E402
 from ibkr_etl.ai_analyst import AIAnalystConfig, AIAnalystError  # noqa: E402
 from ibkr_etl import layer_freshness  # noqa: E402
 from ibkr_etl.autonomous_admin import (  # noqa: E402
+    LAYER_FRESHNESS_PREFIX,
     AutonomyControl,
+    LayerFreshnessReview,
     ROLLBACK_ACTION,
     RecoveryContext,
     authority_review_current,
     diagnose_findings,
     evaluate_supervisor_state,
-    layer_freshness_findings,
     plan_safe_repairs,
+    review_layer_freshness,
 )
 from ibkr_etl.burn_in import collect_import_state, now_hkt_date, portal_boundary_check  # noqa: E402
 from ibkr_etl.ops_agent_posts import post_connection_reports, post_new_diagnoses  # noqa: E402
@@ -287,24 +289,58 @@ def _recovery_context(
     )
 
 
-def _layer_freshness_findings(database_url: str, tenant_id: str) -> list:
-    """Late medallion layers as findings, off unless LAYER_FRESHNESS_ENABLED. Read-only
-    on its own connection; any problem is printed and skipped, never failing the run."""
+def _open_layer_freshness_incidents(connection) -> dict[str, dict]:
+    """Open layer_freshness incidents with their severity and evidence. Runs under a
+    savepoint so a failure here cannot abort the supervisor's transaction."""
+    try:
+        with connection.transaction():
+            rows = connection.execute(
+                """
+                SELECT incident_key, severity, evidence_json FROM system_incidents
+                WHERE status IN ('open', 'acknowledged') AND starts_with(incident_key, %s)
+                """,
+                (LAYER_FRESHNESS_PREFIX,),
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        return {}
+    incidents = {}
+    for row in rows:
+        try:
+            evidence = json.loads(row["evidence_json"] or "{}")
+        except ValueError:
+            evidence = {}
+        incidents[str(row["incident_key"])] = {"severity": str(row["severity"]), "evidence": evidence}
+    return incidents
+
+
+def _layer_freshness_review(
+    connection, database_url: str, tenant_id: str, *, now: datetime | None = None
+) -> LayerFreshnessReview | None:
+    """Medallion layer freshness, off (None) unless LAYER_FRESHNESS_ENABLED. Reads on
+    its own read-only session, by default as this job's DATABASE_URL. Never raises: a
+    failed check is reported as unreadable and holds its incidents open."""
     if not layer_freshness.enabled():
-        return []
+        return None
+    now = now or datetime.now(timezone.utc)
+    open_incidents = _open_layer_freshness_incidents(connection)
     try:
         results = layer_freshness.run_read_only(
-            os.environ.get("LAYER_FRESHNESS_DATABASE_URL") or database_url, tenant_id
+            os.environ.get(layer_freshness.DATABASE_URL_ENV) or database_url, tenant_id, now=now
         )
         print("LAYER_FRESHNESS " + canonical_json(layer_freshness.summary(results)), flush=True)
-        return layer_freshness_findings(results)
     except Exception as error:  # noqa: BLE001
         print("LAYER_FRESHNESS " + canonical_json({"status": "failed", "error_code": type(error).__name__}),
               flush=True)
-        return []
+        results = None
+    try:
+        return review_layer_freshness(results, now=now, open_incidents=open_incidents)
+    except Exception:  # noqa: BLE001
+        return LayerFreshnessReview(hold_open=frozenset(open_incidents))
 
 
-def _sync_incidents(connection, findings, now_iso: str) -> tuple[dict[str, int], set[str]]:
+def _sync_incidents(
+    connection, findings, now_iso: str, *, hold_open=()
+) -> tuple[dict[str, int], set[str]]:
     existing = {
         str(row["incident_key"]): int(row["incident_id"])
         for row in connection.execute(
@@ -341,13 +377,15 @@ def _sync_incidents(connection, findings, now_iso: str) -> tuple[dict[str, int],
             ),
         ).fetchone()
         active[finding.incident_key] = int(row["incident_id"])
-    if active:
+    # Open incidents held open (a check that did not come back fresh) are not resolved.
+    keep = [*active, *(key for key in hold_open if key not in active)]
+    if keep:
         connection.execute(
             """
             UPDATE system_incidents SET status = 'resolved', resolved_at = %s
             WHERE status IN ('open', 'acknowledged') AND NOT (incident_key = ANY(%s))
             """,
-            (now_iso, list(active)),
+            (now_iso, keep),
         )
     else:
         connection.execute(
@@ -358,6 +396,18 @@ def _sync_incidents(connection, findings, now_iso: str) -> tuple[dict[str, int],
             (now_iso,),
         )
     return active, set(active) - set(existing)
+
+
+def _synchronize(
+    connection, findings, now_iso: str, freshness: LayerFreshnessReview | None
+) -> tuple[dict[str, int], set[str]]:
+    """Record findings as incidents. Returns incident ids and the keys to announce.
+    With layer freshness on, incidents it holds stay open, its info findings are
+    recorded quietly, and one that turns into a warning is announced."""
+    if freshness is None:
+        return _sync_incidents(connection, findings, now_iso)
+    incident_ids, new_keys = _sync_incidents(connection, findings, now_iso, hold_open=freshness.hold_open)
+    return incident_ids, (new_keys - freshness.quiet) | (freshness.escalated & set(incident_ids))
 
 
 def _recent_actions(connection) -> dict[str, datetime | None]:
@@ -561,15 +611,15 @@ def main() -> int:
             now_utc=datetime.now(timezone.utc),
         )
         stage = "check_layer_freshness"
-        layer_findings = _layer_freshness_findings(database_url, tenant_id)
-        if layer_findings:
+        freshness = _layer_freshness_review(connection, database_url, tenant_id)
+        if freshness is not None and freshness.findings:
             findings = sorted(
-                [*findings, *layer_findings],
+                [*findings, *freshness.findings],
                 key=lambda item: (item.severity != "critical", item.incident_key),
             )
         now_iso = utc_now_iso()
         stage = "synchronize_incidents"
-        incident_ids, new_keys = _sync_incidents(connection, findings, now_iso)
+        incident_ids, new_keys = _synchronize(connection, findings, now_iso, freshness)
         connection.commit()
 
         diagnosis: dict | None = None
@@ -685,7 +735,8 @@ def main() -> int:
             and control.production_active
             and authority_review_current(control, now=datetime.now(timezone.utc))
         )
-        status = "paused" if not current_authority else ("degraded" if findings else "healthy")
+        counted = [f for f in findings if freshness is None or f.incident_key not in freshness.quiet]
+        status = "paused" if not current_authority else ("degraded" if counted else "healthy")
         summary = (
             diagnosis.get("summary")
             if diagnosis and diagnosis.get("summary")

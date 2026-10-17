@@ -73,7 +73,8 @@ def _chart_url(symbol: str, start_date: date, end_date: date) -> str:
 
 
 def _download_json(
-    url: str, timeout: int = 30, attempts: int = 3, *, capture_key: str | None = None
+    url: str, timeout: int = 30, attempts: int = 3, *, capture_key: str | None = None,
+    capture_history: bool = False,
 ) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(attempts):
@@ -91,7 +92,8 @@ def _download_json(
             if capture_key:
                 raw_capture.capture_http("yahoo-chart", "Yahoo Finance chart API", url=url,
                                          body=body, key=capture_key, status=status,
-                                         extension="json", requested_at=requested_at)
+                                         extension="json", requested_at=requested_at,
+                                         history=capture_history)
             return json.loads(body.decode("utf-8"))
         except Exception as error:  # network and malformed-response failures retry alike
             last_error = error
@@ -116,6 +118,7 @@ def fetch_daily_closes(
         capture_key=raw_capture.request_key(
             instrument.symbol, start_date.isoformat(), end_date.isoformat(), "1d"
         ),
+        capture_history=raw_capture.settled(end_date),
     )
     chart = payload.get("chart") or {}
     if chart.get("error"):

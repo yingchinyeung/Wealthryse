@@ -5,9 +5,14 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
+import os
 import re
+import socket
+import threading
+import time
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -19,6 +24,8 @@ from ibkr_etl.raw_capture import RawCapture
 ROOT = Path(__file__).resolve().parents[1]
 REQUESTED = datetime(2026, 10, 16, 8, 31, 5, tzinfo=timezone.utc)
 ACCOUNT_URL = "https://example.invalid"
+# Thread start-up and wake-up time allowed on top of a time limit in these tests.
+SCHEDULING_SLACK = 0.25
 
 
 class _Uploads:
@@ -181,15 +188,20 @@ class CaptureWhenOnTests(unittest.TestCase):
 class DefaultUploaderTests(unittest.TestCase):
     def test_uses_the_blob_helper_with_short_timeouts_no_retries_and_no_overwrite(self):
         service = Mock()
-        with patch("azure.identity.DefaultAzureCredential") as credential, \
+        with patch.dict("os.environ", {"AZURE_CLIENT_ID": "00000000-0000-0000-0000-00000000000a"}), \
+                patch("azure.identity.DefaultAzureCredential", side_effect=AssertionError("no chain")), \
+                patch("azure.identity.ManagedIdentityCredential") as credential, \
                 patch("azure.storage.blob.BlobServiceClient", return_value=service) as client_class:
             capture = RawCapture(container="bronze-market-data", account_url=ACCOUNT_URL)
             name = capture.http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<x/>",
                                 key="year-2026", extension="xml", requested_at=REQUESTED)
             capture.http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<y/>",
                          key="year-2026", extension="xml", requested_at=REQUESTED)
-        credential.assert_called_once_with(exclude_interactive_browser_credential=True)
+        # Managed identity only: one token request, short timeouts, no retries.
+        credential.assert_called_once_with(client_id="00000000-0000-0000-0000-00000000000a",
+                                           connection_timeout=3, read_timeout=5, retry_total=0)
         client_class.assert_called_once()  # one client for the whole process
+        self.assertIs(client_class.call_args.kwargs["credential"], credential.return_value)
         self.assertEqual(client_class.call_args.kwargs["account_url"], ACCOUNT_URL)
         for option, value in (("connection_timeout", 3), ("read_timeout", 5), ("retry_total", 0)):
             self.assertEqual(client_class.call_args.kwargs[option], value)
@@ -233,14 +245,21 @@ class FailSoftTests(unittest.TestCase):
         self.assertIsNotNone(capture.frame("yahoo-crisis-history", "p", frame=_frame(), request={}, key="k"))
 
     def test_time_budget_caps_the_delay_a_job_can_see(self):
-        ticks = iter(range(0, 1000, 4))  # each capture "takes" 4 seconds
         uploads = _Uploads()
-        capture = _capture(uploads, budget_seconds=10, clock=lambda: next(ticks))
+        slow = uploads.upload
+
+        def upload(*args, **kwargs):
+            time.sleep(0.2)
+            return slow(*args, **kwargs)
+
+        capture = _capture(uploads, budget_seconds=0.5)
+        capture._uploader_factory = lambda *_: upload
         with self.assertLogs("ibkr_etl.raw_capture", level="WARNING"):
             for index in range(6):
                 capture.http("hkab-hibor", "HKAB", url="https://x", body=str(index).encode(), key=str(index))
-        self.assertEqual(len(uploads.calls), 3)
+        self.assertLessEqual(len(uploads.calls), 3)
         self.assertIn("time budget", capture.disabled_reason)
+        self.assertLessEqual(capture.summary()["seconds"], 0.5 + SCHEDULING_SLACK)
 
     def test_unknown_feed_is_rejected_without_raising(self):
         uploads = _Uploads()
@@ -255,6 +274,7 @@ class FailSoftTests(unittest.TestCase):
             used.update(re.findall(r"capture_(?:http|frame|document)\(\s*\"([a-z0-9-]+)\"", text))
             used.update(re.findall(r"feed='([a-z0-9-]+)'", text))
             used.update(re.findall(r'"(yahoo-(?:fx|benchmark)-history)"', text))
+            used.update(re.findall(r'RAW_FEED = "([a-z0-9-]+)"', text))
         self.assertTrue(used)
         self.assertLessEqual(used, raw_capture.FEEDS)
         self.assertEqual(raw_capture.FEEDS - used, set())
@@ -298,11 +318,13 @@ class ParsedResultsUnchangedTests(unittest.TestCase):
         self.assertEqual(json.loads(fx[0]["metadata"]["request"])["symbol"], "TWD=X")
 
     def test_crisis_history(self):
-        from ibkr_etl.crisis_replay import fetch_adjusted_history
+        from ibkr_etl.crisis_replay import RAW_FEED, fetch_adjusted_history
 
         calls = self._three_ways(lambda: fetch_adjusted_history(
-            "SPY", lambda _symbol: _Ticker(_frame()), start_date=date(2025, 1, 20), end_date=date(2025, 1, 23)))
-        self.assertTrue(calls[0]["name"].startswith("yahoo-crisis-history/"))
+            "SPY", lambda _symbol: _Ticker(_frame()), start_date=date(2025, 1, 20), end_date=date(2025, 1, 23),
+            capture_feed=RAW_FEED))
+        # A finished crisis window is filed once, without a date folder.
+        self.assertTrue(calls[0]["name"].startswith("yahoo-crisis-history/history/SPY_2025-01-20_2025-01-24_1d-"))
 
     def test_treasury_xml(self):
         from ibkr_etl.reference_data import HttpBody
@@ -397,6 +419,261 @@ class ParsedResultsUnchangedTests(unittest.TestCase):
             calls = self._three_ways(lambda: market_data.fetch_daily_closes(
                 instrument, date(2025, 1, 20), date(2025, 1, 23)))
         self.assertTrue(calls[0]["name"].startswith("yahoo-chart/"))
+
+
+class _HungServer:
+    """A local endpoint that accepts connections and never answers."""
+
+    def __init__(self):
+        self.connections: list[socket.socket] = []
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(16)
+        self.port = self.server.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                connection, _ = self.server.accept()
+            except OSError:
+                return
+            self.connections.append(connection)
+
+    def close(self):
+        self.server.close()
+        for connection in self.connections:
+            connection.close()
+
+
+def _without_proxies(extra: dict) -> dict:
+    environment = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+    environment.update(extra)
+    return environment
+
+
+class HungIdentityEndpointTests(unittest.TestCase):
+    """Container Apps hands out tokens from IDENTITY_ENDPOINT; here it never answers."""
+
+    def setUp(self):
+        self.endpoint = _HungServer()
+        self.addCleanup(self.endpoint.close)
+        environment = _without_proxies({
+            "IDENTITY_ENDPOINT": f"http://127.0.0.1:{self.endpoint.port}/msi/token",
+            "IDENTITY_HEADER": "synthetic-header",
+            "AZURE_CLIENT_ID": "00000000-0000-0000-0000-00000000000a",
+        })
+        for name in ("MSI_ENDPOINT", "IMDS_ENDPOINT", "IDENTITY_SERVER_THUMBPRINT", "AZURE_FEDERATED_TOKEN_FILE"):
+            environment.pop(name, None)
+        patcher = patch.dict("os.environ", environment, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # azure.identity logs each expected failure; keep the test output quiet.
+        identity_log = logging.getLogger("azure.identity")
+        self.addCleanup(identity_log.setLevel, identity_log.level)
+        identity_log.setLevel(logging.CRITICAL)
+
+    def test_the_credential_gives_up_after_one_request_and_its_read_timeout(self):
+        from ibkr_etl.cloud_storage import best_effort_credential
+
+        credential = best_effort_credential(connection_timeout=1, read_timeout=1)
+        started = time.monotonic()
+        with self.assertRaises(Exception):
+            credential.get_token("https://storage.azure.com/.default")
+        self.assertLess(time.monotonic() - started, 1 + 1.5)
+        self.assertEqual(len(self.endpoint.connections), 1)
+
+    def test_capture_switches_off_within_the_timeout_and_never_asks_again(self):
+        with patch.object(raw_capture, "CONNECTION_TIMEOUT_SECONDS", 1), \
+                patch.object(raw_capture, "READ_TIMEOUT_SECONDS", 1):
+            # Bearer tokens need https; nothing listens on port 9, but the token comes first.
+            capture = RawCapture(container="bronze-market-data", account_url="https://127.0.0.1:9")
+            started = time.monotonic()
+            with self.assertLogs("ibkr_etl.raw_capture", level="WARNING"):
+                self.assertIsNone(capture.http("treasury-par-yield", "U.S. Treasury", url="https://x",
+                                               body=b"<x/>", key="year-2026", extension="xml"))
+            self.assertLess(time.monotonic() - started, 1 + 1.5)
+            self.assertIsNotNone(capture.disabled_reason)
+            self.assertIsNone(capture.http("treasury-par-yield", "U.S. Treasury", url="https://x",
+                                           body=b"<y/>", key="year-2026", extension="xml"))
+        self.assertEqual(len(self.endpoint.connections), 1)
+        self.assertEqual((capture.stats["failed"], capture.stats["skipped"]), (1, 1))
+
+
+class HungUploadTests(unittest.TestCase):
+    def setUp(self):
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+        self.started = []
+
+    def _hung_factory(self, account_url, container):
+        def upload(name, content, **_options):
+            self.started.append(name)
+            self.release.wait(60)
+        return upload
+
+    def _capture(self, **options):
+        return RawCapture(container="bronze-market-data", account_url=ACCOUNT_URL,
+                          uploader_factory=self._hung_factory, **options)
+
+    def test_a_hung_upload_holds_the_job_no_longer_than_the_budget(self):
+        capture = self._capture(budget_seconds=1.0)
+        started = time.monotonic()
+        with self.assertLogs("ibkr_etl.raw_capture", level="WARNING"):
+            self.assertIsNone(capture.http("hkab-hibor", "HKAB", url="https://x", body=b"{}", key="a"))
+        self.assertLess(time.monotonic() - started, 1.0 + SCHEDULING_SLACK)
+        self.assertIn("TimeoutError", capture.disabled_reason)
+        started = time.monotonic()
+        self.assertIsNone(capture.http("hkab-hibor", "HKAB", url="https://x", body=b"{}", key="b"))
+        self.assertLess(time.monotonic() - started, 0.05)
+        self.assertEqual(len(self.started), 1)
+
+    def test_each_upload_waits_at_most_one_write_allowance(self):
+        capture = self._capture(budget_seconds=30, write_wait_seconds=0.3)
+        started = time.monotonic()
+        with self.assertLogs("ibkr_etl.raw_capture", level="WARNING"):
+            capture.http("hkab-hibor", "HKAB", url="https://x", body=b"{}", key="a")
+        self.assertLess(time.monotonic() - started, 0.3 + SCHEDULING_SLACK)
+        self.assertIsNotNone(capture.disabled_reason)
+
+
+class SharedBudgetTests(unittest.TestCase):
+    """Four threads, like the sector job's workers, share one budget."""
+
+    def _run_threads(self, capture, *, threads=4, per_thread=6):
+        barrier = threading.Barrier(threads)
+        waits = []
+        lock = threading.Lock()
+
+        def worker(number):
+            barrier.wait()
+            for index in range(per_thread):
+                started = time.monotonic()
+                capture.http("yahoo-sector-search", "Yahoo", url="https://x",
+                             body=f"{number}-{index}".encode(), key=f"T{number}-{index}")
+                with lock:
+                    waits.append(time.monotonic() - started)
+
+        pool = [threading.Thread(target=worker, args=(n,)) for n in range(threads)]
+        with self.assertLogs("ibkr_etl.raw_capture", level="WARNING"):
+            for thread in pool:
+                thread.start()
+            for thread in pool:
+                thread.join(30)
+        return waits
+
+    def test_slow_uploads_from_many_threads_stay_within_one_budget(self):
+        def slow_factory(account_url, container):
+            def upload(name, content, **_options):
+                time.sleep(0.3)
+            return upload
+
+        capture = RawCapture(container="bronze-market-data", account_url=ACCOUNT_URL,
+                             budget_seconds=1.0, uploader_factory=slow_factory)
+        waits = self._run_threads(capture)
+        self.assertEqual(len(waits), 24)
+        self.assertLessEqual(sum(waits), 1.0 + SCHEDULING_SLACK)
+        self.assertLessEqual(capture.summary()["seconds"], 1.0 + SCHEDULING_SLACK)
+        self.assertGreaterEqual(capture.stats["written"], 1)
+        self.assertIsNotNone(capture.disabled_reason)
+
+    def test_hung_uploads_from_many_threads_stay_within_one_budget(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hung_factory(account_url, container):
+            def upload(name, content, **_options):
+                release.wait(60)
+            return upload
+
+        capture = RawCapture(container="bronze-market-data", account_url=ACCOUNT_URL,
+                             budget_seconds=1.0, uploader_factory=hung_factory)
+        waits = self._run_threads(capture)
+        self.assertEqual(len(waits), 24)
+        self.assertLessEqual(sum(waits), 1.0 + SCHEDULING_SLACK)
+        self.assertEqual(capture.stats["written"], 0)
+        self.assertIsNotNone(capture.disabled_reason)
+
+
+class HistoryNamingTests(unittest.TestCase):
+    """Finished windows get one date-free, content-addressed name; repeats stay quiet."""
+
+    def tearDown(self):
+        raw_capture.reset()
+
+    def test_settled_means_ended_over_a_week_ago(self):
+        now = datetime(2026, 10, 17, 9, 0, tzinfo=timezone.utc)
+        self.assertTrue(raw_capture.settled(date(2026, 10, 9), now=now))
+        self.assertFalse(raw_capture.settled(date(2026, 10, 10), now=now))
+        self.assertFalse(raw_capture.settled("2026-10-17", now=now))
+        self.assertTrue(raw_capture.settled("2009-03-09", now=now))
+        self.assertFalse(raw_capture.settled("not a date", now=now))
+
+    def test_a_repeated_history_request_is_the_quiet_existing_case(self):
+        from azure.core.exceptions import ResourceExistsError
+
+        uploads = _Uploads()
+        first = _capture(uploads).http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<2025/>",
+                                       key="year-2025", extension="xml", requested_at=REQUESTED, history=True)
+        digest = hashlib.sha256(b"<2025/>").hexdigest()[:16]
+        self.assertEqual(first, f"treasury-par-yield/history/year-2025-{digest}.xml")
+        # The next day's run asks again and gets the same file: same name, no new blob.
+        tomorrow = _Uploads(ResourceExistsError("BlobAlreadyExists"))
+        capture = _capture(tomorrow)
+        with self.assertNoLogs("ibkr_etl.raw_capture", level="WARNING"):
+            second = capture.http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<2025/>",
+                                  key="year-2025", extension="xml",
+                                  requested_at=REQUESTED + timedelta(days=1), history=True)
+        self.assertEqual(second, first)
+        self.assertEqual((capture.stats["existing"], capture.stats["written"]), (1, 0))
+        self.assertIsNone(capture.disabled_reason)
+
+    def test_treasury_files_finished_years_once_and_this_year_daily(self):
+        from ibkr_etl.reference_data import HttpBody
+        from ibkr_etl.risk_free import fetch_treasury_3m_rates
+
+        def xml(year):
+            body = HttpBody(f"""<feed xmlns:m="m" xmlns:d="d"><entry><content><m:properties>
+                <d:NEW_DATE>{year}-01-15T00:00:00</d:NEW_DATE><d:BC_3MONTH>4.01</d:BC_3MONTH>
+                </m:properties></content></entry></feed>""".encode())
+            body.status = 200
+            return body
+
+        uploads = _Uploads()
+        raw_capture.reset(_capture(uploads))
+        this_year = raw_capture.utc_now().year
+        with patch("ibkr_etl.risk_free._get", side_effect=[xml(this_year - 1), xml(this_year)]):
+            fetch_treasury_3m_rates(date(this_year - 1, 1, 1), date(this_year, 12, 31))
+        names = [call["name"] for call in uploads.calls]
+        self.assertTrue(names[0].startswith(f"treasury-par-yield/history/year-{this_year - 1}-"))
+        self.assertRegex(names[1], rf"^treasury-par-yield/{this_year}/\d\d/\d\d/year-{this_year}-")
+
+    def test_a_benchmark_window_ending_today_keeps_a_date_folder(self):
+        from ibkr_etl.provisional_benchmark import BENCHMARKS, fetch_benchmark_yfinance
+
+        uploads = _Uploads()
+        raw_capture.reset(_capture(uploads))
+        today = raw_capture.utc_now().date()
+        index = pd.DatetimeIndex([today.isoformat()], name="Date")
+        frame = pd.DataFrame({"Close": [6000.5], "Adj Close": [6000.5], "Volume": [1]}, index=index)
+        fetch_benchmark_yfinance(BENCHMARKS[0], today - timedelta(days=3), today, lambda _symbol: _Ticker(frame))
+        self.assertTrue(uploads.calls[0]["name"].startswith(f"yahoo-benchmark-history/{today:%Y/%m/%d}/"))
+
+    def test_fama_french_stand_ins_are_never_filed_as_crisis_history(self):
+        from ibkr_etl import fama_french
+
+        uploads = _Uploads()
+        raw_capture.reset(_capture(uploads))
+        ticker = _Ticker(_frame())
+        fake_yf = Mock()
+        fake_yf.Ticker.side_effect = lambda _symbol: ticker
+        with patch.dict("sys.modules", {"yfinance": fake_yf}):
+            try:
+                fama_french.load_proxy_factors(sorted(fama_french.PROXY_LEGS)[0], today=date(2025, 1, 23))
+            except fama_french.FactorDataError:
+                pass  # three synthetic days are not enough factors; the fetch is what matters
+        self.assertTrue(ticker.calls, "the default Yahoo fetch must have run")
+        self.assertEqual(uploads.calls, [])
 
 
 if __name__ == "__main__":

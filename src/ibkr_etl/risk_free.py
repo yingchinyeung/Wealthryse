@@ -86,8 +86,10 @@ def fetch_treasury_3m_rates(
         url = treasury_year_url(year)
         requested_at = raw_capture.utc_now()
         payload = _get(url, timeout=timeout)
+        # A finished year's file is filed once under history/; this year's changes daily.
         raw_capture.capture_http("treasury-par-yield", PROVIDER, url=url, body=payload,
-                                 key=f"year-{year}", extension="xml", requested_at=requested_at)
+                                 key=f"year-{year}", extension="xml", requested_at=requested_at,
+                                 history=raw_capture.settled(date(year, 12, 31), now=requested_at))
         for observation in parse_treasury_3m_xml(payload):
             observed = date.fromisoformat(observation.rate_date)
             if start_date <= observed <= effective_end:

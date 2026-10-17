@@ -94,6 +94,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'REFERENCE_DATA_SOURCE', value: referenceDataSource }
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
             { name: 'ALLOW_UNLICENSED_BENCHMARK', value: 'true' }
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
           ]
           resources: {
             cpu: json('0.5')

@@ -227,6 +227,7 @@ resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'AZURE_AI_REGION', value: aiRegion }
             { name: 'AZURE_AI_PROCESSING_SCOPE', value: aiProcessingScope }
             { name: 'AI_ADMIN_ENABLED', value: 'true' }
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
           ], layerFreshnessEnv)
           resources: {
             cpu: json('0.25')

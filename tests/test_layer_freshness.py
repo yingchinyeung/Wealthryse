@@ -452,6 +452,15 @@ class BicepDefaultsTests(unittest.TestCase):
         self.assertIn("], layerFreshnessBlobEnv)", text)
         self.assertIn("], layerFreshnessEnv)", text)
 
+    def test_jobs_the_medallion_release_moves_never_apply_migrations(self):
+        # Their image carries migrations that are held back in production; only bootstrap applies migrations.
+        for name in ("staging-institutional-daily.bicep", "staging-burn-in-monitoring.bicep",
+                     "staging-autonomous-admin.bicep", "staging-derived-refresh.bicep"):
+            with self.subTest(name=name):
+                text = (ROOT / "infra" / name).read_text(encoding="utf-8")
+                self.assertEqual(text.count("IBKR_RUN_MIGRATIONS"), 1)
+                self.assertIn("{ name: 'IBKR_RUN_MIGRATIONS', value: 'false' }", text)
+
 
 if __name__ == "__main__":
     unittest.main()

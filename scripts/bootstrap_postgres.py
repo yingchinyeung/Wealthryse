@@ -48,6 +48,14 @@ APPROVAL_LAYER_STATEMENTS = (
     "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {schema} FROM {role}",
     "REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA {schema} FROM {role}",
 )
+# The columns the approval login reads for the layer freshness check (medallion S2).
+FRESHNESS_COLUMNS = (
+    ("raw_reports", ("tenant_id", "received_at")),
+    ("flex_rows", ("tenant_id", "flex_row_id", "first_seen_run_id")),
+    ("risk_analytics_snapshots", ("tenant_id", "as_of_date")),
+    ("crisis_scenario_results", ("tenant_id", "holdings_as_of")),
+    ("crisis_replay_daily", ("tenant_id", "holdings_as_of")),
+)
 
 
 def _layer_statements(connection, statements, layers, role) -> None:
@@ -70,10 +78,17 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-pending", action="append", default=[],
         help="with --only-migration: migrations that may stay pending (comma-separated, repeatable)",
     )
+    parser.add_argument(
+        "--allow-applied-without-file", action="append", default=[], metavar="VERSION",
+        help="with --only-migration: a version recorded as applied that has no file here, "
+             "such as one applied outside the repository (repeatable, one version each)",
+    )
     args = parser.parse_args(argv)
     allow_pending = [name for value in args.allow_pending for name in value.split(",") if name]
     if allow_pending and not args.only_migration:
         parser.error("--allow-pending needs --only-migration")
+    if args.allow_applied_without_file and not args.only_migration:
+        parser.error("--allow-applied-without-file needs --only-migration")
 
     admin_url = os.environ.get("DATABASE_ADMIN_URL", "")
     app_password = os.environ.get("DATABASE_APP_PASSWORD", "")
@@ -98,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
             settings.tenant_name,
             only_migration=args.only_migration,
             allow_pending=allow_pending,
+            allow_applied_without_file=args.allow_applied_without_file,
         )
     finally:
         if previous is None:
@@ -363,6 +379,12 @@ def main(argv: list[str] | None = None) -> int:
             connection.execute(sql.SQL(
                 "GRANT SELECT, INSERT, UPDATE ON TABLE factsheet_design_drafts, factsheet_design_proposals TO {}"
             ).format(sql.Identifier(approval_role)))
+            # The autonomous administrator's layer freshness check reads only when rows
+            # arrived, never their content (flex_rows.data_json stays unreadable).
+            for table, columns in FRESHNESS_COLUMNS:
+                connection.execute(sql.SQL("GRANT SELECT ({}) ON TABLE {} TO {}").format(
+                    sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+                    sql.Identifier(table), sql.Identifier(approval_role)))
             design_privileges = connection.execute(
                 """SELECT has_table_privilege(%s, 'public.report_design_update_requests', 'INSERT')
                     AND has_table_privilege(%s, 'public.qualified_report_designs', 'SELECT')

@@ -41,6 +41,8 @@ TOLERATED_MIGRATIONS = {"027_legacy_external_market_data_approval.sql", "056_spe
 HELD_BACK = ("054_shadow_workflow_evidence.sql", "055_fx_evidence_versions.sql", "059_owner_codex_tasks.sql",
              "060_shadow_workflow_date_policies.sql", "061_shadow_workflow_leases.sql")
 LAYER_FILES = sorted(path.name for path in MIGRATIONS.glob("*_medallion_*.sql"))
+# Production's ledger has this version, applied outside the repository.
+OUTSIDE = ("067_hong_kong_china_external_market_data_approval.sql",)
 LAYERS = ("bronze", "silver", "gold")
 RUNTIME_PATH = 'search_path="$user", bronze, silver, gold, public'
 _MODULES: dict = {}
@@ -251,6 +253,23 @@ class LayerViewTests(unittest.TestCase):
                     self.assertEqual(owner.execute("SELECT relkind FROM pg_class WHERE oid = to_regclass(%s)",
                                                    (f"public.{name}",)).fetchone()[0], "v")
 
+    def test_only_migration_tolerates_just_the_named_versions_without_a_file(self):
+        from ibkr_etl.db import apply_postgres_migrations, connect
+
+        last = sorted(path.name for path in MIGRATIONS.glob("*.sql"))[-1]
+        connection = connect(Path("unused.db"), _url(self.database, OWNER), TENANT)
+        self.addCleanup(connection.close)
+        connection.execute("INSERT INTO schema_migrations VALUES (?, 'x', 'x')", OUTSIDE)
+        with self.assertRaisesRegex(RuntimeError, r"not in the repository \['067_hong_kong_china_"):
+            apply_postgres_migrations(connection, only=last)
+        self.assertEqual(apply_postgres_migrations(connection, only=last, allow_applied_without_file=OUTSIDE), [])
+        connection.execute("INSERT INTO schema_migrations VALUES ('999_gone.sql', 'x', 'x')")
+        with self.assertRaisesRegex(RuntimeError, r"not in the repository \['999_gone\.sql'\]"):
+            apply_postgres_migrations(connection, only=last, allow_applied_without_file=OUTSIDE)
+        connection.rollback()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            _script("bootstrap_postgres").main(["--allow-applied-without-file", OUTSIDE[0]])
+
     @unittest.skipUnless(LAYER_FILES, "no layer migrations in this checkout")
     def test_undo_moves_each_layer_back_and_the_batches_apply_again(self):
         undo = _script("medallion_layers").undo_sql
@@ -268,6 +287,54 @@ class LayerViewTests(unittest.TestCase):
                 owner.execute((MIGRATIONS / name).read_text(encoding="utf-8"))
                 owner.commit()
             self.assertEqual(_layout(owner), self.after_layers)
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class MirrorPrivilegesTests(unittest.TestCase):
+    """mirror_privileges on a table moved by hand, so it runs before any layer migration exists."""
+
+    def setUp(self):
+        import psycopg
+
+        self.database = "medallion_mirror_" + uuid.uuid4().hex[:8]
+        self.role = "medallion_test_reader"
+        _drop(self.database, (self.role,))
+        _build(self.database, skip=[path.name for path in MIGRATIONS.glob("*.sql")])  # an empty database
+        with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
+            admin.execute(f"CREATE ROLE {self.role} LOGIN PASSWORD '{PASSWORD}'")
+        self.addCleanup(_drop, self.database, (self.role,))
+
+    def test_column_grants_are_mirrored_and_keep_the_schema_usable(self):
+        import psycopg
+
+        from ibkr_etl.medallion_layers import mirror_privileges, mismatches
+
+        with _connect(self.database, tenant=None) as owner:
+            owner.execute("CREATE TABLE public.probe (tenant_id uuid, received_at text, content text)")
+            owner.execute("INSERT INTO public.probe VALUES (gen_random_uuid(), '2026-10-01', 'secret')")
+            owner.execute("CREATE SCHEMA gold")
+            owner.execute("ALTER TABLE public.probe SET SCHEMA gold")
+            owner.execute("CREATE VIEW public.probe WITH (security_invoker = true) AS SELECT * FROM gold.probe")
+            # What bootstrap_postgres.py grants on public; a stale table-wide grant on the layer table.
+            owner.execute(f"GRANT SELECT (tenant_id, received_at) ON public.probe TO {self.role}")
+            owner.execute(f"GRANT SELECT ON gold.probe TO {self.role}")
+            self.assertEqual(len(mismatches(owner, [self.role])), 2)
+            mirror_privileges(owner, [self.role])
+            self.assertEqual(mismatches(owner, [self.role]), [])
+            self.assertTrue(owner.execute("SELECT has_schema_privilege(%s, 'gold', 'USAGE')",
+                                          (self.role,)).fetchone()[0])
+            owner.commit()
+        with _connect(self.database, self.role, tenant=None) as reader:
+            self.assertEqual(reader.execute("SELECT received_at FROM gold.probe").fetchall(), [("2026-10-01",)])
+            reader.execute("SET search_path = gold, public")  # what bootstrap gives runtime logins
+            self.assertEqual(reader.execute("SELECT received_at FROM probe").fetchall(), [("2026-10-01",)])
+            reader.rollback()
+            # PostgreSQL checks every column of a security_invoker view on the table behind
+            # it, so column grants alone never read through the view in public.
+            for statement in ("SELECT content FROM gold.probe", "SELECT received_at FROM public.probe"):
+                with self.subTest(statement), self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    reader.execute(statement)
+                reader.rollback()
 
 
 def _seed(owner) -> None:
@@ -342,6 +409,7 @@ class BatchRehearsalTests(unittest.TestCase):
                 admin.execute(f"DROP ROLE IF EXISTS {role}")
         applied = _build(cls.database, skip=HELD_BACK, stop_before_layers=True)
         with _connect(cls.database) as owner:
+            owner.execute("INSERT INTO schema_migrations VALUES (%s, 'x', '2026-10-01T00:00:00+00:00')", OUTSIDE)
             _seed(owner)
             for text in _script("install_agent_schema").agent_schema_sql(owner):
                 owner.execute(text)
@@ -379,6 +447,8 @@ class BatchRehearsalTests(unittest.TestCase):
             "DATABASE_WEB_ROLE": WEB, "DATABASE_WEB_PASSWORD": PASSWORD,
             "DATABASE_APPROVAL_ROLE": APPROVAL, "DATABASE_APPROVAL_PASSWORD": PASSWORD,
         }
+        if "--only-migration" in args:  # as production runs it
+            args += ("--allow-applied-without-file", *OUTSIDE)
         output = io.StringIO()
         with patch.dict(os.environ, environment), contextlib.redirect_stdout(output):
             _script("bootstrap_postgres").main(list(args))
@@ -466,19 +536,23 @@ class BatchRehearsalTests(unittest.TestCase):
         ledger = connection.execute("SELECT version, sha256 FROM schema_migrations ORDER BY 1").fetchall()
         first = ledger[0][0]
         attempts = (
-            ("999_missing.sql", pending, None),
-            (LAYER_FILES[0], (), None),  # the held-back files are pending
-            (LAYER_FILES[0], pending, ("UPDATE schema_migrations SET sha256 = 'drift' WHERE version = ?", (first,))),
-            (LAYER_FILES[0], pending, ("INSERT INTO schema_migrations VALUES ('999_gone.sql', 'x', 'x')", ())),
+            ("999_missing.sql", pending, OUTSIDE, None),
+            (LAYER_FILES[0], (), OUTSIDE, None),  # the held-back files are pending
+            (LAYER_FILES[0], pending, (), None),  # the version applied outside the repository
+            (LAYER_FILES[0], pending, OUTSIDE,
+             ("UPDATE schema_migrations SET sha256 = 'drift' WHERE version = ?", (first,))),
+            (LAYER_FILES[0], pending, OUTSIDE, ("INSERT INTO schema_migrations VALUES ('999_gone.sql', 'x', 'x')", ())),
         )
-        for only, allow, change in attempts:
-            with self.subTest(only=only, change=change):
+        for only, allow, without_file, change in attempts:
+            with self.subTest(only=only, allow=bool(allow), without_file=without_file, change=change):
                 if change:
                     connection.execute(*change)
                 with self.assertRaises(RuntimeError):
-                    apply_postgres_migrations(connection, only=only, allow_pending=allow)
+                    apply_postgres_migrations(connection, only=only, allow_pending=allow,
+                                              allow_applied_without_file=without_file)
                 connection.rollback()
-        self.assertEqual(apply_postgres_migrations(connection, only=LAYER_FILES[0], allow_pending=pending), [])
+        self.assertEqual(apply_postgres_migrations(connection, only=LAYER_FILES[0], allow_pending=pending,
+                                                   allow_applied_without_file=OUTSIDE), [])
         connection.rollback()
         self.assertEqual(connection.execute("SELECT version, sha256 FROM schema_migrations ORDER BY 1").fetchall(),
                          ledger)
@@ -493,7 +567,8 @@ class BatchRehearsalTests(unittest.TestCase):
         self.addCleanup(connection.close)
         connection.execute("SET search_path = bronze, silver, gold, public")
         connection.commit()
-        self.assertEqual(apply_postgres_migrations(connection, only=LAYER_FILES[0], allow_pending=pending), [])
+        self.assertEqual(apply_postgres_migrations(connection, only=LAYER_FILES[0], allow_pending=pending,
+                                                   allow_applied_without_file=OUTSIDE), [])
         self.assertIsNone(connection.execute("SELECT to_regclass('bronze.schema_migrations')").fetchone()[0])
         connection.commit()
         # Only for the migrations' own transaction.
@@ -531,7 +606,7 @@ class BatchRehearsalTests(unittest.TestCase):
                          "ON CONFLICT (tenant_id, sha256) DO NOTHING", ("b" * 64,))
         self.assertEqual(approval.execute("SELECT count(*) FROM factsheet_design_files").fetchone()[0], 2)
         approval.rollback()
-        for statement in ("SELECT 1 FROM flex_rows", "SELECT 1 FROM public.raw_reports",
+        for statement in ("SELECT data_json FROM flex_rows", "SELECT file_path FROM public.raw_reports",
                           "UPDATE factsheet_design_files SET created_at = 'x'", "DELETE FROM nav_snapshots"):
             with self.subTest(statement), self.assertRaises(psycopg.errors.InsufficientPrivilege):
                 approval.execute(statement)
@@ -581,6 +656,34 @@ class BatchRehearsalTests(unittest.TestCase):
                     "SELECT %s, '2026-09-01', 'USD', 'x', max(run_id) FROM ingestion_runs "
                     "ON CONFLICT ON CONSTRAINT nav_snapshots_pkey DO NOTHING", (account,))
         app.rollback()
+
+    def test_the_freshness_check_reads_only_its_columns(self):
+        import psycopg
+
+        from ibkr_etl.medallion_layers import mismatches
+
+        bootstrap = _script("bootstrap_postgres")
+        approval = self._login(APPROVAL)
+        layers = _catalog()
+        for table, columns in bootstrap.FRESHNESS_COLUMNS:
+            listed = ", ".join(columns)
+            # The check names tables unqualified; the login's search_path finds the layer table.
+            self.assertTrue(approval.execute("SELECT %s::regclass = %s::regclass",
+                                             (table, f"{layers[table]}.{table}")).fetchone()[0])
+            for name in (f"{layers[table]}.{table}", table):
+                with self.subTest(name):
+                    approval.execute(f"SELECT {listed} FROM {name}").fetchall()
+            # A security_invoker view needs every one of its columns on the table behind it.
+            with self.subTest(f"public.{table}"), self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                approval.execute(f"SELECT {listed} FROM public.{table}")
+            approval.rollback()
+        self.assertEqual(approval.execute("SELECT count(*) FROM flex_rows").fetchone()[0], 5)
+        for name in ("public.flex_rows", "bronze.flex_rows", "flex_rows"):
+            with self.subTest(name), self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                approval.execute(f"SELECT data_json FROM {name}")
+            approval.rollback()
+        with _connect(self.database) as owner:
+            self.assertEqual(mismatches(owner, [APP, WEB, APPROVAL]), [])
 
     def test_frozen_reporting_snapshots_stay_frozen_through_the_view(self):
         import psycopg

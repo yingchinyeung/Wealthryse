@@ -111,6 +111,11 @@ class ObservationDeploymentTests(TestCase):
         self.assertEqual(resource['properties']['template']['containers'][0]['env'],[dict(name='SPECIALIST_OBSERVATION_DATABASE_URL',secretRef='observation-url')])
         self.assertNotIn('database-admin-url',str(resource));self.assertNotIn('ingestion-identity',str(resource))
 
+    def test_reader_runs_the_image_recorded_as_deployed(self):
+        recorded=json.loads((Path(__file__).resolve().parents[1]/'deploy/deployed-images.json').read_text(encoding='utf-8'))['images']
+        self.assertEqual(deployment.definition()['properties']['template']['containers'][0]['image'],recorded[deployment.JOB])
+        self.assertEqual(deployment.definition(True)['properties']['template']['containers'][0]['image'],deployment.IMAGE)
+
     def test_bundles_compile_and_are_bounded(self):
         for provision in (False,True):
             args,digest=deployment.bundle(provision)
@@ -177,7 +182,7 @@ class ObservationUpdateTests(TestCase):
     def test_any_other_drift_stops_before_the_put(self):
         for key,value in [('image','ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:'+'0'*64),
                           ('env',[dict(name='DATABASE_URL',secretRef='admin-url')])]:
-            with self.subTest(key=key),self.assertRaises(ValueError):
+            with self.subTest(key=key),self.assertRaisesRegex(ValueError,'beyond its code: '+key):
                 self.run_update(self.live(**{key:value}))
         identity=self.live();identity['identity']['userAssignedIdentities']={deployment.BASE+'other':{}}
         with self.assertRaises(ValueError): self.run_update(identity)

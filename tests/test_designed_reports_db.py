@@ -17,9 +17,8 @@ from unittest.mock import patch
 from test_broker_onboarding_db import ADMIN_DSN, IDENTITY, OWNER_ROLE, TENANT, _dsn, _MigratedDatabase
 
 
-@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
-class DesignedReportRunTests(_MigratedDatabase):
-    """A case with no built-in design waits for the owner's design, then renders every month from it."""
+class _DesignedCase(_MigratedDatabase):
+    """A synthetic composite case with no built-in design, on its own migrated database."""
 
     def _connection(self):
         import psycopg
@@ -93,6 +92,12 @@ class DesignedReportRunTests(_MigratedDatabase):
                    (f"2030-01-01T00:00:{self.submitted:02d}+00:00", draft_id))
         db.commit()
         return spec, template
+
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class DesignedReportRunTests(_DesignedCase):
+    """A case with no built-in design waits for the owner's design, then renders every month from it."""
 
     def test_the_case_waits_for_a_design_then_renders_every_month_from_it(self):
         from ibkr_etl import designed_reports as dr
@@ -187,6 +192,92 @@ class DesignedReportRunTests(_MigratedDatabase):
             designs.append(self._submit_design(db, "Hong Kong dollar design", currency="HKD"))
             self.assertEqual(run()[0]["check"], "fail")
             self.assertIn("Submit a design in USD", check()["message"])
+
+
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class LiveMonthEndTests(_DesignedCase):
+    """After go-live, the month-end renders each new month in the design approved at approval 2."""
+
+    def test_after_go_live_each_month_renders_in_the_approved_design(self):
+        from ibkr_etl import designed_reports as dr
+        from ibkr_etl import onboarding_month_end as live
+        from ibkr_etl.onboarding_v2_web import approve_case, case_detail, record_platform_check
+
+        db = self._connection()
+        case_id = self._case_with_history(db)
+        blobs: dict = {}
+        rendered, ready = [], {"2025-01-31", "2025-02-28"}
+        designs = []
+
+        def fetch(container, blob):
+            return blobs[(container, blob)]
+
+        def store(container, blob, content, content_type):
+            blobs.setdefault((container, blob), content)
+
+        def freeze(connection, *, tenant_id, subject_id, period_start, period_end, reporting_currency,
+                   reject_quality_fail):
+            payload = json.dumps({"subject_id": subject_id, "period_end": period_end,
+                                  "reporting_currency": "USD"}, sort_keys=True)
+            snapshot_id = str(uuid.uuid4())
+            connection.execute(
+                "INSERT INTO reporting_snapshots (snapshot_id, tenant_id, subject_id, period_start, period_end, "
+                "as_of_at, reporting_currency, formula_version, source_manifest_json, snapshot_payload_json, "
+                "data_sha256, quality_status, status, created_at) VALUES (?, ?, ?, ?, ?, 'x', 'USD', 'v1', '{}', ?, "
+                "?, 'warn', 'frozen', 'x')",
+                (snapshot_id, tenant_id, subject_id, period_start, period_end, payload,
+                 hashlib.sha256(payload.encode()).hexdigest()))
+            connection.commit()
+            return types.SimpleNamespace(snapshot_id=snapshot_id)
+
+        def render(spec, payload, *, template_path, example_path, output_path):
+            rendered.append((spec["title"], payload["period_end"]))
+            output_path.write_bytes(f"%PDF {spec['title']} {payload['period_end']}".encode())
+            return {}
+
+        def approve(approval, **extra):
+            terms = case_detail(db, TENANT, case_id)["awaiting_terms_sha256"]
+            result = approve_case(db, TENANT, case_id, approval=approval, terms_sha256=terms,
+                                  **{"acknowledge_warnings": [], "confirmation": None, "actor": IDENTITY, **extra})
+            db.commit()
+            return result
+
+        with patch.object(dr, "freeze_month_end_snapshot", freeze), \
+                patch.object(dr, "month_ready", lambda connection, kind, subject_id, period_end: period_end in ready):
+            designs.append(self._submit_design(db, "Approved design"))
+            dr.run_designed_report_cases(db, TENANT, container="internal-reports", today=date(2025, 3, 3),
+                                         fetch=fetch, store=store, render=render)
+            self.assertEqual(live.live_cases(db, TENANT), [])  # not live yet
+            record_platform_check(db, TENANT, case_id, "agent_review_complete", "pass", "No findings.",
+                                  {"review_id": "synthetic"})
+            db.commit()
+            approve("historical_reports")
+            approve("go_live", confirmation=case_detail(db, TENANT, case_id)["go_live_phrase"])
+            self.assertEqual([c["case_id"] for c in live.live_cases(db, TENANT)], [case_id])
+
+            # A design submitted after go-live does not change the monthly factsheets.
+            designs.append(self._submit_design(db, "Later design", template=b"%PDF later template"))
+            ready.add("2025-03-31")
+            results = live.run_live_month_end(db, TENANT, container="internal-reports", today=date(2025, 4, 2),
+                                              fetch=fetch, store=store, render_design=render)
+        self.assertEqual(results, [{"subject_id": "synthetic-own-design", "status": "processed",
+                                    "latest_month": "2025-03-31", "waiting_for": None}])
+        self.assertEqual(rendered, [("Approved design", "2025-01-31"), ("Approved design", "2025-02-28"),
+                                    ("Approved design", "2025-03-31")])
+        march = db.execute(
+            "SELECT r.status, r.template_id FROM report_generation_runs r JOIN reporting_snapshots s "
+            "USING (tenant_id, snapshot_id) WHERE s.subject_id = 'synthetic-own-design' "
+            "AND s.period_end = '2025-03-31'").fetchall()
+        self.assertEqual([(m["status"], m["template_id"]) for m in march],
+                         [("awaiting_approval", "synthetic-own-design-monthly-factsheet")])
+
+        # A stored design that no longer matches what was approved is refused, not rendered.
+        db.execute("UPDATE factsheet_design_versions SET spec_sha256 = repeat('0', 64)")
+        db.commit()
+        with self.assertRaisesRegex(dr.DesignedReportError, "integrity"):
+            dr.approved_design(db, TENANT, case_id, "synthetic-own-design")
 
 
 if __name__ == "__main__":

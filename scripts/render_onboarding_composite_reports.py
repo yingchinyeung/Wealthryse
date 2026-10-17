@@ -7,6 +7,10 @@ are no longer built. It does nothing until
 migration 064 exists, or while no composite case is waiting on its reports.
 Each case's outcome is recorded on its reports_rendered check; see
 ibkr_etl/composite_reports.py and ibkr_etl/designed_reports.py.
+
+It also renders the month-end factsheets of subjects that went live from a
+new-onboarding case (ibkr_etl/onboarding_month_end.py), which the original
+month-end package cannot render. It exits 3 when one of those failed.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from ibkr_etl.cloud_storage import download_blob_bytes, upload_bytes  # noqa: E4
 from ibkr_etl.composite_reports import HONG_KONG, run_composite_report_cases  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.designed_reports import run_designed_report_cases  # noqa: E402
+from ibkr_etl.onboarding_month_end import run_live_month_end  # noqa: E402
 
 
 def _required(name: str) -> str:
@@ -70,10 +75,16 @@ def main() -> int:
         # Every other case reports in the design its owner made in the factsheet designer.
         designed = run_designed_report_cases(connection, tenant_id, container=container,
                                              today=today, fetch=fetch, store=store)
+        # Subjects that went live from a case render each month in their approved design.
+        live = run_live_month_end(connection, tenant_id, container=container,
+                                  today=today, fetch=fetch, store=store)
     finally:
         connection.close()
-    print(json.dumps({"status": "success", "cases": results, "designed_cases": designed}, sort_keys=True))
-    return 0
+    failed = any(item["status"] == "failed" for item in live)
+    print(json.dumps({"status": "partial_failure" if failed else "success", "cases": results,
+                      "designed_cases": designed, "live_month_end": live}, sort_keys=True))
+    # 3 tells the month-end job that a live subject's month-end failed.
+    return 3 if failed else 0
 
 
 if __name__ == "__main__":

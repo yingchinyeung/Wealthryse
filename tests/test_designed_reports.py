@@ -129,5 +129,61 @@ class DesignerAccessTests(unittest.TestCase):
         self.assertIn("stage IN ('request', 'load_and_reconcile', 'build_history')", source)
 
 
+class LiveMonthEndTests(unittest.TestCase):
+    """Subjects that went live from a case render their month-end like their approved history."""
+
+    CASE = {"case_id": "c-1", "target_subject_id": "hk-composite", "report_style": "alpha-world-ms",
+            "definition_sha256": "d", "source_kind": "composite_portfolio"}
+
+    def run_month_end(self, case, *, fails=None):
+        from ibkr_etl import onboarding_month_end as live
+        calls = []
+
+        def built_in(connection, tenant_id, case, **kwargs):
+            calls.append(("built_in", case["target_subject_id"]))
+            if fails:
+                raise fails
+            return {"reports": [{"period_end": "2025-03-31"}], "waiting_for": None}
+
+        def designed(connection, tenant_id, case, **kwargs):
+            calls.append(("designed", kwargs["design"]["title"]))
+            return {"reports": [], "waiting_for": "2025-03-31"}
+
+        class Connection:
+            def rollback(self):
+                calls.append(("rollback",))
+
+        with mock.patch.object(live, "live_cases", lambda connection, tenant_id: [case]), \
+                mock.patch.object(live.composite_reports, "render_case_reports", built_in), \
+                mock.patch.object(live.designed_reports, "render_case_reports", designed), \
+                mock.patch.object(live.designed_reports, "approved_design",
+                                  lambda connection, tenant_id, case_id, subject_id: {"title": "Approved"}):
+            results = live.run_live_month_end(Connection(), "t", container="c", today=None, fetch=None, store=None)
+        return results, calls
+
+    def test_a_built_in_design_and_an_owner_design_each_render_their_own_way(self):
+        self.assertEqual(self.run_month_end(self.CASE), (
+            [{"subject_id": "hk-composite", "status": "processed", "latest_month": "2025-03-31",
+              "waiting_for": None}], [("built_in", "hk-composite")]))
+        own = {**self.CASE, "target_subject_id": "U1234567", "report_style": None}
+        self.assertEqual(self.run_month_end(own)[1], [("designed", "Approved")])
+
+    def test_a_failure_is_reported_for_that_subject(self):
+        results, calls = self.run_month_end(self.CASE, fails=RuntimeError("no snapshot\n for March"))
+        self.assertEqual(results, [{"subject_id": "hk-composite", "status": "failed",
+                                    "reason": "no snapshot for March"}])
+        self.assertIn(("rollback",), calls)
+
+    def test_the_month_end_job_hands_live_subjects_to_the_onboarding_run(self):
+        from pathlib import Path
+        scripts = Path(__file__).resolve().parents[1] / "scripts"
+        registry = (scripts / "run_registry_month_end_packages.py").read_text()
+        self.assertIn('if str(row["subject_id"]) in live_subjects:', registry)
+        self.assertIn('"status": "onboarding_month_end"', registry)
+        reports = (scripts / "render_onboarding_composite_reports.py").read_text()
+        self.assertIn("run_live_month_end(", reports)
+        self.assertIn("return 3 if failed else 0", reports)
+
+
 if __name__ == "__main__":
     unittest.main()

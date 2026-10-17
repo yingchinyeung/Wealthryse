@@ -40,6 +40,8 @@ APPROVAL_GRANTS = (
     "ibkr_flex_source_accounts, subject_flex_source_bindings, subject_operating_registrations, "
     "institutional_work_items TO {role}",
     "GRANT INSERT ON TABLE audit_events TO {role}",
+    # As bootstrap grants it: the revert reads whether v2's pull already loaded NAV rows.
+    "GRANT SELECT ON TABLE accounts, nav_snapshots, ingestion_runs TO {role}",
     "GRANT USAGE, SELECT ON SEQUENCE audit_events_audit_event_id_seq TO {role}",
 )
 
@@ -602,6 +604,118 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
         self.assertEqual((state["daily_feed_source"]["schedule_hour"], state["daily_feed_source"]["schedule_minute"]),
                          (16, 20))
         self.assertEqual(flex_import_failures(state, today_hkt=today), [])
+
+    def _first_pull(self, *accounts):
+        """Cutover, dispatch and one successful pull for yesterday HKT. Returns (x, today)."""
+        from ibkr_etl.flex_client import FlexReport
+
+        today = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
+        x = today - timedelta(days=1)
+        for account in accounts:
+            self._subject(account)
+        content = statement(x, *accounts)
+        self._apply(self._request(x, content), today)
+
+        class FakeClient:
+            def __init__(self, settings):
+                pass
+
+            def request_report(self, start, end):
+                return FlexReport(content=content, content_type="application/xml", reference_code="SYNTHETIC-2")
+
+        self._run_dispatcher()
+        self.assertEqual(self._run_worker(FakeClient), 0)
+        return x, today
+
+    def test_an_account_with_two_onboarding_cases_is_imported_and_the_tenant_keeps_its_name(self):
+        account = "U9450001"
+        self._subject(account)
+        # Three cases point at the same subject: v1.1's, a Flex one and a cancelled Flex one.
+        for system, source_account, status in (("existing_v11", account, "active"),
+                                               ("ibkr_flex", account, "in_progress"),
+                                               ("ibkr_flex", account + "-OLD", "cancelled")):
+            case_id = uuid.uuid4()
+            self.db.execute("INSERT INTO account_onboarding_cases (case_id, target_subject_id, source_system, "
+                            "source_account_id, stage, status) VALUES (%s, %s, %s, %s, 'data_import', %s)",
+                            (case_id, account, system, source_account, status))
+            self.db.execute("INSERT INTO account_onboarding_checks (case_id, check_id, status, message) "
+                            "VALUES (%s, 'data_import_reconciled', 'pending', 'Waiting for the import')",
+                            (case_id,))
+        self.db.commit()
+        from ibkr_etl.flex_client import FlexReport
+
+        today = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
+        x = today - timedelta(days=1)
+        content = statement(x, account)
+        self._apply(self._request(x, content), today)
+
+        class FakeClient:
+            def __init__(self, settings):
+                pass
+
+            def request_report(self, start, end):
+                return FlexReport(content=content, content_type="application/xml", reference_code="SYNTHETIC-3")
+
+        self._run_dispatcher()
+        self.assertEqual(self._run_worker(FakeClient), 0)
+        statuses = sorted((row["source_system"], row["case_status"], row["status"]) for row in self.db.execute(
+            "SELECT cases.source_system, cases.status AS case_status, checks.status "
+            "FROM account_onboarding_checks AS checks JOIN account_onboarding_cases AS cases USING (case_id)"))
+        self.assertEqual(statuses, [("existing_v11", "active", "pass"), ("ibkr_flex", "cancelled", "pending"),
+                                    ("ibkr_flex", "in_progress", "pass")])
+        self.assertEqual({(r["work_kind"], r["status"]) for r in self.db.execute(
+            "SELECT work_kind, status FROM institutional_work_items WHERE work_kind <> 'analytics_rebuild'")},
+            {("account_import", "succeeded"), ("flex_statement_request", "succeeded"),
+             ("source_partition", "succeeded")})
+        # Loading never renames the tenant (the job sets no tenant name).
+        self.assertEqual(self.db.execute("SELECT name FROM tenants WHERE tenant_id = %s",
+                                         (self.tenant,)).fetchone()["name"], "Synthetic")
+        self.db.rollback()
+
+    def test_the_revert_refuses_once_rows_are_loaded_unless_allowed(self):
+        from ibkr_etl.flex_cutover import CutoverRefused, apply_revert, plan_revert
+
+        x, _today = self._first_pull("U9460001", "U9460002")
+        # The load commits before reconciliation, so a pull that failed afterwards still loaded rows.
+        self.db.execute("UPDATE institutional_work_items SET status = 'dead_letter' "
+                        "WHERE work_kind = 'flex_statement_request'")
+        self.db.commit()
+        plan = plan_revert(self.approval, tenant_id=self.tenant, effective_date=x)
+        self.approval.rollback()
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual((plan["flex_requests_sent"], plan["rows_loaded_by_flex_pull"]), (1, 2))
+        self.assertTrue(any("fix forward" in warning for warning in plan["warnings"]))
+
+        before = self._snapshot()
+        with self.assertRaises(CutoverRefused) as refused:
+            apply_revert(self.approval, tenant_id=self.tenant, effective_date=x, approver_sha256=APPROVER)
+        self.approval.rollback()
+        self.assertIn("allow_after_load", str(refused.exception))
+        self.assertEqual(self._snapshot(), before)
+
+        reverted = apply_revert(self.approval, tenant_id=self.tenant, effective_date=x,
+                                approver_sha256=APPROVER, allow_after_load=True)
+        self.approval.commit()
+        self.assertEqual((reverted["status"], reverted["allowed_after_load"]), ("reverted", True))
+
+    def test_the_revert_goes_ahead_when_the_request_failed_before_loading(self):
+        from ibkr_etl.flex_cutover import apply_revert, plan_revert
+
+        x, today = date(2026, 10, 20), date(2026, 10, 21)
+        self._subject("U9470001")
+        source = self._apply(self._request(x, statement(x, "U9470001")), today)["query"]["flex_source_id"]
+        # An IBKR error: the request was sent and failed, and nothing was loaded.
+        self.db.execute("INSERT INTO institutional_work_items (work_item_id, flex_source_id, work_kind, "
+                        "ordering_key, idempotency_key, status, payload_json, maximum_attempts, completed_at) "
+                        "VALUES (%s, %s, 'flex_statement_request', 'credential:x', %s, 'dead_letter', %s, 1, now())",
+                        (uuid.uuid4(), source, f"flex:{source}:{x}", json.dumps({"run_date": str(x)})))
+        self.db.commit()
+        plan = plan_revert(self.approval, tenant_id=self.tenant, effective_date=x)
+        self.approval.rollback()
+        self.assertEqual((plan["flex_requests_sent"], plan["rows_loaded_by_flex_pull"]), (1, 0))
+        reverted = apply_revert(self.approval, tenant_id=self.tenant, effective_date=x, approver_sha256=APPROVER)
+        self.approval.commit()
+        self.assertEqual((reverted["status"], reverted["allowed_after_load"]), ("reverted", False))
 
     def test_a_lockout_is_recorded_and_the_next_run_leaves_it_alone(self):
         from ibkr_etl.flex_client import FlexError

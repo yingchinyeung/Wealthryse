@@ -685,19 +685,39 @@ def plan_revert(
         )
         sources.update(entry["flex_source_ids"])
     plan["flex_source_ids"] = sorted(sources)
+    plan["flex_requests_sent"] = 0
+    plan["rows_loaded_by_flex_pull"] = 0
     if sources:
-        pulls = connection.execute(
+        sent = connection.execute(
             """
             SELECT COUNT(*) AS n FROM institutional_work_items
             WHERE tenant_id = %s AND work_kind = 'flex_statement_request'
-              AND status = 'succeeded' AND flex_source_id = ANY(%s::uuid[])
+              AND status NOT IN ('queued', 'cancelled') AND flex_source_id = ANY(%s::uuid[])
             """,
             (tenant_id, sorted(sources)),
         ).fetchone()
-        if int(pulls["n"]):
+        plan["flex_requests_sent"] = int(sent["n"])
+        if plan["flex_requests_sent"]:
+            warnings.append(f"{plan['flex_requests_sent']} Flex request(s) were already sent for these accounts")
+    reverting_ids = sorted(item["subject_id"] for item in plan["subjects"] if item.get("action") == "revert")
+    if reverting_ids:
+        # Rows count as loaded whatever the pull's final status: the load commits before
+        # reconciliation, so a pull that failed afterwards may still have written them.
+        loaded = connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM nav_snapshots AS nav
+            JOIN ingestion_runs AS runs ON runs.run_id = nav.last_seen_run_id
+            WHERE runs.tenant_id = %s AND nav.account_id = ANY(%s::text[])
+              AND runs.run_type = 'institutional-flex-daily'
+            """,
+            (tenant_id, reverting_ids),
+        ).fetchone()
+        plan["rows_loaded_by_flex_pull"] = int(loaded["n"])
+        if plan["rows_loaded_by_flex_pull"]:
             warnings.append(
-                f"{int(pulls['n'])} Flex pull(s) already loaded rows; account-sync's exact "
-                "row counts will not match them, so fix forward rather than revert"
+                f"v2's Flex pull already loaded {plan['rows_loaded_by_flex_pull']} NAV row(s) for these "
+                "accounts; account-sync's exact row counts will not match them, so fix forward rather "
+                "than revert (the revert refuses unless it is allowed after a load)"
             )
     if problems:
         return plan
@@ -713,7 +733,10 @@ def apply_revert(
     effective_date: date,
     approver_sha256: str,
     subject_ids: tuple[str, ...] = (),
+    allow_after_load: bool = False,
 ) -> dict[str, Any]:
+    """Restore the existing_v11 path. Refuses once v2's pull has loaded rows for these
+    accounts, unless allow_after_load: account-sync's exact row counts would then fail."""
     if not IDENTITY_SHA256.fullmatch(approver_sha256 or ""):
         raise ValueError("Reverting the cutover requires an approver")
     _lock(connection)
@@ -725,6 +748,14 @@ def apply_revert(
         raise CutoverRefused(plan)
     if plan["status"] == "already_reverted":
         return plan
+    if plan["rows_loaded_by_flex_pull"] and not allow_after_load:
+        plan["status"] = "refused"
+        plan["problems"].append(
+            "v2's Flex pull already loaded rows for these accounts; fix forward, or revert "
+            "deliberately with allow_after_load"
+        )
+        raise CutoverRefused(plan)
+    plan["allowed_after_load"] = bool(plan["rows_loaded_by_flex_pull"])
     for item in plan["subjects"]:
         if item.get("action") != "revert":
             continue

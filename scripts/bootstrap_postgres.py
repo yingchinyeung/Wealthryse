@@ -114,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             only_migration=args.only_migration,
             allow_pending=allow_pending,
             allow_applied_without_file=args.allow_applied_without_file,
+            set_tenant_name=True,
         )
     finally:
         if previous is None:

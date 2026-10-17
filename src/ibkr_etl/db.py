@@ -241,7 +241,13 @@ def initialize(
     only_migration: str | None = None,
     allow_pending: Sequence[str] = (),
     allow_applied_without_file: Sequence[str] = (),
+    set_tenant_name: bool = False,
 ) -> list[str]:
+    """Prepare the database and make sure the tenant row exists.
+
+    An existing tenant keeps its name unless set_tenant_name is true (bootstrap sets it);
+    a job that only loads data must never rename the tenant as a side effect.
+    """
     if database_url.startswith(("postgres://", "postgresql://")):
         connection = connect(database_path, database_url, tenant_id)
         applied: list[str] = []
@@ -266,8 +272,8 @@ def initialize(
                 """
                 INSERT INTO tenants(tenant_id, name, status, created_at)
                 VALUES (?, ?, 'active', ?)
-                ON CONFLICT(tenant_id) DO UPDATE SET name = excluded.name
-                """,
+                ON CONFLICT(tenant_id) DO """
+                + ("UPDATE SET name = excluded.name" if set_tenant_name else "NOTHING"),
                 (tenant_id, tenant_name, utc_now_iso()),
             )
             connection.commit()

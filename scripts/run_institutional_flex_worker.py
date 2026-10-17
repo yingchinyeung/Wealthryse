@@ -187,16 +187,20 @@ def _process_non_request(connection, claim) -> dict:
         raise RuntimeError("Downstream Flex work has no subject")
     evidence = _subject_evidence(connection, claim.subject_id)
     if claim.work_kind == "account_import":
+        # A subject can have more than one onboarding case (an existing_v11 case and an
+        # ibkr_flex one, for example), so this joins rather than expecting a single case.
         connection.execute(
             """
-            UPDATE account_onboarding_checks
+            UPDATE account_onboarding_checks AS checks
             SET status = 'pass',
                 message = 'The IBKR data import and row-count reconciliation passed.',
                 evidence_json = ?::jsonb, checked_at = now()
-            WHERE case_id = (
-                SELECT case_id FROM account_onboarding_cases
-                WHERE target_subject_id = ?
-            ) AND check_id = 'data_import_reconciled'
+            FROM account_onboarding_cases AS cases
+            WHERE checks.tenant_id = cases.tenant_id
+              AND checks.case_id = cases.case_id
+              AND checks.check_id = 'data_import_reconciled'
+              AND cases.target_subject_id = ?
+              AND cases.status <> 'cancelled'
             """,
             (canonical_json(evidence), claim.subject_id),
         )

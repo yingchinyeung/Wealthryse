@@ -15,13 +15,14 @@ the existing_v11 registrations the cutover closed. Both are safe to re-run.
       --token-secret-name ibkr-flex-source-<32 hex> --statement v11.xml \
       [--account U...] [--token-fingerprint <16 hex>] [--approved-by <identity>] [--apply]
   python scripts/cutover_v11_accounts_to_flex.py --revert --effective-date 2026-10-18 \
-      [--account U...] --approved-by <identity> [--apply]
+      [--account U...] --approved-by <identity> [--allow-after-load] [--apply]
 
 The effective date is the first data date the Flex pull owns. With
 INSTITUTIONAL_DISPATCH_RUN_DATE=previous_hkt_day, a switch on day D uses D - 1.
 No IBKR request is made; the statement is one v1.1 already downloaded.
-Run it last on D, after the Azure schedule changes; after a successful Flex
-pull, fix forward rather than revert (see src/ibkr_etl/flex_cutover.py).
+Run it last on D, after the Azure schedule changes. Once v2's pull has loaded
+rows for these accounts, fix forward rather than revert: the revert refuses
+unless --allow-after-load is given (see src/ibkr_etl/flex_cutover.py).
 """
 
 from __future__ import annotations
@@ -76,12 +77,17 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--statement", type=Path, help="one v1.1 Flex statement (XML)")
     parser.add_argument("--approved-by", help="approver's Entra object ID or email")
     parser.add_argument("--revert", action="store_true")
+    parser.add_argument("--allow-after-load", action="store_true",
+                        help="revert even though v2's pull already loaded rows (account-sync's row "
+                             "counts will then fail; fixing forward is preferred)")
     parser.add_argument("--apply", action="store_true", help="write; without it nothing changes")
     arguments = parser.parse_args(argv)
     if not arguments.revert and (not arguments.token_secret_name or not arguments.statement):
         parser.error("--token-secret-name and --statement are required for the cutover")
     if arguments.apply and not arguments.approved_by:
         parser.error("--approved-by is required with --apply")
+    if arguments.allow_after_load and not arguments.revert:
+        parser.error("--allow-after-load only applies to --revert")
     if arguments.token_fingerprint and arguments.token_fingerprint_from_vault:
         parser.error("use --token-fingerprint or --token-fingerprint-from-vault, not both")
     if arguments.query_id_secret_name is not None and not QUERY_SECRET_NAME.fullmatch(arguments.query_id_secret_name):
@@ -128,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
                         connection, tenant_id=tenant_id,
                         effective_date=arguments.effective_date,
                         approver_sha256=approver, subject_ids=accounts,
+                        allow_after_load=arguments.allow_after_load,
                     )
                 else:
                     result = plan_revert(

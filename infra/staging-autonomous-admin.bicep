@@ -25,17 +25,22 @@ param azureSubscriptionId string
 param portfolioTenantId string = '00000000-0000-0000-0000-000000000001'
 param pilotAccountId string = 'U16088571'
 // Medallion layer freshness (src/ibkr_etl/layer_freshness.py). Off by default, which
-// leaves the supervisor's environment exactly as before. The bronze-market-data
-// checks also need the container name and Storage Blob Data Reader on it.
+// leaves the supervisor's environment exactly as before. The bronze-market-data file
+// checks have their own switch, for once raw capture is on; they also need the
+// container name and Storage Blob Data Reader on it for the diagnostics identity.
 param layerFreshnessEnabled bool = false
+param layerFreshnessBlobChecks bool = false
 param rawMarketDataContainer string = ''
 param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
-var layerFreshnessEnv = !layerFreshnessEnabled ? [] : concat([
-  { name: 'LAYER_FRESHNESS_ENABLED', value: 'true' }
+var layerFreshnessBlobEnv = !layerFreshnessBlobChecks ? [] : concat([
+  { name: 'LAYER_FRESHNESS_BLOB_CHECKS', value: 'true' }
 ], empty(rawMarketDataContainer) ? [] : [
   { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
   { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
 ])
+var layerFreshnessEnv = !layerFreshnessEnabled ? [] : concat([
+  { name: 'LAYER_FRESHNESS_ENABLED', value: 'true' }
+], layerFreshnessBlobEnv)
 
 var tags = {
   application: 'wealthryse-portfolio-data-platform'

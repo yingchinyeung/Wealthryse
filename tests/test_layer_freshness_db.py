@@ -3,15 +3,18 @@
 Needs a disposable server: set AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI starts
 one). Skipped otherwise. Creates and drops its own database and roles and writes
 synthetic rows only. Shows which checks the approval login (the autonomous
-administrator's DATABASE_URL) can read today, and the grants that make the rest readable.
+administrator's DATABASE_URL) can read today, the grants that make the rest readable,
+and how the administrator records checks it cannot read.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from ibkr_etl import layer_freshness
 
@@ -40,6 +43,14 @@ FRESHNESS_GRANTS = (
 )
 UNREADABLE_TODAY = {"bronze.raw_reports", "bronze.flex_rows", "gold.risk_analytics_snapshots",
                     "gold.crisis_scenario_results", "gold.crisis_replay_daily"}
+
+
+def _supervisor():
+    spec = importlib.util.spec_from_file_location(
+        "autonomous_supervisor", ROOT / "scripts" / "run_autonomous_administrator.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _dsn(database: str, user: str | None = None) -> str:
@@ -162,9 +173,11 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
 
     def _results(self, user: str) -> dict:
         results = layer_freshness.run_read_only(_dsn(self.database, user), TENANT, now=NOW, environ={})
-        return {r["check_id"]: r for r in results if not r.get("feed")}
+        return {r["check_id"]: r for r in results}
 
     def test_every_query_runs_and_judges_the_synthetic_day_fresh(self):
+        # A login with the reads (here the owner) sees every check, through the same
+        # read-only session the administrator opens.
         results = self._results(OWNER)
         self.assertEqual(len(results), len([r for r in layer_freshness.RULES if r.query]))
         self.assertEqual({k: r["state"] for k, r in results.items() if r["state"] != "fresh"}, {})
@@ -174,15 +187,34 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
         self.assertEqual(results["silver.benchmark_prices"]["observed"], "2026-10-16T08:31:00+00:00")
         self.assertEqual(results["gold.crisis_scenario_results"]["observed"], "2026-10-15")
 
-    def test_the_check_cannot_write(self):
+    def test_the_session_refuses_writes(self):
         import psycopg
 
-        # run_read_only opens its connection with these options.
-        with psycopg.connect(_dsn(self.database, OWNER), autocommit=True,
-                             options="-c default_transaction_read_only=on") as connection:
-            connection.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
-            with self.assertRaises(psycopg.errors.ReadOnlySqlTransaction):
-                connection.execute("DELETE FROM raw_reports")
+        session = layer_freshness.open_read_only(_dsn(self.database, OWNER), TENANT)
+        try:
+            settings = session.execute(
+                "SELECT current_setting('transaction_read_only') AS read_only, "
+                "current_setting('statement_timeout') AS statement, current_setting('lock_timeout') AS lock"
+            ).fetchone()
+            self.assertEqual((settings["read_only"], settings["statement"], settings["lock"]), ("on", "5s", "2s"))
+            for statement in ("DELETE FROM raw_reports",
+                              "UPDATE nav_snapshots SET currency = 'HKD'",
+                              "INSERT INTO system_incidents(incident_key, check_id, severity, status, description, "
+                              "evidence_json, first_seen_at, last_seen_at) VALUES "
+                              "('x', 'x', 'info', 'open', 'x', '{}', 'x', 'x')"):
+                with self.subTest(statement=statement.split()[0]):
+                    with self.assertRaises(psycopg.errors.ReadOnlySqlTransaction):
+                        with session.transaction():
+                            session.execute(statement)
+            # Nor can the session switch itself to read-write.
+            with self.assertRaises(psycopg.errors.ActiveSqlTransaction):
+                with session.transaction():
+                    session.execute("SET TRANSACTION READ WRITE")
+        finally:
+            session.rollback()
+            session.close()
+        with psycopg.connect(_dsn(self.database, OWNER)) as owner:
+            self.assertEqual(owner.execute("SELECT count(*) FROM raw_reports").fetchone()[0], 1)
 
     def test_approval_login_today_and_with_the_switch_on_grants(self):
         import psycopg
@@ -213,6 +245,55 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
                                        ("crisis_replay_daily", "tenant_id, holdings_as_of")):
                     owner.execute(f"REVOKE SELECT ({columns}) ON {table} FROM {APPROVAL}")
                 owner.commit()
+
+    def test_administrator_holds_unreadable_checks_open_and_warns_after_an_hour(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        supervisor = _supervisor()
+        late_key = "layer_freshness:gold.crisis_scenario_results"
+        with psycopg.connect(_dsn(self.database, OWNER), row_factory=dict_row) as admin:
+            admin.execute("DELETE FROM system_incidents")
+            # An earlier run found the crisis results late.
+            admin.execute(
+                "INSERT INTO system_incidents(incident_key, check_id, severity, status, description, "
+                "evidence_json, first_seen_at, last_seen_at) VALUES (%s, 'layer_freshness', 'warning', 'open', "
+                "'Gold layer is late', '{}', '2026-10-16T10:00:00+00:00', '2026-10-16T10:00:00+00:00')",
+                (late_key,))
+            admin.commit()
+
+            def run(now, database_url, extra=None):
+                with patch.dict("os.environ", {"LAYER_FRESHNESS_ENABLED": "true", **(extra or {})}), \
+                        patch("builtins.print"):
+                    review = supervisor._layer_freshness_review(admin, database_url, TENANT, now=now)
+                ids, announce = supervisor._synchronize(admin, list(review.findings), now.isoformat(), review)
+                admin.commit()
+                rows = admin.execute("SELECT incident_key, severity, status FROM system_incidents").fetchall()
+                return announce, {row["incident_key"]: (row["severity"], row["status"]) for row in rows}
+
+            trackers = {"layer_freshness:unavailable:" + check for check in UNREADABLE_TODAY}
+            # The administrator's own login (the approval role) cannot read five checks.
+            approval_url = _dsn(self.database, APPROVAL)
+            announce, incidents = run(NOW, approval_url)
+            self.assertEqual(incidents[late_key], ("warning", "open"))  # unreadable, so not closed
+            self.assertEqual({k for k, (_, status) in incidents.items() if status == "open"} - {late_key}, trackers)
+            self.assertEqual({incidents[k][0] for k in trackers}, {"info"})
+            self.assertEqual(announce, set())  # info is recorded, not announced
+
+            announce, incidents = run(NOW + timedelta(minutes=30), approval_url)
+            self.assertEqual({incidents[k][0] for k in trackers}, {"info"})
+            self.assertEqual(announce, set())
+
+            announce, incidents = run(NOW + timedelta(minutes=61), approval_url)
+            self.assertEqual({incidents[k] for k in trackers}, {("warning", "open")})
+            self.assertEqual(announce, trackers)  # announced once, when they become warnings
+            self.assertEqual(incidents[late_key], ("warning", "open"))
+
+            # A login that can read everything: every check is fresh, so all close.
+            announce, incidents = run(NOW + timedelta(minutes=70), approval_url,
+                                      {"LAYER_FRESHNESS_DATABASE_URL": _dsn(self.database, OWNER)})
+            self.assertEqual({status for _, status in incidents.values()}, {"resolved"})
+            self.assertEqual(announce, set())
 
 
 if __name__ == "__main__":

@@ -11,18 +11,23 @@ finishes is judged against yesterday's cycle.
   due date (weekends and market holidays need the slack).
 
 The autonomous administrator raises late required checks as system incidents when
-LAYER_FRESHNESS_ENABLED is on. Run `python -m ibkr_etl.layer_freshness` for a dry run.
+LAYER_FRESHNESS_ENABLED is on. The bronze-market-data file checks also need
+LAYER_FRESHNESS_BLOB_CHECKS, so they can wait until raw capture is switched on.
+Run `python -m ibkr_etl.layer_freshness` for a dry run.
 """
 from __future__ import annotations
 
 import json
 import os
+import threading
 import time as monotonic_time
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
 ENABLED_ENV = "LAYER_FRESHNESS_ENABLED"
+BLOB_CHECKS_ENV = "LAYER_FRESHNESS_BLOB_CHECKS"
+DATABASE_URL_ENV = "LAYER_FRESHNESS_DATABASE_URL"  # optional override of DATABASE_URL
 LOADED = "loaded_at"
 AS_OF = "as_of_date"
 LATE_STATES = frozenset({"late", "missing", "future"})
@@ -30,6 +35,13 @@ MARKET_DATA_TARGET = "ibkrv2stgauhecwc4itaoo/bronze-market-data"
 FEED_LOOKBACK_DAYS = 3
 FUTURE_TOLERANCE = timedelta(minutes=10)
 DEFAULT_TIME_BUDGET_SECONDS = 15.0
+CONNECT_TIMEOUT_SECONDS = 5
+STATEMENT_TIMEOUT_MS = 5000
+LOCK_TIMEOUT_MS = 2000
+# error_scope of an unavailable result: one check failed, or the whole session did
+# (no database connection, storage not configured, time budget used).
+CHECK_SCOPE = "check"
+SESSION_SCOPE = "session"
 
 
 @dataclass(frozen=True)
@@ -62,9 +74,10 @@ RULES: tuple[Rule, ...] = (
          query="SELECT r.started_at AS observed FROM flex_rows f "
                "JOIN ingestion_runs r ON r.run_id = f.first_seen_run_id "
                "ORDER BY f.flex_row_id DESC LIMIT 1"),
-    # Bronze: newest raw market-data file per feed (written by S2 raw capture).
+    # Bronze: newest raw market-data file per feed in its dated folders (S2 raw capture).
+    # yahoo-crisis-history has no rule: crisis windows are finished history, filed
+    # once under history/, so no new file is expected each day.
     _feed("yahoo-benchmark-history", time(9, 30)),
-    _feed("yahoo-crisis-history", time(10, 0)),
     _feed("treasury-par-yield", time(23, 30)),
     # Fetched only when a subject needs them (FX, new holdings, licensed HIBOR, derived-daily).
     _feed("yahoo-fx-history", time(9, 30), required=False),
@@ -104,9 +117,23 @@ RULES: tuple[Rule, ...] = (
 )
 
 
-def enabled(environ: Mapping[str, str] | None = None) -> bool:
+def _flag(environ: Mapping[str, str] | None, name: str) -> bool:
     environ = os.environ if environ is None else environ
-    return str(environ.get(ENABLED_ENV, "")).strip().lower() in {"1", "true", "yes", "on"}
+    return str(environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def enabled(environ: Mapping[str, str] | None = None) -> bool:
+    return _flag(environ, ENABLED_ENV)
+
+
+def blob_checks_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    return _flag(environ, BLOB_CHECKS_ENV)
+
+
+def active_rules(environ: Mapping[str, str] | None = None) -> tuple[Rule, ...]:
+    """Every database rule; the bronze-market-data rules only with blob checks on."""
+    blobs = blob_checks_enabled(environ)
+    return tuple(rule for rule in RULES if blobs or not rule.feed)
 
 
 def last_due(now: datetime, due_utc: time) -> datetime:
@@ -133,7 +160,8 @@ def _date(value: Any) -> date:
     return date.fromisoformat(str(value).strip()[:10])
 
 
-def evaluate(rule: Rule, observed: Any, *, now: datetime, error: str | None = None) -> dict[str, Any]:
+def evaluate(rule: Rule, observed: Any, *, now: datetime, error: str | None = None,
+             scope: str = CHECK_SCOPE) -> dict[str, Any]:
     """Judge one observation; the result is plain JSON."""
     due = last_due(now, rule.due_utc)
     result: dict[str, Any] = {
@@ -144,7 +172,7 @@ def evaluate(rule: Rule, observed: Any, *, now: datetime, error: str | None = No
     if rule.feed:
         result["feed"] = rule.feed
     if error is not None:
-        result["error"] = error
+        result.update(error=error, error_scope=scope)
     elif observed is None:
         result["state"] = "missing"
     else:
@@ -165,12 +193,12 @@ def evaluate(rule: Rule, observed: Any, *, now: datetime, error: str | None = No
                 result["state"] = ("future" if value > now.astimezone(timezone.utc).date() + timedelta(days=1)
                                    else "late" if value < earliest_day else "fresh")
         except (TypeError, ValueError):
-            result.update(state="unavailable", error="unreadable value")
+            result.update(state="unavailable", error="unreadable value", error_scope=CHECK_SCOPE)
     result["late"] = bool(rule.required and result["state"] in LATE_STATES)
     return result
 
 
-def _error_label(error: Exception) -> str:
+def _error_label(error: BaseException) -> str:
     name = type(error).__name__
     sqlstate = getattr(error, "sqlstate", None)
     return f"{name} ({sqlstate})" if sqlstate else name
@@ -188,6 +216,18 @@ def newest_feed_blob(newest_blob_time: Callable[[str], datetime | None], feed: s
     return None
 
 
+def _query(connection: Any, sql: str) -> Any:
+    """One rule's query. Inside a transaction each runs under a savepoint, so a denied
+    or cancelled query does not abort the ones after it."""
+    transaction = getattr(connection, "transaction", None)
+    if transaction is None:
+        row = connection.execute(sql).fetchone()
+    else:
+        with transaction():
+            row = connection.execute(sql).fetchone()
+    return None if row is None else (row["observed"] if isinstance(row, Mapping) else row[0])
+
+
 def collect(
     connection: Any,
     *,
@@ -196,30 +236,35 @@ def collect(
     rules: Iterable[Rule] = RULES,
     time_budget_seconds: float = DEFAULT_TIME_BUDGET_SECONDS,
     clock: Callable[[], float] = monotonic_time.monotonic,
+    results: list[dict[str, Any]] | None = None,
+    database_error: str | None = None,
+    storage_error: str | None = None,
 ) -> list[dict[str, Any]]:
     """Measure and judge every rule. Never raises; problems become 'unavailable'.
 
-    `connection` should be an autocommit, read-only connection so one failed query
-    does not affect the next. `newest_blob_time(prefix)` lists bronze-market-data.
+    `connection` is a read-only session (see open_read_only). `newest_blob_time(prefix)`
+    lists bronze-market-data. Results are appended to `results` as they are made, so a
+    caller that stops waiting still has the finished ones.
     """
-    results = []
+    results = [] if results is None else results
     started = clock()
     for rule in rules:
         if clock() - started > time_budget_seconds:
-            results.append(evaluate(rule, None, now=now, error="time budget used"))
+            results.append(evaluate(rule, None, now=now, error="time budget used", scope=SESSION_SCOPE))
             continue
         try:
             if rule.feed:
                 if newest_blob_time is None:
-                    results.append(evaluate(rule, None, now=now, error="bronze-market-data not configured"))
+                    results.append(evaluate(rule, None, now=now, scope=SESSION_SCOPE,
+                                            error=storage_error or "bronze-market-data not configured"))
                     continue
                 observed = newest_feed_blob(newest_blob_time, rule.feed, now=now)
             else:
                 if connection is None:
-                    results.append(evaluate(rule, None, now=now, error="database not configured"))
+                    results.append(evaluate(rule, None, now=now, scope=SESSION_SCOPE,
+                                            error=database_error or "database not configured"))
                     continue
-                row = connection.execute(rule.query).fetchone()
-                observed = None if row is None else (row["observed"] if isinstance(row, Mapping) else row[0])
+                observed = _query(connection, rule.query)
             results.append(evaluate(rule, observed, now=now))
         except Exception as error:  # noqa: BLE001 - report, never fail the caller
             results.append(evaluate(rule, None, now=now, error=_error_label(error)))
@@ -235,54 +280,106 @@ def summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def run_read_only(database_url: str, tenant_id: str, *, now: datetime | None = None,
-                  environ: Mapping[str, str] | None = None) -> list[dict[str, Any]]:
-    """Open read-only database and blob clients, collect, close. Never raises."""
-    environ = os.environ if environ is None else environ
-    now = now or datetime.now(timezone.utc)
-    connection = None
-    blob_lister = None
-    connection_error = None
-    try:
-        import psycopg
-        from psycopg.rows import dict_row
+def open_read_only(database_url: str, tenant_id: str) -> Any:
+    """A session inside one READ ONLY transaction with short statement and lock
+    timeouts. The caller rolls back and closes it."""
+    import psycopg
+    from psycopg.rows import dict_row
 
-        connection = psycopg.connect(
-            database_url, autocommit=True, connect_timeout=5, row_factory=dict_row,
-            options="-c default_transaction_read_only=on -c statement_timeout=5000 -c lock_timeout=2000",
+    connection = psycopg.connect(database_url, connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                                 row_factory=dict_row)
+    try:
+        connection.read_only = True  # psycopg starts each transaction with BEGIN READ ONLY
+        connection.execute(
+            "SELECT set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true), "
+            "set_config('app.tenant_id', %s, true)",
+            (str(STATEMENT_TIMEOUT_MS), str(LOCK_TIMEOUT_MS), tenant_id),
         )
-        connection.execute("SELECT set_config('app.tenant_id', %s, false)", (tenant_id,))
-    except Exception as error:  # noqa: BLE001
-        connection_error = _error_label(error)
-        connection = None
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _blob_lister(environ: Mapping[str, str]) -> tuple[Callable[[str], datetime | None] | None, str | None]:
     account_url = str(environ.get("AZURE_STORAGE_ACCOUNT_URL", "")).strip()
     container = str(environ.get("MARKET_DATA_RAW_CONTAINER", "")).strip()
-    if account_url and container:
-        try:
-            from .cloud_storage import container_client, newest_blob_time
-
-            client = container_client(account_url, container, connection_timeout=3,
-                                      read_timeout=5, retry_total=0)
-            blob_lister = lambda prefix: newest_blob_time(client, prefix)  # noqa: E731
-        except Exception:  # noqa: BLE001
-            blob_lister = None
+    if not (account_url and container):
+        return None, "bronze-market-data not configured"
     try:
-        results = collect(connection, now=now, newest_blob_time=blob_lister)
-        if connection_error:
-            for result in results:
-                if result.get("error") == "database not configured":
-                    result["error"] = connection_error
-        return results
+        from .cloud_storage import best_effort_credential, container_client, newest_blob_time
+
+        client = container_client(
+            account_url, container,
+            credential=best_effort_credential(connection_timeout=3, read_timeout=5),
+            connection_timeout=3, read_timeout=5, retry_total=0,
+        )
+        return (lambda prefix: newest_blob_time(client, prefix)), None
+    except Exception as error:  # noqa: BLE001
+        return None, _error_label(error)
+
+
+def _measure(database_url: str, tenant_id: str, *, now: datetime, environ: Mapping[str, str],
+             rules: tuple[Rule, ...], results: list[dict[str, Any]], budget: float) -> None:
+    connection = None
+    database_error = None
+    try:
+        try:
+            connection = open_read_only(database_url, tenant_id)
+        except Exception as error:  # noqa: BLE001
+            database_error = _error_label(error)
+        lister, storage_error = (None, None)
+        if any(rule.feed for rule in rules):
+            lister, storage_error = _blob_lister(environ)
+        collect(connection, now=now, newest_blob_time=lister, rules=rules, time_budget_seconds=budget,
+                results=results, database_error=database_error, storage_error=storage_error)
     finally:
         if connection is not None:
             try:
+                connection.rollback()
                 connection.close()
             except Exception:  # noqa: BLE001
                 pass
 
 
+def run_read_only(database_url: str, tenant_id: str, *, now: datetime | None = None,
+                  environ: Mapping[str, str] | None = None,
+                  time_budget_seconds: float = DEFAULT_TIME_BUDGET_SECONDS) -> list[dict[str, Any]]:
+    """Collect every active rule within a hard time limit, connection included. Never
+    raises. The work runs in a daemon thread; whatever is unfinished when the budget
+    runs out is reported unavailable and the thread is left behind."""
+    environ = os.environ if environ is None else environ
+    now = now or datetime.now(timezone.utc)
+    rules = active_rules(environ)
+    results: list[dict[str, Any]] = []
+    failure: list[str] = []
+    done = threading.Event()
+
+    def work() -> None:
+        try:
+            _measure(database_url, tenant_id, now=now, environ=environ, rules=rules,
+                     results=results, budget=time_budget_seconds)
+        except BaseException as error:  # noqa: BLE001 - reported below
+            failure.append(_error_label(error))
+        finally:
+            done.set()
+
+    try:
+        threading.Thread(target=work, name="layer-freshness", daemon=True).start()
+        finished = done.wait(time_budget_seconds)
+    except Exception as error:  # noqa: BLE001 - for example no thread could start
+        finished, failure = True, [_error_label(error)]
+    snapshot = list(results)
+    if finished and not failure:
+        return snapshot
+    reason = failure[0] if failure else f"TimeoutError (time budget of {time_budget_seconds:g} seconds)"
+    measured = {result["check_id"] for result in snapshot}
+    return snapshot + [evaluate(rule, None, now=now, error=reason, scope=SESSION_SCOPE)
+                       for rule in rules if rule.check_id not in measured]
+
+
 def main() -> int:
-    database_url = os.environ.get("LAYER_FRESHNESS_DATABASE_URL") or os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get(DATABASE_URL_ENV) or os.environ.get("DATABASE_URL", "")
     tenant_id = os.environ.get("PORTFOLIO_TENANT_ID", "00000000-0000-0000-0000-000000000001")
     results = run_read_only(database_url, tenant_id)
     print(json.dumps({"summary": summary(results), "checks": results}, indent=1, sort_keys=True))

@@ -229,19 +229,73 @@ def evaluate_supervisor_state(
 
 
 LAYER_FRESHNESS_CHECK = "layer_freshness"
+LAYER_FRESHNESS_PREFIX = LAYER_FRESHNESS_CHECK + ":"
+LAYER_FRESHNESS_UNAVAILABLE_PREFIX = LAYER_FRESHNESS_PREFIX + "unavailable:"
+# A required check that cannot be read for this long raises a warning of its own.
+LAYER_FRESHNESS_UNAVAILABLE_AFTER = timedelta(hours=1)
 
 
-def layer_freshness_findings(results: Sequence[Mapping[str, Any]]) -> list[Finding]:
-    """Late required layers (see layer_freshness.RULES) as warnings. Report only: no
-    autonomous action, so the repair policy never acts on them."""
+@dataclass(frozen=True)
+class LayerFreshnessReview:
+    """What one administrator run does with the layer freshness results.
+
+    findings: late layers (warning) and required checks that cannot be read (info for
+    the first hour, then warning). hold_open: open layer_freshness incidents this run
+    must not close, because their check did not come back fresh. quiet: info findings,
+    recorded but not announced. escalated: open info incidents that are now warnings,
+    to announce as if new.
+    """
+
+    findings: tuple[Finding, ...] = ()
+    hold_open: frozenset[str] = frozenset()
+    quiet: frozenset[str] = frozenset()
+    escalated: frozenset[str] = frozenset()
+
+
+def _unavailable_since(previous: Mapping[str, Any] | None) -> datetime | None:
+    try:
+        value = (previous or {}).get("evidence", {}).get("unavailable_since")
+        parsed = datetime.fromisoformat(str(value))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _unavailable_finding(key: str, subject: str, error: str, evidence: Mapping[str, Any], *,
+                         now: datetime, open_incidents: Mapping[str, Mapping[str, Any]]) -> Finding:
+    since = _unavailable_since(open_incidents.get(key)) or now
+    since_text = since.astimezone(timezone.utc).isoformat(timespec="seconds")
+    late = now - since >= LAYER_FRESHNESS_UNAVAILABLE_AFTER
+    return Finding(
+        incident_key=key,
+        check_id=LAYER_FRESHNESS_CHECK,
+        severity="warning" if late else "info",
+        description=f"{subject} cannot be read since {since_text}: {error}",
+        evidence={**dict(evidence), "unavailable_since": since_text},
+    )
+
+
+def review_layer_freshness(
+    results: Sequence[Mapping[str, Any]] | None,
+    *,
+    now: datetime,
+    open_incidents: Mapping[str, Mapping[str, Any]] | None = None,
+) -> LayerFreshnessReview:
+    """Turn freshness results (None: the check itself failed) into findings. Report
+    only: no autonomous action, so the repair policy never acts on them.
+
+    `open_incidents` maps each open layer_freshness incident key to its severity and
+    evidence, so an unreadable check keeps the time it was first unreadable.
+    """
+    open_incidents = open_incidents or {}
     findings: list[Finding] = []
-    for result in results:
+    for result in results or ():
         if not result.get("late"):
             continue
         source = result.get("feed") or result.get("target")
         findings.append(
             Finding(
-                incident_key=f"{LAYER_FRESHNESS_CHECK}:{result['check_id']}",
+                incident_key=f"{LAYER_FRESHNESS_PREFIX}{result['check_id']}",
                 check_id=LAYER_FRESHNESS_CHECK,
                 severity="warning",
                 description=(
@@ -252,17 +306,49 @@ def layer_freshness_findings(results: Sequence[Mapping[str, Any]]) -> list[Findi
                 evidence=dict(result),
             )
         )
-    if results and all(result.get("state") == "unavailable" for result in results):
-        findings.append(
-            Finding(
-                incident_key=f"{LAYER_FRESHNESS_CHECK}:unavailable",
-                check_id=LAYER_FRESHNESS_CHECK,
-                severity="warning",
-                description="The layer freshness check could not read any layer",
-                evidence={"checked": len(results)},
-            )
-        )
-    return findings
+    unreadable = [r for r in results or () if r.get("required") and r.get("state") == "unavailable"]
+    # One incident for a failed session (no database, no storage settings, no time
+    # left), one per check for a query or listing that fails on its own.
+    session = [r for r in unreadable if r.get("error_scope") == "session"]
+    for result in unreadable:
+        if result.get("error_scope") == "session":
+            continue
+        findings.append(_unavailable_finding(
+            f"{LAYER_FRESHNESS_UNAVAILABLE_PREFIX}{result['check_id']}",
+            f"{str(result.get('layer', '')).capitalize()} layer check {result['check_id']}",
+            str(result.get("error") or "unavailable"), result, now=now, open_incidents=open_incidents))
+    if results is None or session:
+        errors = sorted({str(r.get("error") or "unavailable") for r in session}) or ["the check failed to run"]
+        findings.append(_unavailable_finding(
+            f"{LAYER_FRESHNESS_UNAVAILABLE_PREFIX}session", "The layer freshness check",
+            "; ".join(errors), {"checks": sorted(r["check_id"] for r in session)},
+            now=now, open_incidents=open_incidents))
+
+    active = {finding.incident_key for finding in findings}
+    by_check = None if results is None else {r["check_id"]: r for r in results}
+    hold = set()
+    for key in open_incidents:
+        if not key.startswith(LAYER_FRESHNESS_PREFIX) or key in active:
+            continue
+        if by_check is None:
+            hold.add(key)  # nothing was measured, so nothing came back fresh
+        elif key.startswith(LAYER_FRESHNESS_UNAVAILABLE_PREFIX):
+            result = by_check.get(key[len(LAYER_FRESHNESS_UNAVAILABLE_PREFIX):])
+            if result is not None and result.get("state") == "unavailable":
+                hold.add(key)
+        else:
+            result = by_check.get(key[len(LAYER_FRESHNESS_PREFIX):])
+            if result is not None and result.get("state") != "fresh":
+                hold.add(key)
+    return LayerFreshnessReview(
+        findings=tuple(findings),
+        hold_open=frozenset(hold),
+        quiet=frozenset(f.incident_key for f in findings if f.severity == "info"),
+        escalated=frozenset(
+            f.incident_key for f in findings
+            if f.severity != "info" and (open_incidents.get(f.incident_key) or {}).get("severity") == "info"
+        ),
+    )
 
 
 def plan_safe_repairs(

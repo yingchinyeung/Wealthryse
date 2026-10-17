@@ -36,7 +36,7 @@
   "ibkrv2stg-institutional-shadow": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:445ff2f5b880d165635348393de1e0156aac2bd409e438a712a7d7933984c1c7",
   "ibkrv2stg-internal-release": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:16206504babb9b068dd65539c37640d1e38cc672a6ab5560f301507a0cc3ce7a",
   "ibkrv2stg-metadata-monitor": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:3e9841a5abc3a37592a7c4134f07040db2ec4103ee28f333be0304cd1c9f3ebe",
-  "ibkrv2stg-month-end-factsheet": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:f5394492f671973d5bb033ec4cd02d0e32a0e6fa911a075bcfa7c2d269a6aaa3",
+  "ibkrv2stg-month-end-factsheet": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:cd122bca9a155c72db99520a632f18e81a67cf3e3e4a0372b74f355880c1978f",
   "ibkrv2stg-netqa45-n1": "ibkrnetqa45acr1012.azurecr.io/netqa45/probe:v1",
   "ibkrv2stg-netqa45-repdis": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:3e9841a5abc3a37592a7c4134f07040db2ec4103ee28f333be0304cd1c9f3ebe",
   "ibkrv2stg-observe-reader": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:3e9841a5abc3a37592a7c4134f07040db2ec4103ee28f333be0304cd1c9f3ebe",

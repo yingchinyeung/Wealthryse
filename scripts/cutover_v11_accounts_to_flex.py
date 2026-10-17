@@ -6,7 +6,10 @@ the existing_v11 registrations the cutover closed. Both are safe to re-run.
 
   DATABASE_URL            the approval login is enough (no DELETE is used)
   PORTFOLIO_TENANT_ID     optional, defaults to the platform tenant
-  CUTOVER_FLEX_QUERY_ID   v1.1's Flex query ID (digits; never printed)
+  CUTOVER_FLEX_QUERY_ID   v1.1's Flex query ID (digits; never printed), unless
+                          --query-id-secret-name reads it from the flex vault
+  FLEX_TOKEN_VAULT_URI, AZURE_CLIENT_ID
+                          only with --query-id-secret-name or --token-fingerprint-from-vault
 
   python scripts/cutover_v11_accounts_to_flex.py --effective-date 2026-10-18 \
       --token-secret-name ibkr-flex-source-<32 hex> --statement v11.xml \
@@ -26,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -40,6 +44,8 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from ibkr_etl.db import DEFAULT_TENANT_ID  # noqa: E402
+from ibkr_etl.flex_guard import token_fingerprint  # noqa: E402
+from ibkr_etl.flex_discovery import _secret_value  # noqa: E402
 from ibkr_etl.flex_cutover import (  # noqa: E402
     CutoverRefused,
     CutoverRequest,
@@ -51,6 +57,9 @@ from ibkr_etl.flex_cutover import (  # noqa: E402
 )
 
 
+QUERY_SECRET_NAME = re.compile(r"^ibkr-flex-query-[0-9a-f]{32}$")
+
+
 def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--effective-date", required=True, type=date.fromisoformat)
@@ -59,7 +68,11 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--token-secret-name", help="the token's name in v2's flex vault")
     parser.add_argument("--query-id-env", default="CUTOVER_FLEX_QUERY_ID",
                         help="environment variable that holds the query ID")
+    parser.add_argument("--query-id-secret-name",
+                        help="read the query ID from this flex vault secret instead of the environment")
     parser.add_argument("--token-fingerprint", help="first 16 hex of the token's SHA-256 (optional)")
+    parser.add_argument("--token-fingerprint-from-vault", action="store_true",
+                        help="work out the fingerprint from the token secret itself; the token is never printed")
     parser.add_argument("--statement", type=Path, help="one v1.1 Flex statement (XML)")
     parser.add_argument("--approved-by", help="approver's Entra object ID or email")
     parser.add_argument("--revert", action="store_true")
@@ -69,7 +82,28 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--token-secret-name and --statement are required for the cutover")
     if arguments.apply and not arguments.approved_by:
         parser.error("--approved-by is required with --apply")
+    if arguments.token_fingerprint and arguments.token_fingerprint_from_vault:
+        parser.error("use --token-fingerprint or --token-fingerprint-from-vault, not both")
+    if arguments.query_id_secret_name is not None and not QUERY_SECRET_NAME.fullmatch(arguments.query_id_secret_name):
+        parser.error("--query-id-secret-name must look like ibkr-flex-query-<32 hex>")
     return arguments
+
+
+def vault_inputs(arguments: argparse.Namespace, environ, secret_value) -> tuple[str, str | None]:
+    """The query ID and token fingerprint, read from the flex vault where asked. Nothing is printed."""
+
+    fingerprint = arguments.token_fingerprint
+    query_id = environ.get(arguments.query_id_env, "").strip()
+    if arguments.query_id_secret_name is None and not arguments.token_fingerprint_from_vault:
+        return query_id, fingerprint
+    vault, client = environ.get("FLEX_TOKEN_VAULT_URI", "").strip(), environ.get("AZURE_CLIENT_ID", "").strip()
+    if not vault or not client:
+        raise RuntimeError("FLEX_TOKEN_VAULT_URI and AZURE_CLIENT_ID are required to read the flex vault")
+    if arguments.query_id_secret_name is not None:
+        query_id = secret_value(vault, arguments.query_id_secret_name, client).strip()
+    if arguments.token_fingerprint_from_vault:
+        fingerprint = token_fingerprint(secret_value(vault, arguments.token_secret_name.strip(), client))
+    return query_id, fingerprint
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -83,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
     today = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
     approver = identity_sha256(arguments.approved_by) if arguments.approved_by else None
     accounts = tuple(arguments.account)
+    query_id, fingerprint = (os.environ.get(arguments.query_id_env, "").strip(), None) if arguments.revert \
+        else vault_inputs(arguments, os.environ, _secret_value)
     with psycopg.connect(database_url, row_factory=dict_row) as connection:
         connection.execute("SELECT set_config('app.tenant_id', %s, false)", (tenant_id,))
         try:
@@ -103,12 +139,12 @@ def main(argv: list[str] | None = None) -> int:
                     tenant_id=tenant_id,
                     effective_date=arguments.effective_date,
                     token_secret_name=arguments.token_secret_name.strip(),
-                    query_id=os.environ.get(arguments.query_id_env, "").strip(),
+                    query_id=query_id,
                     statement=arguments.statement.read_bytes(),
                     statement_name=arguments.statement.name,
                     approver_sha256=approver,
                     subject_ids=accounts,
-                    token_fingerprint=arguments.token_fingerprint,
+                    token_fingerprint=fingerprint,
                 )
                 if arguments.apply:
                     result = apply_cutover(connection, request, today=today)

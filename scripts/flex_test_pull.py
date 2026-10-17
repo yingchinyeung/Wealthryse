@@ -12,7 +12,8 @@ once; there is no retry, because a second request on the same token can lock it.
 
 Environment: FLEX_TOKEN_VAULT_URI, AZURE_CLIENT_ID, AZURE_STORAGE_ACCOUNT_URL,
 optional AZURE_RAW_CONTAINER (default ibkr-raw) and PORTFOLIO_TENANT_ID, and the
-query ID in the variable named by --query-id-env.
+query ID in the variable named by --query-id-env, or in the flex vault secret named
+by --query-id-secret-name (read with the job identity, never printed).
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from ibkr_etl.flex_discovery import _secret_value  # noqa: E402
 from ibkr_etl.flex_recipe import check_flex_recipe  # noqa: E402
 
 SECRET_NAME = re.compile(r"^ibkr-flex-source-[0-9a-f]{32}$")
+QUERY_SECRET_NAME = re.compile(r"^ibkr-flex-query-[0-9a-f]{32}$")
 QUERY_ID = re.compile(r"^[0-9]{1,20}$")
 HKT = ZoneInfo("Asia/Hong_Kong")
 # The daily IBKR requests (v1.1's and v2's) run in this window; stay out of it.
@@ -81,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--token-secret-name", required=True, help="the token's name in v2's flex vault")
     parser.add_argument("--query-id-env", default="CUTOVER_FLEX_QUERY_ID",
                         help="environment variable that holds the query ID")
+    parser.add_argument("--query-id-secret-name",
+                        help="read the query ID from this flex vault secret instead of the environment")
     parser.add_argument("--to-date", type=date.fromisoformat, help="last data date (default: yesterday HKT)")
     parser.add_argument("--days", type=int, default=14, help="days in the request, like the daily pull")
     parser.add_argument("--apply", action="store_true", help="make the request; without it nothing is sent")
@@ -90,9 +94,14 @@ def main(argv: list[str] | None = None) -> int:
     problems = []
     if not SECRET_NAME.fullmatch(args.token_secret_name):
         problems.append("token secret name must look like ibkr-flex-source-<32 hex>")
-    query_id = os.environ.get(args.query_id_env, "").strip()
-    if not QUERY_ID.fullmatch(query_id):
-        problems.append(f"{args.query_id_env} is missing or not a query ID")
+    if args.query_id_secret_name is not None:
+        query_id = ""
+        if not QUERY_SECRET_NAME.fullmatch(args.query_id_secret_name):
+            problems.append("query ID secret name must look like ibkr-flex-query-<32 hex>")
+    else:
+        query_id = os.environ.get(args.query_id_env, "").strip()
+        if not QUERY_ID.fullmatch(query_id):
+            problems.append(f"{args.query_id_env} is missing or not a query ID")
     for name in ("FLEX_TOKEN_VAULT_URI", "AZURE_CLIENT_ID", "AZURE_STORAGE_ACCOUNT_URL"):
         if not os.environ.get(name, "").strip():
             problems.append(f"{name} is not set")
@@ -111,6 +120,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     settings = load_settings()
+    if args.query_id_secret_name is not None:
+        query_id = _secret_value(os.environ["FLEX_TOKEN_VAULT_URI"], args.query_id_secret_name,
+                                 os.environ["AZURE_CLIENT_ID"]).strip()
+        if not QUERY_ID.fullmatch(query_id):
+            print("TEST_PULL refused: the query ID secret does not hold a query ID")
+            return 2
     token = _secret_value(os.environ["FLEX_TOKEN_VAULT_URI"], args.token_secret_name,
                           os.environ["AZURE_CLIENT_ID"])
     try:

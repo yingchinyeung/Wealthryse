@@ -130,6 +130,45 @@ class FlexTestPullTests(unittest.TestCase):
         self.assertIn("code=1018 lockout=True", out)
         self.assertNotIn(TOKEN, out)
 
+    def test_the_query_id_can_come_from_the_flex_vault_and_is_never_printed(self) -> None:
+        query_secret = "ibkr-flex-query-" + "b" * 32
+        output = io.StringIO()
+        calls = []
+
+        def secret(vault, name, client):
+            calls.append(name)
+            return QUERY if name == query_secret else TOKEN
+
+        def fake_request(client, start, end):
+            calls.append(client.settings.flex_query_id)
+            return FlexReport(STATEMENT, "application/xml", "ref-1")
+
+        env = {k: v for k, v in ENV.items() if k != "CUTOVER_FLEX_QUERY_ID"}
+        _Clock.current = NOON
+        with patch.dict(os.environ, env, clear=False), \
+                patch.object(flex_test_pull, "datetime", _Clock), \
+                patch.object(flex_test_pull, "_secret_value", side_effect=secret), \
+                patch.object(flex_test_pull.FlexClient, "request_report", fake_request), \
+                patch.object(flex_test_pull, "upload_bytes", return_value="https://example/blob"), \
+                contextlib.redirect_stdout(output):
+            os.environ.pop("CUTOVER_FLEX_QUERY_ID", None)
+            code = flex_test_pull.main(["--token-secret-name", SECRET, "--query-id-secret-name", query_secret,
+                                        "--apply"])
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(calls, [query_secret, SECRET, QUERY])
+        for value in (TOKEN, QUERY, "U7654321"):
+            self.assertNotIn(value, output.getvalue())
+
+    def test_a_bad_query_secret_name_is_refused_before_the_vault_is_read(self) -> None:
+        output = io.StringIO()
+        with patch.dict(os.environ, ENV), patch.object(flex_test_pull, "_secret_value") as secret, \
+                contextlib.redirect_stdout(output):
+            code = flex_test_pull.main(["--token-secret-name", SECRET, "--query-id-secret-name", "ibkr-flex-query-id",
+                                        "--apply"])
+        self.assertEqual(code, 2)
+        secret.assert_not_called()
+        self.assertIn("ibkr-flex-query-<32 hex>", output.getvalue())
+
     def test_a_statement_that_cannot_be_saved_fails(self) -> None:
         code, out, _ = _run("--apply", upload=None)
         self.assertEqual(code, 4)

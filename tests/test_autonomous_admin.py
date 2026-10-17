@@ -93,6 +93,46 @@ class AutonomousAdminTests(unittest.TestCase):
         findings = evaluate_supervisor_state(state, today_hkt=date(2026, 10, 21))
         self.assertIn("account_import_status", {finding.check_id for finding in findings})
 
+    def test_switch_morning_waits_for_the_first_flex_pull_until_an_hour_after_it_is_due(self) -> None:
+        # Switch on Mon 19 Oct, effective 18 Oct; the source is scheduled at 16:20 HKT (08:20 UTC).
+        state = self._state()
+        state.update(
+            daily_feed="ibkr_flex",
+            daily_feed_effective_from=date(2026, 10, 18),
+            daily_feed_source={"flex_source_id": "s", "schedule_time_zone": "Asia/Hong_Kong",
+                               "schedule_hour": 16, "schedule_minute": 20},
+            latest_import=None,
+            latest_nav_run={"run_type": "staging-snapshot-import", "status": "success",
+                            "completed_at": "2026-10-18T08:12:00+00:00"},
+        )
+        today = date(2026, 10, 19)
+
+        def imports(now_utc, changes=None):
+            findings = evaluate_supervisor_state({**state, **(changes or {})}, today_hkt=today, now_utc=now_utc)
+            return [(f.incident_key, f.severity, f.description) for f in findings
+                    if f.check_id == "account_import_status"]
+
+        waiting = [("first_flex_pull_pending", "warning", "Waiting for v2's first Flex pull, due by 09:20 UTC")]
+        for moment in ("2026-10-19T07:45:00", "2026-10-19T08:30:00", "2026-10-19T09:19:59"):
+            self.assertEqual(imports(datetime.fromisoformat(moment + "+00:00")), waiting)
+        late = imports(datetime(2026, 10, 19, 9, 20, tzinfo=timezone.utc))
+        self.assertEqual([(key, severity) for key, severity, _ in late], [("account_import_status", "critical")])
+        # No clock, no window.
+        self.assertEqual(imports(None)[0][:2], ("account_import_status", "critical"))
+        # A pull that finished today ends the window, even a failed one.
+        failed = {"latest_import": {"status": "dead_letter", "completed_at": "2026-10-19T08:21:00+00:00"}}
+        self.assertEqual(imports(datetime(2026, 10, 19, 8, 30, tzinfo=timezone.utc), failed)[0][:2],
+                         ("account_import_status", "critical"))
+        # Only on the first previous-day pull's day.
+        self.assertEqual(imports(datetime(2026, 10, 19, 8, 30, tzinfo=timezone.utc),
+                                 {"daily_feed_effective_from": date(2026, 10, 17)})[0][:2],
+                         ("account_import_status", "critical"))
+        # A successful pull leaves nothing to report.
+        done = {"latest_import": {"status": "success", "completed_at": "2026-10-19T08:31:00+00:00"},
+                "latest_nav_run": {"run_type": "institutional-flex-daily", "status": "success",
+                                   "completed_at": "2026-10-19T08:31:00+00:00"}}
+        self.assertEqual(imports(datetime(2026, 10, 19, 8, 40, tzinfo=timezone.utc), done), [])
+
     def test_policy_allows_at_most_one_action_and_honors_cooldown(self) -> None:
         now = datetime(2026, 9, 24, 8, tzinfo=timezone.utc)
         findings = [

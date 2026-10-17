@@ -538,7 +538,8 @@ def main() -> int:
         )
         connection.commit()
         findings = evaluate_supervisor_state(
-            state, today_hkt=now_hkt_date(), portal_failure=portal_failure
+            state, today_hkt=now_hkt_date(), portal_failure=portal_failure,
+            now_utc=datetime.now(timezone.utc),
         )
         now_iso = utc_now_iso()
         stage = "synchronize_incidents"

@@ -218,8 +218,8 @@ All times below are **Hong Kong Time (HKT, UTC+8)**. Azure Container Apps stores
 |---|---|---|
 | 07:00 daily | `ibkrv2stg-risk-free-daily` | Refresh validated U.S. Treasury 3-month rate, when the source has a new observation. |
 | 16:00 daily | `ibkr-v11-daily` | Existing production IBKR Flex import, checks, derived portfolios, dashboard and exports. Stops on the day v2 makes its own daily Flex pull. |
+| 16:00 daily (16:20 from the switch day) | `ibkrv2stg-institutional-daily` | Process active website-managed Flex connections with one statement-generation attempt per source, archive the raw response, partition selected accounts and enqueue downstream work. It sends nothing to IBKR unless its `flexSendsEnabled` setting is on, and never before a source's scheduled time. From the switch day it asks for data up to the previous HKT day and is the one daily IBKR request. |
 | 16:10 daily | `ibkrv2stg-account-sync-daily` | Validate the production manifest/hash and idempotently synchronize U16088571 into the website database. It has no Flex access. Stops on the day v2 makes its own daily Flex pull. |
-| 16:20 daily | `ibkrv2stg-institutional-daily` | Process active website-managed Flex connections with one statement-generation attempt per source, asking for data up to the previous HKT day, archive the raw response, partition selected accounts and enqueue downstream work. From the switch day (`scripts/cutover_v11_accounts_to_flex.py`) it is the one daily IBKR request. |
 | 16:30 daily | `ibkrv2stg-benchmark-daily` | Refresh provisional Yahoo benchmarks and crisis data. |
 | 16:45 daily | `ibkrv2stg-sector-classification` | Refresh provisional holdings-sector classifications. |
 | 16:50 daily | `ibkrv2stg-derived-daily` | Recalculate every active filtered or composite portfolio in dependency order after its physical sources and market data are available. |
@@ -230,6 +230,17 @@ All times below are **Hong Kong Time (HKT, UTC+8)**. Azure Container Apps stores
 | 09:00 on the 1st of each month | `ibkrv2stg-autonomy-review` | Create the monthly owner authority review. |
 
 The scheduled jobs use one replica and **zero platform retries**, except the older manual bootstrap job. The no-retry setting is deliberate to avoid aggravating IBKR's “Too many failed attempts” response. A failed scheduled run should be diagnosed, not blindly restarted.
+
+### The day v2 makes its own daily Flex pull
+
+On that day (D), everything happens before 07:55 UTC (15:55 HKT), in this order:
+
+1. **Azure schedules first.** Turn off the account-sync and `ibkr-v11-daily` schedules (`scheduleEnabled=false`). Deploy `ibkrv2stg-institutional-daily` with `scheduleUtc='20 8 * * *'`, `dispatchRunDate='previous_hkt_day'` and `flexSendsEnabled=true`. Regenerate the schedule watchdog rules with `IBKR_DAILY_FEED=direct_flex` and disable the deployed v1.1 watchdog rule.
+2. **The cutover last.** Run `scripts/cutover_v11_accounts_to_flex.py` with effective date D − 1, first as a dry run, then with `--apply`.
+
+The first pull runs at 16:20 HKT. Until an hour after that, the administrator shows a warning, “waiting for v2's first Flex pull”, rather than a critical import incident.
+
+If the pull fails, wait until the `ibkrv2stg-institutional-daily` execution has ended before anything runs v1.1 by hand, so the token never has two requests in flight. The cutover's `--revert` is clean only before the first successful pull. After one, account-sync's exact row counts no longer match v1.1's export, so fix forward rather than revert.
 
 ## 5. Your routine as owner
 

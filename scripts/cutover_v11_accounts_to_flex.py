@@ -8,15 +8,17 @@ the existing_v11 registrations the cutover closed. Both are safe to re-run.
   PORTFOLIO_TENANT_ID     optional, defaults to the platform tenant
   CUTOVER_FLEX_QUERY_ID   v1.1's Flex query ID (digits; never printed)
 
-  python scripts/cutover_v11_accounts_to_flex.py --effective-date 2026-10-20 \
+  python scripts/cutover_v11_accounts_to_flex.py --effective-date 2026-10-18 \
       --token-secret-name ibkr-flex-source-<32 hex> --statement v11.xml \
       [--account U...] [--token-fingerprint <16 hex>] [--approved-by <identity>] [--apply]
-  python scripts/cutover_v11_accounts_to_flex.py --revert --effective-date 2026-10-20 \
+  python scripts/cutover_v11_accounts_to_flex.py --revert --effective-date 2026-10-18 \
       [--account U...] --approved-by <identity> [--apply]
 
 The effective date is the first data date the Flex pull owns. With
 INSTITUTIONAL_DISPATCH_RUN_DATE=previous_hkt_day, a switch on day D uses D - 1.
 No IBKR request is made; the statement is one v1.1 already downloaded.
+Run it last on D, after the Azure schedule changes; after a successful Flex
+pull, fix forward rather than revert (see src/ibkr_etl/flex_cutover.py).
 """
 
 from __future__ import annotations

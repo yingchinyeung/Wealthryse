@@ -48,6 +48,15 @@ RUNTIME_PATH = 'search_path="$user", bronze, silver, gold, public'
 _MODULES: dict = {}
 
 
+def setUpModule():
+    # CI tests the installed package, which looks for migrations next to its install folder.
+    from ibkr_etl import db
+
+    patcher = patch.object(db, "POSTGRES_MIGRATIONS_DIR", MIGRATIONS)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 def _script(name: str):
     if name not in _MODULES:
         spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / f"{name}.py")

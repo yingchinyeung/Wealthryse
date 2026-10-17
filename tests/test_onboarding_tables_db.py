@@ -46,7 +46,11 @@ class OnboardingTablesDatabaseTests(unittest.TestCase):
         self.bundle = dict(rollout.bundle(), web_role=WEB, approval_role=APPROVAL)
         self.database = "onboard_test_" + uuid.uuid4().hex[:8]
         self.bundle["database"] = self.database
-        skipped = set(self.bundle["targets"]) | set(self.bundle["held_back"]) | set(self.bundle["other_rollouts"])
+        # The medallion layer migrations (068 on) came after this rollout and move its tables.
+        later = {path.name for path in (ROOT / "migrations" / "postgres").glob("*_medallion_*.sql")}
+        self.bundle["expected"] = {k: v for k, v in self.bundle["expected"].items() if k not in later}
+        skipped = (set(self.bundle["targets"]) | set(self.bundle["held_back"]) | set(self.bundle["other_rollouts"])
+                   | later)
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
             for role in (WEB, APPROVAL):
                 admin.execute(f"DROP ROLE IF EXISTS {role}")

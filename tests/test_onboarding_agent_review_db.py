@@ -24,6 +24,16 @@ TOLERATED_MIGRATIONS = {"027_legacy_external_market_data_approval.sql", "056_spe
 IDENTITY = "a" * 64
 
 
+def _agent_schema_sql(connection) -> list[str]:
+    """The agent schema files as scripts/install_agent_schema.py applies them."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("install_agent_schema", ROOT / "scripts" / "install_agent_schema.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.agent_schema_sql(connection)
+
+
 def _dsn(base: str, database: str, user: str | None = None) -> str:
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
@@ -73,8 +83,8 @@ class OnboardingReviewDatabaseTests(unittest.TestCase):
                 connection.commit()
         connection.close()
         with psycopg.connect(_dsn(ADMIN_DSN, cls.database, OWNER_ROLE), options=f"-c app.tenant_id={TENANT}") as owner:
-            for path in sorted((ROOT / "migrations" / "agent").glob("*.sql")):
-                owner.execute(path.read_text(encoding="utf-8"))
+            for text in _agent_schema_sql(owner):
+                owner.execute(text)
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:  # roles are cluster-wide
             admin.execute(f"GRANT agent_reader TO {READER}")
             admin.execute(f"GRANT agent_writer TO {WRITER}")

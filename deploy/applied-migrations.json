@@ -20,6 +20,10 @@
   "067_factsheet_design_agents.sql": {
    "sha256": "9b2ad6312a3769d3eae5528c2a4dd47392069787f66b609840eb988268c76caa",
    "evidence": "ibkrv2stg-bootstrap-mqewfdk on the job's own image ibkr-platform@sha256:5198ebb73783315418ff3765d4a04247ee9c1dd6593580e2039e5c472759c108, 067 only (embedded from main a1b70a6) plus the approval-role grants, status pass, 2026-10-16 about 23:47 UTC"
+  },
+  "068_medallion_gold_layer.sql": {
+   "sha256": "02165f9fe18dc77ad3b7bf429be0b1b21b4415ad431c1f77bbd4cfe22615964b",
+   "evidence": "ibkrv2stg-bootstrap-gp3actj on ibkr-platform main-b832403 (sha256:cd122bca9a155c72db99520a632f18e81a67cf3e3e4a0372b74f355880c1978f), 068 only (embedded from main 39dba35) with bootstrap_postgres.py --only-migration, Medallion S3a gold batch, status pass with 0 failed checks, 2026-10-17 about 11:49 UTC"
   }
  }
 }

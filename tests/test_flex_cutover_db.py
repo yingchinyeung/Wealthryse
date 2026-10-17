@@ -161,6 +161,11 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
             admin.execute(f"GRANT USAGE ON SCHEMA public TO {APPROVAL_ROLE}")
             for grant in APPROVAL_GRANTS:
                 admin.execute(grant.format(role=APPROVAL_ROLE))
+            # Once a layer migration has moved a table, the grant above reaches only its view in
+            # public; bootstrap copies it onto the table behind the view, and so does this.
+            from ibkr_etl.medallion_layers import mirror_privileges
+
+            mirror_privileges(admin, [APPROVAL_ROLE])
 
     @classmethod
     def tearDownClass(cls):

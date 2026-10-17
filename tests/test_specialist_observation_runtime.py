@@ -1,6 +1,10 @@
 import base64
 import gzip
+import json
 import sys
+from contextlib import redirect_stdout
+from io import StringIO
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase
@@ -131,3 +135,60 @@ class ObservationDeploymentTests(TestCase):
             self.assertEqual(deployment.verify_cloud_identity()['registered_rbac_assignments'],2)
             az.return_value=grants+[dict(scope=deployment.BASE,role='roles/owner')]
             with self.assertRaises(ValueError): deployment.verify_cloud_identity()
+
+
+class ObservationUpdateTests(TestCase):
+    """`update` swaps only the bundled code of the installed reader."""
+    def live(self,**changes):
+        job=deployment.definition()
+        job['properties']['template']['containers'][0]['args']=['-c','print("old reader")']
+        job['tags']=dict(job['tags'],payloadSha256='d'*64,owner='synthetic-extra-tag')
+        job['properties']['provisioningState']='Succeeded'
+        for key,value in changes.items(): job['properties']['template']['containers'][0][key]=value
+        return job
+
+    def run_update(self,current,executions=()):
+        calls=[];state={'job':current}
+        def request(method,path,data=None,**_):
+            calls.append((method,path))
+            if path.endswith('/executions?api-version=2024-03-01'):
+                return {'value':[{'properties':{'status':s}} for s in executions]}
+            if method=='PUT':
+                state['job']=json.loads(json.dumps(data));return data
+            return state['job']
+        with TemporaryDirectory() as folder,patch.object(deployment,'request',side_effect=request), \
+            patch.object(deployment,'FOLDER',Path(folder)),redirect_stdout(StringIO()) as out:
+            try: deployment.update()
+            finally: saved=sorted(p.name for p in Path(folder).iterdir()) if Path(folder).exists() else []
+        return calls,state['job'],saved,out.getvalue()
+
+    def test_only_the_code_and_its_tag_change(self):
+        calls,job,saved,out=self.run_update(self.live(),executions=('Succeeded','Failed'))
+        wanted=deployment.definition()
+        self.assertEqual([m for m,_ in calls].count('PUT'),1)
+        self.assertEqual(job['properties']['template'],wanted['properties']['template'])
+        self.assertEqual(job['properties']['configuration'],wanted['properties']['configuration'])
+        self.assertEqual(job['identity'],wanted['identity'])
+        self.assertEqual(job['tags'],dict(wanted['tags'],owner='synthetic-extra-tag'))
+        self.assertEqual(saved,[deployment.JOB+'-before-dddddddddddd.json',
+            deployment.JOB+'-definition-'+wanted['tags']['payloadSha256'][:12]+'.json'])
+        self.assertTrue(json.loads(out)['updated'])
+
+    def test_any_other_drift_stops_before_the_put(self):
+        for key,value in [('image','ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:'+'0'*64),
+                          ('env',[dict(name='DATABASE_URL',secretRef='admin-url')])]:
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                self.run_update(self.live(**{key:value}))
+        identity=self.live();identity['identity']['userAssignedIdentities']={deployment.BASE+'other':{}}
+        with self.assertRaises(ValueError): self.run_update(identity)
+        unregistered=self.live();unregistered['tags']['purpose']='other'
+        with self.assertRaises(ValueError): self.run_update(unregistered)
+
+    def test_a_running_execution_stops_before_the_put(self):
+        with self.assertRaises(ValueError): self.run_update(self.live(),executions=('Running',))
+
+    def test_already_current_changes_nothing(self):
+        current=deployment.definition()
+        calls,_,saved,out=self.run_update(current)
+        self.assertEqual([m for m,_ in calls],['GET']);self.assertEqual(saved,[])
+        self.assertFalse(json.loads(out)['updated'])

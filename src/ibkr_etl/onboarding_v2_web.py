@@ -796,7 +796,7 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
     summary = _definition_summary(terms["definition"]) if derived else []
     if style_label:
         summary.append({"label": "Report design", "value": style_label})
-    return {
+    detail = {
         "case_id": case.case_id,
         "source_kind": case.source_kind,
         "broker": case.broker,
@@ -843,6 +843,51 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
         "documents_open": onboarding_agents.agents_enabled() and onboarding_agents.documents_open(row, approvals),
         "readiness": onboarding_agents.case_readiness(connection, tenant_id, case.case_id, awaiting),
     }
+    # Last, as it reads another feature's table: a failed read leaves only this part unavailable.
+    design = _factsheet_design(connection, tenant_id, row, case)
+    detail["factsheet_design"] = design
+    if design and design.get("owner_action") and detail["next_owner_action"] is None:
+        detail["next_owner_action"] = design["owner_action"]
+    return detail
+
+
+def factsheet_design_enabled() -> bool:
+    from .factsheet_design_web import enabled
+    return enabled()
+
+
+def _factsheet_design(connection, tenant_id: str, row: Mapping[str, Any], case: OnboardingCase) -> dict | None:
+    """The factsheet design step of a case with no built-in design, or None.
+
+    Such a case reports in the design its owner makes in the factsheet designer
+    (designed_reports.py): its reports_rendered check waits for a submitted design.
+    The designer opens once approval 1 has registered the subject.
+    """
+
+    if case.cancelled or row.get("report_style") in REPORT_STYLES or case.stage not in PRE_LIVE_STAGES:
+        return None
+    if not factsheet_design_enabled():
+        return None
+    subject_id = row.get("subject_id")
+    step = {"open": bool(subject_id) and case.stage == "build_history", "designs": [], "submitted": None,
+            "designer_page": f"/accounts/{row['target_subject_id']}/factsheet-designer", "owner_action": None}
+    if not step["open"]:
+        return step
+    try:
+        designs = connection.execute(
+            "SELECT title, status, current_version, updated_at FROM factsheet_design_drafts "
+            "WHERE tenant_id = %s AND subject_id = %s AND status <> 'archived' ORDER BY updated_at DESC LIMIT 10",
+            (tenant_id, subject_id),
+        ).fetchall()
+    except Exception:  # the designer's tables are another feature's; never break the case page for them
+        return {**step, "unavailable": True}
+    step["designs"] = [{"title": str(d["title"]), "status": str(d["status"]), "version": int(d["current_version"]),
+                        "updated_at": str(d["updated_at"])} for d in designs]
+    step["submitted"] = next((d for d in step["designs"] if d["status"] == "submitted"), None)
+    if step["submitted"] is None and case.checks.get("reports_rendered") != "pass":
+        step["owner_action"] = ("Design the factsheet: open the factsheet designer, upload the template, "
+                                "review the draft and submit it.")
+    return step
 
 
 def _subject_names(connection, tenant_id: str, subject_ids: Iterable[str]) -> dict[str, str]:
@@ -1679,6 +1724,7 @@ CASE_CONTENT = """<div class="page-view active" data-section="account-onboarding
 <div class="card wide"><div class="label" id="case-kicker">Loading…</div><h2 id="case-title"></h2><div id="case-next" class="muted"></div><div id="case-progress" class="status-row"></div></div>
 <div class="card wide" id="case-portfolio" hidden><div class="label">The portfolio</div><p id="case-description"></p><p class="muted" id="case-report-style" hidden></p><div id="case-tree" style="max-width:760px;margin-top:14px;overflow-x:auto"></div></div>
 <div class="card wide"><div class="label">Checks for this stage</div><div id="case-checks" class="onboarding-checks"></div></div>
+<div class="card wide" id="case-design" hidden><div class="label">Factsheet design</div><p class="muted">The monthly factsheets use the design you make from your template in the factsheet designer. Upload the template and, if you have one, a completed example. The design agents draft it, you review it and ask for changes in plain words, then submit it. The historical factsheets are rendered from the submitted design for approval 2.</p><div id="case-design-body"></div></div>
 <div class="card wide" id="case-proposals" hidden><div class="label">Proposed security master entries</div><p class="muted">Securities in this account that the security master does not have yet, as the agent proposes them. Nothing is added until you approve the account terms.</p><div id="case-proposal-list"></div></div>
 <div class="card wide" id="case-documents" hidden><div class="label">Client documents</div><p class="muted">The mandate, fee terms and side letters. The agent drafts the account terms from them, quoting each clause, for you to compare before approval 1.</p><div id="case-document-list"></div><form id="case-document-form" hidden><div class="actions"><input type="file" name="document" accept=".pdf,.docx,.txt,.md" required aria-label="Client document"><button class="button" type="submit">Add document</button></div><div class="muted" role="status"></div></form></div>
 <div class="card wide"><div class="label">Your three approvals</div><div id="case-approvals" class="status-row"></div><div id="case-term-draft" hidden></div><div id="case-readiness" hidden></div><div id="case-approval-form"></div><div id="case-result" class="muted" role="status" aria-live="polite"></div></div>
@@ -1743,6 +1789,13 @@ const renderDraft=(c,d)=>{const box=document.querySelector('#case-term-draft');c
   const terms=Object.values(d.terms||{}).filter(t=>t.status!=='not_found'||t.value);
   const source=s=>`${esc(s.document)} p.${esc(s.page)}: “${esc(s.quote)}”`;
   box.innerHTML=`<div class="onboarding-row" style="display:block;margin-top:14px"><strong>Terms drafted by the agent from the client's documents</strong> ${pill(text,cls)}<p class="muted">${esc(d.summary)} Compare them with the terms below before you approve; the agent does not change the case.</p>${terms.map(t=>`<div class="status-item" style="min-width:0;margin-top:8px"><div class="label">${esc(t.label)}${t.status==='conflict'?' · documents disagree':''}</div><strong>${esc(t.status==='conflict'?(t.values||[]).join(' / '):t.value)}</strong><details><summary>Sources</summary>${(t.sources||[]).map(s=>`<div class="muted">${source(s)}</div>`).join('')}</details></div>`).join('')}${(d.findings||[]).length?`<div class="warning" style="margin-top:10px">${d.findings.map(f=>`<div>${esc(f.message)}</div>`).join('')}</div>`:''}<div class="muted">Read from ${esc((d.documents||[]).map(x=>x.document).join(', ')||'no documents')} · drafted ${esc(d.drafted_at)}</div></div>`};
+const designState={review:['In review',''],failed:['Needs changes','blocked'],submitted:['Submitted','active']};
+const renderDesign=d=>{const card=document.querySelector('#case-design');card.hidden=!d;if(!d)return;const body=document.querySelector('#case-design-body');
+  if(!d.open){body.innerHTML='<p class="muted">The designer opens once you approve the account terms.</p>';return}
+  if(d.unavailable){body.innerHTML='<div class="warning">The designs could not be listed. Open the designer to see them.</div>'}
+  else body.innerHTML=(d.designs.length?d.designs.map(x=>{const [text,cls]=designState[x.status]||[x.status,''];return row(x.title,`version ${x.version} · ${x.updated_at}`,pill(text,cls))}).join(''):'<p class="muted">No design yet.</p>')
+    +(d.submitted?`<p class="muted">The historical factsheets are rendered from ${esc(d.submitted.title)}. Until you approve them, submitting a newer design renders them again.</p>`:'');
+  body.innerHTML+=`<div class="actions"><a class="button" href="${esc(d.designer_page)}">${d.designs.length?'Open the factsheet designer':'Design the factsheet'}</a></div>`};
 const termState={matches:['Matches','active'],differs:['Differs','blocked'],not_in_documents:['Not in the documents',''],no_draft:['No draft yet','']};
 const renderReadiness=r=>{const box=document.querySelector('#case-readiness');box.hidden=!r;if(!r){box.innerHTML='';return}
   if(r.unavailable){box.innerHTML='<div class="warning" style="margin-top:14px">The readiness summary could not be built. The checks and approvals above are still current.</div>';return}
@@ -1780,6 +1833,7 @@ const render=c=>{
   const agent=c.agents||{checks:{}};
   document.querySelector('#case-checks').innerHTML=c.checks.map(k=>{const ev=agent.checks[k.check_id];return `<div class="onboarding-check ${esc(k.status==='pending'?'':k.status)}"><strong>${esc(k.label)}${ev?' '+pill('Checked by agent',''):''}</strong><span>${esc(k.message)}${k.status==='warn'&&k.acknowledged?' Acknowledged.':''}</span>${ev?evidenceDrawer(ev):''}</div>`}).join('')||'<div class="muted">No checks in this stage.</div>';
   renderProposals(agent.security_proposals||[]);
+  renderDesign(c.factsheet_design);
   renderDraft(c,agent.term_draft);
   renderDocuments(c);
   renderReadiness(c.readiness);

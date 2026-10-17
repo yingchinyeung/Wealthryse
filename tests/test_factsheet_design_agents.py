@@ -320,6 +320,7 @@ class WebTests(Files):
         self.addCleanup(self.db.close)
         self.api = FakeApi()
         self.allowed = {"S1"}
+        self.onboarding = {}
         app = FastAPI()
 
         @contextlib.contextmanager
@@ -333,7 +334,7 @@ class WebTests(Files):
 
         web.install(app, owner_user=lambda: self.OWNER, check_subject=check_subject, write_database=write_database,
                     portable=lambda c: c, render_page=lambda user, **k: f"<html>{k['content']}{k['script']}</html>",
-                    tenant_id="t", agent_api=lambda: self.api)
+                    tenant_id="t", agent_api=lambda: self.api, onboarding_case=self.onboarding.get)
         self.client = TestClient(app)
         patcher = mock.patch.dict(os.environ, {"FACTSHEET_DESIGN_AGENTS_ENABLED": "true"})
         patcher.start()
@@ -409,6 +410,22 @@ class WebTests(Files):
         self.assertIn(draft_id, created.call_args.args[4])
         refused = self.client.post(f"{self.base}/{draft_id}/edits", json={"request": "bigger", "expected_version": 3})
         self.assertEqual(refused.status_code, 409)
+
+    def test_during_onboarding_the_submitted_design_is_for_the_case_not_a_design_request(self):
+        live = self.client.get("/accounts/S1/factsheet-designer").text
+        self.assertNotIn("Part of onboarding", live)
+        self.assertIn('name="currency" value="USD"', live)
+        self.onboarding["S1"] = {"case_id": "11111111-2222-3333-4444-555555555555", "reporting_currency": "HKD"}
+        page = self.client.get("/accounts/S1/factsheet-designer").text
+        self.assertIn("Part of onboarding", page)
+        self.assertIn('href="/account-onboarding/cases/11111111-2222-3333-4444-555555555555"', page)
+        self.assertIn('name="currency" value="HKD"', page)
+        draft_id = self.create()
+        with mock.patch.object(web.report_design_updates, "create_request") as created:
+            submitted = self.client.post(f"{self.base}/{draft_id}/submit", json={"expected_version": 1})
+        self.assertEqual(submitted.json(), {"status": "submitted", "used_for": "onboarding"})
+        created.assert_not_called()
+        self.assertEqual(self.client.get(f"{self.base}/{draft_id}").json()["status"], "submitted")
 
     def test_guarded_changes_need_confirmation_to_accept(self):
         draft_id = self.create()

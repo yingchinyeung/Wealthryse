@@ -16,6 +16,10 @@
   "066_crisis_scenarios.sql": {
    "sha256": "dfecbcde08a5bd8cffb5bcac61582a1c24ffef809d38ac4e45e6e7adaf73dcbf",
    "evidence": "ibkrv2stg-bootstrap-d7qto9d on ibkr-platform main-ba08c0f (sha256:cdf18ee2a69de687cba1e4383983772f6b3038d046fe669185acc05f0e5163ea), status pass, 2026-10-15 about 23:21 UTC"
+  },
+  "067_factsheet_design_agents.sql": {
+   "sha256": "9b2ad6312a3769d3eae5528c2a4dd47392069787f66b609840eb988268c76caa",
+   "evidence": "ibkrv2stg-bootstrap-mqewfdk on the job's own image ibkr-platform@sha256:5198ebb73783315418ff3765d4a04247ee9c1dd6593580e2039e5c472759c108, 067 only (embedded from main a1b70a6) plus the approval-role grants, status pass, 2026-10-16 about 23:47 UTC"
   }
  }
 }

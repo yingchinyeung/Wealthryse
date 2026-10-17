@@ -97,6 +97,32 @@ class FirstImportedTest(unittest.TestCase):
         self.assertLess(code.index("result['first_imported']"), code.index("'import ibkr_etl.web'"))
 
 
+class SubpackageTest(unittest.TestCase):
+    """The factsheet designer (14 Oct) added src/ibkr_etl/factsheet_spec/; run 38984176348 failed on it."""
+    AFTER = {
+        "web.py": b"from . import factsheet_design_web\n",
+        "factsheet_design_web.py": b"from .factsheet_spec import builder\nfrom .factsheet_spec.engine import render\n",
+        "factsheet_spec/__init__.py": b"",
+        "factsheet_spec/builder.py": b"from . import draft\nfrom .spec import x\nfrom .. import metrics_guide\n",
+        "factsheet_spec/engine.py": b"from .spec import x\n",
+        "factsheet_spec/draft.py": b"",
+        "factsheet_spec/spec.py": b"",
+        "factsheet_spec/stress.py": b"",
+        "metrics_guide.py": b"",
+        "other_job.py": b"",
+    }
+
+    def test_subpackage_files_the_website_imports_are_website_modules(self):
+        self.assertEqual(release.website_modules(self.AFTER), set(self.AFTER) - {"factsheet_spec/stress.py", "other_job.py"})
+
+    def test_the_change_carries_new_subpackage_files(self):
+        before = {"web.py": b"", "metrics_guide.py": b"", "other_job.py": b""}
+        with mock.patch.object(release, "sides", return_value=(before, dict(self.AFTER))):
+            patch, live, new = release.change_set({})
+        self.assertIn(b"src/ibkr_etl/factsheet_spec/engine.py", patch)
+        self.assertIn("factsheet_spec/engine.py", new)
+
+
 class AlreadyLiveFilesTest(unittest.TestCase):
     def test_sections_for_files_already_live_are_dropped(self):
         patch = (b"diff --git a/src/ibkr_etl/web.py b/src/ibkr_etl/web.py\n--- a/src/ibkr_etl/web.py\n"

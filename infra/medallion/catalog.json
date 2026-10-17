@@ -1463,7 +1463,7 @@
     "ingest",
     "conform"
    ],
-   "schedule": "08:20 UTC",
+   "schedule": "08:00 UTC",
    "note": "v2's own Flex pull into ibkr-raw, then the loader."
   },
   "ibkrv2stg-institutional-shadow": {

@@ -4,8 +4,9 @@ import os
 import sys
 import uuid
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +39,7 @@ def _work_source(connection, flex_source_id: str) -> dict:
     row = connection.execute(
         """
         SELECT q.flex_source_id, q.query_id, q.credential_id,
+               q.schedule_time_zone, q.schedule_hour, q.schedule_minute,
                c.key_vault_secret_name
         FROM ibkr_flex_queries q
         JOIN ibkr_flex_credentials c
@@ -50,6 +52,28 @@ def _work_source(connection, flex_source_id: str) -> dict:
     if row is None:
         raise RuntimeError("The queued Flex source is no longer active")
     return dict(row)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _send_block(source: dict, now: datetime) -> str | None:
+    """Why no IBKR request may be sent now, or None.
+
+    Nothing is sent unless INSTITUTIONAL_FLEX_SENDS_ENABLED=true, and never
+    before the source's scheduled time on that day.
+    """
+    if os.environ.get("INSTITUTIONAL_FLEX_SENDS_ENABLED", "").strip().lower() != "true":
+        return "institutional_flex_sends_disabled"
+    local = now.astimezone(ZoneInfo(str(source["schedule_time_zone"])))
+    scheduled = local.replace(
+        hour=int(source["schedule_hour"]), minute=int(source["schedule_minute"]),
+        second=0, microsecond=0,
+    )
+    if local < scheduled:
+        return "before_scheduled_send_time"
+    return None
 
 
 def _update_payload(connection, work_item_id: str, evidence: dict) -> None:
@@ -65,7 +89,12 @@ def _update_payload(connection, work_item_id: str, evidence: dict) -> None:
 
 def _request_statement(connection, claim, *, database_url: str, tenant_id: str) -> dict:
     source = _work_source(connection, str(claim.flex_source_id))
+    blocked = _send_block(source, _now())
+    if blocked:
+        # Ends as any blocked send: no lock, no circuit change, no IBKR request.
+        raise ValidationBlocked(blocked)
     request = {**source, "flex_source_id": claim.flex_source_id}
+    # Commits the send record before the request, so a crash cannot lose it.
     _authorize_send(connection, tenant_id, request)
     token = ""
     try:

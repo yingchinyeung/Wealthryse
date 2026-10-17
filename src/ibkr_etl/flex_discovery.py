@@ -167,6 +167,8 @@ def _authorize_send(connection, tenant_id: str, request: dict) -> None:
             """,
             (tenant_id, credential_id, request["flex_source_id"]),
         )
+    # The send record must outlive a crash or rollback during the request.
+    connection.commit()
 
 
 def _complete_failure(

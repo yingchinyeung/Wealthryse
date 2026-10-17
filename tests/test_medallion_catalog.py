@@ -93,6 +93,12 @@ class MedallionCatalogTest(unittest.TestCase):
             self.assertIn(entry["layer"], layers, name)
             self.assertEqual(entry["target_schema"], TARGET_SCHEMA[entry["layer"]], name)
 
+    def test_every_silver_and_gold_object_says_how_it_is_rebuilt(self):
+        sources = {"silver": {"ibkr", "market-data", "derived"}, "gold": {"derived"}}
+        for name, entry in _catalog()["postgres"].items():
+            if entry["layer"] in sources:
+                self.assertIn(entry.get("source"), sources[entry["layer"]], name)
+
     def test_every_bicep_container_has_a_layer(self):
         catalog = _catalog()
         layers = set(catalog["layers"])

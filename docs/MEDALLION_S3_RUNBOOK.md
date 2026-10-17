@@ -35,8 +35,8 @@ Three batches, one a day, each at about 10:00 UTC, outside the daily load:
    approval login's freshness check names its tables unqualified, so it reads the layer
    tables, which come first in its `search_path`. Two readers name `public` and are
    refused once their tables move (tested on a rehearsal database): the specialist
-   observation reader (`SET LOCAL search_path TO public`; `accounts`, `nav_snapshots`,
-   `platform_subjects` and `derived_portfolio_nav` from S3c) and the metadata monitor
+   observation reader (`SET LOCAL search_path TO public`; `accounts`, `nav_snapshots`
+   and `derived_portfolio_nav` from S3c) and the metadata monitor
    (`public.<table>`; its gold tables from S3a, its silver tables from S3c, and it has no
    USAGE on the layer schemas). If either runs in production, change it to read the
    layer tables before the batch that moves them.

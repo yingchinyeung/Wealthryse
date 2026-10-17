@@ -13,16 +13,16 @@ Status: the catalog is in place. Nothing has moved yet, and every table is still
 | Layer | Holds | Rule |
 |---|---|---|
 | Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
-| Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmarks, FX closes, risk-free rates), sectors, derived and composite portfolios | Built only from bronze and rebuildable from it. Corrections happen here and keep a link to the raw record. |
-| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built only from silver. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
-| Ops | Runs, approvals, audit, access, onboarding workflow, configuration, agent state | Control plane, not a data layer. Stays in `public`. |
+| Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmark prices, FX closes, risk-free rates), sectors, derived and composite portfolios | Each table's `source` in the catalog says how it is rebuilt: `ibkr` tables from bronze (v2's own Flex pull from the switch on; v1.1's history from its archived statements), `market-data` tables once their raw responses are kept in bronze (from S3b), `derived` tables from other silver tables. A record IBKR re-sends replaces the earlier one here; every version stays in the raw statement files. |
+| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: the benchmark comparison reads bronze `flex_rows` for cash flows, and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
+| Ops | Runs, approvals, audit, access, onboarding workflow, configuration and hand-maintained settings (subjects, benchmark list and mapping, metric catalogue), agent state | Control plane, not a data layer. Stays in `public`. |
 | Platform | `tenants`, `schema_migrations`, row-level security helpers | Stays in `public`. |
 
 ## Where each layer lives
 
 - **Postgres:**
-  - Target schemas are `bronze` (14 tables), `silver` (26 tables and 8 read views) and
-    `gold` (8 tables).
+  - Target schemas are `bronze` (14 tables), `silver` (21 tables and 8 read views) and
+    `gold` (6 tables).
   - `public` keeps the platform and ops objects, so only the data tables move.
   - The `agent` schema stays as it is: agent state plus account-scoped views over silver
     and gold.

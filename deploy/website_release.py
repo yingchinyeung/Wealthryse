@@ -73,23 +73,54 @@ def sides(state):
 
 
 def website_modules(files):
-    """The src/ibkr_etl files ibkr_etl.web imports, directly or through other modules."""
-    def imported(source):
+    """The src/ibkr_etl files ibkr_etl.web imports, directly or through other modules.
+
+    Names are paths under src/ibkr_etl, so a subpackage file is
+    'factsheet_spec/engine.py'. Importing a subpackage module also imports the
+    subpackage's __init__.py.
+    """
+    def module_files(parts):
+        """The files that importing ibkr_etl.<parts> loads (empty if it is not a package module)."""
+        found = set()
+        for i in range(1, len(parts)):
+            found.add('/'.join(parts[:i]) + '/__init__.py')
+        if parts:
+            found.add('/'.join(parts) + '.py')
+            found.add('/'.join(parts) + '/__init__.py')
+        return found
+
+    def imported(name, source):
+        package = name.split('/')[:-1]
         names = set()
         for node in ast.walk(ast.parse(source)):
-            if isinstance(node, ast.ImportFrom) and (node.level == 1 or (node.module or '').split('.')[0] == 'ibkr_etl'):
-                module = node.module if node.level else (node.module or '').partition('.')[2]
-                names |= {module.split('.')[0]} if module else {alias.name for alias in node.names}
+            if isinstance(node, ast.ImportFrom):
+                if node.level:
+                    if node.level - 1 > len(package):
+                        continue
+                    base = package[:len(package) - (node.level - 1)]
+                elif (node.module or '').split('.')[0] == 'ibkr_etl':
+                    base = []
+                else:
+                    continue
+                module = (node.module or '') if node.level else (node.module or '').partition('.')[2]
+                parts = base + [m for m in module.split('.') if m]
+                names |= module_files(parts)
+                # "from .pkg import mod" may name a submodule rather than a value.
+                for alias in node.names:
+                    if alias.name != '*':
+                        names |= module_files(parts + [alias.name])
             elif isinstance(node, ast.Import):
-                names |= {a.name.split('.')[1] for a in node.names if a.name.startswith('ibkr_etl.')}
-        return {name + '.py' for name in names}
+                for alias in node.names:
+                    if alias.name.startswith('ibkr_etl.'):
+                        names |= module_files(alias.name.split('.')[1:])
+        return names
     found, pending = set(), ['web.py']
     while pending:
         name = pending.pop()
         if name in found or name not in files:
             continue
         found.add(name)
-        pending.extend(imported(files[name]))
+        pending.extend(imported(name, files[name]))
     return found
 
 
@@ -123,6 +154,7 @@ def change_set(state, merged=None):
             (Path(tmp) / side / PACKAGE).mkdir(parents=True)
             for name in changed:
                 if name in files:
+                    (Path(tmp) / side / PACKAGE / name).parent.mkdir(parents=True, exist_ok=True)
                     (Path(tmp) / side / PACKAGE / name).write_bytes(files[name])
         diff = subprocess.run(['git', 'diff', '--no-index', '--binary', '--no-prefix', 'a', 'b'], cwd=tmp, capture_output=True)
         if diff.returncode not in (0, 1):
@@ -200,6 +232,10 @@ def prepare():
     unsupported = [p for p in image_changes if not p.startswith(PACKAGE + '/')]
     if unsupported:
         raise SystemExit('This release path only ships src/ibkr_etl. Other image files changed:\n  ' + '\n  '.join(unsupported))
+    data = [p for p in image_changes if p.startswith(PACKAGE + '/') and not p.endswith('.py')]
+    if data:
+        print('Not part of the website release (package data; this path ships the .py files of src/ibkr_etl, '
+              'so the website must not need these):\n  ' + '\n  '.join(data))
     state = {
         'head': head, 'deployed_commit': deployed, 'live_image': live,
         'fqdn': app['properties']['configuration']['ingress']['fqdn'],

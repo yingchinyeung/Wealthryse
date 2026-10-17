@@ -9,7 +9,9 @@ Dry run by default: nothing is written except the JSON report. --live reads
 DATABASE_URL read-only to skip rows already there and list frozen periods.
 --apply inserts missing rows in one transaction (never overwrites); if the
 rows add an external flow it also needs --accept-flow-changes, because live
-returns for those dates would then change.
+returns for those dates would then change. Every account must belong to the
+tenant (account_belongs_to_current_tenant), checked with --live and again
+inside the --apply transaction.
 
 Exit codes: 0 no flow added (or applied), 1 flows would be added, 2 could not run.
 
@@ -22,7 +24,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import tempfile
 from dataclasses import replace
@@ -36,9 +37,11 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from ibkr_etl.db import DEFAULT_TENANT_ID  # noqa: E402
 from ibkr_etl.flow_backfill import (  # noqa: E402
-    BackfillError, apply, load_candidates, plan, registry_accounts, without_rows,
+    BackfillError, apply, load_candidates, plan, registry_accounts, unowned_accounts, without_rows,
 )
-from ibkr_etl.switch_dry_run import AccountMasker, open_read_only, statement_from_bytes  # noqa: E402
+from ibkr_etl.switch_dry_run import (  # noqa: E402
+    AccountMasker, mask_account_ids, open_read_only, statement_from_bytes,
+)
 
 MAX_BLOB_BYTES = 512 * 1024 * 1024
 
@@ -119,13 +122,18 @@ def _connect(args: argparse.Namespace):
 
 def run(args: argparse.Namespace, work_dir: Path) -> dict:
     accounts = set(args.account)
-    if args.accounts_from_registry:
+    if args.live:
+        # A short read: registry accounts, and every selected account must belong to the tenant.
         live = _connect(args)
         try:
-            accounts |= set(registry_accounts(live, args.tenant_id)) | _configured_accounts()
+            if args.accounts_from_registry:
+                accounts |= set(registry_accounts(live, args.tenant_id)) | _configured_accounts()
+            unowned = unowned_accounts(live, accounts)
         finally:
             live.rollback()
             live.close()
+        if unowned:
+            raise BackfillError(f"Accounts not in this tenant: {', '.join(unowned)}")
     accounts = sorted(accounts)
     if not accounts:
         raise BackfillError("No account to backfill")
@@ -170,8 +178,7 @@ def main(argv: list[str] | None = None) -> int:
         with tempfile.TemporaryDirectory(prefix="medallion-flow-backfill-") as directory:
             report = run(args, Path(directory))
     except Exception as error:  # noqa: BLE001 - one clear line, then exit 2
-        text = re.sub(r"\b[A-Z]{1,2}\d{5,}\b", lambda m: "***" + m.group()[-3:], str(error))
-        print(f"medallion flow backfill: ERROR {type(error).__name__}: {text}")
+        print(f"medallion flow backfill: ERROR {type(error).__name__}: {mask_account_ids(str(error))}")
         return 2
     masker = AccountMasker(report["accounts"])
     report = json.loads(masker.scrub(json.dumps(report, sort_keys=True, default=str)))

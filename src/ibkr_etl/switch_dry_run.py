@@ -6,10 +6,17 @@ throwaway SQLite database. The result is compared with the v1.1 snapshots
 account-sync imported for the same date and, optionally, with the live
 database through a read-only transaction. Nothing is written anywhere except
 the temporary directory and the caller's report.
+
+If rekeyed rows are found, the loader's legacy-key step
+(IBKR_FLEX_LEGACY_KEY_COMPAT) avoids duplicating them. It must not run while
+account-sync imports the same accounts. Bronze (flex_rows) keeps the parser's
+key while silver keeps the legacy key, so S6's replay will list those rows as
+rekeyed.
 """
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -38,6 +45,15 @@ END_DATE_TABLES = {"position_snapshots", "cash_snapshots"}
 IGNORED_COLUMNS = {"account_id", "tenant_id", "last_seen_run_id", "first_seen_run_id", "row_sha256"}
 HASH_KEY_PREFIXES = ("cash:", "fx:", "corporate-action:", "derived:", "fx-rate:", "fx-rate-unresolved:")
 SAMPLE_LIMIT = 20
+# IBKR account ids anywhere in a text. No word boundaries, so ids inside names
+# such as flex_U1234567_x or followed by a letter still match.
+ACCOUNT_ID_IN_TEXT = re.compile(r"[A-Z]{1,2}\d{5,}")
+
+
+def mask_account_ids(text: str) -> str:
+    """For error lines, where the account list is not known: keep the last three characters."""
+
+    return ACCOUNT_ID_IN_TEXT.sub(lambda match: "***" + match.group()[-3:], text)
 
 
 class DryRunError(RuntimeError):
@@ -268,6 +284,7 @@ def compare_table(
     v2, reference = index(v2_rows, "v2"), index(reference_rows, "reference")
     counts: Counter = Counter()
     samples: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    dates: dict[str, set[str]] = defaultdict(set)
 
     def sample(kind: str, item: dict[str, Any]) -> None:
         if len(samples[kind]) < SAMPLE_LIMIT:
@@ -319,11 +336,13 @@ def compare_table(
             counts["extra_before_start"] += 1
         else:
             counts["extra_in_v2"] += 1
+            dates["extra_in_v2"].add(str(day))
             sample("extra_in_v2", describe(key, v2[key]))
     for key in sorted(reference_only, key=str):
         day = reference[key].get(date_column)
         if in_scope(day):
             counts["missing_in_v2"] += 1
+            dates["missing_in_v2"].add(str(day))
             sample("missing_in_v2", describe(key, reference[key]))
         else:
             counts["reference_outside_scope"] += 1
@@ -339,6 +358,8 @@ def compare_table(
     }
     if samples:
         result["samples"] = dict(samples)
+    if dates:
+        result["dates"] = {name: sorted(values) for name, values in sorted(dates.items())}
     return result
 
 
@@ -559,7 +580,11 @@ def open_read_only(database_url: str, tenant_id: str):
 
 
 def live_check(connection: Any, v2: sqlite3.Connection, *, tenant_id: str, accounts: Iterable[str],
-               statements: list[Statement], lookback_days: int) -> dict[str, Any]:
+               statements: list[Statement], lookback_days: int,
+               unchecked: Iterable[str] = ()) -> dict[str, Any]:
+    """Would the first pull duplicate or overwrite live rows? `unchecked` accounts have no snapshot."""
+
+    unchecked = set(unchecked)
     anchor = max(statement.to_date for statement in statements)
     wanted = _dates((date.fromisoformat(anchor) - timedelta(days=lookback_days - 1)).isoformat(), anchor)
     result: dict[str, Any] = {"window": [min(wanted), max(wanted)], "lookback_days": lookback_days, "accounts": {}}
@@ -576,6 +601,8 @@ def live_check(connection: Any, v2: sqlite3.Connection, *, tenant_id: str, accou
             continue
         rows, columns, extra = live_reference(connection, tenant_id=tenant_id, account_id=account_id,
                                               v2=v2, window=window)
+        # Nothing live to collide with: the pull only adds this account's rows.
+        new_in_live = account_id in unchecked and not any(rows.values())
         tables = {}
         for table in (*NATURAL_TABLES, *EVENT_TABLES):
             date_column = ACCOUNT_TABLES[table][0]
@@ -585,14 +612,29 @@ def live_check(connection: Any, v2: sqlite3.Connection, *, tenant_id: str, accou
                 table, mine, rows[table], set(columns[table]) & set(_table_columns(v2, table)),
                 in_scope=in_scope, before_start=lambda day: False,
             )
-        # Natural-key rows absent from live fill a gap; event keys absent from live are new rows.
+        # Natural-key rows absent from live fill a gap, unless live holds another key for that
+        # date (a second NAV row, doubled holdings). Event keys absent from live are new rows.
+        drift = []
         for table in NATURAL_TABLES:
-            tables[table]["would_insert"] = tables[table].pop("extra_in_v2")
-        failures += unexplained(tables, missing_fails=False)
+            compared = tables[table]
+            compared["would_insert"] = compared.pop("extra_in_v2")
+            dates = compared.get("dates", {})
+            if "extra_in_v2" in dates:
+                dates["would_insert"] = dates.pop("extra_in_v2")
+            shared = set(dates.get("would_insert", ())) & set(dates.get("missing_in_v2", ()))
+            compared["dates_with_another_live_key"] = len(shared)
+            if shared:
+                drift.append(f"{table}: on {len(shared)} dates live holds a row under another key; "
+                             "the first pull would add a second row beside it")
+        if new_in_live:
+            for table in EVENT_TABLES:
+                tables[table]["new_rows"] = tables[table].pop("extra_in_v2")
+        failures += drift + unexplained(tables, missing_fails=False)
         if extra["nav_base_currency_rows"]:
             failures.append(f"live has {extra['nav_base_currency_rows']} NAV rows in currency BASE")
         result["accounts"][account_id] = {
             "status": "FAIL" if failures else "PASS", "failures": failures,
+            "checked_against_snapshot": account_id not in unchecked, "new_in_live": new_in_live,
             "days_checked": len(window), "tables": tables, **extra,
         }
         if failures:
@@ -603,9 +645,27 @@ def live_check(connection: Any, v2: sqlite3.Connection, *, tenant_id: str, accou
 
 # ------------------------------------------------------------------- driver
 
+def _allowed_unchecked(allow: Iterable[str], accounts: list[str]) -> set[str]:
+    """Full ids, or the masked form the summary prints (***123)."""
+
+    masker = AccountMasker(accounts)
+    by_mask = {masker(account): account for account in accounts}
+    allowed = set()
+    for item in allow:
+        account = item if item in accounts else by_mask.get(item)
+        if account is None:
+            raise DryRunError(f"--allow-unchecked-account {item} is not an account in the statements")
+        allowed.add(account)
+    return allowed
+
+
 def run_dry_run(statements: Iterable[Statement], snapshots: Iterable[Snapshot], *, work_dir: Path,
                 tenant_id: str = DEFAULT_TENANT_ID, live_connection: Any = None,
-                lookback_days: int = 14) -> dict[str, Any]:
+                open_live: Callable[[], Any] | None = None, lookback_days: int = 14,
+                allow_unchecked: Iterable[str] = ()) -> dict[str, Any]:
+    """Compare v2's load with the snapshots. `open_live` opens the read-only connection
+    only when the offline work is done; that connection is closed afterwards."""
+
     ordered = order_statements(statements)
     if not ordered:
         raise DryRunError("At least one statement is required")
@@ -620,6 +680,7 @@ def run_dry_run(statements: Iterable[Statement], snapshots: Iterable[Snapshot], 
     for account_id in by_account:
         if account_id not in statement_accounts:
             raise DryRunError("A snapshot account does not appear in any statement")
+    allowed = _allowed_unchecked(allow_unchecked, statement_accounts)
 
     instruments = [item for snapshot in by_account.values() for item in snapshot.instruments]
     database_path = load_with_v2(ordered, work_dir / "sequential", tenant_id=tenant_id, instruments=instruments)
@@ -637,6 +698,7 @@ def run_dry_run(statements: Iterable[Statement], snapshots: Iterable[Snapshot], 
         },
         "accounts": {},
         "accounts_not_compared": {},
+        "failures": [],
     }
     status = "PASS"
     try:
@@ -682,15 +744,29 @@ def run_dry_run(statements: Iterable[Statement], snapshots: Iterable[Snapshot], 
             }
             if failures:
                 status = "FAIL"
-        for account_id in statement_accounts:
-            if account_id not in by_account:
-                report["accounts_not_compared"][account_id] = {"rows_v2_would_load": _account_rows(v2, account_id)}
-        if live_connection is not None:
-            report["live_check"] = live_check(live_connection, v2, tenant_id=tenant_id,
-                                              accounts=sorted(by_account), statements=ordered,
-                                              lookback_days=lookback_days)
-            if report["live_check"]["status"] != "PASS":
+        unchecked = [account for account in statement_accounts if account not in by_account]
+        for account_id in unchecked:
+            report["accounts_not_compared"][account_id] = {
+                "rows_v2_would_load": _account_rows(v2, account_id), "allowed": account_id in allowed}
+            if account_id not in allowed:
+                report["failures"].append(
+                    f"{account_id} is in the statements but has no snapshot; the pull would load it unchecked "
+                    "(allow it with --allow-unchecked-account)")
                 status = "FAIL"
+        opened = None
+        try:
+            if live_connection is None and open_live is not None:
+                live_connection = opened = open_live()
+            if live_connection is not None:
+                report["live_check"] = live_check(live_connection, v2, tenant_id=tenant_id,
+                                                  accounts=sorted(by_account) + unchecked, statements=ordered,
+                                                  lookback_days=lookback_days, unchecked=unchecked)
+                if report["live_check"]["status"] != "PASS":
+                    status = "FAIL"
+        finally:
+            if opened is not None:
+                opened.rollback()
+                opened.close()
     finally:
         v2.close()
     report["status"] = status
@@ -729,16 +805,22 @@ def summary_lines(report: Mapping[str, Any]) -> list[str]:
             lines.append(f"  warn {text}")
     if report.get("accounts_not_compared"):
         lines.append("accounts in the statements without a snapshot (the Flex pull would load them too): "
-                     + ", ".join(f"{a} ({v['rows_v2_would_load']} rows)"
+                     + ", ".join(f"{a} ({v['rows_v2_would_load']} rows, "
+                                 f"{'allowed' if v.get('allowed') else 'not allowed'})"
                                  for a, v in sorted(report["accounts_not_compared"].items())))
+    for text in report.get("failures", ()):
+        lines.append(f"FAIL {text}")
     live = report.get("live_check")
     if live:
         lines.append(f"live check: {live['status']} window {live['window'][0]}..{live['window'][1]}")
         for account, item in sorted(live["accounts"].items()):
-            lines.append(f"  account {account}: {item['status']}")
+            note = "" if item.get("checked_against_snapshot", True) else (
+                " (no snapshot; new in live)" if item.get("new_in_live") else " (no snapshot)")
+            lines.append(f"  account {account}: {item['status']}{note}")
             for table, result in item.get("tables", {}).items():
                 counts = " ".join(f"{name}={result.get(name, 0)}" for name in
-                                  ("matched", "different", "rekeyed", "extra_in_v2", "would_insert", "missing_in_v2"))
+                                  ("matched", "different", "rekeyed", "extra_in_v2", "would_insert",
+                                   "missing_in_v2", "dates_with_another_live_key", "new_rows"))
                 lines.append(f"    {table:<19} v2={result['v2_rows']} {counts}")
             for text in item["failures"]:
                 lines.append(f"    FAIL {text}")

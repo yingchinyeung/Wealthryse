@@ -9,6 +9,15 @@ param storageAccountName string = 'ibkrv2stgauhecwc4itaoo'
 param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
+// The defaults keep today's job. On the day v2 makes its own daily Flex pull:
+// scheduleUtc '20 8 * * *', dispatchRunDate 'previous_hkt_day', flexSendsEnabled true.
+param scheduleUtc string = '0 8 * * *'
+@allowed([
+  'current_hkt_day'
+  'previous_hkt_day'
+])
+param dispatchRunDate string = 'current_hkt_day'
+param flexSendsEnabled bool = false
 
 var tags = {
   application: 'ibkr-portfolio-platform'
@@ -69,10 +78,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
       replicaTimeout: 3000
       replicaRetryLimit: 0
       scheduleTriggerConfig: {
-        // One fail-closed statement generation per active Flex query at 16:20 HKT,
-        // after account-sync (16:10) and before the benchmark job (16:30). It asks
-        // up to yesterday HKT, as v1.1's pull does.
-        cronExpression: '20 8 * * *'
+        // One fail-closed statement generation per active Flex query. From the
+        // switch day: 16:20 HKT, asking up to yesterday HKT as v1.1's pull does.
+        cronExpression: scheduleUtc
         parallelism: 1
         replicaCompletionCount: 1
       }
@@ -106,7 +114,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${storageAccountName}.blob.${environment().suffixes.storage}' }
             { name: 'AZURE_RAW_CONTAINER', value: 'ibkr-raw' }
             { name: 'INSTITUTIONAL_FLEX_LOOKBACK_DAYS', value: '14' }
-            { name: 'INSTITUTIONAL_DISPATCH_RUN_DATE', value: 'previous_hkt_day' }
+            { name: 'INSTITUTIONAL_DISPATCH_RUN_DATE', value: dispatchRunDate }
+            // No IBKR request at all unless this is on.
+            { name: 'INSTITUTIONAL_FLEX_SENDS_ENABLED', value: flexSendsEnabled ? 'true' : 'false' }
             // The app login cannot create tables, so the import must not try migrations
             // (the v1.1 job sets the same).
             { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
@@ -123,4 +133,4 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
 }
 
 output jobName string = job.name
-output scheduleHongKong string = 'Daily at 16:20 Asia/Hong_Kong (UTC+8)'
+output scheduleUtc string = scheduleUtc

@@ -557,7 +557,8 @@ def main() -> int:
         )
         connection.commit()
         findings = evaluate_supervisor_state(
-            state, today_hkt=now_hkt_date(), portal_failure=portal_failure
+            state, today_hkt=now_hkt_date(), portal_failure=portal_failure,
+            now_utc=datetime.now(timezone.utc),
         )
         stage = "check_layer_freshness"
         layer_findings = _layer_freshness_findings(database_url, tenant_id)

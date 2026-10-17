@@ -15,11 +15,28 @@ Dates are data dates, as the dispatcher's run_date is. With
 INSTITUTIONAL_DISPATCH_RUN_DATE=previous_hkt_day the pull for date X runs on
 X + 1, so a switch on day D uses effective date D - 1.
 
+Run order on D, all before 07:55 UTC:
+1. Azure schedules first: account-sync and v1.1's daily job off
+   (scheduleEnabled=false); institutional-daily to scheduleUtc '20 8 * * *',
+   dispatchRunDate previous_hkt_day and flexSendsEnabled true; the schedule
+   watchdog rules regenerated with IBKR_DAILY_FEED=direct_flex and the v1.1
+   rule disabled.
+2. This cutover last: a dry run, then --apply.
+The worker never sends before the source's scheduled time (16:20 HKT here),
+so a cutover that lands while an old 08:00 schedule is still live sends
+nothing at 08:00.
+
+Fallback if the 08:20 pull fails: wait until institutional-daily's execution
+has ended before anything runs v1.1 by hand, so one token never has two
+requests in flight.
+
 Revert disables the ibkr_flex registration, re-opens the existing_v11 one,
-retires the binding and stops the schedule. Nothing is deleted, so the role
-behind database-approval-url (no DELETE grant) can run both directions.
-Connections are psycopg connections with a dict row factory and the tenant
-set; the caller commits.
+retires the binding and stops the schedule. It is clean only before the
+first successful pull: after one, account-sync's exact row-count check
+meets rows v1.1 does not have, so the path is to fix forward, not revert.
+Nothing is deleted, so the role behind database-approval-url (no DELETE
+grant) can run both directions. Connections are psycopg connections with a
+dict row factory and the tenant set; the caller commits.
 """
 
 from __future__ import annotations
@@ -209,10 +226,21 @@ def _credential_and_query(connection, request: CutoverRequest, credential_id: uu
         """,
         (request.tenant_id, credential_id, request.query_id),
     ).fetchone()
+    same_token = None
+    if request.token_fingerprint is not None:
+        same_token = connection.execute(
+            """
+            SELECT credential_id FROM ibkr_flex_credentials
+            WHERE tenant_id = %s AND status = 'active' AND credential_id <> %s
+              AND left(token_fingerprint, 16) = %s
+            """,
+            (request.tenant_id, credential_id, request.token_fingerprint),
+        ).fetchone()
     return (
         None if credential is None else dict(credential),
         named,
         None if query is None else dict(query),
+        same_token,
     )
 
 
@@ -261,7 +289,9 @@ def plan_cutover(
     if not match:
         return plan
     credential_id = uuid.UUID(match.group(1))
-    credential, named, query = _credential_and_query(connection, request, credential_id, lock=lock)
+    credential, named, query, same_token = _credential_and_query(
+        connection, request, credential_id, lock=lock
+    )
     plan["credential"] = {
         "credential_id": str(credential_id),
         "key_vault_secret_name": request.token_secret_name,
@@ -271,13 +301,17 @@ def plan_cutover(
     }
     plan["query"] = {
         "flex_source_id": None if query is None else str(query["flex_source_id"]),
-        "query_id_sha256": sha256_text(request.query_id),
+        # Never the ID or a digest of it: a short digit string is easy to reverse.
+        "query_id_supplied": bool(request.query_id),
+        "query_id_digits": len(request.query_id),
         "action": "insert" if query is None else (
             "keep" if query["status"] == "active" and query["schedule_enabled"] else "activate"
         ),
     }
     if named is not None:
         problems.append("Another credential already uses this display name or secret name")
+    if same_token is not None:
+        problems.append("An active credential already holds this token (same fingerprint)")
     if credential is not None:
         if credential["key_vault_secret_name"] != request.token_secret_name:
             problems.append("The existing credential row references a different secret")
@@ -662,8 +696,8 @@ def plan_revert(
         ).fetchone()
         if int(pulls["n"]):
             warnings.append(
-                f"{int(pulls['n'])} Flex pull(s) already loaded rows; account-sync's "
-                "row-count check can fail on rows v1.1 does not have"
+                f"{int(pulls['n'])} Flex pull(s) already loaded rows; account-sync's exact "
+                "row counts will not match them, so fix forward rather than revert"
             )
     if problems:
         return plan

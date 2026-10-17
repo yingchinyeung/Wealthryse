@@ -56,9 +56,9 @@ class ScheduleMonitorTests(unittest.TestCase):
         self.assertNotIn('ibkrv2stg-account-sync-daily', names)
         self.assertEqual(len(v2), 9)
         self.assertEqual(daily_schedules('v11_export'), (DAILY_V1, DAILY_V2))
-        # institutional-daily runs at 08:20 UTC in both, matching its Bicep file.
-        for specs in (DAILY_V2, v2):
-            self.assertIn(('ibkrv2stg-institutional-daily', 500, 50), specs)
+        # institutional-daily: 08:00 UTC as its Bicep defaults, 08:20 from the switch day.
+        self.assertIn(('ibkrv2stg-institutional-daily', 480, 50), DAILY_V2)
+        self.assertIn(('ibkrv2stg-institutional-daily', 500, 50), v2)
         with self.assertRaises(ValueError):
             daily_schedules('both')
 

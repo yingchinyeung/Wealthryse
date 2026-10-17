@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from .ai_analyst import AIAnalystConfig, AIAnalystError, _default_client
-from .burn_in import flex_import_failures, freshness_check
+from .burn_in import first_flex_pull_due, flex_import_failures, freshness_check
 from .util import canonical_json
 
 
@@ -103,8 +103,13 @@ def evaluate_supervisor_state(
     *,
     today_hkt: date,
     portal_failure: str | None = None,
+    now_utc: datetime | None = None,
 ) -> list[Finding]:
-    """Convert deterministic observations into a stable, typed incident set."""
+    """Convert deterministic observations into a stable, typed incident set.
+
+    now_utc only opens the switch-morning window for v2's first Flex pull;
+    without it there is no such window.
+    """
     findings: list[Finding] = []
     freshness_specs = (
         (
@@ -158,7 +163,27 @@ def evaluate_supervisor_state(
         # This runs every five minutes, so it accepts yesterday's pull; the
         # 17:15 HKT burn-in check requires today's.
         failures = flex_import_failures(state, today_hkt=today_hkt, maximum_age_days=1)
-        if failures:
+        due = first_flex_pull_due(state, today_hkt=today_hkt, now_utc=now_utc) if failures else None
+        if due is not None:
+            # Switch morning: the first pull has not run yet and is not late.
+            findings.append(
+                Finding(
+                    incident_key="first_flex_pull_pending",
+                    check_id="account_import_status",
+                    severity="warning",
+                    description=(
+                        "Waiting for v2's first Flex pull, due by "
+                        f"{due.astimezone(timezone.utc):%H:%M} UTC"
+                    ),
+                    evidence={
+                        "daily_feed": "ibkr_flex",
+                        "daily_feed_effective_from": str(state.get("daily_feed_effective_from")),
+                        "due_by_utc": due.astimezone(timezone.utc).isoformat(),
+                    },
+                    autonomous_action=None,
+                )
+            )
+        elif failures:
             nav_run = state.get("latest_nav_run") or {}
             findings.append(
                 Finding(

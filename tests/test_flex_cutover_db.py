@@ -8,6 +8,7 @@ or Key Vault request is made.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -15,7 +16,7 @@ import os
 import tempfile
 import unittest
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
@@ -29,6 +30,8 @@ APPROVAL_ROLE = "flex_cutover_test_approval"
 TEST_PASSWORD = "flex-cutover-test-only"  # throwaway roles in a disposable test server
 TOLERATED_MIGRATIONS = {"027_legacy_external_market_data_approval.sql", "056_specialist_audit_ledger.sql"}
 QUERY_ID = "908172635"
+QUERY_ID_SHA256 = hashlib.sha256(QUERY_ID.encode()).hexdigest()
+HKT = ZoneInfo("Asia/Hong_Kong")
 APPROVER = "a" * 64
 START = "2025-01-20"
 # What the website's approval login may do on the tables the cutover touches: no DELETE.
@@ -258,6 +261,7 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
             "RAW_REPORT_DIR": str(Path(directory) / "raw"),
             "DATABASE_PATH": str(Path(directory) / "unused.sqlite3"),
             "AZURE_STORAGE_ACCOUNT_URL": "",
+            "INSTITUTIONAL_FLEX_SENDS_ENABLED": "true",
         }
         values.update(extra)
         return values
@@ -273,14 +277,31 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
             self.assertEqual(dispatcher.main(), 0)
         return json.loads(output.getvalue())
 
-    def _run_worker(self, client):
+    def _run_worker(self, client, *, now=None, **extra):
+        """Runs the worker at now (default 17:00 HKT today). self.secret_reads counts vault reads."""
         worker = _load_script("run_institutional_flex_worker")
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.dict(os.environ, self._environment(directory)), \
-                mock.patch.object(worker, "_secret_value", return_value="synthetic-token"), \
-                mock.patch.object(worker, "FlexClient", client), \
-                contextlib.redirect_stdout(io.StringIO()):
-            return worker.main()
+        now = now or datetime.combine(datetime.now(HKT).date(), time(17, 0), tzinfo=HKT)
+        secret = mock.Mock(return_value="synthetic-token")
+        try:
+            with tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.dict(os.environ, self._environment(directory, **extra)), \
+                    mock.patch.object(worker, "_secret_value", secret), \
+                    mock.patch.object(worker, "FlexClient", client), \
+                    mock.patch.object(worker, "_now", return_value=now), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                return worker.main()
+        finally:
+            self.secret_reads = secret.call_count
+
+    def _send_record(self, credential_id):
+        """The committed send time, read on a separate connection."""
+        import psycopg
+
+        with psycopg.connect(_dsn(ADMIN_DSN, self.database, OWNER_ROLE),
+                             options=f"-c app.tenant_id={self.tenant}") as other:
+            row = other.execute("SELECT last_send_at FROM ibkr_credential_circuit_state WHERE credential_id = %s",
+                                (credential_id,)).fetchone()
+        return None if row is None else row[0]
 
     # Tests
 
@@ -293,7 +314,8 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
         self._subject("U9100002")
         self._subject("U9100003", state="preview")
         self._subject("U9100004", source="kiwoom_rest")  # not fed by v1.1, so left alone
-        request = self._request(x, statement(x, "U9100001", "U9100002", "U9100003", "U9100009"))
+        request = self._request(x, statement(x, "U9100001", "U9100002", "U9100003", "U9100009"),
+                                token_fingerprint="0123456789abcdef")
         before = self._snapshot()
 
         plan = plan_cutover(self.approval, request, today=today)
@@ -305,6 +327,8 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
         self.assertEqual((plan["closes_existing_v11_on"], plan["first_dispatch_day"]["previous_hkt_day"]),
                          ("2026-10-19", "2026-10-21"))
         self.assertNotIn(QUERY_ID, json.dumps(plan, default=str))
+        self.assertNotIn(QUERY_ID_SHA256, json.dumps(plan, default=str))
+        self.assertEqual((plan["query"]["query_id_supplied"], plan["query"]["query_id_digits"]), (True, 9))
         self.assertTrue(any(w.startswith("U9100003: preview subjects move too") for w in plan["warnings"]))
         self.assertTrue(any(w.endswith("these are not moved: U9100009") for w in plan["warnings"]))
 
@@ -358,6 +382,14 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
         self.assertEqual(query, {"id": source, "query_id": QUERY_ID, "status": "active", "schedule_enabled": True})
         self.db.rollback()
         self.assertEqual(self._snapshot()["audit"], [("v11_accounts_moved_to_flex",)])
+        audit = self.db.execute("SELECT details_json FROM audit_events WHERE actor_id = "
+                                "'v11-flex-cutover'").fetchone()["details_json"]
+        self.db.rollback()
+        audit = json.loads(audit) if isinstance(audit, str) else audit
+        self.assertNotIn(QUERY_ID, json.dumps(audit))
+        self.assertNotIn(QUERY_ID_SHA256, json.dumps(audit))
+        self.assertEqual({key: audit["query"][key] for key in ("query_id_supplied", "query_id_digits")},
+                         {"query_id_supplied": True, "query_id_digits": 9})
 
         # A re-run finds everything in place and writes nothing, not even an audit event.
         after = self._snapshot()
@@ -419,6 +451,14 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
         self.db.execute("UPDATE ibkr_flex_credentials SET status = 'revoked'")
         self.db.commit()
         refused("The credential is revoked", "U9200001")
+        # The same token already active under another name.
+        self.db.execute("INSERT INTO ibkr_flex_credentials (credential_id, display_name, key_vault_secret_name, "
+                        "token_fingerprint, status) VALUES (%s, 'Website login', %s, 'abcdefabcdefabcd', 'active')",
+                        (uuid.uuid4(), "ibkr-flex-source-" + uuid.uuid4().hex))
+        self.db.commit()
+        refused("An active credential already holds this token (same fingerprint)", "U9200004",
+                token_secret_name="ibkr-flex-source-" + uuid.uuid4().hex, credential_display_name="Second token",
+                token_fingerprint="abcdefabcdefabcd")
 
     def test_revert_restores_the_export_and_the_cutover_applies_again(self):
         from ibkr_etl.burn_in import collect_import_state
@@ -499,15 +539,17 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
         self._subject("U9400001")
         self._subject("U9400002")
         content = statement(x, "U9400001", "U9400002")
-        self._apply(self._request(x, content), today)
+        credential_id = self._apply(self._request(x, content), today)["credential"]["credential_id"]
         calls = []
+        send_record = self._send_record
 
         class FakeClient:
             def __init__(self, settings):
                 calls.append({"query_id": settings.flex_query_id, "token": settings.flex_token})
 
             def request_report(self, start, end):
-                calls[-1]["window"] = (start, end)
+                # The send record is committed before IBKR is asked.
+                calls[-1].update(window=(start, end), committed=send_record(credential_id) is not None)
                 return FlexReport(content=content, content_type="application/xml", reference_code="SYNTHETIC-1")
 
         summary = self._run_dispatcher()
@@ -516,7 +558,7 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
             (x.isoformat(), "previous_hkt_day", 2, 7))
         self.assertEqual(self._run_worker(FakeClient), 0)
         self.assertEqual(calls, [{"query_id": QUERY_ID, "token": "synthetic-token",
-                                  "window": (x - timedelta(days=13), x)}])
+                                  "window": (x - timedelta(days=13), x), "committed": True}])
 
         # Nothing claims analytics_rebuild yet; the daily jobs after the pull do that work.
         self.assertEqual([(r["work_kind"], r["status"]) for r in self.db.execute(
@@ -534,10 +576,31 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
                                   "consecutive_failures FROM ibkr_credential_circuit_state").fetchone()
         self.assertEqual(circuit, {"sent": True, "requires_manual_reset": False, "consecutive_failures": 0})
 
-        # The burn-in and the administrator now judge the account by this pull.
+        # Another source's later failed pull is not the pilot's.
+        other_credential, other_source = uuid.uuid4(), uuid.uuid4()
+        self.db.execute("INSERT INTO ibkr_flex_credentials (credential_id, display_name, key_vault_secret_name, "
+                        "status) VALUES (%s, 'Website login', %s, 'active')",
+                        (other_credential, "ibkr-flex-source-" + other_credential.hex))
+        self.db.execute("INSERT INTO ibkr_flex_queries (flex_source_id, credential_id, query_id, display_name, "
+                        "schedule_enabled, status) VALUES (%s, %s, '111', 'Website query', true, 'active')",
+                        (other_source, other_credential))
+        self.db.execute("INSERT INTO institutional_work_items (work_item_id, flex_source_id, work_kind, "
+                        "ordering_key, idempotency_key, status, payload_json, maximum_attempts, completed_at) "
+                        "VALUES (%s, %s, 'flex_statement_request', 'credential:other', %s, 'dead_letter', %s, 1, "
+                        "now() + interval '1 minute')",
+                        (uuid.uuid4(), other_source, f"flex:{other_source}:{x}", json.dumps({"run_date": str(x)})))
+        self.db.execute("INSERT INTO ingestion_runs (run_type, started_at, completed_at, status) "
+                        "VALUES ('institutional-flex-daily', 'x', '2099-01-01T00:00:00+00:00', 'failed')")
+        self.db.commit()
+
+        # The burn-in and the administrator now judge the account by its own source's pull.
         state = collect_import_state(self.db, "U9400001", as_of=today)
         self.db.rollback()
         self.assertEqual((state["daily_feed"], state["latest_nav_run"]["run_id"]), ("ibkr_flex", run[0]["run_id"]))
+        self.assertEqual((state["latest_import"]["status"], state["latest_import"]["run_id"]),
+                         ("success", str(run[0]["run_id"])))
+        self.assertEqual((state["daily_feed_source"]["schedule_hour"], state["daily_feed_source"]["schedule_minute"]),
+                         (16, 20))
         self.assertEqual(flex_import_failures(state, today_hkt=today), [])
 
     def test_a_lockout_is_recorded_and_the_next_run_leaves_it_alone(self):
@@ -585,6 +648,83 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
         self.assertEqual(requests, [(x.isoformat(), "dead_letter", "1018"),
                                     ((x + timedelta(days=1)).isoformat(), "dead_letter", "ValidationBlocked")])
 
+    def test_no_request_is_sent_with_sends_off_or_before_the_scheduled_time(self):
+        from ibkr_etl.flex_discovery import ValidationBlocked
+
+        x, today = date(2026, 10, 18), date(2026, 10, 19)
+        self._subject("U9700001")
+        credential_id = self._apply(self._request(x, statement(x, "U9700001")), today)["credential"]["credential_id"]
+
+        class MustNotSend:
+            def __init__(self, settings):
+                raise AssertionError("A request was sent")
+
+        cases = (
+            ({"INSTITUTIONAL_FLEX_SENDS_ENABLED": "false"}, None, "institutional_flex_sends_disabled"),
+            ({"INSTITUTIONAL_FLEX_SENDS_ENABLED": ""}, None, "institutional_flex_sends_disabled"),
+            # 08:19:59 UTC is 16:19:59 HKT, a second before the source's 16:20.
+            ({}, datetime(2026, 10, 19, 8, 19, 59, tzinfo=timezone.utc), "before_scheduled_send_time"),
+        )
+        for day, (environment, now, reason) in enumerate(cases):
+            run_date = x + timedelta(days=day)
+            self._run_dispatcher(WORK_RUN_DATE=run_date.isoformat())
+            with self.assertRaisesRegex(ValidationBlocked, reason):
+                self._run_worker(MustNotSend, now=now, **environment)
+            self.assertEqual(self.secret_reads, 0)
+            item = self.db.execute(
+                "SELECT status, error_code, error_message FROM institutional_work_items "
+                "WHERE work_kind = 'flex_statement_request' AND payload_json ->> 'run_date' = %s",
+                (run_date.isoformat(),)).fetchone()
+            self.db.rollback()
+            # As any blocked send: dead-lettered, and the circuit is never touched.
+            self.assertEqual(dict(item), {"status": "dead_letter", "error_code": "ValidationBlocked",
+                                          "error_message": reason})
+            self.assertIsNone(self._send_record(credential_id))
+
+    def test_flex_discovery_still_sends_nothing(self):
+        """The shared send check now commits its send record; flex discovery's behaviour is unchanged.
+
+        Its own connection returns dict rows, so the check's lock query (fetchone()[0]) stops it
+        before any request, as before this change. If that is ever fixed, discovery starts sending:
+        review its release gate then.
+        """
+        from ibkr_etl import flex_discovery
+        from ibkr_etl.flex_client import FlexReport
+
+        x = date(2026, 10, 18)
+        credential_id, source = uuid.uuid4(), uuid.uuid4()
+        self.db.execute("INSERT INTO ibkr_flex_credentials (credential_id, display_name, key_vault_secret_name, "
+                        "status) VALUES (%s, 'Website login', %s, 'pending_validation')",
+                        (credential_id, "ibkr-flex-source-" + credential_id.hex))
+        self.db.execute("INSERT INTO ibkr_flex_queries (flex_source_id, credential_id, query_id, display_name, "
+                        "status) VALUES (%s, %s, '222', 'Website query', 'pending_validation')",
+                        (source, credential_id))
+        self.db.execute("INSERT INTO ibkr_flex_source_validation_requests (validation_request_id, flex_source_id, "
+                        "status, requested_from, requested_to) VALUES (%s, %s, 'pending', %s, %s)",
+                        (uuid.uuid4(), source, x - timedelta(days=6), x))
+        self.db.commit()
+        content = statement(x, "U9800001")
+        sends = []
+
+        class FakeClient:
+            def __init__(self, settings):
+                sends.append(settings.flex_query_id)
+
+            def request_report(self, start, end):
+                return FlexReport(content=content, content_type="application/xml", reference_code="SYNTHETIC-2")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, self._environment(directory)), \
+                mock.patch.object(flex_discovery, "_secret_value", return_value="synthetic-token") as secret, \
+                mock.patch.object(flex_discovery, "FlexClient", FakeClient):
+            with self.assertRaises(KeyError):
+                flex_discovery.run_one_validation()
+        self.assertEqual((sends, secret.call_count), ([], 0))
+        self.assertIsNone(self._send_record(credential_id))
+        status = self.db.execute("SELECT status FROM ibkr_flex_source_validation_requests").fetchone()["status"]
+        self.db.rollback()
+        self.assertEqual(status, "pending")
+
     def test_the_command_dry_runs_applies_and_reverts(self):
         from ibkr_etl.flex_cutover import identity_sha256
 
@@ -604,6 +744,7 @@ class FlexCutoverDatabaseTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment), contextlib.redirect_stdout(output):
                 code = cli.main(list(argv))
             self.assertNotIn(QUERY_ID, output.getvalue())
+            self.assertNotIn(QUERY_ID_SHA256, output.getvalue())
             return code, json.loads(output.getvalue())
 
         cutover = ["--effective-date", x.isoformat(), "--token-secret-name", self.secret_name,

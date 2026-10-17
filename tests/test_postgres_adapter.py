@@ -986,9 +986,15 @@ class SecurityDefinitionTests(unittest.TestCase):
         analytics = (
             root / "infra" / "staging-onboarding-analytics-job.bicep"
         ).read_text(encoding="utf-8")
-        self.assertIn("cronExpression: '20 8 * * *'", institutional)
+        # Deploying with the defaults keeps today's 16:00 HKT job and sends nothing.
+        self.assertIn("param scheduleUtc string = '0 8 * * *'", institutional)
+        self.assertIn("cronExpression: scheduleUtc", institutional)
+        self.assertIn("param dispatchRunDate string = 'current_hkt_day'", institutional)
+        self.assertIn("{ name: 'INSTITUTIONAL_DISPATCH_RUN_DATE', value: dispatchRunDate }", institutional)
+        self.assertIn("param flexSendsEnabled bool = false", institutional)
+        self.assertIn("{ name: 'INSTITUTIONAL_FLEX_SENDS_ENABLED', value: flexSendsEnabled ? 'true' : 'false' }",
+                      institutional)
         self.assertIn("INSTITUTIONAL_FLEX_LOOKBACK_DAYS", institutional)
-        self.assertIn("{ name: 'INSTITUTIONAL_DISPATCH_RUN_DATE', value: 'previous_hkt_day' }", institutional)
         self.assertIn("{ name: 'IBKR_RUN_MIGRATIONS', value: 'false' }", institutional)
         self.assertIn("AZURE_RAW_CONTAINER", institutional)
         self.assertIn("cronExpression: '50 8 * * *'", derived)

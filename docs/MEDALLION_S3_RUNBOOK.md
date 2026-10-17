@@ -87,7 +87,9 @@ with `DATABASE_ADMIN_URL` set:
    checks each moved table's view in `public` (columns, grants, row counts, row-level
    security under an unknown tenant) and, for bronze, the append-only triggers. The
    live tables' row counts are reported as notes, as the collector writes every few
-   minutes.
+   minutes. Reporting snapshots created after the snapshot was taken (the month-end
+   factsheet job runs at 09:00 UTC) are notes too, with the older snapshot they supersede
+   for the same account and month; every existing row must keep its sha256 and payload.
 5. Restart the website so its connections take the runtime logins' new `search_path`
    (layer schemas first); the scheduled jobs take it on their next run. Connections
    opened before the batch keep working through the views in `public`.

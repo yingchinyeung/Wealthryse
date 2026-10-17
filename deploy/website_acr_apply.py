@@ -43,6 +43,7 @@ def apply(release, src=SRC, files=HERE / 'files'):
     # Unchanged files the reviewed website imports and the live one did not (see first_imported).
     for name, digest in sorted(release['imported'].items()):
         if sha(src / name) != digest:
+            (src / name).parent.mkdir(parents=True, exist_ok=True)
             (src / name).write_bytes((files / name).read_bytes())
             written.append(name)
     for name, want in list(release['touched'].items()) + [(n, {'new': d}) for n, d in release['imported'].items()]:

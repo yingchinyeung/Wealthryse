@@ -390,9 +390,10 @@ def main():
         first = []
         for name, data in sorted((config.get('imported') or {}).items()):
             content = gzip.decompress(base64.b64decode(data))
-            if '/' in name or not name.endswith('.py') or name in touched or hashlib.sha256(content).hexdigest() != wanted.get(name):
+            if name.startswith('/') or '..' in name.split('/') or not name.endswith('.py') or name in touched or hashlib.sha256(content).hexdigest() != wanted.get(name):
                 raise ValueError('First-imported file ' + name + ' does not match the reviewed commit; nothing built')
             if patched.get(name) != wanted[name]:
+                (package / name).parent.mkdir(parents=True, exist_ok=True)
                 (package / name).write_bytes(content)
                 first.append(name)
         result['first_imported'] = first

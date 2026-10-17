@@ -404,7 +404,8 @@ def _seed(owner) -> None:
 
 
 @unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
-@unittest.skipUnless(LAYER_FILES, "no layer migrations in this checkout")
+@unittest.skipUnless(len(LAYER_FILES) == len(LAYERS),
+                     "all three layer migrations are needed; main gets one on each batch day")
 class BatchRehearsalTests(unittest.TestCase):
     """The three batches as production runs them, then what each login can still do."""
 

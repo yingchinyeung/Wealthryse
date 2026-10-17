@@ -145,6 +145,10 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
             admin.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         with psycopg.connect(_dsn(cls.database, OWNER)) as owner:
             for path in sorted((ROOT / "migrations" / "postgres").glob("*.sql")):
+                if "_medallion_" in path.name:
+                    # The approval login as it is before the layer moves, which bootstrap makes with
+                    # their grants (test_medallion_layers_db and the S3 runs cover the moves).
+                    continue
                 try:
                     owner.execute(path.read_text(encoding="utf-8"))
                     owner.commit()

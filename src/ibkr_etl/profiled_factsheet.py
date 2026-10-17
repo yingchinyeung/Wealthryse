@@ -278,7 +278,10 @@ def render(snapshot, *, template_path, output_path, design_model_path=None):
         base_path, supporting = Path(design_model_path), Path(template_path)
     else:
         base_path, supporting = Path(template_path), None
-        if design_model_path is not None and Path(design_model_path).resolve() != base_path.resolve():
+        # The month-end run downloads the completed example to its own file;
+        # for T it is the same PDF as the owner template, so compare contents.
+        if design_model_path is not None and Path(design_model_path).resolve() != base_path.resolve() \
+                and Path(design_model_path).read_bytes() != base_path.read_bytes():
             raise MonthlyArtifactError("The T design has one source, its owner template")
     original = base_path.read_bytes()
     if hashlib.sha256(original).hexdigest() != design["authority"]:
@@ -378,6 +381,7 @@ def render(snapshot, *, template_path, output_path, design_model_path=None):
     return {"output_path": str(destination), "pages": 2, "layout_version": LAYOUT_VERSION, "layout_family": family,
             "report_style": profile.style, "display_name": profile.display_name,
             "source_template_sha256": design["authority"], "supporting_template_sha256": supporting_sha256,
+            "completed_example_sha256": design["authority"],
             "period_end": inputs.period_end, "data_as_of": inputs.data_as_of, "reporting_currency": "HKD",
             "chart_calculation": {"metrics": metrics, **evidence}, "variable_content_removed": removed,
             "title_font": "synthetic-bold-georgia" if runs[0]["synthetic_bold"] else "georgia-bold",

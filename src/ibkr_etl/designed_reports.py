@@ -85,6 +85,46 @@ def submitted_design(connection, tenant_id: str, subject_id: str) -> dict | None
     }
 
 
+def approved_design(connection, tenant_id: str, case_id: str, subject_id: str) -> dict:
+    """The design version the owner approved with the historical reports (approval 2).
+
+    After go-live every month renders from this version, so a design submitted
+    later never changes the monthly factsheets without its own review.
+    """
+
+    row = connection.execute(
+        "SELECT terms_json FROM broker_onboarding_approvals "
+        "WHERE tenant_id = ? AND case_id = ? AND approval_kind = 'historical_reports'",
+        (tenant_id, case_id),
+    ).fetchone()
+    terms = _json(row["terms_json"]) if row is not None else None
+    evidence = (((terms or {}).get("checks") or {}).get(CHECK_ID) or {}).get("evidence") or {}
+    approved = evidence.get("design") if isinstance(evidence, Mapping) else None
+    if not isinstance(approved, Mapping) or not approved.get("draft_id") or not approved.get("version"):
+        raise DesignedReportError("The approved historical reports name no factsheet design")
+    draft = connection.execute(
+        "SELECT title, template_sha256, example_sha256 FROM factsheet_design_drafts "
+        "WHERE tenant_id = ? AND subject_id = ? AND draft_id = ?",
+        (tenant_id, subject_id, str(approved["draft_id"])),
+    ).fetchone()
+    version = connection.execute(
+        "SELECT spec_json, spec_sha256 FROM factsheet_design_versions WHERE draft_id = ? AND version = ?",
+        (str(approved["draft_id"]), int(approved["version"])),
+    ).fetchone()
+    if draft is None or version is None:
+        raise DesignedReportError("The approved factsheet design is no longer stored")
+    spec = _json(version["spec_json"])
+    if str(version["spec_sha256"]) != str(approved.get("spec_sha256")) or engine.spec_sha256(spec) != str(
+            version["spec_sha256"]):
+        raise DesignedReportError("The approved factsheet design failed its integrity check")
+    return {
+        "draft_id": str(approved["draft_id"]), "title": str(draft["title"]), "version": int(approved["version"]),
+        "spec": spec, "spec_sha256": str(version["spec_sha256"]),
+        "template_sha256": str(draft["template_sha256"]),
+        "example_sha256": str(draft["example_sha256"]) if draft["example_sha256"] else None,
+    }
+
+
 def design_file(connection, tenant_id: str, sha256: str) -> bytes:
     row = connection.execute(
         "SELECT content FROM factsheet_design_files WHERE tenant_id = ? AND sha256 = ?", (tenant_id, sha256),
@@ -146,12 +186,17 @@ def month_ready(connection, source_kind: str, subject_id: str, period_end: str) 
 def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, container: str,
                         today: date, fetch: Callable[[str, str], bytes],
                         store: Callable[[str, str, bytes, str], None],
-                        render: Callable[..., Mapping[str, Any]] = engine.render) -> dict:
-    """Render the case's completed months from its submitted design and return the reports_rendered evidence."""
+                        render: Callable[..., Mapping[str, Any]] = engine.render,
+                        design: Mapping[str, Any] | None = None) -> dict:
+    """Render the case's completed months and return the reports_rendered evidence.
+
+    The design is the latest submitted one unless given (after go-live, the approved one).
+    """
 
     subject_id = str(case["target_subject_id"])
     currency = str(case["reporting_currency"])
-    design = submitted_design(connection, tenant_id, subject_id)
+    if design is None:
+        design = submitted_design(connection, tenant_id, subject_id)
     if design is None:
         return {"design": None, "designer_page": DESIGNER_PATH.format(subject_id=subject_id),
                 "reports": [], "waiting_for": None}

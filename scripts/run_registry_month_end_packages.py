@@ -14,6 +14,7 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.onboarding_agents import agents_enabled, run_reviews  # noqa: E402
+from ibkr_etl.onboarding_month_end import live_cases  # noqa: E402
 
 
 def record_agent_reviews(database_url: str, tenant_id: str) -> dict:
@@ -75,6 +76,9 @@ def main() -> int:
             ORDER BY r.subject_id
             """
         ).fetchall()
+        # Subjects that went live from a new-onboarding case have no wizard presentation
+        # identity or registered templates; render_onboarding_composite_reports.py renders them.
+        live_subjects = {case["target_subject_id"] for case in live_cases(connection, tenant_id)}
     finally:
         connection.close()
     results: list[dict[str, str]] = [
@@ -87,6 +91,9 @@ def main() -> int:
     ]
     failed = bool(missing_subjects)
     for row in rows:
+        if str(row["subject_id"]) in live_subjects:
+            results.append({"subject_id": str(row["subject_id"]), "status": "onboarding_month_end"})
+            continue
         environment = dict(os.environ)
         environment.update(
             {
@@ -110,9 +117,8 @@ def main() -> int:
             results.append({"subject_id": str(row["subject_id"]), "status": "failed", "reason": str(error)})
         else:
             results.append({"subject_id": str(row["subject_id"]), "status": "processed"})
-    print(json.dumps({"status": "partial_failure" if failed else "success", "subjects": results}, sort_keys=True))
-    # Stage 3 reports for new-onboarding composites. Each case records its own
-    # outcome, so this never changes the month-end packages' result.
+    # Stage 3 reports for new-onboarding cases (each case records its own outcome),
+    # and the month-end of subjects that went live from one (exit 3 when one failed).
     try:
         subprocess.run(
             [sys.executable, str(PROJECT_ROOT / "scripts" / "render_onboarding_composite_reports.py")],
@@ -123,6 +129,9 @@ def main() -> int:
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         print(json.dumps({"onboarding_composite_reports": "failed", "reason": str(error)}, sort_keys=True))
+        if live_subjects:
+            failed = True
+    print(json.dumps({"status": "partial_failure" if failed else "success", "subjects": results}, sort_keys=True))
     print(json.dumps({"onboarding_agent_reviews": record_agent_reviews(database_url, tenant_id)}, sort_keys=True))
     return 1 if failed else 0
 

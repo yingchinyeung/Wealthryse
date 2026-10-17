@@ -9,7 +9,8 @@ history and new data are read the same way.
 
 Dry run by default. Applying inserts only missing rows and never overwrites.
 It refuses to add rows that create an external flow unless the caller
-accepts that live returns for those dates will change.
+accepts that live returns for those dates will change, and refuses accounts
+that do not belong to the tenant.
 """
 from __future__ import annotations
 
@@ -178,9 +179,16 @@ def apply(live: Any, planned: dict[str, Any], *, tenant_id: str, accept_flow_cha
     if not rows:
         return {"status": "nothing_to_insert", "inserted": 0}
     live.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_id,))
+    unowned = unowned_accounts(live, planned["accounts"])
+    if unowned:
+        live.rollback()
+        raise BackfillError(f"Accounts not in this tenant, nothing was written: {', '.join(unowned)}")
+    # Excludes only jobs that take the same lock (the cloud daily job and repair scripts), not
+    # account-sync or the institutional worker. If one of those writes a planned row meanwhile,
+    # the count check below rolls back the whole insert.
     if not live.execute("SELECT pg_try_advisory_xact_lock(hashtext(%s))", (f"ibkr-daily:{tenant_id}",)).fetchone()[0]:
         live.rollback()
-        raise BackfillError("Daily ingestion holds the lock; try again later")
+        raise BackfillError("Another job holds this tenant's ibkr-daily lock; try again later")
     run_id = live.execute(
         "INSERT INTO ingestion_runs(run_type, requested_from, requested_to, started_at, status) "
         "VALUES (%s, %s, %s, %s, 'running') RETURNING run_id",
@@ -199,7 +207,8 @@ def apply(live: Any, planned: dict[str, Any], *, tenant_id: str, accept_flow_cha
         inserted += cursor.rowcount
     if inserted != len(rows):
         live.rollback()
-        raise BackfillError("Rows appeared while the backfill ran; nothing was written")
+        raise BackfillError("Another writer added some of these rows meanwhile; the whole insert was "
+                            "rolled back and nothing was written")
     summary = {account: {"inserted": item["new_rows"], "sections": dict(Counter(r["section"] for r in item["rows"]))}
                for account, item in planned["accounts"].items()}
     live.execute(
@@ -209,6 +218,13 @@ def apply(live: Any, planned: dict[str, Any], *, tenant_id: str, accept_flow_cha
     )
     live.commit()
     return {"status": "inserted", "inserted": inserted, "run_id": run_id}
+
+
+def unowned_accounts(live: Any, accounts: Iterable[str]) -> list[str]:
+    """Accounts that fail account_belongs_to_current_tenant (app.tenant_id must be set)."""
+
+    return [account for account in sorted(set(accounts)) if not live.execute(
+        "SELECT account_belongs_to_current_tenant(%s)", (account,)).fetchone()[0]]
 
 
 def registry_accounts(live: Any, tenant_id: str) -> list[str]:

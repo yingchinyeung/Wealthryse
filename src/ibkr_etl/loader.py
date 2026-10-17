@@ -1,3 +1,10 @@
+"""Load a parsed Flex report into flex_rows and the normalized tables.
+
+The optional legacy-key step (IBKR_FLEX_LEGACY_KEY_COMPAT) must not run while
+account-sync imports the same accounts. With it, bronze (flex_rows) keeps the
+parser's key while silver keeps the legacy key, so S6's replay will list those
+rows as rekeyed.
+"""
 from __future__ import annotations
 
 import os

@@ -5,6 +5,8 @@ temporary SQLite database and compares the result with the v1.1 snapshots
 account-sync imported for the same date. With --live-check it also reads the
 live database (read-only) to see whether the first v2 pull would add rows.
 Makes no IBKR request and writes nothing except stdout and the JSON report.
+An account in the statements without a snapshot fails the check unless it is
+named with --allow-unchecked-account; it is still live-checked.
 
 Exit codes: 0 safe (PASS), 1 differences found (FAIL), 2 could not run.
 
@@ -20,7 +22,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import tempfile
 from datetime import date, timedelta
@@ -34,7 +35,7 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from ibkr_etl.db import DEFAULT_TENANT_ID  # noqa: E402
 from ibkr_etl.switch_dry_run import (  # noqa: E402
-    DryRunError, masked_report, open_read_only, read_snapshot, run_dry_run,
+    DryRunError, mask_account_ids, masked_report, open_read_only, read_snapshot, run_dry_run,
     statement_from_bytes, summary_lines,
 )
 
@@ -61,6 +62,9 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--live-check", action="store_true",
                         help="also read DATABASE_URL in a read-only transaction")
     parser.add_argument("--lookback-days", type=int, default=14)
+    parser.add_argument("--allow-unchecked-account", action="append", default=[],
+                        help="an account in the statements without a snapshot that the pull may load "
+                             "unchecked (full id or the masked ***123 form); repeatable")
     parser.add_argument("--report", default="medallion-switch-dry-run.json", help="JSON report path")
     return parser.parse_args(argv)
 
@@ -123,26 +127,22 @@ def _inputs(args: argparse.Namespace, work_dir: Path):
 def main(argv: list[str] | None = None) -> int:
     args = _arguments(argv)
     try:
+        open_live = None
+        if args.live_check:
+            database_url = os.environ.get("DATABASE_URL", "")
+            if not database_url:
+                raise DryRunError("--live-check needs DATABASE_URL")
+            # Opened by run_dry_run after the offline load, so no transaction waits on it.
+            open_live = lambda: open_read_only(database_url, args.tenant_id)  # noqa: E731
         with tempfile.TemporaryDirectory(prefix="medallion-dry-run-") as directory:
             work_dir = Path(directory)
             statements, snapshots = _inputs(args, work_dir)
-            live = None
-            if args.live_check:
-                database_url = os.environ.get("DATABASE_URL", "")
-                if not database_url:
-                    raise DryRunError("--live-check needs DATABASE_URL")
-                live = open_read_only(database_url, args.tenant_id)
-            try:
-                report = run_dry_run(statements, snapshots, work_dir=work_dir / "work",
-                                     tenant_id=args.tenant_id, live_connection=live,
-                                     lookback_days=args.lookback_days)
-            finally:
-                if live is not None:
-                    live.rollback()
-                    live.close()
+            report = run_dry_run(statements, snapshots, work_dir=work_dir / "work",
+                                 tenant_id=args.tenant_id, open_live=open_live,
+                                 lookback_days=args.lookback_days,
+                                 allow_unchecked=args.allow_unchecked_account)
     except Exception as error:  # noqa: BLE001 - one clear line, then exit 2
-        text = re.sub(r"\b[A-Z]{1,2}\d{5,}\b", lambda m: "***" + m.group()[-3:], str(error))
-        print(f"medallion switch dry run: ERROR {type(error).__name__}: {text}")
+        print(f"medallion switch dry run: ERROR {type(error).__name__}: {mask_account_ids(str(error))}")
         return 2
     report, masker = masked_report(report)
     Path(args.report).write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")

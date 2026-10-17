@@ -17,7 +17,7 @@ from pathlib import Path
 
 from switch_fixtures import ACCOUNT_A, ACCOUNT_B, ACCOUNT_C, FIRST_RUN, edit_snapshot, scenario
 from ibkr_etl.switch_dry_run import (
-    AccountMasker, DryRunError, key_kind, masked_report, read_snapshot, run_dry_run,
+    AccountMasker, DryRunError, key_kind, mask_account_ids, masked_report, read_snapshot, run_dry_run,
     statement_from_bytes, summary_lines,
 )
 
@@ -26,6 +26,7 @@ import medallion_switch_dry_run as command  # noqa: E402
 
 
 def _run(root, statements, snapshots, **options):
+    options.setdefault("allow_unchecked", [ACCOUNT_C])  # in the statements, no snapshot
     return run_dry_run(
         [statement_from_bytes(f"statement-{index}.xml", content) for index, content in enumerate(statements)],
         [read_snapshot(path.name, path) for path in snapshots],
@@ -61,6 +62,21 @@ class SwitchDryRunTests(unittest.TestCase):
             self.assertEqual(item["flows"]["window_flows"], {})
             self.assertEqual(item["flows"]["transfers_sections"], {"present_empty": 2})
         self.assertIn(ACCOUNT_C, report["accounts_not_compared"])
+        self.assertTrue(report["accounts_not_compared"][ACCOUNT_C]["allowed"])
+        self.assertEqual(report["failures"], [])
+
+    def test_accounts_without_a_snapshot_must_be_allowed(self):
+        _, statements, snapshots = scenario(self.root)
+        report = _run(self.root, statements[-1:], snapshots.values(), allow_unchecked=[])
+        self.assertEqual(report["status"], "FAIL")
+        self.assertFalse(report["accounts_not_compared"][ACCOUNT_C]["allowed"])
+        self.assertIn("--allow-unchecked-account", report["failures"][0])
+        self.assertIn("FAIL ", "\n".join(summary_lines(masked_report(report)[0])))
+        # The masked form printed in the summary is accepted too.
+        masked = _run(self.root, statements[-1:], snapshots.values(), allow_unchecked=["***003"])
+        self.assertEqual(masked["status"], "PASS")
+        with self.assertRaises(DryRunError):
+            _run(self.root, statements[-1:], snapshots.values(), allow_unchecked=["U0000000"])
 
     def test_cash_transaction_under_another_key_is_reported_as_rekeyed(self):
         _, statements, snapshots = scenario(self.root)
@@ -145,6 +161,8 @@ class SwitchDryRunTests(unittest.TestCase):
         self.assertEqual(masker("U9999999"), "***999")
         self.assertNotEqual(masker("U1111234"), masker("U2221234"))
         self.assertEqual(masker.scrub("U9999999 and U1111234"), "***999 and " + masker("U1111234"))
+        self.assertEqual(mask_account_ids("flex_U1234567_x DU7654321abc /F1234567/ 2026-10-20"),
+                         "flex_***567_x ***321abc /***567/ 2026-10-20")
         self.assertEqual(key_kind("transactionID:1"), "id")
         self.assertEqual(key_kind("cash:abc"), "hash")
 
@@ -168,6 +186,9 @@ class SwitchDryRunTests(unittest.TestCase):
             files += ["--statement-file", str(path)]
         before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in snapshots.values()}
         arguments = files + sum((["--snapshot-file", str(path)] for path in snapshots.values()), [])
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(command.main(arguments + ["--report", str(self.root / "unchecked.json")]), 1)
+        arguments += ["--allow-unchecked-account", "***003"]
         report_path = self.root / "report.json"
         output = io.StringIO()
         with redirect_stdout(output):

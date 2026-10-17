@@ -18,7 +18,12 @@ What check compares with the snapshot taken before the batch:
 - row counts of every table the catalog moves (live_* tables are written every few
   minutes, so their counts are reported, not compared), and each table's count read
   through its public view equals the count read from the table.
-- each reporting_snapshots row's stored data_sha256 and a sha256 of its payload.
+- each reporting_snapshots row's stored data_sha256 and a sha256 of its payload. Rows
+  created after the snapshot was taken are allowed (the month-end factsheet job freezes
+  new snapshots at 09:00 UTC, in the batch window), and so is an existing row going from
+  frozen to superseded when such a new row is for the same subject and month; its stored
+  sha256 and payload must not change. The row count and the agent month_end_snapshots
+  view may grow by those rows, and the burn-in's latest snapshot may become one of them.
 - the stage-43 correction: report_artifact_releases revocation state, and no duplicate
   active release groups.
 - the burn-in queries (scripts/run_burn_in_check.py) return the same answers, and the
@@ -200,16 +205,28 @@ def _stage43(connection, tenant: str) -> dict:
             "duplicate_active_groups": duplicates}
 
 
-def _burn_in(conninfo: str, tenant: str, account: str) -> dict:
+def _burn_in(conninfo: str, tenant: str, account: str, day: str) -> dict:
+    import inspect
+    from datetime import date
+
     for path in (str(ROOT / "src"), str(ROOT / "scripts")):
         if path not in sys.path:
             sys.path.insert(0, path)
     from run_burn_in_check import _database_state
 
-    return json.loads(json.dumps(_database_state(conninfo, tenant, account), default=str))
+    arguments = [conninfo, tenant, account]
+    if len(inspect.signature(_database_state).parameters) > 3:  # the HKT day the answers are for
+        arguments.append(date.fromisoformat(day))
+    return json.loads(json.dumps(_database_state(*arguments), default=str))
 
 
-def snapshot(conninfo: str, *, tenant: str, account: str | None) -> dict:
+def _hkt_day() -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(hours=8)).date().isoformat()
+
+
+def snapshot(conninfo: str, *, tenant: str, account: str | None, burn_in_day: str | None = None) -> dict:
     import psycopg
 
     files = {path.name: hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
@@ -238,7 +255,8 @@ def snapshot(conninfo: str, *, tenant: str, account: str | None) -> dict:
             "objects": _objects(connection, tenant),
             "reporting_snapshots": [list(row) for row in connection.execute(
                 "SELECT snapshot_id::text, status, data_sha256, "
-                "encode(sha256(convert_to(snapshot_payload_json, 'UTF8')), 'hex') "
+                "encode(sha256(convert_to(snapshot_payload_json, 'UTF8')), 'hex'), "
+                "subject_id, period_end::text, created_at::text "
                 "FROM public.reporting_snapshots ORDER BY snapshot_id").fetchall()],
             "stage43": _stage43(connection, tenant),
             "agent": _agent_views(connection, tenant),
@@ -248,7 +266,8 @@ def snapshot(conninfo: str, *, tenant: str, account: str | None) -> dict:
                 "ORDER BY 1").fetchall()],
         }
     if account:
-        state["burn_in"] = _burn_in(conninfo, tenant, account)
+        state["burn_in_day"] = burn_in_day or _hkt_day()
+        state["burn_in"] = _burn_in(conninfo, tenant, account, state["burn_in_day"])
     return state
 
 
@@ -296,22 +315,91 @@ def compare(before: dict, after: dict, batch: str | None,
     expected = [applied] if applied else [BATCH_MIGRATION[batch]] if batch else []
     if added != expected:
         problems.append(f"schema_migrations gained {added}, expected {expected}")
+    appended = _reporting_snapshots(before, after, problems, notes)
     for name, entry in before["objects"].items():
         later = after["objects"].get(name, {})
         if entry.get("rows") != later.get("rows"):
             text = f"{name} rows {entry.get('rows')} -> {later.get('rows')}"
-            (notes if name in VOLATILE else problems).append(text)
+            grown = name == "reporting_snapshots" and later.get("rows") == (entry.get("rows") or 0) + len(appended)
+            (notes if name in VOLATILE or grown else problems).append(text)
         if (entry["location"] is None) != (later.get("location") is None):
             problems.append(f"{name} existence changed")
-    if before["reporting_snapshots"] != after["reporting_snapshots"]:
-        problems.append("reporting_snapshots rows, stored sha256 or payloads changed")
     if before["stage43"] != after["stage43"]:
         problems.append(f"stage-43 release state changed: {before['stage43']} -> {after['stage43']}")
-    if before.get("burn_in") != after.get("burn_in"):
-        problems.append(f"burn-in answers changed: {before.get('burn_in')} -> {after.get('burn_in')}")
+    old_burn_in, new_burn_in = before.get("burn_in"), after.get("burn_in")
+    if old_burn_in != new_burn_in:
+        if _new_latest_snapshot(old_burn_in, new_burn_in, appended):
+            notes.append("burn-in latest snapshot is one created during the batch window")
+        else:
+            problems.append(f"burn-in answers changed: {old_burn_in} -> {new_burn_in}")
     if before.get("agent") != after.get("agent"):
-        problems.append(f"agent views changed: {before.get('agent')} -> {after.get('agent')}")
+        if _agent_grew(before.get("agent"), after.get("agent"), len(appended)):
+            notes.append("agent month_end_snapshots shows the snapshots created during the batch window")
+        else:
+            problems.append(f"agent views changed: {before.get('agent')} -> {after.get('agent')}")
     return problems, notes
+
+
+def _after(value: str, moment: str) -> bool:
+    from datetime import datetime, timezone
+
+    def instant(text: str):
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    try:
+        return instant(value) > instant(moment)
+    except (TypeError, ValueError):
+        return False
+
+
+def _reporting_snapshots(before: dict, after: dict, problems: list[str], notes: list[str]) -> set[str]:
+    """Existing rows unchanged; rows created after the snapshot allowed. Returns their ids."""
+    old = {row[0]: row for row in before["reporting_snapshots"]}
+    new = {row[0]: row for row in after["reporting_snapshots"]}
+    appended = {key for key in new if key not in old}
+    late = sorted(key for key in appended if not _after(new[key][6], before["taken_at"]))
+    if late:
+        problems.append(f"reporting_snapshots gained rows created before the snapshot: {late}")
+    fresh = {(new[key][4], new[key][5]) for key in appended if key not in late}
+    for key, row in old.items():
+        later = new.get(key)
+        if later == row:
+            continue
+        superseded = (later is not None and row[1] == "frozen" and later[1] == "superseded"
+                      and later[:1] + later[2:] == row[:1] + row[2:] and (row[4], row[5]) in fresh)
+        if superseded:
+            notes.append(f"reporting_snapshots {key} superseded by a snapshot created during the batch window")
+        else:
+            problems.append(f"reporting_snapshots row {key} changed or disappeared")
+    if appended and not late:
+        notes.append(f"reporting_snapshots: {len(appended)} rows created during the batch window")
+    return appended - set(late)
+
+
+def _new_latest_snapshot(old: dict | None, new: dict | None, appended: set[str]) -> bool:
+    if not (old and new and appended):
+        return False
+    moving = {"latest_snapshot", "ready_report_types"}
+    if any(old.get(key) != new.get(key) for key in set(old) | set(new) if key not in moving):
+        return False
+    return str((new.get("latest_snapshot") or {}).get("snapshot_id")) in appended
+
+
+def _agent_grew(old: dict | None, new: dict | None, appended: int) -> bool:
+    if not (old and new and appended) or old.get("subjects") != new.get("subjects"):
+        return False
+    views_old, views_new = old.get("views") or {}, new.get("views") or {}
+    if set(views_old) != set(views_new):
+        return False
+    for view, count in views_old.items():
+        later = views_new[view]
+        if view == "month_end_snapshots" and isinstance(count, int) and isinstance(later, int):
+            if not 0 <= later - count <= appended:
+                return False
+        elif later != count:
+            return False
+    return True
 
 
 def summary(state: dict, batches: list[str]) -> dict:
@@ -394,14 +482,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "undo-sql":
         print(undo_sql(args.layer))
         return 0
-    state = snapshot(_conninfo(args.url_env), tenant=args.tenant, account=args.account)
+    before = None
+    if args.command == "check" and args.before:
+        before = json.loads(Path(args.before).read_text(encoding="utf-8"))
+    state = snapshot(_conninfo(args.url_env), tenant=args.tenant, account=args.account,
+                     burn_in_day=(before or {}).get("burn_in_day"))
     if args.out:
         Path(args.out).write_text(json.dumps(state, indent=1, sort_keys=True, default=str), encoding="utf-8")
     batches = [layer for layer in LAYERS if layer in state["layers"]]
     report = {"command": args.command, "taken_at": state["taken_at"], **summary(state, batches)}
     problems = list(report["after_problems"])
-    if args.command == "check" and args.before:
-        before = json.loads(Path(args.before).read_text(encoding="utf-8"))
+    if before is not None:
         changed, notes = compare(before, state, args.batch, args.applied)
         problems += changed
         report["compared_with"] = before["taken_at"]

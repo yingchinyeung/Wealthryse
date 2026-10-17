@@ -96,6 +96,11 @@ class LiveDataDatabaseTests(unittest.TestCase):
             owner.execute(f"GRANT USAGE ON SCHEMA public TO {WEB}")
             owner.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {WEB}")
             owner.execute(f"GRANT EXECUTE ON FUNCTION public.app_tenant_id() TO {WEB}")
+            # The same on the layer schemas once migrations 068-070 exist, as bootstrap_postgres.py grants.
+            for layer in ("bronze", "silver", "gold"):
+                if owner.execute("SELECT to_regnamespace(%s)", (layer,)).fetchone()[0]:
+                    owner.execute(f"GRANT USAGE ON SCHEMA {layer} TO {WEB}")
+                    owner.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {layer} TO {WEB}")
             owner.commit()
         with psycopg.connect(_dsn(cls.database), autocommit=True) as admin:
             # A superuser bypasses the tenants table's row-level security.
@@ -117,6 +122,10 @@ class LiveDataDatabaseTests(unittest.TestCase):
         import psycopg
 
         with psycopg.connect(_dsn(self.database), autocommit=True) as admin:
+            # Migration 069 moves the live tables to bronze, which refuses TRUNCATE;
+            # replica mode skips that trigger for this test cleanup.
+            admin.execute("SET search_path = bronze, public")
+            admin.execute("SET session_replication_role = replica")
             admin.execute("TRUNCATE live_gateway_status, live_account_values, live_positions, live_quotes, "
                           "live_executions, live_daily_bars, live_contracts")
 

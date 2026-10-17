@@ -48,6 +48,9 @@ class Stage1PayloadDatabaseTests(unittest.TestCase):
         self.bundle = dict(rollout.bundle(), role=COLLECTOR, web_role=WEB)
         self.database = "stage1_test_" + uuid.uuid4().hex[:8]
         self.bundle["database"] = self.database
+        # The medallion layer migrations (068 on) came after this rollout and move its tables.
+        later = {path.name for path in (ROOT / "migrations" / "postgres").glob("*_medallion_*.sql")}
+        self.bundle["expected"] = {k: v for k, v in self.bundle["expected"].items() if k not in later}
         self.verifier = rollout.scram_verifier(COLLECTOR_PASSWORD)
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
             for role in (COLLECTOR, WEB):
@@ -62,7 +65,7 @@ class Stage1PayloadDatabaseTests(unittest.TestCase):
             owner.execute("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, sha256 TEXT NOT NULL, "
                           "applied_at TEXT NOT NULL)")
             for path in sorted((ROOT / "migrations" / "postgres").glob("*.sql")):
-                if path.name == self.bundle["target"]:
+                if path.name == self.bundle["target"] or path.name in later:
                     continue
                 text = path.read_text(encoding="utf-8")
                 try:

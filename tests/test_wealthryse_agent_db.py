@@ -23,6 +23,16 @@ STRANGER = "33333333-3333-3333-3333-333333333333"
 TEST_PASSWORD = "agent-test-only"  # throwaway roles in a disposable test server
 
 
+def _agent_schema_sql(connection) -> list[str]:
+    """The agent schema files as scripts/install_agent_schema.py applies them."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("install_agent_schema", ROOT / "scripts" / "install_agent_schema.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.agent_schema_sql(connection)
+
+
 def _dsn(base: str, database: str, user: str | None = None) -> str:
     from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
@@ -85,8 +95,8 @@ class AgentDatabaseTests(unittest.TestCase):
             # Every agent schema file in name order, as scripts/install_agent_schema.py applies them;
             # twice, because the installer must be safe to re-run.
             for _ in range(2):
-                for path in sorted((ROOT / "migrations" / "agent").glob("*.sql")):
-                    owner.execute(path.read_text(encoding="utf-8"))
+                for text in _agent_schema_sql(owner):
+                    owner.execute(text)
             owner.execute((ROOT / "tests/fixtures/agent_seed.sql").read_text(encoding="utf-8"))
             cls._seed_month_end(owner)
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:  # roles are cluster-wide

@@ -62,7 +62,9 @@ Each batch is one migration:
 - A migration that changes a moved table names it by its layer and re-creates its
   compatibility view, because a view fixes its column list when it is created.
 - A normal bootstrap applies every migration on `main`. So a batch's migration merges
-  on the day the batch runs.
+  on the day the batch runs, and that day's bootstrap run applies only it
+  (`--only-migration`). [MEDALLION_S3_RUNBOOK.md](MEDALLION_S3_RUNBOOK.md) has the
+  steps, the checks and the undo.
 
 ## Stages
 

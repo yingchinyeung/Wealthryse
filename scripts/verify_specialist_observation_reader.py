@@ -8,7 +8,7 @@ import os
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
-from ibkr_etl.specialist_observation_access import TRIAL_ROLE,COLUMNS,DENIED_COLUMNS,grant_statements,verify_permissions
+from ibkr_etl.specialist_observation_access import TRIAL_ROLE,COLUMNS,DENIED_COLUMNS,grant_statements,layer_grant_statements,verify_permissions
 
 TENANT='00000000-0000-0000-0000-000000000001'
 
@@ -23,7 +23,7 @@ def main():
         if exists(): raise ValueError('Observation trial role already exists')
         with c.transaction(force_rollback=True):
             c.execute('CREATE ROLE ibkr_specialist_observation_trial NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS')
-            for statement in grant_statements(TRIAL_ROLE): c.execute(statement)
+            for statement in grant_statements(TRIAL_ROLE)+layer_grant_statements(c,TRIAL_ROLE): c.execute(statement)
             c.execute('GRANT ibkr_specialist_observation_trial TO CURRENT_USER WITH ADMIN FALSE, INHERIT FALSE, SET TRUE')
             c.execute('SET LOCAL ROLE ibkr_specialist_observation_trial')
             c.execute("SELECT set_config('app.tenant_id',%s,true)",(TENANT,))

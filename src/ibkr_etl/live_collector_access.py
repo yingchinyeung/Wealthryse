@@ -72,16 +72,22 @@ def provision(connection, *, password: str, database: str, role: str = ROLE) -> 
     )
     for statement in grants:
         connection.execute(statement)
+    # After migration 069 the live tables are in bronze, behind views in public that
+    # check the caller's rights on the table too.
+    for table in LIVE_TABLES:
+        if connection.execute("SELECT to_regclass(%s)", ("bronze." + table,)).fetchone()[0]:
+            connection.execute(f"GRANT USAGE ON SCHEMA bronze TO {role}")
+            connection.execute(f"GRANT {TABLE_PRIVILEGES} ON TABLE bronze.{table} TO {role}")
 
 
 def privilege_report(connection, role: str = ROLE) -> dict[str, object]:
-    """What the role can do, for the post-provisioning check."""
+    """What the role can do, for the post-provisioning check (a table and its view count once)."""
     grant_statements(role)
     writable = connection.execute(
         """
-        SELECT c.relname
+        SELECT DISTINCT c.relname
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'v', 'm', 'p')
+        WHERE n.nspname IN ('public', 'bronze', 'silver', 'gold') AND c.relkind IN ('r', 'v', 'm', 'p')
           AND (has_table_privilege(%s, c.oid, 'INSERT')
                OR has_table_privilege(%s, c.oid, 'UPDATE')
                OR has_table_privilege(%s, c.oid, 'DELETE'))
@@ -91,9 +97,9 @@ def privilege_report(connection, role: str = ROLE) -> dict[str, object]:
     ).fetchall()
     readable = connection.execute(
         """
-        SELECT c.relname
+        SELECT DISTINCT c.relname
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'v', 'm', 'p')
+        WHERE n.nspname IN ('public', 'bronze', 'silver', 'gold') AND c.relkind IN ('r', 'v', 'm', 'p')
           AND has_table_privilege(%s, c.oid, 'SELECT')
         ORDER BY c.relname
         """,

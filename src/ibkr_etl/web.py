@@ -5039,7 +5039,6 @@ ACCOUNT_SECTIONS = {
     "holdings": "Holdings",
     "risk": "Risk analytics",
     "modelling": "Modelling",
-    "desk": "Desk",  # shown only where DESK_PAGE allows it (web_desk.py)
     "cash": "Cash",
     "trades": "Trade history",
     "reports": "Monthly reports",
@@ -5121,7 +5120,16 @@ PLATFORM_SECTIONS = {
     "administration": "Administration",
 }
 
-ALL_PAGE_SECTIONS = ACCOUNT_SECTIONS | PLATFORM_SECTIONS
+# The Desk tab (web_desk.py), shown only where DESK_PAGE allows it. It stays out of
+# ACCOUNT_SECTIONS until the certified figures register places it: the register release that
+# adds "desk" to its out_of_scope_pages moves it into ACCOUNT_SECTIONS, before DESK_PAGE is on.
+ACCOUNT_TABS = {
+    **{key: label for key, label in ACCOUNT_SECTIONS.items() if key in ("overview", "performance", "holdings", "risk", "modelling")},
+    "desk": "Desk",
+    **ACCOUNT_SECTIONS,
+}
+
+ALL_PAGE_SECTIONS = ACCOUNT_TABS | PLATFORM_SECTIONS
 
 
 def _platform_navigation(user: dict[str, object], *, active: str | None = None) -> str:
@@ -11057,7 +11065,7 @@ def _render_account_page(
         live_assets(account_id, section) if live_view_allowed(access, user) else ""
     )
     visible_sections = (
-        ONBOARDING_PREVIEW_SECTIONS if preview_mode else set(ACCOUNT_SECTIONS)
+        ONBOARDING_PREVIEW_SECTIONS if preview_mode else set(ACCOUNT_TABS)
     )
     if _agent_analyst_replaces_tab(user):
         visible_sections = visible_sections - {"ai-analyst"}
@@ -11065,7 +11073,7 @@ def _render_account_page(
     if not desk_shown:
         visible_sections = visible_sections - {"desk"}
     desk_view = _desk_web.page_view(account_id, reporting_currency_value) if desk_shown and section == "desk" else ""
-    page_title = escape(ACCOUNT_SECTIONS[section])
+    page_title = escape(ACCOUNT_TABS[section])
     active = {key: " active" if key == section else "" for key in ALL_PAGE_SECTIONS}
     subpages = ACCOUNT_SUBPAGES.get(section, ())
     if part is None and subpages:
@@ -11095,7 +11103,7 @@ def _render_account_page(
         )
 
     navigation = "".join(
-        nav_item(key, label) for key, label in ACCOUNT_SECTIONS.items() if key in visible_sections
+        nav_item(key, label) for key, label in ACCOUNT_TABS.items() if key in visible_sections
     )
 
     platform_navigation = _platform_navigation(user)

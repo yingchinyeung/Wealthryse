@@ -601,7 +601,7 @@ class AccountPageTests(unittest.TestCase):
             return web._render_account_page(user, account_id="U1", section=section, access=access, part=part)
 
     def test_with_desk_page_unset_the_account_page_is_byte_for_byte_unchanged(self):
-        without = {key: label for key, label in web.ACCOUNT_SECTIONS.items() if key != "desk"}
+        without = {key: label for key, label in web.ACCOUNT_TABS.items() if key != "desk"}
         with _desk_page(None):
             for user in (OWNER, VIEWER):
                 for state in (None, "preview", "active"):
@@ -610,12 +610,20 @@ class AccountPageTests(unittest.TestCase):
                             access = _access(state, subject_type=kind)
                             with self.subTest(user=user["role"], state=state, kind=kind, section=section):
                                 page = self._page(user, access, section)
-                                with patch.object(web, "ACCOUNT_SECTIONS", without), \
+                                with patch.object(web, "ACCOUNT_TABS", without), \
                                         patch.object(web, "ALL_PAGE_SECTIONS", without | web.PLATFORM_SECTIONS):
                                     self.assertEqual(page, self._page(user, access, section))
                                 self.assertNotIn("/desk\"", page)
                                 self.assertNotIn('data-section="desk"', page)
                                 self.assertNotIn("metric-intraday-p-l", page)
+
+    def test_the_desk_tab_waits_for_its_register_entry(self):
+        # The certified figures register places every ACCOUNT_SECTIONS page. The Desk joins
+        # ACCOUNT_SECTIONS in the register release that adds it to out_of_scope_pages.
+        self.assertNotIn("desk", web.ACCOUNT_SECTIONS)
+        keys = list(web.ACCOUNT_TABS)
+        self.assertEqual(keys.index("desk"), keys.index("modelling") + 1)
+        self.assertEqual([key for key in keys if key != "desk"], list(web.ACCOUNT_SECTIONS))
 
     def test_with_desk_page_unset_the_desk_page_is_an_unknown_page(self):
         with _desk_page(None), patch.object(web, "_portfolio_access_context",
@@ -680,7 +688,7 @@ class GuideTests(unittest.TestCase):
         script = (
             "import re\n"
             "from ibkr_etl import metrics_guide as g, web_desk as d\n"
-            "from ibkr_etl.web import ACCOUNT_SECTIONS\n"
+            "from ibkr_etl.web import ACCOUNT_TABS\n"
             "keys = [s.key for s in g.METRIC_SECTIONS]\n"
             "assert keys.index('desk') == keys.index('modelling-portfolio') + 1, keys\n"
             "names = [m.name for s in g.METRIC_SECTIONS for m in s.metrics]\n"
@@ -690,7 +698,7 @@ class GuideTests(unittest.TestCase):
             "linked = set(re.findall(r'/metrics-guide#([a-z0-9-]+)', d.page_view('U1', 'USD')))\n"
             "assert linked <= anchors, linked - anchors\n"
             "for name in d.GUIDE_NAMES:\n"
-            "    assert g.metric_location(name) in ACCOUNT_SECTIONS.values(), name\n"
+            "    assert g.metric_location(name) in ACCOUNT_TABS.values(), name\n"
             "    assert g.search(name)[0]['name'] == name, name\n"
             "    assert g.definition_payload(name)['link'] == d.GUIDE[name]\n"
             "page = g.render_metrics_guide()\n"

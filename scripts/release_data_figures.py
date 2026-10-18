@@ -321,9 +321,31 @@ def attribution_today(api, subject: str, day: str) -> dict[Key, Any] | None:
     return found
 
 
+def charts_today(api, subject: str, day: str) -> dict[Key, Any]:
+    """The charts, tables and indicators (ibkr_etl.certified_charts): each series' point on the date,
+    and the tables on the date, read from the answers the pages draw them from."""
+    from ibkr_etl import certified_charts as charts
+
+    found: dict[Key, Any] = {}
+    for name, extract in (("analytics", charts.analytics_points), ("benchmark", charts.benchmark_points),
+                          ("holdings", charts.holdings_points),
+                          ("holdings_correlation", charts.correlation_points)):
+        answer = api.call(name, subject, day)
+        points = extract(answer) if answer is not None else charts.Points()
+        for figure_id, values in points.figures.items():
+            if figure_id not in charts.FIGURES:
+                continue  # another page's figure, compared there
+            item_benchmark = points.benchmark_id if register.figure(figure_id).per_benchmark else ""
+            for (point_day, item), (value, _detail) in values.items():
+                if point_day == day:
+                    found[(figure_id, "", item, item_benchmark)] = value
+    return found
+
+
 TODAY: dict[str, Callable] = {
     "overview": overview_today, "holdings": holdings_today, "cash": cash_today, "performance": performance_today,
     "risk-snapshot": risk_snapshot_today, "risk-statistics": risk_statistics_today, "attribution": attribution_today,
+    "charts": charts_today,
 }
 
 
@@ -366,6 +388,7 @@ class WebPages:
             "risk": lambda: web.risk_analytics(subject, as_of=day, user=user),
             "risk_details": lambda: web.risk_analytics_details(subject, as_of=day, user=user),
             "attribution": lambda: web.monthly_attribution_view(subject, month=str(day)[:7], as_of=day, user=user),
+            "holdings_correlation": lambda: web.holdings_correlation_view(subject, as_of=day, user=user),
         }
         return json.loads(json.dumps(calls[name](), default=str))
 

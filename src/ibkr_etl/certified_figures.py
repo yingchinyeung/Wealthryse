@@ -18,7 +18,7 @@ is safe to import everywhere. The stable API for the build, the website readers 
     figure(figure_id) -> Figure             one figure; UnknownFigure (a KeyError) names close ids
     figures() -> dict[str, Figure]          all of them, in register order
     figures_for_page(page_id) -> list       the figures a page shows: its own, then borrowed ones
-    pages() -> dict[str, Page]              the seven pages, in move order
+    pages() -> dict[str, Page]              the nine pages, in move order
     page(page_id) -> Page
     batch_for_page(page_id) -> Batch        (number, date) of the batch the page moves in
     page_modes(text) -> dict[page, mode]    parses CERTIFIED_FIGURES_PAGES ("overview=on,cash=shadow");

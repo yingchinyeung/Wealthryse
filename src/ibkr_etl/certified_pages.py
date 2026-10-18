@@ -2,7 +2,7 @@
 
 docs/MEDALLION_CERTIFIED_FIGURES.md explains the layer. One setting,
 CERTIFIED_FIGURES_PAGES (for example "overview=on,holdings=on,performance=shadow"),
-puts each of the seven pages in one of three modes. A page not listed is off.
+puts each of the register's nine pages in one of three modes. A page not listed is off.
 
 - off: today's behaviour exactly. serve() only calls the page's own builder: no query,
   no log line.

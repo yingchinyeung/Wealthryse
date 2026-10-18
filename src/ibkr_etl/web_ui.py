@@ -70,6 +70,8 @@ const safe=t=>String(t??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':
 if(!line){line=document.createElement('div');line.className='muted certified-line';line.style.cssText='margin-top:10px;font-size:12px';card.appendChild(line)}
 line.innerHTML=`${safe(c.label)}${c.note?' · <strong>'+safe(c.note)+'</strong>':''} · <a href="${safe(c.link||'/metrics-guide')}">how this is worked out</a>`}
 const certifiedFor=(c,page)=>c&&(c.pages||[]).includes(page)?c:null;
+const chartsFor=(c,ids,what)=>c&&ids.every(id=>(c.figure_ids||[]).includes(id))?(what?{...c,label:what+' · '+c.label}:c):null;
+const rollingBenchmarkCharts=['series.rolling_beta_126d','series.rolling_correlation_126d'];
 """
 
 ACCOUNT_UI_SCRIPT = _NUMBER_HELPERS + CERTIFIED_LINE_SCRIPT + r"""

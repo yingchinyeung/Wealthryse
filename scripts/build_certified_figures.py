@@ -6,7 +6,8 @@ then for older NAV dates with no published figures yet, newest first (every olde
 --backfill), until its time limit (--minutes); checks them; and publishes them to
 gold.certified_figures or holds the build with its reason. The next run carries on with the
 dates left. --dry-run reads and checks but writes nothing and prints only counts. The work is
-in ibkr_etl.certified_build.
+in ibkr_etl.certified_build. The charts are read only with CERTIFIED_FIGURES_CHARTS=fallback or on,
+or with --page charts (ibkr_etl.certified_charts).
 
 Exit codes: 0 when published, held for review, not due yet or off; 1 when the run fails.
 """
@@ -40,8 +41,9 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
                              f"{certified_build.MINUTES_ENV}, else {certified_build.DEFAULT_MINUTES:g}).")
     parser.add_argument("--dry-run", action="store_true", help="Read and check, write nothing, print counts.")
     parser.add_argument("--subject", action="append", default=[], help="Only this subject (repeatable).")
-    parser.add_argument("--page", action="append", default=[], choices=list(certified_build.READERS),
-                        help="Only this page's figures (repeatable).")
+    parser.add_argument("--page", action="append", default=[], choices=[*certified_build.READERS, "charts"],
+                        help="Only this page's figures (repeatable). --page charts alone fills in the charts' "
+                             "history: the dates with no chart rows yet (ibkr_etl.certified_charts).")
     return parser.parse_args(argv)
 
 

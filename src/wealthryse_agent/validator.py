@@ -7,12 +7,22 @@ are not shown to anyone.
 
 Certified figures (get_certified_figures, behind AGENT_CERTIFIED_FIGURES) are
 cited [F1], [F2]: the number beside an [F#] must be that figure's value, not
-just any number a tool returned. Until 8 Nov that check only warns
-(Validation.figure_warnings); it never rejects an answer. Without certified
-figures the check does not run and nothing changes.
+just any number a tool returned. By default (AGENT_CERTIFIED_FIGURE_CHECK unset
+or warn) that check only warns (Validation.figure_warnings); it never rejects
+an answer. Without certified figures the check does not run and nothing changes.
+
+With figure_check="enforce" (AGENT_CERTIFIED_FIGURE_CHECK=enforce) two more
+rules fail the answer, as an unmatched number does: the number beside each
+[F#] must be that figure's value (and the ref must exist), and a number whose
+only source is a certified figure (get_certified_figures, or a figure tool's
+``certified`` block) must be cited by its [F#], not quoted from the tool call.
+A number some other tool result also returned is allowed either way. The
+runtime then asks once for a corrected answer and, if that fails too, shows
+none (the existing reject path).
 """
 from __future__ import annotations
 
+import copy
 import math
 import re
 from dataclasses import dataclass, field
@@ -46,6 +56,11 @@ class Validation:
     # Warn-only until 8 Nov: [F#] citations whose number is not that certified figure's value.
     figure_warnings: list[str] = field(default_factory=list)
     figure_checks: dict[str, str] = field(default_factory=dict)  # F# -> "ok" or "warning"
+    # Enforce mode only: certified figures quoted without their [F#] (with the number, for the
+    # model), and their refs (for logs).
+    quoted_elsewhere: list[str] = field(default_factory=list)
+    quoted_refs: list[str] = field(default_factory=list)
+    figure_mode: str = "warn"
 
     def feedback(self) -> str:
         parts = []
@@ -57,6 +72,11 @@ class Validation:
             parts.append("These dates do not appear in any tool result: " + ", ".join(self.bad_dates[:10]))
         if self.bad_visuals:
             parts.append("Charts and tables: " + "; ".join(self.bad_visuals[:10]))
+        if self.figure_mode == "enforce" and self.figure_warnings:
+            parts.append("Certified figures: " + "; ".join(self.figure_warnings[:10]))
+        if self.figure_mode == "enforce" and self.quoted_elsewhere:
+            parts.append("These figures are certified, so cite each by its ref instead: "
+                         + ", ".join(self.quoted_elsewhere[:10]))
         return ". ".join(parts)
 
 
@@ -226,11 +246,122 @@ def check_figure_citations(answer: str, figures: Mapping[str, Mapping[str, Any]]
     return warnings, checks
 
 
+def _cited_spans(answer: str, figures: Mapping[str, Mapping[str, Any]]) -> list[tuple[int, int]]:
+    """Where in ``answer`` the number each [F#] citation is checked against sits (as
+    check_figure_citations picks it: the last number in the clause before the citation)."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for citation in _ANY_CITATION.finditer(answer):
+        offset, span = start, answer[start:citation.start()]
+        start = citation.end()
+        ref = citation.group(0)[1:-1]
+        if not ref.startswith("F") or ref not in figures:
+            continue
+        ends = list(_CLAUSE_END.finditer(span))
+        if ends:
+            offset, span = offset + ends[-1].end(), span[ends[-1].end():]
+        numbers = list(_NUMBER.finditer(_DATE.sub(lambda m: " " * len(m.group(0)), span)))
+        if numbers:
+            spans.append((offset + numbers[-1].start(), offset + numbers[-1].end()))
+    return spans
+
+
+def _pointer_clear(result: Any, pointer: str) -> None:
+    """Blank the value a JSON pointer (/data/periods/2/twr) names, if it is there."""
+    parts = [part.replace("~1", "/").replace("~0", "~") for part in str(pointer).split("/")[1:]]
+    node = result
+    for part in parts[:-1]:
+        if isinstance(node, Mapping):
+            node = node.get(part)
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return
+    if parts and isinstance(node, dict) and parts[-1] in node:
+        node[parts[-1]] = None
+    elif parts and isinstance(node, list) and parts[-1].isdigit() and int(parts[-1]) < len(node):
+        node[int(parts[-1])] = None
+
+
+def uncertified_results(results: Mapping[str, Any], figures: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """The tool results without their certified figures: no get_certified_figures figures, no
+    ``certified`` blocks, and no value a certified figure was used for (its ``at`` pointer)."""
+    stripped = copy.deepcopy(dict(results))
+    for result in stripped.values():
+        if isinstance(result, dict):
+            result.pop("certified", None)
+            if result.get("tool") == "get_certified_figures":
+                result.pop("figures", None)
+    for figure in figures.values():
+        call, at = figure.get("tool_call"), figure.get("at")
+        if call in stripped and at:
+            _pointer_clear(stripped[call], at)
+    return stripped
+
+
+def _scrubbed(text: str, known_strings: set[str]) -> str:
+    """As validate_answer prepares the text before matching numbers."""
+    text = _CITATION.sub(" ", _DATE.sub(" ", _FIGURE_CITATION.sub(" ", text)))
+    for name in sorted((x for x in known_strings if _NAMED_NUMBER.search(x) and len(x) <= 80), key=len, reverse=True):
+        if name in text:
+            text = re.sub(r"(?<!\w)" + re.escape(name) + r"(?!\w)", " ", text)
+    for clock in _TIME.findall(text):
+        if any(clock.zfill(5) in x or clock in x for x in known_strings):
+            text = re.sub(r"(?<![\w:])" + re.escape(clock) + r"(?![\w:])", " ", text)
+    return text
+
+
+def _in_pool(match: re.Match, known: Mapping[str, list[float]]) -> bool:
+    raw = match.group("num").replace(",", "")
+    unit = (match.group("unit") or "").lower()
+    shown, decimals, sign = float(raw), (len(raw.split(".")[1]) if "." in raw else 0), match.group("sign")
+    if unit == "%":
+        return _matches(shown, decimals, 1.0, known["percents"], sign)
+    if unit in ("bp", "bps"):
+        return _matches(shown, decimals, 1.0, known["basis_points"], sign)
+    if unit in _SCALE:
+        return _matches(shown * _SCALE[unit], decimals, _SCALE[unit], known["values"], sign)
+    return _matches(shown, decimals, 1.0, known["values"], sign)
+
+
+def quoted_elsewhere(answer: str, results: Mapping[str, Any], figures: Mapping[str, Mapping[str, Any]],
+                     question: str = "") -> tuple[list[str], list[str]]:
+    """Numbers whose only source is a certified figure but that are not the number beside its
+    [F#]: the shown numbers (for the model) and the refs (for logs)."""
+    masked = list(answer)
+    for begin, end in _cited_spans(answer, figures):
+        masked[begin:end] = " " * (end - begin)
+    known_strings = set(_strings(list(results.values())))
+    text = _scrubbed("".join(masked), known_strings)
+    question_numbers = {m.group("num").replace(",", "") for m in _NUMBER.finditer(question or "")}
+    numeric = {ref: f for ref, f in figures.items()
+               if str(f.get("unit") or "") not in ("date", "text") and isinstance(f.get("value"), (int, float))
+               and not isinstance(f.get("value"), bool)}
+    pool = known_numbers(uncertified_results(results, figures))
+    shown, refs = [], []
+    for match in _NUMBER.finditer(text):
+        raw = match.group("num").replace(",", "")
+        decimals = len(raw.split(".")[1]) if "." in raw else 0
+        if raw in question_numbers:
+            continue
+        if not match.group("unit") and not match.group("cur") and decimals == 0 and (
+                float(raw) <= SMALL_COUNT_LIMIT or 1990 <= float(raw) <= 2100):
+            continue  # counts, ordinals and years, as validate_answer skips them
+        hits =[ref for ref, f in numeric.items() if _shown_matches(match, float(f["value"]), str(f.get("unit") or ""))]
+        if hits and not _in_pool(match, pool):
+            shown.append(f"{match.group(0).strip()} is {'/'.join(f'[{ref}]' for ref in hits)}")
+            refs += [ref for ref in hits if ref not in refs]
+    return shown, refs
+
+
 def validate_answer(answer: str, citations: list[str], results: Mapping[str, Any], question: str = "",
                     visuals: list[Mapping[str, Any]] | None = None,
-                    figures: Mapping[str, Mapping[str, Any]] | None = None) -> Validation:
+                    figures: Mapping[str, Mapping[str, Any]] | None = None,
+                    figure_check: str = "warn") -> Validation:
     """``results`` maps citation id (T1, T2…) to the tool result it labels; ``figures`` maps F1, F2…
-    to the certified figures those results carried (None when there are none)."""
+    to the certified figures those results carried (None when there are none). ``figure_check``
+    is warn (the [F#] check only warns) or enforce (it fails the answer)."""
+    original_answer = answer
     known = known_numbers(results)
     values, percents, basis_points = known["values"], known["percents"], known["basis_points"]
     known_strings = set(_strings(list(results.values())))
@@ -295,4 +426,8 @@ def validate_answer(answer: str, citations: list[str], results: Mapping[str, Any
         report.bad_citations.append("(none given)")
     report.bad_visuals = validate_visuals(list(visuals or []), results, known, known_strings)
     report.ok = not (report.unverified or report.bad_citations or report.bad_dates or report.bad_visuals)
+    if figure_check == "enforce" and figures is not None:
+        report.figure_mode = "enforce"
+        report.quoted_elsewhere, report.quoted_refs = quoted_elsewhere(original_answer, results, figures, question)
+        report.ok = report.ok and not (report.figure_warnings or report.quoted_elsewhere)
     return report

@@ -8,8 +8,14 @@ sits with the guide tools.
 All of it is off unless AGENT_CERTIFIED_FIGURES=on, and even then a figure is served only
 once its own website page is on in CERTIFIED_FIGURES_PAGES (set to the website's value on the
 tool server), so an agent never quotes a certified figure the website does not show yet. The
-month-end commentary job (month_end_drafter) never gets them before 8 Nov: its drafts must
-match the frozen month-end reports. The register is read through ibkr_etl.certified_figures.
+month-end commentary job (month_end_drafter) does not get them unless AGENT_CERTIFIED_MONTH_END=on
+(set on the tool server and in the job): its drafts must match the frozen month-end reports. The
+register is read through ibkr_etl.certified_figures.
+
+AGENT_CERTIFIED_FIGURE_CHECK sets how the [F#] figure check treats an answer (runtime.py,
+validator.py): warn (the default, and any other value) logs mismatches and shows the answer;
+enforce sends an answer back once with the reasons and, if it still fails, shows nothing
+(the run is ``rejected`` and a scheduled job writes no inbox item).
 """
 from __future__ import annotations
 
@@ -23,8 +29,13 @@ PAGES_SETTING = register.PAGES_SETTING
 GET = "get_certified_figures"
 TRACE = "trace_figure"
 LIST = "list_certified_figures"
-# The month-end commentary job keeps its own tool list until 8 Nov (open question 12).
+# The month-end commentary job keeps its own tool list (open question 12) until
+# AGENT_CERTIFIED_MONTH_END=on releases the read tools to it.
 NOT_FOR_JOBS = frozenset({"month_end_drafter"})
+MONTH_END_JOB = "month_end_drafter"
+MONTH_END_SETTING = "AGENT_CERTIFIED_MONTH_END"
+CHECK_SETTING = "AGENT_CERTIFIED_FIGURE_CHECK"
+CHECK_MODES = ("warn", "enforce")
 MAX_FIGURE_IDS = 25
 MAX_ROWS = 200
 PUBLISH_GATE = "shadow"  # the publish gate's verdict is recorded, not binding, until 8 Nov
@@ -41,6 +52,25 @@ def enabled(environ: Mapping[str, str] | None = None) -> bool:
     """AGENT_CERTIFIED_FIGURES=on shows the tools; anything else, or nothing, hides them."""
     environ = os.environ if environ is None else environ
     return str(environ.get(AGENT_SETTING, "")).strip().lower() in _ON
+
+
+def month_end_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """AGENT_CERTIFIED_MONTH_END=on gives the month-end commentary job the read tools."""
+    environ = os.environ if environ is None else environ
+    return str(environ.get(MONTH_END_SETTING, "")).strip().lower() in _ON
+
+
+def released(name: str, job: str | None, environ: Mapping[str, str] | None = None) -> bool:
+    """Whether a job listed in a tool's not_jobs may still have it: only the month-end job's
+    read tools, once AGENT_CERTIFIED_MONTH_END is on."""
+    return job == MONTH_END_JOB and name in (GET, TRACE) and month_end_enabled(environ)
+
+
+def figure_check(environ: Mapping[str, str] | None = None) -> str:
+    """AGENT_CERTIFIED_FIGURE_CHECK: enforce, or warn (the default, and any other value)."""
+    environ = os.environ if environ is None else environ
+    value = str(environ.get(CHECK_SETTING, "")).strip().lower()
+    return value if value in CHECK_MODES else "warn"
 
 
 def served(environ: Mapping[str, str] | None = None) -> dict[str, register.Figure]:

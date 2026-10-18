@@ -432,6 +432,84 @@ view (`agent.certified_figures`, through a `SECURITY DEFINER` function like the 
 approved run of that script on Tue 20, while the tools are still off. The removed grants later
 are another.
 
+### The figure tools on certified figures, with the automatic fallback
+
+The "From 8 Nov" column above, built behind three settings that are all off by default. With
+them unset every tool answer, tool list, prompt and figure check is as before.
+
+| Setting | Set on | Modes | What it does |
+|---|---|---|---|
+| `AGENT_CERTIFIED_FIGURE_TOOLS` | the tool server (the agents' tools) and the website (the website analyst's) | `off` (the default, and any other value), `fallback`, `on` | The figure tools read certified figures alongside their own |
+| `AGENT_CERTIFIED_MONTH_END` | the tool server and the jobs | off, `on` | The month-end commentary job gets `get_certified_figures` and `trace_figure` (with `AGENT_CERTIFIED_FIGURES=on`) |
+| `AGENT_CERTIFIED_FIGURE_CHECK` | the agent service and the jobs | `warn` (the default), `enforce` | The `[F#]` check fails an answer instead of warning |
+
+**Fallback.** Each tool works its figures out as today. Every figure that has a certified
+version with the same definition is then compared with the published one for the same subject,
+date, period, item and benchmark, with the release report's tolerances (ratios and numbers
+relative 1e-9, money to the cent, dates and text exactly). Equal: the certified value is used,
+and the agents' tools list it in a `certified` block so the answer can cite it `[F#]` (only for
+figures whose page is on, as `get_certified_figures` serves them). Different, not published or
+not readable: today's value stays, the answer marks it in `figures_source`
+(`{"/data/periods/2/irr_annualized": "fallback"}`, for a different or unreadable figure), and one
+`CERTIFIED_FIGURE_TOOLS` log line per call gives counts by figure id, the mode, the masked
+subject and the read time; never values or account ids. The read runs inside the tool's own
+read-only transaction in a savepoint with a 2-second limit (1 second on the website, on its own
+read-only connection), so a slow or missing view never breaks a tool. `on` uses the certified
+value even when it differs; it is not used before two clean month-ends.
+
+**Which figures.** `get_performance`: NAV and, for every period the website shows (MTD, QTD,
+YTD, each year, since inception), TWR, annualised TWR, annualised IRR and net flows.
+`compare_to_benchmark`: each period's portfolio return. `get_nav_history` from inception: each
+point's NAV and since-inception return. `get_risk_metrics` over the whole history only: total
+return, maximum drawdown, best and worst day and month. `get_sector_allocation`: each sector's
+weight. The website analyst: `compare_with_benchmarks`' comparison metrics, `get_risk_metrics`'
+Risk snapshot metrics, `get_sector_allocation`'s weights. Where a definition differs, today's
+value stays and nothing is compared: `get_risk_metrics`' one-year window (its base is the last
+valuation before the same date a year earlier, not 365 days), its volatility, downside deviation
+and benchmark statistics (annualised by valuations a year, not √252), its annualised return
+(365.25-day years) and positive months (a count, not a share); the benchmark returns of
+`compare_to_benchmark` and `get_nav_history` (the benchmark's own price return over each window,
+not the comparison series); `get_holdings`' weights (of gross holdings, not of NAV); and
+`get_performance`'s description, which promises a 1Y period it does not return (no certified
+one-year figure exists, and the description stays as it is). `wealthryse_agent/certified_fallback.py`
+lists each case.
+
+**The month-end snapshot builder cannot change.** `ibkr_etl/agent_tools.py` applies the setting
+only when its caller passes `certified_mode`, and only the website analyst (`ai_analyst.py`)
+does. `reporting_snapshot.py`, the pages and every other caller never pass it, so the frozen
+snapshots keep today's numbers whatever the setting says (a test checks it).
+
+**Enforce.** In `enforce` an answer fails the figure check, as an unmatched number does, when the
+number beside an `[F#]` is not that figure's value (or the ref does not exist), or when a number
+whose only source is a certified figure is quoted from the tool call (`[T#]`) instead of its
+`[F#]`; a number another tool result also returned is allowed. The runtime sends the answer back
+once with the reasons. If the second answer fails too, it is blocked: the person sees "I couldn't
+produce an answer whose figures all match the data", the run is `rejected`, and a scheduled job
+writes no inbox item. Each failure logs `CERTIFIED_FIGURE_CHECK` with the mode, `retry` or
+`rejected`, counts, refs and figure ids.
+
+**Before switching on: the rehearsal on a restored copy.** Restore a copy after the certified
+build has run, and run, read-only:
+
+    DATABASE_ADMIN_URL=... python scripts/compare_agent_certified_figures.py [--as-of YYYY-MM-DD]
+
+For every active subject it calls each figure tool today's way and the fallback way and prints
+counts only (equal, different, missing, error per tool and figure; calls refused; values the
+fallback changed). Switch to `fallback` only when it shows:
+
+- `Values the fallback changed beyond the certified tolerance: 0`;
+- `error` 0 everywhere (the reads work within their time limits);
+- `different` 0, or each figure that differs explained; a figure that differs on every subject
+  means a definition differs, and its comparison is taken out before go-live;
+- `missing` only where the build has not certified that date or benchmark (for example NAV
+  history dates before the backfill, or a benchmark other than the page's);
+- the same refusals both ways (they are the tools refusing today).
+
+Run it for the latest date and for the last month-end (`--as-of`). Before `enforce`, the warn
+mode's `CERTIFIED_FIGURE_CHECK` lines should be rare and explained, and the agent evaluation
+(`python -m wealthryse_agent.evaluate`) run with `AGENT_CERTIFIED_FIGURE_CHECK=enforce` should
+reject no answer.
+
 ## How a page moves
 
 ### Three modes per page

@@ -1,0 +1,120 @@
+"""The shadow report: what the supervisor would have done next to today's analyst, over a period.
+
+Reads the supervisor rows in ``agent.tasks`` (counts, names and dates only) and says how often
+the routing rules agreed with the tools the analyst actually needed, how much would have taken
+the fast path, how often an answer's figures were behind the pinned date or mixed builds, how
+often a figure fell back to the old calculation, and what each kind of request cost.
+
+    python -m wealthryse_agent.supervisor.report --from 2026-10-29 --to 2026-11-09
+    python -m wealthryse_agent.supervisor.report --from 2026-10-29 --to 2026-11-09 --json
+
+Run it where the agent jobs run (it signs in as the agent writer). It changes nothing.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import Counter
+from datetime import date
+from typing import Any, Iterable
+
+AGREEMENTS = ("agree", "over", "under", "partial", "differ", "undecided", "no_tools")
+
+
+def _percentile(values: list[int], share: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(share * len(ordered)))]
+
+
+def summarise(roots: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    roots = list(roots)
+    details = [r.get("detail") or {} for r in roots]
+    usage = [r.get("usage") or {} for r in roots]
+    leads = Counter((d.get("route") or {}).get("lead", "router") for d in details)
+    tokens_by_lead: dict[str, list[int]] = {}
+    for detail, used in zip(details, usage):
+        lead = (detail.get("route") or {}).get("lead", "router")
+        tokens_by_lead.setdefault(lead, []).append(int(used.get("input_tokens", 0)) + int(used.get("output_tokens", 0)))
+    layers: Counter[str] = Counter()
+    for detail in details:
+        layers.update({layer for layer, n in (detail.get("layers") or {}).items() if n})
+    elapsed = [int(d["elapsed_ms"]) for d in details if isinstance(d.get("elapsed_ms"), int)]
+    return {
+        "requests": len(roots),
+        "outcomes": dict(Counter(r.get("status") for r in roots)),
+        "route": {"fast_path": leads.get("fast_path", 0), "planner": leads.get("planner", 0),
+                  "router": leads.get("router", 0),
+                  "advice": sum(1 for d in details if (d.get("route") or {}).get("advice")),
+                  "declined_as_advice": sum(1 for d in details if d.get("out_of_scope"))},
+        "agreement": {kind: sum(1 for d in details if d.get("agreement") == kind) for kind in AGREEMENTS},
+        "specialists_planned": dict(Counter(s for d in details for s in (d.get("route") or {}).get("specialists", []))),
+        "specialists_used": dict(Counter(s for d in details for s in d.get("used_specialists", []))),
+        # Requests that read each layer at least once.
+        "layers": dict(layers),
+        "figures": {"answers_citing_certified": sum(1 for d in details if d.get("figure_refs")),
+                    "answers_citing_only_tools": sum(1 for d in details if d.get("tool_refs") and not d.get("figure_refs")),
+                    "with_fallback": sum(1 for d in details if d.get("fallback")),
+                    "figure_check_warnings": sum(int(d.get("figure_warnings") or 0) for d in details)},
+        "pin": {"unavailable": sum(1 for d in details if (d.get("pin") or {}).get("source") == "unavailable"),
+                "behind_pin": sum(1 for d in details if d.get("behind_pin")),
+                "mixed_builds": sum(1 for d in details if d.get("mixed_builds"))},
+        "cost": {"tokens": sum(sum(v) for v in tokens_by_lead.values()),
+                 "tool_calls": sum(int(u.get("tool_calls", 0)) for u in usage),
+                 "mean_tokens_by_lead": {lead: round(sum(v) / len(v)) for lead, v in tokens_by_lead.items() if v}},
+        "elapsed_ms": {"p50": _percentile(elapsed, 0.5), "p90": _percentile(elapsed, 0.9)},
+    }
+
+
+def _share(part: int, whole: int) -> str:
+    return f"{part} ({part / whole:.0%})" if whole else "0"
+
+
+def render(summary: dict[str, Any], since: str, until: str) -> str:
+    n = summary["requests"]
+    route, agree, figures, pin = summary["route"], summary["agreement"], summary["figures"], summary["pin"]
+    lines = [f"Supervisor shadow report, {since} to {until} (UTC), {n} chat answers",
+             "",
+             f"Routing: fast path {_share(route['fast_path'], n)}, planner {_share(route['planner'], n)}, "
+             f"no rule matched {_share(route['router'], n)}; advice asked {route['advice']}, declined by the "
+             f"analyst {route['declined_as_advice']}.",
+             "Against what the analyst used: " + ", ".join(f"{k} {_share(v, n)}" for k, v in agree.items() if v) + ".",
+             f"Figures: certified [F#] cited in {_share(figures['answers_citing_certified'], n)}, only tool results "
+             f"in {_share(figures['answers_citing_only_tools'], n)}, old-calculation fallback in "
+             f"{_share(figures['with_fallback'], n)}, figure-check warnings {figures['figure_check_warnings']}.",
+             f"Pinning: figures behind the pinned date in {_share(pin['behind_pin'], n)}, mixed builds in "
+             f"{_share(pin['mixed_builds'], n)}, pin unavailable {pin['unavailable']}.",
+             "Layers read: " + (", ".join(f"{k} {_share(v, n)}" for k, v in sorted(summary["layers"].items())) or "none") + ".",
+             f"Cost: {summary['cost']['tokens']} tokens, {summary['cost']['tool_calls']} tool calls; mean tokens by "
+             "route: " + (", ".join(f"{k} {v}" for k, v in sorted(summary["cost"]["mean_tokens_by_lead"].items()))
+                          or "none") + ".",
+             f"Time to answer: median {summary['elapsed_ms']['p50']} ms, 90th percentile {summary['elapsed_ms']['p90']} ms."]
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--from", dest="since", required=True, type=date.fromisoformat, help="first day (UTC)")
+    parser.add_argument("--to", dest="until", required=True, type=date.fromisoformat, help="day after the last (UTC)")
+    parser.add_argument("--json", action="store_true", help="print the numbers as JSON")
+    args = parser.parse_args(argv)
+    if args.until <= args.since:
+        parser.error("--to must be after --from")
+    from ..config import DatabaseSettings
+    from ..database import connect
+    from ..store import Store
+
+    db = DatabaseSettings.from_env()
+    store = Store(connect(db, search_path="agent"), db.tenant_id)
+    if not store.tasks_ready():
+        print("agent.tasks is not installed yet.", file=sys.stderr)
+        return 1
+    summary = summarise(store.task_roots(args.since.isoformat(), args.until.isoformat()))
+    print(json.dumps(summary, indent=2) if args.json else render(summary, args.since.isoformat(), args.until.isoformat()))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

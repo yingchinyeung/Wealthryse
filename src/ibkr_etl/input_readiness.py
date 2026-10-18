@@ -8,6 +8,8 @@ what happens:
 - enforce: the same, but a job whose inputs are not ready stops with exit code 75.
   With INPUT_READINESS_WAIT_SECONDS set, it first logs a "wait" line and checks again
   every INPUT_READINESS_RECHECK_SECONDS until the inputs are ready or the wait is over.
+  A lineage run that is still running only delays: when the wait is over, the check
+  runs once more without it, and the job carries on if the rest is ready.
 
 The check reads evidence the earlier steps already leave in the database, in one
 READ ONLY session (layer_freshness.open_read_only) within a hard time limit, and
@@ -16,7 +18,8 @@ UTC day. institutional-daily asks IBKR for data up to yesterday, so ingestion an
 reconciliation must cover yesterday; benchmarks, derived and risk must have completed
 today, after the steps they read (date policy built with workflow_dates). Rows in the
 shadow evidence ledger, once it has any for the cycle, must agree as well. Where a job
-leaves lineage records (lineage.py, migration 071), its newest run must have ended.
+leaves lineage records (lineage.py, migration 071), its newest run must not have
+crashed; reports are judged by month-end-factsheet's lineage run alone.
 
 Nothing is written. `python -m ibkr_etl.input_readiness <job>` prints a dry run.
 """
@@ -58,6 +61,7 @@ JOB_STAGES = {
     "risk-snapshots": "risk",
     "crisis-scenarios-daily": "risk",
     "month-end-factsheet": "reports",
+    "analyst-assurance": "assurance",
 }
 
 
@@ -139,9 +143,15 @@ LEDGER_READABLE_SQL = ("SELECT has_table_privilege(to_regclass('workflow_stage_e
 LINEAGE_JOBS: dict[str, tuple[tuple[str, str, int], ...]] = {
     "benchmarks_fx": (("sectors", "ibkrv2stg-sector-classification", 1800),),
     "risk": (("run", "ibkrv2stg-risk-snapshots", 3600),),
+    "reports": (("run", "ibkrv2stg-month-end-factsheet", 3600),),
 }
+# Stages with no table evidence, judged by their lineage run alone. Without a usable run
+# they are not checked, and the policy goes on to check the stages before them.
+LINEAGE_ONLY = frozenset({"reports"})
+# Second jobs that can delay a stage but never fail it: yesterday's sector
+# classifications are good enough for a day.
+SOFT_KEYS = frozenset({"sectors"})
 LINEAGE_KEY = "lineage"  # where observe() puts the lineage runs among the observations
-PART_KEYS = frozenset(key for jobs in LINEAGE_JOBS.values() for key, _, _ in jobs if key != "run")
 LINEAGE_NAMESPACE = "wealthryse"  # lineage.NAMESPACE
 LINEAGE_READABLE_SQL = ("SELECT has_table_privilege(to_regclass('public.lineage_events'), 'SELECT') "
                         "AS readable")
@@ -245,15 +255,6 @@ def _instant(value: Any) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _finish_times(detail: Mapping[str, Any]) -> list[str]:
-    """When a stage finished, oldest first: its own completion and any second job's end."""
-    times = [detail.get("completed_at")]
-    for key, part in detail.items():
-        if key in PART_KEYS and isinstance(part, Mapping) and part.get("state") == "finished":
-            times.append(part.get("ended_at"))
-    return sorted((value for value in times if value), key=datetime.fromisoformat)
-
-
 def judge(name: str, observation: Mapping[str, Any], *, now: datetime) -> dict[str, Any]:
     """One stage's evidence, judged. Plain JSON; `completed_at` is UTC ISO or None."""
     from . import layer_freshness
@@ -329,8 +330,10 @@ def judge_run(job: str, row: Mapping[str, Any] | None, *, now: datetime, limit_s
     return detail
 
 
-def _runs(name: str, lineage: Mapping[str, Any] | None, *, now: datetime) -> dict[str, dict[str, Any]]:
-    """The judged lineage runs for one stage, by evidence key."""
+def _runs(name: str, lineage: Mapping[str, Any] | None, *, now: datetime,
+          hold_open_runs: bool) -> dict[str, dict[str, Any]]:
+    """The judged lineage runs for one stage, by evidence key. Without hold_open_runs a
+    run still in progress is not used, so the stage is judged as if it had no record."""
     found: dict[str, dict[str, Any]] = {}
     for key, job, limit in LINEAGE_JOBS.get(name, ()):
         if lineage is None:
@@ -342,7 +345,30 @@ def _runs(name: str, lineage: Mapping[str, Any] | None, *, now: datetime) -> dic
                 found[key] = judge_run(job, (lineage.get("runs") or {}).get(job), now=now, limit_seconds=limit)
             except (KeyError, TypeError, ValueError) as error:
                 found[key] = {"job": job, "state": "not_used", "why": f"unreadable record ({type(error).__name__})"}
+        if found[key]["state"] == "running" and not hold_open_runs:
+            found[key].update(state="not_used",
+                              why=f"still running after the wait (started {found[key]['started_at']})")
     return found
+
+
+def _judge_by_run(run: Mapping[str, Any], cycle: date) -> dict[str, Any]:
+    """A lineage-only stage, judged by its run. Without a usable run it is not checked and
+    passes on to the stages before it."""
+    state = run["state"]
+    if state == "running":
+        return {"state": "in_progress", "status": "running"}
+    if state in ("finished", "failed"):
+        return {"state": "fresh", "status": "succeeded" if state == "finished" else "failed",
+                "completed_at": run["ended_at"], "through_date": run["ended_at"][:10]}
+    return {"state": "not_checked", "status": "succeeded", "completed_at": None,
+            "through_date": cycle.isoformat()}
+
+
+def open_runs(decision: Mapping[str, Any]) -> list[str]:
+    """The jobs whose lineage run was still in progress in this decision."""
+    return sorted(part["job"] for detail in (decision.get("evidence") or {}).values() if isinstance(detail, Mapping)
+                  for part in detail.values()
+                  if isinstance(part, Mapping) and part.get("job") and part.get("state") == "running")
 
 
 def _ended_later(observation: Mapping[str, Any], own: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -360,8 +386,10 @@ def _ended_later(observation: Mapping[str, Any], own: Mapping[str, Any] | None) 
 
 
 def decide(stage: str, observations: Mapping[str, Mapping[str, Any]], *, now: datetime,
-           tenant_id: str = DEFAULT_TENANT_ID, ledger: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """The decision for `stage` from observed evidence. Pure; raises on a bad policy."""
+           tenant_id: str = DEFAULT_TENANT_ID, ledger: Mapping[str, Any] | None = None,
+           hold_open_runs: bool = True) -> dict[str, Any]:
+    """The decision for `stage` from observed evidence. Pure; raises on a bad policy.
+    hold_open_runs=False judges as if runs still in progress had left no record."""
     from .workflow_ledger import digest
     from .workflow_readiness import PREREQUISITES, StageEvidence, readiness
 
@@ -375,12 +403,15 @@ def decide(stage: str, observations: Mapping[str, Mapping[str, Any]], *, now: da
     extra: list[str] = []
     notes: list[str] = []
     for name in needed:
-        if name not in EVIDENCE:
+        if name not in EVIDENCE and name not in LINEAGE_ONLY:
             details[name] = {"state": "no_source"}
             continue
-        runs = _runs(name, lineage, now=now)
-        observation = _ended_later(observations.get(name, {"error": "not measured"}), runs.get("run"))
-        detail = judge(name, observation, now=now)
+        runs = _runs(name, lineage, now=now, hold_open_runs=hold_open_runs)
+        if name in LINEAGE_ONLY:
+            detail = _judge_by_run(runs["run"], cycle)
+        else:
+            observation = _ended_later(observations.get(name, {"error": "not measured"}), runs.get("run"))
+            detail = judge(name, observation, now=now)
         detail["expected"] = dates[name].isoformat()
         details[name] = detail
         if detail.get("waiting"):
@@ -389,17 +420,21 @@ def decide(stage: str, observations: Mapping[str, Mapping[str, Any]], *, now: da
         for key, run in runs.items():
             detail[key] = run
             job, state = run["job"], run["state"]
+            failed = f"did not finish ({run.get('error') or run.get('end')})"
             if state == "running":
                 extra.append(f"{name}: {job} is still running (started {run['started_at']})")
                 if detail.get("status") == "succeeded":
                     detail.update(state="in_progress", status="running")
-            elif state == "failed":
-                extra.append(f"{name}: {job} did not finish ({run.get('error') or run.get('end')})")
+            elif state == "failed" and key not in SOFT_KEYS:
+                extra.append(f"{name}: {job} {failed}")
                 if detail.get("status") == "succeeded":
                     detail["status"] = "failed"
-            elif state == "not_used":
-                judged_by = f"judged by {EVIDENCE[name][1]} alone" if key == "run" else f"{key} not checked"
-                notes.append(f"{name}: {job} {run['why']}; {judged_by}")
+            elif state in ("failed", "not_used"):
+                if key in SOFT_KEYS or name in LINEAGE_ONLY:
+                    judged_by = f"{key if key in SOFT_KEYS else name} not checked"
+                else:
+                    judged_by = f"judged by {EVIDENCE[name][1]} alone"
+                notes.append(f"{name}: {job} {failed if state == 'failed' else run['why']}; {judged_by}")
         if detail["state"] == "unavailable":
             extra.append(f"{name}: evidence unavailable ({detail.get('error', 'unknown')})")
             continue
@@ -416,19 +451,17 @@ def decide(stage: str, observations: Mapping[str, Mapping[str, Any]], *, now: da
         evidence[name] = StageEvidence(SUBJECT, name, "succeeded" if succeeded else "failed", succeeded,
                                        through, digest({"stage": name, **detail}), {})
     # A step that completed before one it reads has not used that step's latest output.
-    # A stage with a second job (sectors) counts from its first finish, and as an input
-    # from its last.
     for name, item in evidence.items():
         hashes = {}
         for parent in PREREQUISITES[name]:
             upstream = evidence.get(parent)
             if upstream is None:
                 continue
-            own_times, parent_times = _finish_times(details[name]), _finish_times(details[parent])
-            ran_before = bool(own_times and parent_times) and _before(own_times[0], parent_times[-1])
+            ran_before = _before(details[name].get("completed_at"), details[parent].get("completed_at"))
             hashes[parent] = "0" * 64 if ran_before else upstream.output_sha256
         evidence[name] = StageEvidence(item.subject_id, item.stage, item.status, item.validated,
                                        item.through_date, item.output_sha256, hashes)
+    notes += _sector_order_notes(details, PREREQUISITES)
     ready, reasons = readiness(stage, subject_id=SUBJECT, expected_date=cycle, evidence=evidence,
                                expected_dates=dates)
     unavailable = {reason.split(":")[0] for reason in extra if "evidence unavailable" in reason}
@@ -447,6 +480,21 @@ def decide(stage: str, observations: Mapping[str, Mapping[str, Any]], *, now: da
     }
 
 
+def _sector_order_notes(details: Mapping[str, Mapping[str, Any]], prerequisites_of: Mapping) -> list[str]:
+    """Sectors are soft: an order problem with them is a note, never a reason."""
+    sectors = (details.get("benchmarks_fx") or {}).get("sectors") or {}
+    if sectors.get("state") != "finished":
+        return []
+    ended, job = sectors.get("ended_at"), sectors.get("job")
+    notes = []
+    if _before(ended, (details.get("reconciliation") or {}).get("completed_at")):
+        notes.append(f"benchmarks_fx: {job} ended before reconciliation; it classified the earlier positions")
+    for name, detail in details.items():
+        if "benchmarks_fx" in prerequisites_of.get(name, ()) and _before(detail.get("completed_at"), ended):
+            notes.append(f"{name}: finished before {job} ended; it used the earlier sector classifications")
+    return notes
+
+
 def _fetch(connection: Any, sql: str, params: tuple | None = None) -> Mapping[str, Any] | None:
     # Each query under a savepoint, so a denied one does not abort the rest.
     with connection.transaction():
@@ -462,9 +510,9 @@ def observe(connection: Any, stage: str, *, now: datetime, tenant_id: str) -> tu
     observations: dict[str, dict[str, Any]] = {}
     jobs: list[str] = []
     for name in prerequisites(stage):
+        jobs += [job for _, job, _ in LINEAGE_JOBS.get(name, ())]
         if name not in EVIDENCE:
             continue
-        jobs += [job for _, job, _ in LINEAGE_JOBS.get(name, ())]
         try:
             observations[name] = {"row": _fetch(connection, EVIDENCE[name][2])}
         except Exception as error:  # noqa: BLE001 - reported as unavailable
@@ -513,7 +561,7 @@ def read_ledger(connection: Any, stage: str, *, now: datetime, tenant_id: str) -
 
 def check(job: str, *, environ: Mapping[str, str] | None = None, now: datetime | None = None,
           time_budget_seconds: float = TIME_BUDGET_SECONDS,
-          connect: Callable[[str, str], Any] | None = None) -> dict[str, Any]:
+          connect: Callable[[str, str], Any] | None = None, hold_open_runs: bool = True) -> dict[str, Any]:
     """Measure and decide within a hard time limit, connection included. Never raises;
     any problem is a reason, so the decision is then not ready."""
     environ = os.environ if environ is None else environ
@@ -527,7 +575,8 @@ def check(job: str, *, environ: Mapping[str, str] | None = None, now: datetime |
         tenant_id = str(environ.get("PORTFOLIO_TENANT_ID") or DEFAULT_TENANT_ID).strip()
         if not database_url:
             decision = decide(stage, {name: {"error": "database not configured"}
-                                      for name in (*EVIDENCE, LINEAGE_KEY)}, now=now, tenant_id=tenant_id)
+                                      for name in (*EVIDENCE, LINEAGE_KEY)}, now=now, tenant_id=tenant_id,
+                              hold_open_runs=hold_open_runs)
         else:
             if connect is None:
                 from .layer_freshness import open_read_only as connect
@@ -559,7 +608,8 @@ def check(job: str, *, environ: Mapping[str, str] | None = None, now: datetime |
             else:
                 failure = outcome[0] if outcome else "no result"
                 observations, ledger = {name: {"error": failure} for name in (*EVIDENCE, LINEAGE_KEY)}, None
-            decision = decide(stage, observations, now=now, tenant_id=tenant_id, ledger=ledger)
+            decision = decide(stage, observations, now=now, tenant_id=tenant_id, ledger=ledger,
+                              hold_open_runs=hold_open_runs)
         base.update(decision)
     except Exception as error:  # noqa: BLE001 - a broken check is a reason, never a crash
         base.update(ready=False, reasons=[f"check failed: {type(error).__name__}: {error}"[:300]])
@@ -611,7 +661,9 @@ def gate(job: str, *, environ: Mapping[str, str] | None = None, now: datetime | 
 
     Only enforce waits: when not ready and INPUT_READINESS_WAIT_SECONDS is above 0, it logs
     a "wait" line, then checks again (each check with its own session and time limit) until
-    ready or the wait is over, and logs the final decision."""
+    ready or the wait is over, and logs the final decision. A lineage run still in progress
+    only delays: if one is open when the wait is over, it checks once more as if that run had
+    left no record, and that check decides."""
     environ = os.environ if environ is None else environ
     selected, note = mode(environ)
     if selected == OFF:
@@ -635,6 +687,10 @@ def gate(job: str, *, environ: Mapping[str, str] | None = None, now: datetime | 
                 decision = check(job, environ=environ, now=later, **options)
                 if decision.get("ready"):
                     break
+        if not decision.get("ready") and open_runs(decision):
+            attempts += 1
+            later = None if now is None else now + timedelta(seconds=waited)
+            decision = check(job, environ=environ, now=later, hold_open_runs=False, **options)
         labels.update(attempts=attempts, waited_seconds=round(waited, 1))
         if attempts > 1:
             labels["first_reasons"] = first.get("reasons", [])

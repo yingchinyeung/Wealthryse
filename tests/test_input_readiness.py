@@ -32,6 +32,8 @@ WIRED = {
     "crisis-scenarios-daily": ("infra/staging-crisis-scenarios-job.bicep", "scripts/refresh_crisis_scenarios.py"),
     "month-end-factsheet": ("infra/staging-month-end-factsheet-job.bicep",
                             "scripts/run_registry_month_end_packages.py"),
+    "analyst-assurance": ("infra/staging-portfolio-analyst-assurance.bicep",
+                          "scripts/run_registry_portfolio_assurance.py"),
 }
 
 
@@ -41,6 +43,7 @@ def _row(completed_at, *, through=None, planned=1, succeeded=None, failed=0):
 
 
 RISK_JOB, SECTOR_JOB = "ibkrv2stg-risk-snapshots", "ibkrv2stg-sector-classification"
+REPORTS_JOB = "ibkrv2stg-month-end-factsheet"
 
 
 def _run(started, ended=None, *, end=None, exit_code=None, error=None):
@@ -50,7 +53,7 @@ def _run(started, ended=None, *, end=None, exit_code=None, error=None):
 
 
 def _with_runs(evidence, **runs):
-    names = {"risk": RISK_JOB, "sectors": SECTOR_JOB}
+    names = {"risk": RISK_JOB, "sectors": SECTOR_JOB, "reports": REPORTS_JOB}
     return {**evidence, readiness.LINEAGE_KEY: {"runs": {names[key]: run for key, run in runs.items()}}}
 
 
@@ -151,10 +154,16 @@ class DecisionTests(unittest.TestCase):
         decision = readiness.decide("derived", evidence, now=NOW)
         self.assertIn("benchmarks_fx: completion time is in the future", decision["reasons"])
 
-    def test_assurance_has_no_reports_evidence_yet(self):
+    def test_assurance_without_a_reports_record_still_checks_the_steps_before(self):
         decision = readiness.decide("assurance", healthy(), now=NOW)
-        self.assertEqual(decision["evidence"]["reports"], {"state": "no_source"})
-        self.assertEqual(decision["reasons"], ["reports: missing completion evidence"])
+        self.assertEqual((decision["ready"], decision["evidence"]["reports"]["state"]), (True, "not_checked"))
+        self.assertIn("reports: ibkrv2stg-month-end-factsheet lineage not read; reports not checked",
+                      decision["notes"])
+        late = healthy()
+        late["risk"] = _row("2026-10-18T08:57:00+00:00", planned=5)
+        stale = readiness.decide("assurance", late, now=NOW)
+        self.assertFalse(stale["ready"])
+        self.assertIn("risk: stale data", stale["reasons"])
 
     def test_ledger_rows_when_present_must_agree(self):
         decision = readiness.decide("derived", healthy(), now=NOW,
@@ -281,22 +290,32 @@ class SectorRunTests(unittest.TestCase):
                 decision = readiness.decide(stage, evidence, now=NOW)
                 self.assertEqual((decision["ready"], decision["reasons"]), (True, []))
 
-    def test_derived_that_finished_before_sectors_must_recalculate(self):
+    def test_derived_that_finished_before_sectors_ended_is_only_a_note(self):
         evidence = _with_runs(healthy(), sectors=_run("2026-10-19T08:45:00+00:00", "2026-10-19T08:53:00+00:00"))
         decision = readiness.decide("risk", evidence, now=NOW)
-        self.assertEqual(decision["reasons"], ["derived: benchmarks_fx changed; recalculate"])
+        self.assertEqual((decision["ready"], decision["reasons"]), (True, []))
+        self.assertIn("derived: finished before ibkrv2stg-sector-classification ended; it used the earlier sector "
+                      "classifications", decision["notes"])
 
-    def test_sectors_that_finished_before_the_pull_must_recalculate(self):
+    def test_sectors_that_ended_before_the_pull_are_only_a_note(self):
         evidence = _with_runs(healthy(), sectors=_run("2026-10-19T08:20:00+00:00", "2026-10-19T08:23:00+00:00"))
         decision = readiness.decide("derived", evidence, now=NOW)
-        self.assertEqual(decision["reasons"], ["benchmarks_fx: reconciliation changed; recalculate"])
+        self.assertEqual((decision["ready"], decision["reasons"]), (True, []))
+        self.assertIn("benchmarks_fx: ibkrv2stg-sector-classification ended before reconciliation; it classified "
+                      "the earlier positions", decision["notes"])
 
-    def test_sectors_that_failed_are_not_validated(self):
-        run = _run("2026-10-19T08:45:00+00:00", "2026-10-19T08:46:00+00:00", end="FAIL", error="RuntimeError")
-        decision = readiness.decide("derived", _with_runs(healthy(), sectors=run), now=NOW)
-        self.assertEqual(decision["reasons"], [
-            "benchmarks_fx: ibkrv2stg-sector-classification did not finish (RuntimeError)",
-            "benchmarks_fx: not validated"])
+    def test_sectors_that_failed_or_never_ended_never_stop_anything(self):
+        crashed = _run("2026-10-19T08:45:00+00:00", "2026-10-19T08:46:00+00:00", end="FAIL", error="RuntimeError")
+        aborted = _run("2026-10-19T08:45:00+00:00", "2026-10-19T08:46:00+00:00", end="ABORT")
+        lost = _run("2026-10-19T07:40:00+00:00")  # no end after its 1800 s replicaTimeout
+        for run, why in ((crashed, "did not finish (RuntimeError)"), (aborted, "did not finish (ABORT)"),
+                         (lost, "no end recorded within 1800 seconds")):
+            for stage in ("derived", "risk", "reports"):
+                with self.subTest(why=why, stage=stage):
+                    decision = readiness.decide(stage, _with_runs(healthy(), sectors=run), now=NOW)
+                    self.assertEqual((decision["ready"], decision["reasons"]), (True, []))
+                    self.assertIn(f"benchmarks_fx: ibkrv2stg-sector-classification {why}; sectors not checked",
+                                  decision["notes"])
 
     def test_unclassified_holdings_exit_2_count_as_finished(self):
         run = _run("2026-10-19T08:45:00+00:00", "2026-10-19T08:48:00+00:00", end="FAIL", exit_code="2")
@@ -317,9 +336,71 @@ class SectorRunTests(unittest.TestCase):
         self.assertEqual(decision["notes"], [])
 
 
+class OpenRunTests(unittest.TestCase):
+    """A START with no end only delays: judged without it, the tables decide."""
+    at = datetime(2026, 10, 19, 9, 0, tzinfo=timezone.utc)
+
+    def test_without_holding_open_runs_the_tables_decide_and_a_note_says_so(self):
+        evidence = _with_runs(healthy(), risk=_run("2026-10-19T08:55:00+00:00"),
+                              sectors=_run("2026-10-19T08:45:00+00:00"))
+        held = readiness.decide("reports", evidence, now=self.at)
+        self.assertFalse(held["ready"])
+        self.assertEqual(readiness.open_runs(held), [RISK_JOB, SECTOR_JOB])
+        decision = readiness.decide("reports", evidence, now=self.at, hold_open_runs=False)
+        self.assertEqual((decision["ready"], decision["reasons"], readiness.open_runs(decision)), (True, [], []))
+        self.assertIn("risk: ibkrv2stg-risk-snapshots still running after the wait (started "
+                      "2026-10-19T08:55:00+00:00); judged by public.risk_analytics_snapshots alone", decision["notes"])
+        self.assertIn("benchmarks_fx: ibkrv2stg-sector-classification still running after the wait (started "
+                      "2026-10-19T08:45:00+00:00); sectors not checked", decision["notes"])
+
+    def test_tables_that_are_not_done_still_stop(self):
+        evidence = _with_runs(healthy(), risk=_run("2026-10-19T08:55:00+00:00"))
+        evidence["risk"] = _row("2026-10-18T08:57:00+00:00", planned=5)
+        decision = readiness.decide("reports", evidence, now=self.at, hold_open_runs=False)
+        self.assertFalse(decision["ready"])
+        self.assertIn("risk: stale data", decision["reasons"])
+
+    def test_a_run_that_ended_in_failure_keeps_stopping(self):
+        run = _run("2026-10-19T08:55:00+00:00", "2026-10-19T08:56:00+00:00", end="FAIL", error="RuntimeError")
+        decision = readiness.decide("reports", _with_runs(healthy(), risk=run), now=self.at, hold_open_runs=False)
+        self.assertIn("risk: not validated", decision["reasons"])
+
+
+class ReportsRunTests(unittest.TestCase):
+    """Reports are judged by month-end-factsheet's lineage run alone."""
+    at = datetime(2026, 10, 19, 9, 10, tzinfo=timezone.utc)
+
+    def test_a_finished_month_end_run_lets_assurance_start(self):
+        for run in (_run("2026-10-19T09:00:00+00:00", "2026-10-19T09:04:00+00:00"),
+                    _run("2026-10-19T09:00:00+00:00", "2026-10-19T09:04:00+00:00", end="FAIL", exit_code="1")):
+            with self.subTest(end=run["end_type"]):
+                decision = readiness.decide("assurance", _with_runs(healthy(), reports=run), now=self.at)
+                self.assertEqual((decision["ready"], decision["reasons"]), (True, []))
+                reports = decision["evidence"]["reports"]
+                self.assertEqual((reports["status"], reports["completed_at"]),
+                                 ("succeeded", "2026-10-19T09:04:00+00:00"))
+
+    def test_a_month_end_run_still_running_or_crashed_is_not_ready(self):
+        running = _with_runs(healthy(), reports=_run("2026-10-19T09:00:00+00:00"))
+        self.assertEqual(readiness.decide("assurance", running, now=self.at)["reasons"], [
+            "reports: ibkrv2stg-month-end-factsheet is still running (started 2026-10-19T09:00:00+00:00)",
+            "reports: missing completion evidence"])
+        self.assertTrue(readiness.decide("assurance", running, now=self.at, hold_open_runs=False)["ready"])
+        crashed = _run("2026-10-19T09:00:00+00:00", "2026-10-19T09:01:00+00:00", end="FAIL", error="RuntimeError")
+        decision = readiness.decide("assurance", _with_runs(healthy(), reports=crashed), now=self.at)
+        self.assertEqual(decision["reasons"], ["reports: ibkrv2stg-month-end-factsheet did not finish (RuntimeError)",
+                                               "reports: not validated"])
+
+    def test_a_month_end_run_that_ended_before_risk_must_recalculate(self):
+        run = _run("2026-10-19T08:50:00+00:00", "2026-10-19T08:52:00+00:00")
+        decision = readiness.decide("assurance", _with_runs(healthy(), reports=run), now=self.at)
+        self.assertEqual(decision["reasons"], ["reports: risk changed; recalculate"])
+
+
 class LineageSettingsTests(unittest.TestCase):
     BICEP = {SECTOR_JOB: "infra/staging-sector-classification-job.bicep",
-             RISK_JOB: "infra/staging-risk-snapshot-job.bicep"}
+             RISK_JOB: "infra/staging-risk-snapshot-job.bicep",
+             REPORTS_JOB: "infra/staging-month-end-factsheet-job.bicep"}
 
     def test_each_time_limit_is_the_jobs_replica_timeout(self):
         for stage, jobs in readiness.LINEAGE_JOBS.items():
@@ -339,7 +420,6 @@ class LineageSettingsTests(unittest.TestCase):
         for jobs in readiness.LINEAGE_JOBS.values():
             for _, job, _ in jobs:
                 self.assertIn(job, recorded)
-                self.assertIn(job, lineage.JOB_INPUTS)
 
 
 class FakeSession:
@@ -585,6 +665,44 @@ class WaitTests(unittest.TestCase):
         self.assertEqual((self.sleeps, checks, len(records)), ([], 1, 1))
         self.assertEqual((result["decision"], result["ready"]), ("continue", False))
         self.assertNotIn("attempts", result)
+
+    def test_an_open_run_only_delays_then_the_tables_decide(self):
+        running = _with_runs(healthy(), risk=_run("2026-10-19T08:55:00+00:00"))
+        lines = []
+        environ = {**CheckTests.environ, readiness.MODE_ENV: "enforce", readiness.WAIT_ENV: "120",
+                   readiness.RECHECK_ENV: "60"}
+        with patch.object(readiness, "observe", return_value=(running, {"rows": 0})) as observed:
+            result = readiness.gate("month-end-factsheet", environ=environ, now=NOW, out=lines.append,
+                                    sleep=self.sleeps.append, connect=lambda url, tenant: FakeSession())
+        records = [json.loads(line.removeprefix(readiness.LOG_PREFIX)) for line in lines]
+        self.assertEqual(self.sleeps, [60.0, 60.0])
+        self.assertEqual(observed.call_count, 4)  # the first check, two rechecks, one without the open run
+        self.assertEqual([record["decision"] for record in records], ["wait", "continue"])
+        self.assertEqual((result["ready"], result["reasons"], result["attempts"]), (True, [], 4))
+        self.assertIn("still running after the wait", " ".join(result["notes"]))
+        self.assertIn("risk: ibkrv2stg-risk-snapshots is still running (started 2026-10-19T08:55:00+00:00)",
+                      result["first_reasons"])
+
+    def test_without_a_wait_an_open_run_does_not_stop_either(self):
+        running = _with_runs(healthy(), sectors=_run("2026-10-19T08:45:00+00:00"))
+        result, records, checks = self._gate("enforce", [running])
+        self.assertEqual((result["decision"], result["ready"], checks, self.sleeps), ("continue", True, 2, []))
+        self.assertEqual(len(records), 1)
+
+    def test_an_open_run_with_other_reasons_still_stops(self):
+        late = _with_runs(self.late, sectors=_run("2026-10-19T08:45:00+00:00"))
+        result, records, checks = self._gate("enforce", [late])
+        self.assertEqual((result.code, checks), (readiness.EXIT_NOT_READY, 2))
+        self.assertEqual(records[-1]["reasons"], ["reconciliation: missing completion evidence"])
+
+    def test_shadow_logs_the_open_run_as_not_ready_and_checks_once(self):
+        running = _with_runs(healthy(), risk=_run("2026-10-19T08:55:00+00:00"))
+        lines = []
+        with patch.object(readiness, "observe", return_value=(running, {"rows": 0})) as observed:
+            result = readiness.gate("month-end-factsheet", environ={**CheckTests.environ, readiness.MODE_ENV: "shadow"},
+                                    now=NOW, out=lines.append, sleep=self.sleeps.append,
+                                    connect=lambda url, tenant: FakeSession())
+        self.assertEqual((observed.call_count, len(lines), result["ready"], self.sleeps), (1, 1, False, []))
 
     def test_off_never_waits(self):
         def fail(*args, **kwargs):

@@ -5,9 +5,10 @@ one). Skipped otherwise. Creates and drops its own databases and roles and write
 synthetic rows only. Shows the evidence queries judge a cycle that ran as ready and a
 late pull as not ready, that shadow and enforce act on that, and that with the mode
 unset the gate opens no connection and logs nothing. Also that a subject still in
-onboarding does not hold up risk, that an open lineage run of risk or sectors does,
-that enforce waits and checks again, and that without migration 071 (no lineage_events)
-the check falls back to the evidence it used before.
+onboarding does not hold up risk, that an open lineage run of risk or sectors only
+delays, that sectors never stop anything, that reports follow month-end's run, that
+enforce waits and checks again, and that without migration 071 (no lineage_events) the
+check falls back to the evidence it used before.
 """
 from __future__ import annotations
 
@@ -35,6 +36,7 @@ EVIDENCE_TABLES = ("risk_analytics_snapshots", "subject_calculation_runs", "inst
 READER_TABLES = (*EVIDENCE_TABLES, "platform_subjects")
 LINEAGE_MIGRATION = "071_lineage_records.sql"
 RISK_JOB, SECTOR_JOB = "ibkrv2stg-risk-snapshots", "ibkrv2stg-sector-classification"
+REPORTS_JOB = "ibkrv2stg-month-end-factsheet"
 
 
 def _dsn(database: str, user: str | None = None) -> str:
@@ -210,7 +212,8 @@ class InputReadinessDatabaseTests(_ReadinessDatabase):
         results = {}
         for job, clock in (("benchmark-daily", "08:30"), ("sector-classification", "08:45"),
                            ("derived-daily", "08:50"), ("risk-snapshots", "08:55"),
-                           ("month-end-factsheet", "09:00"), ("crisis-scenarios-daily", "09:20")):
+                           ("month-end-factsheet", "09:00"), ("analyst-assurance", "09:10"),
+                           ("crisis-scenarios-daily", "09:20")):
             with self.subTest(job=job):
                 result, records = self._gate(job, clock, "enforce")
                 self.assertEqual((result["ready"], result["reasons"], result["decision"]), (True, [], "continue"))
@@ -394,17 +397,41 @@ class InputReadinessDatabaseTests(_ReadinessDatabase):
         self.assertIn("benchmarks_fx: ibkrv2stg-sector-classification is still running "
                       "(started 2026-10-19T08:45:00+00:00)", result["reasons"])
         self.assertFalse(result["ready"])
+        # Still open when the wait is over: derived carries on and a note says so.
+        result, records = self._gate("derived-daily", "08:50", "enforce", sleep=lambda seconds: None,
+                                     INPUT_READINESS_WAIT_SECONDS="60", INPUT_READINESS_RECHECK_SECONDS="30")
+        self.assertEqual(([r["decision"] for r in records], result["ready"], result["attempts"]),
+                         (["wait", "continue"], True, 4))
+        self.assertIn("benchmarks_fx: ibkrv2stg-sector-classification still running after the wait (started "
+                      "2026-10-19T08:45:00+00:00); sectors not checked", result["notes"])
         self._seed(_lineage, SECTOR_JOB, "FAIL", _at(DAY, "08:48"), run_id=run, facets={"exit_code": 2})
         result, _ = self._gate("derived-daily", "08:50", "enforce")
         self.assertEqual((result["ready"], result["evidence"]["benchmarks_fx"]["sectors"]["state"]), (True, "finished"))
 
-    def test_derived_that_finished_before_sectors_ended_must_recalculate(self):
+    def test_a_sector_run_that_crashed_never_stops_anything(self):
+        self._seed(_cycle, DAY)
+        run = str(uuid.uuid4())
+        self._seed(_lineage, SECTOR_JOB, "START", _at(DAY, "08:45"), run_id=run)
+        self._seed(_lineage, SECTOR_JOB, "FAIL", _at(DAY, "08:47"), run_id=run,
+                   facets={"error": {"type": "RuntimeError"}})
+        for job, clock in (("derived-daily", "08:50"), ("risk-snapshots", "08:55"),
+                           ("month-end-factsheet", "09:00"), ("crisis-scenarios-daily", "09:20")):
+            with self.subTest(job=job):
+                result, records = self._gate(job, clock, "enforce")
+                self.assertEqual((result["ready"], result["reasons"], records[-1]["decision"]),
+                                 (True, [], "continue"))
+                self.assertIn("benchmarks_fx: ibkrv2stg-sector-classification did not finish (RuntimeError); "
+                              "sectors not checked", result["notes"])
+
+    def test_derived_that_finished_before_sectors_ended_carries_on_with_a_note(self):
         self._seed(_cycle, DAY)  # derived completed at 08:52
         run = str(uuid.uuid4())
         self._seed(_lineage, SECTOR_JOB, "START", _at(DAY, "08:45"), run_id=run)
         self._seed(_lineage, SECTOR_JOB, "COMPLETE", _at(DAY, "08:53"), run_id=run)
-        result, _ = self._gate("risk-snapshots", "08:55", "shadow")
-        self.assertEqual(result["reasons"], ["derived: benchmarks_fx changed; recalculate"])
+        result, _ = self._gate("risk-snapshots", "08:55", "enforce")
+        self.assertEqual((result["ready"], result["reasons"]), (True, []))
+        self.assertIn("derived: finished before ibkrv2stg-sector-classification ended; it used the earlier "
+                      "sector classifications", result["notes"])
 
     def test_lineage_the_login_cannot_read_falls_back_with_a_note(self):
         self._seed(_cycle, DAY)
@@ -433,15 +460,68 @@ class InputReadinessDatabaseTests(_ReadinessDatabase):
         self.assertEqual([record["decision"] for record in records], ["wait", "continue"])
         self.assertEqual((result["ready"], result["attempts"], result["waited_seconds"]), (True, 3, 120.0))
 
-    def test_enforce_stops_when_risk_is_still_running_after_the_wait(self):
-        self._seed(_cycle, DAY)
+    def test_a_risk_run_still_open_after_the_wait_only_delays_when_the_tables_are_done(self):
+        self._seed(_cycle, DAY)  # snapshots for today, but the run never recorded its end
         self._seed(_lineage, RISK_JOB, "START", _at(DAY, "08:55"), run_id=str(uuid.uuid4()))
         pauses = []
-        with self.assertRaises(SystemExit) as stopped:
-            self._gate("month-end-factsheet", "09:00", "enforce", sleep=pauses.append,
-                       INPUT_READINESS_WAIT_SECONDS="120", INPUT_READINESS_RECHECK_SECONDS="60")
-        self.assertEqual(stopped.exception.code, readiness.EXIT_NOT_READY)
+        result, records = self._gate("month-end-factsheet", "09:00", "enforce", sleep=pauses.append,
+                                     INPUT_READINESS_WAIT_SECONDS="120", INPUT_READINESS_RECHECK_SECONDS="60")
         self.assertEqual(pauses, [60.0, 60.0])
+        self.assertEqual([record["decision"] for record in records], ["wait", "continue"])
+        self.assertEqual((result["ready"], result["reasons"], result["attempts"]), (True, [], 4))
+        self.assertIn("risk: ibkrv2stg-risk-snapshots still running after the wait (started "
+                      "2026-10-19T08:55:00+00:00); judged by public.risk_analytics_snapshots alone", result["notes"])
+        self.assertEqual(result["first_reasons"], [
+            "risk: ibkrv2stg-risk-snapshots is still running (started 2026-10-19T08:55:00+00:00)",
+            "risk: missing completion evidence"])
+
+    def test_enforce_stops_when_risk_is_still_running_and_its_tables_are_not_done(self):
+        self._seed(_cycle, DAY)
+        self._seed(lambda c: c.execute("DELETE FROM risk_analytics_snapshots WHERE analytics_version = %s",
+                                       ("v-" + DAY,)))
+        self._seed(_lineage, RISK_JOB, "START", _at(DAY, "08:55"), run_id=str(uuid.uuid4()))
+        pauses, lines = [], []
+        environ = self._environ("enforce", INPUT_READINESS_WAIT_SECONDS="120", INPUT_READINESS_RECHECK_SECONDS="60")
+        with self.assertRaises(SystemExit) as stopped:
+            readiness.gate("month-end-factsheet", environ=environ, now=_at(DAY, "09:00"), out=lines.append,
+                           sleep=pauses.append)
+        self.assertEqual((stopped.exception.code, pauses), (readiness.EXIT_NOT_READY, [60.0, 60.0]))
+        final = json.loads(lines[-1].removeprefix(readiness.LOG_PREFIX))
+        # Yesterday's snapshots: stale, and older than the steps they read.
+        self.assertEqual((final["decision"], final["reasons"]), ("stop", [
+            "risk: benchmarks_fx changed; recalculate", "risk: derived changed; recalculate", "risk: stale data"]))
+        self.assertIn("risk: ibkrv2stg-risk-snapshots still running after the wait (started "
+                      "2026-10-19T08:55:00+00:00); judged by public.risk_analytics_snapshots alone", final["notes"])
+
+    # Reports, judged by month-end-factsheet's run -------------------------------------
+
+    def test_assurance_follows_the_month_end_run(self):
+        self._seed(_cycle, DAY)
+        result, _ = self._gate("analyst-assurance", "09:10", "enforce")
+        self.assertEqual((result["ready"], result["evidence"]["reports"]["state"]), (True, "not_checked"))
+        self.assertIn("reports: ibkrv2stg-month-end-factsheet no run recorded; reports not checked",
+                      result["notes"])
+        run = str(uuid.uuid4())
+        self._seed(_lineage, REPORTS_JOB, "START", _at(DAY, "09:00"), run_id=run)
+        result, _ = self._gate("analyst-assurance", "09:10", "shadow")
+        self.assertIn("reports: ibkrv2stg-month-end-factsheet is still running (started 2026-10-19T09:00:00+00:00)",
+                      result["reasons"])
+        # A partial failure (exit 1) ran to its end: finished.
+        self._seed(_lineage, REPORTS_JOB, "FAIL", _at(DAY, "09:05"), run_id=run, facets={"exit_code": 1})
+        result, _ = self._gate("analyst-assurance", "09:10", "enforce")
+        self.assertEqual((result["ready"], result["reasons"]), (True, []))
+        self.assertEqual((result["evidence"]["reports"]["completed_at"], result["evidence"]["reports"]["run"]["state"]),
+                         ("2026-10-19T09:05:00+00:00", "finished"))
+        crashed = str(uuid.uuid4())
+        self._seed(_lineage, REPORTS_JOB, "START", _at(DAY, "09:06"), run_id=crashed)
+        self._seed(_lineage, REPORTS_JOB, "FAIL", _at(DAY, "09:07"), run_id=crashed,
+                   facets={"error": {"type": "SystemExit"}})
+        with self.assertRaises(SystemExit) as stopped:
+            self._gate("analyst-assurance", "09:10", "enforce")
+        self.assertEqual(stopped.exception.code, readiness.EXIT_NOT_READY)
+        result, _ = self._gate("analyst-assurance", "09:10", "shadow")
+        self.assertEqual(result["reasons"], ["reports: ibkrv2stg-month-end-factsheet did not finish (SystemExit)",
+                                             "reports: not validated"])
 
     def test_shadow_and_off_never_wait(self):
         self._seed(_cycle, DAY)
@@ -461,10 +541,13 @@ class WithoutLineageMigrationTests(_ReadinessDatabase):
 
     def test_the_cycle_is_ready_as_before_and_the_notes_say_lineage_is_missing(self):
         self._seed(_cycle, DAY)
-        for job, clock in (("derived-daily", "08:50"), ("month-end-factsheet", "09:00")):
+        for job, clock in (("derived-daily", "08:50"), ("month-end-factsheet", "09:00"),
+                           ("analyst-assurance", "09:10")):
             with self.subTest(job=job):
                 result, records = self._gate(job, clock, "enforce")
                 self.assertEqual((result["ready"], result["reasons"], records[-1]["decision"]), (True, [], "continue"))
+        self.assertIn("reports: ibkrv2stg-month-end-factsheet lineage unavailable (lineage_events not present or "
+                      "not readable); reports not checked", result["notes"])
         self.assertIn("risk: ibkrv2stg-risk-snapshots lineage unavailable (lineage_events not present or not "
                       "readable); judged by public.risk_analytics_snapshots alone", result["notes"])
         self.assertIn("benchmarks_fx: ibkrv2stg-sector-classification lineage unavailable (lineage_events not "

@@ -12,7 +12,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from ibkr_etl import input_readiness  # noqa: E402
+from ibkr_etl import input_readiness, lineage  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.onboarding_agents import agents_enabled, run_reviews  # noqa: E402
 from ibkr_etl.onboarding_month_end import live_cases  # noqa: E402
@@ -139,4 +139,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-month-end-factsheet", main))

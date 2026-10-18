@@ -99,8 +99,11 @@ The **full report** (private):
 
 ## What it compares, and what it shows
 
-- Every silver and gold table in the catalog. Views are not compared: they read the
-  tables. Columns that every rebuild rewrites are skipped: `generated_at`, `fetched_at`,
+- Every silver and gold table in the catalog, and the certified figures view
+  `gold.v_certified_figures`, by the key readers look a figure up with (subject, figure, period,
+  item, benchmark, date): it picks which build's figure every page and agent sees, so a build
+  marked `rolled_back` shows there as changed figures. Other views are not compared: they read
+  the tables. Columns that every rebuild rewrites are skipped: `generated_at`, `fetched_at`,
   `checked_at`, `first_seen_at`, `last_seen_at`, `last_seen_run_id`, `duration_ms`,
   `timings_json`. Numbers equal within a relative 1e-9 count as unchanged (`--rel-tol`).
 - Numeric columns, the IBKR `*_text` columns (numbers kept as text) and the numbers inside
@@ -121,3 +124,47 @@ The **full report** (private):
   `REPEATABLE READ` transaction. A login that does not bypass row-level security reads the
   default tenant's rows (`--tenant` for another).
 - `--table <layer.name>` (repeatable) limits a snapshot or comparison to some tables.
+
+## Certified figures: the `figures` command
+
+Before a page moves to certified figures (docs/MEDALLION_CERTIFIED_FIGURES.md, "Each move, on
+its day"), the same restored copy is used once more. After the snapshot before, the build
+with `--backfill` and the snapshot after (steps 2 to 4 above, which show that only the
+certified tables changed):
+
+```
+export DATABASE_ADMIN_URL=<the copy's admin URL, never the live server's>
+python scripts/release_data_report.py figures --batch 1 \
+    --private-dir <a private folder outside the clone> --public-summary certified-figures-summary.md
+```
+
+`--batch 1` (Overview, Holdings, Cash), `--batch 2` (Performance) or `--batch 3` (Risk and
+Combined holdings); `--page <name>` (repeatable) for one page, `--subject` (repeatable) for one
+account or portfolio while fixing a difference.
+
+- **Today's figures** are the page's own API answers: the command calls the website's API
+  functions on the copy with `CERTIFIED_FIGURES_PAGES` cleared, as an owner who may see every
+  active account, so every page answers the old way. The account page's day change is the
+  one-day custom period the page asks for; the accounts list is checked at each account's
+  latest date.
+- **Certified figures** are the rows of `gold.v_certified_figures`, what readers see.
+- **Which dates:** for every active account and portfolio, its latest NAV date, the last NAV
+  date of every month, and a fixed sample of 12 other NAV dates (`--sample`), the same every run.
+- **Matching:** ratios and numbers within a relative 1e-9, money to the cent, dates and text
+  exactly. A value on one side and a dash on the other is a difference: either the page shows
+  a value the certified figures lack, or the build fills a figure the page used to leave
+  blank (often expected; write it down before the run).
+- **Not compared, and why**, is listed in both reports: Data freshness (the page works it out
+  in the browser from the day it is read), the rebased chart levels (a series), the crisis
+  scenarios (read from their own table), and Combined holdings (each account's Holdings
+  figures, compared under Holdings). A page answer that was an error is counted, not compared.
+- **The full report** (`certified-figures-report.md` and `.json`, readable by their owner only)
+  goes to `--private-dir`, which must be outside the clone. It has each difference with both
+  values; accounts appear as `u…#n` and other subjects as `s…#n`. Copy it to
+  `/mnt/project-files/release-reports/<PR number>/` for the approver.
+- **The public summary** has counts, figure ids and page names only (no values, dates,
+  subjects, holdings or benchmarks) and is the only part that goes on the PR.
+- It exits 0 when every compared figure matches, 1 when any differs, and 2 when it could not
+  run (a missing variable, an unknown batch or page, no `gold.v_certified_figures` on the copy).
+
+A page moves only when every difference is fixed or explained and approved.

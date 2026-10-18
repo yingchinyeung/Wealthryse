@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from . import calculator
+from . import calculator, certified_tools
 from .config import ModelSettings
 from .memory import MEMORY_SCHEMA
 from .prompts import ANALYST, ROUTER
@@ -89,6 +90,9 @@ TOOL_LABELS = {
     "search_metrics_guide": "Searching the Metrics guide",
     "get_guide_conformance": "Checking figures against the Metrics guide",
     "get_guide_drift": "Reading what changed in the code",
+    certified_tools.GET: "Reading certified figures",
+    certified_tools.TRACE: "Tracing where a figure came from",
+    certified_tools.LIST: "Listing certified figures",
     calculator.NAME: "Calculating",
 }
 OUT_OF_SCOPE = ("I can explain your holdings and performance, but I can't recommend trades, rebalancing "
@@ -99,6 +103,10 @@ MAX_QUESTION_CHARS = 2000
 
 
 LOGGER = logging.getLogger("wealthryse_agent.runtime")
+CERTIFIED_NOTE = ("\n\nCertified figures: get_certified_figures returns the stored, checked figures the website "
+                  "shows. Prefer it for any figure it serves, and cite each figure you quote by its ref right after "
+                  "the number, for example \"Your Sharpe ratio was 1.12 [F1]\". Hypothetical model results keep "
+                  "[T#] citations.")
 
 
 def _model_error(error: Exception) -> tuple[int | None, str | None, str | None]:
@@ -129,6 +137,8 @@ class Turn:
     usage: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
     # Fields a caller added to the answer schema (extra_fields), already through the figure check.
     extra: dict[str, Any] = field(default_factory=dict)
+    # Certified figures cited [F#] whose number did not match (warn-only until 8 Nov); refs only.
+    figure_warnings: list[str] = field(default_factory=list)
 
 
 def default_model_client(settings: ModelSettings):
@@ -215,12 +225,15 @@ class Agent:
                                    "parameters": calculator.SCHEMA, "strict": False})
         allowed_names = {t["name"] for t in function_tools}
         system = instructions or ANALYST.format(account_id=account_id, today=date.today().isoformat())
+        if certified_tools.GET in allowed_names and certified_tools.enabled():
+            system += CERTIFIED_NOTE
         conversation: list[dict[str, Any]] = [
             {"role": m["role"], "content": str(m["content"])[:4000]}
             for m in list(history)[-10:] if m.get("role") in ("user", "assistant")
         ]
         conversation.append({"role": "user", "content": question})
         results: dict[str, Any] = {}
+        figures: dict[str, dict[str, Any]] = {}  # F1, F2… across the turn
         retried = False
         schema = ANSWER_SCHEMA
         if extra_fields:
@@ -247,7 +260,8 @@ class Agent:
                     if turn.tool_calls > self.settings.max_tool_calls:
                         raise AgentError("too_many_steps", "That needed too many lookups. Try a narrower question.")
                     yield {"type": "status", "text": TOOL_LABELS.get(call.name, "Looking up data")}
-                    output = self._call_tool(tools, call.name, call.arguments, allowed_names, results, account_id)
+                    output = self._call_tool(tools, call.name, call.arguments, allowed_names, results, account_id,
+                                             figures)
                     conversation.append({"type": "function_call_output", "call_id": call.call_id,
                                          "output": json.dumps(output)})
                 continue
@@ -266,12 +280,20 @@ class Agent:
             except (ValueError, KeyError, TypeError, AttributeError) as error:
                 raise AgentError("invalid_model_output", "The model did not return a usable answer.") from error
             checked = "\n".join([answer, *(x for values in extra.values() for x in values)])
-            check = validate_answer(checked, cited, results, question, visuals)
+            check = validate_answer(checked, cited, results, question, visuals, figures or None)
             if check.ok:
                 turn.answer, turn.visuals, turn.remember, turn.extra = answer, visuals, remember, extra
                 turn.citations = [{"id": c, "tool": results[c]["tool"], "account_id": results[c].get("account_id"),
                                    "as_of": results[c].get("as_of"), "sources": results[c].get("citations", [])}
                                   for c in dict.fromkeys(cited) if c in results]
+                if figures:
+                    turn.citations += figure_citations(checked, cited, figures, check.figure_checks)
+                    turn.figure_warnings = sorted(ref for ref, state in check.figure_checks.items() if state != "ok")
+                    if check.figure_warnings:
+                        # Warn-only until 8 Nov. Refs and figure ids only: never values or text.
+                        LOGGER.warning("CERTIFIED_FIGURE_CHECK %s", json.dumps({
+                            "warnings": len(check.figure_warnings), "refs": turn.figure_warnings,
+                            "figure_ids": sorted({figures[r]["figure_id"] for r in turn.figure_warnings if r in figures})}))
                 yield {"type": "answer", "answer": answer, "citations": turn.citations, "visuals": visuals,
                        "turn": turn}
                 return
@@ -287,7 +309,8 @@ class Agent:
 
     @staticmethod
     def _call_tool(tools: ToolClient, name: str, raw_arguments: str, allowed: set[str],
-                   results: dict[str, Any], account_id: str | None = None) -> dict[str, Any]:
+                   results: dict[str, Any], account_id: str | None = None,
+                   figures: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
         if name not in allowed:
             return {"error": {"code": "unknown_tool", "message": "That tool is not available here."}}
         try:
@@ -311,5 +334,44 @@ class Agent:
         except ToolCallFailed as error:
             return {"error": {"code": error.code, "message": error.message}}
         citation_id = f"T{len(results) + 1}"
+        if name == certified_tools.GET and figures is not None:
+            result = number_figures(result, figures, citation_id)
         results[citation_id] = result
         return {"citation_id": citation_id, **result}
+
+
+def number_figures(result: dict[str, Any], figures: dict[str, dict[str, Any]], citation_id: str) -> dict[str, Any]:
+    """Give each certified figure in a result the next F# of the turn, as tool calls get T#."""
+    numbered = []
+    for figure in result.get("figures") or []:
+        if not isinstance(figure, dict):
+            continue
+        ref = f"F{len(figures) + 1}"
+        figure = {**figure, "ref": ref}
+        figures[ref] = {**figure, "subject": result.get("account_id"), "tool_call": citation_id}
+        numbered.append(figure)
+    return {**result, "figures": numbered}
+
+
+def figure_citations(answer: str, cited: list[str], figures: Mapping[str, Mapping[str, Any]],
+                     checks: Mapping[str, str]) -> list[dict[str, Any]]:
+    """What the message keeps for each F# the answer cites: enough to fetch and trace that exact figure."""
+    refs = [c for c in cited if c in figures]
+    refs += [ref for ref in re.findall(r"\[(F\d+)\]", answer) if ref in figures]
+    entries = []
+    for ref in dict.fromkeys(refs):
+        figure = figures[ref]
+        lineage, definition = figure.get("lineage") or {}, figure.get("definition") or {}
+        entries.append({
+            "id": ref, "tool": certified_tools.GET, "account_id": figure.get("subject"),
+            "as_of": figure.get("as_of_date"), "certified": True, "check": checks.get(ref, "not_checked"),
+            "figure": {"figure_id": figure.get("figure_id"), "label": figure.get("label"),
+                       "subject": figure.get("subject"), "as_of_date": figure.get("as_of_date"),
+                       "period": figure.get("period_key"), "item": figure.get("item"),
+                       "benchmark_id": figure.get("benchmark_id"), "build_id": lineage.get("build_id"),
+                       "definition_id": definition.get("id"), "definition_version": definition.get("version"),
+                       "link": definition.get("link"), "value": figure.get("value"), "unit": figure.get("unit"),
+                       "display": figure.get("display")},
+            "sources": [{"source": "certified_figures", "tool_call": figure.get("tool_call")}],
+        })
+    return entries

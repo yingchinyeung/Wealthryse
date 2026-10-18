@@ -12,6 +12,7 @@ from typing import Any
 
 from ibkr_etl import metrics_guide as guide
 
+from . import certified_tools
 from .tool_client import ToolCallFailed
 
 # Inbox cards about the whole website (not one account) use this subject; only owners see them.
@@ -98,11 +99,19 @@ class GuideTools:
 
     def list_tools(self) -> list[dict[str, Any]]:
         listed = list(self.inner.list_tools()) if self.inner is not None else []
-        return [t for t in listed if t["name"] not in NAMES] + [dict(spec) for spec in SPECS]
+        extra = [certified_tools.LIST_SPEC] if certified_tools.enabled() else []
+        return ([t for t in listed if t["name"] not in NAMES and t["name"] != certified_tools.LIST]
+                + [dict(spec) for spec in (*SPECS, *extra)])
 
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name in NAMES:
             return call(name, arguments)
+        if name == certified_tools.LIST and certified_tools.enabled():
+            # The register only (no client data), so it needs no account.
+            try:
+                return certified_tools.list_certified_figures(arguments)
+            except ValueError as problem:
+                raise ToolCallFailed("invalid_arguments", str(problem)) from None
         if self.inner is None:
             raise ToolCallFailed("unknown_tool", "That tool is not available here.")
         return self.inner.call(name, arguments)

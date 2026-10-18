@@ -164,7 +164,9 @@ class GuideCheckWiringTest(unittest.TestCase):
         self.assertNotIn("NOT VALID", migration)
         earlier = (ROOT / "migrations/agent/015_export_agent.sql").read_text(encoding="utf-8")
         self.assertEqual(earlier.count("NOT VALID;"), 2)
-        self.assertEqual(sorted(p.name for p in (ROOT / "migrations/agent").glob("*.sql"))[-1], "016_guide_check.sql")
+        # 016 follows 015 (installed in name order); later files may follow it.
+        names = sorted(p.name for p in (ROOT / "migrations/agent").glob("*.sql"))
+        self.assertEqual(names.index("016_guide_check.sql"), names.index("015_export_agent.sql") + 1)
 
 
 

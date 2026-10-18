@@ -510,5 +510,62 @@ class BenchmarkHolidayTests(_BuildDatabase):
         self.assertEqual(source_key["observation_date"], days[-21])
 
 
+def _gate(states: dict[str, str]):
+    def check(job, *, since, environ, now):
+        state = states.get(job, "pass")
+        return {"verdict": state, "reasons": [f"{SUBJECT} {job}"] if state == "fail" else [],
+                "reasons_total": 1 if state == "fail" else 0}
+    return check
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class GateTests(_BuildDatabase):
+    """In order: a failed verdict holds a binding build, a passing one publishes, report mode only
+    stores, and the real gate runs read-only against this database."""
+
+    def _with(self, mode: str, **kwargs):
+        with patch.dict(os.environ, {build.GATE_ENV: mode}):
+            return self._run(**kwargs)
+
+    def test_1_binding_holds_the_build_when_a_source_job_fails(self):
+        code, lines = self._with("binding", gate_check=_gate({"derived-daily": "fail", "risk-snapshots": "warn"}))
+        self.assertEqual(code, 0)
+        _build_id, status, reason, checks = self._builds()[-1]
+        self.assertEqual(status, "held")
+        self.assertEqual(reason, "the publish gate failed for derived-daily")
+        self.assertEqual(checks["failed"], ["publish_gate"])
+        self.assertEqual((checks["publish_gate"]["verdict"], checks["publish_gate"]["mode"]), ("fail", "binding"))
+        self.assertEqual(self._published(), {})   # readers see nothing new
+        text = "\n".join(lines)
+        self.assertIn("Publish gate (binding, since 2026-10-19T00:00Z): fail; benchmark-daily pass (0 reasons), "
+                      "derived-daily fail (1 reasons), risk-snapshots warn (0 reasons)", text)
+        self.assertNotIn(SUBJECT, text)
+
+    def test_2_binding_publishes_when_nothing_fails(self):
+        code, _lines = self._with("binding", gate_check=_gate({"derived-daily": "warn", "benchmark-daily": "skipped"}))
+        self.assertEqual(code, 0)
+        _build_id, status, reason, checks = self._builds()[-1]
+        self.assertEqual((status, reason), ("published", None))
+        self.assertEqual((checks["passed"], checks["total"]), (5, 5))
+        self.assertEqual(checks["publish_gate"]["verdict"], "warn")
+        self.assertTrue(self._published())
+
+    def test_3_report_mode_only_records_the_verdict(self):
+        code, lines = self._with("report", dry_run=True, gate_check=_gate({"crisis-scenarios-daily": "fail"}))
+        self.assertEqual(code, 0)
+        text = "\n".join(lines)
+        self.assertIn("Publish gate (report", text)
+        self.assertIn("Dry run: nothing written. Nothing to publish.", text)
+
+    def test_4_the_real_gate_reads_this_database(self):
+        code, lines = self._with("binding", dry_run=True)
+        self.assertEqual(code, 0)
+        line = next(l for l in lines if l.startswith("Publish gate (binding"))
+        for job in build.GATE_JOBS:
+            self.assertIn(job, line)
+        self.assertNotIn("check failed", line)
+        self.assertEqual(len(self._builds()), 2)   # still the two builds above: the gate writes nothing
+
+
 if __name__ == "__main__":
     unittest.main()

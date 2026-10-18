@@ -13,6 +13,10 @@ param certifiedFiguresBuild string = 'off'
 // Lineage records each run and stamps the rows it writes (U4).
 @allowed(['false', 'true'])
 param lineageRecording string = 'true'
+// The publish gate's verdict on the source jobs: off, report (stored with each build) or binding
+// (a failed verdict also holds the build). docs/MEDALLION_CERTIFIED_FIGURES.md.
+@allowed(['off', 'report', 'binding'])
+param certifiedFiguresGate string = 'off'
 
 var tags = {
   application: 'ibkr-portfolio-platform'
@@ -90,6 +94,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'DEPLOYMENT_ENVIRONMENT', value: 'internal-production' }
             { name: 'CERTIFIED_FIGURES_BUILD', value: certifiedFiguresBuild }
             { name: 'LINEAGE_RECORDING', value: lineageRecording }
+            { name: 'CERTIFIED_FIGURES_GATE', value: certifiedFiguresGate }
             // The build calls the website's page code, so the settings that change what a page
             // shows must match the website's (crisis scenarios are shown there).
             { name: 'CRISIS_SCENARIOS_ENABLED', value: 'true' }

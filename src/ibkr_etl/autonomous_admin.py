@@ -399,6 +399,134 @@ def review_layer_freshness(
     )
 
 
+LAYER_QUALITY_CHECK = "layer_quality"
+LAYER_QUALITY_PREFIX = LAYER_QUALITY_CHECK + ":"
+_QUALITY_EVIDENCE = ("typical", "recent", "low", "high", "direction", "date", "day_kind", "differences",
+                     "contract_version", "rule", "column", "must_be", "band", "subjects_checked", "reason", "error")
+
+
+def _quality_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Counts, dates and masked subjects only; never a figure."""
+    detail = result.get("detail") or {}
+    evidence = {key: result.get(key) for key in ("check_id", "kind", "layer", "target", "state", "severity",
+                                                  "observed")}
+    evidence.update({key: detail[key] for key in _QUALITY_EVIDENCE if key in detail})
+    if detail.get("failed"):
+        evidence["subjects"] = sorted({str(item.get("subject")) for item in detail["failed"]})
+    return evidence
+
+
+def _quality_description(result: Mapping[str, Any]) -> str:
+    layer = str(result.get("layer", "")).capitalize()
+    detail = result.get("detail") or {}
+    kind, target, observed = result.get("kind"), result.get("target"), result.get("observed")
+    if kind == "volume":
+        if detail.get("direction"):
+            return (f"{layer} row count {detail['direction']}: {target} has {observed} rows for {detail.get('date')}, "
+                    f"typically {detail.get('typical')}")
+        return f"{layer} row count: {target} has {observed} rows ({detail.get('reason', 'failed')})"
+    if kind == "schema":
+        return f"{layer} schema drift: {target} differs from its data contract in {observed} way(s)"
+    if kind == "value":
+        return f"{layer} value check {result.get('check_id')} failed for {observed} subject(s)"
+    return f"{layer} quality check {result.get('check_id')} failed on {target} ({observed} rows)"
+
+
+def review_layer_quality(
+    outcome: Mapping[str, Any] | None,
+    *,
+    warn: bool,
+    open_incidents: Mapping[str, Mapping[str, Any]] | None = None,
+) -> LayerFreshnessReview:
+    """Turn one run's layer quality outcome (layer_quality.run_in_administrator; None: the check
+    itself failed) into findings. Report only: no autonomous action.
+
+    Shadow (warn False): every finding is info, recorded quietly and never announced. Warn: a
+    layer late for its target time, or a failed check of severity error, is a warning; the rest
+    stay info for the weekly report. Readiness is judged every run and its incident closes only
+    when the layer is ready; a daily check's incident closes only when that check passes.
+    """
+    open_incidents = open_incidents or {}
+    readiness = list((outcome or {}).get("readiness") or ())
+    daily = None if outcome is None else outcome.get("daily")
+    findings: list[Finding] = []
+    for item in readiness:
+        if item.get("state") != "late":
+            continue
+        waiting = sorted(check for check, value in (item.get("checks") or {}).items() if not value.get("ready"))
+        findings.append(Finding(
+            incident_key=f"{LAYER_QUALITY_PREFIX}{item['check_id']}",
+            check_id=LAYER_QUALITY_CHECK,
+            severity="warning" if warn else "info",
+            description=(f"{str(item.get('layer', '')).capitalize()} layer not ready by "
+                         f"{str(item.get('ready_by', ''))[11:16]} UTC: data for {item.get('business_day')} "
+                         f"has not arrived in {', '.join(waiting)}"),
+            evidence={key: item.get(key) for key in ("check_id", "layer", "business_day", "ready_by", "checks")},
+        ))
+    for result in daily or ():
+        if result.get("state") != "fail":
+            continue
+        findings.append(Finding(
+            incident_key=f"{LAYER_QUALITY_PREFIX}{result['check_id']}",
+            check_id=LAYER_QUALITY_CHECK,
+            severity="warning" if warn and result.get("severity") == "error" else "info",
+            description=_quality_description(result),
+            evidence=_quality_evidence(result),
+        ))
+
+    active = {finding.incident_key for finding in findings}
+    by_target = {f"{LAYER_QUALITY_PREFIX}{item['check_id']}": item for item in readiness}
+    ready_keys = {f"{LAYER_QUALITY_PREFIX}{target}" for target in _ready_target_ids()}
+    by_check = None if daily is None else {f"{LAYER_QUALITY_PREFIX}{r['check_id']}": r for r in daily}
+    session_failed = any((r.get("detail") or {}).get("error_scope") == "session" for r in daily or ())
+    hold = set()
+    for key in open_incidents:
+        if not key.startswith(LAYER_QUALITY_PREFIX) or key in active:
+            continue
+        if outcome is None:
+            hold.add(key)
+        elif key in ready_keys:
+            if (by_target.get(key) or {}).get("state") != "ready":
+                hold.add(key)  # closes only once the layer is ready
+        elif by_check is None:
+            hold.add(key)  # no daily pass this run
+        elif key in by_check:
+            if by_check[key].get("state") != "pass":
+                hold.add(key)
+        elif session_failed:
+            hold.add(key)
+    return LayerFreshnessReview(
+        findings=tuple(findings),
+        hold_open=frozenset(hold),
+        quiet=frozenset(f.incident_key for f in findings if f.severity == "info"),
+        escalated=frozenset(
+            f.incident_key for f in findings
+            if f.severity != "info" and (open_incidents.get(f.incident_key) or {}).get("severity") == "info"
+        ),
+    )
+
+
+def _ready_target_ids() -> tuple[str, ...]:
+    from .layer_quality import READY, TARGETS
+
+    return tuple(target.target_id for target in TARGETS if target.kind == READY)
+
+
+def combine_reviews(*reviews: LayerFreshnessReview | None) -> LayerFreshnessReview | None:
+    """One review from several (layer freshness, layer quality); None when all are off."""
+    present = [review for review in reviews if review is not None]
+    if not present:
+        return None
+    if len(present) == 1:
+        return present[0]
+    return LayerFreshnessReview(
+        findings=tuple(finding for review in present for finding in review.findings),
+        hold_open=frozenset().union(*(review.hold_open for review in present)),
+        quiet=frozenset().union(*(review.quiet for review in present)),
+        escalated=frozenset().union(*(review.escalated for review in present)),
+    )
+
+
 def plan_safe_repairs(
     findings: Sequence[Finding],
     control: AutonomyControl,

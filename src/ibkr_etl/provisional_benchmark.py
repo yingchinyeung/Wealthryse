@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from . import lineage, raw_capture
+from . import lineage, publish_gate, raw_capture
 from .benchmark_analytics import (
     BenchmarkContract,
     build_comparison,
@@ -783,6 +783,11 @@ def _refresh_and_materialize(
                 ),
             }
         )
+    # Off by default. Enforce rolls a failing version back and raises BuildHeldBack; without
+    # commit, the caller's savepoint undoes it instead.
+    publish_gate.before_commit(
+        connection, {publish_gate.COMPARISON: {"subject_id": account_id, "generated_at": fetched_at}},
+        writer="provisional_benchmark", rollback=commit)
     if commit:
         connection.commit()
     return {

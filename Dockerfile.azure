@@ -22,6 +22,10 @@ COPY src ./src
 COPY migrations ./migrations
 COPY scripts ./scripts
 COPY queries ./queries
+# Medallion data contracts and registers (infra/medallion), read by the layer quality checks
+# and the certified figures. The rest of infra/ stays out of the image.
+COPY infra/medallion ./medallion
+ENV MEDALLION_DIR=/app/medallion
 
 RUN python -m pip install --require-hashes -r requirements.lock && \
     python -m pip install --no-deps . && \

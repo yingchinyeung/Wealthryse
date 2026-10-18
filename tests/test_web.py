@@ -1580,5 +1580,38 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertEqual(raised.exception.detail["code"], "admin_actions_disabled")
 
 
+class DerivedRefreshStartTests(unittest.TestCase):
+    """Onboarding starts derived-daily with the readiness check in shadow, so it never waits or stops."""
+
+    def test_web_starts_derived_daily_with_readiness_in_shadow(self) -> None:
+        from ibkr_etl import input_readiness
+
+        self.assertEqual(web.WEB_DERIVED_REFRESH_ENV, {input_readiness.MODE_ENV: "shadow"})
+        with patch.object(web, "start_job_with_env", return_value="execution-1") as start:
+            self.assertEqual(web._start_derived_refresh(), "execution-1")
+        start.assert_called_once_with(web.ADMIN_ACTION_CONFIG, web.DERIVED_REFRESH_JOB_NAME,
+                                      {"INPUT_READINESS_MODE": "shadow"}, needed=web._readiness_could_hold)
+
+    def test_only_a_job_set_to_enforce_needs_the_override(self) -> None:
+        # Unset, off, shadow or not understood (runs as shadow): the job starts as configured.
+        for own in ({}, {"INPUT_READINESS_MODE": "off"}, {"INPUT_READINESS_MODE": "shadow"},
+                    {"INPUT_READINESS_MODE": "bogus"}, {"OTHER": "enforce"}):
+            self.assertFalse(web._readiness_could_hold(own), own)
+        # Enforce, or a value held in a secret that the web cannot see.
+        for own in ({"INPUT_READINESS_MODE": "enforce"}, {"INPUT_READINESS_MODE": " ENFORCE "},
+                    {"INPUT_READINESS_MODE": None}):
+            self.assertTrue(web._readiness_could_hold(own), own)
+
+    def test_every_onboarding_start_of_derived_daily_uses_it(self) -> None:
+        import inspect
+
+        for endpoint in (web.queue_onboarding_calculation, web.queue_onboarding_analytics):
+            source = inspect.getsource(endpoint)
+            self.assertIn("_start_derived_refresh()", source)
+            self.assertNotIn("_default_job_starter(ADMIN_ACTION_CONFIG, DERIVED_REFRESH_JOB_NAME", source)
+        self.assertNotIn("_default_job_starter(ADMIN_ACTION_CONFIG, DERIVED_REFRESH_JOB_NAME",
+                         inspect.getsource(web))
+
+
 if __name__ == "__main__":
     unittest.main()

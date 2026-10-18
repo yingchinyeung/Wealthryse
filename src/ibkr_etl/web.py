@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Literal, Mapping
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
@@ -55,6 +55,7 @@ from .admin_actions import (
     claim_action_for_execution,
     create_action_preview,
     execute_claimed_action,
+    start_job_with_env,
     _default_job_starter,
 )
 from .admin_chat import (
@@ -90,7 +91,7 @@ from .performance_periods import (
     flow_statement,
     performance_periods as calculate_performance_periods,
 )
-from . import report_design_updates
+from . import input_readiness, report_design_updates
 from .report_design_ui import controls as report_design_controls, SCRIPT as REPORT_DESIGN_SCRIPT
 from .internal_release import InternalReleaseError
 from .risk_snapshots import RISK_ANALYTICS_VERSION, decoded_payload, snapshot_read_status
@@ -231,6 +232,9 @@ CREDENTIAL_BROKER_AUTH = os.environ.get("CREDENTIAL_BROKER_AUTH", "").strip()
 DERIVED_REFRESH_JOB_NAME = os.environ.get(
     "DERIVED_REFRESH_JOB_NAME", "ibkrv2stg-derived-daily"
 ).strip()
+# Onboarding starts derived-daily outside the daily chain. When the job is set to enforce
+# input readiness, those executions run it in shadow, so it never waits or stops them.
+WEB_DERIVED_REFRESH_ENV = {"INPUT_READINESS_MODE": "shadow"}
 ONBOARDING_REPORT_JOB_NAME = os.environ.get(
     "ONBOARDING_REPORT_JOB_NAME", "ibkrv2stg-onboard-render"
 ).strip()
@@ -9445,6 +9449,19 @@ def _onboarding_activation_scope(payload: dict) -> dict:
     }
 
 
+def _readiness_could_hold(own_env: Mapping[str, str | None]) -> bool:
+    """Whether the job's own INPUT_READINESS_MODE could make the check wait or stop it."""
+    if input_readiness.MODE_ENV not in own_env:
+        return False
+    value = own_env[input_readiness.MODE_ENV]
+    return value is None or input_readiness.mode({input_readiness.MODE_ENV: value})[0] == input_readiness.ENFORCE
+
+
+def _start_derived_refresh() -> str:
+    return start_job_with_env(ADMIN_ACTION_CONFIG, DERIVED_REFRESH_JOB_NAME, WEB_DERIVED_REFRESH_ENV,
+                              needed=_readiness_could_hold)
+
+
 @app.post("/api/onboarding/{subject_id}/calculations/queue")
 def queue_onboarding_calculation(
     subject_id: str,
@@ -9548,9 +9565,7 @@ def queue_onboarding_calculation(
             ),
         )
     try:
-        reference = _default_job_starter(
-            ADMIN_ACTION_CONFIG, DERIVED_REFRESH_JOB_NAME
-        )
+        reference = _start_derived_refresh()
     except AdminActionError as error:
         with _approval_database() as connection:
             connection.execute(
@@ -9716,8 +9731,10 @@ def queue_onboarding_analytics(
             ),
         )
     try:
-        reference = _default_job_starter(
-            ADMIN_ACTION_CONFIG, job_name
+        reference = (
+            _start_derived_refresh()
+            if job_name == DERIVED_REFRESH_JOB_NAME
+            else _default_job_starter(ADMIN_ACTION_CONFIG, job_name)
         )
     except AdminActionError as error:
         with _approval_database() as connection:

@@ -41,6 +41,13 @@ var layerFreshnessBlobEnv = !layerFreshnessBlobChecks ? [] : concat([
 var layerFreshnessEnv = !layerFreshnessEnabled ? [] : concat([
   { name: 'LAYER_FRESHNESS_ENABLED', value: 'true' }
 ], layerFreshnessBlobEnv)
+// Medallion layer quality (src/ibkr_etl/layer_quality.py): off by default. shadow measures and
+// records quietly; warn also raises late layers and failed error checks as warnings.
+@allowed(['off', 'shadow', 'warn'])
+param layerQualityMode string = 'off'
+var layerQualityEnv = layerQualityMode == 'off' ? [] : [
+  { name: 'LAYER_QUALITY_MODE', value: layerQualityMode }
+]
 
 var tags = {
   application: 'wealthryse-portfolio-data-platform'
@@ -210,7 +217,7 @@ resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
           image: '${registry.properties.loginServer}/ibkr-portfolio@${imageDigest}'
           command: ['python']
           args: ['scripts/run_autonomous_administrator.py']
-          env: concat([
+          env: concat(concat([
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'PORTAL_URL', value: portalUrl }
             { name: 'ENTRA_TENANT_ID', value: entraTenantId }
@@ -228,7 +235,7 @@ resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'AZURE_AI_PROCESSING_SCOPE', value: aiProcessingScope }
             { name: 'AI_ADMIN_ENABLED', value: 'true' }
             { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
-          ], layerFreshnessEnv)
+          ], layerFreshnessEnv), layerQualityEnv)
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'

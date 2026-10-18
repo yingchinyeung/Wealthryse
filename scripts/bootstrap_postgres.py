@@ -15,6 +15,7 @@ if str(SOURCE_ROOT) not in sys.path:
 from ibkr_etl.config import load_settings  # noqa: E402
 from ibkr_etl.db import connect, initialize, transaction  # noqa: E402
 from ibkr_etl.evidence_acl import quarantine_evidence_objects  # noqa: E402
+from ibkr_etl.layer_quality import COUNT_COLUMNS, HISTORY_TABLE  # noqa: E402
 from ibkr_etl.medallion_layers import (  # noqa: E402
     mirror_privileges,
     mismatches,
@@ -410,6 +411,16 @@ def main(argv: list[str] | None = None) -> int:
                 connection.execute(sql.SQL("GRANT SELECT ({}) ON TABLE {} TO {}").format(
                     sql.SQL(", ").join(sql.Identifier(column) for column in columns),
                     sql.Identifier(table), sql.Identifier(approval_role)))
+            # Its layer quality check (medallion review item 7) counts rows per business date,
+            # reading one column of each silver and gold table, and appends its results to
+            # quality_check_results once migration 072 has created it.
+            for table, column in sorted(COUNT_COLUMNS.items()):
+                if connection.execute("SELECT to_regclass(%s)", (table,)).fetchone()[0]:
+                    connection.execute(sql.SQL("GRANT SELECT ({}) ON TABLE {} TO {}").format(
+                        sql.Identifier(column), sql.Identifier(table), sql.Identifier(approval_role)))
+            if connection.execute("SELECT to_regclass(%s)", (HISTORY_TABLE,)).fetchone()[0]:
+                connection.execute(sql.SQL("GRANT SELECT, INSERT ON TABLE {} TO {}").format(
+                    sql.Identifier(HISTORY_TABLE), sql.Identifier(approval_role)))
             design_privileges = connection.execute(
                 """SELECT has_table_privilege(%s, 'public.report_design_update_requests', 'INSERT')
                     AND has_table_privilege(%s, 'public.qualified_report_designs', 'SELECT')

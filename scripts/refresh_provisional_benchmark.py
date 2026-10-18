@@ -18,7 +18,7 @@ from ibkr_etl.db import (  # noqa: E402
     finish_run_success,
     start_run,
 )
-from ibkr_etl import input_readiness  # noqa: E402
+from ibkr_etl import input_readiness, publish_gate  # noqa: E402
 from ibkr_etl.provisional_benchmark import refresh_and_materialize  # noqa: E402
 from ibkr_etl.crisis_replay import (  # noqa: E402
     refresh_composite_crisis_replay,
@@ -242,14 +242,22 @@ def main() -> int:
     lineage.current().facet(job_run_id=run_id)
     try:
         accounts: list[dict] = []
+        held_back: list[dict] = []
         for account_id in account_ids:
             subject = connection.execute(
                 "SELECT subject_type FROM platform_subjects WHERE subject_id = ?",
                 (account_id,),
             ).fetchone()
-            result = refresh_and_materialize(
-                connection, account_id=account_id, start_date=start
-            )
+            try:
+                result = refresh_and_materialize(
+                    connection, account_id=account_id, start_date=start
+                )
+            except publish_gate.BuildHeldBack as error:
+                # The publish gate (enforce) kept this subject's last good comparison;
+                # the other subjects carry on.
+                connection.rollback()
+                held_back.append({"account_id": account_id, "reason": str(error)[:1000]})
+                continue
             _mark_wave0_benchmark_fx_reconciled(connection, result)
             # Crisis-period holdings and symbols may leave Azure only after the
             # owner has approved the exact disclosure in the onboarding wizard.
@@ -278,6 +286,8 @@ def main() -> int:
             ),
             "crisis_scenarios": scenarios,
         }
+        if held_back:
+            result["held_back_by_publish_gate"] = held_back
         payload = canonical_json(result)
         finish_run_success(
             connection,
@@ -291,7 +301,9 @@ def main() -> int:
         )
         _record_outputs(result)
         print(payload)
-        return 0
+        # The run record stays a success, so the next jobs' readiness is not stopped for
+        # every subject; the exit code shows the hold.
+        return publish_gate.EXIT_REJECTED if held_back else 0
     except Exception as error:
         finish_run_failure(connection, run_id, str(error))
         raise

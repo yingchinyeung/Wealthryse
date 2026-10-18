@@ -1,7 +1,12 @@
 """Move the v1.1-fed accounts onto v2's own daily Flex pull, and back.
 
-Today account-sync imports v1.1's export for every subject whose current
-daily_ingestion registration says source "existing_v11". The cutover:
+v1.1 was deleted on 21 Oct 2026 and account-sync retired with it, so nothing
+imports v1.1's export any more: a revert would leave the accounts with no
+daily feed. Fix forward instead. The notes below describe the switch.
+
+Before the switch, account-sync imported v1.1's export for every subject
+whose current daily_ingestion registration said source "existing_v11". The
+cutover:
 
 - records v1.1's Flex token (a Key Vault reference only, never the value) and
   query as an active, scheduled v2 Flex source;

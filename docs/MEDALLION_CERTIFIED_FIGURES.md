@@ -896,6 +896,12 @@ same inputs, which would hold the build.
    would change; they do not change any report in `fallback`, and each difference in a written
    field is explained before `on` is considered. "Today's payload equals the stored frozen
    snapshot" shows whether today's code still makes September's frozen snapshot from the copy.
+   Subjects that went live through the new onboarding freeze their month-end through that path
+   (`onboarding_month_end`), so their reports are made as well, with that path's own arguments
+   (a composite's report profile inception and currency; otherwise the case's history start and
+   currency), when the path would freeze the month: not already frozen, its data in, and its
+   report profile or approved design accepted. They count in the same "N of N" line and the exit
+   code; the "Live new-onboarding subjects" line counts them and the ones the path would not make.
 
 ### Switch-on and undo
 

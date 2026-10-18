@@ -9,7 +9,8 @@ certified build. Synthetic data only.
 It checks that the Attribution figures are the page's own, that a month-end report made with
 MONTHLY_REPORTS_CERTIFIED=fallback is byte for byte today's (the same snapshot id), that a failed
 certified read leaves the report and its transaction alone, and that the rehearsal tool
-(scripts/compare_monthly_report_figures.py) writes nothing and prints counts only.
+(scripts/compare_monthly_report_figures.py) writes nothing and prints counts only, and makes a
+subject that went live through the new onboarding with that path's own arguments.
 """
 from __future__ import annotations
 
@@ -87,6 +88,52 @@ def _second_benchmark(database: str) -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def _live_onboarding_case(database: str, *, history_start: str) -> None:
+    """SUBJECT as a broker account that went live through the new onboarding, in the factsheet
+    design approved with its historical reports, from a later history start than its registration."""
+    import uuid
+
+    from ibkr_etl.composite_reports import CHECK_ID
+    from ibkr_etl.designed_reports import engine
+
+    template = b"%PDF synthetic owner template"
+    template_sha256 = sha256_text(template.decode())
+    spec = {"design_id": "synthetic-design", "title": "Synthetic design", "currencies": ["USD"]}
+    spec_sha256 = engine.spec_sha256(spec)
+    connection_id, case_id, draft_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    with layers._connect(database) as owner:
+        owner.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+        owner.execute("INSERT INTO broker_connections (connection_id, tenant_id, broker, environment, display_name, "
+                      "key_vault_secret_name, credential_fingerprint, credential_expires_on, status) VALUES "
+                      "(%s, %s, 'ibkr_flex', 'live', 'Synthetic connection', %s, %s, '2027-06-30', 'healthy')",
+                      (connection_id, TENANT, "ibkr-flex-source-" + "0" * 32, "0" * 16))
+        owner.execute("INSERT INTO broker_connection_accounts (tenant_id, connection_id, broker_account_id, "
+                      "discovery_status) VALUES (%s, %s, %s, 'live')", (TENANT, connection_id, SUBJECT))
+        owner.execute("INSERT INTO broker_onboarding_cases (case_id, tenant_id, source_kind, connection_id, broker, "
+                      "broker_account_id, target_subject_id, display_name, reporting_currency, history_start_date, "
+                      "subject_id, stage, status, went_live_at) VALUES (%s, %s, 'broker_account', %s, 'ibkr_flex', "
+                      "%s, %s, 'Synthetic account', 'USD', %s, %s, 'first_month_end', 'live', '2026-07-01')",
+                      (case_id, TENANT, connection_id, SUBJECT, SUBJECT, history_start, SUBJECT))
+        owner.execute("INSERT INTO factsheet_design_files (tenant_id, sha256, content_type, byte_count, content, "
+                      "created_at) VALUES (%s, %s, 'application/pdf', %s, %s, '2026-06-20')",
+                      (TENANT, template_sha256, len(template), template))
+        owner.execute("INSERT INTO factsheet_design_drafts (draft_id, tenant_id, subject_id, title, template_sha256, "
+                      "more_examples_json, status, current_version, build_json, created_by, created_at, updated_at) "
+                      "VALUES (%s, %s, %s, 'Synthetic design', %s, '[]', 'submitted', 1, '{}', 'test', "
+                      "'2026-06-20', '2026-06-20')", (draft_id, TENANT, SUBJECT, template_sha256))
+        owner.execute("INSERT INTO factsheet_design_versions (tenant_id, draft_id, version, spec_json, spec_sha256, "
+                      "source, summary, changes_json, checks_json, created_by, created_at) VALUES "
+                      "(%s, %s, 1, %s, %s, 'builder', 'Drafted', '[]', '{}', 'test', '2026-06-20')",
+                      (TENANT, draft_id, canonical_json(spec), spec_sha256))
+        design = {"draft_id": str(draft_id), "version": 1, "spec_sha256": spec_sha256}
+        for kind, terms in (("historical_reports", {"checks": {CHECK_ID: {"evidence": {"design": design}}}}),
+                            ("go_live", {"confirmation": "synthetic"})):
+            owner.execute("INSERT INTO broker_onboarding_approvals (tenant_id, case_id, approval_kind, terms_json, "
+                          "terms_sha256, approved_by_identity_sha256) VALUES (%s, %s, %s, %s::jsonb, %s, %s)",
+                          (TENANT, case_id, kind, canonical_json(terms), sha256_text(canonical_json(terms)), "0" * 64))
+        owner.commit()
 
 
 def _rehearsal_script():
@@ -319,6 +366,69 @@ class ReportsOnCertifiedFiguresTests(base._BuildDatabase):
         self.assertTrue(all(line.startswith(certified_reports.LOG_PREFIX) for lines in record["log_lines"].values()
                             for line in lines))
 
+
+    def test_7_the_rehearsal_makes_a_live_onboarding_subject_with_that_paths_arguments(self):
+        from ibkr_etl import onboarding_month_end
+
+        script = _rehearsal_script()
+        _live_onboarding_case(self.database, history_start="2026-06-15")
+        with self._report_connection() as connection:
+            [case] = onboarding_month_end.live_cases(connection, TENANT)
+        self.assertEqual((case["target_subject_id"], str(case["history_start_date"])), (SUBJECT, "2026-06-15"))
+
+        tables = ("reporting_snapshots", "gold.certified_figures", "broker_onboarding_cases",
+                  "broker_onboarding_approvals", "data_quality_results")
+        before = {table: self._owner(f"SELECT count(*) FROM {table}") for table in tables}
+        audit = logging.getLogger(script.QUIET_LOGGERS[0])
+        self.addCleanup(audit.setLevel, audit.level)
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "private" / "monthly-reports-2026-07.json"
+            printed: list[str] = []
+            with patch.dict(os.environ, {"DATABASE_URL": self.app_url, "PORTFOLIO_TENANT_ID": TENANT}), \
+                    contextlib.redirect_stdout(io.StringIO()) as stray:
+                code = script.main(["--month", "2026-07", "--out", str(target)], out=printed.append)
+            self.assertEqual(code, 0, printed)
+            full = json.loads(target.read_text())
+        self.assertEqual({table: self._owner(f"SELECT count(*) FROM {table}") for table in tables}, before)
+
+        text = "\n".join(printed) + stray.getvalue()
+        # July has no frozen snapshot: the month-end job's list makes it from the registration's history
+        # start, and the onboarding path (designed_reports) from the case's.
+        self.assertIn("Subjects: 2; made with today's code: 2; could not be made today either: 0; "
+                      "failed only with the setting: 0.", text)
+        self.assertIn("Live new-onboarding subjects (onboarding_month_end): 1; made with that path's arguments: 1 "
+                      "(identical off and fallback: 1); its report profile or design fails today: 0; not made by "
+                      "that path for this month: already frozen 0, waiting for data 0, no completed month 0; the "
+                      "same as the month-end job's: 0.", text)
+        self.assertIn("Identical with MONTHLY_REPORTS_CERTIFIED off and fallback: 2 of 2.", text)
+        self.assertNotIn(SUBJECT, text)
+        self.assertNotIn("U93", text)
+        self.assertNotIn("2026-06-15", text)
+        self.assertNotIn(str(case["case_id"]), text)
+
+        records = {record["source"]: record for record in full["subjects"]}
+        self.assertEqual(set(records), {"month_end_job", "onboarding"})
+        onboarding = records["onboarding"]
+        self.assertEqual((onboarding["subject_id"], onboarding["case_id"], onboarding["design"]),
+                         (SUBJECT, str(case["case_id"]), "designed"))
+        self.assertEqual((onboarding["period_start"], onboarding["reporting_currency"]), ("2026-06-15", "USD"))
+        self.assertEqual(records["month_end_job"]["period_start"], PERIOD_START)
+        for record in records.values():
+            self.assertEqual(record["digests"]["off"], record["digests"]["fallback"])
+            self.assertEqual(record["errors"], {})
+        self.assertNotEqual(onboarding["digests"]["off"], records["month_end_job"]["digests"]["off"])
+        self.assertEqual(full["summary"]["onboarding_cases"]["live"], 1)
+
+        # September is frozen (test 4): the onboarding path reuses that snapshot and makes nothing.
+        connection = script._connect(self.app_url, TENANT)
+        try:
+            listed = script.subjects(connection, tenant_id=TENANT, period_end=PERIOD_END)
+            live, counts = script.onboarding_subjects(connection, tenant_id=TENANT, period_end=PERIOD_END,
+                                                      listed=listed)
+        finally:
+            connection.rollback()
+            connection.close()
+        self.assertEqual((live, counts), ([], {"frozen_already": 1, "live": 1, "profile_errors": 0, "rehearsed": 0}))
 
 if __name__ == "__main__":
     unittest.main()

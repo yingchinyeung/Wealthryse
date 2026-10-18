@@ -387,6 +387,8 @@ class RehearsalToolTests(unittest.TestCase):
             if "FROM reporting_snapshots" in sql:
                 row = self.stored.get(params[1])
                 return SimpleNamespace(fetchone=lambda: row)
+            if "to_regclass('public.broker_onboarding_cases')" in sql:
+                return SimpleNamespace(fetchone=lambda: {"present": None})  # no new onboarding on this copy
             raise AssertionError(sql)
 
         def rollback(self):
@@ -475,6 +477,92 @@ class RehearsalToolTests(unittest.TestCase):
                                    ["--month", "2026-09", "--out", self.out, "--subject", "U9300002"])
         self.assertEqual(code, 0)
         self.assertIn("Subjects: 1;", text)
+
+    def test_live_new_onboarding_subjects_are_made_with_their_paths_arguments(self):
+        """Subjects that went live through the new onboarding freeze their month through
+        onboarding_month_end (composite_reports or designed_reports), with that path's arguments."""
+        from ibkr_etl import composite_reports, designed_reports, onboarding_month_end
+        from ibkr_etl.report_profiles import ReportProfileError
+
+        def case(subject, *, start="2026-07-15", currency="HKD", style=None, kind="broker_account"):
+            return {"case_id": f"case-{subject}", "source_kind": kind, "target_subject_id": subject,
+                    "reporting_currency": currency, "history_start_date": start, "report_style": style,
+                    "definition_sha256": "a" * 64 if style else None}
+
+        cases = [case("U9300003"),                                             # designed: made
+                 case("COMP-1", style="alpha-world-ms", kind="composite_portfolio"),  # composite: made
+                 case("U9300004", start="2026-10-01"),                         # no completed month by then
+                 case("U9300005"),                                             # already frozen for the month
+                 case("U9300001", start="2026-06-01", currency="USD"),         # as the month-end job makes it
+                 case("COMP-2", style="alpha-world-t", kind="composite_portfolio"),  # its profile fails today
+                 case("U9300006"),                                             # waiting for its data
+                 case("U9300007", currency="EUR")]                             # its approved design is not in EUR
+
+        def profile(connection, subject_id, *, tenant_id=None):
+            if subject_id == "COMP-2":
+                raise ReportProfileError(f"{subject_id} has no approved definition in its report currency")
+            return SimpleNamespace(built_in=False, style="alpha-world-ms", definition_sha256="a" * 64,
+                                   inception="2026-01-05", reporting_currency="HKD")
+
+        def assets(connection, style):  # both designs' approved files are stored
+            return SimpleNamespace(template_version=f"{style}-v1")
+
+        def design(connection, tenant_id, case_id, subject_id):  # each designed case's approved design
+            return {"spec": {"currencies": ["HKD", "USD"]}}
+
+        made: dict[str, tuple] = {}
+        inner = self.builder()
+
+        def build(connection, *, tenant_id, subject_id, period_start, period_end, reporting_currency, environ, out):
+            made.setdefault(subject_id, (period_start, period_end, reporting_currency))
+            return inner(connection, tenant_id=tenant_id, subject_id=subject_id, period_start=period_start,
+                         period_end=period_end, reporting_currency=reporting_currency, environ=environ, out=out)
+
+        with patch.object(onboarding_month_end, "live_cases", lambda connection, tenant_id: cases), \
+                patch.object(composite_reports, "load_profile", profile), \
+                patch.object(composite_reports, "design_assets", assets), \
+                patch.object(designed_reports, "approved_design", design), \
+                patch.object(reporting_snapshot, "active_month_end_snapshot_id",
+                             lambda connection, *, tenant_id, subject_id, period_end:
+                             "frozen" if subject_id == "U9300005" else None), \
+                patch.object(composite_reports, "month_end_ready", lambda *args: True), \
+                patch.object(designed_reports, "month_ready", lambda connection, kind, subject, end: subject != "U9300006"):
+            code, text = self.run_tool(self.Database(["U9300001"]), build)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(made, {"U9300001": ("2026-06-01", MONTH_END, "USD"),
+                                "U9300003": ("2026-07-15", MONTH_END, "HKD"),
+                                "COMP-1": ("2026-01-05", MONTH_END, "HKD")})
+        self.assertIn("Subjects: 5; made with today's code: 3; could not be made today either: 2; "
+                      "failed only with the setting: 0.", text)
+        self.assertIn("Identical with MONTHLY_REPORTS_CERTIFIED off and fallback: 3 of 3.", text)
+        self.assertIn("Live new-onboarding subjects (onboarding_month_end): 8; made with that path's arguments: 2 "
+                      "(identical off and fallback: 2); its report profile or design fails today: 2; not made by that "
+                      "path for this month: already frozen 1, waiting for data 1, no completed month 1; the same as the "
+                      "month-end job's: 1.", text)
+        self.assertIn("Errors by type: CompositeReportError 1, DesignedReportError 1", text)  # as that path raises
+        for leaked in ("U93", "COMP-", "case-", "2026-07-15", "approved definition", "EUR"):
+            self.assertNotIn(leaked, text)
+        written = json.loads(Path(self.out).read_text(encoding="utf-8"))
+        onboarding = {record["subject_id"]: record for record in written["subjects"] if record["source"] == "onboarding"}
+        self.assertEqual(set(onboarding), {"U9300003", "COMP-1", "COMP-2", "U9300007"})
+        self.assertEqual((onboarding["COMP-1"]["design"], onboarding["U9300003"]["design"]), ("composite", "designed"))
+        self.assertTrue(onboarding["U9300003"]["identical_fallback"])
+        self.assertFalse(onboarding["COMP-2"]["made_today"])
+
+    def test_a_live_onboarding_report_that_fails_only_with_the_setting_fails_the_rehearsal(self):
+        from ibkr_etl import designed_reports, onboarding_month_end
+
+        live = [{"case_id": "c", "source_kind": "broker_account", "target_subject_id": "U9300003",
+                 "reporting_currency": "USD", "history_start_date": "2026-07-15", "report_style": None,
+                 "definition_sha256": None}]
+        with patch.object(onboarding_month_end, "live_cases", lambda connection, tenant_id: live), \
+                patch.object(reporting_snapshot, "active_month_end_snapshot_id", lambda connection, **kw: None), \
+                patch.object(designed_reports, "approved_design", lambda *args: {"spec": {"currencies": ["USD"]}}), \
+                patch.object(designed_reports, "month_ready", lambda *args: True):
+            code, text = self.run_tool(self.Database(["U9300001"]), self.builder(fail={"fallback": {"U9300003"}}))
+        self.assertEqual(code, 1)
+        self.assertIn("failed only with the setting: 1", text)
+        self.assertIn("off and fallback: 1 of 2", text)
 
 
 if __name__ == "__main__":

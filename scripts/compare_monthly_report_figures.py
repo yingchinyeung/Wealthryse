@@ -6,9 +6,22 @@ For one month and every subject the month-end job reports on (active subjects re
 month_end_reporting, and any subject with a frozen snapshot for that month end), it makes the
 month-end payload exactly as the freeze does (reporting_snapshot.build_month_end_payload) three
 times on the same read-only database: with MONTHLY_REPORTS_CERTIFIED off (today's code), fallback
-and on. It shows that fallback gives exactly today's payload (the same sha256 the freeze stores)
-and counts, field by field, how the report's figures compare with the certified ones: equal,
-close (within the certified tolerance), different or missing.
+and on.
+
+Subjects that went live through the new onboarding (onboarding_month_end.live_cases) make their
+month-end through that path instead (composite_reports or designed_reports render_case_reports,
+which freeze the month with the case's own arguments). Each such subject whose month the path
+would freeze (a completed month after its inception, by composite_reports.report_months, with no
+frozen or approved snapshot yet and its data in) is rehearsed the same way, with exactly the
+arguments that path passes: a composite with a report style, its report profile's inception and
+reporting currency; any other case, the case's history start date and reporting currency. A
+case whose report profile or approved design that path refuses today is counted as not made, by
+error type. A subject the month-end job's list already rehearses with the same arguments is not
+made twice.
+
+It shows that fallback gives exactly today's payload (the same sha256 the freeze stores) and
+counts, field by field, how the report's figures compare with the certified ones: equal, close
+(within the certified tolerance), different or missing.
 
 It writes nothing. The session is read-only (SET SESSION CHARACTERISTICS AS TRANSACTION ...
 READ ONLY, so any write would fail), every subject's work is rolled back, no reporting_snapshots
@@ -32,7 +45,7 @@ import logging
 import os
 import sys
 from collections import Counter, defaultdict
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -109,18 +122,123 @@ def subjects(connection, *, tenant_id: str, period_end: str, only: Iterable[str]
             for row in rows if not wanted or str(row["subject_id"]) in wanted]
 
 
+def _month_end_job_arguments(connection, *, tenant_id: str, subject: dict, period_end: str) -> tuple:
+    """The freeze's arguments as the month-end job's rehearsal takes them: the stored snapshot's,
+    else the subject's history start and reporting currency. Returns (stored row, start, currency)."""
+    stored = connection.execute(STORED_SQL, (tenant_id, subject["subject_id"], period_end)).fetchone()
+    period_start = _day(stored["period_start"]) if stored else subject["history_start_date"]
+    currency = str(stored["reporting_currency"]) if stored else subject["reporting_currency"]
+    return stored, period_start, currency
+
+
+def _onboarding_path(connection, *, tenant_id: str, case: dict) -> tuple[str, str, str]:
+    """What onboarding_month_end.render_month_end checks before it freezes any month, raising as
+    it does, and the arguments it then freezes with: (design, period_start, reporting_currency)."""
+    from ibkr_etl import composite_reports, designed_reports
+    from ibkr_etl.report_profiles import ReportProfileError
+
+    subject_id = str(case["target_subject_id"])
+    if case.get("report_style"):  # composite_reports.render_case_reports
+        style = str(case["report_style"])
+        try:
+            profile = composite_reports.load_profile(connection, subject_id, tenant_id=tenant_id)
+        except ReportProfileError as error:
+            raise composite_reports.CompositeReportError(str(error)) from error
+        if profile is None or profile.built_in or profile.style != style:
+            raise composite_reports.CompositeReportError(f"{subject_id} has no {style} report profile")
+        if profile.definition_sha256 != str(case["definition_sha256"]):
+            raise composite_reports.CompositeReportError("The report profile is not bound to this case's approved "
+                                                         "definition")
+        composite_reports.design_assets(connection, style)
+        return "composite", profile.inception, profile.reporting_currency
+    # designed_reports.render_case_reports, in the design approved with the historical reports
+    design = designed_reports.approved_design(connection, tenant_id, str(case["case_id"]), subject_id)
+    currency = str(case["reporting_currency"])
+    if currency not in tuple(design["spec"].get("currencies") or ()):
+        raise designed_reports.DesignedReportError(f"The approved design does not report in {currency}")
+    return "designed", date.fromisoformat(str(case["history_start_date"])[:10]).isoformat(), currency
+
+
+def onboarding_subjects(connection, *, tenant_id: str, period_end: str, only: Iterable[str] = (),
+                        listed: Iterable[dict] = ()) -> tuple[list[dict], dict]:
+    """The live new-onboarding subjects whose month the onboarding path would freeze, each with
+    exactly the arguments that path passes (onboarding_month_end.render_month_end), and counts of
+    the others by reason. ``listed`` are the month-end job's subjects, to make each report once."""
+    from ibkr_etl import composite_reports, designed_reports, onboarding_month_end
+    from ibkr_etl.reporting_snapshot import active_month_end_snapshot_id
+
+    wanted, end = set(only), date.fromisoformat(period_end)
+    by_subject = {subject["subject_id"]: subject for subject in listed}
+    found: list[dict] = []
+    skipped: Counter = Counter()
+    live = [case for case in onboarding_month_end.live_cases(connection, tenant_id)
+            if not wanted or str(case["target_subject_id"]) in wanted]
+    for case in live:
+        subject_id = str(case["target_subject_id"])
+        entry: dict[str, Any] = {"subject_id": subject_id, "source": "onboarding", "case_id": str(case["case_id"]),
+                                 "design": "composite" if case.get("report_style") else "designed"}
+        try:
+            entry["design"], inception, currency = _onboarding_path(connection, tenant_id=tenant_id, case=case)
+        except Exception as error:  # noqa: BLE001 - that path fails the same way today; counted by type
+            connection.rollback()
+            found.append({**entry, "error": {"type": type(error).__name__, "message": str(error)[:500]}})
+            continue
+        # The path makes every completed month after inception up to its "today", oldest first; here
+        # "today" is the day after the rehearsal's month end, so that month is the latest completed one.
+        months = composite_reports.report_months(date.fromisoformat(str(inception)[:10]), end + timedelta(days=1))
+        if not months or months[-1] != period_end:
+            skipped["no_completed_month"] += 1
+            continue
+        reason = None
+        for month in months:
+            if active_month_end_snapshot_id(connection, tenant_id=tenant_id, subject_id=subject_id,
+                                            period_end=month) is not None:
+                if month == period_end:
+                    reason = "frozen_already"  # the path reuses it; the month-end job's list rehearses it
+                continue
+            ready = (composite_reports.month_end_ready(connection, subject_id, month) if entry["design"] == "composite"
+                     else designed_reports.month_ready(connection, str(case["source_kind"]), subject_id, month))
+            if not ready:
+                reason = "waiting_for_data"  # the path stops at the first month whose data are not in
+                break
+        if reason:
+            skipped[reason] += 1
+            continue
+        if subject_id in by_subject:
+            _, start, listed_currency = _month_end_job_arguments(connection, tenant_id=tenant_id,
+                                                                 subject=by_subject[subject_id], period_end=period_end)
+            if (start, listed_currency) == (inception, currency):
+                skipped["same_as_month_end_job"] += 1
+                continue
+        found.append({**entry, "period_start": inception, "reporting_currency": currency})
+    connection.rollback()
+    return found, {"live": len(live), "rehearsed": sum("error" not in item for item in found),
+                   "profile_errors": sum("error" in item for item in found), **dict(sorted(skipped.items()))}
+
+
 def rehearse_subject(connection, *, tenant_id: str, subject: dict, period_end: str,
                      build: Callable | None = None) -> dict:
-    """One subject's report three ways, rolled back. Returns the full record (with values)."""
+    """One subject's report three ways, rolled back. Returns the full record (with values).
+
+    A live new-onboarding subject (source "onboarding") is made with the arguments its path
+    passes, which it carries; any other with the stored snapshot's or the subject's."""
     if build is None:
         from ibkr_etl.reporting_snapshot import build_month_end_payload as build
     subject_id = subject["subject_id"]
-    stored = connection.execute(STORED_SQL, (tenant_id, subject_id, period_end)).fetchone()
-    period_start = _day(stored["period_start"]) if stored else subject["history_start_date"]
-    currency = str(stored["reporting_currency"]) if stored else subject["reporting_currency"]
-    record: dict[str, Any] = {"subject_id": subject_id, "period_start": period_start,
+    source = subject.get("source", "month_end_job")
+    if source == "onboarding":
+        stored = connection.execute(STORED_SQL, (tenant_id, subject_id, period_end)).fetchone()
+        period_start, currency = subject.get("period_start"), subject.get("reporting_currency")
+    else:
+        stored, period_start, currency = _month_end_job_arguments(connection, tenant_id=tenant_id, subject=subject,
+                                                                   period_end=period_end)
+    record: dict[str, Any] = {"subject_id": subject_id, "source": source, "period_start": period_start,
                               "reporting_currency": currency, "digests": {}, "errors": {}, "log_lines": {}}
-    for selected in MODES:
+    if source == "onboarding":
+        record.update(case_id=subject.get("case_id"), design=subject.get("design"))
+    if subject.get("error"):  # the onboarding path cannot make it today either
+        record["errors"]["off"] = subject["error"]
+    for selected in MODES if not subject.get("error") else ():
         lines: list[str] = []
         try:
             payload, quality, allowed, _, comparison = build(
@@ -171,8 +289,11 @@ def summarize(records: list[dict]) -> dict:
         totals.update(counts)
     errors = Counter(error["type"] for record in records for error in record["errors"].values())
     stored = [record["stored_snapshot"] for record in made if record["stored_snapshot"]]
+    onboarding = [record for record in records if record.get("source") == "onboarding"]
     return {
         "subjects": len(records), "made": len(made), "not_made_today": len(records) - len(made),
+        "onboarding": {"made": sum(record["made_today"] for record in onboarding),
+                       "identical_fallback": sum(record["identical_fallback"] for record in onboarding)},
         "failed_only_with_setting": sum("fallback" in record["errors"] for record in made),
         "identical_fallback": sum(record["identical_fallback"] for record in made),
         "identical_on": sum(record["identical_on"] for record in made),
@@ -193,6 +314,15 @@ def print_summary(summary: dict, *, month: str, period_end: str, out_path: Path,
     out(f"Monthly reports on certified figures, rehearsal for {month} (month end {period_end}). Nothing was written.")
     out(f"Subjects: {summary['subjects']}; made with today's code: {made}; could not be made today either: "
         f"{summary['not_made_today']}; failed only with the setting: {summary['failed_only_with_setting']}.")
+    live = summary.get("onboarding_cases")
+    if live is not None:
+        onboarding = summary["onboarding"]
+        out(f"Live new-onboarding subjects (onboarding_month_end): {live['live']}; made with that path's arguments: "
+            f"{onboarding['made']} (identical off and fallback: {onboarding['identical_fallback']}); its report "
+            f"profile or design fails today: {live['profile_errors']}; not made by that path for this month: "
+            f"already frozen {live.get('frozen_already', 0)}, waiting for data {live.get('waiting_for_data', 0)}, "
+            f"no completed month {live.get('no_completed_month', 0)}; the same as the month-end job's: "
+            f"{live.get('same_as_month_end_job', 0)}.")
     out(f"Identical with MONTHLY_REPORTS_CERTIFIED off and fallback: {summary['identical_fallback']} of {made}.")
     out(f"Identical with off and on (certified values written): {summary['identical_on']} of {made}.")
     out(f"Today's payload equals the stored frozen snapshot: {summary['stored_same']} of {summary['stored']} "
@@ -247,12 +377,15 @@ def main(argv: list[str] | None = None, *, connect: Callable | None = None,
     try:
         found = subjects(connection, tenant_id=tenant_id, period_end=period_end, only=args.subject)
         connection.rollback()
+        live, live_counts = onboarding_subjects(connection, tenant_id=tenant_id, period_end=period_end,
+                                                only=args.subject, listed=found)
         records = [rehearse_subject(connection, tenant_id=tenant_id, subject=subject, period_end=period_end)
-                   for subject in found]
+                   for subject in [*found, *live]]
     finally:
         connection.rollback()
         connection.close()
     summary = summarize(records)
+    summary["onboarding_cases"] = live_counts
     write_private(target, json.dumps({"month": args.month, "period_end": period_end, "summary": summary,
                                       "subjects": records}, indent=1, sort_keys=True, default=str))
     print_summary(summary, month=args.month, period_end=period_end, out_path=target, out=out)

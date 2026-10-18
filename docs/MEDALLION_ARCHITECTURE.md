@@ -17,6 +17,7 @@ Status: the catalog is in place. Nothing has moved yet, and every table is still
 | Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: the benchmark comparison reads bronze `flex_rows` for cash flows, and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
 | Ops | Runs, approvals, audit, access, onboarding workflow, configuration and hand-maintained settings (subjects, benchmark list and mapping, metric catalogue), agent state | Control plane, not a data layer. Stays in `public`. |
 | Platform | `tenants`, `schema_migrations`, row-level security helpers | Stays in `public`. |
+| Research | Experiments: a point-in-time feature store, backtests, an experiment log, a signal library and model training | Outside the served data path. Lives on its own small Postgres server and in the `research-*` containers, never on the live server. Reads bronze and silver as known on each date; writes only `research.*` and `research-*`. Nothing in the website, the agents or gold reads it. A result reaches gold only as a certified figure, through the publish gate, with a model card and the owner's approval. `tests/test_research_isolation.py` fails if code outside `src/ibkr_etl/research/` or `scripts/research/` names a research object, or if a live-server migration creates the `research` schema. |
 
 ## Where each layer lives
 
@@ -33,8 +34,11 @@ Status: the catalog is in place. Nothing has moved yet, and every table is still
   - Ops: the release and audit containers, and a planned `ops-qa`.
   - Containers that database rows point to keep their names and get a layer label.
   - New containers are named `<layer>-<content>`.
+- **Research:** its own Burstable Postgres Flexible Server, stopped when idle, plus
+  `research-features` (point-in-time Parquet exports) and `research-experiments`.
+  Licensed vendor data lands in bronze in `bronze-vendor-data`.
 - **Jobs:** the catalog records each job's hops (ingest, conform, analytics,
-  quality-gate, publish, serve, ops). Job names stay, and a tag carries the hop.
+  quality-gate, publish, serve, research, ops). Job names stay, and a tag carries the hop.
 
 ## Adding a table, view or container
 

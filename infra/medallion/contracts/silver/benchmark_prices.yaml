@@ -1,0 +1,227 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.benchmark_prices
+name: benchmark_prices
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: Daily benchmark index levels (such as the S&P 500 and the Hang Seng) from the market-data provider, with
+    a quality flag. The benchmark comparison reads them.
+  limitations: Yahoo levels are provisional closes with quality_status warn. raw_sha256 is the digest of the parsed
+    series, not of the raw file in bronze-market-data (review item 4).
+tags:
+- silver
+- market-data
+schema:
+- name: benchmark_prices
+  physicalName: silver.benchmark_prices
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, benchmark_id, observation_date and observation_status.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: benchmark_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: Benchmark id in benchmark_master, such as GSPC, IXIC or HSI.
+  - name: observation_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: internal
+    description: Trading date of the level.
+    quality:
+    - name: observation_date_is_iso_date
+      description: observation_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.benchmark_prices WHERE observation_date IS NOT NULL AND observation_date
+        !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: level
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Index level (close) in currency; above zero.
+    quality:
+    - name: level_positive
+      description: level is above zero (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.benchmark_prices WHERE level <= 0
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Currency of the level.
+  - name: observation_status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: internal
+    description: official_close, provisional_close, intraday or corrected. The Yahoo feed writes provisional_close.
+    quality:
+    - name: observation_status_allowed_values
+      description: observation_status is one of official_close, intraday, corrected, provisional_close (a CHECK
+        constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.benchmark_prices WHERE observation_status NOT IN ('official_close', 'intraday',
+        'corrected', 'provisional_close')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: provider
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Data provider, such as Yahoo Finance via yfinance.
+  - name: source_reference
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The provider call that produced the level.
+  - name: observed_at
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the provider observed the level; the current writer leaves it empty.
+  - name: fetched_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) the row was last written. Every run re-stamps it; the freshness check measures
+      it.
+    quality:
+    - name: fetched_at_is_iso_timestamp
+      description: fetched_at is an ISO 8601 timestamp. layer_freshness parses it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.benchmark_prices WHERE fetched_at IS NOT NULL AND fetched_at !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: quality_status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: pending, pass, warn or fail. The Yahoo feed writes warn; fail rows are not counted as fresh.
+    quality:
+    - name: quality_status_allowed_values
+      description: quality_status is one of pending, pass, warn, fail (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.benchmark_prices WHERE quality_status NOT IN ('pending', 'pass', 'warn',
+        'fail')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: raw_sha256
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the canonical JSON of the parsed (date, level) series the run received for the benchmark.
+    quality:
+    - name: raw_sha256_is_sha256
+      description: raw_sha256 is a lowercase hex sha256 (util.sha256_text).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.benchmark_prices WHERE raw_sha256 IS NOT NULL AND raw_sha256 !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+slaDefaultElement: benchmark_prices.fetched_at
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: benchmark_prices.fetched_at
+- property: timeOfAvailability
+  value: 09:30+00:00
+  element: benchmark_prices.fetched_at
+  driver: operational
+- property: latency
+  value: 6
+  unit: h
+  element: benchmark_prices.fetched_at
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: market-data
+- property: catalogNote
+  value: 'Parsed provider benchmark levels with a quality flag. Raw responses: bronze-market-data.'
+- property: consumers
+  value:
+  - ibkr_etl.agent_tools
+  - ibkr_etl.comparison_source_evidence
+  - ibkr_etl.layer_freshness
+  - ibkr_etl.web
+  - ibkr_etl.workflow_lineage
+- property: producers
+  value:
+  - ibkr_etl.provisional_benchmark
+- property: freshnessCheck
+  value:
+    checkId: silver.benchmark_prices
+    measure: loaded_at
+    required: true
+    query: SELECT MAX(fetched_at) AS observed FROM benchmark_prices WHERE quality_status <> 'fail'
+    source: ibkr_etl.layer_freshness.RULES
+contractCreatedTs: '2026-10-18T00:00:00Z'

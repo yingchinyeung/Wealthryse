@@ -1,0 +1,259 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.subject_live_positions
+name: subject_live_positions
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: Positions in each IBKR account's latest live snapshot, with contract details and the latest live quote.
+  limitations: 'A security_invoker view: each reader sees only its own tenant''s rows through the tables'' row-level
+    security. Reads bronze directly (live_positions, live_contracts, live_quotes). Intraday and unreconciled.'
+tags:
+- silver
+- derived
+schema:
+- name: subject_live_positions
+  physicalName: silver.subject_live_positions
+  physicalType: view
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, subject_id and conid.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: subject_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: IBKR account number. Restricted.
+  - name: observed_at
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the collector observed the positions (the account's latest snapshot).
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR contract id.
+  - name: symbol
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Ticker symbol.
+  - name: description
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Contract long name.
+  - name: sec_type
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR security type.
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the position.
+  - name: primary_exchange
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Primary exchange.
+  - name: industry
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR industry.
+  - name: category
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR category.
+  - name: subcategory
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR subcategory.
+  - name: quantity
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Position quantity.
+  - name: average_cost
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Average cost per unit.
+  - name: market_price
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Market price.
+  - name: market_value
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Market value.
+  - name: unrealized_pnl
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Unrealised P&L.
+  - name: daily_pnl
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: P&L for the day.
+  - name: last_price
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Last price from the latest quote.
+  - name: bid_price
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Bid from the latest quote.
+  - name: ask_price
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Ask from the latest quote.
+  - name: prior_close
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Prior close from the latest quote.
+  - name: market_data_type
+    physicalType: smallint
+    logicalType: integer
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR market data type of the quote (live, frozen, delayed).
+  - name: quote_observed_at
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the latest quote was observed.
+  quality:
+  - name: grain_is_unique
+    description: No two rows share (tenant_id, subject_id, conid).
+    type: sql
+    query: SELECT COUNT(*) FROM (SELECT tenant_id, subject_id, conid FROM silver.subject_live_positions GROUP BY
+      tenant_id, subject_id, conid HAVING COUNT(*) > 1) d
+    mustBe: 0
+    severity: warning
+    dimension: uniqueness
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: Latest live positions per subject.
+- property: consumers
+  value:
+  - ibkr_etl.live_view
+contractCreatedTs: '2026-10-18T00:00:00Z'

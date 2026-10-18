@@ -1,0 +1,254 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.synthetic_portfolio_components
+name: synthetic_portfolio_components
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Daily constituents of each composite built from fixed coefficients: each component''s value in its own
+    and the base currency, indexed, and its contribution. A composite''s NAV on a date is the sum of its contributions.'
+  limitations: Rebuilt in full for a composite on each refresh.
+tags:
+- silver
+- derived
+schema:
+- name: synthetic_portfolio_components
+  physicalName: silver.synthetic_portfolio_components
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, portfolio_id, snapshot_date and component_id.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: portfolio_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: confidential-financial
+    description: Composite id (derived_portfolios.portfolio_id).
+  - name: snapshot_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: NAV date of the composite.
+    quality:
+    - name: snapshot_date_is_iso_date
+      description: snapshot_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.synthetic_portfolio_components WHERE snapshot_date IS NOT NULL AND snapshot_date
+        !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: component_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: confidential-financial
+    description: Component id, such as a sleeve subject, an index hedge or cash.
+  - name: component_name
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Component name.
+  - name: component_type
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Kind of component.
+  - name: direction
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: long, short or cash.
+    quality:
+    - name: direction_allowed_values
+      description: direction is one of long, short, cash (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.synthetic_portfolio_components WHERE direction NOT IN ('long', 'short',
+        'cash')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: coefficient
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Fixed coefficient of the component; the constant cash amount for cash.
+  - name: source_currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of source_value.
+  - name: base_currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The composite's base currency.
+  - name: source_value
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Component value in source_currency on observation_date.
+  - name: fx_rate_to_base
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Rate from source_currency to base_currency; 1 for cash.
+  - name: base_value
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: source_value in the base currency.
+  - name: normalized_value
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Component value indexed to the composite's normalisation date; 1 for cash.
+  - name: contribution
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'coefficient × normalized_value: the component''s part of the composite NAV.'
+  - name: observation_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'Date of the component value used: the latest on or before snapshot_date.'
+    quality:
+    - name: observation_date_is_iso_date
+      description: observation_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.synthetic_portfolio_components WHERE observation_date IS NOT NULL AND observation_date
+        !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: generated_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the run that wrote the row.
+  quality:
+  - name: contribution_matches
+    description: contribution equals coefficient × normalized_value.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.synthetic_portfolio_components WHERE ABS(contribution - coefficient * normalized_value)
+      > 1e-9 * GREATEST(1, ABS(contribution))
+    mustBe: 0
+    severity: error
+    dimension: accuracy
+  - name: observation_not_after_snapshot
+    description: A component's value is never from after the NAV date.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.synthetic_portfolio_components WHERE observation_date > snapshot_date
+    mustBe: 0
+    severity: warning
+    dimension: timeliness
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: Composite constituents by day.
+- property: consumers
+  value:
+  - ibkr_etl.agent_tools
+  - ibkr_etl.alpha_world_ms_crisis
+  - ibkr_etl.alpha_world_t_crisis
+  - ibkr_etl.alpha_world_t_reporting
+  - ibkr_etl.analyst_export
+  - ibkr_etl.composite_reports
+  - ibkr_etl.crisis_replay
+  - ibkr_etl.crisis_scenarios
+  - ibkr_etl.derived_portfolio
+  - ibkr_etl.historical_reporting
+  - ibkr_etl.model_cash_display
+  - ibkr_etl.monthly_reporting_analytics
+  - ibkr_etl.profiled_crisis
+  - ibkr_etl.profiled_reporting
+  - ibkr_etl.report
+  - ibkr_etl.subject_exports
+  - ibkr_etl.web
+- property: producers
+  value:
+  - ibkr_etl.derived_portfolio
+  - ibkr_etl.reference_subject_rename
+contractCreatedTs: '2026-10-18T00:00:00Z'

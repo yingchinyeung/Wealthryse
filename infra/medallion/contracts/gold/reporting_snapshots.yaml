@@ -1,0 +1,336 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.gold.reporting_snapshots
+name: reporting_snapshots
+version: 1.0.0
+status: active
+domain: gold
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Frozen month-end report payloads per subject and period: the figures a month-end report shows, with
+    their sources, quality and publication decision.'
+  usage: Publish only a frozen or approved row with publication_allowed true. A newer payload for the same period
+    supersedes the older one; both are kept.
+  limitations: Content columns cannot change once a row is frozen or approved (trigger reporting_snapshot_immutable);
+    only status and approval can.
+tags:
+- gold
+- derived
+schema:
+- name: reporting_snapshots
+  physicalName: gold.reporting_snapshots
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per snapshot_id; at most one frozen snapshot per tenant, subject and period_end.
+  properties:
+  - name: snapshot_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: true
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: UUID v5 of tenant, subject, period end and data_sha256, so the same payload always gets the same
+      id.
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: subject_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: 'Subject: an IBKR account number for accounts, a slug for portfolios and composites. Restricted.'
+  - name: period_start
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: First day of the reporting period.
+    quality:
+    - name: period_start_is_iso_date
+      description: period_start is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM gold.reporting_snapshots WHERE period_start IS NOT NULL AND period_start !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: period_end
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Last day of the reporting period.
+    quality:
+    - name: period_end_is_iso_date
+      description: period_end is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM gold.reporting_snapshots WHERE period_end IS NOT NULL AND period_end !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: as_of_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) the snapshot was frozen.
+  - name: reporting_currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the report.
+  - name: formula_version
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Version of the comparison formula in the payload.
+  - name: source_manifest_json
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Snapshot version, source citations, benchmark licence status and publication decision, as canonical
+      JSON.
+  - name: data_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of snapshot_payload_json.
+    quality:
+    - name: data_sha256_is_sha256
+      description: data_sha256 is a lowercase hex sha256 (util.sha256_text).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.reporting_snapshots WHERE data_sha256 IS NOT NULL AND data_sha256 !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: quality_status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: pass, warn or fail.
+    quality:
+    - name: quality_status_allowed_values
+      description: quality_status is one of pass, warn, fail (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.reporting_snapshots WHERE quality_status NOT IN ('pass', 'warn', 'fail')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: draft, frozen, approved or superseded.
+    quality:
+    - name: status_allowed_values
+      description: status is one of draft, frozen, approved, superseded (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.reporting_snapshots WHERE status NOT IN ('draft', 'frozen', 'approved', 'superseded')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: created_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) the row was written.
+  - name: approved_at
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: When the snapshot was approved.
+  - name: approved_by
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: Who approved it. Restricted.
+  - name: snapshot_payload_json
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The month-end payload as canonical JSON.
+  - name: publication_allowed
+    physicalType: boolean
+    logicalType: boolean
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: True only when quality_status is pass and there are no blockers.
+  - name: publication_blockers_json
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: JSON list of the reasons publication is blocked.
+  - name: benchmark_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Primary benchmark id.
+  - name: benchmark_convention
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Return convention of the primary benchmark, such as price.
+  - name: benchmark_provider
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Provider of the primary benchmark.
+  - name: data_as_of
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Latest data date in the payload.
+  quality:
+  - name: digest_matches_payload
+    description: data_sha256 is the sha256 of snapshot_payload_json, so a published figure can be proved unchanged.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.reporting_snapshots WHERE data_sha256 <> encode(sha256(convert_to(snapshot_payload_json,
+      'UTF8')), 'hex')
+    mustBe: 0
+    severity: error
+    dimension: accuracy
+  - name: publication_needs_pass
+    description: publication_allowed is true only with quality_status pass and no blockers.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.reporting_snapshots WHERE publication_allowed AND (quality_status <> 'pass'
+      OR publication_blockers_json <> '[]')
+    mustBe: 0
+    severity: error
+    dimension: consistency
+  - name: one_frozen_per_period
+    description: At most one frozen snapshot per tenant, subject and period_end; a new one supersedes the old.
+    type: sql
+    query: SELECT COUNT(*) FROM (SELECT tenant_id, subject_id, period_end FROM gold.reporting_snapshots WHERE status
+      = 'frozen' GROUP BY 1, 2, 3 HAVING COUNT(*) > 1) d
+    mustBe: 0
+    severity: error
+    dimension: uniqueness
+  - name: period_in_order
+    description: period_start is not after period_end.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.reporting_snapshots WHERE period_start > period_end
+    mustBe: 0
+    severity: error
+    dimension: conformity
+  - name: approved_has_approval
+    description: An approved snapshot records when it was approved.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.reporting_snapshots WHERE status = 'approved' AND approved_at IS NULL
+    mustBe: 0
+    severity: warning
+    dimension: completeness
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: Frozen month-end report payload; immutable once frozen.
+- property: consumers
+  value:
+  - ibkr_etl.composite_reports
+  - ibkr_etl.flow_backfill
+  - ibkr_etl.onboarding_v2_web
+  - ibkr_etl.portfolio_assurance
+  - ibkr_etl.report_design_updates
+  - ibkr_etl.report_design_worker
+  - ibkr_etl.reporting_snapshot
+  - ibkr_etl.web
+- property: producers
+  value:
+  - ibkr_etl.reporting_snapshot
+- property: calculationVersionColumn
+  value: formula_version
+- property: calculationVersionSource
+  value:
+  - ibkr_etl.reporting_snapshot.FORMULA_VERSION
+  - ibkr_etl.reporting_snapshot.SNAPSHOT_VERSION
+contractCreatedTs: '2026-10-18T00:00:00Z'

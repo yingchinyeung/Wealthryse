@@ -1,0 +1,194 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.corporate_actions
+name: corporate_actions
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: Corporate actions per account from the Flex statements, such as splits, mergers and spin-offs.
+  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
+    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
+    are not versioned yet (review item 8).
+tags:
+- silver
+- ibkr
+schema:
+- name: corporate_actions
+  physicalName: silver.corporate_actions
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per account_id and source_key.
+  properties:
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: restricted
+    description: 'IBKR account number. Restricted: never shown or logged in full.'
+  - name: source_key
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: Stable key of the statement row (parser._source_key).
+  - name: action_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR actionID.
+  - name: effective_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Report date of the statement row.
+    quality:
+    - name: effective_date_is_iso_date
+      description: effective_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.corporate_actions WHERE effective_date IS NOT NULL AND effective_date !~
+        '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: action_type
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR action type (type, actionType or code).
+  - name: description
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR description of the action.
+  - name: quantity_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Quantity as decimal text.
+    quality:
+    - name: quantity_text_is_decimal
+      description: quantity_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.corporate_actions WHERE quantity_text IS NOT NULL AND quantity_text !~
+        '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: amount_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Amount or proceeds as decimal text.
+    quality:
+    - name: amount_text_is_decimal
+      description: amount_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.corporate_actions WHERE amount_text IS NOT NULL AND amount_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the amount.
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Contract the action applies to.
+  - name: row_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows.
+    quality:
+    - name: row_sha256_is_sha256
+      description: row_sha256 is a lowercase hex sha256 (util.sha256_text of the row).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.corporate_actions WHERE row_sha256 IS NOT NULL AND row_sha256 !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: last_seen_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ingestion run that last wrote the row (ingestion_runs.run_id).
+  quality:
+  - name: account_in_accounts
+    description: Every row's account is in silver.accounts. A row of an unknown account is invisible to every tenant
+      under the account_isolation policy, so run this with a role that bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.corporate_actions t WHERE NOT EXISTS (SELECT 1 FROM silver.accounts a WHERE
+      a.account_id = t.account_id)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Typed Flex sections; values are still stored as text and cast on read.
+- property: consumers
+  value:
+  - ibkr_etl.analyst_export
+- property: producers
+  value:
+  - ibkr_etl.loader
+contractCreatedTs: '2026-10-18T00:00:00Z'

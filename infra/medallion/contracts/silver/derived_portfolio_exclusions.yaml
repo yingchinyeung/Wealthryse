@@ -1,0 +1,203 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.derived_portfolio_exclusions
+name: derived_portfolio_exclusions
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: Source-account positions left out of each derived portfolio, with the reason and their value in the portfolio's
+    base currency.
+  limitations: Rebuilt in full for a portfolio on each refresh.
+tags:
+- silver
+- derived
+schema:
+- name: derived_portfolio_exclusions
+  physicalName: silver.derived_portfolio_exclusions
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, portfolio_id, snapshot_date, conid and model_code.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: portfolio_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: confidential-financial
+    description: Derived portfolio id (derived_portfolios.portfolio_id).
+  - name: source_account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: IBKR account the portfolio is filtered from. Restricted.
+  - name: snapshot_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: Statement date of the source position.
+    quality:
+    - name: snapshot_date_is_iso_date
+      description: snapshot_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_exclusions WHERE snapshot_date IS NOT NULL AND snapshot_date
+        !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: confidential-financial
+    description: IBKR contract id.
+  - name: model_code
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 5
+    classification: confidential-financial
+    description: IBKR model code; empty when none.
+  - name: symbol
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Ticker symbol.
+  - name: description
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Contract description.
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the position.
+  - name: listing_exchange
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Listing exchange.
+  - name: exclusion_reason
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Why the position is left out, such as its country, exchange or currency.
+  - name: quantity_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Quantity as decimal text.
+    quality:
+    - name: quantity_text_is_decimal
+      description: quantity_text is plain decimal text when present. Copied from position_snapshots.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_exclusions WHERE quantity_text IS NOT NULL AND quantity_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: market_value_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Market value in currency as decimal text.
+    quality:
+    - name: market_value_text_is_decimal
+      description: market_value_text is plain decimal text when present. Copied from position_snapshots.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_exclusions WHERE market_value_text IS NOT NULL AND market_value_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: market_value_base
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Market value in the portfolio's base currency (zero when the source had none); subtracted from
+      the source NAV.
+  - name: generated_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the run that wrote the row.
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: Filtered and composite subjects, conformed to the same shape as account data.
+- property: consumers
+  value:
+  - ibkr_etl.analyst_export
+  - ibkr_etl.report
+- property: producers
+  value:
+  - ibkr_etl.derived_portfolio
+contractCreatedTs: '2026-10-18T00:00:00Z'

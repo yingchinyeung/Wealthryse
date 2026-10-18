@@ -191,7 +191,7 @@ class AsKnownOnDraftTests(unittest.TestCase):
 
         # Today's readers see exactly what they see now: the loader and the tables are unchanged.
         self.assertEqual(self._rows("SELECT buy_sell, proceeds_text FROM silver.trades WHERE account_id = %s "
-                                    "ORDER BY proceeds_text", ACCOUNT),
+                                    "ORDER BY proceeds_text::numeric", ACCOUNT),
                          [("SELL (Ca.)", "-5000.00"), ("SELL", "4980.00"), ("SELL", "5000.00")])
 
         # A cancellation and a rebooking arrive as new rows, each recorded when we learned of it,

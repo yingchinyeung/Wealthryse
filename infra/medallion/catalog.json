@@ -204,6 +204,20 @@
    "note": "Typed Flex sections; values are still stored as text and cast on read.",
    "source": "ibkr"
   },
+  "public.certified_builds": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "One row per certified-figures build (U5): shadow, published, held or rolled back, with its checks.",
+   "source": "derived"
+  },
+  "public.certified_figures": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Certified figures (U5): one stored, checked number per Metrics guide figure, subject and date. Append-only.",
+   "source": "derived"
+  },
   "public.corporate_actions": {
    "kind": "table",
    "layer": "silver",
@@ -737,6 +751,13 @@
    "kind": "table",
    "layer": "ops",
    "target_schema": "public"
+  },
+  "public.v_certified_figures": {
+   "kind": "view",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Certified figures as readers see them: the newest published build's row for each figure.",
+   "source": "derived"
   },
   "public.workflow_cycle_date_policies": {
    "kind": "table",

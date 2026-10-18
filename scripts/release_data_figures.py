@@ -51,7 +51,7 @@ OK = ("fail", "empty")  # period statuses the page shows as a dash
 # Figures this command does not compare, and why. Shown in both reports.
 NOT_COMPARED = {
     "overview.data_freshness": "worked out in the browser from the day the page is read",
-    "benchmark.rebased_level": "a chart series: compared with the charts after month-end",
+    "benchmark.rebased_level": "a chart series: checked through the daily returns it compounds (series.*_daily_return, batch 5)",
     "risk.crisis_scenario_max_drawdown": "read from the crisis scenarios table: not compared yet",
 }
 # The pages whose figures are another page's, read when the page is opened.

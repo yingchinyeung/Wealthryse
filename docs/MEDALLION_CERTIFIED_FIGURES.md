@@ -361,7 +361,14 @@ minutes (`CERTIFIED_FIGURES_MINUTES`, or `--minutes`). It publishes what it read
 run carries on. Each subject's built dates stay one unbroken run back from its newest date, so
 a page asked for an older date finds either that date's figures or none, and then shows
 today's figures as it does now. The history fills in over the first few runs; `--backfill`
-reads every older date again.
+reads every older date again, newest first, and a backfill that stops at its time limit starts
+again from the newest date, so give it `--minutes` long enough for the dates it must reach.
+
+The check that the pages give the same figures on their own connections runs for each account
+or portfolio right after its newest date is read, so the two reads are moments apart.
+On a day the benchmark's market was shut (the 18 Oct rehearsal found two such days in the
+history), the performance page still shows the comparison through the last common date, and the
+certified figures for that day are the same, with that date in their source key.
 
 ## How agents read them
 

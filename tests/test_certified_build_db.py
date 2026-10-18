@@ -434,8 +434,23 @@ class TimeLimitTests(_BuildDatabase):
     def test_the_history_is_filled_in_newest_first_over_several_runs(self):
         days = _business_days(FIRST, LAST)
         # Eight reads in each limited run (the clock is read once at the start and once per date).
-        code, lines = self._run(minutes=8.5 / 60, clock=_Clock())
+        events, read_rows, check = [], build.page_rows, build.page_disagreements
+
+        def recorded_read(web, subject, as_of, *args, **kwargs):
+            events.append(("read", as_of))
+            return read_rows(web, subject, as_of, *args, **kwargs)
+
+        def recorded_check(web, subject, as_of, *args, **kwargs):
+            events.append(("check", as_of))
+            return check(web, subject, as_of, *args, **kwargs)
+
+        with patch.object(build, "page_rows", recorded_read), patch.object(build, "page_disagreements", recorded_check):
+            code, lines = self._run(minutes=8.5 / 60, clock=_Clock())
         self.assertEqual(code, 0, lines)
+        # The last five oldest first; the pages are asked again on the newest date at once (the check's
+        # own read), before the history.
+        self.assertEqual(events, [("read", day) for day in days[-5:]] + [("check", days[-1]), ("read", days[-1])]
+                         + [("read", day) for day in (days[-6], days[-7], days[-8])])
         self.assertIn(f"Read 8 of {len(days)} subject dates. Stopped after {8.5 / 60:g} minutes: the other "
                       f"{len(days) - 8} are left for the next run.", lines)
         [(_, status, _, checks)] = self._builds()
@@ -462,6 +477,37 @@ class TimeLimitTests(_BuildDatabase):
         self.assertIn(f"Read {len(days) - 6} of {len(days) - 6} subject dates.", lines)
         self.assertEqual(sorted({key[5] for key in self._published()}), days)
         self.assertEqual([status for _, status, _, _ in self._builds()], ["published"] * 3)
+
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class BenchmarkHolidayTests(_BuildDatabase):
+    """A day the benchmark's market was shut has no comparison row; the page still shows the comparison
+    through the day before, and the certified figures for that day are the same."""
+
+    def test_the_figures_are_the_comparison_the_page_shows(self):
+        days = _business_days(FIRST, LAST)
+        shut = days[-20]
+        with layers._connect(self.database) as owner:
+            owner.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+            owner.execute("DELETE FROM performance_comparison_daily WHERE subject_id = %s AND observation_date::text = %s",
+                          (SUBJECT, shut))
+            owner.commit()
+        comparison = self.web.benchmark_comparison(SUBJECT, as_of=shut, user=build.BUILD_USER)
+        self.assertTrue(comparison["available"])
+        self.assertEqual(str(comparison["series"][-1]["date"]), days[-21])          # through the day before
+        code, lines = self._run()
+        self.assertEqual(code, 0, lines)
+        [(_, status, _, checks)] = self._builds()
+        self.assertEqual(status, "published", checks)
+        for figure_id, name in (("benchmark.correlation", "correlation"), ("benchmark.beta", "beta"),
+                                ("benchmark.tracking_error", "tracking_error")):
+            self.assertIsNotNone(comparison["metrics"][name], name)
+            self.assertEqual(self._value(figure_id, shut, benchmark_id="SYNIDX"), comparison["metrics"][name])
+        [(source_key,)] = self._owner(
+            "SELECT source_key FROM gold.certified_figures WHERE subject_id = %s AND figure_id = 'benchmark.beta' "
+            "AND as_of_date = %s", SUBJECT, shut)
+        self.assertEqual(source_key["observation_date"], days[-21])
 
 
 if __name__ == "__main__":

@@ -144,9 +144,9 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
 A release that touches silver or gold runs its jobs on a restored copy first, and
 `scripts/release_data_report.py` compares every silver and gold table before and after:
 rows added, removed and changed, and the largest changes per table and per account or
-subject. The report goes on the PR for approval. It shows aggregates only, with no
-account numbers or names. [MEDALLION_RELEASE_REPORT.md](MEDALLION_RELEASE_REPORT.md) has
-the steps.
+subject. Its public summary (counts and names only) goes on the PR; the full report,
+with the figures, goes to the approver through the project's private folder.
+[MEDALLION_RELEASE_REPORT.md](MEDALLION_RELEASE_REPORT.md) has the steps.
 
 ## Stages
 

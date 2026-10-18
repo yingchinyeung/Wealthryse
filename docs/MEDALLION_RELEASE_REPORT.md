@@ -1,8 +1,10 @@
 # Release data report: what numbers change
 
 Before an image that touches silver or gold goes live, its jobs run on a restored copy of
-the database, and a before-and-after report of every silver and gold table goes on the PR.
-The reviewer approves the figures as well as the code. This is upgrade U6. On 18 Oct a
+the database, and a before-and-after report of every silver and gold table is made. Its
+public summary goes on the PR; the full report, with the figures, goes to the approver
+through the project's private folder. The approver approves the figures as well as the
+code. This is upgrade U6. On 18 Oct a
 benchmark change (bank deposits counted as external flows) rewrote
 `gold.performance_comparison_daily` with no such report.
 
@@ -50,18 +52,35 @@ From the admin VM, in a clone of the PR's branch (the tool reads the table list 
    python scripts/release_data_report.py compare --before before.jsonl.gz --after after.jsonl.gz
    ```
 
-   It prints the summary and writes `release-data-report.md` and `release-data-report.json`.
-   It exits 0 when nothing changed, 1 when figures changed (expected for a release that
-   changes figures), and 2 when it could not run.
-6. **Post it on the PR:** `gh pr comment <PR number> --body-file release-data-report.md`.
-   Read it first: the repository is public. Keep the JSON with the PR's release evidence.
-7. **Delete** the copy, `before.jsonl.gz` and `after.jsonl.gz`.
+   It writes the full report, `release-data-report.md` and `release-data-report.json`, and
+   the public summary, `release-data-summary.md` (`--public-summary` for another name), and
+   prints the public summary. It exits 0 when nothing changed, 1 when figures changed
+   (expected for a release that changes figures), and 2 when it could not run.
+   `summary --report release-data-report.json --out release-data-summary.md` writes the
+   public summary again from a saved full report.
+6. **Post only the public summary on the PR:**
+   `gh pr comment <PR number> --body-file release-data-summary.md`. The repository is
+   public, and the full report's deltas can reveal client figures (a change from zero
+   shows the whole value), so the full report never goes on a PR, an issue or a CI log.
+7. **Give the approver the full report:** copy `release-data-report.md` and
+   `release-data-report.json` to the project's private shared folder, under
+   `/mnt/project-files/release-reports/<PR number>/`.
+8. **Delete** the copy, `before.jsonl.gz` and `after.jsonl.gz`.
 
 With two copies restored from the same moment (one with each image's jobs run on it),
 compare them directly: `compare --before env:BEFORE_DATABASE_URL --after env:AFTER_DATABASE_URL`,
 with each variable holding that copy's URL.
 
 ## Reading the report
+
+The **public summary** has counts and names only: how many tables changed, were unchanged
+or were not compared; for each changed table, rows added, removed and changed, whether
+any number changed beyond the tolerance (and in which columns), which status and version
+columns changed, and which other columns changed; the frozen month-end snapshot check
+(pass or fail); and the attention items. It has no figures, deltas, dates or subject
+labels.
+
+The **full report** (private):
 
 - **The first lines** say how many tables changed and whether the frozen month-end
   snapshots are unchanged. **Needs attention** lists what stops a release: a frozen or
@@ -89,9 +108,11 @@ with each variable holding that copy's URL.
   from short status and version values such as `quality_status` and `calculation_version`.
 - A raised `calculation_version` or `analytics_version` is part of the key, so the new
   version's rows show as added, and the version's row counts appear in the details.
-- **The report** holds aggregates only. Accounts appear as `u…#1`, `u…#2`, other subjects
-  as `s…#1`; the labels hold within one report. There are no account numbers, names or
-  text values, and any IBKR account id that reached the text is masked as `u…`.
+- **The full report** holds aggregates only. Accounts appear as `u…#1`, `u…#2`, other
+  subjects as `s…#1`; the labels hold within one report. There are no account numbers,
+  names or text values, and any IBKR account id that reached the text is masked as `u…`.
+  Its deltas and relative changes are still client figures, so it stays private.
+- **The public summary** holds counts and table, column and migration names only.
 - **Snapshot files** hold figures row by row, with keys, subjects and text replaced by
   sha256 digests. They are still client data: they are created readable by their owner
   only, stay on the admin VM, and are deleted with the copy.

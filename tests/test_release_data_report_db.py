@@ -242,9 +242,11 @@ class ReleaseDataReportDatabaseTests(unittest.TestCase):
 
     def _compare(self, before: str, after: str, env: dict, name: str):
         markdown, report = self.folder / f"{name}.md", self.folder / f"{name}.json"
+        public = self.folder / f"{name}-summary.md"
         code, output = self._run("compare", "--before", before, "--after", after, "--markdown", str(markdown),
-                                 "--json", str(report), env=env)
+                                 "--json", str(report), "--public-summary", str(public), env=env)
         self.assertNotIn("ERROR", output)
+        self.assertTrue(public.is_file())
         return code, output, markdown.read_text(encoding="utf-8"), json.loads(report.read_text(encoding="utf-8"))
 
     def _database_report(self):
@@ -306,11 +308,17 @@ class ReleaseDataReportDatabaseTests(unittest.TestCase):
         self.assertIn("| gold.performance_comparison_daily | 33 → 33 | 1 | 1 | 4 | 2026-10-05 to 2026-10-16 |", top)
         self.assertIn(f"Δ up to +0.05 ({_label(ACCOUNTS[0])}, 2026-10-15)", top)
         self.assertIn("Frozen month-end snapshots: 1 checked (1 frozen or approved), unchanged.", top)
-        self.assertIn(top.strip(), output)
+        public = (self.folder / "databases-summary.md").read_text(encoding="utf-8")
+        self.assertIn(public.rstrip(), output)  # the terminal shows the public summary, not the figures
+        self.assertIn("- `gold.performance_comparison_daily`: 1 added, 1 removed, 4 changed.", public)
+        self.assertIn("Frozen month-end snapshot check: pass.", public)
+        for figure in ("0.05", "2026-10", "u…", "s…", "Δ", "%"):
+            self.assertNotIn(figure, public)
 
     def test_report_holds_no_account_numbers_names_or_text_values(self):
         _, output, markdown, report = self._database_report()
-        text = markdown + json.dumps(report, ensure_ascii=False) + output
+        public = (self.folder / "databases-summary.md").read_text(encoding="utf-8")
+        text = markdown + json.dumps(report, ensure_ascii=False) + output + public
         for secret in (*ACCOUNTS, *NAMES, "Jane Q", "ZZTEST", COMPOSITE, "1000100.50", "1000000.50"):
             self.assertNotIn(secret, text)
         self.assertNotRegex(text, r"[A-Z]{1,2}\d{5,}")
@@ -372,7 +380,8 @@ class ReleaseDataReportDatabaseTests(unittest.TestCase):
 
     def test_missing_variable_or_file_exits_2_without_writing(self):
         code, output = self._run("compare", "--before", "env:RELEASE_UNSET_VARIABLE", "--after", "missing.jsonl",
-                                 "--markdown", str(self.folder / "unset.md"), "--json", str(self.folder / "unset.json"))
+                                 "--markdown", str(self.folder / "unset.md"), "--json", str(self.folder / "unset.json"),
+                                 "--public-summary", str(self.folder / "unset-summary.md"))
         self.assertEqual(code, 2)
         self.assertIn("RELEASE_UNSET_VARIABLE is not set", output)
         self.assertFalse((self.folder / "unset.md").exists())

@@ -9,6 +9,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -204,6 +205,91 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(len(check["problems"]), 2)
 
 
+class PublicSummaryTests(unittest.TestCase):
+    """The summary for the public PR: counts and names only."""
+
+    def report(self):
+        before_returns = [("U9400001", "2031-07-19", 123456.789, "pass", "v1", "t1"),
+                          ("U9400002", "2031-07-20", 4242.4242, "pass", "v1", "t1"),
+                          ("composite-x", "2031-07-21", 0.0, "pass", "v1", "t1")]
+        after_returns = [("U9400001", "2031-07-19", 98765.4321, "warn", "v1", "t2"),
+                         ("U9400002", "2031-07-20", 4242.4242, "pass", "v1", "t2"),
+                         ("U9400003", "2031-07-22", 31415.9265, "pass", "v2", "t2")]
+        before_nav = [("U9400001", "2031-07-19", "USD", "555555.25", "a", 1)]
+        after_nav = [("U9400001", "2031-07-19", "USD", "777777.75", "b", 2)]
+        after_header = {**HEADER, "migrations": HEADER["migrations"] + ["071_synthetic_change.sql"]}
+        return report_tool.build_report(
+            source("before", returns(before_returns), nav(before_nav)),
+            source("after", returns(after_returns), nav(after_nav), header=after_header))
+
+    def test_no_figures_dates_subjects_or_values(self):
+        report = self.report()
+        full = report_tool.render_markdown(report)
+        public = report_tool.render_public_summary(report)
+        for figure in ("123456", "98765", "24691", "31415", "4242", "555555", "777777", "222222"):
+            self.assertNotIn(figure, public)
+        self.assertIn("222,222", full)  # the full report has the figures; the summary must not
+        for value in ("2031", "07-19", "U9400", "composite-x", "u…", "s…", "…#", "warn", "v1", "v2", "→", "Δ", "%"):
+            self.assertNotIn(value, public)
+        # Outside backticked table, column and migration names, every number is a count.
+        counts = {len(report["biggest_changes"]), len(report["summary"]["unchanged"]),
+                  len(report["summary"]["absent"]) + len(report["views_not_compared"])}
+        for table in report["tables"].values():
+            counts |= {table["rows"].get(name) for name in ("added", "removed", "changed")}
+            counts |= {stats["changed"] for stats in (table.get("columns") or {}).values()}
+        bare = re.sub(r"`[^`]*`", "", public)
+        self.assertTrue(re.findall(r"\d", bare))
+        for number in re.findall(r"\d[\d,]*", bare):
+            self.assertIn(int(number.replace(",", "")), counts, number)
+
+    def test_what_the_summary_says(self):
+        public = report_tool.render_public_summary(self.report())
+        self.assertIn("Tables changed: 2. Unchanged: 0.", public)
+        self.assertIn("Frozen month-end snapshot check: not run", public)
+        self.assertIn("- `gold.performance_comparison_daily`: 1 added, 1 removed, 1 changed.", public)
+        self.assertIn("  - Numbers changed beyond tolerance: yes: `portfolio_return`.", public)
+        self.assertIn("  - `quality_status`: 1 value changed.", public)
+        self.assertIn("  - `calculation_version`: rows per value changed.", public)
+        self.assertIn("  - Numbers changed beyond tolerance: yes: `total_text`.", public)
+        self.assertIn("  - Other columns changed: `row_sha256`.", public)
+        self.assertIn("`071_synthetic_change.sql`", public)
+        self.assertNotIn("Needs attention", public)
+
+    def test_attention_items_carry_no_ids_or_figures(self):
+        frozen = [["11111111-1111-1111-1111-111111111111", "frozen", "d1", "d1", "s1", "2026-09-30",
+                   "2026-10-01T09:00:00+00:00"]]
+        rewritten = [frozen[0][:3] + ["other"] + frozen[0][4:]]
+        columns = [["snapshot_id", "uuid"], ["subject_id", "text"], ["period_end", "text"],
+                   ["snapshot_payload_json", "text"]]
+
+        def snapshots(payload, rows):
+            entry = report_tool.encode_table(report_tool.FROZEN_TABLE, "gold", columns, ["snapshot_id"],
+                                             [(frozen[0][0], "U9400001", "2026-09-30", payload)])
+            return {**entry, "frozen": rows}
+
+        report = report_tool.build_report(
+            source("a", snapshots("{}", frozen), nav([("U9400001", "2026-10-15", "USD", "1", "a", 1)])),
+            source("b", snapshots('{"nav": 1}', rewritten), header={**HEADER, "all_tenants": True}))
+        public = report_tool.render_public_summary(report)
+        self.assertEqual(len(report["summary"]["attention"]), 4)
+        self.assertIn("Frozen month-end snapshot check: fail.", public)
+        self.assertIn("- A frozen or approved month-end snapshot changed.", public)
+        self.assertIn("- Before and after were read with different row-level security", public)
+        self.assertIn("- `silver.nav_snapshots` is no longer in the database.", public)
+        self.assertNotIn("1111", public)
+        self.assertNotIn("sha256:", public)
+
+    def test_summary_command_over_the_json(self):
+        report = self.report()
+        with tempfile.TemporaryDirectory() as folder:
+            saved, out = Path(folder) / "r.json", Path(folder) / "s.md"
+            saved.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = report_tool.main(["summary", "--report", str(saved), "--out", str(out)])
+            self.assertEqual(code, 1)
+            self.assertEqual(out.read_text(encoding="utf-8"), report_tool.render_public_summary(report))
+
+
 class FileTests(unittest.TestCase):
     def test_snapshot_files_round_trip_and_command_line(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -218,24 +304,29 @@ class FileTests(unittest.TestCase):
             with contextlib.redirect_stdout(output):
                 code = report_tool.main(["compare", "--before", str(folder / "before.jsonl.gz"),
                                          "--after", str(folder / "after.jsonl"),
-                                         "--markdown", str(folder / "r.md"), "--json", str(folder / "r.json")])
+                                         "--markdown", str(folder / "r.md"), "--json", str(folder / "r.json"),
+                                         "--public-summary", str(folder / "p.md")])
             self.assertEqual(code, 1)
             saved = json.loads((folder / "r.json").read_text(encoding="utf-8"))
             self.assertAlmostEqual(saved["tables"]["silver.nav_snapshots"]["columns"]["total_text"]["max_abs"]["delta"],
                                    1.0)
-            self.assertIn("**1 of 1 tables changed; 0 unchanged.**", output.getvalue())
-            self.assertNotIn("<details>", output.getvalue())  # stdout has the summary only
+            public = (folder / "p.md").read_text(encoding="utf-8")
+            self.assertIn("Tables changed: 1. Unchanged: 0.", public)
+            self.assertIn(public.rstrip(), output.getvalue())  # stdout has the public summary only
+            self.assertNotIn("Δ", output.getvalue())
             self.assertIn("<details>", (folder / "r.md").read_text(encoding="utf-8"))
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(report_tool.main(["compare", "--before", str(folder / "after.jsonl"),
                                                    "--after", str(folder / "after.jsonl"),
                                                    "--markdown", str(folder / "s.md"),
-                                                   "--json", str(folder / "s.json")]), 0)
+                                                   "--json", str(folder / "s.json"),
+                                                   "--public-summary", str(folder / "sp.md")]), 0)
             (folder / "other.json").write_text('{"something": "else"}\n', encoding="utf-8")
             errors = io.StringIO()
             with contextlib.redirect_stderr(errors):
                 code = report_tool.main(["compare", "--before", str(folder / "other.json"),
-                                         "--after", str(folder / "after.jsonl")])
+                                         "--after", str(folder / "after.jsonl"),
+                                         "--public-summary", str(folder / "op.md")])
             self.assertEqual(code, 2)
             self.assertIn("is not a release data snapshot", errors.getvalue())
 

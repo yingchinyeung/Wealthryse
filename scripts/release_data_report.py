@@ -1,8 +1,8 @@
 """What numbers change: a before-and-after report on the silver and gold tables (upgrade U6).
 
 Before an image that touches silver or gold goes live, its jobs run on a restored copy of
-the database and this report goes on the PR. docs/MEDALLION_RELEASE_REPORT.md has the
-steps. On a single copy, take a snapshot before and after the candidate's jobs run:
+the database. The public summary goes on the PR; the full report stays in the project's
+private folder for the approver. docs/MEDALLION_RELEASE_REPORT.md has the steps. On a single copy, take a snapshot before and after the candidate's jobs run:
 
     python scripts/release_data_report.py snapshot --out before.jsonl.gz
     (run the candidate image's jobs against the copy)
@@ -21,9 +21,11 @@ relative change, per table and per account or subject. Columns that every rebuil
 rewrites (generated_at, fetched_at and the like) are not compared. Frozen month-end
 snapshots get the sha256 checks scripts/medallion_layers.py makes around each S3 batch.
 
-The report (Markdown for the PR, and JSON) holds aggregates only: no account numbers
-(accounts appear as u…#n and other subjects as s…#n, labels that hold within one
-report), no names and no text values. Snapshot files hold figures per row, with keys,
+The full report (Markdown and JSON) holds aggregates only: no account numbers (accounts
+appear as u…#n and other subjects as s…#n, labels that hold within one report), no names
+and no text values. Its deltas can still reveal client figures, and the repository is
+public, so it never goes on a PR. The public summary (--public-summary, or the summary
+command over the JSON) holds counts and table and column names only. Snapshot files hold figures per row, with keys,
 subjects and text replaced by sha256 digests. They are still client data: keep them on
 the admin VM and delete them with the copy.
 
@@ -866,7 +868,9 @@ def _table_details(result: dict) -> list[str]:
 def render_markdown(report: dict, *, details: bool = True) -> str:
     summary, before, after = report["summary"], report["before"], report["after"]
     changed = len(summary["changed"]) + len(summary["new"]) + len(summary["gone"])
-    lines = ["## Release data report: silver and gold", ""]
+    lines = ["## Release data report: silver and gold", "",
+             "Private: keep this report in the project's private folder. Post only the public summary on the PR.",
+             ""]
     if not has_changes(report):
         lines.append(f"**No figures changed.** All {summary['tables']} silver and gold tables are unchanged.")
     else:
@@ -927,6 +931,80 @@ def render_markdown(report: dict, *, details: bool = True) -> str:
     return mask("\n".join(lines) + "\n")
 
 
+def _public_attention(report: dict) -> list[str]:
+    """The attention items without figures, ids or dates."""
+    summary = report["summary"]
+    items = []
+    if (summary.get("frozen_snapshots") or {}).get("problems"):
+        items.append("A frozen or approved month-end snapshot changed. They never change: stop and investigate.")
+    if report["before"].get("rows_read") != report["after"].get("rows_read"):
+        items.append("Before and after were read with different row-level security, so they are not comparable.")
+    items += [f"`{name}` is no longer in the database." for name in summary["gone"]]
+    return items
+
+
+def _public_table(result: dict) -> list[str]:
+    name = result["table"]
+    if result["status"] == "new":
+        return [f"- `{name}`: new table."]
+    if result["status"] == "gone":
+        return [f"- `{name}`: no longer in the database."]
+    rows = result["rows"]
+    lines = [f"- `{name}`: {rows['added']:,} added, {rows['removed']:,} removed, {rows['changed']:,} changed."]
+    columns = result.get("columns") or {}
+    numeric = sorted(column for column, stats in columns.items()
+                     if stats.get("max_abs") or any(item.get("max_abs") for item in (stats.get("paths") or {}).values()))
+    categories = sorted(set(result.get("transitions") or {}) | set(result.get("categories") or {}))
+    other = sorted(column for column in columns if column not in numeric and column not in categories)
+    lines.append("  - Numbers changed beyond tolerance: "
+                 + (("yes: " + ", ".join(f"`{column}`" for column in numeric)) if numeric else "no") + ".")
+    for column in categories:
+        if column in (result.get("transitions") or {}):
+            count = columns.get(column, {}).get("changed", 0)
+            lines.append(f"  - `{column}`: {count:,} value{'' if count == 1 else 's'} changed.")
+        else:
+            lines.append(f"  - `{column}`: rows per value changed.")
+    if other:
+        lines.append("  - Other columns changed: " + ", ".join(f"`{column}`" for column in other) + ".")
+    schema = result.get("schema") or {}
+    if schema:
+        parts = [f"{kind.replace('_', ' ')} " + ", ".join(f"`{column}`" for column in value)
+                 for kind, value in schema.items() if isinstance(value, list)]
+        if schema.get("key_changed"):
+            parts.append("key changed")
+        lines.append("  - Definition changed: " + "; ".join(parts) + ".")
+    return lines
+
+
+def render_public_summary(report: dict) -> str:
+    """What may go on a public PR: counts and names only. No figures, deltas, relative
+    changes, dates or subject labels; the full report stays private."""
+    summary = report["summary"]
+    changed = [item["table"] for item in report["biggest_changes"]]
+    not_compared = len(summary["absent"]) + len(report["views_not_compared"])
+    frozen = summary.get("frozen_snapshots")
+    lines = ["## Release data report: public summary", "",
+             f"Tables changed: {len(changed):,}. Unchanged: {len(summary['unchanged']):,}. "
+             f"Not compared: {not_compared:,} (views, and tables in neither database).",
+             "Frozen month-end snapshot check: "
+             + ("not run (no reporting snapshots table)" if frozen is None else "fail" if frozen["problems"] else "pass")
+             + ".", ""]
+    attention = _public_attention(report)
+    if attention:
+        lines += ["**Needs attention:**", ""] + [f"- {item}" for item in attention] + [""]
+    if changed:
+        lines += ["### Changed tables", ""]
+        for name in changed:
+            lines += _public_table(report["tables"][name])
+        lines.append("")
+    if report["migrations"]["added"]:
+        lines += ["Migrations applied for the candidate: "
+                  + ", ".join(f"`{name}`" for name in report["migrations"]["added"]) + ".", ""]
+    lines.append("Counts and names only. The full report, with the figures, is kept privately for the approver. "
+                 "Made by `scripts/release_data_report.py`.")
+    return mask("\n".join(lines) + "\n")
+
+
 # ---- command line ----
 
 def main(argv: list[str] | None = None) -> int:
@@ -939,17 +1017,28 @@ def main(argv: list[str] | None = None) -> int:
     compare = sub.add_parser("compare", help="compare two snapshots or databases and write the report")
     compare.add_argument("--before", required=True, help="snapshot file, or env:NAME for a database URL")
     compare.add_argument("--after", required=True, help="snapshot file, or env:NAME for a database URL")
-    compare.add_argument("--markdown", default="release-data-report.md", help="Markdown report for the PR")
-    compare.add_argument("--json", default="release-data-report.json", help="JSON report")
+    compare.add_argument("--markdown", default="release-data-report.md", help="full Markdown report (private)")
+    compare.add_argument("--json", default="release-data-report.json", help="full JSON report (private)")
+    compare.add_argument("--public-summary", default="release-data-summary.md",
+                         help="counts and names only, for the PR")
     compare.add_argument("--rel-tol", type=float, default=1e-9,
                          help="numbers this close (relative) count as unchanged")
     compare.add_argument("--abs-tol", type=float, default=1e-12)
+    public = sub.add_parser("summary", help="write the public summary from a saved JSON report")
+    public.add_argument("--report", default="release-data-report.json", help="full JSON report")
+    public.add_argument("--out", default="release-data-summary.md", help="public summary for the PR")
     for command in (snapshot, compare):
         command.add_argument("--tenant", default=medallion_layers.DEFAULT_TENANT,
                              help="app.tenant_id for a login that does not bypass row-level security")
         command.add_argument("--table", action="append", default=[],
                              help="only this table (layer.name or name); repeatable")
     args = parser.parse_args(argv)
+    if args.command == "summary":
+        report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+        text = render_public_summary(report)
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(text.rstrip())
+        return 1 if has_changes(report) else 0
     only = args.table or None
     try:
         if args.command == "snapshot":
@@ -975,8 +1064,11 @@ def main(argv: list[str] | None = None) -> int:
     Path(args.markdown).write_text(markdown, encoding="utf-8")
     Path(args.json).write_text(json.dumps(report, indent=1, sort_keys=True, ensure_ascii=False) + "\n",
                                encoding="utf-8")
-    print(markdown.split("<details>", 1)[0].rstrip())
-    print(f"\nWrote {Path(args.markdown).resolve()} and {Path(args.json).resolve()}")
+    public_summary = render_public_summary(report)
+    Path(args.public_summary).write_text(public_summary, encoding="utf-8")
+    print(public_summary.rstrip())  # the figures stay in the files, out of terminal logs
+    print(f"\nPublic summary for the PR: {Path(args.public_summary).resolve()}")
+    print(f"Full report, keep private: {Path(args.markdown).resolve()} and {Path(args.json).resolve()}")
     return 1 if has_changes(report) else 0
 
 

@@ -212,6 +212,30 @@ class SupervisorTasksDatabaseTests(unittest.TestCase):
         store.db.rollback()
         self.assertEqual(len(failed), 1)
 
+    def test_6_the_dispatchers_records_fit_the_table_and_are_found_again(self):
+        from datetime import datetime, timezone
+
+        from wealthryse_agent.supervisor import dispatcher
+
+        store = self._store()
+        now = datetime(2026, 10, 29, 23, 10, tzinfo=timezone.utc)
+        for job, status, mode in (("holdings_explainer", "shadow", "watch"), ("risk_watch", "done", "live"),
+                                  ("weekly_brief", "blocked", "live"), ("risk_watch", "failed", "live")):
+            event = dispatcher.Event(dispatcher.BY_JOB[job], "U1", "2026-10-30", "2026-W44" if job == "weekly_brief"
+                                     else f"2026-10-{30 if status != 'failed' else 29}")
+            rows = dispatcher.tree(event, mode_=mode, detected_at=now, status=status,
+                                   written=1 if status == "done" else None,
+                                   usage={"input_tokens": 5, "output_tokens": 1} if status == "done" else None,
+                                   error_code="tool_error" if status == "failed" else None)
+            self.assertTrue(store.add_tasks(rows), (job, status))
+        self.assertEqual(store.event_keys(10), {"event:holdings_explainer:U1:2026-10-30",
+                                                "event:risk_watch:U1:2026-10-30", "event:weekly_brief:U1:2026-W44",
+                                                "event:risk_watch:U1:2026-10-29"})
+        roots = [r for r in store.task_roots("2000-01-01", "2999-01-01") if r["source"] == "event"]
+        self.assertEqual(len(roots), 4)
+        self.assertEqual({r["detail"]["minutes_before_fixed_run"] for r in roots if r["detail"]["job"] != "weekly_brief"},
+                         {80, 125})
+
 
 if __name__ == "__main__":
     unittest.main()

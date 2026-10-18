@@ -7,6 +7,8 @@ often a figure fell back to the old calculation, and what each kind of request c
 
 Answers the client analysis team gave in live mode are counted apart, in "live": how each was
 led, how often the checker objected, how many specialists did not finish, and what they cost.
+The event dispatcher's records are counted apart too, in "events": which jobs new data would
+have woken, how long before their fixed times, and in live mode what the runs wrote.
 
     python -m wealthryse_agent.supervisor.report --from 2026-10-29 --to 2026-11-09
     python -m wealthryse_agent.supervisor.report --from 2026-10-29 --to 2026-11-09 --json
@@ -34,9 +36,27 @@ def _percentile(values: list[int], share: float) -> int | None:
 
 def summarise(roots: Iterable[dict[str, Any]]) -> dict[str, Any]:
     roots = list(roots)
-    summary = _watched([r for r in roots if r.get("mode", "watch") == "watch"])
-    summary["live"] = _live([r for r in roots if r.get("mode") == "live"])
+    chat = [r for r in roots if r.get("source", "chat") != "event"]
+    summary = _watched([r for r in chat if r.get("mode", "watch") == "watch"])
+    summary["live"] = _live([r for r in chat if r.get("mode") == "live"])
+    summary["events"] = _events([r for r in roots if r.get("source") == "event"])
     return summary
+
+
+def _events(roots: list[dict[str, Any]]) -> dict[str, Any]:
+    """The dispatcher's records: what new data would have woken (watch) or did wake (live)."""
+    details = [r.get("detail") or {} for r in roots]
+    by_job: dict[str, list[int]] = {}
+    for detail in details:
+        if isinstance(detail.get("minutes_before_fixed_run"), int):
+            by_job.setdefault(str(detail.get("job")), []).append(detail["minutes_before_fixed_run"])
+    return {
+        "events": len(roots),
+        "by_job": dict(Counter(str(d.get("job")) for d in details)),
+        "median_minutes_before_fixed_run": {job: _percentile(v, 0.5) for job, v in sorted(by_job.items())},
+        "live": dict(Counter(r.get("status") for r in roots if r.get("mode") == "live")),
+        "written": sum(int(d.get("written") or 0) for d in details),
+    }
 
 
 def _tokens_by_lead(roots: list[dict[str, Any]]) -> dict[str, list[int]]:
@@ -130,6 +150,16 @@ def render(summary: dict[str, Any], since: str, until: str) -> str:
              "route (finished answers only): " + (", ".join(f"{k} {v}" for k, v in sorted(summary["cost"]["mean_tokens_by_lead"].items()))
                           or "none") + ".",
              f"Time to answer: median {summary['elapsed_ms']['p50']} ms, 90th percentile {summary['elapsed_ms']['p90']} ms."]
+    events = summary.get("events") or {}
+    if events.get("events"):
+        lines += ["",
+                  f"Events: new data would have woken {events['events']} job run(s): "
+                  + ", ".join(f"{k} {v}" for k, v in sorted(events["by_job"].items())) + "; median minutes before "
+                  "the fixed time: " + ", ".join(f"{k} {v}" for k, v in events["median_minutes_before_fixed_run"].items())
+                  + "."]
+        if events["live"]:
+            lines.append("Runs started by events: " + ", ".join(f"{k} {v}" for k, v in sorted(events["live"].items()))
+                         + f"; {events['written']} inbox card(s) written.")
     team = summary.get("live") or {}
     if team.get("requests"):
         m = team["requests"]

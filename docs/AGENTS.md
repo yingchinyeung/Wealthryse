@@ -810,6 +810,39 @@ the report hold up. Each step is a redeploy of `infra/agent-apps.bicep` with Yin
 approval. **The undo is `supervisorMode=watch`** (or `off`): chat goes straight back
 to today's analyst.
 
+### Event dispatcher: jobs wake when their data is in (off)
+
+The scheduled client analysis jobs run at fixed times whether or not that day's data is in.
+The dispatcher (`supervisor/dispatcher.py`, job `ibkrv2stg-agent-dispatcher`, every 5
+minutes, code only) asks the tool server, as each job and with that job's own accounts,
+what the job is waiting for:
+
+| Job | Wakes on (silver, through `get_data_freshness`) | Fixed time today |
+|---|---|---|
+| holdings explainer | a new holdings date with no card yet | 00:30 UTC daily |
+| risk watch | a new valuation date | 01:15 UTC weekdays |
+| weekly brief | a finished week (its Friday is in, or the next week has started) with no brief yet | 01:30 UTC Saturdays |
+
+- **`AGENT_DISPATCHER=watch`** records one tree per event in `agent.tasks` (source
+  `event`): supervisor, `event_dispatcher`, then the job, with the data date, the job's
+  next fixed time and how many minutes earlier the event came. Nothing runs.
+- **`live`** also runs the jobs named in `AGENT_DISPATCHER_JOBS` for that one account,
+  through the same job code, tools and access as the scheduled run, within the daily
+  token budget. The scheduled jobs stay as a backup: whichever comes first writes the
+  inbox card and the other finds it and skips. An event is recorded, and run, once.
+- A run starts nothing new after four minutes, so it ends before the next run starts.
+- The shadow report counts events apart: by job, median minutes before the fixed time,
+  and, in live mode, the runs and the cards they wrote.
+- Held builds (a gate investigator) and finished month-end packages (the month-end
+  team) join once Medallion's contracted build view and the gate investigator's tools
+  exist, and the month-end team only after December's month-end, as decided.
+
+**Turning it on.** Not before the 1 to 7 Nov freeze ends. Planned: `deployDispatcher=true`
+with `dispatcherMode=watch` first, then from Tue 17 Nov `dispatcherMode=live` with
+`dispatcherJobs=holdings_explainer,risk_watch,weekly_brief`; the fixed schedules stay until
+Mon 30 Nov. Each step is a redeploy of `infra/agent-apps.bicep` with Ying's approval. The undo
+is `dispatcherMode=off` (or `watch`), or `deployDispatcher=false`, which removes the job.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool

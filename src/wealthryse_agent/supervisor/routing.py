@@ -87,13 +87,14 @@ def agreement(planned: tuple[str, ...] | list[str], used: tuple[str, ...] | list
     """How the route compares with the specialists today's generalist actually needed.
 
     agree: the same. over: the route asked for more. under: it missed some. partial: some of each.
-    differ: none in common. undecided: no rule placed it. no_tools: the answer needed no data.
+    differ: none in common. undecided: no rule placed it, so the router model would have decided.
+    no_tools: the route picked specialists but the answer needed no data.
     """
     planned_set, used_set = set(planned), set(used)
-    if not used_set:
-        return "agree" if not planned_set else "no_tools"
     if not planned_set:
         return "undecided"
+    if not used_set:
+        return "no_tools"
     if planned_set == used_set:
         return "agree"
     if planned_set > used_set:

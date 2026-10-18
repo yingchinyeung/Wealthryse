@@ -162,6 +162,18 @@ CLIENT_SPECIALISTS = tuple(m.name for m in MEMBERS if m.team == "client_analysis
 JOB_MEMBER = {job: member.name for member in MEMBERS for job in member.jobs}
 
 
+# Which specialist answers for each website page's certified figures (ibkr_etl.certified_figures pages).
+PAGE_OWNERS = {"overview": "holdings_performance", "holdings": "holdings_performance", "cash": "holdings_performance",
+               "performance": "holdings_performance", "combined-holdings": "holdings_performance",
+               "risk-snapshot": "risk", "risk-statistics": "risk"}
+
+
+def figure_owner(figure_id: str) -> str | None:
+    """The specialist a certified figure belongs to, from its website page."""
+    item = certified_tools.register.figures().get(figure_id)
+    return PAGE_OWNERS.get(item.page) if item is not None else None
+
+
 def owner(tool: str) -> str | None:
     """The client analysis specialist a tool belongs to; None for shared and server tools."""
     if tool in SHARED_CLIENT_TOOLS or tool in SERVER_TOOLS:

@@ -29,6 +29,8 @@ SETTING = "AGENT_SUPERVISOR"
 MODES = ("off", "watch")
 PIN_TOOL = "get_data_freshness"
 TABLE_RECHECK_SECONDS = 600.0
+# Trees refused in a row before recording pauses until the next table check.
+REFUSALS_BEFORE_PAUSE = 3
 
 
 def mode(environ: Mapping[str, str] | None = None) -> str:
@@ -54,17 +56,27 @@ def fallback_count(result: Any) -> int:
     return count
 
 
+def _freshness(result: Any) -> dict[str, Any]:
+    """The pin from a get_data_freshness result: its latest valuation date and lag, no values."""
+    data = (result or {}).get("data") or {}
+    return {"as_of": data.get("latest_valuation_date"), "source": "freshness",
+            "lag_days": data.get("days_since_valuation")}
+
+
 class Recorder:
     """A tool client that passes every call straight through and notes which tools were used.
 
-    It never changes an argument or a result. It keeps names and counts only, never data.
+    It never changes an argument or a result. It keeps names, counts and the freshness dates
+    the analyst already read (so the pin needs no second call), never values.
     """
 
     def __init__(self, inner: Any) -> None:
         self.inner = inner
-        self.used: list[str] = []
+        self.used: list[str] = []  # every call, in order
+        self.ok: list[str] = []  # the calls that returned
         self.failed: list[str] = []
         self.fallback: dict[str, int] = {}
+        self.freshness: dict[str, dict[str, Any]] = {}  # account id -> pin, from the analyst's own call
 
     def list_tools(self) -> list[dict[str, Any]]:
         return self.inner.list_tools()
@@ -76,8 +88,11 @@ class Recorder:
         except Exception:
             self.failed.append(name)
             raise
+        self.ok.append(name)
         try:
             flagged = fallback_count(result)
+            if name == PIN_TOOL and isinstance(arguments, dict) and arguments.get("account_id"):
+                self.freshness.setdefault(str(arguments["account_id"]), _freshness(result))
         except Exception:  # noting must never break the call
             flagged = 0
         if flagged:
@@ -95,6 +110,7 @@ class _TableCheck:
         self.clock = clock
         self.ready: bool | None = None
         self.checked = 0.0
+        self.refusals = 0
         self.lock = threading.Lock()
 
     def __call__(self, store: Any) -> bool:
@@ -105,6 +121,18 @@ class _TableCheck:
             if not self.ready:
                 LOGGER.warning("supervisor watch-only mode is on but agent.tasks is not installed; recording nothing")
             return self.ready
+
+    def written(self) -> None:
+        with self.lock:
+            self.refusals = 0
+
+    def refused(self) -> None:
+        """A tree the database refused. Several in a row pause recording until the next check."""
+        with self.lock:
+            self.refusals += 1
+            if self.refusals >= REFUSALS_BEFORE_PAUSE:
+                self.ready, self.checked, self.refusals = False, self.clock(), 0
+                LOGGER.warning("supervisor task trees keep being refused; pausing recording for ten minutes")
 
 
 TABLE = _TableCheck()
@@ -120,9 +148,7 @@ def pin(tools_for: Callable[[str, str], Any], user: str, account_id: str) -> dic
     client = None
     try:
         client = tools_for(user, str(uuid.uuid4()))
-        data = (client.call(PIN_TOOL, {"account_id": account_id}) or {}).get("data") or {}
-        return {"as_of": data.get("latest_valuation_date"), "source": "freshness",
-                "lag_days": data.get("days_since_valuation")}
+        return _freshness(client.call(PIN_TOOL, {"account_id": account_id}))
     except Exception as error:
         return {"as_of": None, "source": "unavailable", "error": type(error).__name__}
     finally:
@@ -148,32 +174,45 @@ def chat_tree(*, route: Route, account_id: str, correlation_id: str, conversatio
               error_code: str | None = None) -> list[dict[str, Any]]:
     """The rows for one chat request, root first."""
     used = list(recorder.used) if recorder else []
+    ok = list(recorder.ok) if recorder else []
     citations = list(getattr(turn, "citations", None) or [])
     facts = _citation_facts(citations)
-    used_specialists = sorted({name for name in (registry.owner(t) for t in used) if name})
-    # Guide definitions are answered in-process; a cited one counts even if the recorder missed it.
+    # Only calls that returned show what the answer needed; failed ones stay in tools_used and tools_failed.
+    needed = {name for name in (registry.owner(t) for t in ok) if name}
     for citation in citations:
-        name = registry.owner(str(citation.get("tool") or "")) if isinstance(citation, dict) else None
-        if name and name not in used_specialists:
-            used_specialists = sorted({*used_specialists, name})
+        if not isinstance(citation, dict):
+            continue
+        if citation.get("certified"):
+            # A certified figure belongs to the specialist for its website page.
+            name = registry.figure_owner(str((citation.get("figure") or {}).get("figure_id") or ""))
+        else:
+            # Guide definitions are answered in-process; a cited one counts even if the recorder missed it.
+            name = registry.owner(str(citation.get("tool") or ""))
+        if name:
+            needed.add(name)
+    used_specialists = sorted(needed)
     pinned_as_of = pinned.get("as_of")
     cited = facts["as_of_cited"]
     root_id = str(uuid.uuid4())
     common = {"root_id": root_id, "mode": "watch", "source": "chat", "subject_id": account_id,
               "correlation_id": correlation_id, "conversation_id": conversation_id}
     status = {"answer": "done", "rejected": "rejected"}.get(outcome, "failed")
+    if turn is not None:
+        usage = {**(getattr(turn, "usage", None) or {}), "tool_calls": int(getattr(turn, "tool_calls", 0) or 0)}
+    else:
+        # A run that failed before its answer: tokens are unknown, so the report leaves it out of cost means.
+        usage = {"tool_calls": len(used)}
     root = {
         **common, "task_id": root_id, "parent_id": None, "level": "supervisor", "team": None, "role": "supervisor",
-        "autonomy": "answer", "status": status, "pinned_as_of": pinned_as_of, "build_ids": facts["build_ids"],
-        "tools_used": used[:60],
-        "usage": {**(getattr(turn, "usage", None) or {}), "tool_calls": int(getattr(turn, "tool_calls", 0) or 0)},
+        "autonomy": "answer", "status": status, "pinned_as_of": pinned_as_of, "build_ids": facts["build_ids"][:20],
+        "tools_used": used[:60], "usage": usage,
         "detail": {
             "route": {"team": route.team, "lead": route.lead,
                       "specialists": list(route.specialists), "decided_by": route.decided_by,
                       "advice": route.advice},
             "used_specialists": used_specialists,
             "agreement": agreement(route.specialists, used_specialists),
-            "layers": registry.layers(used),
+            "layers": registry.layers(ok),
             "tools_failed": (recorder.failed if recorder else [])[:20],
             "fallback": dict(recorder.fallback) if recorder else {},
             "pin": {k: v for k, v in pinned.items() if k != "as_of"},
@@ -185,6 +224,7 @@ def chat_tree(*, route: Route, account_id: str, correlation_id: str, conversatio
             "elapsed_ms": elapsed_ms,
             **({"out_of_scope": True} if getattr(turn, "answer", None) == OUT_OF_SCOPE else {}),
             **({"error_code": error_code} if error_code else {}),
+            **({"usage_partial": True} if turn is None else {}),
         },
     }
     rows = [root]
@@ -213,11 +253,15 @@ def record_chat(store: Any, tools_for: Callable[[str, str], Any], *, user: str, 
     try:
         if not table(store):
             return False
+        # The analyst usually read freshness already; only ask again when it didn't.
+        pinned = (recorder.freshness.get(str(account_id)) if recorder else None) or pin(tools_for, user, account_id)
         rows = chat_tree(route=route_chat(question), account_id=account_id, correlation_id=correlation_id,
                          conversation_id=conversation_id, outcome=outcome, turn=turn, recorder=recorder,
-                         pinned=pin(tools_for, user, account_id), elapsed_ms=elapsed_ms, error_code=error_code)
+                         pinned=pinned, elapsed_ms=elapsed_ms, error_code=error_code)
         if store.add_tasks(rows):
+            getattr(table, "written", lambda: None)()
             return True
+        getattr(table, "refused", lambda: None)()
         LOGGER.warning("supervisor task tree refused", extra={"correlation_id": correlation_id})
     except Exception:
         LOGGER.warning("supervisor watch failed", exc_info=True, extra={"correlation_id": correlation_id})

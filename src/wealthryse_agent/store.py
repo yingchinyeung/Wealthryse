@@ -382,11 +382,12 @@ class Store:
         return True
 
     def task_roots(self, since: str, until: str) -> list[dict[str, Any]]:
-        """The supervisor rows (one per request) created in [since, until), oldest first."""
+        """The supervisor rows (one per request) created in [since, until), UTC days, oldest first."""
         rows = self.db.execute(
             "SELECT task_id::text AS task_id, mode, source, status, subject_id, pinned_as_of, build_ids, tools_used, "
             "usage, detail, created_at FROM agent.tasks WHERE tenant_id = ?::uuid AND parent_id IS NULL "
-            "AND created_at >= ?::date AND created_at < ?::date ORDER BY created_at",
+            "AND created_at >= (?::date)::timestamp AT TIME ZONE 'UTC' "
+            "AND created_at < (?::date)::timestamp AT TIME ZONE 'UTC' ORDER BY created_at",
             (self.tenant_id, since, until),
         ).fetchall()
         self.db.rollback()
@@ -394,12 +395,16 @@ class Store:
 
 
 def _refused(error: Exception) -> bool:
-    """A row the database refused (a check, a missing parent, a bad value), not a broken connection."""
+    """The statement was refused (a check, a bad value, a missing grant), but the connection is fine.
+
+    A lost or broken connection (OperationalError, InterfaceError) is not a refusal and still raises.
+    """
     try:
         import psycopg
     except ImportError:  # pragma: no cover - psycopg is a dependency of the image
         return False
-    return isinstance(error, (psycopg.errors.IntegrityError, psycopg.errors.DataError))
+    return isinstance(error, (psycopg.errors.IntegrityError, psycopg.errors.DataError,
+                              psycopg.errors.ProgrammingError, psycopg.errors.NotSupportedError))
 
 
 def _json_columns(row: dict[str, Any], *names: str) -> dict[str, Any]:

@@ -139,7 +139,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_agreement(self):
         self.assertEqual(agreement(("risk",), ["risk"]), "agree")
-        self.assertEqual(agreement((), []), "agree")
+        self.assertEqual(agreement((), []), "undecided")
         self.assertEqual(agreement(("risk", "modelling"), ["risk"]), "over")
         self.assertEqual(agreement(("risk",), ["risk", "modelling"]), "under")
         self.assertEqual(agreement(("risk", "metrics_guide"), ["risk", "modelling"]), "partial")
@@ -167,7 +167,7 @@ class _Inner:
 
 def _certified(ref, build):
     return {"id": ref, "tool": certified_tools.GET, "certified": True, "as_of": "2026-10-27",
-            "figure": {"figure_id": "sharpe_ratio", "build_id": build, "value": 1.12}}
+            "figure": {"figure_id": "risk.annualized_volatility", "build_id": build, "value": 1.12}}
 
 
 class RecorderTests(unittest.TestCase):
@@ -183,8 +183,17 @@ class RecorderTests(unittest.TestCase):
         recorder.close()
         self.assertTrue(inner.closed)
         self.assertEqual(recorder.used, ["get_performance", "get_risk_metrics"])
+        self.assertEqual(recorder.ok, ["get_performance"])
         self.assertEqual(recorder.failed, ["get_risk_metrics"])
         self.assertEqual(recorder.fallback, {"get_performance": 1})
+
+    def test_keeps_the_freshness_dates_the_analyst_read(self):
+        inner = _Inner({"get_data_freshness": {"data": {"latest_valuation_date": "2026-10-28",
+                                                        "days_since_valuation": 1, "rows": 9}}})
+        recorder = watch.Recorder(inner)
+        recorder.call("get_data_freshness", {"account_id": "U1"})
+        self.assertEqual(recorder.freshness,
+                         {"U1": {"as_of": "2026-10-28", "source": "freshness", "lag_days": 1}})
 
     def test_fallback_marks_are_read_at_the_top_level_or_inside_data(self):
         self.assertEqual(watch.fallback_count({"data": {"figures_source": {"/a": "fallback", "/b": "fallback"}}}), 2)
@@ -309,6 +318,43 @@ class ChatTreeTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "failed")
         self.assertEqual(rows[0]["detail"]["error_code"], "timeout")
         self.assertEqual(rows[0]["usage"], {"tool_calls": 0})
+        self.assertTrue(rows[0]["detail"]["usage_partial"])
+        self.assertNotIn("usage_partial", self._tree()[0]["detail"])
+
+    def test_a_failed_run_counts_the_calls_it_made(self):
+        recorder = watch.Recorder(_Inner(fail={"get_risk_metrics"}))
+        recorder.call("get_performance", {"account_id": "U1"})
+        with self.assertRaises(Exception):
+            recorder.call("get_risk_metrics", {"account_id": "U1"})
+        rows = self._tree(outcome="failed", turn=None, recorder=recorder, error_code="timeout")
+        self.assertEqual(rows[0]["usage"], {"tool_calls": 2})
+        self.assertEqual(rows[0]["tools_used"], ["get_performance", "get_risk_metrics"])
+        self.assertEqual(rows[0]["detail"]["tools_failed"], ["get_risk_metrics"])
+
+    def test_a_failed_call_does_not_count_as_needed(self):
+        recorder = watch.Recorder(_Inner(fail={"get_risk_metrics"}))
+        recorder.call("get_performance", {"account_id": "U1"})
+        with self.assertRaises(Exception):
+            recorder.call("get_risk_metrics", {"account_id": "U1"})
+        turn = Turn(answer="Up 5% [T1].", citations=[{"id": "T1", "tool": "get_performance", "as_of": "2026-10-28"}])
+        detail = self._tree(turn=turn, recorder=recorder)[0]["detail"]
+        self.assertEqual(detail["used_specialists"], ["holdings_performance"])
+        self.assertEqual(detail["layers"], {"silver": 1})
+        self.assertEqual(detail["agreement"], "over")
+
+    def test_an_answer_from_certified_figures_alone_counts_their_specialist(self):
+        recorder = watch.Recorder(_Inner())
+        recorder.call(certified_tools.GET, {"account_id": "U1"})
+        turn = Turn(answer="Volatility 12% [F1].", citations=[_certified("F1", BUILD_A)])
+        detail = self._tree(route=route_chat("What is my volatility?"), turn=turn, recorder=recorder)[0]["detail"]
+        self.assertEqual(detail["used_specialists"], ["risk"])
+        self.assertEqual(detail["agreement"], "agree")
+
+    def test_build_ids_stay_within_the_column_limit(self):
+        citations = [_certified(f"F{i}", f"{i:08d}-0000-0000-0000-000000000000") for i in range(25)]
+        root = self._tree(turn=Turn(answer="ok", citations=citations))[0]
+        self.assertEqual(len(root["build_ids"]), 20)
+        self.assertTrue(root["detail"]["mixed_builds"])
 
 
 class RecordChatTests(unittest.TestCase):
@@ -341,6 +387,37 @@ class RecordChatTests(unittest.TestCase):
             raise RuntimeError("no token")
 
         self.assertTrue(self._record(_TaskStore(), tools_for=no_client))
+
+    def test_the_pin_reuses_the_freshness_the_analyst_read(self):
+        seen = []
+
+        def tools_for(user, correlation_id):
+            seen.append(correlation_id)
+            return _freshness("2026-10-01")(user, correlation_id)
+
+        recorder = watch.Recorder(_freshness()(USER, "corr"))
+        recorder.call("get_data_freshness", {"account_id": "U1"})
+        store = _TaskStore()
+        self.assertTrue(watch.record_chat(store, tools_for, user=USER, account_id="U1", question="How did I do?",
+                                          correlation_id="corr",
+                                          conversation_id="c0ffee00-0000-0000-0000-000000000000",
+                                          outcome="answer", turn=Turn(answer="ok"), recorder=recorder,
+                                          table=lambda s: True))
+        self.assertEqual(seen, [])
+        self.assertEqual(store.trees[0][0]["pinned_as_of"], "2026-10-28")
+
+    def test_trees_refused_in_a_row_pause_recording_until_the_next_check(self):
+        now = [0.0]
+        check = watch._TableCheck(clock=lambda: now[0])
+        store = _TaskStore(accept=False)
+        for _ in range(watch.REFUSALS_BEFORE_PAUSE):
+            self.assertFalse(self._record(store, table=check))
+        self.assertEqual(len(store.trees), watch.REFUSALS_BEFORE_PAUSE)
+        self.assertFalse(self._record(store, table=check))  # paused: nothing sent
+        self.assertEqual(len(store.trees), watch.REFUSALS_BEFORE_PAUSE)
+        store.accept, now[0] = True, watch.TABLE_RECHECK_SECONDS + 1
+        self.assertTrue(self._record(store, table=check))
+        self.assertEqual(check.refusals, 0)
 
     def test_the_pin_uses_its_own_correlation_id(self):
         seen = []
@@ -489,6 +566,9 @@ class ReportTests(unittest.TestCase):
                  root("planner", ["risk", "modelling"], "over", 300, tool_refs=2, behind_pin=True,
                       fallback={"get_performance": 1}),
                  root("router", [], "undecided", 50, pin={"source": "unavailable"}, out_of_scope=True)]
+        failed = root("planner", ["risk", "modelling"], "over", 0, usage_partial=True)
+        failed["status"] = "failed"
+        self.assertEqual(report.summarise([*roots, failed])["cost"]["mean_tokens_by_lead"]["planner"], 300)
         summary = report.summarise(roots)
         self.assertEqual(summary["requests"], 3)
         self.assertEqual(summary["route"], {"fast_path": 1, "planner": 1, "router": 1, "advice": 0,

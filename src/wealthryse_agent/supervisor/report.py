@@ -36,6 +36,8 @@ def summarise(roots: Iterable[dict[str, Any]]) -> dict[str, Any]:
     leads = Counter((d.get("route") or {}).get("lead", "router") for d in details)
     tokens_by_lead: dict[str, list[int]] = {}
     for detail, used in zip(details, usage):
+        if detail.get("usage_partial"):
+            continue  # failed before its answer: its tokens are unknown, so it would drag the mean down
         lead = (detail.get("route") or {}).get("lead", "router")
         tokens_by_lead.setdefault(lead, []).append(int(used.get("input_tokens", 0)) + int(used.get("output_tokens", 0)))
     layers: Counter[str] = Counter()
@@ -88,7 +90,7 @@ def render(summary: dict[str, Any], since: str, until: str) -> str:
              f"{_share(pin['mixed_builds'], n)}, pin unavailable {pin['unavailable']}.",
              "Layers read: " + (", ".join(f"{k} {_share(v, n)}" for k, v in sorted(summary["layers"].items())) or "none") + ".",
              f"Cost: {summary['cost']['tokens']} tokens, {summary['cost']['tool_calls']} tool calls; mean tokens by "
-             "route: " + (", ".join(f"{k} {v}" for k, v in sorted(summary["cost"]["mean_tokens_by_lead"].items()))
+             "route (finished answers only): " + (", ".join(f"{k} {v}" for k, v in sorted(summary["cost"]["mean_tokens_by_lead"].items()))
                           or "none") + ".",
              f"Time to answer: median {summary['elapsed_ms']['p50']} ms, 90th percentile {summary['elapsed_ms']['p90']} ms."]
     return "\n".join(lines)

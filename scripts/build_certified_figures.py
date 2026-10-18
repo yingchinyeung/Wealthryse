@@ -1,10 +1,12 @@
 """Build the certified figures (medallion upgrade U5, docs/MEDALLION_CERTIFIED_FIGURES.md).
 
 Does nothing unless CERTIFIED_FIGURES_BUILD=on: no database connection and no lineage run.
-When on, it reads every page's figures for the dates due (new NAV dates and the last five,
-or every NAV date with --backfill), checks them, and publishes them to gold.certified_figures
-or holds the build with its reason. --dry-run reads and checks but writes nothing and prints
-only counts. The work is in ibkr_etl.certified_build.
+When on, it reads every page's figures for the dates due (new NAV dates and the last five),
+then for older NAV dates with no published figures yet, newest first (every older date with
+--backfill), until its time limit (--minutes); checks them; and publishes them to
+gold.certified_figures or holds the build with its reason. The next run carries on with the
+dates left. --dry-run reads and checks but writes nothing and prints only counts. The work is
+in ibkr_etl.certified_build.
 
 Exit codes: 0 when published, held for review, not due yet or off; 1 when the run fails.
 """
@@ -30,7 +32,11 @@ JOB_NAME = certified_build.JOB_NAME  # the name run_main records, written out be
 
 def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build, check and publish the certified figures.")
-    parser.add_argument("--backfill", action="store_true", help="Every NAV date, not only the new and recent ones.")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Read every older NAV date again, not only those with no published figures yet.")
+    parser.add_argument("--minutes", type=float, default=None,
+                        help="Stop reading after this many minutes and publish what was read (default: "
+                             f"{certified_build.MINUTES_ENV}, else {certified_build.DEFAULT_MINUTES:g}).")
     parser.add_argument("--dry-run", action="store_true", help="Read and check, write nothing, print counts.")
     parser.add_argument("--subject", action="append", default=[], help="Only this subject (repeatable).")
     parser.add_argument("--page", action="append", default=[], choices=list(certified_build.READERS),
@@ -47,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ[cf.PAGES_SETTING] = ""
     record = lineage.current()
     return certified_build.run(database_url=database_url, backfill=args.backfill, dry_run=args.dry_run,
-                               only_subjects=args.subject, pages=args.page or None,
+                               only_subjects=args.subject, pages=args.page or None, minutes=args.minutes,
                                on_connect=lambda connection: record.bind(connection), record=record)
 
 

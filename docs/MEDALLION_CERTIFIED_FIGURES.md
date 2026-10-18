@@ -352,6 +352,17 @@ first checks that its inputs for the day are there; if not, it publishes nothing
 pages say "Not yet updated". Today a page shows new data the minute it lands; a moved page
 shows it once the build has published, at most about an hour and a half later.
 
+**How long a run reads.** Reading every page for every past date takes longer than one run
+may: on the 18 Oct rehearsal copy, reading the history did not finish in 25 minutes. So each
+run first reads the new dates and the last five, oldest first so they follow on from the
+published ones, then older dates that have no published figures yet, newest first and one
+account or portfolio at a time, and stops reading after 30
+minutes (`CERTIFIED_FIGURES_MINUTES`, or `--minutes`). It publishes what it read, and the next
+run carries on. Each subject's built dates stay one unbroken run back from its newest date, so
+a page asked for an older date finds either that date's figures or none, and then shows
+today's figures as it does now. The history fills in over the first few runs; `--backfill`
+reads every older date again.
+
 ## How agents read them
 
 ### The tools
@@ -526,8 +537,8 @@ factsheet job and the monthly reports untouched, so it cannot meet the factsheet
 |---|---|---|---|
 | Mon 19 | Merge parts 1 to 7 | None: everything is off | Revert |
 | Mon 19 | Apply the migration | Its approved step | Reverse migration (the tables are empty) |
-| Mon 19 | On a restored copy: run the build with `--backfill`, the release data report and the `figures` command for all seven pages; fix or explain each difference; Ying reviews the private report | None on live | Delete the copy |
-| Mon 19 evening | Deploy the job (`CERTIFIED_FIGURES_BUILD=on`, `LINEAGE_RECORDING=true`) and run the backfill once on live | The deployment and one run | Setting off; rows stay unread |
+| Mon 19 to Tue 20 | On a restored copy: run the build (time-limited), the release data report and the `figures` command for all seven pages, which counts dates the build has not reached yet apart from differences; fix or explain each difference; Ying reviews the private report | None on live | Delete the copy |
+| Mon 19 to Tue 20 | Deploy the job (`CERTIFIED_FIGURES_BUILD=on`, `LINEAGE_RECORDING=true`) and run it once on live; the scheduled runs fill in the rest of the history | The deployment and one run | Setting off; rows stay unread |
 | Tue 20 | First scheduled builds; website release with all seven pages in `shadow`; install the agent view with the tools still off | Website setting; one approved run of the install script | Setting back; the view is unused |
 | Thu 22 | Batch 1 | `overview=on,holdings=on,cash=on` | Back to `shadow` |
 | Fri 23 | Batch 2 | `performance=on` | Back to `shadow` |

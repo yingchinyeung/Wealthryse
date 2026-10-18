@@ -7,10 +7,18 @@ that shows it today (ibkr_etl.web), called for one subject and one as-of date wi
 arguments the page passes. No figure is worked out here. page_rows() is the reader for one
 subject and date, and can serve any tool that needs "the page's figures the old way".
 
-A run: check its inputs are there; pick the dates (each NAV date for --backfill, otherwise
-new dates and the last RECHECK_DATES); read each page's figures; compare them with the
-published ones and keep only new or changed rows; check them; then write a build in shadow
-with those rows and publish it, or hold it with the reason. The checks:
+A run: check its inputs are there; pick the dates; read each page's figures; compare them
+with the published ones and keep only new or changed rows; check them; then write a build in
+shadow with those rows and publish it, or hold it with the reason.
+
+The dates: first each subject's new dates and its last RECHECK_DATES, oldest first, then the
+history: every older date that has no published figures yet (every older date with --backfill),
+newest first and one subject at a time in turn. Reading stops after a time limit (CERTIFIED_FIGURES_MINUTES,
+--minutes, DEFAULT_MINUTES otherwise) and the run publishes what it read; the next run carries on
+with the rest. Each subject's built dates so stay one unbroken run back from its newest date, so a
+page asked for an older date finds either that date's figures or none (and shows today's).
+
+The checks:
 
 - rules: drawdowns at most zero, win rates and shares of months between 0 and 1, correlation
   between -1 and 1 (the contract rules of gold.certified_figures);
@@ -27,8 +35,11 @@ import contextlib
 import hashlib
 import json
 import math
+import os
 import re
+import time as monotonic_time
 import uuid
+from itertools import zip_longest
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -39,6 +50,10 @@ from . import certified_figures as cf
 
 JOB_NAME = "ibkrv2stg-certified-figures"
 RECHECK_DATES = 5
+# How long one run reads before it publishes what it has: the job runs at 09:05 and 09:45 UTC
+# with a 60-minute limit, so the first run ends before the second starts.
+DEFAULT_MINUTES = 30.0
+MINUTES_ENV = "CERTIFIED_FIGURES_MINUTES"
 WRITE_BATCH = 2000
 HONG_KONG = ZoneInfo("Asia/Hong_Kong")
 # Who the build reads the pages as: an owner, as the website's database authorization sees one.
@@ -817,23 +832,64 @@ def expected_date(today_hk: date) -> date:
     return day
 
 
-def dates_to_build(subject: Subject, published_latest: str | None, *, backfill: bool) -> list[str]:
-    if backfill or not subject.dates:
-        return list(subject.dates)
+def due_dates(subject: Subject, published: Iterable[str]) -> list[str]:
+    """The dates every run reads: the last RECHECK_DATES and each date after the newest published
+    one. With nothing published yet, only the last RECHECK_DATES; the rest is history."""
+    latest = max(published, default=None)
     recent = subject.dates[-RECHECK_DATES:]
-    newer = [day for day in subject.dates if published_latest is None or day > published_latest]
+    newer = [day for day in subject.dates if latest is not None and day > latest]
     return sorted(set(recent) | set(newer))
+
+
+def history_dates(subject: Subject, published: Iterable[str], due: Iterable[str], *, backfill: bool) -> list[str]:
+    """The older dates, newest first: each one with no published figures, or every one with --backfill."""
+    published, due = set(published), set(due)
+    return sorted((day for day in subject.dates if day not in due and (backfill or day not in published)),
+                  reverse=True)
+
+
+def work_plan(found: Iterable[Subject], published_dates: Mapping[str, Iterable[str]], *,
+              backfill: bool) -> list[tuple[Subject, str]]:
+    """What a run reads, in order: every subject's due dates, oldest first, so a run that stops
+    among them leaves no gap after the published dates; then the history, newest first and one
+    date of each subject in turn."""
+    plan: list[tuple[Subject, str]] = []
+    histories = []
+    for subject in found:
+        published = set(published_dates.get(subject.id, ()))
+        due = due_dates(subject, published)
+        plan += [(subject, day) for day in sorted(due)]
+        histories.append([(subject, day) for day in history_dates(subject, published, due, backfill=backfill)])
+    for turn in zip_longest(*histories):
+        plan += [item for item in turn if item is not None]
+    return plan
+
+
+def time_limit(minutes: float | None, environ: Mapping[str, str] | None = None) -> float:
+    """Minutes a run may read: the argument, else CERTIFIED_FIGURES_MINUTES, else DEFAULT_MINUTES."""
+    if minutes is None:
+        text = str((os.environ if environ is None else environ).get(MINUTES_ENV, "")).strip()
+        try:
+            minutes = float(text) if text else DEFAULT_MINUTES
+        except ValueError:
+            minutes = DEFAULT_MINUTES
+    if not math.isfinite(minutes) or minutes <= 0:
+        raise ValueError("the time limit must be a positive number of minutes")
+    return minutes
 
 
 def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, only_subjects: Iterable[str] = (),
         pages: Iterable[str] | None = None, now: datetime | None = None, web=None, record=None,
-        on_connect: Callable[[Any], None] | None = None, out: Callable[[str], None] = print) -> int:
+        on_connect: Callable[[Any], None] | None = None, out: Callable[[str], None] = print,
+        minutes: float | None = None, clock: Callable[[], float] = monotonic_time.monotonic) -> int:
     """One build. Returns 0 when published, held for review or not due (inputs not in yet).
 
     on_connect gets the writing connection first (the job binds its lineage run there); record,
-    a lineage run, is told what was written."""
+    a lineage run, is told what was written. Reading stops after `minutes` (time_limit())."""
     import psycopg
 
+    limit = time_limit(minutes)
+    begun = clock()
     web = web or load_web()
     pages = [page for page in (pages or cf.pages()) if page in READERS]
     started = now or datetime.now(timezone.utc)
@@ -852,35 +908,44 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 on_connect(connection)
             published = published_rows(connection, [subject.id for subject in found])
             connection.rollback()
-            latest = {}
+            published_dates: dict[str, set[str]] = {}
             for key in published:
-                latest[key[0]] = max(latest.get(key[0], ""), key[5])
+                published_dates.setdefault(key[0], set()).add(key[5])
+            plan = work_plan(found, published_dates, backfill=backfill)
             notes: dict = {}
             rows: list[Row] = []
             disagreements: dict[str, list[str]] = {}
             errors: list[str] = []
+            read: dict[str, list[str]] = {}
+            done = 0
+            for subject, day in plan:
+                if clock() - begun >= limit * 60:
+                    break
+                done += 1
+                read.setdefault(subject.id, []).append(day)
+                try:
+                    rows += page_rows(web, subject, day, pages, today_hk=today_hk, notes=notes)
+                except Exception as error:  # noqa: BLE001 - a bug in a reader holds the build
+                    errors.append(f"{mask(subject.id)} {day}: {type(error).__name__}")
+            left = len(plan) - done
             for subject in found:
-                days = dates_to_build(subject, latest.get(subject.id), backfill=backfill)
-                for day in days:
-                    try:
-                        rows += page_rows(web, subject, day, pages, today_hk=today_hk, notes=notes)
-                    except Exception as error:  # noqa: BLE001 - a bug in a reader holds the build
-                        errors.append(f"{mask(subject.id)} {day}: {type(error).__name__}")
-                if days:
-                    newest = days[-1]
-                    try:
-                        with_own_connections = page_disagreements(web, subject, newest, pages, rows, today_hk)
-                    except Exception as error:  # noqa: BLE001
-                        with_own_connections = [f"error: {type(error).__name__}"]
-                    if with_own_connections:
-                        disagreements[mask(subject.id)] = with_own_connections
+                if not read.get(subject.id):
+                    continue
+                newest = max(read[subject.id])
+                try:
+                    with_own_connections = page_disagreements(web, subject, newest, pages, rows, today_hk)
+                except Exception as error:  # noqa: BLE001
+                    with_own_connections = [f"error: {type(error).__name__}"]
+                if with_own_connections:
+                    disagreements[mask(subject.id)] = with_own_connections
             result = compare(rows, published)
             to_write = result["new"] + result["changed"]
             failures = rule_failures(to_write)
             checks = {
                 "subjects": len(found), "subjects_ready": len(ready), "subjects_skipped": len(skipped),
                 "expected_date": expected, "run_kind": "backfill" if backfill else "daily",
-                "figures_read": len(rows), "new": len(result["new"]), "changed": len(result["changed"]),
+                "subject_dates_planned": len(plan), "subject_dates_read": done, "subject_dates_left": left,
+                "minutes": limit, "figures_read": len(rows), "new": len(result["new"]), "changed": len(result["changed"]),
                 "unchanged": result["unchanged"],
                 "same_inputs_new_answer": sorted({row.figure_id for row in result["violations"]}),
                 "same_inputs_new_answer_count": len(result["violations"]),
@@ -909,6 +974,8 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 f"{len(failures)} rule failures, {len(disagreements)} page disagreements, {len(errors)} read errors.")
             for line in errors[:20]:
                 out(f"  read error {line}")
+            out(f"Read {done} of {len(plan)} subject dates."
+                + (f" Stopped after {limit:g} minutes: the other {left} are left for the next run." if left else ""))
             if dry_run:
                 out("Dry run: nothing written. " + ("Would hold: " + held_reason if held_reason
                                                     else "Would publish." if to_write else "Nothing to publish."))

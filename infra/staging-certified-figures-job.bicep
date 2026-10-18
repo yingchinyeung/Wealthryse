@@ -51,7 +51,8 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
     environmentId: managedEnvironment.id
     configuration: {
       triggerType: 'Schedule'
-      // The one-off --backfill (a manual start with the args changed) reads every NAV date.
+      // Each run reads for up to 30 minutes (CERTIFIED_FIGURES_MINUTES in the build) and publishes what
+      // it read; older NAV dates with no figures yet are filled in, newest first, over the next runs.
       replicaTimeout: 3600
       replicaRetryLimit: 0
       scheduleTriggerConfig: {

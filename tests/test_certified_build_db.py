@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import test_medallion_layers_db as layers
 from ibkr_etl import certified_build as build
+from ibkr_etl import certified_pages
 from ibkr_etl import certified_figures as cf
 
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
@@ -175,9 +176,8 @@ def _script():
     return module
 
 
-@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
-class CertifiedBuildTests(unittest.TestCase):
-    """In order: off, dry run, first build, nothing new, held builds, a new day."""
+class _BuildDatabase(unittest.TestCase):
+    """A database of its own for each test class, with the helpers the tests share."""
 
     @classmethod
     def setUpClass(cls):
@@ -236,7 +236,11 @@ class CertifiedBuildTests(unittest.TestCase):
         row = self._published()[(SUBJECT, figure_id, period, item, benchmark_id, as_of)]
         return row["value"] if row["value"] is not None else row["value_text"]
 
-    # -- the tests, in order ------------------------------------------------------------------
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class CertifiedBuildTests(_BuildDatabase):
+    """In order: off, dry run, first build, nothing new, held builds, a new day."""
 
     def test_1_off_by_default_it_does_nothing(self):
         script = _script()
@@ -409,6 +413,55 @@ class CertifiedBuildTests(unittest.TestCase):
         job = self._owner("SELECT DISTINCT job_name FROM lineage_events WHERE run_id = %s", run_id)
         self.assertEqual(job, [(script.JOB_NAME,)])
         self.assertTrue(math.isfinite(self._value("overview.nav", "2026-10-19")))
+
+
+
+class _Clock:
+    """A clock that moves one second each time it is read."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        self.now += 1.0
+        return self.now
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class TimeLimitTests(_BuildDatabase):
+    """A run that reaches its time limit publishes what it read, and the next run carries on."""
+
+    def test_the_history_is_filled_in_newest_first_over_several_runs(self):
+        days = _business_days(FIRST, LAST)
+        # Eight reads in each limited run (the clock is read once at the start and once per date).
+        code, lines = self._run(minutes=8.5 / 60, clock=_Clock())
+        self.assertEqual(code, 0, lines)
+        self.assertIn(f"Read 8 of {len(days)} subject dates. Stopped after {8.5 / 60:g} minutes: the other "
+                      f"{len(days) - 8} are left for the next run.", lines)
+        [(_, status, _, checks)] = self._builds()
+        self.assertEqual((status, checks["subject_dates_read"], checks["subject_dates_left"]),
+                         ("published", 8, len(days) - 8))
+        self.assertEqual(sorted({key[5] for key in self._published()}), days[-8:])   # one unbroken run back
+        # A page asked for a date the build has not reached finds no certified figures, so it shows
+        # today's; one asked for a date it has reached finds that date's.
+        from psycopg.rows import dict_row
+
+        with layers._connect(self.database, WEB, row_factory=dict_row) as web:
+            for day, found in ((days[-9], None), (days[-8], days[-8])):
+                certified = certified_pages.read_certified(web, tenant_id=TENANT, subject_id=SUBJECT,
+                                                           figure_ids=["overview.nav"], as_of=day)
+                self.assertEqual(None if certified is None else certified.as_of, found, day)
+
+        code, lines = self._run(minutes=8.5 / 60, clock=_Clock())                    # the last five again, then three more
+        self.assertEqual(code, 0, lines)
+        self.assertEqual(sorted({key[5] for key in self._published()}), days[-11:])
+        self.assertGreater(self._builds()[-1][3]["unchanged"], 0)
+
+        code, lines = self._run()                                                    # no limit reached: the rest
+        self.assertEqual(code, 0, lines)
+        self.assertIn(f"Read {len(days) - 6} of {len(days) - 6} subject dates.", lines)
+        self.assertEqual(sorted({key[5] for key in self._published()}), days)
+        self.assertEqual([status for _, status, _, _ in self._builds()], ["published"] * 3)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ for folder in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
     if str(folder) not in sys.path:
         sys.path.insert(0, str(folder))
 
-from ibkr_etl import crisis_scenarios, lineage, raw_capture  # noqa: E402
+from ibkr_etl import crisis_scenarios, input_readiness, lineage, raw_capture  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.util import canonical_json  # noqa: E402
 from refresh_provisional_benchmark import _crisis_scenario_subjects  # noqa: E402
@@ -35,6 +35,7 @@ def run(connection, *, ticker_factory=None) -> tuple[int, dict]:
 
 
 def main() -> int:
+    input_readiness.gate("crisis-scenarios-daily")
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() not in {"staging", "internal-production"}:
         raise RuntimeError("The crisis-scenarios job may run only in staging or internal production")
     database_url = os.environ.get("DATABASE_URL", "")

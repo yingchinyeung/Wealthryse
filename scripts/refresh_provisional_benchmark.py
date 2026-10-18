@@ -18,6 +18,7 @@ from ibkr_etl.db import (  # noqa: E402
     finish_run_success,
     start_run,
 )
+from ibkr_etl import input_readiness  # noqa: E402
 from ibkr_etl.provisional_benchmark import refresh_and_materialize  # noqa: E402
 from ibkr_etl.crisis_replay import (  # noqa: E402
     refresh_composite_crisis_replay,
@@ -187,6 +188,7 @@ def _record_outputs(result: dict) -> None:
 
 
 def main() -> int:
+    input_readiness.gate("benchmark-daily")
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() not in {
         "staging",
         "internal-production",

@@ -15,6 +15,7 @@ if str(SOURCE_ROOT) not in sys.path:
 from ibkr_etl import lineage  # noqa: E402
 from ibkr_etl.config import load_settings  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
+from ibkr_etl import input_readiness  # noqa: E402
 from ibkr_etl.risk_snapshots import (  # noqa: E402
     build_risk_snapshot,
     RiskInputsNotReady,
@@ -50,6 +51,7 @@ def _arguments() -> argparse.Namespace:
 
 
 def main() -> int:
+    input_readiness.gate("risk-snapshots")
     args = _arguments()
     settings = load_settings()
     if not settings.database_url:

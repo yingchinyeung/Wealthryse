@@ -11,7 +11,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from ibkr_etl import lineage, raw_capture  # noqa: E402
+from ibkr_etl import input_readiness, lineage, raw_capture  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.sector_classification import (  # noqa: E402
     refresh_sector_classifications_range,
@@ -103,6 +103,7 @@ def _mark_risk_analytics_gate(
 
 
 def main() -> int:
+    input_readiness.gate("sector-classification")
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() not in {
         "staging",
         "internal-production",

@@ -22,6 +22,7 @@ from ibkr_etl.crisis_replay import (  # noqa: E402
     refresh_crisis_replay,
 )
 from ibkr_etl.db import connect  # noqa: E402
+from ibkr_etl import input_readiness  # noqa: E402
 from ibkr_etl.derived_portfolio import (  # noqa: E402
     refresh_filtered_portfolio,
     refresh_fixed_unit_composite,
@@ -477,6 +478,7 @@ def _record_outputs(market_data: dict, results: list[dict]) -> None:
 
 
 def main() -> int:
+    input_readiness.gate("derived-daily")
     settings = load_settings()
     if not settings.database_url:
         raise RuntimeError("Self-service derived refresh requires DATABASE_URL")

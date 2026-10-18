@@ -1,0 +1,152 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.gold.certified_builds
+name: certified_builds
+version: 1.0.0
+status: active
+domain: gold
+dataProduct: portfolio-medallion
+description:
+  purpose: 'One row per certified-figures build (U5): when it ran, whether it was published, held or rolled back,
+    the result of each check, and the lineage run that wrote it.'
+  usage: Readers use published builds only (gold.v_certified_figures does this). Set a published build to rolled_back
+    to undo it; pages and agents fall back to the previous published figures at once.
+  limitations: 'Rows are never deleted. Status moves only forward: shadow to published or held, held to published,
+    and a published or held build to rolled_back (a trigger enforces it).'
+tags:
+- gold
+- derived
+schema:
+- name: certified_builds
+  physicalName: gold.certified_builds
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id and build_id.
+  description: 'One row per certified-figures build: shadow, then published or held; rolled_back undoes one.'
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: build_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: The build's id.
+  - name: run_kind
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: daily (a scheduled run) or backfill (every past date).
+  - name: started_at
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the build started.
+  - name: finished_at
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the build finished its checks.
+  - name: status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: shadow while it writes and checks; then published or held; rolled_back undoes a build.
+  - name: published_at
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the build was published; readers take the newest.
+  - name: checks
+    physicalType: jsonb
+    logicalType: object
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Each check's result as counts and figure ids (no account numbers or values), and the publish gate's
+      verdict once it has one.
+  - name: reason
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Why the build was held or rolled back, in plain words.
+  - name: lineage_run_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The recorded job run that wrote this build (lineage_runs); NULL when that run was not recorded.
+  quality:
+  - name: published_builds_have_a_time
+    description: A published build has its publication time (a CHECK constraint).
+    type: sql
+    query: SELECT COUNT(*) FROM gold.certified_builds WHERE status = 'published' AND published_at IS NULL
+    mustBe: 0
+    severity: error
+    dimension: conformity
+  - name: held_builds_say_why
+    description: A held or rolled-back build says why (a CHECK constraint).
+    type: sql
+    query: SELECT COUNT(*) FROM gold.certified_builds WHERE status IN ('held', 'rolled_back') AND reason IS NULL
+    mustBe: 0
+    severity: error
+    dimension: conformity
+  - name: no_build_left_in_shadow
+    description: A build does not stay in shadow for more than a day (it failed part way).
+    type: sql
+    query: SELECT COUNT(*) FROM gold.certified_builds WHERE status = 'shadow' AND started_at < now() - interval
+      '1 day'
+    mustBe: 0
+    severity: warning
+    dimension: timeliness
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: 'One row per certified-figures build (U5): shadow, published, held or rolled back, with its checks.'
+- property: readByViews
+  value:
+  - gold.v_certified_figures
+contractCreatedTs: '2026-10-18T00:00:00Z'

@@ -1,0 +1,313 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.gold.v_certified_figures
+name: v_certified_figures
+version: 1.0.0
+status: active
+domain: gold
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Certified figures as readers see them: for each figure, subject, period, item, benchmark and date, the
+    row from the newest published build that wrote it.'
+  usage: The website pages and the agents' read tool read this view. Pass the subject and date; freshness is worked
+    out when read (ibkr_etl.certified_figures.freshness).
+  limitations: 'A security_invoker view: each reader sees only its own tenant''s rows through the tables'' row-level
+    security. Marking a build rolled_back drops its rows at once, and the previous published row shows again.'
+tags:
+- gold
+- derived
+schema:
+- name: v_certified_figures
+  physicalName: gold.v_certified_figures
+  physicalType: view
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, subject_id, figure_id, period, item, benchmark_id and as_of_date.
+  description: 'Certified figures as readers see them: the row from the newest published build for each figure.'
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Tenant that owns the row; the tables' row-level security applies to the reader.
+  - name: build_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The build that wrote the row (certified_builds).
+  - name: subject_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: 'Subject: an IBKR account number for accounts, a slug for portfolios and composites. Restricted.'
+  - name: figure_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The figure, from the register (infra/medallion/certified-figures.json), such as risk.sharpe_ratio.
+  - name: period
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: ''''' unless the figure has periods: mtd, qtd, ytd, since_inception, year_YYYY or month_YYYY-MM.'
+  - name: item
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: ''''' unless the figure has items: a holding''s conid, a sector, a currency, a scenario or portfolio/benchmark.
+      Never a name.'
+  - name: benchmark_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: ''''' unless the figure compares with a benchmark.'
+  - name: as_of_date
+    physicalType: date
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The valuation date the figure is for.
+  - name: value
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The number, for units ratio (0.05 is 5%), number and money; NULL when unavailable or for date and
+      text units.
+  - name: value_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The value for units date (yyyy-MM-dd) and text; NULL otherwise.
+  - name: unit
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: ratio, number, money, date or text, as in the factsheet bindings.
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'The currency of a money value: the subject''s reporting currency, or the holding''s or balance''s
+      own.'
+  - name: status
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: ok, or unavailable with the reason.
+  - name: reason
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Why the figure is unavailable, in plain words.
+  - name: detail
+    physicalType: jsonb
+    logicalType: object
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Facts that travel with the value, such as the day of the best day, counts or an FX rate.
+  - name: period_start
+    physicalType: date
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: First date of the data the figure uses, where it has one.
+  - name: period_end
+    physicalType: date
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Last date of the data the figure uses, where it has one.
+  - name: observations
+    physicalType: integer
+    logicalType: integer
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: How many observations the figure uses, where it counts them.
+  - name: definition_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The Metrics guide entry's stable anchor, such as metric-sharpe-ratio.
+  - name: definition_version
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: First 12 hex characters of a sha256 over the guide entry's wording.
+  - name: calculation_version
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The method versions of the code and the source row, such as risk-analytics-v2+benchmark-comparison-v1;
+      imported+<contract> for IBKR's own values.
+  - name: input_sha256
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the inputs the build used for this figure; same inputs and version must give the same
+      value.
+  - name: source_table
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The gold or silver table the figure was read or worked out from.
+  - name: source_key
+    physicalType: jsonb
+    logicalType: object
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: The source row's key, where lineage.trace() starts; it can hold the account number.
+  - name: lineage_run_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The recorded job run that wrote this row (lineage_runs); NULL when that run was not recorded.
+  - name: written_at
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the row was written.
+  - name: build_status
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: 'Always published: only published builds are shown.'
+  - name: published_at
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the build that wrote the row was published.
+  quality:
+  - name: one_row_per_figure
+    description: Each figure appears once per subject, period, item, benchmark and date.
+    type: sql
+    query: SELECT COUNT(*) FROM (SELECT 1 FROM gold.v_certified_figures GROUP BY tenant_id, subject_id, figure_id,
+      period, item, benchmark_id, as_of_date HAVING COUNT(*) > 1) d
+    mustBe: 0
+    severity: error
+    dimension: uniqueness
+  - name: only_published_builds
+    description: Only rows of published builds are shown.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.v_certified_figures WHERE build_status <> 'published'
+    mustBe: 0
+    severity: error
+    dimension: conformity
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: 'Certified figures as readers see them: the newest published build''s row for each figure.'
+- property: calculationVersionColumn
+  value: calculation_version
+- property: calculationVersionSource
+  value:
+  - ibkr_etl.certified_figures.calculation_version
+contractCreatedTs: '2026-10-18T00:00:00Z'

@@ -298,6 +298,114 @@ def _default_job_starter(config: AdminActionConfig, job_name: str) -> str:
     )
 
 
+# The container fields Azure's job start call takes for one execution.
+EXECUTION_CONTAINER_FIELDS = ("name", "image", "command", "args", "env", "resources")
+
+
+def _copy_exactly(item: Mapping[str, Any], fields: tuple[str, ...]) -> dict[str, Any] | None:
+    """`item` limited to `fields`; None when it has anything else that is not empty."""
+    if any(value not in (None, [], {}) for key, value in item.items() if key not in fields):
+        return None
+    return {key: item[key] for key in fields if item.get(key) is not None}
+
+
+def execution_template(job: Mapping[str, Any], env: Mapping[str, str]) -> dict[str, Any] | None:
+    """A job's own template for one execution, with `env` set on its main containers.
+
+    Azure's start call replaces the execution's containers instead of patching them, so
+    they are copied whole. None when the template has anything this cannot copy exactly
+    (volumes, mounts, probes or unknown fields)."""
+    template = _copy_exactly(((job or {}).get("properties") or {}).get("template") or {},
+                             ("containers", "initContainers"))
+    if not template or not template.get("containers"):
+        return None
+    result: dict[str, Any] = {}
+    for key in ("containers", "initContainers"):
+        copied = []
+        for container in template.get(key) or []:
+            item = _copy_exactly(container, EXECUTION_CONTAINER_FIELDS)
+            if item is None or not item.get("name") or not item.get("image"):
+                return None
+            if "resources" in item:  # ephemeralStorage is read-only
+                item["resources"] = {name: item["resources"][name] for name in ("cpu", "memory")
+                                     if name in item["resources"]}
+            if key == "containers":
+                item["env"] = [entry for entry in item.get("env") or [] if entry.get("name") not in env]
+                item["env"] += [{"name": name, "value": value} for name, value in env.items()]
+            copied.append(item)
+        if copied:
+            result[key] = copied
+    return result
+
+
+def configured_env(job: Mapping[str, Any]) -> list[dict[str, str | None]]:
+    """Each main container's own env, by name; None for a value held in a secret."""
+    containers = (((job or {}).get("properties") or {}).get("template") or {}).get("containers") or []
+    return [{str(entry.get("name")): entry.get("value") for entry in container.get("env") or []
+             if isinstance(entry, Mapping)} for container in containers if isinstance(container, Mapping)]
+
+
+def start_job_with_env(config: AdminActionConfig, job_name: str, env: Mapping[str, str], *,
+                       needed: Callable[[Mapping[str, str | None]], bool] | None = None,
+                       token: Callable[[], str] | None = None,
+                       urlopen: Callable[..., Any] = urllib.request.urlopen) -> str:
+    """Start one execution of `job_name` with `env` added for that execution only.
+
+    It reads the job's template and starts the job with that template plus `env`. With
+    `needed`, only when it is true for a main container's own env; otherwise the job
+    starts as configured, exactly as _default_job_starter starts it. It also starts as
+    configured when the template cannot be read or copied exactly, or Azure refuses it
+    (then nothing was started)."""
+    if token is None:
+        from azure.identity import DefaultAzureCredential
+
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        token = lambda: credential.get_token("https://management.azure.com/.default").token  # noqa: E731
+    url = (
+        "https://management.azure.com/subscriptions/"
+        f"{quote(config.subscription_id, safe='')}/resourceGroups/{quote(config.resource_group, safe='')}"
+        f"/providers/Microsoft.App/jobs/{quote(job_name, safe='')}"
+    )
+    headers = {"Authorization": f"Bearer {token()}", "Content-Type": "application/json"}
+
+    def start(body: Mapping[str, Any]) -> str:
+        request = urllib.request.Request(url + "/start?api-version=2024-03-01", data=json.dumps(body).encode("utf-8"),
+                                         method="POST", headers=headers)
+        with urlopen(request, timeout=30) as response:
+            text = response.read()
+            operation_reference = response.headers.get("Operation-Location") or response.headers.get("Location")
+        try:
+            payload = json.loads(text or b"{}")
+        except json.JSONDecodeError:
+            payload = {}
+        return str(payload.get("id") or payload.get("name") or operation_reference or f"start-accepted:{job_name}")
+
+    template, wanted = None, True
+    try:
+        request = urllib.request.Request(url + "?api-version=2024-03-01", method="GET", headers=headers)
+        with urlopen(request, timeout=30) as response:
+            job = json.loads(response.read() or b"{}")
+        wanted = needed is None or any(needed(own) for own in configured_env(job))
+        template = execution_template(job, env) if wanted else None
+    except Exception:  # noqa: BLE001 - start as configured instead
+        template = None
+    try:
+        if not wanted:
+            return start({})
+        if template is not None:
+            try:
+                return start(template)
+            except urllib.error.HTTPError as error:
+                if not 400 <= error.code < 500:
+                    raise
+        ACTION_AUDIT_LOGGER.warning("Started %s without the execution settings %s", job_name, sorted(env))
+        return start({})
+    except urllib.error.HTTPError as error:
+        raise AdminActionError(502, "azure_job_start_failed", f"Azure rejected the staging job start with HTTP {error.code}.") from error
+    except (urllib.error.URLError, TimeoutError) as error:
+        raise AdminActionError(502, "azure_job_start_unavailable", "Azure did not confirm the staging job start.") from error
+
+
 def execute_claimed_action(
     connection_factory: Callable[[], Any],
     config: AdminActionConfig,

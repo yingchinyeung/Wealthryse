@@ -16,6 +16,7 @@ from .benchmark_analytics import (
     portfolio_risk_metrics,
 )
 from .crisis_replay import load_crisis_replay
+from . import publish_gate
 from .util import canonical_json, utc_now_iso
 from .market_calendar import BENCHMARK_MARKETS, CALENDARS, CALENDAR_VERSION, benchmark_session_on_or_before
 
@@ -525,6 +526,11 @@ def build_risk_snapshot(
         timings=timings,
         source_data_sha256=source_sha256,
     )
+    # The publish gate (off by default). It logs its verdict only: the risk page shows one
+    # exact date, so holding this back would show "being prepared" instead.
+    publish_gate.before_commit(connection, {"gold.risk_analytics_snapshots": {
+        "subject_id": subject_id, "as_of_date": as_of, "analytics_version": RISK_ANALYTICS_VERSION}},
+        writer="risk_snapshots")
     connection.commit()
     LOGGER.info(
         "risk_snapshot subject=%s as_of=%s total_ms=%.3f tail_position_ms=%.3f",

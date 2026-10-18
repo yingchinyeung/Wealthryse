@@ -25,6 +25,7 @@ from .crisis_replay import (
     CRISIS_END, CRISIS_START, PROVIDER, PROXY_BY_CURRENCY, PROXY_BY_SYMBOL, RAW_FEED,
     _execute, _fx_rate_as_of, fetch_adjusted_history, resolve_holdings_as_of,
 )
+from . import publish_gate
 from .provisional_benchmark import convert_levels_to_reporting_currency, fetch_fx_to_reporting_yfinance
 from .sector_classification import candidate_symbols
 from .util import canonical_json, utc_now_iso
@@ -471,6 +472,11 @@ def refresh(connection, *, accounts: Iterable[str], composites: Iterable[str],
         else:
             raise RuntimeError(f"{subject_id} is not approved for crisis-period price retrieval")
         store(connection, result)
+        # The publish gate (off by default). In enforce a failing version is rolled back and
+        # recorded below as this subject's failure; load() then shows the previous one.
+        publish_gate.before_commit(connection, {"gold.crisis_scenario_results": {
+            "subject_id": result["subject_id"], "holdings_as_of": result["holdings_as_of"],
+            "calculation_version": VERSION}}, writer="crisis_scenarios")
         connection.commit()
         done[subject_id] = result
         return result

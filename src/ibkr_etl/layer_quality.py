@@ -859,8 +859,9 @@ def _jsonable(value: Any) -> Any:
 
 def record(connection: Any, results: Iterable[Mapping[str, Any]], *, now: datetime, mode_name: str,
            source: str = MONITOR) -> int:
-    """Append results to the history; the caller commits. The publish gate calls this with
-    source='publish_gate' and rule_check_id() ids for each contract rule it runs."""
+    """Append results to the history; the caller commits. A writer that runs contract rules
+    (the publish gate, once wired) records them with source='publish_gate' and rule_check_id()
+    ids, and the monitor then skips those rules that day."""
     current = now.astimezone(timezone.utc)
     rows = []
     for result in results:

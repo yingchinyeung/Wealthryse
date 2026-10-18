@@ -183,6 +183,17 @@ class CatalogCoverageTests(unittest.TestCase):
         planned = layer_quality.plan({layer_quality.CONTRACTS_DIR_ENV: str(CONTRACTS)}, gate_rules=gate).planned()
         self.assertNotIn("rule.silver.nav_snapshots.total_text_is_decimal", [p[0] for p in planned])
 
+    def test_the_image_ships_the_contracts_at_medallion_dir(self):
+        # Dockerfile.azure copies infra/medallion to /app/medallion and sets MEDALLION_DIR.
+        dockerfile = (ROOT / "Dockerfile.azure").read_text(encoding="utf-8")
+        self.assertIn("COPY infra/medallion ./medallion", dockerfile)
+        self.assertIn("ENV MEDALLION_DIR=/app/medallion", dockerfile)
+        ignored = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        self.assertLess(ignored.index("infra"), ignored.index("!infra/medallion"))
+        found = layer_quality.contracts_dir({"MEDALLION_DIR": str(ROOT / "infra" / "medallion"),
+                                             "IBKR_PROJECT_ROOT": "/nonexistent"})
+        self.assertEqual(found, CONTRACTS)
+
     def test_without_contracts_schema_and_rules_are_unavailable(self):
         pass_plan = layer_quality.plan({layer_quality.CONTRACTS_DIR_ENV: "/nonexistent/contracts"})
         self.assertIn("not in this image", pass_plan.contracts_error)

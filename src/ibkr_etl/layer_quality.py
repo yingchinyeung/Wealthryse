@@ -300,6 +300,10 @@ def contracts_dir(environ: Mapping[str, str] | None = None) -> Path | None:
     else:
         roots = [environ.get("IBKR_PROJECT_ROOT"), Path(__file__).resolve().parents[2]]
         candidates = [Path(root) / "infra" / "medallion" / "contracts" for root in roots if root]
+        # The job image copies infra/medallion to MEDALLION_DIR (/app/medallion).
+        medallion = str(environ.get("MEDALLION_DIR", "")).strip()
+        if medallion:
+            candidates.insert(0, Path(medallion) / "contracts")
     return next((path for path in candidates if (path / "silver").is_dir()), None)
 
 

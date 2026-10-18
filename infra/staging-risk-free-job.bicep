@@ -8,10 +8,10 @@ param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
 param riskFreeStartDate string = '2025-01-20'
-// S2 raw market-data capture. Empty keeps capture off and leaves this job's
-// environment exactly as before. To switch on, set it to 'bronze-market-data' after
-// granting this job's identity Storage Blob Data Contributor on that container.
-param rawMarketDataContainer string = ''
+// S2 raw market-data capture, on since 18 Oct 2026: the default matches the live job.
+// The job's identity (ingestionIdentity in staging.bicep) holds Storage Blob Data
+// Contributor on bronze-market-data. Empty switches capture off and drops these settings.
+param rawMarketDataContainer string = 'bronze-market-data'
 param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
 var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [
   { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
@@ -90,6 +90,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'RISK_FREE_START_DATE', value: riskFreeStartDate }
             { name: 'DEPLOYMENT_ENVIRONMENT', value: 'staging' }
+            // The app login cannot create tables, so the job must not try migrations
+            // (live since 18 Oct 2026, as on the institutional daily job).
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
           ], rawMarketDataEnv)
           resources: {
             cpu: json('0.25')

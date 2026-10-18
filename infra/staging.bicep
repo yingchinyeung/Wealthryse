@@ -402,16 +402,11 @@ resource publisherSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-
   }
 }
 
-resource webBlobReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, webIdentity.id, storageBlobReaderRoleId)
-  scope: storage
-  properties: {
-    principalId: webIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: storageBlobReaderRoleId
-  }
-}
+// The web identity's account-wide Storage Blob Data Reader came off on 18 Oct 2026; it reads
+// only through its container roles (staging-web-report-reader.bicep, staging-onboarding-intake.bicep).
 
+// Account-wide Contributor for ingestion and publisher stays until the narrowing around
+// 10 Nov 2026; the container roles below already cover what each identity uses.
 resource ingestionBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, ingestionIdentity.id, storageBlobContributorRoleId)
   scope: storage
@@ -429,6 +424,92 @@ resource publisherBlobContributor 'Microsoft.Authorization/roleAssignments@2022-
     principalId: publisherIdentity.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: storageBlobContributorRoleId
+  }
+}
+
+// Containers made outside this file (onboarding-intake by staging-onboarding-intake.bicep,
+// bronze-market-data by the medallion S2 step), referenced for the container roles below.
+resource onboardingIntakeContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'onboarding-intake'
+}
+resource bronzeMarketDataContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'bronze-market-data'
+}
+
+// Container-scope storage roles (medallion S4a). Each name is the assignment made on
+// 18 Oct 2026, so a redeploy updates it instead of failing on a duplicate.
+resource publisherDraftsContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: '1650cae9-0811-4165-bdba-24be733c4a08'
+  scope: draftContainer
+  properties: {
+    principalId: publisherIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobContributorRoleId
+  }
+}
+
+resource publisherIntakeReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: '8b7c44bf-33fd-4a1d-a66c-1a9a8621dee9'
+  scope: onboardingIntakeContainer
+  properties: {
+    principalId: publisherIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobReaderRoleId
+  }
+}
+
+resource ingestionInputContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: 'e49deab7-7272-4de6-995d-6e7e54fa48a6'
+  scope: inputContainer
+  properties: {
+    principalId: ingestionIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobContributorRoleId
+  }
+}
+
+// The four market-data jobs write their raw copies here as the ingestion identity.
+resource ingestionBronzeMarketDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: 'ce61af0c-490d-4e11-8956-8f4b08b376a6'
+  scope: bronzeMarketDataContainer
+  properties: {
+    principalId: ingestionIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobContributorRoleId
+  }
+}
+
+// For the supervisor's bronze-market-data file checks (still off, see staging-autonomous-admin.bicep).
+resource diagnosticsBronzeMarketDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: '9f644dc9-64c7-4ae0-90db-f760b639048b'
+  scope: bronzeMarketDataContainer
+  properties: {
+    principalId: diagnosticsIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobReaderRoleId
+  }
+}
+
+// Delete locks placed on 18 Oct 2026 (medallion S4a). A lock blocks deletes, not changes, but
+// removing a storage role needs the storage lock lifted briefly. No lock on the key vault yet:
+// role removal there was refused under a lock, so it waits for the credential work (R11, R12).
+resource postgresDeleteLock 'Microsoft.Authorization/locks@2020-05-01' = {
+  name: 'medallion-no-delete'
+  scope: postgres
+  properties: {
+    level: 'CanNotDelete'
+    notes: 'Medallion S4a: delete only with Ying approval'
+  }
+}
+
+resource storageDeleteLock 'Microsoft.Authorization/locks@2020-05-01' = {
+  name: 'medallion-no-delete'
+  scope: storage
+  properties: {
+    level: 'CanNotDelete'
+    notes: 'Medallion S4a: delete only with Ying approval; lift briefly to remove a storage role'
   }
 }
 

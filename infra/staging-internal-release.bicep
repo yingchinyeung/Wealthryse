@@ -29,8 +29,10 @@ var storageBlobContributorRoleId = subscriptionResourceId(
   'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 )
 
+// The name is the assignment made on 18 Oct 2026 (medallion S4a), so a redeploy updates it
+// instead of failing on a duplicate.
 resource publisherInternalReportsContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(internalContainer.id, publisherIdentity.id, storageBlobContributorRoleId)
+  name: '852bd9ae-29b3-44b4-9266-abee52b3bf58'
   scope: internalContainer
   properties: {
     principalId: publisherIdentity.properties.principalId

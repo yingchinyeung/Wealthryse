@@ -64,7 +64,9 @@ class CredentialBrokerTests(unittest.TestCase):
         self.assertIn("scope: tokenVault", source)
         self.assertIn("AZURE_STORAGE_ACCOUNT_URL", source)
         self.assertIn("AZURE_RAW_CONTAINER", source)
-        self.assertIn("flex-discovery-raw-writer", source)
+        # The raw-archive write role sits on the ibkr-raw container, not the whole account.
+        self.assertIn("scope: rawContainer", source)
+        self.assertNotIn("scope: storage\n", source)
         self.assertNotIn("database-admin-url", source)
 
 

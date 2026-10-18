@@ -45,6 +45,14 @@ resource tokenVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
   name: storageAccountName
 }
+resource rawBlobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' existing = {
+  parent: storage
+  name: 'default'
+}
+resource rawContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: rawBlobService
+  name: 'ibkr-raw'
+}
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
   name: last(split(identityResourceId, '/'))
 }
@@ -52,8 +60,10 @@ resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' 
 resource blobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   // Reuse the exact assignment managed by the discovery worker because both
   // jobs intentionally share the same Flex identity and raw archive scope.
-  name: guid(storage.id, identity.id, 'flex-discovery-raw-writer')
-  scope: storage
+  // Scoped to the ibkr-raw container since 18 Oct 2026; the name is the assignment
+  // made that day, so a redeploy updates it instead of failing on a duplicate.
+  name: 'bf64d2a3-4683-4558-89ed-3d35d86a3cf4'
+  scope: rawContainer
   properties: {
     principalId: identity.properties.principalId
     principalType: 'ServicePrincipal'

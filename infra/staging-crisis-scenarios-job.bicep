@@ -7,15 +7,17 @@ param keyVaultName string
 param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
-// S2 raw market-data capture. Empty keeps capture off and leaves this job's
-// environment exactly as before. To switch on, set it to 'bronze-market-data' after
-// granting this job's identity Storage Blob Data Contributor on that container.
-param rawMarketDataContainer string = ''
+// S2 raw market-data capture, on since 18 Oct 2026: the default matches the live job.
+// The job's identity (ingestionIdentity in staging.bicep) holds Storage Blob Data
+// Contributor on bronze-market-data. Empty switches capture off and drops these settings.
+param rawMarketDataContainer string = 'bronze-market-data'
 param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
 var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [
   { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
   { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
   { name: 'AZURE_CLIENT_ID', value: jobIdentity.properties.clientId }
+  // Time allowed for the first-time history files (seconds).
+  { name: 'MARKET_DATA_RAW_BUDGET_SECONDS', value: '120' }
 ]
 
 var tags = {
@@ -91,6 +93,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'DEPLOYMENT_ENVIRONMENT', value: 'internal-production' }
             // Same switch as the website: the job stores scenarios only while the website shows them.
             { name: 'CRISIS_SCENARIOS_ENABLED', value: 'true' }
+            // The app login cannot create tables, so the job must not try migrations
+            // (live since 18 Oct 2026, as on the institutional daily job).
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
           ], rawMarketDataEnv)
           resources: {
             cpu: json('0.5')

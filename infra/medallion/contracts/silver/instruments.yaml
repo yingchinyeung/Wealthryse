@@ -200,6 +200,7 @@ customProperties:
   - ibkr_etl.report
   - ibkr_etl.risk_snapshots
   - ibkr_etl.sector_classification
+  - ibkr_etl.silver_history
   - ibkr_etl.snapshot_preflight
   - ibkr_etl.subject_exports
   - ibkr_etl.switch_dry_run

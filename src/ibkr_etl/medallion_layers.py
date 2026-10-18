@@ -8,6 +8,11 @@ bootstrap_postgres.py keeps granting on public as before, which now reaches the
 views. mirror_privileges then gives each managed login exactly the same rights on
 the table behind each view, column grants included, so every login keeps today's
 rights. Everything here does nothing until a layer schema exists.
+
+The U8 history tables (silver.<table>_history) and their setting
+(public.silver_history_settings) are written only by their owner, through the
+history trigger. The schema-wide grants reach them too, so keep_history_read_only
+takes the write rights back. It does nothing until the U8 migration has run.
 """
 from __future__ import annotations
 
@@ -39,6 +44,16 @@ SELECT p.privilege_type, a.attname
    AND p.grantee = %s::regrole AND p.privilege_type = ANY(%s)
  ORDER BY 1, 2
 """
+
+
+HISTORY_QUERY = """
+SELECT c.relname
+  FROM pg_class c
+  JOIN pg_trigger t ON t.tgrelid = c.oid AND t.tgname = 'history_append_only' AND NOT t.tgisinternal
+ WHERE c.relnamespace = 'silver'::regnamespace AND c.relkind IN ('r', 'p')
+ ORDER BY 1
+"""
+WRITES = ("INSERT", "UPDATE", "DELETE", "TRUNCATE")
 
 
 def present_layers(connection) -> list[str]:
@@ -109,4 +124,38 @@ def mismatches(connection, roles: list[str]) -> list[str]:
                 found.append(f"{role}: public.{name} {view[0]} but {layer}.{name} {table[0]}")
             if view[1] != table[1]:
                 found.append(f"{role}: public.{name} columns {view[1]} but {layer}.{name} columns {table[1]}")
+    return found
+
+
+def history_objects(connection) -> list[tuple[str, str]]:
+    """(schema, name) of the U8 history tables and their setting; empty until that migration has run."""
+    if "silver" not in present_layers(connection):
+        return []
+    found = [("silver", row[0]) for row in connection.execute(HISTORY_QUERY).fetchall()]
+    if connection.execute("SELECT to_regclass('public.silver_history_settings')").fetchone()[0]:
+        found.append(("public", "silver_history_settings"))
+    return found
+
+
+def keep_history_read_only(connection, roles: list[str]) -> int:
+    """Take back the write rights the schema-wide grants give on the history tables and their setting."""
+    from psycopg import sql
+
+    objects = history_objects(connection)
+    for schema, name in objects:
+        for role in roles:
+            connection.execute(sql.SQL("REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE {} FROM {}").format(
+                sql.Identifier(schema, name), sql.Identifier(role)))
+    return len(objects)
+
+
+def history_write_rights(connection, roles: list[str]) -> list[str]:
+    """Any write right a role still has on a history table or the setting, PUBLIC and memberships included."""
+    found = []
+    for schema, name in history_objects(connection):
+        for role in roles:
+            for privilege in WRITES:
+                if connection.execute("SELECT has_table_privilege(%s, %s, %s)",
+                                      (role, f'"{schema}"."{name}"', privilege)).fetchone()[0]:
+                    found.append(f"{role}: {privilege} on {schema}.{name}")
     return found

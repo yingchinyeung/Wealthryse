@@ -536,8 +536,9 @@ class InputReadinessDatabaseTests(_ReadinessDatabase):
 
 
 class WithoutLineageMigrationTests(_ReadinessDatabase):
-    """The same checks on a database where migration 071 was never applied."""
-    SKIPPED = frozenset({LINEAGE_MIGRATION})
+    """The same checks on a database where migration 071, and so every later one, was never applied."""
+    SKIPPED = frozenset(path.name for path in (ROOT / "migrations" / "postgres").glob("*.sql")
+                        if path.name >= LINEAGE_MIGRATION)
 
     def test_the_cycle_is_ready_as_before_and_the_notes_say_lineage_is_missing(self):
         self._seed(_cycle, DAY)

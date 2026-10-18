@@ -1,5 +1,6 @@
 """Data contracts against the real schema: every silver and gold contract matches a database
-built from migrations/postgres, and every quality rule runs on it.
+built from migrations/postgres (then the held migrations the catalog names), and every quality
+rule runs on it.
 
 Needs a disposable server: set AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI's
 agent-database job starts one). Skipped otherwise. Creates and drops its own database
@@ -46,7 +47,8 @@ class ContractSchemaTests(unittest.TestCase):
         cls.script = _script()
         cls.database = f"contracts_{uuid.uuid4().hex[:10]}"
         cls.addClassCleanup(cls.script.drop, ADMIN_DSN, cls.database)
-        cls.script.build(ADMIN_DSN, cls.database, ROOT / "migrations" / "postgres")
+        cls.script.build(ADMIN_DSN, cls.database, ROOT / "migrations" / "postgres",
+                         mc.held_migrations(CATALOG, ROOT))
         cls.catalog = mc.catalog_objects(CATALOG)
         cls.connection = psycopg.connect(**cls.script._params(ADMIN_DSN, cls.database, cls.script.OWNER, TENANT),
                                          autocommit=True)

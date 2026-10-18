@@ -67,13 +67,14 @@ AGENT_ROW_LIMIT = 1000
 STAGE43 = "ms-september-disclaimer-duplicate-20261011-v1"
 
 
-def catalog_objects() -> list[dict]:
-    """The moved objects: name, kind, layer."""
+def catalog_objects(*, created_in_layer: bool = False) -> list[dict]:
+    """The moved objects: name, kind, layer. created_in_layer adds those created in their layer schema."""
     entries = json.loads(CATALOG.read_text(encoding="utf-8"))["postgres"]
+    schemas = ("public", *LAYERS) if created_in_layer else ("public",)
     return [
         {"name": key.split(".", 1)[1], "kind": value["kind"], "layer": value["layer"]}
         for key, value in sorted(entries.items())
-        if key.startswith("public.") and value["layer"] in LAYERS
+        if key.split(".", 1)[0] in schemas and value["layer"] in LAYERS
     ]
 
 

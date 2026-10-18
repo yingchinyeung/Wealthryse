@@ -17,6 +17,8 @@ from ibkr_etl.db import connect, initialize, transaction  # noqa: E402
 from ibkr_etl.evidence_acl import quarantine_evidence_objects  # noqa: E402
 from ibkr_etl.layer_quality import COUNT_COLUMNS, HISTORY_TABLE  # noqa: E402
 from ibkr_etl.medallion_layers import (  # noqa: E402
+    history_write_rights,
+    keep_history_read_only,
     mirror_privileges,
     mismatches,
     present_layers,
@@ -417,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
             for table, column in sorted(COUNT_COLUMNS.items()):
                 if connection.execute("SELECT to_regclass(%s)", (table,)).fetchone()[0]:
                     connection.execute(sql.SQL("GRANT SELECT ({}) ON TABLE {} TO {}").format(
-                        sql.Identifier(column), sql.Identifier(table), sql.Identifier(approval_role)))
+                        sql.Identifier(column), sql.Identifier(*table.split(".")), sql.Identifier(approval_role)))
             if connection.execute("SELECT to_regclass(%s)", (HISTORY_TABLE,)).fetchone()[0]:
                 connection.execute(sql.SQL("GRANT SELECT, INSERT ON TABLE {} TO {}").format(
                     sql.Identifier(HISTORY_TABLE), sql.Identifier(approval_role)))
@@ -532,6 +534,11 @@ def main(argv: list[str] | None = None) -> int:
             problems = mismatches(connection, managed_roles)
             if problems:
                 raise RuntimeError("Layer table rights differ from their public views: " + "; ".join(problems))
+            # The U8 history is written only through its trigger (nothing until that migration).
+            keep_history_read_only(connection, managed_roles)
+            problems = history_write_rights(connection, managed_roles)
+            if problems:
+                raise RuntimeError("A login can still write the silver history: " + "; ".join(problems))
             # Runtime logins find the layer tables first. This migration login keeps
             # public first, and apply_postgres_migrations sets it for its own transaction.
             for role in managed_roles:

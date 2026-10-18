@@ -693,6 +693,38 @@ only, and none sends anything to a client.
 (or per account), rebuild the agent image, and deploy `infra/agent-apps.bicep` for the new jobs (`guide_check`
 and `guide_keeper`).
 
+## Certified figures (off)
+
+The stored, checked figures every website page reads (medallion upgrade U5,
+`docs/MEDALLION_CERTIFIED_FIGURES.md`), for the agents. All of it is off unless
+`AGENT_CERTIFIED_FIGURES=on`; with the setting unset every tool list, prompt and
+answer check is as before (`tests/test_certified_agent_tools.py`).
+
+- **The view.** `migrations/agent/017_certified_figures.sql` adds
+  `agent.certified_figures` (the published figures of the account in scope, from
+  `gold.v_certified_figures`), `agent.certified_builds` (status and times only) and
+  `agent.certified_figure_trace(...)`, all for `agent_reader` only. It changes no
+  existing grant, and does nothing on a database without migration 073
+  (`tests/test_certified_agent_db.py`).
+- **The tools** (`src/wealthryse_agent/certified_tools.py`). `get_certified_figures`
+  returns each figure with value, unit, definition and version, freshness, lineage
+  and build status; `trace_figure` walks from the build back to the raw files by
+  table name and sha256, never storage paths; `list_certified_figures` lists the
+  register and sits with the guide tools. A figure is served only once its page is
+  on in `CERTIFIED_FIGURES_PAGES`, so set that on the tool server to the website's
+  value. The month-end commentary job (`month_end_drafter`) never gets them before
+  8 Nov.
+- **Citations.** The runtime numbers certified figures `F1`, `F2` across a turn.
+  The number beside each `[F#]` must be that figure's value; until 8 Nov a mismatch
+  only warns (`Turn.figure_warnings`, a `CERTIFIED_FIGURE_CHECK` log line with refs
+  and figure ids, never values). The message keeps each cited figure's id, subject,
+  date, period, build and definition version.
+
+**Turning it on.** After migration 073: Ying's typed approval to rerun
+`scripts/install_agent_schema.py` (applies `017_certified_figures.sql`), then set
+`AGENT_CERTIFIED_FIGURES=on` and `CERTIFIED_FIGURES_PAGES` on the tool server and
+`AGENT_CERTIFIED_FIGURES=on` on the agent service.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool

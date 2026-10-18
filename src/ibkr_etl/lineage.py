@@ -518,6 +518,12 @@ JOB_INPUTS: dict[str, tuple[str, ...]] = {
         "silver.nav_snapshots", "silver.derived_portfolio_nav", "silver.position_snapshots",
         "silver.derived_portfolio_positions", "silver.instruments", "silver.instrument_classifications",
         "silver.risk_free_rates", "silver.reference_fx_rates", "silver.benchmark_prices"),
+    "ibkrv2stg-certified-figures": (
+        "silver.nav_snapshots", "silver.derived_portfolio_nav", "silver.position_snapshots",
+        "silver.derived_portfolio_positions", "silver.synthetic_portfolio_components", "silver.cash_snapshots",
+        "silver.cash_transactions", "silver.derived_portfolio_cash_ledger", "silver.derived_portfolio_cash_balances",
+        "silver.fx_rates", "silver.instruments", "silver.instrument_classifications",
+        "gold.performance_comparison_daily", "gold.risk_analytics_snapshots", "gold.crisis_scenario_results"),
 }
 
 
@@ -593,7 +599,16 @@ TRACEABLE = {
     "gold.crisis_scenario_results": (
         ("subject_id", "holdings_as_of", "scenario_id", "calculation_version"), "lineage_run_id"),
     "silver.benchmark_prices": (("benchmark_id", "observation_date", "observation_status"), "raw_sha256"),
+    # A certified figure by its build, or as readers see it (the newest published build's row).
+    "gold.certified_figures": (
+        ("subject_id", "figure_id", "period", "item", "benchmark_id", "as_of_date", "build_id"), "lineage_run_id"),
+    "gold.v_certified_figures": (
+        ("subject_id", "figure_id", "period", "item", "benchmark_id", "as_of_date"), "lineage_run_id"),
 }
+# Rows that name the source row they were copied or worked out from (source_table, source_key).
+SOURCED = {"gold.certified_figures", "gold.v_certified_figures"}
+# Key columns that may be left out, meaning the empty string.
+OPTIONAL_EMPTY = {"period", "item", "benchmark_id"}
 
 
 def _raw(connection: Any) -> Any:
@@ -615,23 +630,30 @@ def trace(connection: Any, table: str, key: Mapping[str, Any], *, max_depth: int
     run that read the raw file named by raw_sha256 (basis 'row'). Each run's table inputs
     lead to the latest run that wrote that table and finished before it started (basis
     'dataset-time', an inference). Blob inputs are the raw files; IBKR runs also list the
-    ingestion runs, whose raw_sha256 and raw_path name the statement. Read-only."""
+    ingestion runs, whose raw_sha256 and raw_path name the statement. A certified figure
+    also names its source row ("source"), traced the same way when trace() knows its table.
+    Read-only."""
     name = table if "." in table else next((t for t in TRACEABLE if t.split(".", 1)[1] == table), table)
     if name not in TRACEABLE:
         raise ValueError(f"trace starts from one of {sorted(TRACEABLE)}")
     columns, reference = TRACEABLE[name]
+    if name in SOURCED:
+        key = {**{c: "" for c in OPTIONAL_EMPTY}, **key}
     missing = [c for c in columns if c not in key]
     if missing:
         raise ValueError(f"{name} needs {', '.join(missing)}")
     schema, relation = name.split(".", 1)
     where = " AND ".join(f"{c}::text = %s" for c in columns)
-    found = _rows(connection, f"SELECT {reference} AS reference FROM {schema}.{relation} WHERE {where}",
+    extra = ", source_table, source_key" if name in SOURCED else ""
+    found = _rows(connection, f"SELECT {reference} AS reference{extra} FROM {schema}.{relation} WHERE {where}",
                   tuple(str(key[c]) for c in columns))
     result: dict[str, Any] = {"table": name, "key": {c: str(key[c]) for c in columns}, "found": bool(found),
                               "runs": [], "raw_files": [], "ibkr_statements": []}
     if len(found) != 1:
         result["note"] = "no such row" if not found else "the key matches more than one row"
         return result
+    if name in SOURCED:
+        result["source"] = _source(connection, found[0], max_depth)
     reference_value = found[0]["reference"]
     result["reference"] = None if reference_value is None else str(reference_value)
     queue: list[tuple[str, int, str]] = []
@@ -694,6 +716,18 @@ def trace(connection: Any, table: str, key: Mapping[str, Any], *, max_depth: int
             SELECT run_id, run_type, status, requested_from, requested_to, raw_sha256, raw_path
             FROM ingestion_runs WHERE run_id = ANY(%s) ORDER BY run_id""", (sorted(ingestion_ids),))
     return result
+
+
+def _source(connection: Any, row: Mapping[str, Any], max_depth: int) -> dict[str, Any]:
+    """The source row a certified figure names, traced when trace() knows its table."""
+    source_key = row.get("source_key")
+    if isinstance(source_key, str):
+        source_key = json.loads(source_key)
+    found: dict[str, Any] = {"table": row.get("source_table"), "key": dict(source_key or {})}
+    columns = TRACEABLE.get(str(found["table"]), ((), None))[0]
+    if found["table"] in TRACEABLE and found["table"] not in SOURCED and all(c in found["key"] for c in columns):
+        found["trace"] = trace(connection, found["table"], found["key"], max_depth=max_depth)
+    return found
 
 
 def main(argv: list[str] | None = None) -> int:

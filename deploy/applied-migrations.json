@@ -32,6 +32,10 @@
   "070_medallion_silver_layer.sql": {
    "sha256": "a830df3b37360b502f963e27f832e0a22f1fe1accc8d9aa208fb7a51d3fb9a3e",
    "evidence": "ibkrv2stg-bootstrap-pwuzreq on ibkr-platform main-b832403 (sha256:cd122bca9a155c72db99520a632f18e81a67cf3e3e4a0372b74f355880c1978f), 070 only (embedded from main af63682) with bootstrap_postgres.py --only-migration, Medallion S3c silver batch, status pass with 0 failed checks, 2026-10-17 about 12:56 UTC"
+  },
+  "071_lineage_records.sql": {
+   "sha256": "c9b0221ad41d397c5817f76fdf3059a7b8a1c966ea3ab025d1414f20ff4997a0",
+   "evidence": "ibkrv2stg-bootstrap-kilsxuz on ibkr-platform main-ba3c644 (sha256:d941526ecf8b2262f2875798939b40b7789fd104adf3476ceeb02ef41d41a242), 071 only with bootstrap_postgres.py --only-migration after a rehearsal on a restored copy (ibkrv2stg-bootstrap-uwffypl), Medallion shadow release, status pass with 0 failed checks, 2026-10-18 about 11:30 UTC"
   }
  }
 }

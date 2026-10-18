@@ -90,7 +90,7 @@ from .performance_periods import (
     flow_statement,
     performance_periods as calculate_performance_periods,
 )
-from . import report_design_updates
+from . import certified_pages, report_design_updates
 from .report_design_ui import controls as report_design_controls, SCRIPT as REPORT_DESIGN_SCRIPT
 from .internal_release import InternalReleaseError
 from .risk_snapshots import RISK_ANALYTICS_VERSION, decoded_payload, snapshot_read_status
@@ -148,6 +148,7 @@ from .broker_connections import onboarding_v2_enabled
 from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS, THEME_TOGGLE_HTML, WEB_FONT_FILES, web_font_bytes
 from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
+from .web_ui import CERTIFIED_LINE_SCRIPT
 from .web_analytics_ui import (
     ANALYTICS_SCRIPT,
     CORRELATION_CARD,
@@ -1235,6 +1236,15 @@ def _portfolio_access_context(
     }
 
 
+def _certified(endpoint: str, account_id: str, requested_as_of: str | None, build) -> dict:
+    """The page's answer from build(as_of); with CERTIFIED_FIGURES_PAGES unset, exactly today's.
+
+    Call only after the account check has passed (certified_pages explains the modes).
+    """
+    return certified_pages.serve(endpoint, tenant_id=TENANT_ID, subject_id=account_id,
+                                 requested_as_of=requested_as_of, build=build)
+
+
 def _authorized_subject_ids(
     user: dict[str, object], *, feature_key: str | None = None
 ) -> list[str]:
@@ -1359,6 +1369,11 @@ def portfolio_summary(
 ) -> dict:
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("summary", account_id, requested_as_of,
+                      lambda day: _portfolio_summary(account_id, access, day, user))
+
+
+def _portfolio_summary(account_id: str, access: dict, requested_as_of: str | None, user: dict) -> dict:
     with _database() as connection:
         account = {
             "account_id": account_id,
@@ -1536,6 +1551,18 @@ def performance_periods_view(
     custom_start, custom_end = _parse_as_of(start), _parse_as_of(end)
     if custom_start and custom_end and custom_start > custom_end:
         raise HTTPException(status_code=400, detail="The custom start date cannot be after the end date")
+
+    def build(day: str | None) -> dict:
+        # The Overview's day change (as-of date to itself) follows the date it is built for.
+        moved = requested_as_of is not None and day != requested_as_of and custom_start == custom_end == requested_as_of
+        return _performance_periods(account_id, access, day, day if moved else custom_start,
+                                    day if moved else custom_end, user)
+
+    return _certified("performance-periods", account_id, requested_as_of, build)
+
+
+def _performance_periods(account_id: str, access: dict, requested_as_of: str | None,
+                         custom_start: str | None, custom_end: str | None, user: dict) -> dict:
     with _database() as connection:
         nav = _subject_nav_values(connection, account_id, access, requested_as_of)
         flows = _subject_external_flows(connection, account_id, access)
@@ -1575,6 +1602,11 @@ def portfolio_analytics_view(
     """Monthly returns calendar, drawdowns, return statistics and rolling risk."""
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("analytics", account_id, requested_as_of,
+                      lambda day: _portfolio_analytics(account_id, access, day))
+
+
+def _portfolio_analytics(account_id: str, access: dict, requested_as_of: str | None) -> dict:
     with _database() as connection:
         nav = _subject_nav_values(connection, account_id, access, requested_as_of)
         flows = _subject_external_flows(connection, account_id, access)
@@ -1911,6 +1943,11 @@ def holdings(
 ) -> dict:
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("holdings", account_id, requested_as_of,
+                      lambda day: _holdings(account_id, access, day))
+
+
+def _holdings(account_id: str, access: dict, requested_as_of: str | None) -> dict:
     with _database() as connection:
         if access.get("subject_type", "physical_account") == "composite_portfolio":
             rows = connection.execute(
@@ -2010,6 +2047,11 @@ def sector_allocation(
     """Sector weights from the same validated tool the AI analyst and factsheets use."""
     _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("sectors", account_id, requested_as_of,
+                      lambda day: _sector_allocation(account_id, request, day, user))
+
+
+def _sector_allocation(account_id: str, request: Request, requested_as_of: str | None, user: dict) -> dict:
     context = AgentToolContext(
         tenant_id=TENANT_ID,
         actor_object_id=str(user.get("object_id") or user.get("email") or "viewer"),
@@ -2050,32 +2092,45 @@ def accounts_overview(user: dict[str, object] = Depends(_authorized_user)) -> di
     accounts = []
     for subject in _account_directory(user):
         subject_id = str(subject["subject_id"])
-        entry = {
-            "account_id": subject_id,
-            "currency": subject.get("reporting_currency"),
-            "nav": None,
-            "nav_date": None,
-            "mtd": None,
-            "ytd": None,
-        }
-        accounts.append(entry)
         try:
             access = _portfolio_access_context(subject_id, user)
-            with _database() as connection:
-                nav = _subject_nav_values(connection, subject_id, access, None)
-                if not nav:
-                    continue
-                entry["currency"] = access["reporting_currency"]
-                entry["nav_date"], latest = nav[-1]
-                entry["nav"] = float(latest)
-                flows = _subject_external_flows(connection, subject_id, access)
-            periods = calculate_performance_periods(nav, flows or {})["periods"]
         except (HTTPException, PerformanceInputError, PostgresError, ValueError):
+            accounts.append(_account_overview_entry(subject, None, None))
             continue
-        for period in periods:
-            if period["key"] in ("mtd", "ytd") and period["status"] not in ("fail", "empty"):
-                entry[period["key"]] = period["twr"]
+        accounts.append(_certified(
+            "accounts-overview", subject_id, None,
+            lambda day, subject=subject, access=access: _account_overview_entry(subject, access, day)))
     return {"accounts": accounts}
+
+
+def _account_overview_entry(subject: dict, access: dict | None, as_of: str | None) -> dict:
+    subject_id = str(subject["subject_id"])
+    entry = {
+        "account_id": subject_id,
+        "currency": subject.get("reporting_currency"),
+        "nav": None,
+        "nav_date": None,
+        "mtd": None,
+        "ytd": None,
+    }
+    if access is None:
+        return entry
+    try:
+        with _database() as connection:
+            nav = _subject_nav_values(connection, subject_id, access, as_of)
+            if not nav:
+                return entry
+            entry["currency"] = access["reporting_currency"]
+            entry["nav_date"], latest = nav[-1]
+            entry["nav"] = float(latest)
+            flows = _subject_external_flows(connection, subject_id, access)
+        periods = calculate_performance_periods(nav, flows or {}, as_of=as_of)["periods"]
+    except (HTTPException, PerformanceInputError, PostgresError, ValueError):
+        return entry
+    for period in periods:
+        if period["key"] in ("mtd", "ytd") and period["status"] not in ("fail", "empty"):
+            entry[period["key"]] = period["twr"]
+    return entry
 
 
 @app.get("/api/holdings/combined")
@@ -2096,6 +2151,7 @@ def combined_holdings(
         raise HTTPException(status_code=400, detail="currency must be a three-letter ISO code")
     requested_as_of = _parse_as_of(as_of)
     accounts = []
+    certified: list[dict] = []
     skipped: list[dict[str, str]] = []
     for subject in _account_directory(user):
         subject_id = str(subject["subject_id"])
@@ -2111,7 +2167,14 @@ def combined_holdings(
         if access.get("subject_type", "physical_account") != "physical_account":
             continue
         with _database() as connection:
-            rows = _latest_subject_holdings(connection, subject_id, requested_as_of)
+            # The account's holding records (certified when the page is on), converted and
+            # added up below with today's functions.
+            records = _certified(
+                "combined-holdings", subject_id, requested_as_of,
+                lambda day: _holding_records(connection, subject_id, day))
+            rows = records["rows"]
+            if "certified" in records:
+                certified.append(records["certified"])
             view = _enrich_subject_holdings(
                 connection,
                 subject_id,
@@ -2141,7 +2204,13 @@ def combined_holdings(
         ],
         "skipped_accounts": skipped,
         **combined,
+        **({"certified": certified_pages.combined_block(certified)} if certified else {}),
     }
+
+
+def _holding_records(connection, subject_id: str, as_of: str | None) -> dict:
+    rows = _latest_subject_holdings(connection, subject_id, as_of)
+    return {"snapshot_date": rows[0]["snapshot_date"] if rows else None, "rows": rows}
 
 
 @app.get("/api/portfolio/{account_id}/cash")
@@ -2154,6 +2223,12 @@ def cash_activity(
 ) -> dict:
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(to_date or as_of)
+    return _certified("cash", account_id, requested_as_of,
+                      lambda day: _cash_activity(account_id, access, day, from_date, user))
+
+
+def _cash_activity(account_id: str, access: dict, requested_as_of: str | None,
+                   from_date: str | None, user: dict) -> dict:
     with _database() as connection:
         effective_as_of = requested_as_of or connection.execute(
             "SELECT MAX(snapshot_date) AS latest FROM subject_nav_series WHERE tenant_id = %s AND subject_id = %s AND currency = " + ACTIVE_NAV_CURRENCY_SQL,
@@ -2356,6 +2431,11 @@ def risk_analytics(
 ) -> dict:
     _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("risk", account_id, requested_as_of,
+                      lambda day: _risk_analytics(account_id, day, response, user))
+
+
+def _risk_analytics(account_id: str, requested_as_of: str | None, response: Response | None, user: dict) -> dict:
     started = time.perf_counter()
     with _database() as connection:
         effective_as_of = requested_as_of or connection.execute(
@@ -2431,6 +2511,11 @@ def risk_analytics_details(
 ) -> dict:
     _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("risk-details", account_id, requested_as_of,
+                      lambda day: _risk_analytics_details(account_id, day, response))
+
+
+def _risk_analytics_details(account_id: str, requested_as_of: str | None, response: Response | None) -> dict:
     started = time.perf_counter()
     with _database() as connection:
         effective_as_of = requested_as_of or connection.execute(
@@ -4851,6 +4936,12 @@ def benchmark_comparison(
 ) -> dict:
     _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("benchmark-comparison", account_id, requested_as_of,
+                      lambda day: _benchmark_comparison(account_id, benchmark_id, day, user))
+
+
+def _benchmark_comparison(account_id: str, benchmark_id: str | None, requested_as_of: str | None,
+                          user: dict) -> dict:
     with _database() as connection:
         benchmark = connection.execute(
             """
@@ -5119,7 +5210,7 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
 
 
 COMBINED_HOLDINGS_PAGE_SCRIPT = r"""
-<script>
+<script>""" + CERTIFIED_LINE_SCRIPT + r"""
 const esc=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 const json=async response=>{const payload=await response.json();if(!response.ok)throw new Error(payload.detail||`http_${response.status}`);return payload};
 const fmt=n=>n==null||n===''?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(n));
@@ -5135,6 +5226,7 @@ const loadCombined=()=>{
     document.querySelector('#combined-currency-label').textContent=data.currency;
     document.querySelector('#combined-accounts').innerHTML=data.accounts.map(item=>`<div class="status-item"><span class="label">${esc(item.display_name)}</span><strong>${esc(item.snapshot_date||'No snapshot')}</strong><span class="muted">${esc(item.holdings_count)} holdings${item.fx_missing_conids.length?` · ${esc(item.fx_missing_conids.length)} without FX`:''}</span></div>`).join('');
     document.querySelector('#combined-holdings').innerHTML=data.holdings.map(x=>`<tr><td>${esc(x.symbol||x.conid)}</td><td>${esc(x.description||'')}</td><td>${esc(x.sector||'')}</td><td><details><summary>${esc(x.account_count)}</summary>${x.accounts.map(a=>`<div class="muted">${esc(a.display_name)}: ${fmt(a.quantity_text)} · ${a.fx_missing?'FX unavailable':esc(fmt(a.reporting_market_value_text))}</div>`).join('')}</details></td><td>${fmt(x.quantity_text)}</td><td>${money(x.reporting_market_value_text)}${x.incomplete?' <span class="muted" title="At least one account has no usable FX rate for this holding">(partial)</span>':''}</td><td>${money(x.reporting_cost_basis_text)}</td><td>${toned(money(x.reporting_unrealized_pnl_text),x.reporting_unrealized_pnl_text)}</td><td>${toned(pct(x.unrealized_pnl_pct),x.unrealized_pnl_pct)}</td><td data-sort="${x.weight??''}">${pct(x.weight)}</td></tr>`).join('')||'<tr><td colspan="10">No holdings are available for your accounts on or before this date.</td></tr>';
+    certifiedLine(document.querySelector('#combined-holdings'),data.certified);
     document.querySelector('#combined-note').textContent=`${data.accounts.length} physical account(s) combined in ${data.currency}. Filtered and composite portfolios are excluded because they are built from these accounts. Each account uses its own latest snapshot and dated FX history. Weights are shares of gross combined holdings value (cash excluded).${data.incomplete?' Some holdings have no usable FX rate; their values are partial.':''}${data.skipped_accounts.length?` ${data.skipped_accounts.length} account(s) could not be included.`:''}`;
   }).catch(error=>{document.querySelector('#combined-note').textContent=`Combined holdings are unavailable: ${error.message}`;document.querySelector('#combined-holdings').innerHTML=''});
 };
@@ -11109,6 +11201,7 @@ document.querySelector('#cash-activity').innerHTML='<tr><td colspan="6">Not appl
 document.querySelector('#cash-note').textContent=result.message;return;
 }}
 document.querySelector('#cash-balances').innerHTML=result.balances.map(x=>`<div class="metric"><div class="label">${{x.currency==='BASE_SUMMARY'?'Base-currency cash summary':esc(x.currency)+' ending cash'}}</div><div class="value">${{fmt(x.ending_cash_text)}}${{x.currency==='BASE_SUMMARY'?'':' '+esc(x.currency)}}</div><div class="muted">Settled: ${{fmt(x.settled_cash_text)}}${{x.currency==='BASE_SUMMARY'?'<br>Broker base-currency aggregate; currency code not supplied.':''}}</div></div>`).join('')||'<div class="empty">No cash balance snapshot is available.</div>';
+certifiedLine(document.querySelector('#cash-balances'),result.certified);
 const cashTime=x=>{{const value=String(x.event_datetime||'');return value.includes('T')?value.split('T')[1].slice(0,8):value.includes(' ')?value.split(' ')[1].slice(0,8):''}};
 document.querySelector('#cash-activity').innerHTML=result.transactions.map(x=>`<tr><td>${{esc(x.effective_date)}}</td><td>${{esc(cashTime(x))}}</td><td>${{esc(x.transaction_type||'')}}</td><td>${{esc(x.description||'')}}</td><td>${{esc(x.currency||'')}}</td><td>${{fmt(x.amount_text)}}</td></tr>`).join('')||'<tr><td colspan="6">No cash activity occurred in this date range.</td></tr>';
 document.querySelector('#cash-note').textContent=`Showing all ${{result.total_count}} cash activities from ${{result.activity_from}} through ${{result.activity_to}}.`;
@@ -11131,7 +11224,7 @@ const asOf=document.querySelector('#asof-select').value,start=document.querySele
 const params=new URLSearchParams({{as_of:asOf}});if(start)params.set('start',start);if(end)params.set('end',end);
 const flowParams=new URLSearchParams({{from_date:start||historyStartDate,to_date:end||asOf}});
 const [r,f]=await Promise.all([fetch(`/api/portfolio/${{account}}/performance/periods?${{params}}`).then(json),fetch(`/api/portfolio/${{account}}/flows?${{flowParams}}`).then(json)]);
-document.querySelector('#period-returns').innerHTML=r.periods.map(periodRow).join('')||'<tr><td colspan="7">No NAV history is available on or before this date.</td></tr>';
+document.querySelector('#period-returns').innerHTML=r.periods.map(periodRow).join('')||'<tr><td colspan="7">No NAV history is available on or before this date.</td></tr>';certifiedLine(document.querySelector('#period-returns'),r.certified);
 document.querySelector('#period-custom').innerHTML=r.custom?periodRow(r.custom):'<tr><td colspan="7">Choose a start and end date, then calculate a custom period.</td></tr>';
 document.querySelector('#period-note').textContent=`Returns through ${{r.effective_as_of||'—'}} in ${{r.currency}}. Each period is valued from the last NAV before it starts to the last NAV on or before it ends. * Period under one year: the annualised IRR extrapolates a short-period result. ${{r.flows_message||''}}`;
 document.querySelector('#flows-totals').innerHTML=f.applicable?[['Contributions',f.totals.flows_in],['Withdrawals',f.totals.flows_out],['Net external flow',f.totals.net]].map(x=>`<div class="metric"><div class="label">${{esc(x[0])}}</div><div class="value">${{fmt(x[1])}} ${{esc(f.currency)}}</div></div>`).join(''):'';
@@ -11145,12 +11238,12 @@ const bc=await fetch(`/api/portfolio/${{account}}/benchmark-comparison?${{query}
 document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':'Secondary'}} · ${{meta.return_basis_label||meta.return_convention}}`;
 document.querySelector('#benchmark-legend').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.return_basis==='price_return'?'price return':meta.return_basis==='total_return'?'total return':meta.return_convention}}`;
 document.querySelector('#benchmark-note').textContent=meta.message+`${{meta.return_basis==='price_return'?' The benchmark is a price index: its returns exclude dividends, while portfolio returns include income, so the comparison favours the portfolio by the index dividend yield.':''}} Provider: ${{meta.provider||'—'}} · Convention: ${{meta.return_convention}} · License: ${{meta.license_status}} · Provisional observations: ${{meta.provisional_observations}} · Latest feed observation: ${{meta.latest_provisional_observation||'—'}}`;
-document.querySelector('#benchmark-metrics').innerHTML='';
+document.querySelector('#benchmark-metrics').innerHTML='';certifiedLine(document.querySelector('#benchmark-metrics'),null);
 draw('#benchmark-chart',[],[],{{emptyMessage:bc.available?'':'No validated comparison is available for this benchmark and date.'}});renderRollingBenchmark(null);
 if(bc.available){{
 const m=bc.metrics,items=[['Portfolio total return',pct(m.portfolio_total_return)],['Benchmark total return',pct(m.benchmark_total_return),bc.benchmark_return_basis==='price_return'?'Benchmark price return (excludes dividends)':undefined],['Excess total return',pct(m.excess_total_return),bc.benchmark_return_basis==='price_return'?'Excess return vs price index':undefined],['Tracking error',pct(m.tracking_error)],['Information ratio',m.information_ratio==null?'—':fmt(m.information_ratio)],['Beta',m.beta==null?'—':fmt(m.beta)],['Correlation',m.correlation==null?'—':fmt(m.correlation)],['Relative win rate',pct(m.relative_win_rate)]];
 document.querySelector('#benchmark-note').textContent+=` Aligned comparison: ${{m.period_start}} through ${{m.period_end}} · Reporting currency: ${{bc.reporting_currency}} · ${{m.observations}} common-date observations. Rebased to 100 at the first common observation; unmatched market dates are not filled.`;
-document.querySelector('#benchmark-metrics').innerHTML=items.map(metricCard).join('');
+document.querySelector('#benchmark-metrics').innerHTML=items.map(metricCard).join('');certifiedLine(document.querySelector('#benchmark-metrics'),bc.certified);
 renderRollingBenchmark(bc);
 draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}})
 }}
@@ -11184,11 +11277,11 @@ if(activeSection==='modelling')renderModelling(asOf);
 document.querySelector('#holdings-asof').textContent=h.snapshot_date||'No snapshot';
 document.querySelector('#holdings-quantity-label').textContent=h.holdings.some(x=>x.holding_kind==='synthetic_exposure')?'Sleeve coefficient (not shares)':'Quantity';
 document.querySelector('#holdings-reporting-currency').textContent=h.reporting_currency||reportingCurrency;
-document.querySelector('#holdings').innerHTML=holdingsRows(h);
+document.querySelector('#holdings').innerHTML=holdingsRows(h);certifiedLine(document.querySelector('#holdings'),h.certified);
 if(h.failed)document.querySelector('#holdings-asof').textContent='unavailable';
 document.querySelector('#holdings-note').textContent=h.weight_basis?`Cost basis and unrealized P&L are in each holding's own currency. Value is converted to ${{h.reporting_currency}} with the dated FX rate on or before the holdings date. Weight basis: ${{h.weight_basis==='nav'?'net asset value':'gross holdings value (NAV unavailable for this date)'}}.${{(h.fx_missing_conids||[]).length?` ${{h.fx_missing_conids.length}} holding(s) have no usable FX rate and are excluded from weights.`:''}} RSI (14) is Wilder's 14-day relative strength index from each holding's daily closing marks; above 70 is marked overbought and below 30 oversold.`:h.failed?'Holdings could not be loaded for this date. Refresh the page or pick another As of date.':'';
 const rm=risk.metrics||{{}},riskItems=[['Total return',pct(rm.total_return)],['Annualized return',pct(rm.annualized_return)],['Annualized volatility',pct(rm.annualized_volatility)],['Risk-free rate',rm.risk_free_annual_rate==null?'Unavailable':pct(rm.risk_free_annual_rate)],['Sharpe ratio',rm.sharpe_ratio==null?'Unavailable':fmt(rm.sharpe_ratio)],['Expected maximum drawdown (1 year)',rm.expected_maximum_drawdown_1y==null?'Unavailable':pct(rm.expected_maximum_drawdown_1y)],['Actual maximum drawdown (1 year)',rm.actual_maximum_drawdown_1y==null?'Unavailable':pct(rm.actual_maximum_drawdown_1y)],['Tail maximum drawdown (1 year)',rm.tail_maximum_drawdown_1y==null?'Unavailable':pct(rm.tail_maximum_drawdown_1y)],['Crisis maximum drawdown (15/9/2008–9/3/2009)',rm.crisis_maximum_drawdown==null?'Unavailable':pct(rm.crisis_maximum_drawdown)],['VaR 95% — daily',pct(rm.var_95_daily)],['Daily Expected Tail Loss (95%)',pct(rm.daily_expected_tail_loss)],['Win rate',pct(rm.win_rate)],['BLUE mean daily return',pct(rm.blue_mean_daily_return)]];
-document.querySelector('#risk-asof').textContent=rm.period_end||risk.as_of||'—';document.querySelector('#risk-metrics').innerHTML=riskItems.map(metricCard).join('');const etl=risk.expected_tail_loss_contributors||{{}},contributorRows=items=>items.map(x=>`<tr><td><strong>${{esc(x.symbol||x.conid)}}</strong><div class="muted">${{esc(x.description||'')}}</div></td><td>${{pct(x.expected_tail_loss_contribution)}}</td></tr>`).join('')||'<tr><td colspan="2">Unavailable</td></tr>';document.querySelector('#etl-top').innerHTML=contributorRows(etl.top||[]);document.querySelector('#etl-bottom').innerHTML=contributorRows(etl.bottom||[]);const displayNotes=riskDisplayNotes(risk,pct);document.querySelector('#etl-note').textContent=displayNotes.attribution;document.querySelector('#risk-note').textContent=displayNotes.risk;
+document.querySelector('#risk-asof').textContent=rm.period_end||risk.as_of||'—';document.querySelector('#risk-metrics').innerHTML=riskItems.map(metricCard).join('');certifiedLine(document.querySelector('#risk-metrics'),risk.certified);const etl=risk.expected_tail_loss_contributors||{{}},contributorRows=items=>items.map(x=>`<tr><td><strong>${{esc(x.symbol||x.conid)}}</strong><div class="muted">${{esc(x.description||'')}}</div></td><td>${{pct(x.expected_tail_loss_contribution)}}</td></tr>`).join('')||'<tr><td colspan="2">Unavailable</td></tr>';document.querySelector('#etl-top').innerHTML=contributorRows(etl.top||[]);document.querySelector('#etl-bottom').innerHTML=contributorRows(etl.bottom||[]);const displayNotes=riskDisplayNotes(risk,pct);document.querySelector('#etl-note').textContent=displayNotes.attribution;document.querySelector('#risk-note').textContent=displayNotes.risk;
 const cs=risk.crisis_scenarios;document.querySelector('#crisis-scenarios-card').hidden=!cs;document.querySelector('#crisis-scenarios').innerHTML=cs&&(cs.scenarios||[]).length?cs.scenarios.map(x=>`<tr><td><strong>${{esc(x.label)}}</strong></td><td>${{esc(x.crisis_start)}} to ${{esc(x.crisis_end)}}</td><td>${{x.available?pct(x.maximum_drawdown):'Unavailable'}}${{x.available?'':`<div class="muted">${{esc(x.reason||'')}}</div>`}}</td><td>${{x.available?`${{x.proxy_components||0}} (${{x.scaled_components||0}})`:'—'}}</td></tr>`).join(''):'<tr><td colspan="4">Not calculated yet</td></tr>';document.querySelector('#crisis-scenarios-note').textContent=cs?`Holdings as of ${{cs.holdings_as_of}}, in ${{cs.reporting_currency||'—'}}. ${{cs.limitations||''}}`:'Crisis scenarios are not available for this portfolio yet.';
 if(displayNotes.attributionAvailable){{const guide=document.createElement('a');guide.className='metric-guide-inline';guide.href=metricGuideHref('ETL residual contribution');guide.textContent=' Read the residual-contribution explanation ↗';document.querySelector('#etl-note').appendChild(guide);}}
 const run=health.latest_run||{{}},portfolio=health.portfolio||{{}},assurance=health.portfolio_analyst_assurance||{{}},assuranceResult=assurance.result_json||{{}},burnIn=health.burn_in||{{}},burnResults=health.burn_in_recent_results||[];document.querySelector('#health-status').innerHTML=[['Environment',health.environment],['Status',health.status],['Latest portfolio date',portfolio.latest_date||'—'],['Latest successful run',run.completed_at||'—']].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1]||'—')}}</strong></div>`).join('');document.querySelector('#health-note').textContent=health.message;document.querySelector('#assurance-status').textContent=assurance.status?assurance.status.toUpperCase():'Awaiting first run';document.querySelector('#assurance-summary').innerHTML=[['Assurance date',assurance.assurance_date||'—'],['Portfolio as of',assurance.as_of_date||'—'],['Checks passed',assurance.checks_passed??0],['Warnings / failures',`${{assurance.checks_warned??0}} / ${{assurance.checks_failed??0}}`]].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1])}}</strong></div>`).join('');document.querySelector('#assurance-note').textContent=assuranceResult.model_review?.summary||'The daily assurance job independently reconciles portfolio data, analytics, report integrity and the approved August layouts.';document.querySelector('#burn-in-status').textContent=burnIn.status?burnIn.status.toUpperCase():'Not started';document.querySelector('#burn-in-summary').innerHTML=[['Start date',burnIn.start_date||'—'],['Consecutive passing days',`${{burnIn.consecutive_pass_days??0}} / ${{burnIn.required_consecutive_days??14}}`],['Original earliest completion',burnIn.earliest_completion_date||'—'],['Last result',burnIn.last_result_date||'Awaiting Day 1'],['Last failure',burnIn.last_failure_date||'None']].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1])}}</strong></div>`).join('');document.querySelector('#burn-in-results').innerHTML=burnResults.length?'<h3>Recent daily acceptance results</h3>'+burnResults.map(x=>`<p><strong>${{esc(x.result_date)}} — ${{esc(x.status.toUpperCase())}}</strong><br><span class="muted">Checked ${{esc(x.checked_at)}}</span></p>`).join(''):'<p>No formal Stage 4 result has been recorded yet.</p>';

@@ -554,8 +554,10 @@ def performance_rows(pages: Pages) -> list[Row]:
     if not comparison.get("available"):
         return rows
     series = comparison.get("series") or []
-    if not series or series[-1]["date"] != as_of:
-        return rows  # no comparison row on this date
+    if not series:
+        return rows
+    # On a day the benchmark's market was shut the page still shows the comparison through its last
+    # common date, so the figures for this date are those (source_key names that date).
     benchmark = comparison["benchmark"]
     benchmark_id = str(benchmark["benchmark_id"])
     version = str(comparison.get("calculation_version"))
@@ -569,7 +571,7 @@ def performance_rows(pages: Pages) -> list[Row]:
         ).fetchall()
     inputs = sha256([[str(r["observation_date"]), str(r["portfolio_value"]), str(r["benchmark_level"])]
                      for r in levels])
-    key = {"subject_id": subject.id, "benchmark_id": benchmark_id, "observation_date": as_of,
+    key = {"subject_id": subject.id, "benchmark_id": benchmark_id, "observation_date": str(series[-1]["date"]),
            "calculation_version": version}
     common = {"inputs": inputs, "source_table": "gold.performance_comparison_daily", "source_key": key,
               "source_version": version, "benchmark_id": benchmark_id}
@@ -912,11 +914,26 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
             for key in published:
                 published_dates.setdefault(key[0], set()).add(key[5])
             plan = work_plan(found, published_dates, backfill=backfill)
+            # Each subject's pages are asked again on its newest date right after that date is read, so
+            # a figure that moves with the clock reads the same both times.
+            newest_due = {subject.id: max(due_dates(subject, published_dates.get(subject.id, ())), default=None)
+                          for subject in found}
             notes: dict = {}
             rows: list[Row] = []
             disagreements: dict[str, list[str]] = {}
             errors: list[str] = []
             read: dict[str, list[str]] = {}
+            checked: set[str] = set()
+
+            def check(subject: Subject, day: str) -> None:
+                checked.add(subject.id)
+                try:
+                    with_own_connections = page_disagreements(web, subject, day, pages, rows, today_hk)
+                except Exception as error:  # noqa: BLE001
+                    with_own_connections = [f"error: {type(error).__name__}"]
+                if with_own_connections:
+                    disagreements[mask(subject.id)] = with_own_connections
+
             done = 0
             for subject, day in plan:
                 if clock() - begun >= limit * 60:
@@ -927,17 +944,12 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                     rows += page_rows(web, subject, day, pages, today_hk=today_hk, notes=notes)
                 except Exception as error:  # noqa: BLE001 - a bug in a reader holds the build
                     errors.append(f"{mask(subject.id)} {day}: {type(error).__name__}")
+                if day == newest_due[subject.id]:
+                    check(subject, day)
             left = len(plan) - done
-            for subject in found:
-                if not read.get(subject.id):
-                    continue
-                newest = max(read[subject.id])
-                try:
-                    with_own_connections = page_disagreements(web, subject, newest, pages, rows, today_hk)
-                except Exception as error:  # noqa: BLE001
-                    with_own_connections = [f"error: {type(error).__name__}"]
-                if with_own_connections:
-                    disagreements[mask(subject.id)] = with_own_connections
+            for subject in found:   # the time limit came before a subject's newest date
+                if read.get(subject.id) and subject.id not in checked:
+                    check(subject, max(read[subject.id]))
             result = compare(rows, published)
             to_write = result["new"] + result["changed"]
             failures = rule_failures(to_write)
@@ -974,6 +986,8 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 f"{len(failures)} rule failures, {len(disagreements)} page disagreements, {len(errors)} read errors.")
             for line in errors[:20]:
                 out(f"  read error {line}")
+            for who, figure_ids in sorted(disagreements.items()):   # figure ids only, no figures
+                out(f"  page disagreement {who}: {', '.join(figure_ids[:20])}")
             out(f"Read {done} of {len(plan)} subject dates."
                 + (f" Stopped after {limit:g} minutes: the other {left} are left for the next run." if left else ""))
             if dry_run:

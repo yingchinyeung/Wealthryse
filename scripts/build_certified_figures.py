@@ -33,7 +33,8 @@ JOB_NAME = certified_build.JOB_NAME  # the name run_main records, written out be
 def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build, check and publish the certified figures.")
     parser.add_argument("--backfill", action="store_true",
-                        help="Read every older NAV date again, not only those with no published figures yet.")
+                        help="Read every older NAV date again, newest first, not only those with no published "
+                             "figures yet (a backfill stopped by its time limit starts again from the newest date).")
     parser.add_argument("--minutes", type=float, default=None,
                         help="Stop reading after this many minutes and publish what was read (default: "
                              f"{certified_build.MINUTES_ENV}, else {certified_build.DEFAULT_MINUTES:g}).")

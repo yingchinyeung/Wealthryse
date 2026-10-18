@@ -34,6 +34,16 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
                     'Dockerfile.live-collector', 'requirements-live.lock',
                     # Repository metadata, not copied into any image.
                     'LICENSE')
+# Lines that put infra/medallion into the platform and agent images (#152). The website image is
+# the live website image plus the .py files of src/ibkr_etl, so these have nothing to release here;
+# any other change to these files still stops the release.
+PLATFORM_ONLY_LINES = {
+    '.dockerignore': ('!infra/medallion',),
+    'Dockerfile.azure': ('# Medallion data contracts and registers (infra/medallion), read by the layer quality checks',
+                         '# and the certified figures. The rest of infra/ stays out of the image.',
+                         'COPY infra/medallion ./medallion',
+                         'ENV MEDALLION_DIR=/app/medallion'),
+}
 # Website switches whose code reads tables from these migrations.
 SWITCHES_NEEDING_MIGRATIONS = {
     'ONBOARDING_V2_ENABLED': ('064_broker_connections_and_onboarding_cases.sql', '065_onboarding_report_style.sql'),
@@ -173,6 +183,18 @@ def unapplied_migrations(switches, commit):
             != hashlib.sha256(git('show', f'{commit}:migrations/postgres/{m}', binary=True)).hexdigest()]
 
 
+def platform_only_change(path, deployed, head):
+    """True when path differs from the deployed commit only by its PLATFORM_ONLY_LINES."""
+    lines = PLATFORM_ONLY_LINES.get(path)
+    if not lines:
+        return False
+    try:
+        before, after = (git('show', f'{commit}:{path}').splitlines() for commit in (deployed, head))
+    except subprocess.CalledProcessError:
+        return False
+    return [line for line in after if line not in lines] == [line for line in before if line not in lines]
+
+
 def pyproject_change_is_package_data_only(deployed, head):
     """True when pyproject.toml differs only in [tool.setuptools.package-data].
 
@@ -224,11 +246,15 @@ def prepare():
         print('Not part of the website release (database migrations; apply them with the bootstrap job '
               'before switching the website if the new code needs them):\n  ' + '\n  '.join(migrations))
     packaging = [p for p in changed if p == 'pyproject.toml' and pyproject_change_is_package_data_only(deployed, head)]
+    platform_only = [p for p in changed if platform_only_change(p, deployed, head)]
+    if platform_only:
+        print('Not part of the website release (they only add infra/medallion to the platform image):\n  '
+              + '\n  '.join(platform_only))
     if packaging:
         print('Not part of the website release (pyproject.toml lists other package data only; this path '
               'ships the .py files of src/ibkr_etl)')
     image_changes = [p for p in changed if not p.startswith(IGNORED_PREFIXES) and not p.endswith('.md')
-                     and p not in skipped and p not in migrations and p not in packaging]
+                     and p not in skipped and p not in migrations and p not in packaging and p not in platform_only]
     unsupported = [p for p in image_changes if not p.startswith(PACKAGE + '/')]
     if unsupported:
         raise SystemExit('This release path only ships src/ibkr_etl. Other image files changed:\n  ' + '\n  '.join(unsupported))

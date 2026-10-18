@@ -4,8 +4,10 @@ docs/MEDALLION_CERTIFIED_FIGURES.md explains the layer. The register is
 infra/medallion/certified-figures.json, read on first use from the first of these that has it:
 the folder named by MEDALLION_DIR, the repository's infra/medallion, /app/medallion (where the
 platform image carries infra/medallion), and last the copy packaged with ibkr_etl
-(certified_figures_register.json), so every image has it. After changing the register, refresh
-that copy with `python -m ibkr_etl.certified_figures --write` (a test checks they match).
+(certified_figures_register.json), so every image has it. The website's release ships only the
+.py files of ibkr_etl, so it reads the same register from certified_figures_register_data.py,
+used when the packaged JSON is missing too. After changing the register, refresh both copies with
+`python -m ibkr_etl.certified_figures --write` (a test checks they match).
 Other code can use medallion_dir() for the catalog and contracts, which are not packaged.
 
 Nothing here reads client data or switches anything on, and importing it reads no file, so it
@@ -57,6 +59,8 @@ DIR_SETTING = "MEDALLION_DIR"
 REPOSITORY_DIR = Path(__file__).resolve().parents[2] / "infra" / "medallion"
 IMAGE_DIR = Path("/app/medallion")
 PACKAGED_REGISTER = Path(__file__).with_name("certified_figures_register.json")
+# The register as code, for the website: its release ships only .py files (deploy/website_release.py).
+PACKAGED_MODULE = Path(__file__).with_name("certified_figures_register_data.py")
 
 BUILD_SETTING = "CERTIFIED_FIGURES_BUILD"
 PAGES_SETTING = "CERTIFIED_FIGURES_PAGES"
@@ -152,18 +156,29 @@ def medallion_dir(environ: Mapping[str, str] | None = None) -> Path:
 
 def register_path(environ: Mapping[str, str] | None = None) -> Path:
     """The register in MEDALLION_DIR, the repository's infra/medallion or /app/medallion, the first
-    that has it; otherwise the copy packaged with ibkr_etl."""
+    that has it; otherwise the JSON copy packaged with ibkr_etl, or, where that is missing too (the
+    website), the copy as code."""
     environ = os.environ if environ is None else environ
     explicit = str(environ.get(DIR_SETTING, "")).strip()
     folders = ([Path(explicit)] if explicit else []) + [REPOSITORY_DIR, IMAGE_DIR]
     return next((folder / REGISTER_NAME for folder in folders if (folder / REGISTER_NAME).is_file()),
-                PACKAGED_REGISTER)
+                PACKAGED_REGISTER if PACKAGED_REGISTER.is_file() else PACKAGED_MODULE)
+
+
+def register_text(environ: Mapping[str, str] | None = None) -> str:
+    """The register's text, from register_path()."""
+    path = register_path(environ)
+    if path == PACKAGED_MODULE:
+        from . import certified_figures_register_data as packaged
+
+        return packaged.TEXT
+    return path.read_text(encoding="utf-8")
 
 
 @lru_cache(maxsize=1)
 def register() -> dict:
     """The register as parsed JSON, read once (shared; do not change it)."""
-    return json.loads(register_path().read_text(encoding="utf-8"))
+    return json.loads(register_text())
 
 
 def reload() -> None:
@@ -333,22 +348,41 @@ def freshness(as_of: date | str, latest: date | str | None, *, reason: str | Non
     return result
 
 
+MODULE_HEAD = (
+    '"""The certified figures register as code: generated, do not edit.\n\n'
+    "A copy of infra/medallion/certified-figures.json for the website, whose release ships only the .py\n"
+    "files of ibkr_etl. Refresh it with python -m ibkr_etl.certified_figures --write (a test keeps the\n"
+    'copies equal)."""\n'
+)
+
+
+def module_source(text: str) -> str:
+    """certified_figures_register_data.py for a register text (a raw string holding it unchanged)."""
+    if "'''" in text or text.endswith("\\"):
+        raise ValueError("the register text cannot sit in a raw triple-quoted string")
+    return MODULE_HEAD + "TEXT = r'''" + text + "'''\n"
+
+
 def main(argv: list[str] | None = None) -> int:
-    """--write copies infra/medallion/certified-figures.json over the packaged copy; without it,
-    says whether the two match."""
+    """--write copies infra/medallion/certified-figures.json over the packaged copies (the JSON and
+    the copy as code); without it, says whether they match."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Keep the packaged register copy in step.")
-    parser.add_argument("--write", action="store_true", help="Refresh the packaged copy from infra/medallion.")
+    parser = argparse.ArgumentParser(description="Keep the packaged register copies in step.")
+    parser.add_argument("--write", action="store_true", help="Refresh the packaged copies from infra/medallion.")
     args = parser.parse_args(argv)
     source = REPOSITORY_DIR / REGISTER_NAME
-    same = PACKAGED_REGISTER.is_file() and PACKAGED_REGISTER.read_bytes() == source.read_bytes()
-    if args.write and not same:
-        PACKAGED_REGISTER.write_bytes(source.read_bytes())
-        print(f"Wrote {PACKAGED_REGISTER.name} from {source}.")
+    text = source.read_text(encoding="utf-8")
+    copies = {PACKAGED_REGISTER: source.read_bytes(), PACKAGED_MODULE: module_source(text).encode("utf-8")}
+    differ = [path for path, data in copies.items() if not path.is_file() or path.read_bytes() != data]
+    if args.write and differ:
+        for path in differ:
+            path.write_bytes(copies[path])
+            print(f"Wrote {path.name} from {source}.")
         return 0
-    print("The packaged register matches." if same else "The packaged register differs; run with --write.")
-    return 0 if same else 1
+    print("The packaged register copies match." if not differ
+          else "The packaged register copies differ (%s); run with --write." % ", ".join(p.name for p in differ))
+    return 0 if not differ else 1
 
 
 if __name__ == "__main__":

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "administratorLoginPassword": {
+      "value": "<read from Key Vault secret research-db-admin-password at deployment time; never stored here>"
+    },
+    "postgresSkuName": {
+      "value": "Standard_B1ms"
+    },
+    "imageDigest": {
+      "value": "<empty for the first deployment; sha256:... of ibkr-research main-<commit> for the second>"
+    },
+    "codeVersion": {
+      "value": "<the commit the image was built from>"
+    },
+    "scheduleHourUtc": {
+      "value": -1
+    },
+    "vendorSecretNames": {
+      "value": []
+    }
+  }
+}

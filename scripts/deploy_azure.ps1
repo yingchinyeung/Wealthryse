@@ -18,6 +18,11 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# This script deploys v1.1 (infra/main.bicep, bootstrap-job.bicep and job.bicep).
+# v1.1 was deleted on 21 Oct 2026, so running it would build a new copy of the
+# retired stack. Kept as a record only; v2 has its own Bicep files in infra/.
+throw 'v1.1 was deleted on 21 Oct 2026. This script would create it again, so it no longer runs.'
+
 if (-not $ConfirmAzureCosts) {
     throw 'Azure resources incur ongoing charges. Re-run with -ConfirmAzureCosts after reviewing the selected region and SKUs.'
 }

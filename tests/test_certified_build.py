@@ -7,7 +7,7 @@ import importlib.util
 import io
 import re
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -135,6 +135,59 @@ class CertifiedBuildTests(unittest.TestCase):
         self.assertEqual(texts, {"2026-10-19": "current", "2026-10-20": "one business day behind",
                                  "2026-10-21": "overdue"})
         self.assertEqual(build.freshness_row(build.Pages(None, subject, "2026-10-15"), date(2026, 10, 19)), [])
+
+
+class GateTests(unittest.TestCase):
+    """The publish gate's verdict for the build: asked per source job, stored, binding only when set."""
+
+    STARTED = datetime(2026, 10, 22, 9, 5, tzinfo=timezone.utc)
+
+    def _verdict(self, states, mode="binding"):
+        calls = []
+
+        def check(job, *, since, environ, now):
+            calls.append((job, since, environ, now))
+            state = states.get(job, "pass")
+            if isinstance(state, Exception):
+                raise state
+            return {"verdict": state, "reasons": [f"U9300001 {job} reason {n}" for n in range(7)] if state == "fail"
+                    else [], "reasons_total": 7 if state == "fail" else 0}
+
+        return build.gate_verdict(mode=mode, database_url="postgresql://app@db/x", tenant_id="t-1",
+                                  started=self.STARTED, check=check), calls
+
+    def test_the_setting_is_off_unless_it_says_report_or_binding(self):
+        for value, mode in (("", "off"), ("off", "off"), (" Binding ", "binding"), ("REPORT", "report"),
+                            ("enforce", "off"), ("on", "off"), ("bindng", "off")):
+            with self.subTest(value=value):
+                self.assertEqual(build.gate_mode({build.GATE_ENV: value}), mode)
+        self.assertEqual(build.gate_mode({}), "off")
+
+    def test_off_asks_nothing(self):
+        verdict, calls = self._verdict({}, mode="off")
+        self.assertIsNone(verdict)
+        self.assertEqual(calls, [])
+
+    def test_each_source_job_is_asked_since_the_start_of_the_day(self):
+        verdict, calls = self._verdict({})
+        self.assertEqual([c[0] for c in calls], list(build.GATE_JOBS))
+        self.assertTrue(all(c[1] == datetime(2026, 10, 22, tzinfo=timezone.utc) for c in calls))
+        self.assertEqual(calls[0][2], {"DATABASE_URL": "postgresql://app@db/x", "PORTFOLIO_TENANT_ID": "t-1"})
+        self.assertEqual((verdict["verdict"], verdict["failed"], verdict["mode"]), ("pass", [], "binding"))
+        self.assertEqual(verdict["since"], "2026-10-22T00:00:00+00:00")
+
+    def test_a_fail_names_the_job_and_keeps_a_few_reasons(self):
+        verdict, _ = self._verdict({"derived-daily": "fail", "risk-snapshots": "warn"})
+        self.assertEqual((verdict["verdict"], verdict["failed"]), ("fail", ["derived-daily"]))
+        job = verdict["jobs"]["derived-daily"]
+        self.assertEqual((len(job["reasons"]), job["reasons_total"]), (build.GATE_REASONS, 7))
+
+    def test_warn_skipped_and_a_broken_check_never_fail(self):
+        verdict, _ = self._verdict({"benchmark-daily": "skipped", "derived-daily": "warn",
+                                    "risk-snapshots": RuntimeError("boom"), "crisis-scenarios-daily": "unavailable"})
+        self.assertEqual((verdict["verdict"], verdict["failed"]), ("warn", []))
+        self.assertEqual(verdict["jobs"]["risk-snapshots"]["verdict"], "unavailable")
+        self.assertEqual(verdict["jobs"]["risk-snapshots"]["reasons"], ["check failed: RuntimeError"])
 
 
 if __name__ == "__main__":

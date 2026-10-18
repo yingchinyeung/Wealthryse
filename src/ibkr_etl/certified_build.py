@@ -115,6 +115,52 @@ def enabled(environ: Mapping[str, str]) -> bool:
     return str(environ.get(cf.BUILD_SETTING, "")).strip().lower() == "on"
 
 
+# The publish gate's verdict on the jobs whose gold tables the pages read (publish_gate.JOB_TABLES).
+# off: not asked. report: asked and stored with the build. binding: a failed verdict also holds the build.
+GATE_ENV = "CERTIFIED_FIGURES_GATE"
+GATE_MODES = ("off", "report", "binding")
+GATE_JOBS = ("benchmark-daily", "derived-daily", "risk-snapshots", "crisis-scenarios-daily")
+GATE_REASONS = 5
+
+
+def gate_mode(environ: Mapping[str, str] | None = None) -> str:
+    """The setting's mode; anything else (a typo included) is off, so a mistake never holds a build."""
+    text = str((os.environ if environ is None else environ).get(GATE_ENV, "")).strip().lower()
+    return text if text in GATE_MODES else "off"
+
+
+def gate_since(started: datetime) -> datetime:
+    """The gate judges what the source jobs wrote since 00:00 UTC on the build's day: the daily
+    cycle (07:20 to 09:45 UTC) and anything rerun since."""
+    return started.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def gate_verdict(*, mode: str, database_url: str, tenant_id: str, started: datetime,
+                 check: Callable[..., dict] | None = None) -> dict | None:
+    """The publish gate's read-only verdict for each source job, as stored with the build. Never
+    raises: a check that cannot run counts as unavailable, which warns and never holds."""
+    if mode == "off":
+        return None
+    from . import publish_gate
+
+    check = check or publish_gate.check
+    since = gate_since(started)
+    environ = {"DATABASE_URL": database_url, "PORTFOLIO_TENANT_ID": tenant_id}
+    jobs: dict[str, dict] = {}
+    for job in GATE_JOBS:
+        try:
+            result = check(job, since=since, environ=environ, now=started)
+        except Exception as error:  # noqa: BLE001 - the gate never breaks the build
+            result = {"verdict": publish_gate.UNAVAILABLE, "reasons": [f"check failed: {type(error).__name__}"]}
+        reasons = [str(reason) for reason in result.get("reasons") or ()]
+        jobs[job] = {"verdict": str(result.get("verdict") or publish_gate.UNAVAILABLE),
+                     "reasons": reasons[:GATE_REASONS], "reasons_total": int(result.get("reasons_total") or len(reasons))}
+    verdict = publish_gate._worst(job["verdict"] for job in jobs.values())
+    return {"mode": mode, "since": since.isoformat(), "verdict": verdict, "jobs": jobs,
+            "failed": [job for job, result in jobs.items() if result["verdict"] == publish_gate.FAIL],
+            "policy_version": publish_gate.POLICY_VERSION}
+
+
 def sha256(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
@@ -883,14 +929,18 @@ def time_limit(minutes: float | None, environ: Mapping[str, str] | None = None) 
 def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, only_subjects: Iterable[str] = (),
         pages: Iterable[str] | None = None, now: datetime | None = None, web=None, record=None,
         on_connect: Callable[[Any], None] | None = None, out: Callable[[str], None] = print,
-        minutes: float | None = None, clock: Callable[[], float] = monotonic_time.monotonic) -> int:
+        minutes: float | None = None, clock: Callable[[], float] = monotonic_time.monotonic,
+        gate_check: Callable[..., dict] | None = None) -> int:
     """One build. Returns 0 when published, held for review or not due (inputs not in yet).
 
     on_connect gets the writing connection first (the job binds its lineage run there); record,
-    a lineage run, is told what was written. Reading stops after `minutes` (time_limit())."""
+    a lineage run, is told what was written. Reading stops after `minutes` (time_limit()). The publish
+    gate is asked as CERTIFIED_FIGURES_GATE says (gate_mode(); gate_check replaces publish_gate.check
+    in tests)."""
     import psycopg
 
     limit = time_limit(minutes)
+    gate = gate_mode()
     begun = clock()
     web = web or load_web()
     pages = [page for page in (pages or cf.pages()) if page in READERS]
@@ -953,6 +1003,8 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
             result = compare(rows, published)
             to_write = result["new"] + result["changed"]
             failures = rule_failures(to_write)
+            verdict = gate_verdict(mode=gate, database_url=database_url, tenant_id=str(web.TENANT_ID),
+                                   started=started, check=gate_check)
             checks = {
                 "subjects": len(found), "subjects_ready": len(ready), "subjects_skipped": len(skipped),
                 "expected_date": expected, "run_kind": "backfill" if backfill else "daily",
@@ -964,11 +1016,13 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 "rule_failures": sorted(set(failures)), "rule_failure_count": len(failures),
                 "page_disagreements": disagreements, "reader_errors": len(errors),
                 "page_unavailable": notes.get("page_unavailable", {}),
-                # publish_gate.check's verdict goes here once that module is in (binding from 8 Nov).
-                "publish_gate": None,
+                # publish_gate.check's verdict on the source jobs (gate_verdict); None when the setting is off.
+                "publish_gate": verdict,
             }
             outcomes = {"contract_rules": not failures, "same_inputs_same_answer": not result["violations"],
                         "pages_agree": not disagreements, "pages_read": not errors}
+            if gate == "binding":
+                outcomes["publish_gate"] = not verdict["failed"]
             checks.update(passed=sum(outcomes.values()), total=len(outcomes),
                           failed=[name for name, ok in outcomes.items() if not ok])
             reasons = []
@@ -980,10 +1034,16 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 reasons.append(f"the pages disagree for {len(disagreements)} subjects")
             if errors:
                 reasons.append(f"{len(errors)} subject dates could not be read")
+            if gate == "binding" and verdict["failed"]:
+                reasons.append(f"the publish gate failed for {', '.join(verdict['failed'])}")
             held_reason = "; ".join(reasons) or None
             out(f"Read {len(rows)} figures: {len(result['new'])} new, {len(result['changed'])} changed, "
                 f"{result['unchanged']} unchanged. Checks: {len(result['violations'])} same-input changes, "
                 f"{len(failures)} rule failures, {len(disagreements)} page disagreements, {len(errors)} read errors.")
+            if verdict is not None:   # verdicts and counts only: the reasons name subjects
+                out(f"Publish gate ({gate}, since {verdict['since'][:16]}Z): {verdict['verdict']}; "
+                    + ", ".join(f"{job} {result['verdict']} ({result['reasons_total']} reasons)"
+                                for job, result in verdict["jobs"].items()) + ".")
             for line in errors[:20]:
                 out(f"  read error {line}")
             for who, figure_ids in sorted(disagreements.items()):   # figure ids only, no figures

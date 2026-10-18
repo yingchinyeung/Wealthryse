@@ -340,10 +340,22 @@ tables are untouched:
 3. Only then is it marked `published`, and readers move to it. Otherwise it is `held`, and
    pages keep the last published figures, marked "Not yet updated".
 
-The publish gate's own verdict on the source tables (from `publish_gate.check`, in shadow) is
-stored with each build from the start, and becomes binding from 8 Nov with one setting
-(open question 3). This is review item 2 built early for one table, so it can be the gate's
-first enforced user.
+The publish gate's own verdict on the source tables (from `publish_gate.check`) is stored with
+each build, and becomes binding with one setting (open question 3). This is review item 2 built
+early for one table, so it can be the gate's first enforced user. The job's
+`CERTIFIED_FIGURES_GATE` setting picks the mode:
+
+- `off` (the default): the gate is not asked, and `checks.publish_gate` is empty.
+- `report`: the gate is asked, read-only, about what `benchmark-daily`, `derived-daily`,
+  `risk-snapshots` and `crisis-scenarios-daily` wrote since 00:00 UTC on the build's day. Its
+  verdict per job, with the first few reasons, is stored in `checks.publish_gate`. The log shows
+  only verdicts and counts.
+- `binding`: the same, and a `fail` for any of those jobs also holds the build ("the publish gate
+  failed for derived-daily"). Pages keep the last published figures. A warning, a job with
+  nothing new, or a check that cannot run never holds.
+
+Ying moved binding into October (18 Oct, "Everything Oct"): the job's setting goes to `binding`
+on Thu 22 Oct with its move to an image that has this code.
 
 **When it runs.** Twice a day, so pages update as soon as their data does: after the derived
 step (about 09:00 UTC) for the NAV, holdings, cash and statistics figures, and after the

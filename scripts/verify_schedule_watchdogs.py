@@ -59,7 +59,7 @@ def main():
                     or properties['autoMitigate'] is not True or properties['severity'] != 2
                     or criterion['query'].strip() != rule['query'].strip()
                     or len(action_groups) != 1
-                    or not action_groups[0].lower().endswith('/actiongroups/ibkr-v11-daily-alerts')):
+                    or not action_groups[0].lower().endswith('/actiongroups/ibkrv2stg-alerts')):
                 raise RuntimeError('Deployed watchdog differs from reviewed settings')
             evidence['deployed_rules'].append({'name': rule['name'], 'enabled': True, 'query_verified': True})
     for rule in rules:

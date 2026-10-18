@@ -1,6 +1,6 @@
 // Deploy independently: never redeploy a job merely to extend alert coverage.
 targetScope = 'resourceGroup'
-param actionGroupName string = 'ibkr-v11-daily-alerts'
+param actionGroupName string = 'ibkrv2stg-alerts'
 param jobNames array = [
   'ibkrv2stg-derived-daily'
   'ibkrv2stg-risk-snapshots'

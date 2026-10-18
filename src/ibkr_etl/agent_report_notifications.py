@@ -93,7 +93,7 @@ def rule_definition(*, workspace_id, action_group_id):
     """Dormant rule only: no caller-controlled enablement or destination."""
     base = '/subscriptions/3956e821-cee4-403f-8708-e84e2ed490eb/resourceGroups/rg-ibkr-database-v11/providers/'
     if (workspace_id != base + 'Microsoft.OperationalInsights/workspaces/ibkrv2stg-logs'
-            or action_group_id != base + 'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts'):
+            or action_group_id != base + 'Microsoft.Insights/actionGroups/ibkrv2stg-alerts'):
         raise ValueError('Registered Azure notification destination required')
     return dict(location='eastasia', kind='LogAlert',
         tags=dict(application='ibkr-portfolio-platform', purpose='specialist-report-readiness', mode='dormant'),

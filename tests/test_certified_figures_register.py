@@ -1,10 +1,11 @@
-"""The draft certified-figures register must agree with the Metrics guide (a design proof for U5).
+"""The certified-figures register must agree with the Metrics guide (medallion upgrade U5).
 
 infra/medallion/certified-figures.json lists the figures to certify first, page by page,
 and the three batches the pages move in before the November month-end
-(docs/MEDALLION_CERTIFIED_FIGURES.md). Nothing reads it at run time and nothing is switched
-on by it. These checks keep the draft honest while it is reviewed:
+(docs/MEDALLION_CERTIFIED_FIGURES.md). src/ibkr_etl/certified_figures.py reads it, through an
+identical copy in the package. These checks keep it honest:
 
+- the packaged copy is identical to the reviewed file, and the module's API reads it;
 - every figure names a Metrics guide definition, and the guide places that definition on
   the figure's page (or the figure records the gap);
 - every definition in the guide sections the first pages cover is certified or deferred
@@ -24,6 +25,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 
+from ibkr_etl import certified_figures as cf
 from ibkr_etl import metrics_guide as guide
 from ibkr_etl.factsheet_spec.bindings import CATALOGUE as BINDINGS
 
@@ -37,7 +39,7 @@ LAYERS = ("silver", "gold")
 
 
 def _register() -> dict:
-    return json.loads(REGISTER.read_text(encoding="utf-8"))
+    return cf.register()
 
 
 def _catalog_targets() -> dict[str, str]:
@@ -266,6 +268,128 @@ class CertifiedFiguresRegisterTests(unittest.TestCase):
                     self.assertIn(field.rsplit(".", 1)[1], risk)
                 elif field.startswith("comparison_metrics:"):
                     self.assertIn(field.split(":", 1)[1], comparison)
+
+
+
+class CertifiedFiguresModuleTests(unittest.TestCase):
+    """The API the build, the website readers and the agents import."""
+
+    def tearDown(self) -> None:
+        cf.reload()
+
+    def test_the_register_is_found_in_the_repository_the_setting_or_the_image(self) -> None:
+        import tempfile
+        from unittest.mock import patch
+
+        self.assertEqual(cf.medallion_dir({}), ROOT / "infra" / "medallion")
+        self.assertEqual(cf.register_path({}), REGISTER)
+        self.assertEqual(cf.register(), json.loads(REGISTER.read_text(encoding="utf-8")))
+        self.assertEqual(cf.medallion_dir({"MEDALLION_DIR": "/somewhere/medallion"}), Path("/somewhere/medallion"))
+        self.assertEqual(cf.medallion_dir({"MEDALLION_DIR": "  "}), ROOT / "infra" / "medallion")
+        with tempfile.TemporaryDirectory() as folder:
+            image = Path(folder) / "medallion"
+            image.mkdir()
+            (image / cf.REGISTER_NAME).write_bytes(REGISTER.read_bytes())
+            # As in the image: no repository folder, the register at /app/medallion.
+            with patch.object(cf, "REPOSITORY_DIR", Path(folder) / "absent"), patch.object(cf, "IMAGE_DIR", image):
+                self.assertEqual(cf.medallion_dir({}), image)
+                cf.reload()
+                self.assertEqual(len(cf.figures()), 71)
+            with patch.dict("os.environ", {"MEDALLION_DIR": str(Path(folder) / "elsewhere")}):
+                cf.reload()
+                with self.assertRaises(FileNotFoundError):
+                    cf.register()
+        cf.reload()
+        self.assertEqual(len(cf.figures()), 71)
+
+    def test_figures_carry_their_definition_and_version(self) -> None:
+        figures = cf.figures()
+        self.assertEqual(list(figures), list(cf.register()["figures"]))
+        self.assertEqual(len(figures), 71)
+        sharpe = cf.figure("risk.sharpe_ratio")
+        self.assertEqual((sharpe.label, sharpe.definition_id, sharpe.link, sharpe.unit, sharpe.page, sharpe.batch),
+                         ("Sharpe ratio", "metric-sharpe-ratio", "/metrics-guide#metric-sharpe-ratio", "number",
+                          "risk-snapshot", 3))
+        self.assertRegex(sharpe.definition_version, r"^[0-9a-f]{12}$")
+        self.assertEqual(sharpe.definition_version, cf.definition_version("Sharpe ratio"))
+        self.assertNotEqual(sharpe.definition_version, cf.definition_version("Sortino ratio"))
+        for figure in figures.values():
+            with self.subTest(figure=figure.id):
+                self.assertEqual(figure.definition_id, guide.METRIC_ANCHORS[figure.guide])
+                self.assertTrue(figure.source_tables)
+        labels = [figure.label for figure in figures.values()]
+        self.assertEqual(len(labels), len(set(labels)), "two figures share a label")
+        self.assertEqual(cf.figure("stats.maximum_drawdown").label, "Maximum drawdown (every NAV date)")
+        self.assertEqual(cf.figure("risk.maximum_drawdown").label, "Maximum drawdown (benchmark dates)")
+        self.assertEqual(cf.figure("stats.best_day").label, "Best day")
+
+    def test_wording_changes_the_definition_version(self) -> None:
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        before = cf.definition_version("Sharpe ratio")
+        changed = replace(guide.definition("Sharpe ratio"), meaning="Something else.")
+        with patch.dict(guide._BY_NAME, {"Sharpe ratio": changed}):
+            self.assertNotEqual(cf.definition_version("Sharpe ratio"), before)
+
+    def test_unknown_ids_name_the_closest(self) -> None:
+        with self.assertRaises(KeyError) as caught:
+            cf.figure("risk.sharpe_ration")
+        self.assertIsInstance(caught.exception, cf.UnknownFigure)
+        self.assertIn("risk.sharpe_ratio", caught.exception.closest)
+        self.assertIn("risk.sharpe_ratio", str(caught.exception))
+        with self.assertRaises(KeyError):
+            cf.page("trades")
+
+    def test_pages_batches_and_what_each_page_shows(self) -> None:
+        self.assertEqual(list(cf.pages()), ["overview", "holdings", "cash", "performance", "risk-snapshot",
+                                            "risk-statistics", "combined-holdings"])
+        self.assertEqual(cf.batch_for_page("performance"), cf.Batch(2, date(2026, 10, 23)))
+        overview = [figure.id for figure in cf.figures_for_page("overview")]
+        self.assertEqual(overview[0], "overview.as_of")
+        self.assertEqual(overview[-2:], ["holdings.holding_weight", "holdings.sector_allocation"])
+        combined = [figure.id for figure in cf.figures_for_page("combined-holdings")]
+        self.assertEqual(combined, ["holdings.quantity", "holdings.market_value", "holdings.cost_basis",
+                                    "holdings.unrealized_pnl"])
+        per_page = sum(len([f for f in cf.figures().values() if f.page == page]) for page in cf.pages())
+        self.assertEqual(per_page, 71)
+
+    def test_page_modes_default_off_and_ignore_typos(self) -> None:
+        self.assertEqual(set(cf.page_modes(None).values()), {"off"})
+        self.assertEqual(set(cf.page_modes("").values()), {"off"})
+        modes = cf.page_modes(" Overview=on, holdings=shadow,cash=ON,performance=maybe,trades=on,risk-snapshot")
+        self.assertEqual({page: mode for page, mode in modes.items() if mode != "off"},
+                         {"overview": "on", "holdings": "shadow", "cash": "on"})
+        served = {figure.page for figure in cf.served_figures(modes)}
+        self.assertEqual(served, {"overview", "cash"})
+        self.assertEqual(cf.served_figures(cf.page_modes("")), [])
+
+    def test_periods(self) -> None:
+        twr, monthly = cf.figure("overview.twr"), cf.figure("performance.monthly_return")
+        for period in ("mtd", "qtd", "ytd", "year_2025", "since_inception"):
+            self.assertTrue(cf.period_allowed(twr, period), period)
+        for period in ("", "month_2026-10", "year_25", "1y"):
+            self.assertFalse(cf.period_allowed(twr, period), period)
+        self.assertTrue(cf.period_allowed(monthly, "month_2026-10"))
+        self.assertFalse(cf.period_allowed(monthly, "month_2026-13"))
+        self.assertTrue(cf.period_allowed(cf.figure("risk.sharpe_ratio"), ""))
+        self.assertFalse(cf.period_allowed(cf.figure("risk.sharpe_ratio"), "ytd"))
+
+    def test_calculation_versions(self) -> None:
+        self.assertEqual(cf.calculation_version(cf.figure("risk.sharpe_ratio"), "risk-analytics-v2"),
+                         "risk-analytics-v2+benchmark-comparison-v1")
+        self.assertEqual(cf.calculation_version(cf.figure("stats.skewness")), "portfolio-analytics-v1")
+        self.assertEqual(cf.calculation_version(cf.figure("cash.ending_cash"), "silver.subject_cash_balance_series@1.0.0"),
+                         "imported+silver.subject_cash_balance_series@1.0.0")
+
+    def test_freshness(self) -> None:
+        self.assertEqual(cf.freshness("2026-10-21", "2026-10-21")["status"], "fresh")
+        behind = cf.freshness(date(2026, 10, 16), date(2026, 10, 20), reason="The build was held.")
+        self.assertEqual((behind["status"], behind["business_days_behind"], behind["reason"]),
+                         ("behind", 2, "The build was held."))
+        self.assertEqual(cf.freshness("2026-10-09", "2026-10-16")["status"], "late")
+        self.assertEqual(cf.freshness("2026-10-12", "2026-10-16")["status"], "behind")
+        self.assertNotIn("reason", cf.freshness("2026-10-16", "2026-10-16", reason="x"))
 
 
 if __name__ == "__main__":

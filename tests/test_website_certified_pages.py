@@ -17,7 +17,7 @@ HEAD = "b" * 40
 LIVE = "a" * 40
 SQL = b"create 073\n"
 SHADOW = ("overview=shadow,holdings=shadow,cash=shadow,performance=shadow,risk-snapshot=shadow,"
-          "risk-statistics=shadow,combined-holdings=shadow")
+          "risk-statistics=shadow,combined-holdings=shadow,attribution=shadow")
 
 
 def at(text):
@@ -32,7 +32,9 @@ class PagesValueTest(unittest.TestCase):
                          .replace("holdings=shadow,cash", "holdings=on,cash").replace("cash=shadow", "cash=on"))
         modes = release.page_modes(release.pages_value("batch-2"))
         self.assertEqual([p for p, m in modes.items() if m == "on"], ["overview", "holdings", "cash", "performance"])
-        self.assertEqual(set(release.page_modes(release.pages_value("batch-3")).values()), {"on"})
+        modes = release.page_modes(release.pages_value("batch-3"))
+        self.assertEqual([p for p, m in modes.items() if m != "on"], ["attribution"])
+        self.assertEqual(set(release.page_modes(release.pages_value("batch-4")).values()), {"on"})
 
     def test_the_stages_follow_the_register(self):
         # The same pages and modes the website reads (ibkr_etl.certified_figures.page_modes).

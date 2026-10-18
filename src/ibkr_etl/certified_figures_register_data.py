@@ -18,10 +18,12 @@ TEXT = r'''{
   "scalar": "One value for each subject and as-of date.",
   "per_period": "One value for each subject, as-of date and period (for example mtd, ytd, a calendar year or a month).",
   "per_item": "One value for each subject, as-of date and item (a holding, sector, currency or crisis scenario).",
+  "per_period_item": "One value for each subject, as-of date, period and item (a holding's or a sector's contribution in one month).",
   "series": "One value for each date; the rows stay in their gold table and are served through the certified view."
  },
  "methods": {
-  "imported": "IBKR's own value as imported into silver, unchanged. The calculation version is the source table's contract version."
+  "imported": "IBKR's own value as imported into silver, unchanged. The calculation version is the source table's contract version.",
+  "monthly-reporting-attribution-v2-full-nav-coverage": "The monthly reports' attribution engine (ibkr_etl.monthly_reporting_analytics), which Performance › Attribution shares. The calculation version is the engine's own method version."
  },
  "timeline": {
   "approval": "2026-10-19",
@@ -31,13 +33,16 @@ TEXT = r'''{
   "last_move": "2026-10-29",
   "watching": ["2026-10-30", "2026-10-31"],
   "freeze": ["2026-11-01", "2026-11-07"],
-  "after_month_end": "2026-11-08"
+  "after_month_end": "2026-11-08",
+  "october_switch_ons": ["2026-10-26", "2026-10-29"]
  },
  "batches": {
   "1": {"date": "2026-10-22", "pages": ["overview", "holdings", "cash"]},
   "2": {"date": "2026-10-23", "pages": ["performance"]},
   "3": {"date": "2026-10-24", "pages": ["risk-snapshot", "risk-statistics", "combined-holdings"],
-        "also": "The agents' typed read tool (get_certified_figures, trace_figure, list_certified_figures)."}
+        "also": "The agents' typed read tool (get_certified_figures, trace_figure, list_certified_figures)."},
+  "4": {"date": "2026-10-27", "pages": ["attribution"],
+        "also": "The monthly reports read certified figures in the automatic fallback (MONTHLY_REPORTS_CERTIFIED=fallback): a certified value is used only when it equals today's."}
  },
  "pages": {
   "overview": {
@@ -86,7 +91,7 @@ TEXT = r'''{
                               "overview.twr_annualised", "overview.irr_annualised", "overview.net_external_flows",
                               "overview.positions", "overview.reporting_currency", "overview.observations"],
    "deferred_here": ["Cash-flow-adjusted daily portfolio return", "Daily benchmark return", "Benchmark return basis"],
-   "prerequisites": ["None new. gold.performance_comparison_daily is rewritten in place; the build copies the figures it needs into its own versioned rows. Performance › Attribution stays on today's path until after month-end (see after_month_end)."]
+   "prerequisites": ["None new. gold.performance_comparison_daily is rewritten in place; the build copies the figures it needs into its own versioned rows. Performance › Attribution moves on its own (the attribution page, batch 4)."]
   },
   "risk-snapshot": {
    "order": 5,
@@ -122,6 +127,17 @@ TEXT = r'''{
    "deferred_here": [],
    "note": "Combines the certified holding records of the accounts the viewer may see, converted into the chosen currency with today's dated FX rule and added up when the page is read (holdings_view.combine_holdings). The sums and weights are not stored, because they depend on who is looking and which currency they choose. The guide describes them in the Holdings entries (Cost basis, Unrealized P&L, Holding weight).",
    "prerequisites": ["The Holdings page's certified records (batch 1)."]
+  },
+  "attribution": {
+   "order": 8,
+   "batch": 4,
+   "title": "Performance › Attribution",
+   "routes": ["/accounts/{id}/performance/attribution"],
+   "apis": ["/api/portfolio/{id}/attribution"],
+   "guide_locations": ["Performance › Attribution"],
+   "deferred_here": [],
+   "note": "Contribution to return for one month, from the engine the monthly reports use (monthly_reporting_analytics). The figures are kept per month (period month_YYYY-MM) on the month's last NAV date, and for the month in progress on the newest date. The composite portfolios keep today's figures: their engine adds the sleeves in an order that changes from one run to the next, so its totals can differ in the last digit and the build's same-inputs check would hold the build. The dividends line on the page is a cash record total, not a guide figure.",
+   "prerequisites": ["The past month-ends filled in by one run of the build with --backfill --page attribution (the daily runs read only the latest dates). The engine's daily denominator uses today's flows reader (the Transfers and deposit rows of bronze flex_rows, the known exception), as the Overview does, so the figures stay the same."]
   }
  },
  "figures": {
@@ -342,13 +358,38 @@ TEXT = r'''{
    "method": "imported", "note": "One row per currency, plus the base-currency summary IBKR sends."},
   "cash.settled_cash": {"guide": "Settled cash", "unit": "money", "currency": "own", "kind": "per_item",
    "item": "currency", "page": "cash", "source": "new", "inputs": ["silver.subject_cash_balance_series"],
-   "method": "imported"}
+   "method": "imported"},
+
+  "attribution.portfolio_return": {"guide": "Contribution to return", "unit": "ratio", "kind": "per_period",
+   "page": "attribution", "periods": ["month_YYYY-MM"], "source": "new", "inputs": ["silver.subject_nav_series", "silver.subject_position_series", "silver.fx_rates",
+              "silver.instruments", "silver.instrument_classifications"],
+   "method": "monthly-reporting-attribution-v2-full-nav-coverage", "basis": "attribution basis",
+   "note": "The month's return as the attribution engine compounds it: every NAV interval in the month, on the Modified Dietz half-flow denominator. It can differ slightly from performance.monthly_return."},
+  "attribution.holdings_contribution": {"guide": "Contribution to return", "unit": "ratio", "kind": "per_period",
+   "page": "attribution", "periods": ["month_YYYY-MM"], "source": "new", "inputs": ["silver.subject_nav_series", "silver.subject_position_series", "silver.fx_rates",
+              "silver.instruments", "silver.instrument_classifications"],
+   "method": "monthly-reporting-attribution-v2-full-nav-coverage",
+   "note": "The holdings' linked contributions added up (the engine's equity_contribution)."},
+  "attribution.residual_contribution": {"guide": "Contribution to return", "unit": "ratio", "kind": "per_period",
+   "page": "attribution", "periods": ["month_YYYY-MM"], "source": "new", "inputs": ["silver.subject_nav_series", "silver.subject_position_series", "silver.fx_rates",
+              "silver.instruments", "silver.instrument_classifications"],
+   "method": "monthly-reporting-attribution-v2-full-nav-coverage",
+   "note": "Cash, interest, fees, FX on cash, intramonth trading and unmatched movements, linked the same way, so holdings plus residual add up to the month's return."},
+  "attribution.holding_contribution": {"guide": "Contribution to return", "unit": "ratio", "kind": "per_period_item",
+   "item": "holding", "page": "attribution", "periods": ["month_YYYY-MM"], "source": "new", "inputs": ["silver.subject_nav_series", "silver.subject_position_series", "silver.fx_rates",
+              "silver.instruments", "silver.instrument_classifications"],
+   "method": "monthly-reporting-attribution-v2-full-nav-coverage",
+   "note": "One row per holding (IBKR conid) held during the month; its symbol and sector travel in the detail."},
+  "attribution.sector_contribution": {"guide": "Contribution to return", "unit": "ratio", "kind": "per_period_item",
+   "item": "sector", "page": "attribution", "periods": ["month_YYYY-MM"], "source": "new", "inputs": ["silver.subject_nav_series", "silver.subject_position_series", "silver.fx_rates",
+              "silver.instruments", "silver.instrument_classifications"],
+   "method": "monthly-reporting-attribution-v2-full-nav-coverage",
+   "note": "The holdings' contributions added up by sector (Unclassified when a holding has none)."}
  },
  "deferred": {
   "Cash-flow-adjusted daily portfolio return": "A daily series already stored in gold.performance_comparison_daily and drawn on the Vs benchmark chart as today; certified as a series after month-end.",
   "Daily benchmark return": "A daily series already stored in gold.performance_comparison_daily and drawn on the Vs benchmark chart as today; certified as a series after month-end.",
   "Benchmark return basis": "A label (price or total return), carried in the detail of every benchmark figure rather than as a figure of its own.",
-  "Contribution to return": "Performance › Attribution shares its engine (monthly_reporting_analytics) with the monthly reports that produce the 1 Nov client reports, so it stays on today's path with them until after month-end.",
   "RSI (14)": "A price indicator per holding, worked out from daily mark prices; it stays calculated on the Holdings page until after month-end.",
   "Top 5 ETL contributors": "Shown by sorting the rows of risk.etl_contribution; not a figure of its own.",
   "Bottom 5 ETL contributors": "Shown by sorting the rows of risk.etl_contribution; not a figure of its own.",
@@ -386,9 +427,8 @@ TEXT = r'''{
   "administration": "Settings and access, not client figures."
  },
  "after_month_end": {
-  "reports": "Monthly reports produce the 1 Nov client reports from the frozen month-end snapshot, so they stay on today's path until 8 Nov.",
+  "reports": "The Reports pages list the month-end files. From 27 Oct the monthly reports read certified figures only in the automatic fallback (MONTHLY_REPORTS_CERTIFIED=fallback): a certified value is used only when it equals today's, so the 1 Nov client reports come out exactly as today's code makes them. The certified path alone (on) waits for two clean month-ends.",
   "factsheet": "The factsheet renderers read the frozen month-end snapshot, and their job moves on 21 Oct; they stay on today's path until 8 Nov.",
-  "attribution": "Performance › Attribution uses the monthly reports' engine, so it moves with them, from 8 Nov.",
   "month_end_drafter": "The agents' month-end commentary job keeps its own tool list until 8 Nov, so its drafts match the frozen reports."
  },
  "factsheet_only": {

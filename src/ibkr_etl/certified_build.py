@@ -252,6 +252,71 @@ def _call(handler: Callable, *args: Any, **kwargs: Any) -> dict:
         raise PageUnavailable(f"{error.status_code}: {error.detail}") from None
 
 
+class _Reads:
+    """Every row a page handler reads, in the order it reads them: the input fingerprint of a page
+    whose engine reads its own tables (Attribution). The order counts, because the engine adds
+    up in that order."""
+
+    def __init__(self) -> None:
+        self._sha = hashlib.sha256()
+        self.queries = 0
+
+    def add(self, query: Any, params: Any, rows: list) -> None:
+        self.queries += 1
+        plain = [dict(row) if isinstance(row, Mapping) else list(row) if isinstance(row, (list, tuple)) else row
+                 for row in rows]
+        self._sha.update(_canonical([str(query), params, plain]).encode("utf-8") + b"\n")
+
+    def hexdigest(self) -> str:
+        return self._sha.hexdigest()
+
+    @contextlib.contextmanager
+    def around(self, web) -> Iterator[None]:
+        """Record the reads of the handlers called inside, on whatever connections they use."""
+        original = web._database
+
+        @contextlib.contextmanager
+        def database():
+            with original() as connection:
+                yield _RecordingConnection(connection, self)
+
+        web._database = database
+        try:
+            yield
+        finally:
+            web._database = original
+
+
+class _RecordingConnection:
+    def __init__(self, connection, reads: _Reads):
+        self._connection, self._reads = connection, reads
+
+    def execute(self, query, params=None, *args, **kwargs):
+        cursor = self._connection.execute(query, params, *args, **kwargs)
+        rows = cursor.fetchall() if cursor.description is not None else []
+        self._reads.add(query, params, rows)
+        return _RecordedCursor(rows, cursor.description, cursor.rowcount)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+class _RecordedCursor:
+    def __init__(self, rows: list, description: Any, rowcount: int):
+        self._rows, self.description, self.rowcount = list(rows), description, rowcount
+
+    def fetchone(self):
+        return self._rows.pop(0) if self._rows else None
+
+    def fetchall(self):
+        rows, self._rows = self._rows, []
+        return rows
+
+    def __iter__(self):
+        while self._rows:
+            yield self._rows.pop(0)
+
+
 class Pages:
     """The page payloads for one subject and date, each called once and only when needed."""
 
@@ -305,6 +370,15 @@ class Pages:
     def risk_details(self) -> dict:
         return self._get("risk_details", lambda: _call(self.web.risk_analytics_details, self.subject.id,
                                                        as_of=self.as_of))
+
+    def attribution(self, month: str) -> tuple[dict, str]:
+        """Performance › Attribution for one month, and sha256 of every row its handler read."""
+        def make():
+            reads = _Reads()
+            with reads.around(self.web):
+                payload = _call(self.web.monthly_attribution_view, self.subject.id, month=month, as_of=self.as_of)
+            return payload, reads.hexdigest()
+        return self._get(f"attribution:{month}", make)
 
     def nav_inputs(self) -> str:
         """sha256 of the NAV series and external flows through the as-of date, as the handlers read them."""
@@ -722,6 +796,48 @@ def risk_statistics_rows(pages: Pages) -> list[Row]:
     return rows
 
 
+ATTRIBUTION_TOTALS = (("attribution.portfolio_return", "portfolio_monthly_return"),
+                      ("attribution.holdings_contribution", "equity_contribution"),
+                      ("attribution.residual_contribution", "residual_contribution"))
+
+
+def attribution_rows(pages: Pages) -> list[Row]:
+    """Performance › Attribution: the as-of date's month, from the page's own handler (the monthly
+    reports' engine). The page works a month out to its calendar end whatever the as-of date, so
+    a month is read only on its last date and, for the month in progress, on the newest date.
+    The composites keep today's figures: their engine adds the sleeves in set order, which
+    changes from one run to the next, so its totals can move in the last digit with the same
+    inputs and would hold the build."""
+    subject, as_of = pages.subject, pages.as_of
+    month = as_of[:7]
+    later = [day for day in subject.dates if day > as_of]
+    if subject.kind == "composite_portfolio" or (later and later[0][:7] == month):
+        return []
+    payload, inputs = pages.attribution(month)
+    if payload.get("available") and "position_coverage" not in payload:
+        return []  # a composite's answer
+    period = f"month_{month}"
+    common = {"inputs": inputs, "source_table": "silver.subject_position_series",
+              "source_key": {"subject_id": subject.id, "month": month, "as_of_date": as_of},
+              "source_version": payload.get("method_version"), "period": period}
+    if not payload.get("available"):
+        reason = str(payload.get("message") or "") or "Contribution to return is unavailable for this month."
+        return [_row(subject, figure_id, as_of, None, reason=reason, **common) for figure_id, _ in ATTRIBUTION_TOTALS]
+    span = {"period_start": payload.get("period_start"), "period_end": payload.get("period_end"),
+            "observations": payload.get("daily_observations")}
+    detail = {"quality_status": payload.get("quality_status")}
+    rows = [_row(subject, figure_id, as_of, payload.get(name), detail=detail, **span, **common)
+            for figure_id, name in ATTRIBUTION_TOTALS]
+    for entry in payload.get("security_contributions") or []:
+        rows.append(_row(subject, "attribution.holding_contribution", as_of, entry.get("contribution"),
+                         item=str(entry["conid"]), detail={"symbol": entry.get("symbol"), "sector": entry.get("sector")},
+                         **span, **common))
+    for entry in payload.get("sector_contributions") or []:
+        rows.append(_row(subject, "attribution.sector_contribution", as_of, entry.get("contribution"),
+                         item=str(entry["sector"]), **span, **common))
+    return rows
+
+
 READERS: dict[str, tuple[Callable[[Pages], list[Row]], ...]] = {
     "overview": (overview_rows,),
     "holdings": (holdings_rows, sector_rows),
@@ -730,6 +846,7 @@ READERS: dict[str, tuple[Callable[[Pages], list[Row]], ...]] = {
     "risk-snapshot": (risk_snapshot_rows,),
     "risk-statistics": (risk_statistics_rows,),
     "combined-holdings": (),  # the Holdings page's records, added up when read
+    "attribution": (attribution_rows,),
 }
 
 

@@ -139,6 +139,10 @@ class Turn:
     extra: dict[str, Any] = field(default_factory=dict)
     # Certified figures cited [F#] whose number did not match (warn-only until 8 Nov); refs only.
     figure_warnings: list[str] = field(default_factory=list)
+    # The tool results (T#) and certified figures (F#) the answer was checked against. Kept in memory
+    # for the supervisor's writer; never saved.
+    results: dict[str, Any] = field(default_factory=dict, repr=False)
+    figures: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
 
 
 def default_model_client(settings: ModelSettings):
@@ -202,9 +206,15 @@ class Agent:
 
     def run(self, *, question: str, account_id: str, tools: ToolClient, history: Sequence[Mapping[str, str]] = (),
             allowed_tools: Sequence[str] | None = None, instructions: str | None = None,
-            skip_router: bool = False, extra_fields: Mapping[str, Any] | None = None) -> Iterator[dict[str, Any]]:
+            skip_router: bool = False, extra_fields: Mapping[str, Any] | None = None,
+            evidence: tuple[Mapping[str, Any], Mapping[str, Mapping[str, Any]]] | None = None,
+            ) -> Iterator[dict[str, Any]]:
         """``extra_fields`` adds lists of strings to the answer (for example a checker's concerns); their
-        figures are checked with the answer's, and they come back in ``turn.extra``."""
+        figures are checked with the answer's, and they come back in ``turn.extra``.
+
+        ``evidence`` starts the turn with tool results (T#) and certified figures (F#) gathered by earlier
+        runs, so a writer can cite and check them without calling the tools again (the supervisor's
+        planner). New calls continue the numbering."""
         question = (question or "").strip()
         if not question or len(question) > MAX_QUESTION_CHARS:
             raise AgentError("invalid_question", f"Questions must be 1 to {MAX_QUESTION_CHARS} characters.")
@@ -232,8 +242,9 @@ class Agent:
             for m in list(history)[-10:] if m.get("role") in ("user", "assistant")
         ]
         conversation.append({"role": "user", "content": question})
-        results: dict[str, Any] = {}
-        figures: dict[str, dict[str, Any]] = {}  # F1, F2… across the turn
+        results: dict[str, Any] = dict(evidence[0]) if evidence else {}
+        figures: dict[str, dict[str, Any]] = {k: dict(v) for k, v in evidence[1].items()} if evidence else {}  # F1, F2…
+        turn.results, turn.figures = results, figures
         retried = False
         schema = ANSWER_SCHEMA
         if extra_fields:

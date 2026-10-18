@@ -725,7 +725,7 @@ answer check is as before (`tests/test_certified_agent_tools.py`).
 `AGENT_CERTIFIED_FIGURES=on` and `CERTIFIED_FIGURES_PAGES` on the tool server and
 `AGENT_CERTIFIED_FIGURES=on` on the agent service.
 
-## Supervisor (watch-only, off)
+## Supervisor (off)
 
 The first step of the supervisor design that Ying approved on 19 Oct: one supervisor
 above four team leads (client analysis, reporting, onboarding, data and operations),
@@ -766,6 +766,49 @@ Oct), then `AGENT_SUPERVISOR=watch` on the agent service (planned Thu 29 Oct). T
 undo is `AGENT_SUPERVISOR=off`; the table stays, unread. Any other value is off.
 **Once it is on, every later deploy of `infra/agent-apps.bicep` must pass
 `supervisorMode=watch`, or that deploy turns watch off.**
+
+### Live mode: the client analysis team answers (named people only, off)
+
+The second step. With `AGENT_SUPERVISOR=live`, website chat for the people named in
+`AGENT_SUPERVISOR_USERS` (Entra object ids, comma-separated, or `*` for everyone)
+goes through the client analysis team (`supervisor/live.py`); everyone else keeps
+today's analyst, with watch-only recording. Empty names nobody, so `live` on its
+own changes nothing anyone sees.
+
+- **The router** checks scope first, exactly as today.
+- **Fast path.** When the rules place a question with one specialist, that
+  specialist answers on its own with only its own tools (registry) and the same
+  budget, figure check and memory as today's analyst.
+- **Planner.** Otherwise the planner model splits the question into at most one
+  part per specialist. The specialists run in parallel, each with its own tool
+  client and a share of the request's tool calls and time, and report findings.
+  A writer turns them into one answer, citing only what the specialists found:
+  their tool results and certified figures carry over (`Agent.run(evidence=...)`),
+  so every number still passes the figure check, and the writer can only
+  calculate. A specialist that fails is named in the answer; if none finishes,
+  nothing is shown. A plan of one part takes the fast path with the person's own
+  question. No usable plan: today's analyst answers.
+- **Answer checker.** After a planned answer, a separate model call that sees only
+  the question, the answer and the results it cites objects to anything
+  unanswered, unsupported, advice-like or about another account. Any objection
+  sends the answer back for one rewrite; a checker that fails objects to nothing
+  (the figure check still stands).
+- **The record.** One tree per request in `agent.tasks`, mode `live`: supervisor,
+  the lead (`fast_path`, `planner`, `analyst` or `router`), each specialist with
+  its status, tools and usage, and the checker. The root's usage is the whole
+  request's. Same rules as watch: ids, names and counts, never text or figures.
+- **Measuring it.** The shadow report counts live answers apart (leads, checker
+  objections and rewrites, specialists that did not finish, cost by lead).
+  `python -m wealthryse_agent.evaluate --user <id> --supervisor` runs the
+  evaluation questions through the team and says which lead and specialists
+  answered each one; compare it with the same run without `--supervisor`.
+
+**Turning it on.** Not before the 1 to 7 Nov freeze ends. Planned: owners only from
+Mon 16 Nov (`supervisorMode=live`, `supervisorUsers=<owner object ids>`), then
+everyone from Mon 23 Nov (`supervisorUsers=*`) if the evaluation run and a week of
+the report hold up. Each step is a redeploy of `infra/agent-apps.bicep` with Ying's
+approval. **The undo is `supervisorMode=watch`** (or `off`): chat goes straight back
+to today's analyst.
 
 ## Cost drivers
 

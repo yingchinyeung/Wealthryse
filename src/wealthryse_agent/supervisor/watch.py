@@ -1,6 +1,7 @@
 """Watch-only mode: the supervisor records what it would do beside every website chat answer.
 
-``AGENT_SUPERVISOR=watch`` turns it on. Off (the default, and any other value) leaves chat
+``AGENT_SUPERVISOR=watch`` turns it on; ``live`` keeps it on for everyone not named in
+``AGENT_SUPERVISOR_USERS`` (live.py). Off (the default, and any other value) leaves chat
 exactly as it was. Even when on, nobody sees a change: today's analyst still answers, and only
 after the answer is saved does a background thread write one task tree to ``agent.tasks``:
 
@@ -26,7 +27,7 @@ from .routing import Route, agreement, route_chat
 
 LOGGER = logging.getLogger("wealthryse_agent.supervisor")
 SETTING = "AGENT_SUPERVISOR"
-MODES = ("off", "watch")
+MODES = ("off", "watch", "live")
 PIN_TOOL = "get_data_freshness"
 TABLE_RECHECK_SECONDS = 600.0
 # Trees refused in a row before recording pauses until the next table check.
@@ -34,7 +35,7 @@ REFUSALS_BEFORE_PAUSE = 3
 
 
 def mode(environ: Mapping[str, str] | None = None) -> str:
-    """off or watch. Anything unrecognised is off, so a typo can never switch more on."""
+    """off, watch or live. Anything unrecognised is off, so a typo can never switch more on."""
     environ = os.environ if environ is None else environ
     value = str(environ.get(SETTING, "")).strip().lower()
     return value if value in MODES else "off"

@@ -184,6 +184,34 @@ class SupervisorTasksDatabaseTests(unittest.TestCase):
                                           (rows[0]["task_id"],)).fetchone()["n"], 0)
         store.db.rollback()
 
+    def test_5_every_live_tree_the_team_writes_fits_the_table(self):
+        from test_supervisor_live import PlannerTests, _final, _Model, _team
+
+        store = self._store()
+        conversation = store.create_conversation(USER, "U1", "Synthetic")
+        cases = {
+            "fast_path": ("What is my volatility this year?", _Model()),
+            "planner": (PlannerTests.QUESTION, _Model(plan=PlannerTests.PLAN, fail=("risk",),
+                                                      writer=("Up 5.1% [T1]; the risk figures weren't available.",))),
+            "analyst": (PlannerTests.QUESTION, _Model(plan=[])),
+            "router": ("Write me a poem.", _Model(in_scope=False)),
+        }
+        for lead, (question, model) in cases.items():
+            team = _team(model)
+            final = _final(list(team.answer(question)))
+            rows = team.tree(outcome=final["type"], turn=final["turn"], conversation_id=conversation, elapsed_ms=1,
+                             pinned={"as_of": "2026-10-28", "source": "freshness", "lag_days": 0})
+            self.assertTrue(store.add_tasks(rows), lead)
+            saved = store.db.execute("SELECT mode, role, status FROM agent.tasks WHERE root_id = ?::uuid "
+                                     "ORDER BY level, role", (rows[0]["task_id"],)).fetchall()
+            store.db.rollback()
+            self.assertEqual({r["mode"] for r in saved}, {"live"}, lead)
+            self.assertIn(lead, {r["role"] for r in saved})
+        failed = store.db.execute("SELECT detail FROM agent.tasks WHERE mode = 'live' AND role = 'risk' "
+                                  "AND status = 'failed'").fetchall()
+        store.db.rollback()
+        self.assertEqual(len(failed), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

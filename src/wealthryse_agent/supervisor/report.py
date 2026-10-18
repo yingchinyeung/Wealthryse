@@ -5,6 +5,9 @@ the routing rules agreed with the tools the analyst actually needed, how much wo
 the fast path, how often an answer's figures were behind the pinned date or mixed builds, how
 often a figure fell back to the old calculation, and what each kind of request cost.
 
+Answers the client analysis team gave in live mode are counted apart, in "live": how each was
+led, how often the checker objected, how many specialists did not finish, and what they cost.
+
     python -m wealthryse_agent.supervisor.report --from 2026-10-29 --to 2026-11-09
     python -m wealthryse_agent.supervisor.report --from 2026-10-29 --to 2026-11-09 --json
 
@@ -31,15 +34,49 @@ def _percentile(values: list[int], share: float) -> int | None:
 
 def summarise(roots: Iterable[dict[str, Any]]) -> dict[str, Any]:
     roots = list(roots)
-    details = [r.get("detail") or {} for r in roots]
-    usage = [r.get("usage") or {} for r in roots]
-    leads = Counter((d.get("route") or {}).get("lead", "router") for d in details)
-    tokens_by_lead: dict[str, list[int]] = {}
-    for detail, used in zip(details, usage):
+    summary = _watched([r for r in roots if r.get("mode", "watch") == "watch"])
+    summary["live"] = _live([r for r in roots if r.get("mode") == "live"])
+    return summary
+
+
+def _tokens_by_lead(roots: list[dict[str, Any]]) -> dict[str, list[int]]:
+    tokens: dict[str, list[int]] = {}
+    for root in roots:
+        detail, used = root.get("detail") or {}, root.get("usage") or {}
         if detail.get("usage_partial"):
             continue  # failed before its answer: its tokens are unknown, so it would drag the mean down
         lead = (detail.get("route") or {}).get("lead", "router")
-        tokens_by_lead.setdefault(lead, []).append(int(used.get("input_tokens", 0)) + int(used.get("output_tokens", 0)))
+        tokens.setdefault(lead, []).append(int(used.get("input_tokens", 0)) + int(used.get("output_tokens", 0)))
+    return tokens
+
+
+def _live(roots: list[dict[str, Any]]) -> dict[str, Any]:
+    """The team's own answers: fast_path, planner, analyst (no usable plan) or router (out of scope)."""
+    details = [r.get("detail") or {} for r in roots]
+    tokens = _tokens_by_lead(roots)
+    elapsed = [int(d["elapsed_ms"]) for d in details if isinstance(d.get("elapsed_ms"), int)]
+    return {
+        "requests": len(roots),
+        "outcomes": dict(Counter(r.get("status") for r in roots)),
+        "lead": dict(Counter((d.get("route") or {}).get("lead", "router") for d in details)),
+        "specialists_not_finished": sum(len(set(d.get("plan") or []) - set(d.get("used_specialists") or []))
+                                        for d in details),
+        "checker": {"objected": sum(1 for d in details if d.get("objections")),
+                    "revised": sum(1 for d in details if d.get("revised"))},
+        "figure_check_warnings": sum(int(d.get("figure_warnings") or 0) for d in details),
+        "with_fallback": sum(1 for d in details if d.get("fallback")),
+        "behind_pin": sum(1 for d in details if d.get("behind_pin")),
+        "cost": {"tokens": sum(sum(v) for v in tokens.values()),
+                 "mean_tokens_by_lead": {lead: round(sum(v) / len(v)) for lead, v in tokens.items() if v}},
+        "elapsed_ms": {"p50": _percentile(elapsed, 0.5), "p90": _percentile(elapsed, 0.9)},
+    }
+
+
+def _watched(roots: list[dict[str, Any]]) -> dict[str, Any]:
+    details = [r.get("detail") or {} for r in roots]
+    usage = [r.get("usage") or {} for r in roots]
+    leads = Counter((d.get("route") or {}).get("lead", "router") for d in details)
+    tokens_by_lead = _tokens_by_lead(roots)
     layers: Counter[str] = Counter()
     for detail in details:
         layers.update({layer for layer, n in (detail.get("layers") or {}).items() if n})
@@ -93,6 +130,20 @@ def render(summary: dict[str, Any], since: str, until: str) -> str:
              "route (finished answers only): " + (", ".join(f"{k} {v}" for k, v in sorted(summary["cost"]["mean_tokens_by_lead"].items()))
                           or "none") + ".",
              f"Time to answer: median {summary['elapsed_ms']['p50']} ms, 90th percentile {summary['elapsed_ms']['p90']} ms."]
+    team = summary.get("live") or {}
+    if team.get("requests"):
+        m = team["requests"]
+        lines += ["",
+                  f"Live answers from the client analysis team: {m}, "
+                  + ", ".join(f"{k} {v}" for k, v in sorted(team["outcomes"].items())) + ".",
+                  "Led by: " + ", ".join(f"{k} {_share(v, m)}" for k, v in sorted(team["lead"].items())) + ".",
+                  f"Checker objected to {_share(team['checker']['objected'], m)}, rewritten "
+                  f"{team['checker']['revised']}; specialists that did not finish {team['specialists_not_finished']}; "
+                  f"figure-check warnings {team['figure_check_warnings']}; behind the pinned date "
+                  f"{team['behind_pin']}; old-calculation fallback in {team['with_fallback']}.",
+                  "Mean tokens by lead: " + (", ".join(f"{k} {v}" for k, v in sorted(team["cost"]["mean_tokens_by_lead"].items()))
+                                             or "none")
+                  + f"; time to answer median {team['elapsed_ms']['p50']} ms, 90th percentile {team['elapsed_ms']['p90']} ms."]
     return "\n".join(lines)
 
 

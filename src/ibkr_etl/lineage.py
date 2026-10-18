@@ -524,6 +524,11 @@ JOB_INPUTS: dict[str, tuple[str, ...]] = {
         "silver.cash_transactions", "silver.derived_portfolio_cash_ledger", "silver.derived_portfolio_cash_balances",
         "silver.fx_rates", "silver.instruments", "silver.instrument_classifications",
         "gold.performance_comparison_daily", "gold.risk_analytics_snapshots", "gold.crisis_scenario_results"),
+    "ibkrv2stg-quant-analytics": (
+        "gold.performance_comparison_daily", "silver.risk_free_rates", "silver.position_snapshots",
+        "silver.derived_portfolio_positions", "silver.instruments", "silver.instrument_classifications",
+        "silver.trades", "silver.reference_fx_rates", "silver.nav_snapshots", "silver.derived_portfolio_nav",
+        "silver.cash_transactions", "silver.derived_portfolio_cash_ledger"),
 }
 
 
@@ -604,6 +609,8 @@ TRACEABLE = {
         ("subject_id", "figure_id", "period", "item", "benchmark_id", "as_of_date", "build_id"), "lineage_run_id"),
     "gold.v_certified_figures": (
         ("subject_id", "figure_id", "period", "item", "benchmark_id", "as_of_date"), "lineage_run_id"),
+    "gold.quant_analytics_snapshots": (("subject_id", "as_of_date", "section", "analytics_version"),
+                                       "lineage_run_id"),
 }
 # Rows that name the source row they were copied or worked out from (source_table, source_key).
 SOURCED = {"gold.certified_figures", "gold.v_certified_figures"}

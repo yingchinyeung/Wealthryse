@@ -55,6 +55,7 @@ class Rule:
     query: str | None = None  # one row with an "observed" column
     feed: str | None = None  # bronze-market-data folder
     required: bool = True  # False: reported, never raised as an incident
+    held: bool = False  # its table comes from a held migration: not checked while the table is absent
 
 
 def _feed(feed: str, due: time, *, required: bool = True) -> Rule:
@@ -114,6 +115,12 @@ RULES: tuple[Rule, ...] = (
     Rule("gold.crisis_replay_daily", "gold", "public.crisis_replay_daily", AS_OF, time(9, 30),
          timedelta(days=4),
          query="SELECT MAX(holdings_as_of) AS observed FROM crisis_replay_daily"),
+    # The quant analytics job (09:30, done by 09:40; docs/QUANT_ANALYTICS.md). A held migration
+    # (076) creates the table, so it is not checked until then, and never raised as an incident
+    # while the job is off.
+    Rule("gold.quant_analytics_snapshots", "gold", "public.quant_analytics_snapshots", AS_OF,
+         time(10, 0), timedelta(days=4),
+         query="SELECT MAX(as_of_date) AS observed FROM quant_analytics_snapshots", required=False, held=True),
 )
 
 
@@ -228,6 +235,16 @@ def _query(connection: Any, sql: str) -> Any:
     return None if row is None else (row["observed"] if isinstance(row, Mapping) else row[0])
 
 
+def _absent(connection: Any, target: str) -> bool:
+    """True only when the session says the table does not exist (a held rule waits for it)."""
+    try:
+        with connection.transaction():
+            row = connection.execute("SELECT to_regclass(%s) IS NULL AS absent", (target,)).fetchone()
+        return (row["absent"] if isinstance(row, Mapping) else row[0]) is True
+    except Exception:  # noqa: BLE001 - not known to be absent: the rule runs as any other
+        return False
+
+
 def collect(
     connection: Any,
     *,
@@ -264,6 +281,8 @@ def collect(
                     results.append(evaluate(rule, None, now=now, scope=SESSION_SCOPE,
                                             error=database_error or "database not configured"))
                     continue
+                if rule.held and _absent(connection, rule.target):
+                    continue  # its held migration has not run: nothing to check yet
                 observed = _query(connection, rule.query)
             results.append(evaluate(rule, observed, now=now))
         except Exception as error:  # noqa: BLE001 - report, never fail the caller

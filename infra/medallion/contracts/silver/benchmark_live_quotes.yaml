@@ -1,0 +1,124 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.benchmark_live_quotes
+name: benchmark_live_quotes
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: The latest live quote of each benchmark contract (live_contracts with is_benchmark), for the Desk page's
+    market factor (wiring design section 1).
+  usage: Check observed_at for the quote's age before using it; market_data_type says whether it is live or delayed.
+  limitations: Only benchmark contracts the live collector has quoted appear. Created by a held migration (infra/medallion/drafts/desk_live_views.sql,
+    077 on its day).
+tags:
+- silver
+- derived
+schema:
+- name: benchmark_live_quotes
+  physicalName: silver.benchmark_live_quotes
+  physicalType: view
+  logicalType: object
+  description: The latest live quote of each benchmark contract (live_contracts.is_benchmark).
+  dataGranularityDescription: 'One row per tenant_id and conid: the latest quote.'
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR contract id of the benchmark instrument.
+  - name: symbol
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The benchmark contract's symbol.
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the quote.
+  - name: last_price
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Last traded price.
+  - name: bid_price
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Bid.
+  - name: ask_price
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Ask.
+  - name: prior_close
+    physicalType: numeric
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The previous session's close.
+  - name: market_data_type
+    physicalType: smallint
+    logicalType: integer
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'IBKR market data type: 1 live, 2 frozen, 3 delayed, 4 delayed frozen.'
+  - name: observed_at
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the quote was taken (UTC).
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: The latest live quote of each benchmark contract, for the Desk page (wiring design section 1).
+contractCreatedTs: '2026-10-18T00:00:00Z'

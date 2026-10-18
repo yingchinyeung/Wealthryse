@@ -228,7 +228,7 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         for check_id, result in results.items():
             states.setdefault(result["state"], set()).add(check_id)
         self.assertNotIn("unavailable", states)
-        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 43)
+        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 46)
         self.assertEqual({c for c in states.get("fail", ()) if not c.startswith("value.")}, set())
         # The corrections history (U8) is held: its checks wait for its migration.
         held = {c for c in states["skipped"] if "held migration" in str(results[c]["detail"].get("reason"))}
@@ -298,7 +298,7 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         self.assertTrue(unreadable and all(k.startswith("rule.") for k in unreadable))
         self.assertEqual({k for k, r in daily.items() if r["state"] == "fail"},
                          {"value.nav_move", "value.positions_to_zero"})
-        freshness_rows = len([r for r in layer_freshness.RULES if r.query])
+        freshness_rows = len([r for r in layer_freshness.RULES if r.query and not r.held])  # held: table absent
         self.assertEqual(outcome["history"]["recorded"], len(daily) + freshness_rows)
 
         # Five minutes later: readiness already recorded, the daily pass already ran.

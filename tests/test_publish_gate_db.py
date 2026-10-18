@@ -397,8 +397,13 @@ class PublishGateDatabaseTests(unittest.TestCase):
 
     def test_the_dry_run_reads_every_job_without_error(self):
         self._write("off")
+        # A job whose tables a held migration creates has nothing to read here; its own test
+        # (test_quant_snapshots_db) runs the dry run once the migration has run.
+        catalog = json.loads((layers.ROOT / "infra" / "medallion" / "catalog.json").read_text())["postgres"]
+        held = {f"{entry['target_schema']}.{key.split('.', 1)[1]}" for key, entry in catalog.items()
+                if entry.get("held")}
         with patch.dict(os.environ, {"DATABASE_URL": self.url}):
-            for job in gate.JOB_TABLES:
+            for job in (job for job, tables in gate.JOB_TABLES.items() if not set(tables) <= held):
                 stdout = io.StringIO()
                 with self.subTest(job=job), redirect_stdout(stdout):
                     self.assertEqual(gate.main([job, "--since", "2026-01-01"]), 0)

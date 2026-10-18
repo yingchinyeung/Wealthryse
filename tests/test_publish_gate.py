@@ -408,7 +408,9 @@ class BeforeCommitTests(unittest.TestCase):
         self.assertEqual((result["verdict"], result["decision"]), ("fail", "publish"))
         self.assertIn("exact date", result["not_held_back"])
         self.assertEqual(connection.rolled_back, 0)
-        self.assertEqual({name for name, table in gate.TABLES.items() if table.holds_back}, {COMPARISON, SCENARIOS})
+        # Quant analytics readers fall back to the latest earlier date, so a held-back day is safe.
+        self.assertEqual({name for name, table in gate.TABLES.items() if table.holds_back},
+                         {COMPARISON, SCENARIOS, gate.QUANT})
 
     def test_a_slow_or_broken_check_never_holds_back(self):
         result, connection, _, measure = self._run("enforce", clean_observation(), time_budget_seconds=0)

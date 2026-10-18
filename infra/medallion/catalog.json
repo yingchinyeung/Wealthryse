@@ -139,6 +139,14 @@
    "layer": "ops",
    "target_schema": "public"
   },
+  "public.benchmark_live_quotes": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "The latest live quote of each benchmark contract, for the Desk page (wiring design section 1).",
+   "source": "derived",
+   "held": "infra/medallion/drafts/desk_live_views.sql"
+  },
   "public.benchmark_master": {
    "kind": "table",
    "layer": "ops",
@@ -589,6 +597,14 @@
    "target_schema": "public",
    "note": "Layer quality history: readiness, freshness, row counts, schema drift, value checks and contract rules, one row per result. Append-only."
   },
+  "public.quant_analytics_snapshots": {
+   "kind": "table",
+   "layer": "gold",
+   "target_schema": "gold",
+   "note": "Quant analytics payload per subject, date and section (docs/QUANT_ANALYTICS.md). Written by ibkrv2stg-quant-analytics, which does nothing unless QUANT_ANALYTICS_BUILD=on.",
+   "source": "derived",
+   "held": "infra/medallion/drafts/quant_analytics.sql"
+  },
   "public.raw_reports": {
    "kind": "table",
    "layer": "bronze",
@@ -806,6 +822,14 @@
    "target_schema": "silver",
    "note": "Read contract: cash balances.",
    "source": "derived"
+  },
+  "public.subject_live_executions": {
+   "kind": "view",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Live fills per physical account, for the Desk page (wiring design section 1).",
+   "source": "derived",
+   "held": "infra/medallion/drafts/desk_live_views.sql"
   },
   "public.subject_live_positions": {
    "kind": "view",
@@ -1675,6 +1699,13 @@
     "publish"
    ],
    "schedule": "manual (from the website)"
+  },
+  "ibkrv2stg-quant-analytics": {
+   "hops": [
+    "analytics"
+   ],
+   "schedule": "09:30 UTC",
+   "note": "Stores the quant analytics sections in gold.quant_analytics_snapshots (docs/QUANT_ANALYTICS.md), after the crisis step and before the second certified run; ends by 09:40. Does nothing unless QUANT_ANALYTICS_BUILD=on."
   },
   "ibkrv2stg-report-snapshot": {
    "hops": [

@@ -223,6 +223,8 @@ VOLUMES: tuple[Volume, ...] = (
     Volume("crisis_replay_daily", "gold", "holdings_as_of"),
     Volume("crisis_scenario_results", "gold", "holdings_as_of"),
     Volume("performance_comparison_daily", "gold", "observation_date"),
+    # Quant analytics (docs/QUANT_ANALYTICS.md): one row per subject, date and section. Held until 11 Nov.
+    Volume("quant_analytics_snapshots", "gold", "as_of_date", held=True),
     Volume("reporting_snapshots", "gold", count_column="snapshot_id"),
     Volume("risk_analytics_snapshots", "gold", "as_of_date"),
 )

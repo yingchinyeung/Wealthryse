@@ -183,7 +183,8 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
         # A login with the reads (here the owner) sees every check, through the same
         # read-only session the administrator opens.
         results = self._results(OWNER)
-        self.assertEqual(len(results), len([r for r in layer_freshness.RULES if r.query]))
+        # A rule on a held migration's table waits for it: that table is not in this database.
+        self.assertEqual(len(results), len([r for r in layer_freshness.RULES if r.query and not r.held]))
         self.assertEqual({k: r["state"] for k, r in results.items() if r["state"] != "fresh"}, {})
         self.assertEqual(results["bronze.raw_reports"]["observed"], "2026-10-16T08:02:00+00:00")
         self.assertEqual(results["bronze.flex_rows"]["observed"], "2026-10-16T08:01:00+00:00")

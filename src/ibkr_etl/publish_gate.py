@@ -108,6 +108,7 @@ class GoldTable:
 
 COMPARISON = "gold.performance_comparison_daily"
 RISK = "gold.risk_analytics_snapshots"
+QUANT = "gold.quant_analytics_snapshots"
 TABLES: dict[str, GoldTable] = {table.name: table for table in (
     # Readers keep the earlier rows of each series (the writer upserts the same keys).
     GoldTable(COMPARISON, "generated_at", True,
@@ -119,6 +120,9 @@ TABLES: dict[str, GoldTable] = {table.name: table for table in (
     GoldTable(RISK, "generated_at", True, ("benchmark_coverage",), holds_back=False),
     # Written by the month-end subprocesses; judged afterwards by report(), which never stops.
     GoldTable("gold.reporting_snapshots", "created_at", holds_back=False),
+    # The quant sections (docs/QUANT_ANALYTICS.md): readers take the latest date on or before the
+    # one asked for, so a held-back day leaves the day before in view.
+    GoldTable(QUANT, "generated_at", True),
 )}
 
 # The jobs that write gold, and the gold tables each writes (catalog and contract producers).
@@ -129,6 +133,7 @@ JOB_TABLES: dict[str, tuple[str, ...]] = {
     "risk-snapshots": (RISK,),
     "crisis-scenarios-daily": ("gold.crisis_scenario_results",),
     "month-end-factsheet": ("gold.reporting_snapshots",),
+    "quant-analytics": (QUANT,),
 }
 # benchmark-daily must cover every subject it is asked to, as it picks them.
 REGISTERED_SUBJECTS_SQL = """

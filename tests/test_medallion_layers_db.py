@@ -102,10 +102,13 @@ def _connect(database: str, user: str = OWNER, tenant: str | None = TENANT, **kw
 
 
 def _catalog() -> dict[str, str]:
-    """name -> layer for every catalog object that moves to a layer schema."""
+    """name -> layer for every catalog object that moves to a layer schema.
+
+    Objects a held migration creates are left out: no migration here creates them until it moves in.
+    """
     entries = json.loads((ROOT / "infra" / "medallion" / "catalog.json").read_text(encoding="utf-8"))["postgres"]
     return {key.split(".", 1)[1]: value["layer"] for key, value in entries.items()
-            if key.startswith("public.") and value["layer"] in LAYERS}
+            if key.startswith("public.") and value["layer"] in LAYERS and not value.get("held")}
 
 
 def _build(database: str, *, skip=(), stop_before_layers=False, before_layers=None) -> list[str]:

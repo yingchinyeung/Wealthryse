@@ -269,6 +269,85 @@
    ],
    "version": "1.1.0"
   },
+  "gold.quant_analytics_snapshots": {
+   "calculation_version_column": "analytics_version",
+   "contract": "wealthryse.gold.quant_analytics_snapshots",
+   "rules": [
+    {
+     "column": "as_of_date",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "as_of_date_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE as_of_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": "duration_ms",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "duration_not_negative",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE duration_ms < 0",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "consistency",
+     "mustBe": 0,
+     "name": "payload_names_its_row",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE (payload_json->>'section' = section AND payload_json->>'model_id' = model_id AND payload_json->>'model_version' = model_version AND payload_json->>'as_of' = as_of_date) IS NOT TRUE",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "completeness",
+     "mustBe": 0,
+     "name": "payload_says_if_available",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE COALESCE(jsonb_typeof(payload_json->'available'), '') <> 'boolean'",
+     "severity": "error"
+    },
+    {
+     "column": "payload_sha256",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "payload_sha256_is_sha256",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE payload_sha256 !~ '^[0-9a-f]{64}$'",
+     "severity": "error"
+    },
+    {
+     "column": "quality_status",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "quality_status_allowed_values",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE quality_status NOT IN ('pass', 'warn', 'fail')",
+     "severity": "error"
+    },
+    {
+     "column": "section",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "section_allowed_values",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE section NOT IN ('skill', 'decisions', 'currency', 'tail', 'regime', 'holdings_risk', 'correlation', 'concentration', 'execution')",
+     "severity": "error"
+    },
+    {
+     "column": "source_data_sha256",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "source_data_sha256_is_sha256",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE source_data_sha256 !~ '^[0-9a-f]{64}$'",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "completeness",
+     "mustBe": 0,
+     "name": "unavailable_sections_say_why",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE payload_json->>'available' = 'false' AND COALESCE(payload_json->>'reason', '') = ''",
+     "severity": "warning"
+    }
+   ],
+   "version": "1.0.0"
+  },
   "gold.reporting_snapshots": {
    "calculation_version_column": "formula_version",
    "contract": "wealthryse.gold.reporting_snapshots",

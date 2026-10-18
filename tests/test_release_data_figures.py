@@ -268,6 +268,18 @@ class FiguresCommandTests(unittest.TestCase):
         self.assertIn("NO_SUCH_URL_VARIABLE is not set", errors.getvalue())
 
 
+class WebPagesTests(unittest.TestCase):
+    def test_pages_answer_the_old_way_whatever_the_certified_setting(self):
+        from ibkr_etl import certified_figures, web
+
+        with mock.patch.dict("os.environ", {certified_figures.PAGES_SETTING: "overview=on"}), \
+                mock.patch.object(web, "TENANT_ID", web.TENANT_ID):
+            pages = figures.WebPages("postgresql://copy.invalid/db", "tenant-x")
+            self.assertNotIn(certified_figures.PAGES_SETTING, figures.os.environ)
+            self.assertEqual(figures.os.environ["DATABASE_URL"], "postgresql://copy.invalid/db")
+            self.assertEqual((pages.web, web.TENANT_ID), (web, "tenant-x"))
+
+
 class CertifiedViewComparisonTests(unittest.TestCase):
     def test_the_certified_view_is_compared_and_other_views_are_not(self):
         self.assertEqual([item["table"] for item in report_tool.compared_views()], ["gold.v_certified_figures"])

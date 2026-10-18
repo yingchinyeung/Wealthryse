@@ -312,7 +312,7 @@ class WebPages:
             "email": "release-data-report"}
 
     def __init__(self, url: str, tenant: str) -> None:
-        os.environ.pop(PAGES_SETTING, None)
+        os.environ.pop(register.PAGES_SETTING, None)
         os.environ["DATABASE_URL"] = url
         from ibkr_etl import web
 

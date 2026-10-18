@@ -1511,14 +1511,6 @@
    "schedule": "manual",
    "note": "Legacy."
   },
-  "ibkrv2stg-account-sync-daily": {
-   "hops": [
-    "ingest",
-    "conform"
-   ],
-   "schedule": "08:10 UTC",
-   "note": "Reads v1.1 gold (the export) into v2 bronze and silver. Inverted layering; retires with v1.1."
-  },
   "ibkrv2stg-agent": {
    "hops": [
     "serve"

@@ -23,10 +23,9 @@ var tags = {
   purpose: 'single-user-burn-in'
 }
 
-// v1.1's ibkr-v11-daily keeps its own failed-execution alert from infra/job.bicep,
-// on v1.1's action group, until v1.1 is deleted.
+// v1.1's ibkr-v11-daily and account-sync are not listed: both stopped when v2
+// began its own Flex pull (17 Oct 2026), and v1.1 was deleted on 21 Oct 2026.
 var monitoredJobNames = [
-  'ibkrv2stg-account-sync-daily'
   'ibkrv2stg-benchmark-daily'
   'ibkrv2stg-risk-free-daily'
   'ibkrv2stg-sector-classification'

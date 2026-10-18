@@ -39,12 +39,23 @@ CHECK_MODES = ("warn", "enforce")
 MAX_FIGURE_IDS = 25
 MAX_ROWS = 200
 PUBLISH_GATE = "shadow"  # the publish gate's verdict is recorded, not binding, until 8 Nov
-# The tool that still works a page's figures out, for a figure whose page has not moved.
+# The tool that still works a page's figures out, for a figure whose page has not moved. Every
+# register page has one (a test keeps them in step); the keys also list the pages in LIST_SPEC.
 STILL_ANSWERED_BY = {
     "overview": "get_performance", "holdings": "get_holdings", "cash": "get_data_freshness",
     "performance": "compare_to_benchmark", "risk-snapshot": "get_risk_metrics",
     "risk-statistics": "get_risk_metrics", "combined-holdings": "get_holdings",
+    # Contribution to return is worked out by no other agent tool; the nearest is each holding's
+    # price move, trades and FX between two dates.
+    "attribution": "get_holdings_changes",
+    # The daily returns and rebased levels over time, and volatility, beta, correlation and the
+    # deepest drawdown over a window; no other tool gives RSI or the holdings correlation matrix.
+    "charts": "get_nav_history and get_risk_metrics",
 }
+# Pages whose rows name their item by an id (a conid, a pair of conids, an episode's peak date):
+# the row's detail (symbol and sector, trough and recovery, observations, RSI signal) travels with
+# each figure. The other pages' answers are unchanged.
+DETAIL_PAGES = frozenset({"attribution", "charts"})
 _ON = ("on", "true", "1", "yes")
 
 
@@ -130,10 +141,15 @@ def _wanted(arguments: Mapping[str, Any], allowed: Mapping[str, register.Figure]
     return found
 
 
-def _as_of(connection, account_id: str, ids: list[str], requested: str | None, error) -> str:
+def _as_of(connection, account_id: str, ids: list[str], requested: str | None, error, period: str = "") -> str:
+    """The newest published date on or before ``requested`` with these figures and, when a period is
+    asked for, with that period (or figures that have none). A month's Attribution is kept on the
+    month's last NAV date (per_period and per_period_item), so asking for a past month finds that
+    date rather than the newest one, where only the month in progress is."""
     row = connection.execute(
         "SELECT MAX(as_of_date) AS d FROM certified_figures WHERE subject_id = ? AND figure_id = ANY(?) "
-        "AND (?::date IS NULL OR as_of_date <= ?::date)", (account_id, list(ids), requested, requested)).fetchone()
+        "AND (?::date IS NULL OR as_of_date <= ?::date) AND (?::text = '' OR period IN ('', ?))",
+        (account_id, list(ids), requested, requested, period, period)).fetchone()
     if row is None or row["d"] is None:
         raise error("no_certified_figures", "No certified figure is published on or before that date. The build "
                     "publishes after the daily data steps, by about 10:00 UTC.", 404)
@@ -160,7 +176,7 @@ def get_certified_figures(connection, arguments: Mapping[str, Any]) -> dict[str,
     if period and not any(register.period_allowed(item, period) for item in wanted):
         raise ToolError("invalid_arguments", f"None of these figures has the period {period}.", 400)
     ids = [item.id for item in wanted]
-    as_of = _as_of(connection, account_id, ids, requested, ToolError)
+    as_of = _as_of(connection, account_id, ids, requested, ToolError, period)
     benchmark = arguments.get("benchmark_id")
     if not benchmark and any(item.per_benchmark for item in wanted):
         mapping = _benchmark_mapping(connection, account_id, as_of)
@@ -168,7 +184,7 @@ def get_certified_figures(connection, arguments: Mapping[str, Any]) -> dict[str,
     rows = connection.execute(
         """
         SELECT figure_id, period, item, benchmark_id, as_of_date, value, value_text, unit, currency, status, reason,
-               period_start, period_end, observations, definition_id, definition_version, calculation_version,
+               detail, period_start, period_end, observations, definition_id, definition_version, calculation_version,
                source_table, source_key, build_id, lineage_run_id, build_status, published_at
         FROM certified_figures
         WHERE subject_id = ? AND figure_id = ANY(?) AND as_of_date = ?::date
@@ -206,6 +222,7 @@ def get_certified_figures(connection, arguments: Mapping[str, Any]) -> dict[str,
             **({"period_key": row["period"]} if row["period"] else {}),
             **({"item": row["item"]} if row["item"] else {}),
             **({"benchmark_id": row["benchmark_id"]} if row["benchmark_id"] else {}),
+            **({"detail": row.get("detail")} if item.page in DETAIL_PAGES and row.get("detail") else {}),
             "period": {"start": _iso(row["period_start"]), "end": _iso(row["period_end"]),
                        "observations": row["observations"], **({"basis": item.basis} if item.basis else {})},
             "definition": {"id": row["definition_id"], "version": row["definition_version"], "name": item.guide,
@@ -253,8 +270,8 @@ def trace_figure(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
     figure_id = str(arguments["figure_id"])
     [item] = _wanted({"figures": [figure_id]}, allowed, ToolError)
     requested = _day(arguments["as_of"], "as_of") if arguments.get("as_of") else None
-    as_of = _as_of(connection, account_id, [item.id], requested, ToolError)
     period, part, benchmark = (str(arguments.get(name) or "") for name in ("period", "item", "benchmark_id"))
+    as_of = _as_of(connection, account_id, [item.id], requested, ToolError, period)
     row = connection.execute(
         "SELECT agent.certified_figure_trace(?, ?, ?, ?, ?, ?::date) AS trace",
         (account_id, item.id, period, part, benchmark, as_of)).fetchone()

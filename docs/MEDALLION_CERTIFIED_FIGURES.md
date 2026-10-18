@@ -410,6 +410,14 @@ tool that still answers it), or no published figure on or before the date (with 
 build is due). A held build is not an error: the tool returns the last published figures,
 marked `behind`, with the reason.
 
+Attribution (batch 4) and the charts (batch 5) follow the same rule. A period asks for the
+newest date that has it, so `month_2026-09` finds September's last NAV date, where that month's
+Attribution is kept (`per_period_item`: one row per month and holding or sector). A series gives
+its point on the as-of date (ask with an earlier `as_of` for an earlier point); the tables give
+their rows on the date. For these two pages each figure also carries its row's `detail` (a
+holding's symbol and sector, an episode's trough and recovery, a pair's observations, RSI's
+signal), because the item alone is an id. The other pages' answers are unchanged.
+
 All three are read-only, go through the existing tool server and its audit, and see exactly
 one account per call, as every tool does today.
 

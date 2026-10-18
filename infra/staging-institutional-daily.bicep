@@ -9,15 +9,16 @@ param storageAccountName string = 'ibkrv2stgauhecwc4itaoo'
 param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
-// The defaults keep today's job. On the day v2 makes its own daily Flex pull:
-// scheduleUtc '20 8 * * *', dispatchRunDate 'previous_hkt_day', flexSendsEnabled true.
-param scheduleUtc string = '0 8 * * *'
+// The defaults match the live job since v2 made its own daily Flex pull on 17 Oct 2026: it runs at
+// 08:20 UTC, asks IBKR for data up to yesterday (HKT) and may send Flex requests. Before that switch it
+// ran at 08:00 UTC with 'current_hkt_day' and sends off.
+param scheduleUtc string = '20 8 * * *'
 @allowed([
   'current_hkt_day'
   'previous_hkt_day'
 ])
-param dispatchRunDate string = 'current_hkt_day'
-param flexSendsEnabled bool = false
+param dispatchRunDate string = 'previous_hkt_day'
+param flexSendsEnabled bool = true
 
 var tags = {
   application: 'ibkr-portfolio-platform'

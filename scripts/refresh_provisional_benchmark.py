@@ -23,7 +23,7 @@ from ibkr_etl.crisis_replay import (  # noqa: E402
     refresh_composite_crisis_replay,
     refresh_crisis_replay,
 )
-from ibkr_etl import crisis_scenarios, raw_capture  # noqa: E402
+from ibkr_etl import crisis_scenarios, lineage, raw_capture  # noqa: E402
 from ibkr_etl.util import canonical_json, sha256_text  # noqa: E402
 
 
@@ -165,6 +165,27 @@ def _mark_wave0_benchmark_fx_reconciled(connection, result: dict) -> None:
     )
 
 
+def _record_outputs(result: dict) -> None:
+    """What this run wrote, for its lineage record (a no-op unless recording is on)."""
+    record = lineage.current()
+    if not record.active:
+        return
+    try:
+        accounts = result.get("accounts") or []
+        record.output("silver.benchmark_prices", rows=result.get("benchmark_observations"))
+        record.output("silver.reference_fx_rates")
+        record.output("gold.performance_comparison_daily",
+                      rows=sum(int(item.get("comparison_rows") or 0) for item in accounts))
+        if any(item.get("crisis_replay") for item in accounts):
+            record.output("gold.crisis_replay_daily", rows=result.get("crisis_replay_observations"))
+            record.output("gold.crisis_replay_components")
+            record.output("silver.market_data_prices")
+        if (result.get("crisis_scenarios") or {}).get("subjects"):
+            record.output("gold.crisis_scenario_results")
+    except Exception:  # noqa: BLE001 - lineage never fails the job
+        pass
+
+
 def main() -> int:
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() not in {
         "staging",
@@ -185,6 +206,8 @@ def main() -> int:
     )
     start = date.fromisoformat(os.environ.get("BENCHMARK_START_DATE", "2025-01-20"))
     connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
+    # With lineage recording on, the gold rows this session writes name this run.
+    lineage.current().bind(connection)
     configured_ids = os.environ.get("BENCHMARK_ACCOUNT_IDS", "").strip()
     if configured_ids:
         account_ids = [
@@ -214,6 +237,7 @@ def main() -> int:
         connection, "staging-yfinance-benchmark", start.isoformat(), None
     )
     raw_capture.set_job_run_id(run_id)
+    lineage.current().facet(job_run_id=run_id)
     try:
         accounts: list[dict] = []
         for account_id in account_ids:
@@ -263,6 +287,7 @@ def main() -> int:
             + int(result["crisis_replay_observations"]),
             reconciliation_json=payload,
         )
+        _record_outputs(result)
         print(payload)
         return 0
     except Exception as error:
@@ -273,4 +298,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-benchmark-daily", main))

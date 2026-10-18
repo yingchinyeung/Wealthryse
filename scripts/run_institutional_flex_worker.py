@@ -14,6 +14,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from ibkr_etl import lineage  # noqa: E402
 from ibkr_etl.config import load_settings  # noqa: E402
 from ibkr_etl.db import DEFAULT_TENANT_ID, connect  # noqa: E402
 from ibkr_etl.flex_client import FlexClient, FlexError, is_lockout_error  # noqa: E402
@@ -87,6 +88,47 @@ def _update_payload(connection, work_item_id: str, evidence: dict) -> None:
     )
 
 
+# Silver tables load_report writes for each Flex record type (see loader.load_report).
+SILVER_BY_RECORD_TYPE = (
+    (lambda kind: kind == "trade", "silver.trades"),
+    (lambda kind: "cashtransaction" in kind, "silver.cash_transactions"),
+    (lambda kind: "corporateaction" in kind, "silver.corporate_actions"),
+    (lambda kind: "openposition" in kind, "silver.position_snapshots"),
+    (lambda kind: "cashreportcurrency" in kind or kind == "cashreport", "silver.cash_snapshots"),
+    (lambda kind: "netassetvalue" in kind or "equitysummarybyreportdate" in kind, "silver.nav_snapshots"),
+    (lambda kind: "conversionrate" in kind or kind in {"fxrate", "currencyconversionrate"}, "silver.fx_rates"),
+    (lambda kind: kind == "fxtransaction", "silver.fx_transactions"),
+)
+
+
+def _record_statement(result: dict) -> None:
+    """The statement this run read and the tables it loaded, for its lineage record
+    (a no-op unless recording is on)."""
+    record = lineage.current()
+    if not record.active:
+        return
+    try:
+        ingestion_run_id = result.get("run_id")
+        record.append("ingestion_run_ids", ingestion_run_id)
+        blob = lineage.blob_dataset(result.get("raw_path"))
+        if blob:
+            record.input(blob, sha256=result.get("raw_sha256"), ingestion_run_id=ingestion_run_id)
+        counts = (result.get("reconciliation") or {}).get("record_types") or {}
+        rows = sum(int(value) for key, value in counts.items() if key != "legacy_source_keys_reused")
+        record.output("bronze.raw_reports", rows=1)
+        record.output("bronze.flex_rows", rows=rows)
+        record.output("silver.accounts")
+        record.output("silver.instruments")
+        for record_type, count in counts.items():
+            kind = str(record_type).lower()
+            for matches, table in SILVER_BY_RECORD_TYPE:
+                if matches(kind):
+                    record.output(table, rows=int(count))
+                    break
+    except Exception:  # noqa: BLE001 - lineage never fails the job
+        pass
+
+
 def _request_statement(connection, claim, *, database_url: str, tenant_id: str) -> dict:
     source = _work_source(connection, str(claim.flex_source_id))
     blocked = _send_block(source, _now())
@@ -143,6 +185,7 @@ def _request_statement(connection, claim, *, database_url: str, tenant_id: str) 
             """,
             (source["credential_id"],),
         )
+        _record_statement(result)
         return {
             "ingestion_run_id": result["run_id"],
             "requested_from": start_date.isoformat(),
@@ -301,4 +344,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-institutional-daily", main))

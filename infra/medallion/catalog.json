@@ -404,6 +404,24 @@
    "note": "Dimension.",
    "source": "ibkr"
   },
+  "public.lineage_events": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Lineage: START and end event of each recorded job run. Append-only."
+  },
+  "public.lineage_io": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Lineage: datasets each recorded run read and wrote, with row counts and raw-file sha256. Append-only."
+  },
+  "public.lineage_runs": {
+   "kind": "view",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Lineage: one row per recorded run."
+  },
   "public.live_account_values": {
    "kind": "table",
    "layer": "bronze",

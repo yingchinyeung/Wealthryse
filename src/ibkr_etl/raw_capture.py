@@ -16,6 +16,10 @@ Blob names, written with overwrite=False (the container is under a legal hold):
   time, for responses that can change from day to day;
 - <feed>/history/<request-key>-<sha256 prefix>.<ext> for windows that ended over a week
   ago (see settled), so the same answer is stored once and a repeat is "existing".
+
+Each stored file (written or already there) is passed to the observers registered with
+add_observer, which is how lineage.py records it as an input of the run; sha256_of gives
+the full sha256 of a file this process stored.
 """
 from __future__ import annotations
 
@@ -48,6 +52,7 @@ SETTLED_AFTER_DAYS = 7
 SHA_PREFIX = 16
 MAX_KEY_LENGTH = 120
 MAX_METADATA_VALUE = 1024
+MAX_REMEMBERED_DIGESTS = 20000
 
 # Feed folders in bronze-market-data, one per provider dataset.
 FEEDS = frozenset({
@@ -190,6 +195,7 @@ class RawCapture:
         self._spent = 0.0  # seconds callers have waited on storage, all threads together
         self._reserved = 0.0  # seconds claimed by uploads still in flight
         self._names: set[str] = set()
+        self._digests: dict[str, str] = {}  # blob name -> full sha256, for files stored by this process
         self._warned: set[str] = set()
         self._lock = threading.Lock()  # stats and budget; never held while waiting
         self._factory_lock = threading.Lock()  # only taken in upload threads
@@ -273,6 +279,13 @@ class RawCapture:
             return {"container": self.container, **self.stats,
                     "seconds": round(self._spent, 3), "disabled": self.disabled_reason}
 
+    def digest_of(self, name: str | None) -> str | None:
+        """The full sha256 of a file this process stored under name, or None."""
+        if not name:
+            return None
+        with self._lock:
+            return self._digests.get(name)
+
     # Internals -----------------------------------------------------------------------
 
     def _open(self) -> bool:
@@ -324,10 +337,13 @@ class RawCapture:
             digest = hashlib.sha256(content).hexdigest()
             folder = "history" if history else f"{requested:%Y/%m/%d}"
             name = f"{feed}/{folder}/{request_key(key)}-{digest[:SHA_PREFIX]}.{extension}"
+            stored = dict(name=name, digest=digest, size=len(content), feed=feed, provider=provider, key=key)
             with self._lock:
-                if name in self._names:
+                seen = name in self._names
+                if seen:
                     self.stats["existing"] += 1
-                    return name
+            if seen:
+                return self._stored(**stored, outcome="existing")
             metadata = {
                 "feed": feed,
                 "provider": provider,
@@ -344,20 +360,33 @@ class RawCapture:
                 self._upload_within(claim - (time.monotonic() - started), name, content,
                                     content_type=content_type, metadata=metadata)
             except Exception as error:  # noqa: BLE001
+                exists = _already_exists(error)
                 with self._lock:
-                    if _already_exists(error):
+                    if exists:
                         self._names.add(name)
                         self.stats["existing"] += 1
-                        return name
-                    self.stats["failed"] += 1
-                    self._disable(f"{type(error).__name__}: {' '.join(str(error).split())[:200]}")
+                    else:
+                        self.stats["failed"] += 1
+                        self._disable(f"{type(error).__name__}: {' '.join(str(error).split())[:200]}")
+                if exists:
+                    return self._stored(**stored, outcome="existing")
                 return None
             with self._lock:
                 self._names.add(name)
                 self.stats["written"] += 1
-            return name
+            return self._stored(**stored, outcome="written")
         finally:
             self._release(claim, time.monotonic() - started)
+
+    def _stored(self, *, name: str, digest: str, size: int, feed: str, provider: str, key: str,
+                outcome: str) -> str:
+        """Remember a stored file's sha256 and tell the observers; returns its blob name."""
+        with self._lock:
+            if name not in self._digests and len(self._digests) < MAX_REMEMBERED_DIGESTS:
+                self._digests[name] = digest
+        _notify({"container": self.container, "blob": name, "sha256": digest, "bytes": size,
+                 "feed": feed, "provider": provider, "request_key": request_key(key), "outcome": outcome})
+        return name
 
     def _upload_within(self, timeout: float, name: str, content: bytes, **options: Any) -> None:
         """Upload in a daemon thread and wait at most `timeout`; a hung call is left behind."""
@@ -406,6 +435,34 @@ class RawCapture:
             pass
 
 
+_OBSERVERS: list[Callable[[dict[str, Any]], None]] = []
+_OBSERVERS_LOCK = threading.Lock()
+
+
+def add_observer(callback: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
+    """Call callback with each stored file (container, blob, sha256, bytes, feed, provider,
+    request_key, outcome). Returns a function that removes it. An observer's error is ignored."""
+    with _OBSERVERS_LOCK:
+        _OBSERVERS.append(callback)
+
+    def remove() -> None:
+        with _OBSERVERS_LOCK:
+            if callback in _OBSERVERS:
+                _OBSERVERS.remove(callback)
+
+    return remove
+
+
+def _notify(record: dict[str, Any]) -> None:
+    with _OBSERVERS_LOCK:
+        observers = list(_OBSERVERS)
+    for observer in observers:
+        try:
+            observer(dict(record))
+        except Exception:  # noqa: BLE001 - an observer never fails a capture
+            pass
+
+
 _DEFAULT: RawCapture | None = None
 _DEFAULT_LOCK = threading.Lock()
 
@@ -443,6 +500,14 @@ def set_job_run_id(run_id: Any) -> None:
         default().job_run_id = "" if run_id is None else str(run_id)
     except Exception:  # noqa: BLE001
         pass
+
+
+def sha256_of(name: str | None) -> str | None:
+    """The full sha256 of a file the process-wide capture stored under name, or None."""
+    try:
+        return default().digest_of(name)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def capture_http(feed: str, provider: str, **kwargs: Any) -> str | None:

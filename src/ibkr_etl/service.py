@@ -117,7 +117,8 @@ def ingest_content(
             row_count=len(report.rows),
             reconciliation_json=canonical_json(reconciliation),
         )
-        return {"run_id": run_id, "raw_path": str(raw_path), "reconciliation": reconciliation}
+        return {"run_id": run_id, "raw_path": str(raw_path), "raw_sha256": digest,
+                "reconciliation": reconciliation}
     except Exception as exc:
         finish_run_failure(connection, run_id, f"{type(exc).__name__}: {exc}")
         raise

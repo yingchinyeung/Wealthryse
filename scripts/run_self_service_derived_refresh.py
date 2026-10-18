@@ -13,6 +13,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from ibkr_etl import lineage  # noqa: E402
 from ibkr_etl.cloud_storage import download_blob_snapshot  # noqa: E402
 from ibkr_etl.reference_snapshot import inspect_reference_bytes  # noqa: E402
 from ibkr_etl.config import load_settings  # noqa: E402
@@ -449,6 +450,32 @@ def _dry_run_portfolio_cases(connection, tenant_id: str, reference_path: Path, r
     )
 
 
+DERIVED_OUTPUTS = ("silver.derived_portfolio_nav", "silver.derived_portfolio_positions",
+                   "silver.derived_portfolio_cash_ledger", "silver.derived_portfolio_cash_balances",
+                   "silver.derived_portfolio_exclusions", "silver.synthetic_portfolio_components")
+ANALYTICS_OUTPUTS = ("silver.benchmark_prices", "silver.reference_fx_rates", "silver.instrument_classifications",
+                     "silver.market_data_prices", "gold.performance_comparison_daily", "gold.crisis_replay_daily",
+                     "gold.crisis_replay_components", "gold.risk_analytics_snapshots")
+
+
+def _record_outputs(market_data: dict, results: list[dict]) -> None:
+    """What this run wrote, for its lineage record (a no-op unless recording is on)."""
+    record = lineage.current()
+    if not record.active:
+        return
+    try:
+        instruments = (market_data.get("instruments") or {}).values()
+        record.output("silver.market_data_prices", rows=sum(int(item.get("rows_received") or 0) for item in instruments))
+        if any(item.get("validation") for item in results):
+            for table in DERIVED_OUTPUTS:
+                record.output(table)
+        if any(item.get("analytics") for item in results):
+            for table in ANALYTICS_OUTPUTS:
+                record.output(table)
+    except Exception:  # noqa: BLE001 - lineage never fails the job
+        pass
+
+
 def main() -> int:
     settings = load_settings()
     if not settings.database_url:
@@ -459,6 +486,8 @@ def main() -> int:
     connection = connect(
         settings.database_path, settings.database_url, settings.tenant_id
     )
+    # With lineage recording on, the gold rows this session writes name this run.
+    lineage.current().bind(connection)
     lock_name = f"self-service-derived:{settings.tenant_id}"
     acquired = False
     try:
@@ -490,6 +519,7 @@ def main() -> int:
         onboarding_cases = _has_onboarding_cases(connection)
         targets = _ordered_targets(_approved_targets(connection))
         if not targets:
+            _record_outputs(market_data, [])
             print(
                 canonical_json(
                     {
@@ -675,6 +705,7 @@ def main() -> int:
                     }
                 )
                 continue
+        _record_outputs(market_data, results)
         print(
             canonical_json(
                 {
@@ -699,4 +730,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-derived-daily", main))

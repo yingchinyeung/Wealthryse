@@ -12,6 +12,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from ibkr_etl import lineage  # noqa: E402
 from ibkr_etl.config import load_settings  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.risk_snapshots import (  # noqa: E402
@@ -56,6 +57,8 @@ def main() -> int:
     connection = connect(
         settings.database_path, settings.database_url, settings.tenant_id
     )
+    # With lineage recording on, the gold rows this session writes name this run.
+    lineage.current().bind(connection)
     results: list[dict] = []
     skipped = 0
     blocked = []
@@ -145,6 +148,8 @@ def main() -> int:
             historical=audit_risk_history(connection,tenant_id=settings.tenant_id,subjects=subjects,
                 audit_limit=args.history_audit_limit,rebuild_limit=args.history_rebuild_limit)
             print(json.dumps({"historical_audit":historical},sort_keys=True),flush=True)
+        lineage.current().output("gold.risk_analytics_snapshots",
+                                 rows=len(results)+int((historical or {}).get("rebuilt") or 0))
         print(
             json.dumps(
                 {
@@ -169,4 +174,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-risk-snapshots", main))

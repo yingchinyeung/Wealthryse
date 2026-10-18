@@ -95,6 +95,50 @@ Each batch is one migration:
     checks also need `LAYER_FRESHNESS_BLOB_CHECKS=true`, for once capture is on.
   - `python -m ibkr_etl.layer_freshness` prints the same checks for a dry run.
 
+## Input readiness checks (U3 step one)
+
+Each daily job after ingestion first asks whether its inputs for today's cycle are
+ready (`src/ibkr_etl/input_readiness.py`). The jobs and the stage each one produces
+are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
+(derived), risk-snapshots and crisis-scenarios-daily (risk), and month-end-factsheet
+(reports).
+
+- **What it checks.** The dependency policy in `workflow_readiness.py`, applied to
+  evidence the earlier steps already leave in the database:
+  - ingestion and reconciliation: institutional-daily's statement requests and account
+    imports for its newest run date (`institutional_work_items`). They must all have
+    succeeded and must cover yesterday, because the pull asks IBKR for data up to
+    yesterday;
+  - benchmarks and FX: the newest finished benchmark run in `ingestion_runs`;
+  - derived: each subject's newest calculation in derived-daily's newest execution
+    (`subject_calculation_runs`); one still running means it has not finished;
+  - risk: the time the risk job last checked each snapshot (`risk_analytics_snapshots`).
+
+  These must have succeeded today (UTC), after the steps they read. The expected dates
+  go through `workflow_dates`, as a persisted date policy would. If the shadow ledger
+  ever has rows for the cycle (`daily:<date>`, subject `daily-cycle`), they must agree
+  too. Today it has none: migrations 054 and 060 are held back in production.
+- **How it runs.** One READ ONLY session with short timeouts
+  (`layer_freshness.open_read_only`), within a hard 10-second limit, using the job's own
+  `DATABASE_URL` (`INPUT_READINESS_DATABASE_URL` overrides it). A step it cannot read
+  makes the inputs not ready. It never writes, so the decision goes to the log, not to
+  the ledger.
+- **Modes,** set by `INPUT_READINESS_MODE` on the job:
+  - `off`, the default and also when the variable is unset: nothing runs. No query, no
+    log line, no new way to fail. A test proves this.
+  - `shadow`: logs one line, `INPUT_READINESS {json}`, with the decision, the reasons
+    and each step's evidence, and the job always carries on.
+  - `enforce`: the same line with `"decision":"stop"`, then the job ends with exit code
+    75 before doing anything, so the execution shows as failed. For after month-end
+    (S6); nothing sets it today.
+- **Switching shadow on** is a separate approved step: add
+  `INPUT_READINESS_MODE=shadow` to the six job definitions, on an image built from a
+  `main` that has this code. To read the results:
+  `ContainerAppConsoleLogs_CL | where Log_s startswith 'INPUT_READINESS '`. Run shadow
+  for at least two weeks and explain every "not ready" before enforce. The evidence
+  queries are judged on synthetic data only so far.
+- `python -m ibkr_etl.input_readiness <job>` prints a dry run of the check.
+
 ## Stages
 
 1. **S0:** this catalog and test (repo only).

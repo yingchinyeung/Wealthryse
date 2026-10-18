@@ -371,7 +371,7 @@ CERTIFIED_SQL = """
 
 def certified_rows(connection, subjects: list[str], days: list[str], figures: list[str]) -> list[dict]:
     if connection.execute("SELECT to_regclass('gold.v_certified_figures')").fetchone()[0] is None:
-        raise FiguresError("gold.v_certified_figures is not in this database: apply migration 072 and run the build")
+        raise FiguresError("gold.v_certified_figures is not in this database: apply migration 073 and run the build")
     cursor = connection.execute(CERTIFIED_SQL, (subjects, days, figures))
     names = [column.name for column in cursor.description]
     return [dict(zip(names, row)) for row in cursor.fetchall()]

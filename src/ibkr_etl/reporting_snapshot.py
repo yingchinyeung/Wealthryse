@@ -420,7 +420,7 @@ def _collect_tool_results(
     return normalize_collected_report_holdings(connection, subject_id, reporting_currency, results)
 
 
-def freeze_month_end_snapshot(
+def build_month_end_payload(
     connection,
     *,
     tenant_id: str,
@@ -428,8 +428,15 @@ def freeze_month_end_snapshot(
     period_start: str,
     period_end: str,
     reporting_currency: str,
-    reject_quality_fail: bool = False,
-) -> ReportingSnapshotResult:
+    environ: Mapping[str, str] | None = None,
+    out=None,
+) -> tuple[dict[str, Any], str, bool, tuple[str, ...], dict[str, Any] | None]:
+    """The month-end payload a freeze stores, without storing it: collected, assembled, and with
+    the certified figures applied as MONTHLY_REPORTS_CERTIFIED says (certified_reports; off, the
+    default, leaves it exactly as assembled and reads nothing). Returns the payload, its quality,
+    publication_allowed, the blockers and the certified comparison (None when off)."""
+    from .certified_reports import apply_certified
+
     tool_results = _collect_tool_results(
         connection,
         tenant_id=tenant_id,
@@ -443,6 +450,29 @@ def freeze_month_end_snapshot(
         period_end=period_end,
         reporting_currency=reporting_currency,
         tool_results=tool_results,
+    )
+    comparison = apply_certified(connection, tenant_id=tenant_id, subject_id=subject_id, payload=payload,
+                                 environ=environ, out=out)
+    return payload, quality, publication_allowed, blockers, comparison
+
+
+def freeze_month_end_snapshot(
+    connection,
+    *,
+    tenant_id: str,
+    subject_id: str,
+    period_start: str,
+    period_end: str,
+    reporting_currency: str,
+    reject_quality_fail: bool = False,
+) -> ReportingSnapshotResult:
+    payload, quality, publication_allowed, blockers, _ = build_month_end_payload(
+        connection,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
+        period_start=period_start,
+        period_end=period_end,
+        reporting_currency=reporting_currency,
     )
     if reject_quality_fail and (
         quality == "fail" or not (payload.get("monthly_reporting") or {}).get("available")

@@ -67,7 +67,9 @@ PAGES_SETTING = "CERTIFIED_FIGURES_PAGES"
 AGENT_SETTING = "AGENT_CERTIFIED_FIGURES"
 MODES = ("off", "shadow", "on")
 UNITS = ("ratio", "number", "money", "date", "text")
-KINDS = ("scalar", "per_period", "per_item", "series")
+KINDS = ("scalar", "per_period", "per_item", "series", "per_period_item")
+# Kinds whose rows carry a period (per_period_item also carries an item).
+PERIOD_KINDS = ("per_period", "per_period_item")
 IMPORTED = "imported"
 # The source contracts promise data daily by 10:00 UTC and at most four days behind.
 LATE_AFTER_BUSINESS_DAYS = 4
@@ -306,7 +308,7 @@ def served_figures(modes: Mapping[str, str]) -> list[Figure]:
 
 
 def period_allowed(item: Figure, period: str) -> bool:
-    if item.kind != "per_period":
+    if item.kind not in PERIOD_KINDS:
         return period in ("", None)
     return any(re.fullmatch(_PERIOD_PATTERNS[template], str(period or "")) for template in item.periods)
 

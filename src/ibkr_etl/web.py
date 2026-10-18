@@ -1635,14 +1635,20 @@ def monthly_attribution_view(
     user: dict[str, str] = Depends(_authorized_user),
 ) -> dict:
     """Contribution to return by holding and sector for one calendar month."""
-    from .monthly_reporting_analytics import build_monthly_reporting_analytics
-
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month or ""):
         raise HTTPException(status_code=400, detail="Month must be YYYY-MM")
     if requested_as_of and month > requested_as_of[:7]:
         raise HTTPException(status_code=400, detail="Month is after the as-of date")
+    # The month is worked out to its calendar end whatever the as-of date, as before.
+    return _certified("attribution", account_id, requested_as_of,
+                      lambda day: _monthly_attribution(account_id, access, month))
+
+
+def _monthly_attribution(account_id: str, access: dict, month: str) -> dict:
+    from .monthly_reporting_analytics import build_monthly_reporting_analytics
+
     year, number = int(month[:4]), int(month[5:])
     next_month = date(year + number // 12, number % 12 + 1, 1)
     period_end = (next_month - timedelta(days=1)).isoformat()

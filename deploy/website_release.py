@@ -796,7 +796,7 @@ PAGES_SETTING = 'CERTIFIED_FIGURES_PAGES'
 PAGES_REGISTER = ROOT / 'infra' / 'medallion' / 'certified-figures.json'
 # A website built from a commit with this file can read the register (the release ships only .py files).
 PAGES_READERS = 'src/ibkr_etl/certified_figures_register_data.py'
-PAGES_STAGES = ('off', 'shadow', 'batch-1', 'batch-2', 'batch-3')
+PAGES_STAGES = ('off', 'shadow', 'batch-1', 'batch-2', 'batch-3', 'batch-4')
 PAGES_QUIET = ((7, 50), (9, 25))   # UTC: no changes while the daily runs publish
 PAGE_RANK = {'off': 0, 'shadow': 1, 'on': 2}
 

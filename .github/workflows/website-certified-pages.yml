@@ -3,7 +3,7 @@ name: Website certified pages
 # Manual: moves the website's pages between today's figures and the certified figures by
 # setting CERTIFIED_FIGURES_PAGES on ibkrv2stg-web (docs/MEDALLION_CERTIFIED_FIGURES.md,
 # "How a page moves"). shadow: every page shows today's figures and logs any difference.
-# batch-1, batch-2, batch-3: those batches show the certified figures, the rest stay in
+# batch-1 to batch-4: those batches show the certified figures (batch-4: Attribution), the rest stay in
 # shadow. off: every page exactly as before. The image is left as it is. It refuses while
 # the daily runs publish (07:50 to 09:25 UTC), and from 1 to 7 Nov it only moves pages
 # back. Rolls back to the previous value if the checks fail.
@@ -11,10 +11,10 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: shadow, batch-1, batch-2, batch-3 or off
+        description: shadow, batch-1, batch-2, batch-3, batch-4 or off
         required: true
         type: choice
-        options: [shadow, batch-1, batch-2, batch-3, 'off']
+        options: [shadow, batch-1, batch-2, batch-3, batch-4, 'off']
 
 permissions:
   contents: read

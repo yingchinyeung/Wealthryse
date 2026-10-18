@@ -20,7 +20,9 @@ Oct**. Pages then move in three batches, each a website release checked with the
 data report: **Thu 22** Overview, Holdings and Cash; **Fri 23** Performance; **Sat 24** Risk,
 Combined holdings and the agents' read tool. Sun 25 to Thu 29 are spare days for a page that
 failed its report; nothing moves after Thu 29, and month-end (1 to 7 Nov) has no changes.
-Monthly reports, the factsheet and Performance › Attribution stay on today's path until 8 Nov.
+The factsheet stays on the frozen month-end snapshot until 8 Nov. Performance › Attribution and
+the monthly reports move on **Tue 27 Oct** in the automatic fallback, which keeps every report
+exactly as today's code makes it ("Monthly reports and Attribution on certified figures").
 One setting undoes any page.
 
 ## The dates
@@ -55,8 +57,11 @@ One setting undoes any page.
 **Stay on today's path until after month-end (from 8 Nov):**
 
 - **Monthly reports.** They produce the 1 Nov client reports from the frozen month-end snapshot.
+  From Tue 27 Oct they compare their figures with the certified ones in the automatic fallback,
+  which changes nothing in them ("Monthly reports and Attribution on certified figures").
 - **The factsheet renderers.** They read the frozen snapshot, and their job moves on Wed 21.
-- **Performance › Attribution.** It uses the monthly reports' engine (`monthly_reporting_analytics`), so it moves with them.
+- **Performance › Attribution.** It uses the monthly reports' engine (`monthly_reporting_analytics`),
+  so it moves with them: its own page key `attribution`, batch 4, Tue 27 Oct.
 - **The agents' month-end commentary job** (`month_end_drafter`, 2 to 7 Nov). It keeps its own tool list, so its drafts match the frozen reports.
 
 **Out of scope:** Modelling (hypothetical models, labelled as such: open question 7), Trade
@@ -567,7 +572,8 @@ difference that takes longer, batch 1 uses a spare day, not Wed 21.
 ### After month-end (from 8 Nov), each its own release with a report
 
 1. The publish gate's verdict becomes binding for the build's sources.
-2. Monthly reports and Attribution read certified figures; the factsheet stays on the frozen
+2. Monthly reports and Attribution read certified figures (brought forward to 27 Oct in the
+   automatic fallback: "Monthly reports and Attribution on certified figures"); the factsheet stays on the frozen
    snapshot, and the October and November month-end figures are checked against it (open
    question 13).
 3. The month-end commentary job gets the read tool; the existing agent figure tools read
@@ -592,6 +598,98 @@ difference that takes longer, batch 1 uses a spare day, not Wed 21.
 - **Release data report (U6).** The `figures` command and the view comparison (part 6).
 - **"As known on" history (U8).** Nothing before month-end. Certified rows already keep every
   published version of a figure.
+
+## Monthly reports and Attribution on certified figures (from Tue 27 Oct)
+
+Item 2 of "After month-end", brought forward by the owner's decision of 18 Oct. The October
+client reports (made 1 to 7 Nov) are made with it switched on, so its first mode, the
+automatic fallback, keeps every report exactly as today's code makes it.
+
+### The setting: `MONTHLY_REPORTS_CERTIFIED`
+
+Read by `reporting_snapshot.build_month_end_payload`, which every month-end freeze uses
+(`freeze_month_end_snapshot`: the month-end factsheet job's `generate_month_end_package.py`,
+`render_onboarding_composite_reports.py` through `composite_reports` and `designed_reports`,
+`historical_reporting`, `generate_month_end_factsheet.py` and `scripts/freeze_month_end_snapshot.py`).
+The code is `ibkr_etl.certified_reports`.
+
+| Mode | What a month-end report does |
+|---|---|
+| `off` (the default: unset, empty or any other value) | Today's code exactly. Nothing is read and nothing is logged. |
+| `fallback` | Today's report, byte for byte (the same snapshot sha256, so the same snapshot id and factsheet). The certified figures for the report's data date (`data_as_of`, its last NAV date on or before the month end) are read alongside, inside a savepoint on the report's own connection, and every field below is compared. A certified value is used only when it is exactly today's, so nothing changes; a value within the certified tolerance (relative 1e-9, money to the cent) counts as close and today's is kept, as for a different or missing one. One line per report, `CERTIFIED_REPORTS {json}`, gives the mode, the subject masked (`u…01`), the status (`match`, `differ`, `none`, `error`, `not_applicable`) and the counts and figure ids that were close, different or missing: never values. A failed read is logged as `error` and the report is today's. |
+| `on` | The certified value replaces today's in every field the mapping writes, wherever one exists. Not used before two clean month-ends (November and December). |
+
+The Alpha World MS and T reports and the profiled design composites are made from their own
+approved HKD design, not from the website's figures, so they are not compared
+(`not_applicable`).
+
+### Which report fields have a certified version
+
+All are read for `as_of_date = data_as_of`. "Compared only" fields are never written, not even by
+`on`, because the report works them out on another basis.
+
+| Report field (snapshot payload) | Certified figure | Period, item, benchmark |
+|---|---|---|
+| `portfolio_summary.latest_nav.total_text` | `overview.nav` | |
+| `portfolio_summary.positions` | `overview.positions` | |
+| `risk.metrics.<name>` (15 fields, as on Risk › Risk snapshot) | `risk.*` (`cvar_95_daily` and `daily_expected_tail_loss` are both `risk.etl_95_daily`) | |
+| `benchmark_comparisons[].metrics.<name>` (also `performance_comparison`, `secondary_performance_comparison`: the same objects) | `benchmark.portfolio_total_return`, `benchmark_total_return`, `excess_total_return`, `tracking_error`, `information_ratio`, `beta`, `correlation`, `relative_win_rate` | benchmark: that comparison's. The build certifies each subject's default benchmark, so a secondary benchmark's are missing |
+| `monthly_reporting.portfolio_monthly_return`, `.equity_contribution`, `.residual_contribution` | `attribution.portfolio_return`, `attribution.holdings_contribution`, `attribution.residual_contribution` | `month_YYYY-MM` of the report month |
+| `monthly_reporting.security_contributions[].contribution` | `attribution.holding_contribution` | the month; item: conid |
+| `monthly_reporting.sector_contributions[].contribution` | `attribution.sector_contribution` | the month; item: sector |
+| Compared only: `month_end_performance[].portfolio_monthly_return` | `performance.monthly_return` | `month_YYYY-MM`. The report's is the ratio of the benchmark comparison's month-end levels (dates shared with the benchmark); the certified one is the time-weighted return over every NAV date |
+| Compared only: `sector_allocation.gross_market_value`, `.allocation[].weight` | `holdings.gross_market_value`, `holdings.sector_allocation` (item: sector) | The report converts with its own dated reporting FX |
+
+No certified version (the report keeps today's): `month_end_performance[].benchmark_monthly_return`
+and the comparison series themselves (only their last point is certified, as
+`benchmark.rebased_level`, a chart figure); `performance.series` (the NAV records); the holding
+records (`holdings`, from the agents' holdings tool with the report's own reporting-currency
+step); `monthly_reporting.cash_activity` (dividends, interest and fees: cash records);
+`freshness`; the crisis replay detail; and the composites' attribution (below). MTD, QTD, YTD and
+the other period returns are not in the snapshot: the factsheet works them out from its own NAV
+index when it renders, and stays on the frozen snapshot (open question 13).
+
+### Attribution as certified figures
+
+Five figures on their own page key, `attribution` (batch 4, Tue 27 Oct; the website workflow's
+`batch-4` stage), all from the engine the reports use: `attribution.portfolio_return`,
+`attribution.holdings_contribution` and `attribution.residual_contribution` per month, and
+`attribution.holding_contribution` and `attribution.sector_contribution` per month and holding
+or sector (the kind `per_period_item`). The build (`certified_build.attribution_rows`) calls the
+page's own handler, so certified equals what the page shows. Because the page works a month out
+to its calendar end whatever the as-of date, a month is read only on its last NAV date, and the
+month in progress on the newest date; other dates give no rows and cost nothing. Its input
+fingerprint is every row the handler read, in order. The page reads its month's figures only
+(`period`), and never shows figures from an earlier date (`exact`): it keeps today's answer and
+logs `behind`. The composite portfolios keep today's figures: their engine adds the sleeves in
+set order, which changes from one run to the next, so totals can move in the last digit with the
+same inputs, which would hold the build.
+
+### Before switch-on: the rehearsal on the restored copy (Sat 24 / Sun 25)
+
+1. Fill the past month-ends: `CERTIFIED_FIGURES_BUILD=on python scripts/build_certified_figures.py
+   --backfill --page attribution` (the daily runs read only the latest dates). It must publish, not hold.
+2. The release data report's `figures` command, which now reads the Attribution page on
+   month-ends and the newest date: no differences for `attribution`.
+3. `DATABASE_URL=<the copy> python scripts/compare_monthly_report_figures.py --month 2026-09 --out
+   <private file outside the repository>`. Read-only: the session is `READ ONLY`, every subject is
+   rolled back, no snapshot is inserted, nothing is uploaded or rendered. It makes each subject's
+   September report with the setting `off`, `fallback` and `on`, prints counts only and exits 0
+   when every report today's code can make is identical with `off` and `fallback`. It must show
+   **"Identical with MONTHLY_REPORTS_CERTIFIED off and fallback: N of N"** and **"failed only
+   with the setting: 0"**. The equal, close, different and missing counts per field say what `on`
+   would change; they do not change any report in `fallback`, and each difference in a written
+   field is explained before `on` is considered. "Today's payload equals the stored frozen
+   snapshot" shows whether today's code still makes September's frozen snapshot from the copy.
+
+### Switch-on and undo
+
+Tue 27 Oct: `MONTHLY_REPORTS_CERTIFIED=fallback` on the month-end factsheet job
+(`ibkrv2stg-month-end-factsheet`) and on any other process that freezes snapshots, and the
+website workflow's `batch-4` stage (or `attribution=shadow` first). From 1 Nov, watch the
+`CERTIFIED_REPORTS` lines. Undo: remove the setting (off), and the workflow's `batch-3` stage for
+the page.
+
 
 ## Open questions for Ying
 

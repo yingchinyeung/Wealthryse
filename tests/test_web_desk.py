@@ -602,7 +602,9 @@ class AccountPageTests(unittest.TestCase):
 
     def test_with_desk_page_unset_the_account_page_is_byte_for_byte_unchanged(self):
         without = {key: label for key, label in web.ACCOUNT_TABS.items() if key != "desk"}
-        with _desk_page(None):
+        # The quant sections have their own switch; keep them off so only the Desk is compared.
+        with _desk_page(None), patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("QUANT_ANALYTICS_PAGES", None)
             for user in (OWNER, VIEWER):
                 for state in (None, "preview", "active"):
                     for kind in ("physical_account", "composite_portfolio"):

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ibkr_etl import metrics_guide as guide
 from ibkr_etl import metrics_guide_audit as audit
+from ibkr_etl import metrics_guide_quant as quant_guide
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,11 +23,12 @@ class AuditOfTheRepositoryTest(unittest.TestCase):
         self.assertEqual(report.unrecorded_sources, [])
 
     def test_watch_list_and_label_map_name_real_definitions_and_labels(self):
+        anchors = {**guide.METRIC_ANCHORS, **quant_guide.METRIC_ANCHORS}
         for source, metrics in audit.WATCHED_SOURCES.items():
             for name in metrics:
-                self.assertIn(name, guide.METRIC_ANCHORS, source)
+                self.assertIn(name, anchors, source)
         for label, name in audit.LABEL_MAP.items():
-            self.assertIn(name, guide.METRIC_ANCHORS, label)
+            self.assertIn(name, anchors, label)
         self.assertEqual(sorted(set(audit.LABEL_MAP) - set(audit.website_labels())), [])
 
     def test_labels_include_modelling_tiles_and_what_if_rows(self):

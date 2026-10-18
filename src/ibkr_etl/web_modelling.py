@@ -15,6 +15,7 @@ import math
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
@@ -262,6 +263,18 @@ def crisis_what_if(stored: Mapping[str, Any], current: Mapping[str, float], prop
     return results
 
 
+@dataclass(frozen=True)
+class ModellingReads:
+    """The Modelling tab's own reads, returned by :func:`install` so another module can model
+    exactly the same holdings, prices, returns and factor fit (web_quant.py does)."""
+
+    holding_access: Callable[[str, dict], dict]
+    holdings_and_prices: Callable[..., tuple[str, list[dict], dict[str, dict[str, float]]]]
+    risk_free_rate: Callable[..., float | None]
+    portfolio_returns: Callable[..., tuple[Any, list[tuple[str, float]]]]
+    fitted_factors: Callable[..., tuple[dict[str, Any], dict[str, Any], float | None]]
+
+
 def install(
     app: FastAPI,
     *,
@@ -281,8 +294,8 @@ def install(
     crisis_enabled: Callable[[], bool] = crisis_scenarios.website_enabled,
     crisis_prices: Callable[[], Any] = _crisis_market,
     load_crisis_scenarios: Callable[..., dict[str, Any] | None] = crisis_scenarios.load,
-) -> None:
-    """Add the /api/portfolio/{account_id}/modelling/* routes."""
+) -> ModellingReads:
+    """Add the /api/portfolio/{account_id}/modelling/* routes; return the reads they share."""
 
     def portfolio_returns(connection, account_id: str, access: dict, as_of: str | None):
         nav = validated_nav(nav_values(connection, account_id, access, as_of))
@@ -700,6 +713,10 @@ def install(
                 "factor_data_through": factors["latest_date"], "momentum_note": factors["momentum_note"],
                 "source": factors.get("source", "kenneth_french"), "source_note": factors.get("source_note", ""),
                 "regions": {key: value[0] for key, value in fama_french.REGIONS.items()}, **result}
+
+    return ModellingReads(holding_access=holding_access, holdings_and_prices=holdings_and_prices,
+                          risk_free_rate=risk_free_rate, portfolio_returns=portfolio_returns,
+                          fitted_factors=fitted_factors)
 
 
 MODELLING_CARDS = r"""

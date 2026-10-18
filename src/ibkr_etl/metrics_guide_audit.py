@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ibkr_etl import metrics_guide as guide
+from ibkr_etl import metrics_guide_quant as quant_guide
 
 # The directory holding the ibkr_etl and wealthryse_agent packages: src/ in the repository, or
 # site-packages in the agent image.
@@ -131,6 +132,11 @@ WATCHED_SOURCES = {
     "wealthryse_agent.jobs:model_check_findings": ("Risk model check",),
 }
 
+# The quant analytics pages (web_quant.py) keep their entries in metrics_guide_quant.py.
+LABEL_SOURCES += quant_guide.LABEL_SOURCES
+LABEL_MAP.update(quant_guide.LABEL_MAP)
+WATCHED_SOURCES.update(quant_guide.WATCHED_SOURCES)
+
 
 def _normal(text: str) -> str:
     ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
@@ -140,6 +146,11 @@ def _normal(text: str) -> str:
 def _guide_terms() -> dict[str, str]:
     terms = {_normal(name): name for name in guide.METRIC_ANCHORS}
     for name, aliases in guide.METRIC_ALIASES.items():
+        for alias in aliases:
+            terms.setdefault(_normal(alias), name)
+    for name in quant_guide.METRIC_ANCHORS:
+        terms.setdefault(_normal(name), name)
+    for name, aliases in quant_guide.ALIASES.items():
         for alias in aliases:
             terms.setdefault(_normal(alias), name)
     return terms
@@ -366,6 +377,8 @@ def drift_facts(report: AuditReport, root: Path = ROOT) -> dict:
 
 
 def _definition_fields(name: str) -> dict:
+    if name in quant_guide.METRIC_ANCHORS:
+        return quant_guide.definition_fields(name)
     metric = guide.definition(name)
     return {"what_it_tells_you": metric.meaning, "technical_method": metric.calculation,
             "how_to_explain_it": metric.interpretation, "how_we_work_it_out": guide.CLIENT_CALCULATIONS[name]}

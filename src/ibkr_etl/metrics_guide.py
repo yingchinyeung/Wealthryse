@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from html import escape
 import re
 import unicodedata
@@ -22,6 +23,22 @@ class MetricSection:
     introduction: str
     metrics: tuple[MetricDefinition, ...]
     location: str = ""
+
+
+@dataclass(frozen=True)
+class GuideAddition:
+    """Sections a switched-on feature adds to the rendered guide page (metrics_guide_quant.py).
+
+    ``sections`` pairs each section with the key of the guide section it follows. The guide's own
+    entries, anchors and search are unchanged; with no additions the page is exactly as before.
+    """
+
+    sections: tuple[tuple[str, MetricSection], ...] = ()
+    client_calculations: Mapping[str, str] = field(default_factory=dict)
+    aliases: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    related: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    locations: Mapping[str, str] = field(default_factory=dict)
+    versions: tuple[tuple[str, str], ...] = ()
 
 
 _DEFINITIONS = (
@@ -1533,12 +1550,16 @@ def search(query: str, limit: int = 5) -> list[dict]:
 ALIASES_SHOWN = 4
 
 
-def _definition_row(metric: MetricDefinition, section: MetricSection) -> str:
-    client_calculation = CLIENT_CALCULATIONS[metric.name]
-    anchor = METRIC_ANCHORS[metric.name]
-    aliases = METRIC_ALIASES.get(metric.name, ())
-    related = RELATED_METRICS.get(metric.name, ())
-    location = METRIC_LOCATIONS.get(metric.name, section.location)
+_NO_ADDITION = GuideAddition()
+
+
+def _definition_row(metric: MetricDefinition, section: MetricSection, addition: GuideAddition | None = None) -> str:
+    extra = addition or _NO_ADDITION
+    client_calculation = extra.client_calculations.get(metric.name) or CLIENT_CALCULATIONS[metric.name]
+    anchor = metric_anchor(metric.name)
+    aliases = extra.aliases.get(metric.name) or METRIC_ALIASES.get(metric.name, ())
+    related = extra.related.get(metric.name) or RELATED_METRICS.get(metric.name, ())
+    location = extra.locations.get(metric.name) or METRIC_LOCATIONS.get(metric.name, section.location)
     search_text = " ".join(
         (
             metric.name,
@@ -1560,7 +1581,7 @@ def _definition_row(metric: MetricDefinition, section: MetricSection) -> str:
     related_html = (
         '<div class="metric-related"><span>See also</span>'
         + "".join(
-            f'<a href="#{escape(METRIC_ANCHORS[name], quote=True)}">{escape(name)}</a>'
+            f'<a href="#{escape(metric_anchor(name), quote=True)}">{escape(name)}</a>'
             for name in related
         )
         + "</div>"
@@ -1593,10 +1614,15 @@ def _section_id(section: MetricSection) -> str:
     return f"guide-{section.key}"
 
 
-def render_metrics_guide() -> str:
+def render_metrics_guide(additions: Sequence[GuideAddition] = ()) -> str:
+    placed: list[tuple[MetricSection, GuideAddition | None]] = [(section, None) for section in METRIC_SECTIONS]
+    for addition in additions:
+        for after, extra in addition.sections:
+            index = next((i + 1 for i, (s, _) in enumerate(placed) if s.key == after), len(placed))
+            placed.insert(index, (extra, addition))
     sections = []
-    for section in METRIC_SECTIONS:
-        rows = "".join(_definition_row(metric, section) for metric in section.metrics)
+    for section, addition in placed:
+        rows = "".join(_definition_row(metric, section, addition) for metric in section.metrics)
         section_id = escape(_section_id(section), quote=True)
         sections.append(
             f'<section id="{section_id}" class="card wide metric-guide-section" '
@@ -1609,11 +1635,11 @@ def render_metrics_guide() -> str:
             '<a class="metric-back" href="#metric-guide-top">Back to top <span aria-hidden="true">↑</span></a>'
             '</section>'
         )
-    total = sum(len(section.metrics) for section in METRIC_SECTIONS)
+    total = sum(len(section.metrics) for section, _ in placed)
     chips = "".join(
         f'<a href="#{escape(_section_id(section), quote=True)}" data-section-chip="{escape(_section_id(section), quote=True)}">'
         f'{escape(section.short_title)} <span>{len(section.metrics)}</span></a>'
-        for section in METRIC_SECTIONS
+        for section, _ in placed
     )
     conventions = "".join(
         f"<div><dt>{escape(label)}</dt><dd>{escape(text)}</dd></div>"
@@ -1621,7 +1647,7 @@ def render_metrics_guide() -> str:
     )
     versions = "".join(
         f"<li><code>{escape(version)}</code> {escape(scope)}</li>"
-        for version, scope in METHODOLOGY_VERSIONS
+        for version, scope in (*METHODOLOGY_VERSIONS, *(item for addition in additions for item in addition.versions))
     )
     return (
         '<div class="page-view active" data-section="metrics-guide">'

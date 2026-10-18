@@ -429,23 +429,27 @@ class SupervisorReportingTests(unittest.TestCase):
 
 
 class BicepDefaultsTests(unittest.TestCase):
-    """Applying the Bicep alone changes nothing: every new setting is empty or off."""
+    """Applying the Bicep alone changes nothing: the defaults match what runs live since 18 Oct 2026."""
 
-    def test_job_files_keep_raw_capture_off_by_default(self):
+    def test_job_files_default_to_the_live_raw_capture(self):
         for name in ("staging-benchmark-job.bicep", "staging-risk-free-job.bicep",
                      "staging-sector-classification-job.bicep", "staging-crisis-scenarios-job.bicep"):
             with self.subTest(name=name):
                 text = (ROOT / "infra" / name).read_text(encoding="utf-8")
-                self.assertIn("param rawMarketDataContainer string = ''", text)
+                self.assertIn("param rawMarketDataContainer string = 'bronze-market-data'", text)
                 self.assertIn("var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [", text)
                 self.assertIn("], rawMarketDataEnv)", text)
                 self.assertIn("{ name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }", text)
                 self.assertIn("{ name: 'AZURE_CLIENT_ID', value: jobIdentity.properties.clientId }", text)
                 self.assertEqual(text.count("MARKET_DATA_RAW_CONTAINER"), 1)
 
-    def test_supervisor_file_keeps_layer_freshness_and_blob_checks_off_by_default(self):
+    def test_crisis_job_keeps_its_raw_capture_time_budget(self):
+        text = (ROOT / "infra" / "staging-crisis-scenarios-job.bicep").read_text(encoding="utf-8")
+        self.assertIn("{ name: 'MARKET_DATA_RAW_BUDGET_SECONDS', value: '120' }", text)
+
+    def test_supervisor_file_has_layer_freshness_on_and_blob_checks_off_by_default(self):
         text = (ROOT / "infra" / "staging-autonomous-admin.bicep").read_text(encoding="utf-8")
-        self.assertIn("param layerFreshnessEnabled bool = false", text)
+        self.assertIn("param layerFreshnessEnabled bool = true", text)
         self.assertIn("param layerFreshnessBlobChecks bool = false", text)
         self.assertIn("var layerFreshnessBlobEnv = !layerFreshnessBlobChecks ? [] : concat([", text)
         self.assertIn("var layerFreshnessEnv = !layerFreshnessEnabled ? [] : concat([", text)
@@ -455,7 +459,9 @@ class BicepDefaultsTests(unittest.TestCase):
     def test_jobs_the_medallion_release_moves_never_apply_migrations(self):
         # Their image carries migrations that are held back in production; only bootstrap applies migrations.
         for name in ("staging-institutional-daily.bicep", "staging-burn-in-monitoring.bicep",
-                     "staging-autonomous-admin.bicep", "staging-derived-refresh.bicep"):
+                     "staging-autonomous-admin.bicep", "staging-derived-refresh.bicep",
+                     "staging-benchmark-job.bicep", "staging-risk-free-job.bicep",
+                     "staging-sector-classification-job.bicep", "staging-crisis-scenarios-job.bicep"):
             with self.subTest(name=name):
                 text = (ROOT / "infra" / name).read_text(encoding="utf-8")
                 self.assertEqual(text.count("IBKR_RUN_MIGRATIONS"), 1)

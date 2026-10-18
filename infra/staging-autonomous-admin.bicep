@@ -24,11 +24,11 @@ param aiProcessingScope string = 'apac-data-zone'
 param azureSubscriptionId string
 param portfolioTenantId string = '00000000-0000-0000-0000-000000000001'
 param pilotAccountId string = 'U16088571'
-// Medallion layer freshness (src/ibkr_etl/layer_freshness.py). Off by default, which
-// leaves the supervisor's environment exactly as before. The bronze-market-data file
-// checks have their own switch, for once raw capture is on; they also need the
-// container name and Storage Blob Data Reader on it for the diagnostics identity.
-param layerFreshnessEnabled bool = false
+// Medallion layer freshness (src/ibkr_etl/layer_freshness.py), on since 18 Oct 2026:
+// the default matches the live supervisor. The bronze-market-data file checks have their
+// own switch and stay off; they also need the container name (the diagnostics identity
+// holds Storage Blob Data Reader on bronze-market-data since 18 Oct, in staging.bicep).
+param layerFreshnessEnabled bool = true
 param layerFreshnessBlobChecks bool = false
 param rawMarketDataContainer string = ''
 param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'

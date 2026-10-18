@@ -518,6 +518,12 @@ JOB_INPUTS: dict[str, tuple[str, ...]] = {
         "silver.nav_snapshots", "silver.derived_portfolio_nav", "silver.position_snapshots",
         "silver.derived_portfolio_positions", "silver.instruments", "silver.instrument_classifications",
         "silver.risk_free_rates", "silver.reference_fx_rates", "silver.benchmark_prices"),
+    "ibkrv2stg-certified-figures": (
+        "silver.nav_snapshots", "silver.derived_portfolio_nav", "silver.position_snapshots",
+        "silver.derived_portfolio_positions", "silver.synthetic_portfolio_components", "silver.cash_snapshots",
+        "silver.cash_transactions", "silver.derived_portfolio_cash_ledger", "silver.derived_portfolio_cash_balances",
+        "silver.fx_rates", "silver.instruments", "silver.instrument_classifications",
+        "gold.performance_comparison_daily", "gold.risk_analytics_snapshots", "gold.crisis_scenario_results"),
 }
 
 

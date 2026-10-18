@@ -233,6 +233,8 @@ class CertifiedFiguresMigrationTests(unittest.TestCase):
         app.commit()
         self.assertEqual(web.execute("SELECT value FROM gold.v_certified_figures WHERE build_id = %s",
                                      (build_id,)).fetchall(), [(1.25,)])
+        self.assertEqual(web.execute("SELECT count(*) FROM public.v_certified_figures WHERE build_id = %s",
+                                     (build_id,)).fetchone()[0], 1)
         web.execute("SET search_path = gold, public")  # what bootstrap gives runtime logins
         self.assertEqual(web.execute("SELECT count(*) FROM v_certified_figures WHERE build_id = %s",
                                      (build_id,)).fetchone()[0], 1)

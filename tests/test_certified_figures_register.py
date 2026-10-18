@@ -295,12 +295,29 @@ class CertifiedFiguresModuleTests(unittest.TestCase):
                 self.assertEqual(cf.medallion_dir({}), image)
                 cf.reload()
                 self.assertEqual(len(cf.figures()), 71)
-            with patch.dict("os.environ", {"MEDALLION_DIR": str(Path(folder) / "elsewhere")}):
+                # MEDALLION_DIR first, when it has the register.
+                elsewhere = Path(folder) / "elsewhere"
+                with patch.dict("os.environ", {"MEDALLION_DIR": str(elsewhere)}):
+                    self.assertEqual(cf.register_path(), image / cf.REGISTER_NAME)
+                    elsewhere.mkdir()
+                    (elsewhere / cf.REGISTER_NAME).write_bytes(REGISTER.read_bytes())
+                    self.assertEqual(cf.register_path(), elsewhere / cf.REGISTER_NAME)
+            # As in the website overlay or the agents image: no folder has it, so the packaged copy.
+            with patch.object(cf, "REPOSITORY_DIR", Path(folder) / "absent"), \
+                    patch.object(cf, "IMAGE_DIR", Path(folder) / "absent-too"), \
+                    patch.dict("os.environ", {"MEDALLION_DIR": ""}):
+                self.assertEqual(cf.register_path(), cf.PACKAGED_REGISTER)
                 cf.reload()
-                with self.assertRaises(FileNotFoundError):
-                    cf.register()
+                self.assertEqual(len(cf.figures()), 71)
         cf.reload()
         self.assertEqual(len(cf.figures()), 71)
+
+    def test_the_packaged_copy_is_the_register(self) -> None:
+        # After changing the register: python -m ibkr_etl.certified_figures --write
+        packaged = Path(cf.__file__).with_name("certified_figures_register.json")
+        self.assertEqual(packaged.read_bytes(), REGISTER.read_bytes())
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('"certified_figures_register.json"', pyproject)
 
     def test_figures_carry_their_definition_and_version(self) -> None:
         figures = cf.figures()
@@ -379,6 +396,8 @@ class CertifiedFiguresModuleTests(unittest.TestCase):
         self.assertEqual(cf.calculation_version(cf.figure("risk.sharpe_ratio"), "risk-analytics-v2"),
                          "risk-analytics-v2+benchmark-comparison-v1")
         self.assertEqual(cf.calculation_version(cf.figure("stats.skewness")), "portfolio-analytics-v1")
+        self.assertEqual(cf.calculation_version(cf.figure("stats.skewness"), "portfolio-analytics-v1"),
+                         "portfolio-analytics-v1")
         self.assertEqual(cf.calculation_version(cf.figure("cash.ending_cash"), "silver.subject_cash_balance_series@1.0.0"),
                          "imported+silver.subject_cash_balance_series@1.0.0")
 

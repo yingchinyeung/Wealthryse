@@ -763,9 +763,9 @@ off until its own release.
 **Turning it on.** Ying's typed approval to rerun `scripts/install_agent_schema.py`
 (applies `018_supervisor_tasks.sql`; planned with Medallion's agent release on Wed 28
 Oct), then `AGENT_SUPERVISOR=watch` on the agent service (planned Thu 29 Oct). The
-undo is `AGENT_SUPERVISOR=off`; the table stays, unread. Any other value is off. Once
-on, deploy `infra/agent-apps.bicep` with `supervisorMode=watch`, or the deployment
-sets it back to off.
+undo is `AGENT_SUPERVISOR=off`; the table stays, unread. Any other value is off.
+**Once it is on, every later deploy of `infra/agent-apps.bicep` must pass
+`supervisorMode=watch`, or that deploy turns watch off.**
 
 ## Cost drivers
 

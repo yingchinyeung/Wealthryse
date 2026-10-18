@@ -1,15 +1,18 @@
 """The certified-figures register in code (medallion upgrade U5).
 
 docs/MEDALLION_CERTIFIED_FIGURES.md explains the layer. The register is
-infra/medallion/certified-figures.json, read on first use from medallion_dir(): the folder
-named by MEDALLION_DIR, else the repository's infra/medallion, else /app/medallion (where the
-website image carries infra/medallion). Other code can use medallion_dir() for the catalog
-and contracts too.
+infra/medallion/certified-figures.json, read on first use from the first of these that has it:
+the folder named by MEDALLION_DIR, the repository's infra/medallion, /app/medallion (where the
+platform image carries infra/medallion), and last the copy packaged with ibkr_etl
+(certified_figures_register.json), so every image has it. After changing the register, refresh
+that copy with `python -m ibkr_etl.certified_figures --write` (a test checks they match).
+Other code can use medallion_dir() for the catalog and contracts, which are not packaged.
 
 Nothing here reads client data or switches anything on, and importing it reads no file, so it
 is safe to import everywhere. The stable API for the build, the website readers and the agents:
 
-    medallion_dir() -> Path                 where the register, catalog and contracts are
+    medallion_dir() -> Path                 where the catalog and contracts are (and the register)
+    register_path() -> Path                 the register file read, as above
     figure(figure_id) -> Figure             one figure; UnknownFigure (a KeyError) names close ids
     figures() -> dict[str, Figure]          all of them, in register order
     figures_for_page(page_id) -> list       the figures a page shows: its own, then borrowed ones
@@ -53,6 +56,7 @@ REGISTER_NAME = "certified-figures.json"
 DIR_SETTING = "MEDALLION_DIR"
 REPOSITORY_DIR = Path(__file__).resolve().parents[2] / "infra" / "medallion"
 IMAGE_DIR = Path("/app/medallion")
+PACKAGED_REGISTER = Path(__file__).with_name("certified_figures_register.json")
 
 BUILD_SETTING = "CERTIFIED_FIGURES_BUILD"
 PAGES_SETTING = "CERTIFIED_FIGURES_PAGES"
@@ -147,7 +151,13 @@ def medallion_dir(environ: Mapping[str, str] | None = None) -> Path:
 
 
 def register_path(environ: Mapping[str, str] | None = None) -> Path:
-    return medallion_dir(environ) / REGISTER_NAME
+    """The register in MEDALLION_DIR, the repository's infra/medallion or /app/medallion, the first
+    that has it; otherwise the copy packaged with ibkr_etl."""
+    environ = os.environ if environ is None else environ
+    explicit = str(environ.get(DIR_SETTING, "")).strip()
+    folders = ([Path(explicit)] if explicit else []) + [REPOSITORY_DIR, IMAGE_DIR]
+    return next((folder / REGISTER_NAME for folder in folders if (folder / REGISTER_NAME).is_file()),
+                PACKAGED_REGISTER)
 
 
 @lru_cache(maxsize=1)
@@ -289,8 +299,8 @@ def period_allowed(item: Figure, period: str) -> bool:
 def calculation_version(item: Figure, source_version: str | None = None) -> str:
     """The figure's method, joined with the source row's own version where it has one:
     'risk-analytics-v2+benchmark-comparison-v1'. IBKR's values copied unchanged say
-    'imported+<source contract version>'."""
-    parts = [str(source_version)] if source_version else []
+    'imported+<source contract version>'. A source version that is the method itself is not repeated."""
+    parts = [str(source_version)] if source_version and str(source_version) != item.method else []
     return "+".join([IMPORTED, *parts] if item.method == IMPORTED else [*parts, item.method])
 
 
@@ -321,3 +331,25 @@ def freshness(as_of: date | str, latest: date | str | None, *, reason: str | Non
     if status != "fresh" and reason:
         result["reason"] = reason
     return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    """--write copies infra/medallion/certified-figures.json over the packaged copy; without it,
+    says whether the two match."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Keep the packaged register copy in step.")
+    parser.add_argument("--write", action="store_true", help="Refresh the packaged copy from infra/medallion.")
+    args = parser.parse_args(argv)
+    source = REPOSITORY_DIR / REGISTER_NAME
+    same = PACKAGED_REGISTER.is_file() and PACKAGED_REGISTER.read_bytes() == source.read_bytes()
+    if args.write and not same:
+        PACKAGED_REGISTER.write_bytes(source.read_bytes())
+        print(f"Wrote {PACKAGED_REGISTER.name} from {source}.")
+        return 0
+    print("The packaged register matches." if same else "The packaged register differs; run with --write.")
+    return 0 if same else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

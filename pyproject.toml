@@ -29,4 +29,4 @@ ibkr-etl = "ibkr_etl.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ibkr_etl = ["assets/alpha_world_subtitle_font.pdf", "assets/alpha_world_ms_disclaimer_font.pdf", "assets/alpha_world_ms_crisis_market_v1.json", "metrics_guide_sources.json", "factsheet_spec/designs/*.json"]
+ibkr_etl = ["assets/alpha_world_subtitle_font.pdf", "assets/alpha_world_ms_disclaimer_font.pdf", "assets/alpha_world_ms_crisis_market_v1.json", "metrics_guide_sources.json", "certified_figures_register.json", "factsheet_spec/designs/*.json"]

@@ -1,5 +1,5 @@
 {
- "about": "Register of the figures to certify first (upgrade U5, stage S7). src/ibkr_etl/certified_figures.py reads it (from /app/medallion in the image); nothing is switched on by it. docs/MEDALLION_CERTIFIED_FIGURES.md explains it. tests/test_certified_figures_register.py checks it against the Metrics guide, the factsheet bindings, the catalog, the contracts and the website's routes.",
+ "about": "Register of the figures to certify first (upgrade U5, stage S7). src/ibkr_etl/certified_figures.py reads it, or its packaged copy src/ibkr_etl/certified_figures_register.json (refresh with python -m ibkr_etl.certified_figures --write); nothing is switched on by it. docs/MEDALLION_CERTIFIED_FIGURES.md explains it. tests/test_certified_figures_register.py checks it against the Metrics guide, the factsheet bindings, the catalog, the contracts and the website's routes.",
  "status": "draft",
  "version": "0.2.0",
  "units": {

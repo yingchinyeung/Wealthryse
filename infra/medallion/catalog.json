@@ -1494,6 +1494,14 @@
    ],
    "schedule": "09:15 UTC"
   },
+  "ibkrv2stg-certified-figures": {
+   "hops": [
+    "analytics",
+    "quality-gate"
+   ],
+   "schedule": "09:05 and 09:45 UTC",
+   "note": "Stores the pages' figures in gold.certified_figures (docs/MEDALLION_CERTIFIED_FIGURES.md). Does nothing unless CERTIFIED_FIGURES_BUILD=on."
+  },
   "ibkrv2stg-credential-broker": {
    "hops": [
     "ops"

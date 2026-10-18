@@ -644,6 +644,10 @@ def generate_grounded_narrative(
     }
     request_hash = hashlib.sha256(canonical_json(request_descriptor).encode("utf-8")).hexdigest()
     tool_results = []
+    from .certified_tool_figures import mode as certified_figure_tools_mode
+
+    # AGENT_CERTIFIED_FIGURE_TOOLS: off (the default) calls the tools exactly as before.
+    certified = certified_figure_tools_mode()
     try:
         for tool_name in tools:
             arguments: dict[str, Any] = {"subject_id": subject_id}
@@ -653,7 +657,8 @@ def generate_grounded_narrative(
                 arguments["benchmark_id"] = benchmark_id
             if tool_name == "get_holdings":
                 arguments["limit"] = 25
-            result = execute_tool(connection, tool_context, tool_name, arguments)
+            result = (execute_tool(connection, tool_context, tool_name, arguments) if certified == "off" else
+                      execute_tool(connection, tool_context, tool_name, arguments, certified_mode=certified))
             if str(result.get("subject_id") or "") != subject_id:
                 raise AIAnalystError(500, "grounding_subject_mismatch", "A grounding result belongs to a different portfolio.")
             tool_results.append(result)

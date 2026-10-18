@@ -2,9 +2,8 @@
 
 Needs a disposable server: set AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI starts one).
 Skipped otherwise. Builds its own database with every migration in order, as the owner (not a
-superuser, so forced row-level security applies as on Azure). When the certified tables'
-migration is not in the repository yet, it applies the design's SQL
-(docs/MEDALLION_CERTIFIED_FIGURES.md, "How it is stored") instead. Synthetic data only.
+superuser, so forced row-level security applies as on Azure), including the certified
+tables' migration (073), and seeds builds the way the build job leaves them. Synthetic data only.
 """
 from __future__ import annotations
 
@@ -24,85 +23,30 @@ ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 TENANT, OTHER_TENANT = layers.TENANT, layers.OTHER_TENANT
 SUBJECT = unit.SUBJECT
 SHA = "c" * 64
-DESIGN_SQL = """
-CREATE TABLE gold.certified_builds (
-    tenant_id uuid NOT NULL DEFAULT app_tenant_id() REFERENCES tenants(tenant_id),
-    build_id uuid NOT NULL,
-    started_at timestamptz NOT NULL,
-    status text NOT NULL CHECK (status IN ('shadow', 'published', 'held', 'rolled_back')),
-    published_at timestamptz,
-    checks jsonb NOT NULL,
-    reason text,
-    lineage_run_id uuid,
-    PRIMARY KEY (tenant_id, build_id)
-);
-CREATE TABLE gold.certified_figures (
-    tenant_id uuid NOT NULL DEFAULT app_tenant_id() REFERENCES tenants(tenant_id),
-    build_id uuid NOT NULL,
-    subject_id text NOT NULL,
-    figure_id text NOT NULL,
-    period text NOT NULL DEFAULT '',
-    item text NOT NULL DEFAULT '',
-    benchmark_id text NOT NULL DEFAULT '',
-    as_of_date date NOT NULL,
-    value double precision,
-    value_text text,
-    unit text NOT NULL CHECK (unit IN ('ratio', 'number', 'money', 'date', 'text')),
-    currency text,
-    status text NOT NULL CHECK (status IN ('ok', 'unavailable')),
-    reason text,
-    detail jsonb NOT NULL DEFAULT '{}',
-    period_start date, period_end date, observations integer,
-    definition_id text NOT NULL,
-    definition_version text NOT NULL,
-    calculation_version text NOT NULL,
-    input_sha256 text NOT NULL CHECK (input_sha256 ~ '^[0-9a-f]{64}$'),
-    source_table text NOT NULL,
-    source_key jsonb NOT NULL,
-    lineage_run_id uuid,
-    written_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (tenant_id, subject_id, figure_id, period, item, benchmark_id, as_of_date, build_id),
-    FOREIGN KEY (tenant_id, build_id) REFERENCES gold.certified_builds
-);
-ALTER TABLE gold.certified_builds ENABLE ROW LEVEL SECURITY;
-ALTER TABLE gold.certified_builds FORCE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON gold.certified_builds
-    USING (tenant_id = app_tenant_id()) WITH CHECK (tenant_id = app_tenant_id());
-ALTER TABLE gold.certified_figures ENABLE ROW LEVEL SECURITY;
-ALTER TABLE gold.certified_figures FORCE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON gold.certified_figures
-    USING (tenant_id = app_tenant_id()) WITH CHECK (tenant_id = app_tenant_id());
-CREATE VIEW gold.v_certified_figures WITH (security_invoker = true) AS
-SELECT DISTINCT ON (f.tenant_id, f.subject_id, f.figure_id, f.period, f.item, f.benchmark_id, f.as_of_date)
-       f.*, b.status AS build_status, b.published_at
-  FROM gold.certified_figures f
-  JOIN gold.certified_builds b ON b.tenant_id = f.tenant_id AND b.build_id = f.build_id
- WHERE b.status = 'published'
- ORDER BY f.tenant_id, f.subject_id, f.figure_id, f.period, f.item, f.benchmark_id, f.as_of_date,
-          b.published_at DESC;
-"""
-
-
-def _migration_present() -> bool:
-    return any(layers.MIGRATIONS.glob("*_certified_figures.sql"))
-
-
 def _insert_build(owner, tenant: str, status: str, published: datetime | None, rows: list[dict]) -> str:
+    """A build as the build job leaves it: rows written while in shadow, then its status moved on."""
     build = str(uuid.uuid4())
     owner.execute("SELECT set_config('app.tenant_id', %s, false)", (tenant,))
-    owner.execute("INSERT INTO gold.certified_builds(tenant_id, build_id, started_at, status, published_at, checks) "
-                  "VALUES (%s, %s, %s, %s, %s, '{}')",
-                  (tenant, build, datetime(2026, 10, 22, 8, tzinfo=timezone.utc), status, published))
+    owner.execute("INSERT INTO gold.certified_builds(tenant_id, build_id, run_kind, started_at, status) "
+                  "VALUES (%s, %s, 'daily', %s, 'shadow')",
+                  (tenant, build, datetime(2026, 10, 22, 8, tzinfo=timezone.utc)))
     for row in rows:
         owner.execute(
             "INSERT INTO gold.certified_figures(tenant_id, build_id, subject_id, figure_id, period, item, "
-            "benchmark_id, as_of_date, value, value_text, unit, status, definition_id, definition_version, "
-            "calculation_version, input_sha256, source_table, source_key) VALUES "
-            "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'metric-x', 'abcdef012345', 'v1', %s, "
+            "benchmark_id, as_of_date, value, value_text, unit, status, reason, definition_id, "
+            "definition_version, calculation_version, input_sha256, source_table, source_key) VALUES "
+            "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'metric-x', 'abcdef012345', 'v1', %s, "
             "'silver.subject_nav_series', '{}')",
             (tenant, build, row.get("subject", SUBJECT), row["figure_id"], row["period"], row["item"],
              row["benchmark_id"], row["as_of_date"], row["value"], row["value_text"], row["unit"],
-             row["status"], SHA))
+             row["status"], "Synthetic: not available" if row["status"] == "unavailable" else None, SHA))
+    moves = {"published": ("published",), "held": ("held",), "rolled_back": ("published", "rolled_back"),
+             "shadow": ()}[status]
+    for step in moves:
+        owner.execute("UPDATE gold.certified_builds SET status = %s, published_at = COALESCE(published_at, %s), "
+                      "reason = %s WHERE tenant_id = %s AND build_id = %s",
+                      (step, published if step == "published" else None,
+                       None if step == "published" else "Synthetic: test", tenant, build))
     owner.commit()
     return build
 
@@ -123,9 +67,6 @@ class CertifiedReaderDatabaseTests(unittest.TestCase):
         try:
             cls.applied = layers._build(cls.database)
             with layers._connect(cls.database) as owner:
-                if not _migration_present():
-                    owner.execute(DESIGN_SQL)
-                    owner.commit()
                 cls._seed(owner)
             import psycopg
             with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
@@ -170,7 +111,8 @@ class CertifiedReaderDatabaseTests(unittest.TestCase):
             return pages.read_certified(connection, tenant_id=tenant, subject_id=SUBJECT, figure_ids=figure_ids,
                                         as_of=as_of, benchmark_id=benchmark_id)
 
-    def test_the_view_comes_from_the_migration_or_the_design(self):
+    def test_the_view_comes_from_the_migration(self):
+        self.assertIn("073_certified_figures.sql", self.applied)
         with self.connection() as connection:
             found = connection.execute("SELECT to_regclass('gold.v_certified_figures') AS view").fetchone()
         self.assertIsNotNone(found["view"])

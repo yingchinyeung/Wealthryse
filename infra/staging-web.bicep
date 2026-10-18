@@ -26,9 +26,8 @@ param authorizationMode string = 'database'
 param tenantId string = '00000000-0000-0000-0000-000000000001'
 param pilotAccountId string = 'U16088571'
 param pilotAccountDisplayName string = 'U16088571-U.S. Technology and Biotechnology'
-@secure()
-@description('Existing Entra application client secret. Required so a full web-template deployment cannot delete Easy Auth credentials.')
-param entraClientSecret string
+@description('Main-vault secret holding the Entra application client secret used by Easy Auth.')
+param entraClientSecretName string = 'website-entra-client-secret'
 param aiEndpoint string = ''
 param aiDeployment string = ''
 param aiRegion string = 'southeastasia'
@@ -45,8 +44,8 @@ param storageAccountUrl string = 'https://ibkrv2stgauhecwc4itaoo.blob.${environm
 param internalReportContainer string = 'internal-reports'
 param onboardingIntakeContainer string = 'onboarding-intake'
 param credentialBrokerUrl string = ''
-@secure()
-param credentialBrokerAuth string = ''
+@description('Main-vault secret holding the shared bearer secret for the credential broker.')
+param credentialBrokerAuthSecretName string = 'credential-broker-auth'
 // The pilot portal is externally reachable only through HTTPS and is protected by
 // the separately managed Container Apps Entra auth configuration plus the
 // application allow-list. Set this parameter to false for emergency isolation.
@@ -108,7 +107,8 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = {
         }
         {
           name: 'microsoft-provider-authentication-secret'
-          value: entraClientSecret
+          keyVaultUrl: '${vault.properties.vaultUri}secrets/${entraClientSecretName}'
+          identity: webIdentity.id
         }
         {
           name: 'database-approval-url'
@@ -117,7 +117,8 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = {
         }
         {
           name: 'credential-broker-auth'
-          value: credentialBrokerAuth
+          keyVaultUrl: '${vault.properties.vaultUri}secrets/${credentialBrokerAuthSecretName}'
+          identity: webIdentity.id
         }
       ]
     }

@@ -5,8 +5,9 @@ param environmentName string = 'ibkrv2stg-env'
 param registryName string
 param keyVaultName string
 param imageTag string
-@secure()
-param brokerAuth string
+@description('Main key vault that holds the shared bearer secret; the broker identity needs Key Vault Secrets User on that one secret.')
+param mainKeyVaultName string
+param brokerAuthSecretName string = 'credential-broker-auth'
 
 resource environment 'Microsoft.App/managedEnvironments@2024-03-01' existing = {
   name: environmentName
@@ -16,6 +17,9 @@ resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' existing =
 }
 resource vault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
   name: keyVaultName
+}
+resource mainVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: mainKeyVaultName
 }
 
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
@@ -84,7 +88,7 @@ resource broker 'Microsoft.App/containerApps@2024-03-01' = {
           identity: identity.id
         }
       ]
-      secrets: [{name: 'broker-auth', value: brokerAuth}]
+      secrets: [{name: 'broker-auth', keyVaultUrl: '${mainVault.properties.vaultUri}secrets/${brokerAuthSecretName}', identity: identity.id}]
     }
     template: {
       containers: [

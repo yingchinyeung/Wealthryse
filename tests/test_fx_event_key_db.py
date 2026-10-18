@@ -202,7 +202,7 @@ class FxEventKeyTests(unittest.TestCase):
         code, output, report = self._tool("fx-check")
         self.assertEqual(code, 1, output)
         self.assertIn("fx-check: DUPLICATES", output)
-        self.assertFalse(report["event_key_column"])
+        self.assertEqual(report["event_key_column"], FX_STEP not in self.pending)
         counts = self._fx_counts(report)
         self.assertEqual({name: counts[name] for name in (
             "rows", "events_with_more_than_one_current_row", "rows_beyond_one_per_event",
@@ -217,8 +217,9 @@ class FxEventKeyTests(unittest.TestCase):
                           report["statements_read"]), (0, 0, 2))
 
     def test_2_the_fx_step_merges_once_and_a_second_run_finds_nothing(self):
-        output = self._bootstrap("--only-migration", FX_STEP, *self._pending_except(FX_STEP))
-        self.assertIn(f"Migrations applied: {FX_STEP}.", output)
+        if FX_STEP in self.pending:
+            output = self._bootstrap("--only-migration", FX_STEP, *self._pending_except(FX_STEP))
+            self.assertIn(f"Migrations applied: {FX_STEP}.", output)
         before, versions = self._fx(), self._versions()
         code, output, report = self._tool("fx-merge")
         self.assertEqual(code, 0, output)

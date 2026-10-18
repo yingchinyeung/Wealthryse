@@ -158,6 +158,12 @@ class CatalogCoverageTests(unittest.TestCase):
         tables = {f"{entry['layer']}.{name}" for name, entry in objects.items() if entry["kind"] == "table"}
         self.assertEqual({v.target for v in VOLUMES}, tables)
         self.assertEqual(len(VOLUMES), len({v.check_id for v in VOLUMES}))
+        # Tables created in their layer schema have no public view, so their count reads layer.table;
+        # those a held migration creates are skipped until it has run.
+        entries = json.loads((ROOT / "infra" / "medallion" / "catalog.json").read_text(encoding="utf-8"))["postgres"]
+        in_layer = {key for key, value in entries.items() if key.split(".", 1)[0] == value.get("layer")}
+        self.assertEqual({v.target for v in VOLUMES if v.qualified}, in_layer & tables)
+        self.assertEqual({v.target for v in VOLUMES if v.held}, layer_quality.held_relations(CONTRACTS) & tables)
 
     def test_count_columns_are_contract_columns_and_dates_are_dates(self):
         contracts = {medallion_contracts.table_object(c)["physicalName"]: c
@@ -165,7 +171,7 @@ class CatalogCoverageTests(unittest.TestCase):
         for rule in VOLUMES:
             with self.subTest(table=rule.table):
                 props = {p["name"]: p for p in medallion_contracts.table_object(contracts[rule.target])["properties"]}
-                self.assertIn(layer_quality.COUNT_COLUMNS[rule.table], props)
+                self.assertIn(layer_quality.COUNT_COLUMNS[rule.relation], props)
                 if rule.date_column:
                     self.assertEqual(props[rule.date_column]["logicalType"], "date")
                 self.assertRegex(rule.table + (rule.date_column or ""), r"^[a-z_]+$")
@@ -173,10 +179,12 @@ class CatalogCoverageTests(unittest.TestCase):
     def test_contract_rules_are_all_planned_with_stable_ids(self):
         pass_plan = layer_quality.plan({layer_quality.CONTRACTS_DIR_ENV: str(CONTRACTS)})
         self.assertIsNone(pass_plan.contracts_error)
-        self.assertEqual(len(pass_plan.contracts), 35)
-        self.assertEqual(len(pass_plan.rules), 181)
-        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 181)
-        self.assertEqual(sum(r.needs_rls_bypass for r in pass_plan.rules), 8)
+        self.assertEqual(len(pass_plan.contracts), 43)
+        self.assertEqual(len(pass_plan.rules), 231)
+        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 231)
+        self.assertEqual(sum(r.needs_rls_bypass for r in pass_plan.rules), 13)
+        self.assertIn("silver.nav_snapshots_history", pass_plan.held)
+        self.assertIn("public.silver_history_settings", pass_plan.held)
         self.assertEqual(layer_quality.rule_check_id("silver.nav_snapshots", "total_text_is_decimal"),
                          "rule.silver.nav_snapshots.total_text_is_decimal")
         gate = {"rule.silver.nav_snapshots.total_text_is_decimal"}
@@ -431,6 +439,59 @@ class ReviewTests(unittest.TestCase):
         review = review_layer_quality(None, warn=False, open_incidents=open_incidents)
         self.assertEqual(len(review.hold_open), 3)
         self.assertEqual(review.findings, ())
+
+
+class _Session:
+    """A read-only session where every count finds 7 rows and the named relations do not exist."""
+
+    def __init__(self, absent=()):
+        self.absent = set(absent)
+        self.queries: list[str] = []
+
+    def execute(self, query, params=None):
+        self.queries.append(query)
+        cursor = Mock()
+        if "to_regclass" in query:
+            cursor.fetchall.return_value = [{"relation": r} for r in params[0] if r in self.absent]
+        elif "rolbypassrls" in query:
+            cursor.fetchall.return_value = [{"bypass": False}]
+        else:
+            cursor.fetchall.return_value = [{"total": 7}]
+        return cursor
+
+
+class HeldTableTests(unittest.TestCase):
+    def test_a_held_table_is_skipped_until_its_migration_has_run(self):
+        held = Volume("nav_snapshots_history", "silver", count_column="version_id", qualified=True, held=True)
+        plain = Volume("accounts", "silver", count_column="account_id")
+        pass_plan = layer_quality.Plan(volumes=(held, plain))
+        session = _Session(absent={"silver.nav_snapshots_history"})
+        results = {r["check_id"]: r for r in layer_quality.measure_daily(
+            session, pass_plan, now=_at(TUESDAY, 10, 30), results=[], time_budget_seconds=60)}
+        self.assertEqual(results["volume.silver.nav_snapshots_history"]["state"], "skipped")
+        self.assertIn("held migration", results["volume.silver.nav_snapshots_history"]["detail"]["reason"])
+        self.assertEqual(results["volume.silver.accounts"]["observed"], 7)
+        self.assertNotIn("nav_snapshots_history", " ".join(q for q in session.queries if "count(*)" in q))
+        # Once the migration has run, the history is counted as layer.table.
+        session = _Session()
+        results = {r["check_id"]: r for r in layer_quality.measure_daily(
+            session, pass_plan, now=_at(TUESDAY, 10, 30), results=[], time_budget_seconds=60)}
+        self.assertEqual(results["volume.silver.nav_snapshots_history"]["observed"], 7)
+        self.assertIn("SELECT count(*) AS total FROM silver.nav_snapshots_history", session.queries)
+
+    def test_held_schema_and_rule_checks_are_skipped_too(self):
+        pass_plan = layer_quality.plan({layer_quality.CONTRACTS_DIR_ENV: str(CONTRACTS)})
+        pass_plan.volumes = ()
+        session = _Session(absent=pass_plan.held)
+        with patch.object(layer_quality, "judge_schema", return_value={"check_id": "x", "state": "pass"}), \
+                patch("ibkr_etl.medallion_contracts.introspect", return_value={}):
+            results = layer_quality.measure_daily(session, pass_plan, now=_at(TUESDAY, 10, 30), results=[],
+                                                  time_budget_seconds=60)
+        skipped = {r["check_id"] for r in results if r["state"] == "skipped"
+                   and "held migration" in str(r["detail"].get("reason"))}
+        self.assertIn("schema.silver.trades_history", skipped)
+        self.assertTrue(any(c.startswith("rule.silver.trades_history.") for c in skipped))
+        self.assertFalse(any("certified" in c for c in skipped))
 
 
 class _History:

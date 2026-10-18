@@ -419,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
             for table, column in sorted(COUNT_COLUMNS.items()):
                 if connection.execute("SELECT to_regclass(%s)", (table,)).fetchone()[0]:
                     connection.execute(sql.SQL("GRANT SELECT ({}) ON TABLE {} TO {}").format(
-                        sql.Identifier(column), sql.Identifier(table), sql.Identifier(approval_role)))
+                        sql.Identifier(column), sql.Identifier(*table.split(".")), sql.Identifier(approval_role)))
             if connection.execute("SELECT to_regclass(%s)", (HISTORY_TABLE,)).fetchone()[0]:
                 connection.execute(sql.SQL("GRANT SELECT, INSERT ON TABLE {} TO {}").format(
                     sql.Identifier(HISTORY_TABLE), sql.Identifier(approval_role)))

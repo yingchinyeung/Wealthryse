@@ -33,7 +33,7 @@ SPREAD_MIN_LOOKBACK = 10
 FLAT = 1e-12
 # MacKinnon (2010), Table 2, constant and no trend, N = 2 variables: τ(T) = β∞ + β₁/T + β₂/T².
 MACKINNON_2010_TWO_VARIABLES = {
-    "1%": (-3.89644, -10.9519, -33.527),
+    "1%": (-3.89644, -10.9519, -22.527),
     "5%": (-3.33613, -6.1101, -6.823),
     "10%": (-3.04445, -4.2412, -2.720),
 }

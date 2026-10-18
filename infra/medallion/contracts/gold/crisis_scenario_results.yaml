@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.gold.crisis_scenario_results
 name: crisis_scenario_results
-version: 1.0.0
+version: 1.1.0
 status: active
 domain: gold
 dataProduct: portfolio-medallion
@@ -181,6 +181,16 @@ schema:
     primaryKeyPosition: -1
     classification: internal
     description: UTC time (ISO 8601) of the run that wrote the row.
+  - name: lineage_run_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The recorded job run that last inserted or updated this row (lineage_runs); NULL when that run
+      was not recorded.
   quality:
   - name: drawdown_matches_availability
     description: An available scenario has a maximum drawdown and an unavailable one has none.

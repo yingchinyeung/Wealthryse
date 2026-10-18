@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.gold.performance_comparison_daily
 name: performance_comparison_daily
-version: 1.0.0
+version: 1.1.0
 status: active
 domain: gold
 dataProduct: portfolio-medallion
@@ -202,6 +202,16 @@ schema:
     primaryKeyPosition: -1
     classification: internal
     description: UTC time (ISO 8601) of the run that wrote the row.
+  - name: lineage_run_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The recorded job run that last inserted or updated this row (lineage_runs); NULL when that run
+      was not recorded.
   quality:
   - name: excess_is_difference
     description: excess_return equals portfolio_return − benchmark_return.

@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.gold.risk_analytics_snapshots
 name: risk_analytics_snapshots
-version: 1.0.0
+version: 1.1.0
 status: active
 domain: gold
 dataProduct: portfolio-medallion
@@ -174,6 +174,16 @@ schema:
     primaryKeyPosition: -1
     classification: internal
     description: Step timings, plus the source-check metadata risk_refresh adds.
+  - name: lineage_run_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The recorded job run that last inserted or updated this row (lineage_runs); NULL when that run
+      was not recorded.
   quality:
   - name: payload_version_matches
     description: The payload names the same analytics_version as the row.

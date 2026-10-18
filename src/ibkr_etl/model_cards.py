@@ -425,6 +425,62 @@ _CARDS: tuple[ModelCard, ...] = (
         served_on=("risk", "modelling"),
         references=("Vovk et al. (2005)", "Lei et al. (2018)", "Murphy (1973)", "Berkowitz (2001)"),
     ),
+    ModelCard(
+        model_id='desk-risk',
+        name='Desk risk and P&L explain',
+        module='quant.desk_risk',
+        version_constant="MODEL_VERSION",
+        entry_points=('intraday_pnl', 'pnl_explain', 'limit_check', 'desk_snapshot',),
+        purpose="Today's P&L from live positions and quotes, where it came from (market, factors, FX, stock-specific) and every live metric against its limit.",
+        inputs='live_positions, live_quotes, live_executions and cash from live_account_values; FX rates now and at the prior close; factor betas; limits.',
+        method='P&L against the prior close with the FX part on the opening value; fills today from their price; '
+               'factor explain through time-series betas, parts adding up exactly; limit usage with green, amber (80%) and red.',
+        limits=(
+                'The collector writes a quote only when it changes, so a quiet holding or a closed market reads as stale.',
+                'Commissions are left out, and fills today are converted at the current FX rate.',
+                'Intraday style-factor returns are rarely available; the explain is then market and specific only.',
+        ),
+        validation='tests/test_quant_desk_risk.py.',
+        served_on=('desk',),
+        references=('Grinold and Kahn (2000)',),
+    ),
+    ModelCard(
+        model_id='pre-trade',
+        name='Pre-trade check',
+        module='quant.pre_trade',
+        version_constant="MODEL_VERSION",
+        entry_points=('pre_trade_check',),
+        purpose='What proposed orders would do to risk, tail loss, concentration, factor exposures, liquidity and limits, and what they would cost, before anything is placed.',
+        inputs="Today's positions and prices, the proposed orders, daily return history, optionally a covariance or factor model, daily volumes, spreads and limits.",
+        method='Orders applied with cash taking the difference; Ledoit-Wolf or factor-model ex-ante volatility; historical VaR and '
+               'expected tail loss over the same history; half-spread plus square-root impact cost; limits before and after.',
+        limits=(
+                'A hypothetical check, not advice; it places nothing.',
+                'Holdings without return history count at 0% risk and are listed.',
+                'Each order is costed on its own at the default impact coefficient unless a fitted one is passed.',
+        ),
+        validation='tests/test_quant_pre_trade.py.',
+        served_on=('desk', 'modelling', 'agents'),
+        references=('Ledoit and Wolf (2004)', 'Almgren et al. (2005)',),
+    ),
+    ModelCard(
+        model_id='crowding',
+        name='Crowding and concentration',
+        module='quant.crowding',
+        version_constant="MODEL_VERSION",
+        entry_points=('ownership_overlap', 'correlation_clusters', 'concentration',),
+        purpose='How much of the portfolio sits in names large funds also hold, which funds look most like it, which holdings move as one bet, and how concentrated it is.',
+        inputs='Portfolio weights, 13F holdings of large funds with shares outstanding, and daily returns of the holdings.',
+        method='Ownership share and top-holder crowding score; cosine similarity of fund weights; average-linkage clustering '
+               'on correlation distance √(½(1 − ρ)); Herfindahl index and effective number of holdings.',
+        limits=(
+                '13F filings lag a quarter by up to 45 days and show US-listed longs only.',
+                'The cluster cut is on average distance, so a cluster can average a little below the chosen correlation.',
+        ),
+        validation='tests/test_quant_crowding.py.',
+        served_on=('risk',),
+        references=('Mantegna (1999)', 'Herfindahl (1950)',),
+    ),
 )
 
 

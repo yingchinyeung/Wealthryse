@@ -139,6 +139,85 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
   queries are judged on synthetic data only so far.
 - `python -m ibkr_etl.input_readiness <job>` prints a dry run of the check.
 
+## Publish gate for gold (U2)
+
+Each gold writer checks the version it has just written before it commits it
+(`src/ibkr_etl/publish_gate.py`). Gold is written in place today (upserts by key, or
+delete and insert per subject and date), so the commit is the moment a version becomes
+what readers see. The gate runs just before it, on the writer's own connection.
+
+- **Where.** `publish_gate.before_commit` is called right before the commit in
+  `provisional_benchmark` (benchmark comparisons, per subject), `crisis_replay` (both
+  writers), `crisis_scenarios.refresh` and `risk_snapshots.build_risk_snapshot`. These
+  run in benchmark-daily, derived-daily, risk-snapshots and crisis-scenarios-daily. The
+  month-end packages are written by subprocesses, so month-end-factsheet calls
+  `publish_gate.report` afterwards, which judges and logs only.
+- **How it runs.** Inside a savepoint that is always rolled back, READ ONLY, with a
+  2-second lock timeout and each statement limited to what is left of a 30-second budget.
+  The writer's transaction is left exactly as it was. The version is the rows the writer
+  just wrote: the subject and write stamp for comparisons, the subject and holdings date
+  for the crisis tables, the subject, date and version for risk snapshots.
+- **Checks and tolerances** (from the code that already compares these figures):
+
+  | Check | Table | Fails on | Only warns on |
+  |---|---|---|---|
+  | contract | every gold table | an error rule from its data contract (`publish_gate_rules.json`, generated from the contracts; a test keeps them equal) | a warning rule |
+  | nav_matches_ibkr | comparisons | a NAV missing from, or different from, the books' NAV for that day (`subject_nav_series`, read as the writer reads it; rounding as `comparison_source_evidence`: max(1e-8, 1e-10 × value)) | books with more than one, or an unreadable, NAV; IBKR days with TOTAL plus ALL or blank rows (the `v_daily_nav` overlap) |
+  | cash_plus_positions | comparisons | never | positions plus cash more than 1% (and at least one unit) from the NAV on the latest day, the export agent's tie |
+  | returns_continuity | comparisons | a series that restarts, does not chain, or has a daily return beyond ±100% (portfolio) or ±50% (benchmark), as `build_comparison` | days with a NAV and a benchmark price missing from the series; older rows left inside the rebuilt range |
+  | benchmark_coverage | comparisons, risk snapshots | a subject with a NAV but no primary comparison; a risk snapshot with no comparison for its benchmark | a missing secondary; a comparison more than 4 days behind the NAV |
+
+  A check that cannot run (a timeout, a lost connection, a rule that errors) warns, so a
+  slow database never holds back a good version. Staleness only warns because the
+  writers already hold the primary benchmark to its exchange calendar (weekends, HK and
+  other holidays), which a day count cannot.
+- **Modes,** set by `PUBLISH_GATE_MODE` on each job:
+  - `off`, the default and also when unset: nothing runs. No query, no log line. A test
+    proves this.
+  - `shadow`: logs one `PUBLISH_GATE {json}` line per version (verdict, reasons, each
+    check's evidence) and the writer commits.
+  - `enforce`: the same, but a failing comparison or crisis-scenario version is rolled
+    back and `BuildHeldBack` raised, so readers keep the last good version: the
+    comparison series keeps its earlier rows, and `crisis_scenarios.load` picks the
+    latest earlier holdings date. benchmark-daily carries on with the other subjects,
+    lists them under `held_back_by_publish_gate`, keeps its run a success (so the next
+    jobs' readiness is not stopped) and exits 65 at the end. derived-daily and
+    crisis-scenarios-daily treat a hold as that subject's failure, as they treat any
+    other. Risk snapshots and the crisis replay are never held back: their pages show one
+    exact date, and would show "being prepared" instead of the previous figures. Their
+    failures are logged with `not_held_back`. The month-end packages are never stopped.
+- **Switching on** is one setting per job: add `PUBLISH_GATE_MODE=shadow` (or `enforce`)
+  to the job definition, on an image built from a `main` that has this code. No
+  migration is needed. To read the results:
+  `ContainerAppConsoleLogs_CL | where Log_s startswith 'PUBLISH_GATE '`.
+- A held-back comparison also skips that subject's later steps in derived-daily, and the
+  risk job then has no comparison for the new NAV date. The risk page shows "being
+  prepared" for that date, as it does today when a benchmark price is late.
+- `python -m ibkr_etl.publish_gate <job>` prints a dry run for everything the job wrote
+  today (UTC), in its own READ ONLY session (`--since`, or `--run-id` for a lineage run).
+  `--write-rules` regenerates the rules file after a contract changes.
+
+### The version readers see (design for S6)
+
+Deciding before the commit is enough for tables whose readers fall back to earlier rows.
+To publish through a pointer, so that undoing a build is pointing back and every table
+can be held back, S6 needs these changes. Each changes what readers or `SELECT *` see, so
+none is built yet:
+
+1. Give each gold build an id (the lineage run id where there is one) and add it to the
+   table keys, so a new version sits beside the old one. `crisis_replay_daily` also needs
+   `calculation_version` in its key: today a new version overwrites the old.
+2. Add `gold.published_builds` (tenant, table, subject, build id, published_at, verdict).
+   The gate writes a row only after a pass; a hold leaves the previous row in place.
+3. Point the `public.<table>` compatibility views at each subject's published build.
+   Readers already read those views, so most need no change. Some read with `SELECT *`
+   (`alpha_world_t_crisis.py` on the replay components, and the MS and T qualification
+   and audit scripts on comparisons and risk snapshots); give them column lists first.
+4. Make the risk page and the crisis replay fall back to the latest published build on
+   or before the date shown, then set `holds_back` for those tables.
+5. Prune builds that were never published, and builds older than the retention period.
+6. Keep month-end report-only: the frozen packages already carry their own sha256.
+
 ## Release data report
 
 A release that touches silver or gold runs its jobs on a restored copy first, and

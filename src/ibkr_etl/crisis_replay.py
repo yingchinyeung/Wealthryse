@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Callable, Iterable, Mapping
 
-from . import raw_capture
+from . import publish_gate, raw_capture
 from .provisional_benchmark import (
     convert_levels_to_reporting_currency,
     fetch_fx_to_reporting_yfinance,
@@ -573,11 +573,21 @@ def refresh_composite_crisis_replay(
                 CALCULATION_VERSION, generated_at,
             ),
         )
+    _before_commit(connection, account_id, latest)
     connection.commit()
     loaded = load_crisis_replay(connection, account_id=account_id, as_of=latest)
     if loaded is None:
         raise RuntimeError("The composite crisis replay could not be reloaded")
     return loaded
+
+
+def _before_commit(connection: Any, account_id: str, latest: str) -> None:
+    """The publish gate on the replay just written (off by default). It logs its verdict
+    only: readers show the replay for one exact holdings date."""
+    partition = {"subject_id": account_id, "holdings_as_of": latest}
+    publish_gate.before_commit(
+        connection, {"gold.crisis_replay_daily": partition, "gold.crisis_replay_components": partition},
+        writer="crisis_replay")
 
 
 def load_crisis_replay(
@@ -882,6 +892,7 @@ def refresh_crisis_replay(
              row["drawdown"], CRISIS_START.isoformat(), CRISIS_END.isoformat(),
              CALCULATION_VERSION, generated_at),
         )
+    _before_commit(connection, account_id, latest)
     connection.commit()
     direct_count = sum(component.mapping_method == "direct" for component in components)
     proxy_count = len(components) - direct_count

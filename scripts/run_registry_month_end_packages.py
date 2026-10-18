@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -12,7 +13,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from ibkr_etl import input_readiness  # noqa: E402
+from ibkr_etl import input_readiness, publish_gate  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.onboarding_agents import agents_enabled, run_reviews  # noqa: E402
 from ibkr_etl.onboarding_month_end import live_cases  # noqa: E402
@@ -43,6 +44,7 @@ def record_agent_reviews(database_url: str, tenant_id: str) -> dict:
 
 def main() -> int:
     input_readiness.gate("month-end-factsheet")
+    started = datetime.now(timezone.utc)  # the publish gate judges snapshots written from here
     database_url = os.environ.get("DATABASE_URL", "").strip()
     tenant_id = os.environ.get(
         "PORTFOLIO_TENANT_ID", "00000000-0000-0000-0000-000000000001"
@@ -133,6 +135,8 @@ def main() -> int:
         print(json.dumps({"onboarding_composite_reports": "failed", "reason": str(error)}, sort_keys=True))
         if live_subjects:
             failed = True
+    # Judge the snapshots this run wrote and log one line (off by default; never stops the packages).
+    publish_gate.report("month-end-factsheet", since=started)
     print(json.dumps({"status": "partial_failure" if failed else "success", "subjects": results}, sort_keys=True))
     print(json.dumps({"onboarding_agent_reviews": record_agent_reviews(database_url, tenant_id)}, sort_keys=True))
     return 1 if failed else 0

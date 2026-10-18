@@ -139,6 +139,82 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
   queries are judged on synthetic data only so far.
 - `python -m ibkr_etl.input_readiness <job>` prints a dry run of the check.
 
+## Layer quality checks (U7)
+
+The autonomous administrator measures each layer against targets and keeps every result
+(`src/ibkr_etl/layer_quality.py`). It reports only: it takes no action, and nothing it
+finds stops a job or holds back publication. Only the publish gate does that.
+
+- **Targets,** defined once in `TARGETS`:
+  - bronze ready by 08:45 UTC, silver by 09:00 and gold by 10:00, on 99% of business
+    days. A business day is a New York session; its data is due the next day, so a
+    Saturday target covers Friday, and Sunday and Monday have none. "Ready" means the
+    freshness checks show that day's data (statements, NAV, positions, benchmarks;
+    performance, risk and crisis results);
+  - silver and gold checks pass, with no failed check of severity error, on 95% of
+    business days.
+- **What runs.**
+  - Every run (every 5 minutes): readiness, from the freshness results. When
+    `LAYER_FRESHNESS_ENABLED` is on it reuses them, so no new query.
+  - Once a day, on the first run from 10:30 UTC (after the gold target):
+    - row counts for every silver and gold table in the catalog. Dated tables are
+      counted per date for six weeks, and the newest complete date is compared with
+      the typical count for the same kind of day (both markets open, Hong Kong only or
+      New York only);
+    - each table's live schema against its data contract;
+    - two value checks: a NAV move of more than 10% between a subject's two newest
+      dates, and positions dropping to zero;
+    - the contract quality rules, apart from any the publish gate already ran that day.
+- **Avoiding false alarms.**
+  - A count is judged only once there are 10 earlier days of the same kind. It fails
+    only when it is under half of both the six-week and the last-five-day typical
+    counts, so a backfill or a new account does not trip it.
+  - A jump (over twice the typical count, plus two) is a warning, for the report only,
+    such as the month-end jump. Event tables (trades, cash and FX transactions,
+    corporate actions, derived ledger and exclusions) are recorded, not judged.
+  - The value checks need 10 dates per subject. Positions to zero applies only to
+    subjects that held positions on at least 80% of their NAV dates.
+  - A NAV move is a warning: it can be a deposit or a withdrawal.
+- **History.** One row per result in `quality_check_results` (migration 072): readiness,
+  freshness, counts, schema, value and rule results. The table is append-only and kept
+  per tenant. A table rather than Log Analytics, because the weekly report reads 13 weeks
+  of it and the job has no way to query Log Analytics. Each run also logs one line,
+  `LAYER_QUALITY {json}`, with states and check ids, no subjects and no figures.
+  Readiness is recorded once when a layer is first seen ready, and once if it is late at
+  its target time. That is what "silver ready by 09:00" is measured from.
+- **Report.** `python -m ibkr_etl.layer_quality report [--week-ending YYYY-MM-DD]
+  [--json]` states each target as met or missed over the last 13 weeks and the week, then
+  the week's failed checks. It gives counts, check ids and table names only.
+- **Modes,** set by `LAYER_QUALITY_MODE` on the administrator job:
+  - `off`, the default and also when the variable is unset: no query and no log line;
+  - `shadow`: measure, record and log. Findings are info incidents, recorded quietly and
+    never announced;
+  - `warn`: a late layer or a failed check of severity error becomes a warning, and is
+    announced once.
+- **How it runs.** The checks use a read-only session (`LAYER_QUALITY_DATABASE_URL`, else
+  the job's `DATABASE_URL`). The history is written on its own session, apart from the
+  administrator's transaction. It all runs within a hard 45-second limit, with 30
+  seconds for the daily pass. Whatever is unfinished is recorded as `unavailable`.
+- **Switching on** is one approved step, in two parts:
+  1. Apply 072 with `bootstrap_postgres.py --only-migration 072_quality_check_results.sql`.
+     This also gives the approval login one column of each counted table and
+     SELECT and INSERT on the history.
+  2. Set `layerQualityMode=shadow` in `infra/staging-autonomous-admin.bicep`.
+
+  Without 072 the checks still run and log, but nothing is recorded, and the daily pass
+  runs only in the 10:30 to 10:35 window.
+- **Caveats.**
+  - The contracts (`infra/medallion/contracts`) are not in the image, so in Azure the
+    schema and rule checks report `unavailable` until they ship or
+    `LAYER_QUALITY_CONTRACTS_DIR` points at them.
+  - The approval login cannot read the tables behind 94 of the 181 rules. Those rules
+    are `unavailable`, which is never a finding.
+- **Publish gate.** It records the rules it runs with `layer_quality.record(...,
+  source="publish_gate")` and `rule_check_id()` ids. The monitor then skips those rules
+  that day, and the report lists the gate's failures alongside the monitor's.
+- `python -m ibkr_etl.layer_quality` prints a dry run (readiness and the daily pass, now)
+  and records nothing.
+
 ## Release data report
 
 A release that touches silver or gold runs its jobs on a restored copy first, and

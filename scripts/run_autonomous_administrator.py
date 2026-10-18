@@ -25,18 +25,21 @@ from ibkr_etl.admin_actions import (  # noqa: E402
 )
 from ibkr_etl.admin_chat import SYSTEM_UPDATES_SOURCE_KEY  # noqa: E402
 from ibkr_etl.ai_analyst import AIAnalystConfig, AIAnalystError  # noqa: E402
-from ibkr_etl import layer_freshness  # noqa: E402
+from ibkr_etl import layer_freshness, layer_quality  # noqa: E402
 from ibkr_etl.autonomous_admin import (  # noqa: E402
     LAYER_FRESHNESS_PREFIX,
+    LAYER_QUALITY_PREFIX,
     AutonomyControl,
     LayerFreshnessReview,
     ROLLBACK_ACTION,
     RecoveryContext,
     authority_review_current,
+    combine_reviews,
     diagnose_findings,
     evaluate_supervisor_state,
     plan_safe_repairs,
     review_layer_freshness,
+    review_layer_quality,
 )
 from ibkr_etl.burn_in import collect_import_state, now_hkt_date, portal_boundary_check  # noqa: E402
 from ibkr_etl.ops_agent_posts import post_connection_reports, post_new_diagnoses  # noqa: E402
@@ -289,9 +292,10 @@ def _recovery_context(
     )
 
 
-def _open_layer_freshness_incidents(connection) -> dict[str, dict]:
-    """Open layer_freshness incidents with their severity and evidence. Runs under a
-    savepoint so a failure here cannot abort the supervisor's transaction."""
+def _open_layer_freshness_incidents(connection, prefix: str = LAYER_FRESHNESS_PREFIX) -> dict[str, dict]:
+    """Open incidents whose key starts with `prefix` (layer_freshness by default), with their
+    severity and evidence. Runs under a savepoint so a failure here cannot abort the
+    supervisor's transaction."""
     try:
         with connection.transaction():
             rows = connection.execute(
@@ -299,7 +303,7 @@ def _open_layer_freshness_incidents(connection) -> dict[str, dict]:
                 SELECT incident_key, severity, evidence_json FROM system_incidents
                 WHERE status IN ('open', 'acknowledged') AND starts_with(incident_key, %s)
                 """,
-                (LAYER_FRESHNESS_PREFIX,),
+                (prefix,),
             ).fetchall()
     except Exception:  # noqa: BLE001
         return {}
@@ -314,11 +318,13 @@ def _open_layer_freshness_incidents(connection) -> dict[str, dict]:
 
 
 def _layer_freshness_review(
-    connection, database_url: str, tenant_id: str, *, now: datetime | None = None
+    connection, database_url: str, tenant_id: str, *, now: datetime | None = None,
+    results_out: list | None = None,
 ) -> LayerFreshnessReview | None:
     """Medallion layer freshness, off (None) unless LAYER_FRESHNESS_ENABLED. Reads on
     its own read-only session, by default as this job's DATABASE_URL. Never raises: a
-    failed check is reported as unreadable and holds its incidents open."""
+    failed check is reported as unreadable and holds its incidents open. The results
+    are added to `results_out`, for layer quality's readiness."""
     if not layer_freshness.enabled():
         return None
     now = now or datetime.now(timezone.utc)
@@ -332,8 +338,39 @@ def _layer_freshness_review(
         print("LAYER_FRESHNESS " + canonical_json({"status": "failed", "error_code": type(error).__name__}),
               flush=True)
         results = None
+    if results is not None and results_out is not None:
+        results_out.extend(results)
     try:
         return review_layer_freshness(results, now=now, open_incidents=open_incidents)
+    except Exception:  # noqa: BLE001
+        return LayerFreshnessReview(hold_open=frozenset(open_incidents))
+
+
+def _layer_quality_review(
+    connection, database_url: str, tenant_id: str, *, now: datetime | None = None,
+    freshness_results: list | None = None,
+) -> LayerFreshnessReview | None:
+    """Medallion layer quality, off (None, with no query and no log line) unless
+    LAYER_QUALITY_MODE is shadow or warn. Measures on its own sessions within a hard time
+    limit and records its history on its own connection, never in this transaction.
+    Never raises; shadow findings are info, recorded quietly."""
+    selected, note = layer_quality.mode()
+    if selected == layer_quality.OFF:
+        return None
+    now = now or datetime.now(timezone.utc)
+    open_incidents = _open_layer_freshness_incidents(connection, LAYER_QUALITY_PREFIX)
+    try:
+        outcome = layer_quality.run_in_administrator(
+            database_url, tenant_id, now=now, mode_name=selected, mode_note=note,
+            freshness=freshness_results or None,
+        )
+        print(layer_quality.LOG_PREFIX + canonical_json(layer_quality.summary(outcome)), flush=True)
+    except Exception as error:  # noqa: BLE001
+        print(layer_quality.LOG_PREFIX + canonical_json({"status": "failed", "error_code": type(error).__name__}),
+              flush=True)
+        outcome = None
+    try:
+        return review_layer_quality(outcome, warn=selected == layer_quality.WARN, open_incidents=open_incidents)
     except Exception:  # noqa: BLE001
         return LayerFreshnessReview(hold_open=frozenset(open_incidents))
 
@@ -402,8 +439,9 @@ def _synchronize(
     connection, findings, now_iso: str, freshness: LayerFreshnessReview | None
 ) -> tuple[dict[str, int], set[str]]:
     """Record findings as incidents. Returns incident ids and the keys to announce.
-    With layer freshness on, incidents it holds stay open, its info findings are
-    recorded quietly, and one that turns into a warning is announced."""
+    With layer freshness or layer quality on (`freshness` is their combined review),
+    incidents they hold stay open, their info findings are recorded quietly, and one
+    that turns into a warning is announced."""
     if freshness is None:
         return _sync_incidents(connection, findings, now_iso)
     incident_ids, new_keys = _sync_incidents(connection, findings, now_iso, hold_open=freshness.hold_open)
@@ -611,7 +649,13 @@ def main() -> int:
             now_utc=datetime.now(timezone.utc),
         )
         stage = "check_layer_freshness"
-        freshness = _layer_freshness_review(connection, database_url, tenant_id)
+        freshness_results: list = []
+        freshness = _layer_freshness_review(connection, database_url, tenant_id, results_out=freshness_results)
+        stage = "check_layer_quality"
+        freshness = combine_reviews(
+            freshness,
+            _layer_quality_review(connection, database_url, tenant_id, freshness_results=freshness_results),
+        )
         if freshness is not None and freshness.findings:
             findings = sorted(
                 [*findings, *freshness.findings],

@@ -567,6 +567,12 @@
    "layer": "ops",
    "target_schema": "public"
   },
+  "public.quality_check_results": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Layer quality history: readiness, freshness, row counts, schema drift, value checks and contract rules, one row per result. Append-only."
+  },
   "public.raw_reports": {
    "kind": "table",
    "layer": "bronze",

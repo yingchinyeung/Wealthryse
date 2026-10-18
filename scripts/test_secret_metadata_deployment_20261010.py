@@ -10,10 +10,15 @@ class MetadataDeploymentTests(unittest.TestCase):
         self.identity={'properties':{'clientId':'00000000-0000-0000-0000-000000000001','principalId':'00000000-0000-0000-0000-000000000002'}}
     def test_exact_metadata_grants(self):
         roles=c.roles(self.identity['properties']['principalId'])
-        self.assertEqual(len(roles),4)
-        self.assertEqual(sum(x['body']['properties']['roleDefinitionId'].endswith(c.READER) for x in roles),3)
+        self.assertEqual(len(roles),3)
+        self.assertEqual(sum(x['body']['properties']['roleDefinitionId'].endswith(c.READER) for x in roles),2)
         self.assertEqual(sum(x['body']['properties']['roleDefinitionId'].endswith(c.PULL) for x in roles),1)
         self.assertTrue(all('/providers/Microsoft.KeyVault/vaults/' in x['scope'] or x['scope']==c.REGISTRY for x in roles))
+        # The two v2 vaults; v1.1's vault was deleted on 21 Oct 2026. The alert expects exactly these.
+        self.assertEqual(c.monitor.VAULTS,('ibkrv2flexauhecwc4ita','ibkrv2stg-auhecwc4itaoo'))
+        q=a.query();count=len(c.monitor.VAULTS)
+        self.assertIn('toint(E.vault_count) != '+str(count)+' or array_length(E.vaults) != '+str(count)+' or',q)
+        self.assertIn('pack_array('+','.join('tostring(E.vaults['+str(i)+'].vault)' for i in range(count))+')',q)
     def test_grants_deterministic(self):self.assertEqual(c.roles('a'),c.roles('a'))
     def test_manual_before_acceptance(self):self.assertEqual(c.body(self.identity)['properties']['configuration']['triggerType'],'Manual')
     def test_schedule(self):self.assertEqual(c.body(self.identity,True)['properties']['configuration']['scheduleTriggerConfig']['cronExpression'],'15 6 * * *')

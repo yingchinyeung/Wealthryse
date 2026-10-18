@@ -20,9 +20,9 @@ def query(source='ContainerAppConsoleLogs_CL'):
 | top 1 by TimeGenerated desc;
 union
 (Latest
-| extend Stamp=todatetime(E.checked_at), MissingVaults=set_difference(dynamic(VAULTS), pack_array(tostring(E.vaults[0].vault),tostring(E.vaults[1].vault),tostring(E.vaults[2].vault)))
+| extend Stamp=todatetime(E.checked_at), MissingVaults=set_difference(dynamic(VAULTS), pack_array(tostring(E.vaults[0].vault),tostring(E.vaults[1].vault)))
 | extend Invalid=isempty(tostring(E.schema)) or tostring(E.schema) != 'wealthryse-secret-metadata-v1' or tostring(E.version) != '20261010-v1'
-    or tostring(E.kind) != 'complete' or isnull(toint(E.vault_count)) or toint(E.vault_count) != 3 or array_length(E.vaults) != 3 or array_length(MissingVaults) != 0
+    or tostring(E.kind) != 'complete' or isnull(toint(E.vault_count)) or toint(E.vault_count) != 2 or array_length(E.vaults) != 2 or array_length(MissingVaults) != 0
     or isnull(Stamp) or Stamp > now()+5m or TimeGenerated > now()+5m
     or isnull(toint(E.secret_values_read)) or toint(E.secret_values_read) != 0
     or isnull(toint(E.secret_values_changed)) or toint(E.secret_values_changed) != 0
@@ -61,7 +61,7 @@ def verify(live):
 
 
 def cases():
-    now=datetime.now(timezone.utc);base={'schema':c.monitor.SCHEMA,'version':c.monitor.VERSION,'checked_at':now.isoformat(),'kind':'complete','vault_count':3,
+    now=datetime.now(timezone.utc);base={'schema':c.monitor.SCHEMA,'version':c.monitor.VERSION,'checked_at':now.isoformat(),'kind':'complete','vault_count':len(c.monitor.VAULTS),
         'vaults':[{'vault':v} for v in c.monitor.VAULTS],'errors':[],'finding_count':0,'secret_values_read':0,'secret_values_changed':0,'expiry_changes':0,'permissions_changed':0}
     yield 'healthy',base,now,0
     yield 'empty',None,now,1
@@ -69,8 +69,8 @@ def cases():
     yield 'stale_payload_recent_ingestion',dict(base,checked_at=(now-timedelta(hours=27)).isoformat()),now,1
     yield 'future',dict(base,checked_at=(now+timedelta(hours=1)).isoformat()),now,1
     yield 'findings',dict(base,finding_count=2),now,1
-    yield 'partial',dict(base,vault_count=2,vaults=base['vaults'][:2]),now,1
-    yield 'wrong_vault',dict(base,vaults=[{'vault':'other'}]*3),now,1
+    yield 'partial',dict(base,vault_count=1,vaults=base['vaults'][:1]),now,1
+    yield 'wrong_vault',dict(base,vaults=[{'vault':'other'}]*len(c.monitor.VAULTS)),now,1
     yield 'failed',dict(base,kind='failed',errors=[{'error_type':'RuntimeError'}]),now,1
     yield 'malformed',{'schema':'invalid'},now,1
     for key in ('schema','version','checked_at','vault_count','vaults','errors','finding_count','secret_values_read','secret_values_changed','expiry_changes','permissions_changed'):

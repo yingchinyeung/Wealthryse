@@ -402,6 +402,12 @@ class _PageCase:
                                             pages.register.figure(key[0]).unit), key)
         self.assertEqual(self.calls, [None])
 
+    def test_on_with_matching_figures_adds_only_the_marker(self):
+        today = self.make(None)
+        shown = self.serve(self.on_setting, FakeView(certified_rows(self.ENDPOINT, today)))
+        self.assertIn("certified", shown)
+        self.assertEqual({key: value for key, value in shown.items() if key != "certified"}, today)
+
     def test_on_when_held_back_shows_the_last_published_with_a_note(self):
         earlier = self.make(EARLIER)
         view = FakeView(certified_rows(self.ENDPOINT, earlier, as_of=EARLIER))
@@ -483,6 +489,28 @@ class SettingTests(unittest.TestCase):
                 for figure_id in group.figure_ids:
                     owner = pages.register.figure(figure_id).page
                     self.assertIn(owner, {group.page, pages.BORROWS.get(group.page)}, (endpoint, figure_id))
+
+
+class ExtraRowsTests(unittest.TestCase):
+    def shadow(self, endpoint, rows, setting):
+        make = ANSWERS[endpoint][0]
+        with patch.object(pages, "_connect", FakeView(rows).connect), \
+                self.assertLogs(LOGGER, level="INFO") as captured:
+            pages.serve(endpoint, tenant_id=TENANT, subject_id=SUBJECT, requested_as_of=None, build=make,
+                        environ={SETTING: setting})
+        return _log_lines(captured)[0]
+
+    def test_a_certified_holding_the_page_does_not_have_is_counted(self):
+        rows = certified_rows("holdings", _holdings(None))
+        rows.append({**next(row for row in rows if row["figure_id"] == "holdings.quantity"), "item": "4004"})
+        line = self.shadow("holdings", rows, "holdings=shadow")
+        self.assertEqual((line["status"], line["extra"]), ("differ", {"holdings.quantity": 1}))
+
+    def test_contributors_beyond_the_top_and_bottom_five_are_not_extra(self):
+        rows = certified_rows("risk-details", _risk_details(None))
+        rows.append({**next(row for row in rows if row["figure_id"] == "risk.etl_contribution"), "item": "4004"})
+        line = self.shadow("risk-details", rows, "risk-snapshot=shadow")
+        self.assertEqual((line["status"], line["extra"]), ("match", {}))
 
 
 class ReaderTests(unittest.TestCase):

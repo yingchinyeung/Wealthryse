@@ -36,55 +36,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Mapping
 
-try:
-    from . import certified_figures as register
-except ImportError:  # TEMPORARY until medallion-certified-core's register module is merged
-    import re as _re
-    from datetime import timedelta as _timedelta
-    from pathlib import Path as _Path
-    from types import SimpleNamespace as _Namespace
-
-    def _shim_register():
-        raw = json.loads((_Path(__file__).resolve().parents[2] / "infra" / "medallion"
-                          / "certified-figures.json").read_text(encoding="utf-8"))
-        patterns = {"mtd": r"mtd", "qtd": r"qtd", "ytd": r"ytd", "since_inception": r"since_inception",
-                    "year_YYYY": r"year_\d{4}", "month_YYYY-MM": r"month_\d{4}-(0[1-9]|1[0-2])"}
-
-        def figure(figure_id):
-            item = raw["figures"][figure_id]
-            return _Namespace(id=figure_id, unit=item["unit"], kind=item["kind"], page=item["page"],
-                              periods=tuple(item.get("periods", ())))
-
-        def period_allowed(item, period):
-            if item.kind != "per_period":
-                return period in ("", None)
-            return any(_re.fullmatch(patterns[name], str(period or "")) for name in item.periods)
-
-        def page_modes(text):
-            modes = {name: "off" for name in raw["pages"]}
-            for part in str(text or "").split(","):
-                name, _, mode = part.partition("=")
-                name, mode = name.strip().lower(), mode.strip().lower()
-                if name in modes and mode in ("off", "shadow", "on"):
-                    modes[name] = mode
-            return modes
-
-        def freshness(as_of, latest, *, reason=None):
-            as_of = date.fromisoformat(str(as_of)[:10])
-            latest = as_of if latest is None else date.fromisoformat(str(latest)[:10])
-            behind, current = 0, as_of
-            while current < latest:
-                current += _timedelta(days=1)
-                behind += current.weekday() < 5
-            status = "fresh" if latest <= as_of else "late" if behind > 4 else "behind"
-            return {"status": status, "latest_data_date": latest.isoformat(), "business_days_behind": behind,
-                    "promise": "daily by 10:00 UTC, at most 4 days behind"}
-
-        return _Namespace(PAGES_SETTING="CERTIFIED_FIGURES_PAGES", figure=figure, figures=lambda: {
-            name: figure(name) for name in raw["figures"]}, period_allowed=period_allowed,
-            page_modes=page_modes, freshness=freshness)
-
-    register = _shim_register()
+from . import certified_figures as register
 
 # uvicorn's logger is the one the website's container logs show at INFO.
 LOGGER = logging.getLogger("uvicorn.error.certified_figures")
@@ -602,16 +554,20 @@ def combined_block(blocks: list[dict]) -> dict:
 
 def _overlay(spec: Endpoint, payload: dict, used: list[tuple[Group, Certified]]) -> int:
     """Write certified values into the answer's own fields; returns how many were written."""
-    planned = []
+    planned, count = [], 0
     for slot in spec.slots(payload):
         if not slot.write:
             continue
         for group, certified in used:
             if slot.key[0] in group.figure_ids and slot.key in certified.values:
-                planned.append((slot, slot.converted(certified.values[slot.key])))
+                value = certified.values[slot.key]
+                count += 1
+                # Decimal text keeps today's spelling ("1250.50") when the number is the same.
+                if not (slot.kind == "decimal_text" and value is not None and slot.get() == float(value)):
+                    planned.append((slot, slot.converted(value)))
     for slot, value in planned:  # every conversion has worked before anything is written
         slot.holder[slot.field] = value
-    return len(planned)
+    return count
 
 
 def serve(endpoint: str, *, tenant_id: str, subject_id: str, requested_as_of: str | None,

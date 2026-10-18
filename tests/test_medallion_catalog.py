@@ -30,18 +30,34 @@ def _catalog() -> dict:
     return json.loads(CATALOG.read_text(encoding="utf-8"))
 
 
-def _migration_objects() -> dict[str, str]:
-    """Qualified name -> 'table' or 'view' for everything the migrations create."""
+def _created(path: Path, schema: str) -> dict[str, str]:
+    """Qualified name -> 'table' or 'view' for everything one SQL file creates."""
+    found = {}
+    for kind, name in CREATE.findall(path.read_text(encoding="utf-8")):
+        name = name.lower()
+        if name.endswith("."):
+            continue  # a format() placeholder in dynamic SQL, e.g. public.%I
+        if "." not in name:
+            name = f"{schema}.{name}"
+        found.setdefault(name, "view" if "VIEW" in kind.upper() else "table")
+    return found
+
+
+def _held_files() -> list[str]:
+    """Held migrations: kept outside migrations/ until their approved day (an entry's "held")."""
+    return sorted({entry["held"] for entry in _catalog()["postgres"].values() if entry.get("held")})
+
+
+def _migration_objects(*, held: bool = True) -> dict[str, str]:
+    """Qualified name -> 'table' or 'view' for everything the migrations (and held migrations) create."""
     found = {}
     for folder, schema in (("postgres", "public"), ("agent", "agent")):
         for path in sorted((MIGRATIONS / folder).glob("*.sql")):
-            for kind, name in CREATE.findall(path.read_text(encoding="utf-8")):
-                name = name.lower()
-                if name.endswith("."):
-                    continue  # a format() placeholder in dynamic SQL, e.g. public.%I
-                if "." not in name:
-                    name = f"{schema}.{name}"
-                found.setdefault(name, "view" if "VIEW" in kind.upper() else "table")
+            for name, kind in _created(path, schema).items():
+                found.setdefault(name, kind)
+    for name in _held_files() if held else ():
+        for key, kind in _created(ROOT / name, "public").items():
+            found.setdefault(key, kind)
     return found
 
 
@@ -79,6 +95,19 @@ class MedallionCatalogTest(unittest.TestCase):
         catalog = _catalog()["postgres"]
         for name, kind in _migration_objects().items():
             self.assertEqual(catalog[name]["kind"], kind, name)
+
+    def test_held_entries_name_a_held_migration_that_creates_them(self):
+        """A held migration lives outside migrations/; when it moves there, its entries lose "held"."""
+        in_migrations = _migration_objects(held=False)
+        for name, entry in _catalog()["postgres"].items():
+            if not entry.get("held"):
+                continue
+            with self.subTest(name):
+                path = ROOT / entry["held"]
+                self.assertTrue(path.is_file(), entry["held"])
+                self.assertNotIn("migrations", path.relative_to(ROOT).parts)
+                self.assertIn(name, _created(path, "public"))
+                self.assertNotIn(name, in_migrations, "it is in migrations/ now: remove \"held\"")
 
     def test_layers_and_target_schemas_are_consistent(self):
         catalog = _catalog()

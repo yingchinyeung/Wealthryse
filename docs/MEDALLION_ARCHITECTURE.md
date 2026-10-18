@@ -172,8 +172,10 @@ finds stops a job or holds back publication. Only the publish gate does that.
   - A jump (over twice the typical count, plus two) is a warning, for the report only,
     such as the month-end jump. Event tables (trades, cash and FX transactions,
     corporate actions, derived ledger and exclusions) are recorded, not judged.
-  - The value checks need 10 dates per subject. Positions to zero applies only to
-    subjects that held positions on at least 80% of their NAV dates.
+  - The value checks need 10 dates per subject, and skip a subject with no NAV for a
+    week, such as a closed account.
+  - Positions to zero applies only to subjects that held positions on at least 80% of
+    their NAV dates. It is reported once, on the day positions drop to zero.
   - A NAV move is a warning: it can be a deposit or a withdrawal.
 - **History.** One row per result in `quality_check_results` (migration 072): readiness,
   freshness, counts, schema, value and rule results. The table is append-only and kept

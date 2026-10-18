@@ -320,8 +320,9 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         from psycopg.rows import dict_row
 
         supervisor = layers._script("run_autonomous_administrator")
-        # Saturday 24 Oct 2026: Friday's data is due by the target times and never arrived.
-        saturday = datetime(2026, 10, 24, 10, 31, tzinfo=timezone.utc)
+        # Thursday 22 Oct 2026: Wednesday's data is due by the target times and never arrived. The
+        # newest NAV (15 Oct) is still within a week, so the value checks judge it again.
+        thursday = datetime(2026, 10, 22, 10, 31, tzinfo=timezone.utc)
         late = {"layer_quality:bronze.ready", "layer_quality:silver.ready", "layer_quality:gold.ready"}
         failed = {"layer_quality:value.nav_move", "layer_quality:value.positions_to_zero"}
         with psycopg.connect(layers._dsn(self.database, OWNER), row_factory=dict_row) as admin:
@@ -340,8 +341,8 @@ class LayerQualityDatabaseTests(unittest.TestCase):
                 rows = admin.execute("SELECT incident_key, severity, status FROM system_incidents").fetchall()
                 return announce, lines, {r["incident_key"]: (r["severity"], r["status"]) for r in rows}
 
-            self.assertEqual(run(saturday, "off"), (None, [], {}))
-            announce, lines, incidents = run(saturday, "shadow")
+            self.assertEqual(run(thursday, "off"), (None, [], {}))
+            announce, lines, incidents = run(thursday, "shadow")
             self.assertEqual(announce, set())  # shadow: recorded, never announced
             self.assertEqual(incidents, {key: ("info", "open") for key in late | failed})
             self.assertEqual(len(lines), 1)
@@ -349,11 +350,11 @@ class LayerQualityDatabaseTests(unittest.TestCase):
             self.assertNotIn("***", lines[0])
             self.assertNotIn("U91", lines[0])
             # Five minutes later, still late and no daily pass: everything stays open, quietly.
-            announce, _, incidents = run(saturday + timedelta(minutes=5), "shadow")
+            announce, _, incidents = run(thursday + timedelta(minutes=5), "shadow")
             self.assertEqual((announce, incidents), (set(), {key: ("info", "open") for key in late | failed}))
             # Warn mode: a late layer becomes a warning and is announced once; the value
             # incidents stay info until the next daily pass.
-            announce, _, incidents = run(saturday + timedelta(minutes=10), "warn")
+            announce, _, incidents = run(thursday + timedelta(minutes=10), "warn")
             self.assertEqual(announce, late)
             self.assertEqual({k: v[0] for k, v in incidents.items()},
                              {**{k: "warning" for k in late}, **{k: "info" for k in failed}})

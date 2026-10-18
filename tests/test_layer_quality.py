@@ -276,15 +276,26 @@ class ValueTests(unittest.TestCase):
         to_zero = [{"subject_id": "P1", "currency": "USD", "dates": 30, "newest": "0", "previous": "100",
                     "newest_date": "2026-10-16", "previous_date": "2026-10-15"}]
         self.assertEqual(judge_nav_moves(to_zero)["observed"], 1)
+        # A closed account's last move is not reported again once its NAV is a week old.
+        self.assertEqual(judge_nav_moves(rows, today=date(2026, 10, 23))["state"], "fail")
+        stale = judge_nav_moves(rows, today=date(2026, 10, 24))
+        self.assertEqual((stale["state"], stale["detail"]["subjects_stale"]), ("learning", 3))
 
     def test_positions_dropping_to_zero(self):
         established = {"subject_id": "U9100001", "nav_date": "2026-10-16", "positions": 0, "earlier_nav_dates": 25,
-                       "held_nav_dates": 25, "last_held": "2026-10-15"}
-        result = judge_positions([established])
+                       "held_nav_dates": 25, "last_held": "2026-10-15", "previous_nav_date": "2026-10-15"}
+        result = judge_positions([established], today=date(2026, 10, 17))
         self.assertEqual((result["state"], result["severity"]), ("fail", "error"))
         self.assertEqual(result["detail"]["failed"][0], {"subject": "***001", "nav_date": "2026-10-16",
                                                          "last_held": "2026-10-15"})
         self.assertEqual(judge_positions([{**established, "positions": 12}])["state"], "pass")
+        # Reported once: the next day it held none the day before either (sold out, or closed).
+        next_day = {**established, "nav_date": "2026-10-19", "previous_nav_date": "2026-10-16",
+                    "earlier_nav_dates": 26}
+        self.assertEqual(judge_positions([next_day])["state"], "pass")
+        # A subject with no NAV for over a week is not judged again.
+        stale = judge_positions([established], today=date(2026, 10, 24))
+        self.assertEqual((stale["state"], stale["detail"]["subjects_stale"]), ("learning", 1))
         # In onboarding, or positions only on some NAV dates (NAV on weekends): not judged.
         onboarding = {**established, "earlier_nav_dates": 3, "held_nav_dates": 3}
         weekends = {**established, "earlier_nav_dates": 35, "held_nav_dates": 25}

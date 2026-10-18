@@ -247,9 +247,14 @@ SELECT n.subject_id, n.nav_date,
        (SELECT count(*) FROM nav d JOIN held h ON h.subject_id = d.subject_id AND h.snapshot_date = d.snapshot_date
          WHERE d.subject_id = n.subject_id AND d.snapshot_date < n.nav_date AND h.positions > 0) AS held_nav_dates,
        (SELECT max(h.snapshot_date) FROM held h WHERE h.subject_id = n.subject_id AND h.positions > 0
-          AND h.snapshot_date < n.nav_date) AS last_held
+          AND h.snapshot_date < n.nav_date) AS last_held,
+       (SELECT max(d.snapshot_date) FROM nav d WHERE d.subject_id = n.subject_id AND d.snapshot_date < n.nav_date)
+           AS previous_nav_date
 FROM newest n ORDER BY n.subject_id"""
 HELD_SHARE = 0.8  # positions normally exist on at least this share of a subject's NAV dates
+# A subject with no NAV for a week (a closed account) is not judged, so an old move or drop
+# is not reported again every day.
+STALE_AFTER_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -398,14 +403,27 @@ def mask(subject: Any) -> str:
     return "***" + text[-3:]
 
 
-def judge_nav_moves(rows: Iterable[Mapping[str, Any]], *, band: Decimal = NAV_BAND) -> dict[str, Any]:
+def _stale(newest: Any, today: date | None) -> bool:
+    if today is None or newest is None:
+        return False
+    try:
+        return date.fromisoformat(str(newest)[:10]) < today - timedelta(days=STALE_AFTER_DAYS)
+    except ValueError:
+        return True
+
+
+def judge_nav_moves(rows: Iterable[Mapping[str, Any]], *, band: Decimal = NAV_BAND,
+                    today: date | None = None) -> dict[str, Any]:
     """Day-on-day NAV moves beyond the band. Deposits and withdrawals move NAV too, so this is a
     warning for the weekly report, never an error."""
     check = VALUE_CHECKS[0]
-    failed, checked, learning = [], 0, 0
+    failed, checked, learning, stale = [], 0, 0, 0
     for row in rows:
         newest, previous = _decimal(row.get("newest")), _decimal(row.get("previous"))
         if newest is None or previous is None or row.get("previous_date") is None:
+            continue
+        if _stale(row.get("newest_date"), today):
+            stale += 1
             continue
         if int(row.get("dates") or 0) < MIN_VALUE_HISTORY:
             learning += 1
@@ -425,31 +443,36 @@ def judge_nav_moves(rows: Iterable[Mapping[str, Any]], *, band: Decimal = NAV_BA
                            "move_pct": None if move is None else float(round(move * 100, 1))})
     state = "fail" if failed else "pass" if checked else "learning"
     return _result(check.check_id, "value", check.layer, check.target, state,
-                   severity="warning" if failed else None, observed=len(failed),
-                   subjects_checked=checked, subjects_learning=learning, band=float(band), failed=failed)
+                   severity="warning" if failed else None, observed=len(failed), subjects_checked=checked,
+                   subjects_learning=learning, subjects_stale=stale, band=float(band), failed=failed)
 
 
-def judge_positions(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
-    """A subject that holds positions on its NAV dates, and holds none on its newest NAV date.
-    Judged only for subjects with MIN_VALUE_HISTORY such dates (not new or in onboarding) whose
-    positions exist on most NAV dates (not NAV-only dates such as weekends)."""
+def judge_positions(rows: Iterable[Mapping[str, Any]], *, today: date | None = None) -> dict[str, Any]:
+    """A subject that held positions on its previous NAV date and holds none on its newest one:
+    reported once, the day it happens. Judged only for subjects with MIN_VALUE_HISTORY such dates
+    (not new or in onboarding) whose positions exist on most NAV dates (not NAV-only dates such
+    as weekends)."""
     check = VALUE_CHECKS[1]
-    failed, checked, learning = [], 0, 0
+    failed, checked, learning, stale = [], 0, 0, 0
     for row in rows:
         if row.get("nav_date") is None:
+            continue
+        if _stale(row.get("nav_date"), today):
+            stale += 1
             continue
         held, earlier = int(row.get("held_nav_dates") or 0), int(row.get("earlier_nav_dates") or 0)
         if held < MIN_VALUE_HISTORY or held < HELD_SHARE * earlier:
             learning += 1
             continue
         checked += 1
-        if int(row.get("positions") or 0) == 0:
+        dropped = row.get("last_held") is not None and str(row.get("last_held")) == str(row.get("previous_nav_date"))
+        if int(row.get("positions") or 0) == 0 and dropped:
             failed.append({"subject": mask(row.get("subject_id")), "nav_date": str(row["nav_date"]),
                            "last_held": None if row.get("last_held") is None else str(row["last_held"])})
     state = "fail" if failed else "pass" if checked else "learning"
     return _result(check.check_id, "value", check.layer, check.target, state,
                    severity="error" if failed else None, observed=len(failed), subjects_checked=checked,
-                   subjects_learning=learning, failed=failed)
+                   subjects_learning=learning, subjects_stale=stale, failed=failed)
 
 
 def judge_schema(contract: Mapping, actual: Mapping | None) -> dict[str, Any]:
@@ -696,9 +719,9 @@ def measure_daily(connection: Any, pass_plan: Plan, *, now: datetime, results: l
 
     nav, positions = VALUE_CHECKS
     attempt(nav.check_id, "value", nav.layer, nav.target,
-            lambda: judge_nav_moves(_rows(connection, NAV_MOVE_SQL, (value_since,))))
+            lambda: judge_nav_moves(_rows(connection, NAV_MOVE_SQL, (value_since,)), today=today))
     attempt(positions.check_id, "value", positions.layer, positions.target,
-            lambda: judge_positions(_rows(connection, POSITIONS_SQL, (value_since, value_since))))
+            lambda: judge_positions(_rows(connection, POSITIONS_SQL, (value_since, value_since)), today=today))
 
     if pass_plan.contracts_error:
         for kind in ("schema", "rule"):

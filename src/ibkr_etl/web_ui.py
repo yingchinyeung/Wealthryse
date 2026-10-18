@@ -60,7 +60,19 @@ const signedMoney=n=>{const text=money(n);return text!=='—'&&Number(n)>0?'+'+t
 const toned=(text,n)=>{const cls=tone(n);return cls?`<span class="${cls}">${text}</span>`:text};
 """
 
-ACCOUNT_UI_SCRIPT = _NUMBER_HELPERS + r"""
+# The "Certified · as of" line under a card whose figures come from certified figures
+# (CERTIFIED_FIGURES_PAGES). An answer without a certified block clears the line, so with
+# the setting off nothing is shown.
+CERTIFIED_LINE_SCRIPT = r"""
+function certifiedLine(target,c){const card=target&&target.closest?(target.closest('.card')||target):null;if(!card)return;let line=card.querySelector(':scope > .certified-line');
+if(!c){if(line)line.remove();return}
+const safe=t=>String(t??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+if(!line){line=document.createElement('div');line.className='muted certified-line';line.style.cssText='margin-top:10px;font-size:12px';card.appendChild(line)}
+line.innerHTML=`${safe(c.label)}${c.note?' · <strong>'+safe(c.note)+'</strong>':''} · <a href="${safe(c.link||'/metrics-guide')}">how this is worked out</a>`}
+const certifiedFor=(c,page)=>c&&(c.pages||[]).includes(page)?c:null;
+"""
+
+ACCOUNT_UI_SCRIPT = _NUMBER_HELPERS + CERTIFIED_LINE_SCRIPT + r"""
 const weightBar=w=>w==null||!Number.isFinite(Number(w))?'—':`<span class="weight-cell"><span class="weight-bar" style="width:${Math.max(2,Math.min(48,Math.abs(Number(w))*48/0.25)).toFixed(1)}px"></span>${esc(weightPct(w))}</span>`;
 const rsiReasons={insufficient_history:'Fewer than 15 daily marks since this position was opened, or since its last split or reopening',no_current_mark:'No mark price on the holdings date'};
 const rsiCell=x=>x.holding_kind==='synthetic_exposure'?'—':x.rsi==null?`<span class="muted" title="${esc(rsiReasons[x.rsi_reason]||'RSI is unavailable')}">—</span>`:`${Number(x.rsi).toFixed(1)}${x.rsi_signal==='overbought'?'<span class="rsi-flag" title="RSI above 70">Overbought</span>':x.rsi_signal==='oversold'?'<span class="rsi-flag" title="RSI below 30">Oversold</span>':''}`;
@@ -83,7 +95,7 @@ const renderSectors=async asOf=>{
   const bars=document.querySelector('#sector-bars'),summary=document.querySelector('#sector-summary'),note=document.querySelector('#sector-note'),detail=document.querySelector('#sector-detail');
   if(!bars)return;bars.innerHTML='<div class="skeleton-line"></div><div class="skeleton-line"></div><div class="skeleton-line"></div>';summary.textContent='';note.textContent='';detail.innerHTML='';
   try{
-    const s=await loadSectors(asOf),items=s.allocation||[];
+    const s=await loadSectors(asOf),items=s.allocation||[];certifiedLine(bars,s.certified);
     if(!items.length){bars.innerHTML=`<div class="empty">${esc(s.reason||'No sector data is available for this date.')}</div>`;return}
     bars.innerHTML=sectorBars(items);
     const coverage=Number(s.classification_coverage_pct);
@@ -101,6 +113,7 @@ const sparkline=(svg,series)=>{
 const renderOverview=async(asOf,s)=>{
   const returns=document.querySelector('#overview-returns');if(!returns)return;
   document.querySelector('#overview-asof').textContent=`As of ${s.effective_as_of||asOf} · ${s.latest_nav.currency} reporting`;
+  certifiedLine(document.querySelector('#overview-asof'),s.certified);
   const holdingsList=document.querySelector('#overview-holdings'),sectorList=document.querySelector('#overview-sectors');
   const params=new URLSearchParams({as_of:asOf,start:asOf,end:asOf});
   const [periods,series,holdings,sectors]=await Promise.allSettled([
@@ -122,13 +135,16 @@ const renderOverview=async(asOf,s)=>{
       tile('Net flows this year',ok(ytd)&&r.flows_applicable!==false?(Number(ytd.net_flows)>0?'+':'')+compactMoney(ytd.net_flows):'—',undefined,r.flows_applicable===false?'not applicable':esc(r.currency||''),'metric-net-external-flows')
     ].join('');
   }else returns.innerHTML='<div class="empty">Period returns are unavailable for this date.</div>';
+  certifiedLine(returns,periods.status==='fulfilled'?periods.value.certified:null);
   if(series.status==='fulfilled')sparkline(document.querySelector('#overview-spark'),series.value.series||[]);
   if(holdings.status==='fulfilled'){
     const top=(holdings.value.holdings||[]).filter(x=>x.weight!=null).sort((a,b)=>Math.abs(b.weight)-Math.abs(a.weight)).slice(0,5);
     holdingsList.innerHTML=top.map(x=>`<div class="sector-row"><span class="sector-name"><strong>${esc(x.symbol||x.conid)}</strong> <span class="muted">${esc(x.description||'')}</span></span><span class="sector-track" aria-hidden="true"><span class="sector-fill" style="width:${(100*Math.abs(x.weight)/Math.abs(top[0].weight)).toFixed(1)}%"></span></span><span class="sector-weight">${esc(weightPct(x.weight))}</span></div>`).join('')||'<div class="empty">No holdings on this date.</div>';
   }else holdingsList.innerHTML='<div class="empty">Holdings are unavailable for this date.</div>';
+  certifiedLine(holdingsList,holdings.status==='fulfilled'?holdings.value.certified:null);
   if(sectors.status==='fulfilled'&&(sectors.value.allocation||[]).length)sectorList.innerHTML=sectorBars(sectors.value.allocation,5);
   else sectorList.innerHTML='<div class="empty">Sector allocation is unavailable for this date.</div>';
+  certifiedLine(sectorList,sectors.status==='fulfilled'?sectors.value.certified:null);
 };
 const chartSource=new Map(),chartRanges=new Map();
 const rangeStart=(range,last)=>{const d=new Date(last+'T00:00:00Z');if(range==='ytd')return `${last.slice(0,4)}-01-01`;const months={'1m':1,'3m':3,'1y':12}[range];if(!months)return null;d.setUTCMonth(d.getUTCMonth()-months);return d.toISOString().slice(0,10)};
@@ -204,6 +220,7 @@ fetch('/api/accounts/overview').then(r=>r.ok?r.json():Promise.reject(r.status)).
     node.querySelector('[data-asof]').textContent=a.nav_date?`as of ${date(a.nav_date)}`:'No NAV yet';
     node.querySelector('[data-returns]').innerHTML=['mtd','ytd'].map(key=>`<span><span class="account-stat-label">${key.toUpperCase()}</span> <span class="${tone(a[key])}">${esc(pct(a[key]))}</span></span>`).join('');
     if(a.nav_date&&latest&&a.nav_date<latest)node.querySelector('[data-asof]').classList.add('behind');
+    if(a.certified)node.querySelector('[data-asof]').textContent+=` · ${a.certified.note||'Certified'}`;
   });
   const summary=document.querySelector('#accounts-summary');
   if(summary)summary.innerHTML=`<span><strong>${data.accounts.length}</strong> account${data.accounts.length===1?'':'s'}</span><span>Data through <strong>${esc(date(latest))}</strong></span>${data.accounts.filter(a=>a.nav_date&&a.nav_date<latest).length?`<span class="behind">${data.accounts.filter(a=>a.nav_date&&a.nav_date<latest).length} behind the latest date</span>`:''}`;

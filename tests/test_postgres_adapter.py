@@ -372,7 +372,7 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("replicaRetryLimit: 0", template)
         self.assertIn("parallelism: 1", template)
         self.assertIn("failed-execution", template)
-        self.assertIn("ibkr-v11-daily-alerts", template)
+        self.assertIn("ibkrv2stg-alerts", template)
         self.assertIn("database-approval-url", template)
         self.assertIn("ibkrv2stg-benchmark-daily", template)
         self.assertIn("ibkrv2stg-risk-free-daily", template)
@@ -416,7 +416,10 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("idx_burn_in_one_running_window", migration)
         self.assertIn("cronExpression: '15 9 * * *'", template)
         self.assertIn("replicaRetryLimit: 0", template)
-        self.assertIn("ibkr-v11-daily", template)
+        # v1.1's pull stopped on 17 Oct 2026; its own alert stays with v1.1.
+        self.assertNotIn("  'ibkr-v11-daily'\n", template)
+        self.assertIn("ibkrv2stg-institutional-daily", template)
+        self.assertIn("param actionGroupName string = 'ibkrv2stg-alerts'", template)
         self.assertIn("ibkrv2stg-autonomous-admin", template)
         self.assertIn("ibkrv2stg-autonomy-review", template)
         self.assertIn("database-approval-url", template)
@@ -986,12 +989,13 @@ class SecurityDefinitionTests(unittest.TestCase):
         analytics = (
             root / "infra" / "staging-onboarding-analytics-job.bicep"
         ).read_text(encoding="utf-8")
-        # Deploying with the defaults keeps today's 16:00 HKT job and sends nothing.
-        self.assertIn("param scheduleUtc string = '0 8 * * *'", institutional)
+        # Deploying with the defaults keeps the live job since v2's own Flex pull began on
+        # 17 Oct 2026: 08:20 UTC, data up to yesterday, sends on.
+        self.assertIn("param scheduleUtc string = '20 8 * * *'", institutional)
         self.assertIn("cronExpression: scheduleUtc", institutional)
-        self.assertIn("param dispatchRunDate string = 'current_hkt_day'", institutional)
+        self.assertIn("param dispatchRunDate string = 'previous_hkt_day'", institutional)
         self.assertIn("{ name: 'INSTITUTIONAL_DISPATCH_RUN_DATE', value: dispatchRunDate }", institutional)
-        self.assertIn("param flexSendsEnabled bool = false", institutional)
+        self.assertIn("param flexSendsEnabled bool = true", institutional)
         self.assertIn("{ name: 'INSTITUTIONAL_FLEX_SENDS_ENABLED', value: flexSendsEnabled ? 'true' : 'false' }",
                       institutional)
         self.assertIn("INSTITUTIONAL_FLEX_LOOKBACK_DAYS", institutional)
@@ -999,8 +1003,10 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("AZURE_RAW_CONTAINER", institutional)
         self.assertIn("cronExpression: '50 8 * * *'", derived)
         self.assertIn("run_self_service_derived_refresh.py", derived)
-        self.assertIn("REFERENCE_STORAGE_ACCOUNT_URL", derived)
-        self.assertIn("REFERENCE_STORAGE_CONTAINER", derived)
+        # Reference data comes from v2's own tables; nothing points at v1.1's storage.
+        self.assertIn("param referenceDataSource string = 'database'", derived)
+        self.assertNotIn("REFERENCE_STORAGE_ACCOUNT_URL", derived)
+        self.assertNotIn("ibkrv115", derived)
         self.assertIn("triggerType: 'Manual'", analytics)
         for template in (institutional, derived, analytics):
             self.assertIn("replicaRetryLimit: 0", template)

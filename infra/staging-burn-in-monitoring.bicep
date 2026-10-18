@@ -6,7 +6,7 @@ param diagnosticsIdentityName string = 'ibkrv2stg-diagnostics-identity'
 param environmentName string = 'ibkrv2stg-env'
 param webAppName string = 'ibkrv2stg-web'
 param monitorJobName string = 'ibkrv2stg-burn-in-monitor'
-param actionGroupName string = 'ibkr-v11-daily-alerts'
+param actionGroupName string = 'ibkrv2stg-alerts'
 param approvalDatabaseSecretName string = 'database-approval-url'
 param imageDigest string
 param portalUrl string
@@ -23,8 +23,9 @@ var tags = {
   purpose: 'single-user-burn-in'
 }
 
+// v1.1's ibkr-v11-daily keeps its own failed-execution alert from infra/job.bicep,
+// on v1.1's action group, until v1.1 is deleted.
 var monitoredJobNames = [
-  'ibkr-v11-daily'
   'ibkrv2stg-account-sync-daily'
   'ibkrv2stg-benchmark-daily'
   'ibkrv2stg-risk-free-daily'

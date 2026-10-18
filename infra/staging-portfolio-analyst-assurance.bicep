@@ -7,7 +7,7 @@ param keyVaultName string
 param openAiAccountName string
 param identityResourceId string
 param imageDigest string
-param actionGroupName string = 'ibkr-v11-daily-alerts'
+param actionGroupName string = 'ibkrv2stg-alerts'
 param databaseSecretName string = 'database-app-url'
 param modelDeploymentName string = 'gpt-5-6-sol-apac'
 param tenantId string = '00000000-0000-0000-0000-000000000001'

@@ -1,0 +1,156 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.fx_rates
+name: fx_rates
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: FX conversion rates per account and statement date from the Flex statements.
+  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
+    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
+    are not versioned yet (review item 8).
+tags:
+- silver
+- ibkr
+schema:
+- name: fx_rates
+  physicalName: silver.fx_rates
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per account_id, rate_date, from_currency and to_currency.
+  properties:
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: restricted
+    description: 'IBKR account number. Restricted: never shown or logged in full.'
+  - name: rate_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: confidential-financial
+    description: Statement date of the rate.
+    quality:
+    - name: rate_date_is_iso_date
+      description: rate_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_rates WHERE rate_date IS NOT NULL AND rate_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: from_currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: Currency converted from.
+  - name: to_currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: confidential-financial
+    description: Currency converted to; BASE when the statement did not name it.
+  - name: rate_text
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Units of to_currency per unit of from_currency, as decimal text.
+    quality:
+    - name: rate_text_is_decimal
+      description: rate_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_rates WHERE rate_text IS NOT NULL AND rate_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+    - name: rate_text_positive
+      description: rate_text is above zero.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_rates WHERE CASE WHEN rate_text ~ '^-?[0-9]+(\.[0-9]+)?$' THEN rate_text::numeric
+        <= 0 ELSE false END
+      mustBe: 0
+      severity: warning
+      dimension: conformity
+  - name: row_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows.
+    quality:
+    - name: row_sha256_is_sha256
+      description: row_sha256 is a lowercase hex sha256 (util.sha256_text of the row).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_rates WHERE row_sha256 IS NOT NULL AND row_sha256 !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: last_seen_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ingestion run that last wrote the row (ingestion_runs.run_id).
+  quality:
+  - name: account_in_accounts
+    description: Every row's account is in silver.accounts. A row of an unknown account is invisible to every tenant
+      under the account_isolation policy, so run this with a role that bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.fx_rates t WHERE NOT EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id
+      = t.account_id)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Typed Flex sections; values are still stored as text and cast on read.
+- property: consumers
+  value:
+  - ibkr_etl.alpha_world_t_crisis
+  - ibkr_etl.analyst_export
+  - ibkr_etl.cashflow_source_evidence
+  - ibkr_etl.comparison_cashflow_evidence
+  - ibkr_etl.derived_portfolio
+  - ibkr_etl.export_agent_source
+  - ibkr_etl.monthly_reporting_analytics
+  - ibkr_etl.provisional_benchmark
+  - ibkr_etl.report
+  - ibkr_etl.reporting_currency_holdings
+  - ibkr_etl.web
+- property: producers
+  value:
+  - ibkr_etl.loader
+contractCreatedTs: '2026-10-18T00:00:00Z'

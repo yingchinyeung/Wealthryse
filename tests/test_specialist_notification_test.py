@@ -26,7 +26,7 @@ class AzureNotificationTestGuards(unittest.TestCase):
         self.assertEqual(status_path(url),GROUP_PATH+'/notificationStatus/1234?api-version=2021-09-01')
         for bad in (url.replace('https:','http:'),url.replace('management.azure.com','evil.example'),
                 url.replace('1234','../../secret'),url+'&token=private',url+'#fragment',
-                url.replace('ibkr-v11-daily-alerts','other-group')):
+                url.replace('ibkrv2stg-alerts','other-group')):
             with self.assertRaises(ValueError): status_path(bad)
 
     def test_exact_provider_success_is_not_recipient_delivery(self):

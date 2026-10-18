@@ -1,0 +1,212 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.instruments
+name: instruments
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'One row per IBKR contract (conid) seen in any statement: symbol, description, asset category and contract
+    terms.'
+  limitations: 'Shared by every tenant: no tenant_id and no row-level security, because it holds public contract
+    terms only. A statement row without a conid gets a synthetic conid (FLEX- and a hash of its identity) so its
+    trades and positions still join.'
+tags:
+- silver
+- ibkr
+schema:
+- name: instruments
+  physicalName: silver.instruments
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per conid.
+  properties:
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: true
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: IBKR contract id; FLEX-<hash> for a contract the statement sent without one.
+  - name: symbol
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ticker symbol.
+  - name: description
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Contract description.
+  - name: asset_category
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: IBKR asset category, such as STK, OPT, FUT or BOND.
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Trading currency.
+  - name: listing_exchange
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Listing exchange.
+  - name: underlying_conid
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: conid of the underlying, for derivatives.
+  - name: expiry
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Expiry as IBKR sends it (not normalised).
+  - name: strike_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Strike as decimal text.
+    quality:
+    - name: strike_text_is_decimal
+      description: strike_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.instruments WHERE strike_text IS NOT NULL AND strike_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: put_call
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: P or C for options.
+  - name: multiplier_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Contract multiplier as decimal text.
+    quality:
+    - name: multiplier_text_is_decimal
+      description: multiplier_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.instruments WHERE multiplier_text IS NOT NULL AND multiplier_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: isin
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: ISIN or other security id (isin, securityID).
+  - name: first_seen_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) the contract was first loaded.
+  - name: last_seen_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the latest load that named the contract.
+  - name: source_json
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The contract's statement attributes as canonical JSON.
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Dimension.
+- property: consumers
+  value:
+  - ibkr_etl.agent_tools
+  - ibkr_etl.analyst_export
+  - ibkr_etl.crisis_replay
+  - ibkr_etl.crisis_scenarios
+  - ibkr_etl.derived_portfolio
+  - ibkr_etl.loader
+  - ibkr_etl.monthly_reporting_analytics
+  - ibkr_etl.pilot_import
+  - ibkr_etl.pilot_snapshot
+  - ibkr_etl.position_recovery
+  - ibkr_etl.reference_data
+  - ibkr_etl.reference_data_source
+  - ibkr_etl.report
+  - ibkr_etl.risk_snapshots
+  - ibkr_etl.sector_classification
+  - ibkr_etl.snapshot_preflight
+  - ibkr_etl.subject_exports
+  - ibkr_etl.switch_dry_run
+  - ibkr_etl.web
+  - ibkr_etl.workflow_financial_inputs
+- property: producers
+  value:
+  - ibkr_etl.loader
+  - ibkr_etl.pilot_snapshot
+contractCreatedTs: '2026-10-18T00:00:00Z'

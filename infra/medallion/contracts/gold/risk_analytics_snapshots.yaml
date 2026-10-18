@@ -1,0 +1,245 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.gold.risk_analytics_snapshots
+name: risk_analytics_snapshots
+version: 1.1.0
+status: active
+domain: gold
+dataProduct: portfolio-medallion
+description:
+  purpose: Risk analytics for a subject on a date as one JSON payload, with fingerprints of its inputs and of the
+    payload. The website risk page and the risk agents read it.
+  usage: Read the analytics_version the reader expects and skip rows whose quality_status is fail.
+  limitations: A later source check (risk_refresh) can set quality_status to fail to invalidate a snapshot; the
+    payload is then kept but must not be shown.
+tags:
+- gold
+- derived
+schema:
+- name: risk_analytics_snapshots
+  physicalName: gold.risk_analytics_snapshots
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, subject_id, as_of_date and analytics_version.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: subject_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: restricted
+    description: 'Subject: an IBKR account number for accounts, a slug for portfolios and composites. Restricted.'
+  - name: as_of_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: Date the analytics are as of.
+    quality:
+    - name: as_of_date_is_iso_date
+      description: as_of_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE as_of_date IS NOT NULL AND as_of_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: analytics_version
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: internal
+    description: Risk method version; part of the key.
+  - name: comparison_version
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Version of the benchmark comparison the analytics were built from.
+  - name: source_data_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 fingerprint of the validated inputs.
+    quality:
+    - name: source_data_sha256_is_sha256
+      description: source_data_sha256 is a lowercase hex sha256 (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE source_data_sha256 IS NOT NULL AND source_data_sha256
+        !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: payload_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the payload's canonical JSON as written.
+    quality:
+    - name: payload_sha256_is_sha256
+      description: payload_sha256 is a lowercase hex sha256 (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE payload_sha256 IS NOT NULL AND payload_sha256
+        !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: payload_json
+    physicalType: jsonb
+    logicalType: object
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The risk analytics payload.
+  - name: quality_status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: pass, warn or fail.
+    quality:
+    - name: quality_status_allowed_values
+      description: quality_status is one of pass, warn, fail (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE quality_status NOT IN ('pass', 'warn', 'fail')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: generated_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the run that wrote the row.
+  - name: duration_ms
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Build time in milliseconds.
+    quality:
+    - name: duration_not_negative
+      description: duration_ms is zero or more (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE duration_ms < 0
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: timings_json
+    physicalType: jsonb
+    logicalType: object
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Step timings, plus the source-check metadata risk_refresh adds.
+  - name: lineage_run_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The recorded job run that last inserted or updated this row (lineage_runs); NULL when that run
+      was not recorded.
+  quality:
+  - name: payload_version_matches
+    description: The payload names the same analytics_version as the row.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE payload_json ? 'analytics_version' AND payload_json->>'analytics_version'
+      <> analytics_version
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+slaDefaultElement: risk_analytics_snapshots.as_of_date
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: risk_analytics_snapshots.as_of_date
+- property: timeOfAvailability
+  value: 10:00+00:00
+  element: risk_analytics_snapshots.as_of_date
+  driver: operational
+- property: latency
+  value: 4
+  unit: d
+  element: risk_analytics_snapshots.as_of_date
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: Versioned risk payload per subject and date.
+- property: consumers
+  value:
+  - ibkr_etl.layer_freshness
+  - ibkr_etl.qualified_agent_risk
+  - ibkr_etl.risk_refresh
+  - ibkr_etl.risk_snapshots
+  - ibkr_etl.web
+  - ibkr_etl.web_modelling
+  - ibkr_etl.workflow_risk_evidence
+- property: producers
+  value:
+  - ibkr_etl.risk_refresh
+  - ibkr_etl.risk_snapshots
+- property: freshnessCheck
+  value:
+    checkId: gold.risk_analytics_snapshots
+    measure: as_of_date
+    required: true
+    query: SELECT MAX(as_of_date) AS observed FROM risk_analytics_snapshots
+    source: ibkr_etl.layer_freshness.RULES
+- property: calculationVersionColumn
+  value: analytics_version
+- property: calculationVersionSource
+  value:
+  - ibkr_etl.risk_snapshots.RISK_ANALYTICS_VERSION
+  - ibkr_etl.benchmark_analytics.CALCULATION_VERSION
+contractCreatedTs: '2026-10-18T00:00:00Z'

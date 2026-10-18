@@ -11,7 +11,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from ibkr_etl import raw_capture  # noqa: E402
+from ibkr_etl import input_readiness, lineage, raw_capture  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.sector_classification import (  # noqa: E402
     refresh_sector_classifications_range,
@@ -103,6 +103,7 @@ def _mark_risk_analytics_gate(
 
 
 def main() -> int:
+    input_readiness.gate("sector-classification")
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() not in {
         "staging",
         "internal-production",
@@ -188,6 +189,8 @@ def main() -> int:
             ),
             "unclassified": sum(int(item["unclassified"]) for item in results),
         }
+        lineage.current().output("silver.instrument_classifications",
+                                 rows=sum(int(item.get("classified") or 0) for item in results))
         print(json.dumps(payload, sort_keys=True))
         return 0 if payload["unclassified"] == 0 else 2
     except Exception:
@@ -198,4 +201,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-sector-classification", main))

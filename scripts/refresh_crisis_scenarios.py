@@ -16,7 +16,7 @@ for folder in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
     if str(folder) not in sys.path:
         sys.path.insert(0, str(folder))
 
-from ibkr_etl import crisis_scenarios, raw_capture  # noqa: E402
+from ibkr_etl import crisis_scenarios, input_readiness, lineage, raw_capture  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.util import canonical_json  # noqa: E402
 from refresh_provisional_benchmark import _crisis_scenario_subjects  # noqa: E402
@@ -35,6 +35,7 @@ def run(connection, *, ticker_factory=None) -> tuple[int, dict]:
 
 
 def main() -> int:
+    input_readiness.gate("crisis-scenarios-daily")
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() not in {"staging", "internal-production"}:
         raise RuntimeError("The crisis-scenarios job may run only in staging or internal production")
     database_url = os.environ.get("DATABASE_URL", "")
@@ -42,10 +43,14 @@ def main() -> int:
         raise RuntimeError("DATABASE_URL must be a PostgreSQL connection URL")
     tenant_id = os.environ.get("PORTFOLIO_TENANT_ID", "00000000-0000-0000-0000-000000000001")
     connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
+    # With lineage recording on, the gold rows this session writes name this run.
+    lineage.current().bind(connection)
     try:
         # No ingestion_runs row: other jobs read the latest run there, and this job is not an ingestion.
         raw_capture.set_job_run_id(raw_capture.new_run_id("crisis-scenarios"))
         code, result = run(connection)
+        if result.get("subjects"):
+            lineage.current().output("gold.crisis_scenario_results")
         print(canonical_json(result), flush=True)
         return code
     finally:
@@ -53,4 +58,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-crisis-scenarios-daily", main))

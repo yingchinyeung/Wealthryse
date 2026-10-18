@@ -9,7 +9,7 @@ param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
 param classificationAccountIds string = ''
 param classificationAsOf string = ''
-param actionGroupName string = 'ibkr-v11-daily-alerts'
+param actionGroupName string = 'ibkrv2stg-alerts'
 // S2 raw market-data capture, on since 18 Oct 2026: the default matches the live job.
 // The job's identity (ingestionIdentity in staging.bicep) holds Storage Blob Data
 // Contributor on bronze-market-data. Empty switches capture off and drops these settings.

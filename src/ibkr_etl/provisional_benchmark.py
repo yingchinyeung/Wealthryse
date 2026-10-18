@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
-from . import raw_capture
+from . import lineage, raw_capture
 from .benchmark_analytics import (
     BenchmarkContract,
     build_comparison,
@@ -171,12 +171,22 @@ def normalize_yfinance_history(frame: Any) -> list[tuple[str, float]]:
     return sorted(rows.items())
 
 
+def raw_prices_digest(captured: dict[str, Any] | None, received: list[tuple[str, float]]) -> str:
+    """raw_sha256 for a benchmark's prices. With lineage recording on and the provider response
+    kept in bronze, the sha256 of that raw file; otherwise the digest of the parsed closes, as before."""
+    digest = (captured or {}).get("sha256") if lineage.enabled() else None
+    return str(digest) if digest else sha256_text(canonical_json(received))
+
+
 def fetch_benchmark_yfinance(
     spec: BenchmarkSpec,
     start_date: date,
     end_date: date,
     ticker_factory: Callable[[str], Any] | None = None,
+    captured: dict[str, Any] | None = None,
 ) -> list[tuple[str, float]]:
+    """Closes in the requested window. When given, captured receives the raw file's blob
+    name and sha256 if raw capture stored the response."""
     if end_date < start_date:
         raise ValueError("Benchmark end date is before the start date")
     if ticker_factory is None:
@@ -194,7 +204,7 @@ def fetch_benchmark_yfinance(
     )
     requested_at = raw_capture.utc_now()
     frame = ticker_factory(spec.symbol).history(**request)
-    raw_capture.capture_frame(
+    blob = raw_capture.capture_frame(
         "yahoo-fx-history" if spec.mapping_type == "fx" else "yahoo-benchmark-history",
         PROVIDER,
         frame=frame,
@@ -203,6 +213,9 @@ def fetch_benchmark_yfinance(
         requested_at=requested_at,
         history=raw_capture.settled(end_date, now=requested_at),
     )
+    digest = raw_capture.sha256_of(blob)
+    if captured is not None and blob and digest:
+        captured.update(blob=blob, sha256=digest)
     observations = [
         row for row in normalize_yfinance_history(frame)
         if start_date.isoformat() <= row[0] <= end_date.isoformat()
@@ -518,10 +531,12 @@ def _refresh_and_materialize(
     cash_flows = _external_flows(connection, account_id)
     received_by_id: dict[str, list[tuple[str, float]]] = {}
     unavailable_by_id: dict[str, str] = {}
+    raw_files: dict[str, dict[str, Any]] = {}
     for spec in specs:
         try:
             received_by_id[spec.benchmark_id] = fetch_benchmark_yfinance(
-                spec, start_date, end_date, ticker_factory
+                spec, start_date, end_date, ticker_factory,
+                captured=raw_files.setdefault(spec.benchmark_id, {}),
             )
         except Exception as error:
             if spec.mapping_type == "primary" or account_id in ('alpha-world-ms','alpha-world-t'):
@@ -602,7 +617,7 @@ def _refresh_and_materialize(
             f"yfinance:TICKER({spec.symbol}):"
             "history(interval=1d,auto_adjust=False):Close"
         )
-        raw_digest = sha256_text(canonical_json(received))
+        raw_digest = raw_prices_digest(raw_files.get(spec.benchmark_id), received)
         connection.execute(
             """
             UPDATE benchmark_master

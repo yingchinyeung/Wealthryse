@@ -210,6 +210,16 @@ class LayerViewTests(unittest.TestCase):
         _build(cls.database, before_layers=capture)
         with _connect(cls.database) as owner:
             cls.after_layers = _layout(owner)
+        if LAYER_FILES and any(path.name > LAYER_FILES[-1] for path in MIGRATIONS.glob("*.sql")):
+            # Undoing the layers keeps what later migrations changed on layer tables (071 adds
+            # lineage_run_id), so the expected result has every migration but the layer moves.
+            unlayered = cls.database + "_unlayered"
+            try:
+                _build(unlayered, skip=LAYER_FILES)
+                with _connect(unlayered) as owner:
+                    cls.before_layers = _layout(owner)
+            finally:
+                _drop(unlayered)
 
     @classmethod
     def tearDownClass(cls):

@@ -404,6 +404,24 @@
    "note": "Dimension.",
    "source": "ibkr"
   },
+  "public.lineage_events": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Lineage: START and end event of each recorded job run. Append-only."
+  },
+  "public.lineage_io": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Lineage: datasets each recorded run read and wrote, with row counts and raw-file sha256. Append-only."
+  },
+  "public.lineage_runs": {
+   "kind": "view",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Lineage: one row per recorded run."
+  },
   "public.live_account_values": {
    "kind": "table",
    "layer": "bronze",
@@ -1500,7 +1518,7 @@
     "ingest",
     "conform"
    ],
-   "schedule": "08:00 UTC",
+   "schedule": "08:20 UTC",
    "note": "v2's own Flex pull into ibkr-raw, then the loader."
   },
   "ibkrv2stg-institutional-shadow": {

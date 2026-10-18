@@ -58,7 +58,7 @@ class NotificationTests(unittest.TestCase):
 
     def test_rule_is_dormant_informational_and_destination_fixed(self):
         base='/subscriptions/3956e821-cee4-403f-8708-e84e2ed490eb/resourceGroups/rg-ibkr-database-v11/providers/'
-        kwargs=dict(workspace_id=base+'Microsoft.OperationalInsights/workspaces/ibkrv2stg-logs',action_group_id=base+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts')
+        kwargs=dict(workspace_id=base+'Microsoft.OperationalInsights/workspaces/ibkrv2stg-logs',action_group_id=base+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts')
         props=rule_definition(**kwargs)['properties']
         self.assertIs(props['enabled'],False);self.assertEqual(props['severity'],3)
         self.assertTrue(props['autoMitigate']);self.assertFalse(props['skipQueryValidation'])

@@ -1,0 +1,166 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.reference_fx_rates
+name: reference_fx_rates
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: Daily FX closes from the market-data provider, stored in both directions. Benchmark levels and crisis
+    replays are converted to the reporting currency with them.
+  limitations: Yahoo closes are provisional with quality_status warn.
+tags:
+- silver
+- market-data
+schema:
+- name: reference_fx_rates
+  physicalName: silver.reference_fx_rates
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, rate_date, from_currency, to_currency and provider.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: rate_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: Trading date of the close.
+    quality:
+    - name: rate_date_is_iso_date
+      description: rate_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.reference_fx_rates WHERE rate_date IS NOT NULL AND rate_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: from_currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: internal
+    description: Currency converted from.
+  - name: to_currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: internal
+    description: Currency converted to.
+  - name: rate
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Units of to_currency per unit of from_currency; above zero.
+    quality:
+    - name: rate_positive
+      description: rate is above zero (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.reference_fx_rates WHERE rate <= 0
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: provider
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 5
+    classification: internal
+    description: Data provider, such as Yahoo Finance via yfinance.
+  - name: observation_status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: official_close, provisional_close or corrected. The Yahoo feed writes provisional_close.
+    quality:
+    - name: observation_status_allowed_values
+      description: observation_status is one of official_close, provisional_close, corrected (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.reference_fx_rates WHERE observation_status NOT IN ('official_close', 'provisional_close',
+        'corrected')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: fetched_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) the row was last written.
+  - name: quality_status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: pending, pass, warn or fail. The Yahoo feed writes warn.
+    quality:
+    - name: quality_status_allowed_values
+      description: quality_status is one of pending, pass, warn, fail (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.reference_fx_rates WHERE quality_status NOT IN ('pending', 'pass', 'warn',
+        'fail')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  quality:
+  - name: inverse_rates_agree
+    description: Each rate and its reverse (same date and provider) multiply to 1; the writer stores both.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.reference_fx_rates a JOIN silver.reference_fx_rates b ON b.tenant_id = a.tenant_id
+      AND b.rate_date = a.rate_date AND b.provider = a.provider AND b.from_currency = a.to_currency AND b.to_currency
+      = a.from_currency WHERE ABS(a.rate * b.rate - 1) > 1e-9
+    mustBe: 0
+    severity: error
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: market-data
+- property: catalogNote
+  value: 'Parsed provider FX closes with a quality flag. Raw responses: bronze-market-data.'
+- property: consumers
+  value:
+  - ibkr_etl.comparison_source_evidence
+  - ibkr_etl.crisis_replay
+  - ibkr_etl.risk_snapshots
+- property: producers
+  value:
+  - ibkr_etl.provisional_benchmark
+contractCreatedTs: '2026-10-18T00:00:00Z'

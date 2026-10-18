@@ -92,7 +92,7 @@ def main():
                 raise ValueError('Scheduled watchdog contract drift: ' + name)
             props = rule_by_name[rule]['properties']
             groups = props['actions']['actionGroups']
-            if props['enabled'] is not True or len(groups) != 1 or not groups[0].casefold().endswith('/actiongroups/ibkr-v11-daily-alerts'):
+            if props['enabled'] is not True or len(groups) != 1 or not groups[0].casefold().endswith('/actiongroups/ibkrv2stg-alerts'):
                 raise ValueError('Watchdog not enabled/routed: ' + rule)
             entry['watchdog'] = rule
         scheduled.append(entry)

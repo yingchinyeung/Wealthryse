@@ -30,7 +30,7 @@ def definition():
                 'operator':'GreaterThan','threshold':0,
                 'dimensions':[{'name':'Scope','operator':'Include','values':['*']}],
                 'failingPeriods':{'numberOfEvaluationPeriods':1,'minFailingPeriodsToAlert':1}}]},
-            'actions':{'actionGroups':[BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts']}}}
+            'actions':{'actionGroups':[BASE+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts']}}}
 
 
 def save(name,value):
@@ -83,7 +83,7 @@ def main():
     if args.stage=='prepare':
         if request('GET',PATH,missing=True) is not None:
             raise ValueError('Alert already exists; do not overwrite it')
-        group=request('GET',BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts?api-version=2023-01-01')
+        group=request('GET',BASE+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts?api-version=2023-01-01')
         if (group['properties'].get('enabled') is not True or not any(
             x.get('emailAddress','').lower()=='anthony.ying@wealthryse.ai' and x.get('status')=='Enabled'
             for x in group['properties'].get('emailReceivers',[]))):

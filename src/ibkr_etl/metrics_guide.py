@@ -1718,3 +1718,203 @@ window.addEventListener('hashchange',revealTarget);
 })();
 </script>
 """
+
+
+# Desk page (web_desk.py) -------------------------------------------------------------------
+# DESK_PAGE ("owners" or "on") switches the Desk on. Until then the guide does not describe it:
+# with the setting unset this block adds nothing, so the guide, its anchors and every account
+# page stay exactly as they were. The setting is read once at import, like the website's other
+# settings, so a new revision picks up a change.
+DESK_DEFINITIONS = (
+    MetricDefinition(
+        "Intraday P&L",
+        "Today's profit or loss on the account since the prior close, from the live IBKR positions and quotes, in the reporting currency.",
+        "For each holding with a fresh quote: quantity × multiplier × (live price − prior close) at today's FX rate, plus the FX part on the opening value, quantity × multiplier × prior close × (FX rate now − FX rate at the prior close). The live price is the last trade, else the bid-ask midpoint. Each fill since the prior close adds signed quantity × multiplier × (prior close − fill price), and foreign cash adds balance × the change in its FX rate. Holdings whose quotes are stale, missing or unusable are listed with the reason and left out of the total, never filled in (desk-risk-v1).",
+        "A live estimate beside the book of record: the daily IBKR statement stays the official figure. Commissions are left out.",
+    ),
+    MetricDefinition(
+        "Intraday P&L share of NAV",
+        "Today's P&L as a share of the account's value at the prior close.",
+        "Intraday P&L ÷ NAV at the prior close. NAV at the prior close is the live net liquidation value less IBKR's own P&L for today, converted into the reporting currency at the prior-close FX rate. Checked against a loss limit of 3% of NAV by default (DESK_LIMITS pnl_return, a range from −3% to +100%).",
+        "Shows how much of the account today's move represents. It turns amber at 80% of the loss limit and red beyond it; gains are not limited in practice.",
+    ),
+    MetricDefinition(
+        "Trading P&L from today's fills",
+        "The part of today's P&L that comes from trades made since the prior close, measured from each fill's price.",
+        "Σ over the fills since the prior close of signed quantity × multiplier × (prior close − fill price), at today's FX rate, before commissions. A buy at 102 of a stock that closed at 100 starts at −2 a share and earns from there. The prior close is 16:10 Hong Kong time for HKD and CNH instruments and 16:00 New York time for others, on the last weekday before the Desk's as-of date in that market; holidays are not modelled. Fills after the live snapshot and currency conversions are left out. Until the live fills view exists the Desk counts no fills and says so.",
+        "With the move of today's quantity it makes up the price part of today's P&L, so a holding bought today earns from its fill price, not from yesterday's close.",
+    ),
+    MetricDefinition(
+        "Intraday FX P&L",
+        "The part of today's P&L that comes from currency moves on holdings and cash in currencies other than the reporting currency.",
+        "Opening value in the holding's currency × (FX rate now − FX rate at the prior close), plus each foreign cash balance × the same change. The rates are the daily reference rates (reference_fx_rates, at most 4 days old): the latest dated before the Desk's as-of date for the prior close, and the latest on or before it for now. Until that day's rate is published both are the same rate, so the FX part is zero.",
+        "Usually small for HKD and USD, which are pegged. A holding with no FX rate is counted in its own currency only and listed.",
+    ),
+    MetricDefinition(
+        "P&L explain",
+        "Today's P&L split into the market's move, currency moves and the stock-specific rest.",
+        "Each counted holding's return since the prior close, weighted by its prior-close value, splits into beta × the primary benchmark's return today (its live price ÷ prior close − 1), its currency's move, and the rest as stock-specific. Trading P&L from today's fills and the FX revaluation of cash are shown beside them, so the parts add up to the intraday P&L exactly. The benchmark quote must be within the quote age limit of the Desk's as-of time. Without it there is no market part, and the market's move stays in stock-specific.",
+        "Says whether today was the market or the holdings themselves. The split rests on betas estimated from history, so it is a model, not a fact.",
+    ),
+    MetricDefinition(
+        "Beta to the primary benchmark",
+        "How much each holding has tended to move for each 1% move in the account's primary benchmark.",
+        "Ordinary least squares, with an intercept, of each holding's daily price return on the primary benchmark's daily return, over the dates both have within the latest 252 sessions. Holding returns come from a year of daily marks (subject_position_series); a date a holding has no mark counts as 0%. Benchmark returns come from the benchmark comparison (performance_comparison_daily). At least 20 common days are needed. The account's beta is the sum of live weight × beta.",
+        "A beta of 1.2 means the holding has tended to move about 1.2% for each 1% benchmark move. It describes the past year and can change.",
+    ),
+    MetricDefinition(
+        "Gross exposure (live)",
+        "The size of all positions at live prices, long and short added together, as a share of NAV.",
+        "Σ |quantity × multiplier × live price × FX rate| ÷ NAV at the prior close. A holding with a stale quote keeps its last price, so it still counts. Default limit 150% of NAV.",
+        "Above 100% means borrowing or shorting; the limit caps leverage.",
+    ),
+    MetricDefinition(
+        "Net exposure (live)",
+        "Long positions less short positions at live prices, as a share of NAV.",
+        "Σ quantity × multiplier × live price × FX rate ÷ NAV at the prior close. Default limit 120% of NAV either way.",
+        "For an account that only holds long positions it is the share invested; the rest is cash.",
+    ),
+    MetricDefinition(
+        "Largest single name (live)",
+        "The largest single position at live prices, as a share of NAV.",
+        "max |quantity × multiplier × live price × FX rate| ÷ NAV at the prior close. Default limit 25% of NAV.",
+        "A concentration check at today's prices. It can differ from Largest holding on Holdings, which uses the validated end-of-day snapshot.",
+    ),
+    MetricDefinition(
+        "One-day VaR 99% (live)",
+        "The loss on a bad day, one day in a hundred, for today's live positions.",
+        "Today's live weights (value ÷ NAV at the prior close) applied to each holding's daily price returns over the past year (subject_position_series, up to 252 sessions, at least 20); the 1st percentile of that daily history, shown as a positive share of NAV. A holding with no history counts at 0% and is listed; currency moves are left out. Default limit 5% of NAV.",
+        "A historical estimate, not a worst case: about one day in a hundred should lose more. The pre-trade check uses the same measure, before and after the orders.",
+    ),
+    MetricDefinition(
+        "Quote age",
+        "How long ago a holding's live quote last changed.",
+        "The Desk's as-of time, which is the newest quote on the account, less the time of the holding's latest quote. The collector writes a quote only when it changes, so this is the time since the last change. Older than 15 minutes (DESK_LIMITS max_quote_age_seconds) is stale: the holding is left out of the P&L but keeps its last price in the exposures. Delayed IBKR data is marked.",
+        "Outside a market's hours its quotes stop changing and read as stale, and a quiet stock can read as stale while its market is open.",
+    ),
+    MetricDefinition(
+        "Stale quote share",
+        "The share of holdings whose live quote is stale or missing.",
+        "Holdings held now whose quote is older than the quote age limit, missing, without a time or later than the as-of time ÷ holdings held now. Default limit 10%.",
+        "When it is high, today's P&L leaves out much of the account; read it with the positions table.",
+    ),
+    MetricDefinition(
+        "Desk limit status",
+        "Each live measure against its limit, shown green, amber or red.",
+        "Usage = |value| ÷ limit for a single limit, the most the measure may be either way. For a range that includes zero, usage runs from zero to the bound on the value's side. Red is outside the limit, amber is 80% of it or more, green is below. Limits are DESK_LIMITS (JSON) over the defaults: gross exposure 150%, net exposure 120%, largest single name 25%, one-day VaR 99% 5%, today's P&L −3% to +100% of NAV and stale quote share 10%.",
+        "A prompt to look, not an instruction to trade.",
+    ),
+    MetricDefinition(
+        "Pre-trade check",
+        "What proposed orders would do to the account's exposure, risk and limits, before anything is placed.",
+        "The orders are applied to today's live quantities at today's live prices in the NAV's currency, and cash takes up the difference, so NAV is unchanged. Before and after: gross and net exposure, cash, the largest holding, top 5 weight, ex-ante volatility (a Ledoit-Wolf covariance of the past year's daily returns), one-day VaR and expected tail loss at 99% over the same history, beta to the primary benchmark and the Desk limits, with the breaches the orders would add (pre-trade-v1). A limit price on a held instrument is in its own currency; an instrument not held is priced at the limit price given, read in the NAV's currency, and has no return history.",
+        "A hypothetical check: it sends nothing to IBKR, places no order and is not advice.",
+    ),
+    MetricDefinition(
+        "Pre-trade trading cost",
+        "The estimated cost of trading the proposed orders.",
+        "Half the live relative bid-ask spread, (ask − bid) ÷ midpoint ÷ 2, × each order's value. Square-root market impact needs average daily volumes, which are not in silver yet, so impact is not estimated and the cost is the half-spread only. An instrument without a live bid and ask has no cost estimate and is listed.",
+        "A lower bound on the cost: large orders also move the price, and commissions are extra.",
+    ),
+)
+DESK_CLIENT_CALCULATIONS = {
+    "Intraday P&L": "Take each holding's move since the prior close at its latest live price, convert it into the reporting currency, and add what today's trades and currency moves made.",
+    "Intraday P&L share of NAV": "Divide today's P&L by what the account was worth at the prior close.",
+    "Trading P&L from today's fills": "For each trade since the prior close, compare its price with that close; with the move since the trade, that is what the trade has made so far.",
+    "Intraday FX P&L": "Value each foreign holding and cash balance at the prior close, then measure how much the change in its exchange rate added or took away.",
+    "P&L explain": "Estimate how much of each holding's move today the market explains, from how it has moved with the benchmark over the past year; the currency's move and what is left over make up the rest.",
+    "Beta to the primary benchmark": "Compare how each holding and the benchmark moved, day by day, over the past year.",
+    "Gross exposure (live)": "Add up the value of every position at live prices, ignoring whether it is long or short, and divide by the account's value.",
+    "Net exposure (live)": "Add up the long positions at live prices, take away the short ones and divide by the account's value.",
+    "Largest single name (live)": "Find the biggest position at today's prices and divide it by the account's value.",
+    "One-day VaR 99% (live)": "Replay the past year's daily moves on today's positions and take the loss that only the worst 1% of days went beyond.",
+    "Quote age": "Compare the time of each holding's latest price with the newest price on the account.",
+    "Stale quote share": "Count the holdings whose price has not changed recently or is missing, and divide by the number of holdings.",
+    "Desk limit status": "Compare each live measure with its limit and show how much of the limit is used.",
+    "Pre-trade check": "Apply the orders to today's positions on paper and compare the figures before and after.",
+    "Pre-trade trading cost": "Take half the gap between the live bid and ask and apply it to the size of each order.",
+}
+DESK_ALIASES = {
+    "Intraday P&L": ("today's P&L", "daily P&L", "live P&L", "P&L since the close"),
+    "Trading P&L from today's fills": ("fills", "executions", "trading P&L"),
+    "Intraday FX P&L": ("FX P&L", "currency P&L", "cash revaluation"),
+    "P&L explain": ("P&L attribution", "market move", "stock-specific", "idiosyncratic"),
+    "Beta to the primary benchmark": ("holding beta", "market beta"),
+    "Gross exposure (live)": ("gross exposure", "leverage"),
+    "Net exposure (live)": ("net exposure", "net long"),
+    "Largest single name (live)": ("single name limit", "concentration limit"),
+    "One-day VaR 99% (live)": ("99% VaR", "live VaR"),
+    "Quote age": ("stale quote", "last changed", "delayed"),
+    "Desk limit status": ("risk limits", "limit breach", "traffic light"),
+    "Pre-trade check": ("pre-trade", "what if I trade", "order check"),
+    "Pre-trade trading cost": ("bid-ask spread", "slippage", "transaction cost"),
+}
+DESK_RELATED = {
+    "Intraday P&L": ("P&L explain", "Intraday P&L share of NAV", "Quote age"),
+    "Intraday P&L share of NAV": ("Intraday P&L", "Desk limit status"),
+    "Trading P&L from today's fills": ("Intraday P&L",),
+    "Intraday FX P&L": ("Intraday P&L", "Reporting currency"),
+    "P&L explain": ("Beta to the primary benchmark", "Intraday P&L", "Intraday FX P&L"),
+    "Beta to the primary benchmark": ("P&L explain", "Beta"),
+    "Gross exposure (live)": ("Net exposure (live)", "Desk limit status"),
+    "Net exposure (live)": ("Gross exposure (live)",),
+    "Largest single name (live)": ("Largest holding", "Desk limit status"),
+    "One-day VaR 99% (live)": ("VaR 95% — daily", "Pre-trade check"),
+    "Quote age": ("Stale quote share", "Intraday P&L"),
+    "Stale quote share": ("Quote age", "Desk limit status"),
+    "Desk limit status": ("Gross exposure (live)", "One-day VaR 99% (live)", "Stale quote share"),
+    "Pre-trade check": ("Pre-trade trading cost", "Desk limit status", "What-if comparison"),
+    "Pre-trade trading cost": ("Pre-trade check",),
+}
+DESK_SECTION = MetricSection(
+    "desk",
+    "Desk",
+    "Desk: live P&L, limits and the pre-trade check",
+    "The Desk page (desk-risk-v1 and pre-trade-v1). Its figures are live, from the IBKR connection, and sit beside the As-of pages: the daily IBKR statement stays the book of record. Nothing on the Desk places an order.",
+    DESK_DEFINITIONS,
+    "Desk",
+)
+
+
+def desk_guide_shown(environ: dict[str, str] | None = None) -> bool:
+    """Whether the guide describes the Desk: DESK_PAGE is "owners" or "on", as web_desk.desk_mode reads it."""
+
+    import os
+
+    return (os.environ if environ is None else environ).get("DESK_PAGE", "").strip().lower() in ("owners", "on")
+
+
+def _add_desk_section() -> None:
+    """Place the Desk section after the Modelling sections, with the same checks as the rest of the guide."""
+
+    global METRIC_SECTIONS, METHODOLOGY_VERSIONS
+    from .quant import desk_risk, pre_trade
+
+    for metric in DESK_DEFINITIONS:
+        if metric.name in _BY_NAME:
+            raise RuntimeError("Metric guide names must be unique")
+        _BY_NAME[metric.name] = metric
+        METRIC_ANCHORS[metric.name] = metric_anchor(metric.name)
+        _SECTION_OF[metric.name] = DESK_SECTION
+    if len(set(METRIC_ANCHORS.values())) != len(METRIC_ANCHORS):
+        raise RuntimeError("Metric guide names and deep-link anchors must be unique")
+    if set(DESK_CLIENT_CALCULATIONS) != {metric.name for metric in DESK_DEFINITIONS}:
+        raise RuntimeError("Every Desk definition needs its plain-language calculation")
+    CLIENT_CALCULATIONS.update(DESK_CLIENT_CALCULATIONS)
+    METRIC_ALIASES.update(DESK_ALIASES)
+    RELATED_METRICS.update(DESK_RELATED)
+    for name, targets in DESK_RELATED.items():
+        for target in targets:
+            if target not in _BY_NAME or target == name:
+                raise RuntimeError(f"Invalid related metric for {name}: {target}")
+    keys = [section.key for section in METRIC_SECTIONS]
+    at = keys.index("modelling-portfolio") + 1 if "modelling-portfolio" in keys else len(keys)
+    METRIC_SECTIONS = METRIC_SECTIONS[:at] + (DESK_SECTION,) + METRIC_SECTIONS[at:]
+    METHODOLOGY_VERSIONS = METHODOLOGY_VERSIONS + (
+        (desk_risk.MODEL_VERSION, "Desk live P&L, explain and limits"),
+        (pre_trade.MODEL_VERSION, "Desk pre-trade check"),
+    )
+
+
+if desk_guide_shown():
+    _add_desk_section()

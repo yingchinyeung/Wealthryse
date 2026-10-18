@@ -5039,6 +5039,7 @@ ACCOUNT_SECTIONS = {
     "holdings": "Holdings",
     "risk": "Risk analytics",
     "modelling": "Modelling",
+    "desk": "Desk",  # shown only where DESK_PAGE allows it (web_desk.py)
     "cash": "Cash",
     "trades": "Trade history",
     "reports": "Monthly reports",
@@ -10997,6 +10998,8 @@ def account_page(
 def _account_page(account_id: str, section: str, user: dict[str, str], part: str | None):
     if section not in ALL_PAGE_SECTIONS:
         raise HTTPException(status_code=404, detail="Account page not found")
+    if section == "desk" and not _desk_web.desk_enabled():
+        raise HTTPException(status_code=404, detail="Account page not found")
     if section == "system-health":
         return RedirectResponse(url="/system-health", status_code=307)
     if section == "combined-holdings":
@@ -11017,6 +11020,8 @@ def _account_page(account_id: str, section: str, user: dict[str, str], part: str
         return RedirectResponse(url="/administration", status_code=307)
     access = _portfolio_access_context(account_id, user)
     if access["preview_mode"] and section not in ONBOARDING_PREVIEW_SECTIONS:
+        raise HTTPException(status_code=404, detail="Account page not found")
+    if section == "desk" and not _desk_web.desk_allowed(access, user):
         raise HTTPException(status_code=404, detail="Account page not found")
     if section == "ai-analyst" and _agent_analyst_replaces_tab(user):
         return RedirectResponse(url=f"/accounts/{urllib.parse.quote(account_id, safe='')}/overview#ask", status_code=307)
@@ -11056,6 +11061,10 @@ def _render_account_page(
     )
     if _agent_analyst_replaces_tab(user):
         visible_sections = visible_sections - {"ai-analyst"}
+    desk_shown = _desk_web.desk_allowed(access, user)
+    if not desk_shown:
+        visible_sections = visible_sections - {"desk"}
+    desk_view = _desk_web.page_view(account_id, reporting_currency_value) if desk_shown and section == "desk" else ""
     page_title = escape(ACCOUNT_SECTIONS[section])
     active = {key: " active" if key == section else "" for key in ALL_PAGE_SECTIONS}
     subpages = ACCOUNT_SUBPAGES.get(section, ())
@@ -11180,7 +11189,7 @@ def _render_account_page(
 <div class="page-view{active['risk']}" data-section="risk"><div class="card wide" id="risk-summary"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div><div class="card wide" id="crisis-scenarios-card" hidden><div class="label"><a class="metric-guide-heading-link" href="{crisis_scenarios_href}">Crisis scenarios <span aria-hidden="true">↗</span></a></div><table><thead><tr><th>Crisis</th><th>Window</th><th>Maximum drawdown</th><th>Stand-ins (scaled)</th></tr></thead><tbody id="crisis-scenarios"></tbody></table><div id="crisis-scenarios-note" class="muted"></div></div>{RISK_ANALYTICS_CARDS}{CORRELATION_CARD}</div>
 <div class="page-view{active['modelling']}" data-section="modelling">{MODELLING_CARDS}</div>
 <div class="page-view{active['cash']}" data-section="cash"><div class="card wide"><div class="label"><span id="cash-kind">Cash balances</span> as of <span id="cash-asof">—</span></div><div id="cash-balances" class="metrics"></div><div id="cash-ledger-controls"><div class="label" style="margin-top:18px">Cash activity history</div><div class="muted">Choose a custom date range to view every matching IBKR cash activity. The CSV download contains the same complete filtered result.</div><div class="filter-grid"><label><span class="label">From</span><input id="cash-from" type="date" min="{history_start_date}" aria-label="Cash activity start date"></label><label><span class="label">To</span><input id="cash-to" type="date" min="{history_start_date}" aria-label="Cash activity end date"></label></div><div class="actions"><button id="cash-apply" class="button" type="button">Apply cash filters</button><a id="cash-export" class="button" href="#">Download cash activity CSV</a></div></div><div id="cash-note" class="muted" style="margin-top:12px">Loading cash activity…</div><div id="cash-ledger-table" class="table-scroll"><table><thead><tr><th>Date</th><th>Time</th><th>Type</th><th>Description</th><th>Currency</th><th>Amount</th></tr></thead><tbody id="cash-activity"></tbody></table></div></div></div>
-<div class="page-view{active['trades']}" data-section="trades">{TRADING_ACTIVITY_CARD}<div class="card wide"><div class="label">Trade history</div><div id="trade-source-title" class="value">Trade records</div><div id="trade-source-note" class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div id="trade-filter-controls" class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
+{desk_view}<div class="page-view{active['trades']}" data-section="trades">{TRADING_ACTIVITY_CARD}<div class="card wide"><div class="label">Trade history</div><div id="trade-source-title" class="value">Trade records</div><div id="trade-source-note" class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div id="trade-filter-controls" class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
 <div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Sector allocation</div><div id="sector-summary" class="muted"></div><div id="sector-bars" class="sector-bars"></div><details class="sector-detail"><summary>Industries within each sector</summary><div class="table-scroll"><table><thead><tr><th class="text-col">Sector</th><th class="text-col">Industry</th><th class="text-col">Region</th><th>Holdings</th><th>Value (<span>{reporting_currency}</span>)</th><th>Weight</th></tr></thead><tbody id="sector-detail"></tbody></table></div></details><div id="sector-note" class="muted sector-note"></div></div>{HOLDINGS_CONCENTRATION_CARD}<div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-tools"><input id="holdings-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter holdings"><span id="holdings-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th title="14-day relative strength index from daily closing marks. Above 70 is overbought, below 30 oversold.">RSI (14)</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
 <div class="page-view{active['reports']}" data-section="reports"><div class="card wide"><div class="label">Monthly factsheets and presentations</div><div class="value">Report centre</div><div id="report-note" class="muted">Loading frozen month-end reports…</div><div class="actions"><select id="report-month" aria-label="Monthly report period"></select><button id="report-prepare" class="button" type="button" disabled>Generate secure downloads</button></div><div id="report-status" class="muted" style="margin-top:14px"></div><div id="report-downloads" class="actions"></div><div id="report-owner-review" style="display:none;margin-top:22px"><h3>Review and release files</h3><p class="muted">Tick a file to make it available to authorized users. Untick it and submit to revoke its download access. A newly approved replacement becomes the current download and withdraws the older version. The original file and approval history are retained. Review files before approving; client distribution remains prohibited.</p><div id="report-release-details" class="muted" style="margin-top:12px"></div><div id="report-release-list" style="display:grid;gap:12px;margin:16px 0"></div><button id="report-release" class="button" type="button" disabled>Submit approval changes</button><div id="report-release-status" class="muted" role="status" aria-live="polite"></div></div>{design_controls_html}</div></div>
 <div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a>{trade_export_link}<a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
@@ -11436,6 +11445,20 @@ onboarding_v2_web.install(
     intake_container=ONBOARDING_INTAKE_CONTAINER,
     # "Ask about this case", answered by the agent service from the case's facts (also behind that switch).
     ask_case=lambda: _case_question_stream(),
+)
+
+
+# Account Desk tab: live P&L, live limits, quote age and a hypothetical pre-trade check
+# (web_desk.py). Off unless DESK_PAGE is "owners" or "on"; until then both routes answer 404.
+from . import web_desk as _desk_web
+
+_desk_web.install(
+    app,
+    authorized_user=_authorized_user,
+    access_context=_portfolio_access_context,
+    read_database=lambda: _database(),
+    comparison_version=website_comparison_version,
+    tenant_id=TENANT_ID,
 )
 
 

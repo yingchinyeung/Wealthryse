@@ -725,6 +725,48 @@ answer check is as before (`tests/test_certified_agent_tools.py`).
 `AGENT_CERTIFIED_FIGURES=on` and `CERTIFIED_FIGURES_PAGES` on the tool server and
 `AGENT_CERTIFIED_FIGURES=on` on the agent service.
 
+## Supervisor (watch-only, off)
+
+The first step of the supervisor design that Ying approved on 19 Oct: one supervisor
+above four team leads (client analysis, reporting, onboarding, data and operations),
+with today's agents as specialists under them. Release 1 only watches. Today's
+analyst still answers every website chat question; the supervisor records beside it
+what it would have done. Nobody sees a change. Everything else in the design stays
+off until its own release.
+
+- **The registry** (`src/wealthryse_agent/supervisor/registry.py`). Every member
+  with its team, level, autonomy (answer, draft or propose; no agent can act),
+  model deployment and tools, and the Medallion layer each tool reads. Today's
+  agents keep their own tool lists for now; the new client analysis specialists
+  (holdings and performance, risk, modelling, Metrics guide) get explicit ones.
+  Tests fail if a job or tool has no place in it (`tests/test_supervisor.py`).
+- **Routing** (`supervisor/routing.py`). Rules place a chat question with one
+  specialist (the fast path, at today's cost) or several (the planner, plus an
+  answer checker). A question no rule places would go to the router model; in
+  watch-only mode nothing calls a model, and it is recorded as undecided.
+- **The pin.** The account's latest valuation date, read through the tool server
+  as the person under its own correlation id. The newest published certified build
+  joins it once Medallion's contracted view exists; until then the record keeps
+  the build ids the answer's `[F#]` figures came from and flags mixed builds.
+- **The record** (`migrations/agent/018_supervisor_tasks.sql`, `agent.tasks`). One
+  tree per request: supervisor, lead, specialists, checker. The root keeps the real
+  outcome, the pin, the route, what the analyst actually used (tools, specialists,
+  layers, `figures_source` fallbacks) and usage. Ids, names, dates and counts only:
+  never the question, the answer or a figure. Written by `agent_writer` only, with
+  no update or delete; a chat's tasks go when `purge_conversations` removes its
+  conversation. The recorder runs on a background thread after the answer is
+  saved, never raises, and does nothing until the table exists.
+- **The shadow report** (`python -m wealthryse_agent.supervisor.report --from
+  2026-10-29 --to 2026-11-09`): routing agreement, fast-path share, figures behind
+  the pin or from mixed builds, fallbacks, layers read and cost by route.
+
+**Turning it on.** Ying's typed approval to rerun `scripts/install_agent_schema.py`
+(applies `018_supervisor_tasks.sql`; planned with Medallion's agent release on Wed 28
+Oct), then `AGENT_SUPERVISOR=watch` on the agent service (planned Thu 29 Oct). The
+undo is `AGENT_SUPERVISOR=off`; the table stays, unread. Any other value is off.
+**Once it is on, every later deploy of `infra/agent-apps.bicep` must pass
+`supervisorMode=watch`, or that deploy turns watch off.**
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool

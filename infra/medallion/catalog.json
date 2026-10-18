@@ -981,6 +981,12 @@
    "target_schema": "agent",
    "note": "Agent state."
   },
+  "agent.tasks": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state: the supervisor's task record (one tree per request)."
+  },
   "agent.tool_calls": {
    "kind": "table",
    "layer": "ops",

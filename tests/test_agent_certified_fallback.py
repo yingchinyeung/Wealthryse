@@ -527,8 +527,8 @@ class RuntimeEnforceTest(unittest.TestCase):
         client = SimpleNamespace(list_tools=lambda: [{"name": "get_performance", "description": "",
                                                       "inputSchema": t.REGISTRY["get_performance"].parameters}],
                                  call=lambda name, arguments: json.loads(json.dumps(PERFORMANCE)))
-        with _env(**{certified_tools.CHECK_SETTING: check}), \
-                self.assertLogs("wealthryse_agent.runtime", "INFO") as logged:
+        self.addCleanup(_env(**{certified_tools.CHECK_SETTING: check}).stop)
+        with self.assertLogs("wealthryse_agent.runtime", "INFO") as logged:
             logging.getLogger("wealthryse_agent.runtime").info("start")
             events = list(Agent(_settings(), model_client=model).run(
                 question="How did it do?", account_id=ACCOUNT, tools=client, skip_router=True))

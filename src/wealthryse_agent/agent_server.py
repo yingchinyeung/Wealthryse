@@ -16,6 +16,7 @@ import os
 import queue
 import re
 import threading
+import time
 import uuid
 from datetime import date
 from typing import Any, Callable, Iterator
@@ -39,6 +40,7 @@ from . import calculator, guide_tools
 from ibkr_etl.metrics_guide import METRIC_ANCHORS
 from .runtime import Agent, AgentError
 from .store import Store
+from .supervisor import watch as supervisor
 from .tool_client import ToolCallFailed, ToolClient
 
 LOGGER = logging.getLogger("wealthryse_agent.runtime")
@@ -259,6 +261,8 @@ class Services:
         self._month_store: _LockedStore | None = None
         self._agent: Agent | None = None
         self.keepalive_seconds = KEEPALIVE_SECONDS
+        # The supervisor's watch-only recorder; it runs on a background thread (replaced in tests).
+        self.watch_chat: Callable[..., Any] = supervisor.watch_chat
 
     def store(self) -> Store:
         with self._store_lock:
@@ -322,6 +326,7 @@ def create_app(services: Services) -> FastAPI:
 
     @app.post("/v1/chat")
     def chat(body: ChatRequest, _: ServiceCaller = Depends(caller)) -> StreamingResponse:
+        started = time.monotonic()
         correlation_id = str(uuid.uuid4())
         user = body.user_object_id.lower()
         if body.account_id not in accounts_for(user, correlation_id):
@@ -343,20 +348,39 @@ def create_app(services: Services) -> FastAPI:
 
         instructions = ANALYST.format(account_id=body.account_id, today=date.today().isoformat()) \
             + memory.prompt_block(store.memories(user))
+        # Watch-only: today's analyst answers as before; the supervisor only records what it would have done.
+        watching = supervisor.mode() == "watch"
 
         def events() -> Iterator[str]:
             yield _sse({"type": "start", "conversation_id": conversation_id, "correlation_id": correlation_id})
             tools = guide_tools.GuideTools(services.tools_for(user, correlation_id))
+            recorder = supervisor.Recorder(tools) if watching else None
+
+            def observe(outcome: str, turn: Any = None, error_code: str | None = None) -> None:
+                if not watching:
+                    return
+                try:
+                    services.watch_chat(store=store, tools_for=services.tools_for, user=user,
+                                        account_id=body.account_id, question=body.message,
+                                        correlation_id=correlation_id, conversation_id=conversation_id,
+                                        outcome=outcome, turn=turn, recorder=recorder, error_code=error_code,
+                                        elapsed_ms=int((time.monotonic() - started) * 1000))
+                except Exception:
+                    LOGGER.warning("supervisor watch did not start", extra={"correlation_id": correlation_id})
+
             try:
-                run = services.agent().run(question=body.message, account_id=body.account_id, tools=tools, history=history,
-                                           instructions=instructions)
-                yield from _answers(run, store, user, conversation_id, correlation_id, remember=True)
+                run = services.agent().run(question=body.message, account_id=body.account_id,
+                                           tools=recorder or tools, history=history, instructions=instructions)
+                yield from _answers(run, store, user, conversation_id, correlation_id, remember=True,
+                                    on_turn=observe if watching else None)
             except AgentError as error:
                 store.add_message(conversation_id, "assistant", error.message, status="failed",
                                   correlation_id=correlation_id)
+                observe("failed", error_code=error.code)
                 yield _sse({"type": "error", "code": error.code, "message": error.message})
             except Exception:
                 LOGGER.exception("agent run failed", extra={"correlation_id": correlation_id})
+                observe("failed", error_code="internal_error")
                 yield _sse({"type": "error", "code": "internal_error",
                             "message": "Something went wrong. Nothing was saved as an answer."})
             finally:
@@ -367,8 +391,12 @@ def create_app(services: Services) -> FastAPI:
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
     def _answers(run: Iterator[dict[str, Any]], store: Store, user: str, conversation_id: str,
-                 correlation_id: str, *, remember: bool) -> Iterator[str]:
-        """The run's events as server-sent events, saving the final answer (and any memories) on the way."""
+                 correlation_id: str, *, remember: bool,
+                 on_turn: Callable[[str, Any], None] | None = None) -> Iterator[str]:
+        """The run's events as server-sent events, saving the final answer (and any memories) on the way.
+
+        ``on_turn`` hears each saved answer's outcome and turn (the supervisor's watch-only recorder).
+        """
         for event in _with_keepalive(run, services.keepalive_seconds):
             if event is None:
                 yield ": keepalive\n\n"
@@ -387,6 +415,8 @@ def create_app(services: Services) -> FastAPI:
                 if links:
                     event["guide_links"] = links
                 remembered = _remember(store, user, turn.remember) if remember and event["type"] == "answer" else []
+                if on_turn is not None:
+                    on_turn(event["type"], turn)
                 yield _sse(event)
                 if remembered:
                     yield _sse({"type": "remembered", "memories": remembered})

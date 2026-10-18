@@ -20,6 +20,9 @@ RUN groupadd --gid 10001 agent && \
 
 COPY pyproject.toml requirements.lock ./
 COPY src ./src
+# The certified figures register, read by ibkr_etl.certified_figures from /app/medallion
+# (the agents' certified figures tools, off unless AGENT_CERTIFIED_FIGURES=on).
+COPY infra/medallion ./medallion
 
 RUN python -m pip install --require-hashes -r requirements.lock && \
     python -m pip install --no-deps . && \

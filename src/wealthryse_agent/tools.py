@@ -24,6 +24,8 @@ from ibkr_etl.reporting_currency_holdings import normalize_collected_report_hold
 from ibkr_etl.sector_classification import YAHOO_PROVIDER, aggregate_sector_allocation
 from ibkr_etl.subject_read_contract import ACTIVE_NAV_CURRENCY_SQL, synthetic_exposure
 
+from . import certified_tools
+
 
 class ToolError(Exception):
     """A safe, user-presentable failure. Never carries database text or payloads."""
@@ -44,6 +46,9 @@ class ToolSpec:
     needs_account: bool = True
     # When set, only these scheduled jobs may call it; people (and so website chat) never see it.
     only_jobs: frozenset[str] = frozenset()
+    # Jobs that never see it, and a switch (an environment setting) that hides it unless on.
+    not_jobs: frozenset[str] = frozenset()
+    switch: Callable[[], bool] | None = None
 
 
 def _now() -> str:
@@ -1704,6 +1709,26 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("list_broker_logins", "The IBKR logins added for onboarding, with the latest check of each: its "
              "status, IBKR's error code if it failed, how many accounts it found, and what its Flex query lacks.", _schema({}, []),
              list_broker_logins, False, only_jobs=ONBOARDING),
+    ToolSpec(certified_tools.GET, "Certified figures: the stored, checked figures the website pages show, with "
+             "value, unit, definition and version, as-of date, freshness and lineage. Use it first for any figure it "
+             "serves (list_certified_figures says which), and cite each figure by its ref, e.g. [F1].",
+             _schema({"account_id": _ACCOUNT,
+                      "figures": {"type": "array", "minItems": 1, "maxItems": certified_tools.MAX_FIGURE_IDS,
+                                  "items": {"type": "string"}, "description": "figure ids, e.g. risk.sharpe_ratio"},
+                      "page": {"type": "string", "description": "all figures of one page, e.g. overview"},
+                      "as_of": {"type": "string", "description": "YYYY-MM-DD; omit for the newest published date"},
+                      "period": {"type": "string", "description": "e.g. ytd, year_2025, month_2026-10"},
+                      "benchmark_id": {"type": "string", "description": "omit for the primary benchmark"}},
+                     ["account_id"]), certified_tools.get_certified_figures,
+             not_jobs=certified_tools.NOT_FOR_JOBS, switch=certified_tools.enabled),
+    ToolSpec(certified_tools.TRACE, "Where one certified figure came from: its build and checks status, then each "
+             "job run back to the IBKR statement or market-data file, with times, code versions, row counts and "
+             "sha256. Steps inferred from timing are marked.",
+             _schema({"account_id": _ACCOUNT, "figure_id": {"type": "string"},
+                      "as_of": {"type": "string", "description": "YYYY-MM-DD; omit for the newest published date"},
+                      "period": {"type": "string"}, "item": {"type": "string"}, "benchmark_id": {"type": "string"}},
+                     ["account_id", "figure_id"]), certified_tools.trace_figure,
+             not_jobs=certified_tools.NOT_FOR_JOBS, switch=certified_tools.enabled),
     ToolSpec("list_open_incidents", "The autonomous administrator's open and acknowledged incidents, with its "
              "evidence, for the operations agent to investigate.", _schema({}, []), list_open_incidents, False,
              only_jobs=OPERATIONS),
@@ -1752,9 +1777,13 @@ def json_safe(value: Any) -> Any:
     return value
 
 
+def switched_on(spec: ToolSpec) -> bool:
+    return spec.switch is None or bool(spec.switch())
+
+
 def run_tool(connection, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
     spec = REGISTRY.get(name)
-    if spec is None:
+    if spec is None or not switched_on(spec):
         raise ToolError("unknown_tool", "That tool does not exist.", 404)
     clean = validate_arguments(spec, arguments)
     result = spec.run(connection, clean)

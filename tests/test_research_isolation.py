@@ -15,9 +15,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "infra" / "medallion" / "catalog.json"
-# The only code allowed to name research objects. Neither exists yet; both are where
-# the research job's code will live.
+# The only code allowed to name research objects. None exists yet; this is where the
+# research job's code, its Bicep (containers and container-scoped roles) and its
+# workflows will live.
 RESEARCH_CODE = (ROOT / "src" / "ibkr_etl" / "research", ROOT / "scripts" / "research")
+RESEARCH_DEPLOYMENT = ("infra/research*.bicep", ".github/workflows/research*.yml")
 SCHEMA_REFERENCE = re.compile(r"\bresearch\.[a-z_][a-z0-9_]*", re.IGNORECASE)
 
 
@@ -34,13 +36,25 @@ def _research_containers() -> set[str]:
 
 
 def _served_code() -> list[Path]:
-    """Every Python file outside the research package: website, agents, jobs and scripts."""
+    """Everything outside the research code that could reach a research object.
+
+    Python under src/ and scripts/ (website, agents, jobs), plus deploy/, the Bicep and
+    the workflows, so a role grant or a workflow step naming a research container is
+    caught too.
+    """
+    allowed_deployment = {path for pattern in RESEARCH_DEPLOYMENT for path in ROOT.glob(pattern)}
+    candidates = [
+        *(ROOT / "src").rglob("*.py"),
+        *(ROOT / "scripts").rglob("*.py"),
+        *(path for path in (ROOT / "deploy").rglob("*") if path.is_file()),
+        *(ROOT / "infra").glob("*.bicep"),
+        *(ROOT / ".github" / "workflows").glob("*.yml"),
+    ]
     files = []
-    for folder in (ROOT / "src", ROOT / "scripts"):
-        for path in sorted(folder.rglob("*.py")):
-            if any(path.is_relative_to(allowed) for allowed in RESEARCH_CODE):
-                continue
-            files.append(path)
+    for path in sorted(set(candidates)):
+        if any(path.is_relative_to(allowed) for allowed in RESEARCH_CODE) or path in allowed_deployment:
+            continue
+        files.append(path)
     return files
 
 
@@ -80,7 +94,7 @@ class ResearchIsolationTest(unittest.TestCase):
                 for match in pattern.finditer(text):
                     line = text.count("\n", 0, match.start()) + 1
                     found.append(f"{path.relative_to(ROOT)}:{line}: {match.group(0)}")
-        self.assertEqual(found, [], "only the research package may refer to research objects")
+        self.assertEqual(found, [], "only the research code and its own Bicep and workflows may refer to research objects")
 
 
 if __name__ == "__main__":

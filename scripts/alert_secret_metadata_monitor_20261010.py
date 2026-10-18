@@ -8,6 +8,8 @@ RULE='ibkr-v2-secret-metadata-findings'
 PATH=c.rid('Microsoft.Insights/scheduledQueryRules',RULE)+'?api-version=2023-12-01'
 WORKSPACE='5264a124-10cd-45f6-93a5-6d65c37e9bfb'
 OUT=c.OUT/'alert-v3'
+# v2's own owner route since 18 Oct 2026; v1.1's ibkr-v11-daily-alerts was deleted with v1.1.
+ACTION_GROUP=c.BASE+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts'
 
 
 def query(source='ContainerAppConsoleLogs_CL'):
@@ -45,7 +47,7 @@ def definition():
             'criteria':{'allOf':[{'query':query(),'timeAggregation':'Count','operator':'GreaterThan','threshold':0,
                 'dimensions':[{'name':'Scope','operator':'Include','values':['*']}],
                 'failingPeriods':{'numberOfEvaluationPeriods':1,'minFailingPeriodsToAlert':1}}]},
-            'actions':{'actionGroups':[c.BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts']}}}
+            'actions':{'actionGroups':[ACTION_GROUP]}}}
 
 
 def verify(live):
@@ -101,7 +103,7 @@ def main(stage):
     if not runtime['passed'] or not schedule['passed']:raise ValueError('Monitor not accepted')
     if stage=='plan':
         if c.request('GET',PATH,missing=True) is not None:raise ValueError('Existing alert must not be overwritten')
-        group=c.request('GET',c.BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts?api-version=2023-01-01')['properties']
+        group=c.request('GET',ACTION_GROUP+'?api-version=2023-01-01')['properties']
         emails=group.get('emailReceivers',[])
         if group.get('enabled') is not True or len(emails)!=1 or emails[0].get('emailAddress')!='anthony.ying@wealthryse.ai' or emails[0].get('status')!='Enabled' or any(v for k,v in group.items() if k.endswith('Receivers') and k!='emailReceivers'):raise ValueError('Previously approved owner-only route required')
         live=c.az('monitor','log-analytics','query','-w',WORKSPACE,'--analytics-query',query())
@@ -113,7 +115,7 @@ def main(stage):
     if plan['definition']!=definition():raise ValueError('Alert definition drift')
     if stage=='apply':
         if c.request('GET',PATH,missing=True) is not None or (OUT/'apply-intent.json').exists():raise ValueError('Reconcile existing alert')
-        group=c.request('GET',c.BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts?api-version=2023-01-01')['properties']
+        group=c.request('GET',ACTION_GROUP+'?api-version=2023-01-01')['properties']
         if c.fingerprint(group)!=plan['owner_route_sha256']:raise ValueError('Alert recipient drift')
         c.save(OUT,'apply-intent',{'definition':definition(),'plan_receipt':plan['protected_receipt']});ack=c.request('PUT',PATH,data=definition())
         c.save(OUT,'apply-ack',{'id':ack['id']});print('Owner-routed metadata alert created');return

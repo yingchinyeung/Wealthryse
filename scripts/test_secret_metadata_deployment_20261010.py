@@ -32,7 +32,7 @@ class MetadataDeploymentTests(unittest.TestCase):
     def test_wrong_scope_rejected(self):
         wanted=c.roles('a')[0];actual={'properties':{**wanted['body']['properties'],'scope':'/subscriptions/other'}}
         self.assertFalse(c.role_match(actual,wanted))
-    def test_single_existing_owner_route(self):self.assertEqual(a.definition()['properties']['actions']['actionGroups'],[c.BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts'])
+    def test_single_existing_owner_route(self):self.assertEqual(a.definition()['properties']['actions']['actionGroups'],[c.BASE+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts'])
     def test_alert_no_sensitive_projection(self):
         self.assertNotIn('secret_name',a.query());self.assertNotIn('tags',a.query());self.assertIn('FindingCount',a.query())
     def test_fault_cases_complete(self):self.assertEqual(len(list(a.cases())),26)

@@ -227,7 +227,7 @@ def encode_table(table: str, location: str, columns: list, key: list[str], rows)
 def catalog_tables(only: list[str] | None = None) -> list[dict]:
     """Silver and gold tables in the catalog, sorted by layer.name."""
     found = []
-    for item in medallion_layers.catalog_objects():
+    for item in medallion_layers.catalog_objects(created_in_layer=True):
         if item["layer"] not in LAYERS or item["kind"] != "table":
             continue
         qualified = f"{item['layer']}.{item['name']}"
@@ -238,7 +238,8 @@ def catalog_tables(only: list[str] | None = None) -> list[dict]:
 
 
 def catalog_views() -> list[str]:
-    return sorted(f"{item['layer']}.{item['name']}" for item in medallion_layers.catalog_objects()
+    return sorted(f"{item['layer']}.{item['name']}"
+                  for item in medallion_layers.catalog_objects(created_in_layer=True)
                   if item["layer"] in LAYERS and item["kind"] == "view")
 
 

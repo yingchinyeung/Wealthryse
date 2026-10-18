@@ -1,15 +1,14 @@
-"""The U8 "as known on" draft (infra/medallion/drafts/u8_silver_history.sql) on a real PostgreSQL.
+"""The U8 "as known on" proof on a real PostgreSQL: the worked example of docs/MEDALLION_AS_KNOWN_ON.md.
 
-A proof for docs/MEDALLION_AS_KNOWN_ON.md, not a test of a migration: the draft is not in
-migrations/postgres, so nothing in production applies it. Needs a disposable server: set
+The held migrations (infra/medallion/drafts/u8_silver_history.sql, then u8_fx_event_key.sql) are
+not in migrations/postgres, so nothing in production applies them. Needs a disposable server: set
 AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI starts one). Skipped otherwise. Builds its own
-database with every migration in order, applies the draft as the owner, then loads made-up
-Flex statements with today's unchanged loader. Synthetic data only.
+database with every migration in order, applies the held files as the owner, then loads made-up
+Flex statements with today's loader (IBKR_FX_EVENT_KEY off). Synthetic data only.
+tests/test_silver_history_db.py covers the backfill, the checks, the FX step and the undo.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import tempfile
 import unittest
@@ -19,11 +18,13 @@ from unittest.mock import patch
 
 import test_medallion_layers_db as layers
 from ibkr_etl.config import Settings
+from ibkr_etl.loader import fx_event_identity, fx_event_key as event_key
 from ibkr_etl.service import ingest_content
 
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
-DRAFT = ROOT / "infra" / "medallion" / "drafts" / "u8_silver_history.sql"
+HELD = (ROOT / "infra" / "medallion" / "drafts" / "u8_silver_history.sql",
+        ROOT / "infra" / "medallion" / "drafts" / "u8_fx_event_key.sql")
 TENANT, OTHER_TENANT = layers.TENANT, layers.OTHER_TENANT
 ACCOUNT = "U9100001"
 QUIET_ACCOUNT = "U9100009"
@@ -75,13 +76,9 @@ FX_RESTATED = dict(FX_FIRST, proceeds="128.60", realizedPL="0.60")
 
 
 def fx_event_key(row: dict) -> str:
-    """What the planned loader change computes: the FX row's identity without the amounts IBKR
+    """The loader's event key (IBKR_FX_EVENT_KEY): the FX row's identity without the amounts IBKR
     restates (proceeds, realised P&L), plus its occurrence in the statement (1 here)."""
-    identity = {name: row.get(name) for name in ("account_id", "event_datetime", "report_date",
-                                                  "functional_currency", "fx_currency", "activity_description",
-                                                  "model_code", "quantity_text", "cost_text")}
-    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    return f"fx-event:v1:{digest}:1"
+    return event_key(fx_event_identity(row), 1)
 
 
 @unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
@@ -97,13 +94,14 @@ class AsKnownOnDraftTests(unittest.TestCase):
                 if admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (READER,)).fetchone() is None:
                     admin.execute(f"CREATE ROLE {READER} LOGIN PASSWORD '{layers.PASSWORD}'")
             with layers._connect(cls.database) as owner:
-                # A job login as bootstrap would grant it, before the draft copies SELECT to the history.
+                # A job login as bootstrap would grant it, before the migration copies SELECT to the history.
                 owner.execute(f"GRANT USAGE ON SCHEMA silver, public TO {READER}")
                 for table in TRACKED + ("accounts",):
                     owner.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON silver.{table} TO {READER}")
                 owner.execute(f"GRANT SELECT ON public.accounts TO {READER}")  # the account check reads it
-                owner.execute(DRAFT.read_text(encoding="utf-8"))
-                owner.commit()
+                for path in HELD:
+                    owner.execute(path.read_text(encoding="utf-8"))
+                    owner.commit()
         except Exception:
             layers._drop(cls.database, roles=(READER,))
             raise
@@ -116,7 +114,8 @@ class AsKnownOnDraftTests(unittest.TestCase):
         layers._drop(cls.database, roles=(READER,))
 
     def setUp(self):
-        self.environment = patch.dict(os.environ, {"IBKR_RUN_MIGRATIONS": "false", "IBKR_FLEX_LEGACY_KEY_COMPAT": ""})
+        self.environment = patch.dict(os.environ, {"IBKR_RUN_MIGRATIONS": "false", "IBKR_FLEX_LEGACY_KEY_COMPAT": "",
+                                                   "IBKR_FX_EVENT_KEY": ""})
         self.environment.start()
 
     def tearDown(self):

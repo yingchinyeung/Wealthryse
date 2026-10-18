@@ -288,7 +288,7 @@
    "kind": "table",
    "layer": "bronze",
    "target_schema": "bronze",
-   "note": "Every Flex record as raw JSON; the database copy of the raw statement. Only last_seen_run_id changes after insert."
+   "note": "Every Flex record as raw JSON; the database copy of the raw statement. When IBKR re-sends a record under the same key, the loader overwrites its content (report_date, conid, currency, row_sha256, data_json) and last_seen_run_id: the bronze rule's one exception for IBKR data (migration 069). Every version stays in the raw statement files."
   },
   "public.fx_evidence_batches": {
    "kind": "table",
@@ -1185,6 +1185,53 @@
    "layer": "consumer",
    "target_schema": "agent",
    "note": "Account-scoped facade the agents read."
+  },
+  "silver.cash_transactions_history": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Every version of silver.cash_transactions rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
+   "source": "ibkr",
+   "held": "infra/medallion/drafts/u8_silver_history.sql"
+  },
+  "silver.fx_rates_history": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Every version of silver.fx_rates rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
+   "source": "ibkr",
+   "held": "infra/medallion/drafts/u8_silver_history.sql"
+  },
+  "silver.fx_transactions_history": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Every version of silver.fx_transactions rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
+   "source": "ibkr",
+   "held": "infra/medallion/drafts/u8_silver_history.sql"
+  },
+  "silver.nav_snapshots_history": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Every version of silver.nav_snapshots rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
+   "source": "ibkr",
+   "held": "infra/medallion/drafts/u8_silver_history.sql"
+  },
+  "silver.trades_history": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Every version of silver.trades rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
+   "source": "ibkr",
+   "held": "infra/medallion/drafts/u8_silver_history.sql"
+  },
+  "public.silver_history_settings": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Configuration: one row; recording turns the silver history triggers on (review item U8). Owner only.",
+   "held": "infra/medallion/drafts/u8_silver_history.sql"
   }
  },
  "blob_containers": {

@@ -16,6 +16,8 @@ from ibkr_etl.config import load_settings  # noqa: E402
 from ibkr_etl.db import connect, initialize, transaction  # noqa: E402
 from ibkr_etl.evidence_acl import quarantine_evidence_objects  # noqa: E402
 from ibkr_etl.medallion_layers import (  # noqa: E402
+    history_write_rights,
+    keep_history_read_only,
     mirror_privileges,
     mismatches,
     present_layers,
@@ -521,6 +523,11 @@ def main(argv: list[str] | None = None) -> int:
             problems = mismatches(connection, managed_roles)
             if problems:
                 raise RuntimeError("Layer table rights differ from their public views: " + "; ".join(problems))
+            # The U8 history is written only through its trigger (nothing until that migration).
+            keep_history_read_only(connection, managed_roles)
+            problems = history_write_rights(connection, managed_roles)
+            if problems:
+                raise RuntimeError("A login can still write the silver history: " + "; ".join(problems))
             # Runtime logins find the layer tables first. This migration login keeps
             # public first, and apply_postgres_migrations sets it for its own transaction.
             for role in managed_roles:

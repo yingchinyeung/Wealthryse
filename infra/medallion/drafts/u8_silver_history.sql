@@ -1,26 +1,44 @@
--- DRAFT for review item U8, "as known on" history. NOT A MIGRATION.
--- bootstrap_postgres.py and db.py read only migrations/postgres, so nothing applies this
--- file. tests/test_as_known_on_draft_db.py applies it to a throwaway database to show the
--- design working. docs/MEDALLION_AS_KNOWN_ON.md has the design; once approved, this
--- becomes the step-1 migration (part A) and the FX step's migration (part B).
+-- Review item U8, step 1: "as known on" history for five silver tables. HELD MIGRATION.
+-- Not in migrations/postgres, so no bootstrap or job applies it. On its approved day it moves
+-- there under the next free number and runs alone (bootstrap_postgres.py --only-migration).
+-- docs/MEDALLION_AS_KNOWN_ON.md has the design; u8_silver_history_undo.sql reverses it.
 --
--- Part A changes nothing readers see. Each tracked silver table keeps its name, columns,
--- key and writers. Beside it, <table>_history keeps every version of every row:
+-- Nothing readers see changes. Each tracked table keeps its name, columns, key and writers.
+-- Beside it, <table>_history keeps every version of every row:
 --   valid_date     when it happened (the row's own trade, report, rate or NAV date)
 --   recorded_from  when we learned this version (the loading transaction's start time)
---   recorded_to    when a newer version replaced it, or IBKR's row was removed (NULL: current)
+--   recorded_to    when a newer version replaced it, or the row was removed (NULL: current)
 -- A trigger on the table writes the history, whoever writes the table. A row seen again
--- unchanged (every daily pull re-sends 14 days) adds nothing. <table>_as_known(at) returns
--- the table exactly as it stood at that moment, with the table's own columns.
+-- unchanged adds nothing. <table>_as_known(at) returns the table as it stood at that moment.
 --
--- Recording is off until public.silver_history_settings.recording is true. The switch-on
--- step sets it in the same transaction as the backfill, so no write falls between them.
--- Only the owner can change the setting or write the history directly; the jobs' logins
--- get SELECT on the history, and their writes reach it only through the trigger.
--- Undo: set recording to false (the history stays and nothing reads it), or drop the
--- triggers, functions and _history tables (the current tables are untouched).
+-- Recording is off until public.silver_history_settings.recording is true, so applying this
+-- changes nothing. scripts/medallion_silver_history.py backfill --apply fills the history
+-- and turns recording on in one transaction. Only the owner writes the history or the
+-- setting; bootstrap_postgres.py keeps the jobs' logins to SELECT on both.
 
 SET LOCAL lock_timeout = '5s';
+
+-- As in 068 to 071: take every lock at once without joining the lock queue, so website
+-- queries never wait behind this; give up after 5 seconds having changed nothing.
+DO $$
+DECLARE
+    deadline CONSTANT timestamptz := clock_timestamp() + interval '5 seconds';
+BEGIN
+    LOOP
+        BEGIN
+            LOCK TABLE silver.trades, silver.cash_transactions, silver.fx_transactions, silver.fx_rates,
+                silver.nav_snapshots IN SHARE ROW EXCLUSIVE MODE NOWAIT;
+            EXIT;
+        EXCEPTION WHEN lock_not_available THEN
+            IF clock_timestamp() >= deadline THEN
+                RAISE EXCEPTION 'the history step could not lock its tables within 5 seconds, so nothing was changed'
+                    USING ERRCODE = 'lock_not_available', HINT = 'Run it again a minute later.';
+            END IF;
+            PERFORM pg_sleep(0.05);
+        END;
+    END LOOP;
+END;
+$$;
 
 CREATE TABLE IF NOT EXISTS public.silver_history_settings (
     id BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
@@ -32,7 +50,7 @@ CREATE TABLE IF NOT EXISTS public.silver_history_settings (
 INSERT INTO public.silver_history_settings (id) VALUES (true) ON CONFLICT (id) DO NOTHING;
 REVOKE ALL ON public.silver_history_settings FROM PUBLIC;
 COMMENT ON TABLE public.silver_history_settings IS
-    'One row. recording=true turns on the silver _history triggers (review item U8).';
+    'One row. recording=true turns on the silver _history triggers (review item U8). Owner only.';
 
 CREATE OR REPLACE FUNCTION silver.history_recording() RETURNS BOOLEAN
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
@@ -133,6 +151,44 @@ BEGIN
 END;
 $$;
 
+-- History columns first, then the table's own columns in the table's order, so a column a
+-- later migration adds to both tables stays aligned.
+CREATE TABLE IF NOT EXISTS silver.trades_history (
+    version_id BIGSERIAL PRIMARY KEY, valid_date DATE, recorded_from TIMESTAMPTZ NOT NULL, recorded_to TIMESTAMPTZ,
+    opened_by TEXT NOT NULL CHECK (opened_by IN ('first', 'restated', 'baseline')),
+    closed_by TEXT CHECK (closed_by IN ('restated', 'merged', 'withdrawn', 'deleted')),
+    recorded_run_id BIGINT, lineage_run_id UUID, opened_note TEXT, closed_note TEXT,
+    LIKE silver.trades,
+    CHECK (recorded_to IS NULL OR recorded_to >= recorded_from), CHECK ((recorded_to IS NULL) = (closed_by IS NULL)));
+CREATE TABLE IF NOT EXISTS silver.cash_transactions_history (
+    version_id BIGSERIAL PRIMARY KEY, valid_date DATE, recorded_from TIMESTAMPTZ NOT NULL, recorded_to TIMESTAMPTZ,
+    opened_by TEXT NOT NULL CHECK (opened_by IN ('first', 'restated', 'baseline')),
+    closed_by TEXT CHECK (closed_by IN ('restated', 'merged', 'withdrawn', 'deleted')),
+    recorded_run_id BIGINT, lineage_run_id UUID, opened_note TEXT, closed_note TEXT,
+    LIKE silver.cash_transactions,
+    CHECK (recorded_to IS NULL OR recorded_to >= recorded_from), CHECK ((recorded_to IS NULL) = (closed_by IS NULL)));
+CREATE TABLE IF NOT EXISTS silver.fx_transactions_history (
+    version_id BIGSERIAL PRIMARY KEY, valid_date DATE, recorded_from TIMESTAMPTZ NOT NULL, recorded_to TIMESTAMPTZ,
+    opened_by TEXT NOT NULL CHECK (opened_by IN ('first', 'restated', 'baseline')),
+    closed_by TEXT CHECK (closed_by IN ('restated', 'merged', 'withdrawn', 'deleted')),
+    recorded_run_id BIGINT, lineage_run_id UUID, opened_note TEXT, closed_note TEXT,
+    LIKE silver.fx_transactions,
+    CHECK (recorded_to IS NULL OR recorded_to >= recorded_from), CHECK ((recorded_to IS NULL) = (closed_by IS NULL)));
+CREATE TABLE IF NOT EXISTS silver.fx_rates_history (
+    version_id BIGSERIAL PRIMARY KEY, valid_date DATE, recorded_from TIMESTAMPTZ NOT NULL, recorded_to TIMESTAMPTZ,
+    opened_by TEXT NOT NULL CHECK (opened_by IN ('first', 'restated', 'baseline')),
+    closed_by TEXT CHECK (closed_by IN ('restated', 'merged', 'withdrawn', 'deleted')),
+    recorded_run_id BIGINT, lineage_run_id UUID, opened_note TEXT, closed_note TEXT,
+    LIKE silver.fx_rates,
+    CHECK (recorded_to IS NULL OR recorded_to >= recorded_from), CHECK ((recorded_to IS NULL) = (closed_by IS NULL)));
+CREATE TABLE IF NOT EXISTS silver.nav_snapshots_history (
+    version_id BIGSERIAL PRIMARY KEY, valid_date DATE, recorded_from TIMESTAMPTZ NOT NULL, recorded_to TIMESTAMPTZ,
+    opened_by TEXT NOT NULL CHECK (opened_by IN ('first', 'restated', 'baseline')),
+    closed_by TEXT CHECK (closed_by IN ('restated', 'merged', 'withdrawn', 'deleted')),
+    recorded_run_id BIGINT, lineage_run_id UUID, opened_note TEXT, closed_note TEXT,
+    LIKE silver.nav_snapshots,
+    CHECK (recorded_to IS NULL OR recorded_to >= recorded_from), CHECK ((recorded_to IS NULL) = (closed_by IS NULL)));
+
 DO $$
 DECLARE
     -- table, valid-date column, key columns (the table's primary key)
@@ -150,47 +206,12 @@ DECLARE
     history text;
     columns text;
     grantee text;
-    targets text;
-    deadline CONSTANT timestamptz := clock_timestamp() + interval '5 seconds';
 BEGIN
-    -- As in 068 to 071: take every lock at once without joining the lock queue, so website
-    -- queries never wait behind this; give up after 5 seconds having changed nothing.
-    SELECT string_agg(format('silver.%I', tracked[n][1]), ', ') INTO targets
-      FROM generate_subscripts(tracked, 1) AS n;
-    LOOP
-        BEGIN
-            EXECUTE format('LOCK TABLE %s IN SHARE ROW EXCLUSIVE MODE NOWAIT', targets);
-            EXIT;
-        EXCEPTION WHEN lock_not_available THEN
-            IF clock_timestamp() >= deadline THEN
-                RAISE EXCEPTION 'the history step could not lock its tables within 5 seconds, so nothing was changed'
-                    USING ERRCODE = 'lock_not_available', HINT = 'Run it again a minute later.';
-            END IF;
-            PERFORM pg_sleep(0.05);
-        END;
-    END LOOP;
     FOR i IN 1 .. array_length(tracked, 1) LOOP
         rel := tracked[i][1];
         valid := tracked[i][2];
         keys := string_to_array(tracked[i][3], ',');
         history := rel || '_history';
-        -- History columns first, then the table's own columns in the table's order, so a
-        -- column a later migration adds to both tables stays aligned.
-        EXECUTE format(
-            'CREATE TABLE IF NOT EXISTS silver.%I ('
-            ' version_id BIGSERIAL PRIMARY KEY,'
-            ' valid_date DATE,'
-            ' recorded_from TIMESTAMPTZ NOT NULL,'
-            ' recorded_to TIMESTAMPTZ,'
-            ' opened_by TEXT NOT NULL CHECK (opened_by IN (''first'', ''restated'', ''baseline'')),'
-            ' closed_by TEXT CHECK (closed_by IN (''restated'', ''merged'', ''withdrawn'', ''deleted'')),'
-            ' recorded_run_id BIGINT,'
-            ' lineage_run_id UUID,'
-            ' opened_note TEXT,'
-            ' closed_note TEXT,'
-            ' LIKE silver.%I,'
-            ' CHECK (recorded_to IS NULL OR recorded_to >= recorded_from),'
-            ' CHECK ((recorded_to IS NULL) = (closed_by IS NULL)))', history, rel);
         EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON silver.%I (%s) WHERE recorded_to IS NULL',
                        history || '_open', history, array_to_string(keys, ', '));
         EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON silver.%I (%s, recorded_from)',
@@ -199,7 +220,7 @@ BEGIN
                        history || '_valid', history);
         EXECUTE format('COMMENT ON TABLE silver.%I IS %L', history,
                        format('Every version of silver.%s rows (review item U8). Written only by the '
-                              'record_version trigger while recording is on.', rel));
+                              'record_version trigger while recording is on, and by the owner''s backfill.', rel));
         -- The same isolation as the table: by account, through silver.accounts.
         EXECUTE format('ALTER TABLE silver.%I ENABLE ROW LEVEL SECURITY', history);
         EXECUTE format('ALTER TABLE silver.%I FORCE ROW LEVEL SECURITY', history);
@@ -213,7 +234,8 @@ BEGIN
         EXECUTE format('DROP TRIGGER IF EXISTS history_no_truncate ON silver.%I', history);
         EXECUTE format('CREATE TRIGGER history_no_truncate BEFORE TRUNCATE ON silver.%I '
                        'FOR EACH STATEMENT EXECUTE FUNCTION silver.refuse_history_change()', history);
-        -- Whoever can read the table can read its history; nobody else writes it.
+        -- Whoever can read the table can read its history. Nobody but the owner writes it, so
+        -- write rights that default privileges gave at creation are taken back.
         FOR grantee IN
             SELECT DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(a.grantee)) END
               FROM pg_class c, aclexplode(c.relacl) a
@@ -221,6 +243,15 @@ BEGIN
                AND a.grantee <> c.relowner AND a.privilege_type = 'SELECT'
         LOOP
             EXECUTE format('GRANT SELECT ON silver.%I TO %s', history, grantee);
+        END LOOP;
+        FOR grantee IN
+            SELECT DISTINCT CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(a.grantee)) END
+              FROM pg_class c, aclexplode(c.relacl) a
+             WHERE c.oid IN (format('silver.%I', history)::regclass, 'public.silver_history_settings'::regclass)
+               AND a.grantee <> c.relowner AND a.privilege_type <> 'SELECT'
+        LOOP
+            EXECUTE format('REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON silver.%I, '
+                           'public.silver_history_settings FROM %s', history, grantee);
         END LOOP;
         EXECUTE format('DROP TRIGGER IF EXISTS record_version ON silver.%I', rel);
         EXECUTE format('CREATE TRIGGER record_version AFTER INSERT OR UPDATE OR DELETE ON silver.%I '
@@ -241,34 +272,5 @@ BEGIN
         EXECUTE format('COMMENT ON FUNCTION silver.%I(TIMESTAMPTZ) IS %L', rel || '_as_known',
                        format('silver.%s as it stood at the given moment (review item U8).', rel));
     END LOOP;
-END;
-$$;
-
--- Part B, the FX step (a separate migration, after part A has run in shadow): an FX row's
--- identity without the amounts IBKR restates. The loader (behind IBKR_FX_EVENT_KEY=true)
--- fills it as fx-event:v1:<sha256 of the identity>:<occurrence in the statement> and
--- updates the row with the same event_key instead of adding a second one. source_key
--- keeps naming the bronze row of the latest version, so lineage still joins flex_rows.
--- The switch-on step fills event_key for existing rows from the replay and merges the
--- re-sent duplicates; each merged row stays in the history as a closed version.
-ALTER TABLE silver.fx_transactions ADD COLUMN IF NOT EXISTS event_key TEXT;
-ALTER TABLE silver.fx_transactions_history ADD COLUMN IF NOT EXISTS event_key TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS fx_transactions_event_key
-    ON silver.fx_transactions (account_id, event_key) WHERE event_key IS NOT NULL;
-COMMENT ON COLUMN silver.fx_transactions.event_key IS
-    'The FX event this row is the latest version of; NULL until the FX step fills it (review item U8).';
--- A view fixes its column list when it is created (tests/test_medallion_layers_db.py).
-CREATE OR REPLACE VIEW public.fx_transactions WITH (security_invoker = true) AS SELECT * FROM silver.fx_transactions;
-DO $$
-DECLARE
-    columns text;
-BEGIN
-    SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum) INTO columns
-      FROM pg_attribute WHERE attrelid = 'silver.fx_transactions'::regclass AND attnum > 0 AND NOT attisdropped;
-    DROP FUNCTION IF EXISTS silver.fx_transactions_as_known(TIMESTAMPTZ);
-    EXECUTE format(
-        'CREATE FUNCTION silver.fx_transactions_as_known(at TIMESTAMPTZ) RETURNS SETOF silver.fx_transactions '
-        'LANGUAGE sql STABLE AS $f$ SELECT %s FROM silver.fx_transactions_history '
-        'WHERE recorded_from <= at AND (recorded_to IS NULL OR recorded_to > at) $f$', columns);
 END;
 $$;

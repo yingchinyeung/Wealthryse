@@ -345,6 +345,67 @@ class Store:
         self._commit()
         return int(row["removed"])
 
+    # Supervisor tasks (migrations/agent/018) ---------------------------------
+
+    def tasks_ready(self) -> bool:
+        """Whether agent.tasks is installed; watch-only mode does nothing until it is."""
+        row = self.db.execute("SELECT to_regclass('agent.tasks') IS NOT NULL AS ready").fetchone()
+        self.db.rollback()
+        return bool(row["ready"])
+
+    def add_tasks(self, rows: Sequence[dict[str, Any]]) -> bool:
+        """Write one task tree in one transaction, parents first.
+
+        A row the table refuses rolls the tree back and returns False rather than raising, so a bad
+        record never makes the shared connection reconnect. A broken connection still raises.
+        """
+        try:
+            for row in rows:
+                self.db.execute(
+                    "INSERT INTO agent.tasks(task_id, root_id, parent_id, tenant_id, mode, source, level, team, role, "
+                    "autonomy, status, subject_id, correlation_id, conversation_id, pinned_as_of, build_ids, "
+                    "tools_allowed, tools_used, usage, detail) VALUES (?::uuid, ?::uuid, ?::uuid, ?::uuid, ?, ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?::uuid, ?::date, ?::text[], ?::text[], ?::text[], ?::jsonb, ?::jsonb)",
+                    (row["task_id"], row["root_id"], row.get("parent_id"), self.tenant_id, row["mode"], row["source"],
+                     row["level"], row.get("team"), row["role"], row["autonomy"], row["status"], row.get("subject_id"),
+                     row.get("correlation_id"), row.get("conversation_id"), row.get("pinned_as_of"),
+                     list(row.get("build_ids") or []), list(row.get("tools_allowed") or []),
+                     list(row.get("tools_used") or []), json.dumps(row.get("usage") or {}),
+                     json.dumps(row.get("detail") or {}, default=str)),
+                )
+        except Exception as error:
+            if not _refused(error):
+                raise
+            self.db.rollback()
+            return False
+        self._commit()
+        return True
+
+    def task_roots(self, since: str, until: str) -> list[dict[str, Any]]:
+        """The supervisor rows (one per request) created in [since, until), UTC days, oldest first."""
+        rows = self.db.execute(
+            "SELECT task_id::text AS task_id, mode, source, status, subject_id, pinned_as_of, build_ids, tools_used, "
+            "usage, detail, created_at FROM agent.tasks WHERE tenant_id = ?::uuid AND parent_id IS NULL "
+            "AND created_at >= (?::date)::timestamp AT TIME ZONE 'UTC' "
+            "AND created_at < (?::date)::timestamp AT TIME ZONE 'UTC' ORDER BY created_at",
+            (self.tenant_id, since, until),
+        ).fetchall()
+        self.db.rollback()
+        return [_json_columns(dict(r), "usage", "detail") for r in rows]
+
+
+def _refused(error: Exception) -> bool:
+    """The statement was refused (a check, a bad value, a missing grant), but the connection is fine.
+
+    A lost or broken connection (OperationalError, InterfaceError) is not a refusal and still raises.
+    """
+    try:
+        import psycopg
+    except ImportError:  # pragma: no cover - psycopg is a dependency of the image
+        return False
+    return isinstance(error, (psycopg.errors.IntegrityError, psycopg.errors.DataError,
+                              psycopg.errors.ProgrammingError, psycopg.errors.NotSupportedError))
+
 
 def _json_columns(row: dict[str, Any], *names: str) -> dict[str, Any]:
     for name in names:

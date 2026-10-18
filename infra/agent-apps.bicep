@@ -42,6 +42,9 @@ param chatTimeoutSeconds int = 210
 param chatMaxOutputTokens int = 32000
 param chatMaxToolCalls int = 16
 param retentionDays int = 90
+@description('The supervisor (docs/AGENTS.md). watch records beside each chat answer what it would have done, in agent.tasks; nobody sees a change. Needs migrations/agent/018 installed.')
+@allowed(['off', 'watch'])
+param supervisorMode string = 'off'
 
 param agentAppName string = 'ibkrv2stg-agent'
 param toolsAppName string = 'ibkrv2stg-agent-tools'
@@ -221,6 +224,7 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AGENT_TIMEOUT_SECONDS', value: string(chatTimeoutSeconds) }
             { name: 'AGENT_MAX_OUTPUT_TOKENS', value: string(chatMaxOutputTokens) }
             { name: 'AGENT_MAX_TOOL_CALLS', value: string(chatMaxToolCalls) }
+            { name: 'AGENT_SUPERVISOR', value: supervisorMode }
           ])
           resources: { cpu: json('0.5'), memory: '1Gi' }
           probes: probes

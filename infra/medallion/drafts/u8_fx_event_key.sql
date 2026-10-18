@@ -1,7 +1,10 @@
 -- Review item U8, the FX step: one row per FX event. HELD MIGRATION, after
--- u8_silver_history.sql has run in shadow. Not in migrations/postgres, so nothing applies it
--- until its approved day, when it moves there under the next free number and runs alone.
--- In the same change, silver/fx_transactions.yaml gains event_key (1.1.0).
+-- u8_silver_history.sql (074_silver_history.sql) has run with recording on. Not in
+-- migrations/postgres, so nothing applies it until its approved day (Thu 29 Oct 2026), when it
+-- moves there unchanged as 075_fx_event_key.sql and runs alone:
+--   bootstrap_postgres.py --only-migration 075_fx_event_key.sql
+-- In the same change, silver/fx_transactions.yaml and silver/fx_transactions_history.yaml gain
+-- event_key. docs/MEDALLION_AS_KNOWN_ON.md ("The FX step in October") has the order and checks.
 --
 -- event_key is an FX row's identity without the two amounts IBKR restates (proceeds and
 -- realised P&L): fx-event:v1:<sha256 of the identity>:<occurrence in the statement>
@@ -17,6 +20,9 @@ DO $$
 DECLARE
     deadline CONSTANT timestamptz := clock_timestamp() + interval '5 seconds';
 BEGIN
+    IF to_regclass('silver.fx_transactions_history') IS NULL THEN
+        RAISE EXCEPTION 'the FX step needs the history migration (074_silver_history.sql) first, so nothing was changed';
+    END IF;
     LOOP
         BEGIN
             LOCK TABLE silver.fx_transactions, silver.fx_transactions_history IN ACCESS EXCLUSIVE MODE NOWAIT;

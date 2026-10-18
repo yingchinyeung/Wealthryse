@@ -109,34 +109,82 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
     imports for its newest run date (`institutional_work_items`). They must all have
     succeeded and must cover yesterday, because the pull asks IBKR for data up to
     yesterday;
-  - benchmarks and FX: the newest finished benchmark run in `ingestion_runs`;
+  - benchmarks and FX: the newest finished benchmark run in `ingestion_runs`, and the
+    newest sector-classification run in the lineage records (below);
   - derived: each subject's newest calculation in derived-daily's newest execution
-    (`subject_calculation_runs`); one still running means it has not finished;
-  - risk: the time the risk job last checked each snapshot (`risk_analytics_snapshots`).
+    (`subject_calculation_runs`); one still running means it has not finished. A failed
+    or blocked calculation of a subject that is not live (`platform_subjects` lifecycle
+    not `active`, for example still in onboarding) is listed as `waiting` and not
+    counted, because risk and reports only process active subjects. A live subject's
+    failed or blocked calculation still stops the check;
+  - risk: the time the risk job last checked each snapshot (`risk_analytics_snapshots`),
+    and the risk job's newest run in the lineage records.
 
   These must have succeeded today (UTC), after the steps they read. The expected dates
   go through `workflow_dates`, as a persisted date policy would. If the shadow ledger
   ever has rows for the cycle (`daily:<date>`, subject `daily-cycle`), they must agree
   too. Today it has none: migrations 054 and 060 are held back in production.
+- **Lineage records as start and finish.** With `LINEAGE_RECORDING=true`, risk-snapshots
+  and sector-classification leave a START row in `lineage_events` (migration 071) and
+  one COMPLETE, FAIL or ABORT row when they end. For each of them the check reads the
+  newest run:
+  - a START with no end, younger than the job's `replicaTimeout`, means still running,
+    so not ready. This is what stops month-end at 09:00 from passing on snapshots the
+    08:55 risk run is still stamping, and derived from starting before sectors end;
+  - COMPLETE, or FAIL from a non-zero return code (the job ran to its end, for example
+    sectors returning 2 for unclassified holdings), means finished. The risk evidence
+    is then dated by the run's end, and a stage that ended before sectors ended must
+    recalculate;
+  - FAIL from an exception (including a readiness stop) or ABORT means not validated;
+  - no record, a run that ended before this cycle, a START with no end after the
+    `replicaTimeout`, or a table that is missing or unreadable: the record is not used.
+    Risk is then judged by its snapshots alone, as before, and sectors are not checked.
+    The decision says so in `notes`, which never make the inputs not ready.
 - **How it runs.** One READ ONLY session with short timeouts
   (`layer_freshness.open_read_only`), within a hard 10-second limit, using the job's own
-  `DATABASE_URL` (`INPUT_READINESS_DATABASE_URL` overrides it). A step it cannot read
-  makes the inputs not ready. It never writes, so the decision goes to the log, not to
-  the ledger.
+  `DATABASE_URL` (`INPUT_READINESS_DATABASE_URL` overrides it; that login needs SELECT on
+  the evidence tables and `platform_subjects`, and on `lineage_events` for the lineage
+  part). A step it cannot read makes the inputs not ready. It never writes, so the
+  decision goes to the log, not to the ledger.
 - **Modes,** set by `INPUT_READINESS_MODE` on the job:
   - `off`, the default and also when the variable is unset: nothing runs. No query, no
-    log line, no new way to fail. A test proves this.
-  - `shadow`: logs one line, `INPUT_READINESS {json}`, with the decision, the reasons
-    and each step's evidence, and the job always carries on.
+    log line, no wait, no new way to fail. A test proves this.
+  - `shadow`: logs one line, `INPUT_READINESS {json}`, with the decision, the reasons,
+    the notes and each step's evidence, and the job always carries on. It never waits.
   - `enforce`: the same line with `"decision":"stop"`, then the job ends with exit code
-    75 before doing anything, so the execution shows as failed. For after month-end
-    (S6); nothing sets it today.
-- **Switching shadow on** is a separate approved step: add
-  `INPUT_READINESS_MODE=shadow` to the six job definitions, on an image built from a
-  `main` that has this code. To read the results:
-  `ContainerAppConsoleLogs_CL | where Log_s startswith 'INPUT_READINESS '`. Run shadow
-  for at least two weeks and explain every "not ready" before enforce. The evidence
-  queries are judged on synthetic data only so far.
+    75 before doing anything, so the execution shows as failed. With
+    `INPUT_READINESS_WAIT_SECONDS` above 0 (default 0: no wait), a job that is not
+    ready first logs a line with `"decision":"wait"`, then checks again every
+    `INPUT_READINESS_RECHECK_SECONDS` (default 60, at least 5) until it is ready or the
+    wait is over, and logs the final line with `attempts`, `waited_seconds` and
+    `first_reasons`. Each check has its own session and 10-second limit, so the gate
+    takes at most the wait plus about 20 seconds. The wait is capped at 1800 seconds; a
+    value that is not a number means no wait, and the line notes it.
+- **Recommended enforce settings.** Every job has `replicaRetryLimit: 0`, so a stop is
+  final for the day. The wait covers a step that is a few minutes late; it must leave
+  the job most of its `replicaTimeout`. Only derived-daily's run time is on record
+  (about 1.5 minutes), so these leave wide margins:
+
+  | Job | Starts (UTC) | `replicaTimeout` | Waits for | Wait | Recheck | Left for the job |
+  |---|---|---|---|---|---|---|
+  | benchmark-daily | 08:30 | 1200 s | pull (08:20) | 300 s | 30 s | at least 880 s |
+  | sector-classification | 08:45 | 1800 s | pull | 600 s | 60 s | at least 1180 s |
+  | derived-daily | 08:50 | 3600 s | pull, benchmark, sectors | 900 s | 60 s | at least 2680 s |
+  | risk-snapshots | 08:55 | 3600 s | derived, benchmark, sectors | 900 s | 60 s | at least 2680 s |
+  | month-end-factsheet | 09:00 | 3600 s | risk | 900 s | 60 s | at least 2680 s |
+  | crisis-scenarios-daily | 09:20 | 1800 s | derived, benchmark, sectors | 300 s | 60 s | at least 1480 s |
+
+  A stop still passes down the chain: a job that stopped leaves its stage stale, so the
+  jobs after it stop too, as they should.
+- **Not covered yet.** Reports (month-end-factsheet) leave no record of each daily run,
+  so the analyst-assurance job (09:10) has nothing to check and calls no gate. Once
+  month-end-factsheet runs inside `lineage.run_main("ibkrv2stg-month-end-factsheet", ...)`
+  with `LINEAGE_RECORDING=true`, its lineage runs can be the reports evidence the same way.
+- **Switching it on** is a separate approved step: add `INPUT_READINESS_MODE` (and for
+  enforce the wait settings) to the six job definitions, with `LINEAGE_RECORDING=true`
+  on the jobs above, on an image built from a `main` that has this code. To read the
+  results: `ContainerAppConsoleLogs_CL | where Log_s startswith 'INPUT_READINESS '`.
+  Explain every "not ready". The evidence queries are judged on synthetic data only so far.
 - `python -m ibkr_etl.input_readiness <job>` prints a dry run of the check.
 
 ## Release data report

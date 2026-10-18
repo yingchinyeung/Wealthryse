@@ -1,10 +1,13 @@
 """Input readiness against a real PostgreSQL with every migration applied.
 
 Needs a disposable server: set AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI starts
-one). Skipped otherwise. Creates and drops its own database and roles and writes
+one). Skipped otherwise. Creates and drops its own databases and roles and writes
 synthetic rows only. Shows the evidence queries judge a cycle that ran as ready and a
 late pull as not ready, that shadow and enforce act on that, and that with the mode
-unset the gate opens no connection and logs nothing.
+unset the gate opens no connection and logs nothing. Also that a subject still in
+onboarding does not hold up risk, that an open lineage run of risk or sectors does,
+that enforce waits and checks again, and that without migration 071 (no lineage_events)
+the check falls back to the evidence it used before.
 """
 from __future__ import annotations
 
@@ -12,7 +15,7 @@ import json
 import os
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,11 +26,15 @@ ROOT = Path(__file__).resolve().parents[1]
 TENANT = "00000000-0000-0000-0000-000000000001"
 OWNER = "readiness_test_owner"
 NO_READS = "readiness_test_no_reads"
+READER = "readiness_test_reader"  # reads the evidence tables but not lineage_events
 TEST_PASSWORD = "readiness-test-only-password"  # throwaway roles in a disposable test server
 TOLERATED_MIGRATIONS = {"027_legacy_external_market_data_approval.sql", "056_specialist_audit_ledger.sql"}
 DAY = "2026-10-19"  # a Monday; the pull asks for data up to Sunday 18 Oct
 EVIDENCE_TABLES = ("risk_analytics_snapshots", "subject_calculation_runs", "institutional_work_items",
                    "ingestion_runs")
+READER_TABLES = (*EVIDENCE_TABLES, "platform_subjects")
+LINEAGE_MIGRATION = "071_lineage_records.sql"
+RISK_JOB, SECTOR_JOB = "ibkrv2stg-risk-snapshots", "ibkrv2stg-sector-classification"
 
 
 def _dsn(database: str, user: str | None = None) -> str:
@@ -81,27 +88,48 @@ def _cycle(connection, day: str, *, pull: bool = True) -> None:
 
 
 DEFINITION = "6f0b6c9e-1d1e-4f43-9a55-2b8f3f1d0001"
+ONBOARDING_DEFINITION = "6f0b6c9e-1d1e-4f43-9a55-2b8f3f1d0002"
+
+
+def _calculation(connection, subject: str, status: str, completed: datetime, *, day: str = DAY) -> None:
+    definition = ONBOARDING_DEFINITION if subject == "SYN-ONBOARDING" else DEFINITION
+    connection.execute(
+        "INSERT INTO subject_calculation_runs(calculation_run_id, subject_id, definition_id, requested_from, "
+        "requested_to, status, started_at, completed_at) VALUES (%s, %s, %s, '2025-01-20', %s, %s, %s, %s)",
+        (str(uuid.uuid4()), subject, definition, day, status, completed - timedelta(minutes=1), completed))
+
+
+def _lineage(connection, job: str, event: str, at: datetime, *, run_id: str, facets: dict | None = None) -> None:
+    connection.execute(
+        "INSERT INTO lineage_events(run_id, event_type, event_time, job_namespace, job_name, producer, facets) "
+        "VALUES (%s, %s, %s, 'wealthryse', %s, 'synthetic-test', %s)",
+        (run_id, event, at, job, json.dumps(facets or {})))
 
 
 @unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
-class InputReadinessDatabaseTests(unittest.TestCase):
+class _ReadinessDatabase(unittest.TestCase):
+    """A disposable database with every migration applied except SKIPPED."""
+    SKIPPED: frozenset[str] = frozenset()
+
     @classmethod
     def setUpClass(cls):
         import psycopg
 
         cls.database = "readiness_test_" + uuid.uuid4().hex[:8]
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
-            admin.execute(f"DROP ROLE IF EXISTS {NO_READS}")
+            for role in (NO_READS, READER):
+                admin.execute(f"DROP ROLE IF EXISTS {role}")
             if admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (OWNER,)).fetchone() is None:
                 # Like Azure: the owner is not a superuser, so forced row-level security applies.
                 admin.execute(f"CREATE ROLE {OWNER} LOGIN PASSWORD '{TEST_PASSWORD}'")
-            admin.execute(f"CREATE ROLE {NO_READS} LOGIN PASSWORD '{TEST_PASSWORD}'")
+            for role in (NO_READS, READER):
+                admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD '{TEST_PASSWORD}'")
             admin.execute(f'CREATE DATABASE "{cls.database}" OWNER {OWNER}')
         with psycopg.connect(_dsn(cls.database), autocommit=True) as admin:
             admin.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         with psycopg.connect(_dsn(cls.database, OWNER)) as owner:
             for path in sorted((ROOT / "migrations" / "postgres").glob("*.sql")):
-                if "_medallion_" in path.name:
+                if "_medallion_" in path.name or path.name in cls.SKIPPED:
                     continue  # the layer moves keep these names working (test_medallion_layers_db)
                 try:
                     owner.execute(path.read_text(encoding="utf-8"))
@@ -118,15 +146,19 @@ class InputReadinessDatabaseTests(unittest.TestCase):
             owner.execute(
                 "INSERT INTO platform_subjects(subject_id, subject_type, display_name, lifecycle_status) VALUES "
                 "('U0000001', 'physical_account', 'Synthetic account', 'active'), "
-                "('SYN-COMPOSITE', 'composite_portfolio', 'Synthetic composite', 'active')")
-            owner.execute(
-                "INSERT INTO subject_calculation_definitions(definition_id, subject_id, subject_type, "
-                "calculation_kind, definition_version, configuration_json, configuration_sha256, approval_status, "
-                "effective_from) VALUES (%s, 'SYN-COMPOSITE', 'composite_portfolio', "
-                "'fixed_unit_normalized_composite', 1, '{}', %s, 'validated', '2025-01-20')",
-                (DEFINITION, "a" * 64))
-            owner.execute(f"GRANT USAGE ON SCHEMA public TO {NO_READS}")
-            owner.execute(f"GRANT EXECUTE ON FUNCTION app_tenant_id() TO {NO_READS}")
+                "('SYN-COMPOSITE', 'composite_portfolio', 'Synthetic composite', 'active'), "
+                "('SYN-ONBOARDING', 'composite_portfolio', 'Synthetic composite in onboarding', 'onboarding')")
+            for definition, subject in ((DEFINITION, "SYN-COMPOSITE"), (ONBOARDING_DEFINITION, "SYN-ONBOARDING")):
+                owner.execute(
+                    "INSERT INTO subject_calculation_definitions(definition_id, subject_id, subject_type, "
+                    "calculation_kind, definition_version, configuration_json, configuration_sha256, "
+                    "approval_status, effective_from) VALUES (%s, %s, 'composite_portfolio', "
+                    "'fixed_unit_normalized_composite', 1, '{}', %s, 'validated', '2025-01-20')",
+                    (definition, subject, "a" * 64))
+            for role in (NO_READS, READER):
+                owner.execute(f"GRANT USAGE ON SCHEMA public TO {role}")
+                owner.execute(f"GRANT EXECUTE ON FUNCTION app_tenant_id() TO {role}")
+            owner.execute(f"GRANT SELECT ON {', '.join(READER_TABLES)} TO {READER}")
             owner.commit()
 
     @classmethod
@@ -135,7 +167,8 @@ class InputReadinessDatabaseTests(unittest.TestCase):
 
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:
             admin.execute(f'DROP DATABASE IF EXISTS "{cls.database}" WITH (FORCE)')
-            admin.execute(f"DROP ROLE IF EXISTS {NO_READS}")
+            for role in (NO_READS, READER):
+                admin.execute(f"DROP ROLE IF EXISTS {role}")
 
     def setUp(self):
         import psycopg
@@ -143,6 +176,11 @@ class InputReadinessDatabaseTests(unittest.TestCase):
         with psycopg.connect(_dsn(self.database, OWNER)) as owner:
             for table in EVIDENCE_TABLES:
                 owner.execute(f"DELETE FROM {table}")
+            if owner.execute("SELECT to_regclass('public.lineage_events')").fetchone()[0]:
+                # Lineage records are append-only; the owner lifts that for a clean test.
+                owner.execute("ALTER TABLE lineage_events DISABLE TRIGGER lineage_events_append_only")
+                owner.execute("DELETE FROM lineage_events")
+                owner.execute("ALTER TABLE lineage_events ENABLE TRIGGER lineage_events_append_only")
             _cycle(owner, "2026-10-18")  # yesterday's cycle, complete
             owner.commit()
 
@@ -153,17 +191,20 @@ class InputReadinessDatabaseTests(unittest.TestCase):
             function(owner, *args, **kwargs)
             owner.commit()
 
-    def _environ(self, mode: str | None, user: str = OWNER) -> dict:
-        environ = {"DATABASE_URL": _dsn(self.database, user), "PORTFOLIO_TENANT_ID": TENANT}
+    def _environ(self, mode: str | None, user: str = OWNER, **settings) -> dict:
+        environ = {"DATABASE_URL": _dsn(self.database, user), "PORTFOLIO_TENANT_ID": TENANT, **settings}
         if mode is not None:
             environ[readiness.MODE_ENV] = mode
         return environ
 
-    def _gate(self, job: str, clock: str, mode: str | None, user: str = OWNER):
+    def _gate(self, job: str, clock: str, mode: str | None, user: str = OWNER, sleep=None, **settings):
         lines: list[str] = []
-        result = readiness.gate(job, environ=self._environ(mode, user), now=_at(DAY, clock), out=lines.append)
+        result = readiness.gate(job, environ=self._environ(mode, user, **settings), now=_at(DAY, clock),
+                                out=lines.append, sleep=sleep)
         return result, [json.loads(line.removeprefix(readiness.LOG_PREFIX)) for line in lines]
 
+
+class InputReadinessDatabaseTests(_ReadinessDatabase):
     def test_ready_when_the_cycle_ran_in_order(self):
         self._seed(_cycle, DAY)
         results = {}
@@ -293,6 +334,167 @@ class InputReadinessDatabaseTests(unittest.TestCase):
         self.assertFalse(result["ready"])
         self.assertEqual(result["reasons"], ["ledger: reconciliation: missing completion evidence"])
         self.assertEqual(result["evidence"]["reconciliation"]["state"], "fresh")
+
+    # Case 1 -----------------------------------------------------------------------------
+
+    def test_a_subject_still_onboarding_does_not_hold_up_risk_or_reports(self):
+        self._seed(_cycle, DAY)
+        self._seed(_calculation, "SYN-ONBOARDING", "failed", _at(DAY, "08:51"))
+        for job, clock in (("risk-snapshots", "08:55"), ("month-end-factsheet", "09:00")):
+            with self.subTest(job=job):
+                result, records = self._gate(job, clock, "enforce")
+                self.assertEqual((result["ready"], result["reasons"], records[-1]["decision"]), (True, [], "continue"))
+                derived = result["evidence"]["derived"]
+                self.assertEqual((derived["planned"], derived["failed"], derived["waiting"],
+                                  derived["waiting_subjects"]), (1, 0, 1, ["SYN-ONBOARDING"]))
+
+    def test_a_live_subjects_blocked_or_failed_calculation_still_stops(self):
+        self._seed(_cycle, DAY)
+        self._seed(_calculation, "SYN-ONBOARDING", "blocked", _at(DAY, "08:51"))
+        for status in ("blocked", "failed"):
+            with self.subTest(status=status):
+                self._seed(_calculation, "SYN-COMPOSITE", status, _at(DAY, "08:53"))
+                result, _ = self._gate("risk-snapshots", "08:55", "shadow")
+                self.assertEqual(result["reasons"], ["derived: not validated"])
+                self.assertEqual(result["evidence"]["derived"]["waiting"], 1)
+        with self.assertRaises(SystemExit) as stopped:
+            self._gate("risk-snapshots", "08:55", "enforce")
+        self.assertEqual(stopped.exception.code, readiness.EXIT_NOT_READY)
+
+    # Cases 2 and 3 ----------------------------------------------------------------------
+
+    def test_risk_still_running_holds_up_reports_until_its_run_ends(self):
+        self._seed(_cycle, DAY)  # snapshots stamped at 08:57 by the run still in progress
+        run = str(uuid.uuid4())
+        self._seed(_lineage, RISK_JOB, "START", _at(DAY, "08:55"), run_id=run)
+        result, _ = self._gate("month-end-factsheet", "09:00", "shadow")
+        self.assertFalse(result["ready"])
+        self.assertIn("risk: ibkrv2stg-risk-snapshots is still running (started 2026-10-19T08:55:00+00:00)",
+                      result["reasons"])
+        self.assertEqual(result["evidence"]["risk"]["run"]["run_id"], run)
+        self._seed(_lineage, RISK_JOB, "COMPLETE", _at(DAY, "09:01"), run_id=run)
+        result, _ = self._gate("month-end-factsheet", "09:02", "enforce")
+        self.assertEqual((result["ready"], result["reasons"]), (True, []))
+        self.assertEqual(result["evidence"]["risk"]["completed_at"], "2026-10-19T09:01:00+00:00")
+
+    def test_a_risk_run_that_crashed_stops_reports(self):
+        self._seed(_cycle, DAY)
+        run = str(uuid.uuid4())
+        self._seed(_lineage, RISK_JOB, "START", _at(DAY, "08:55"), run_id=run)
+        self._seed(_lineage, RISK_JOB, "FAIL", _at(DAY, "08:58"), run_id=run, facets={"error": {"type": "RuntimeError"}})
+        result, _ = self._gate("month-end-factsheet", "09:00", "shadow")
+        self.assertEqual(result["reasons"], ["risk: ibkrv2stg-risk-snapshots did not finish (RuntimeError)",
+                                             "risk: not validated"])
+
+    def test_sectors_still_running_hold_up_derived(self):
+        self._seed(_cycle, DAY)
+        run = str(uuid.uuid4())
+        self._seed(_lineage, SECTOR_JOB, "START", _at(DAY, "08:45"), run_id=run)
+        result, _ = self._gate("derived-daily", "08:50", "shadow")
+        self.assertIn("benchmarks_fx: ibkrv2stg-sector-classification is still running "
+                      "(started 2026-10-19T08:45:00+00:00)", result["reasons"])
+        self.assertFalse(result["ready"])
+        self._seed(_lineage, SECTOR_JOB, "FAIL", _at(DAY, "08:48"), run_id=run, facets={"exit_code": 2})
+        result, _ = self._gate("derived-daily", "08:50", "enforce")
+        self.assertEqual((result["ready"], result["evidence"]["benchmarks_fx"]["sectors"]["state"]), (True, "finished"))
+
+    def test_derived_that_finished_before_sectors_ended_must_recalculate(self):
+        self._seed(_cycle, DAY)  # derived completed at 08:52
+        run = str(uuid.uuid4())
+        self._seed(_lineage, SECTOR_JOB, "START", _at(DAY, "08:45"), run_id=run)
+        self._seed(_lineage, SECTOR_JOB, "COMPLETE", _at(DAY, "08:53"), run_id=run)
+        result, _ = self._gate("risk-snapshots", "08:55", "shadow")
+        self.assertEqual(result["reasons"], ["derived: benchmarks_fx changed; recalculate"])
+
+    def test_lineage_the_login_cannot_read_falls_back_with_a_note(self):
+        self._seed(_cycle, DAY)
+        self._seed(_lineage, RISK_JOB, "START", _at(DAY, "08:55"), run_id=str(uuid.uuid4()))
+        result, _ = self._gate("month-end-factsheet", "09:00", "shadow", user=READER)
+        self.assertEqual((result["ready"], result["reasons"]), (True, []))
+        self.assertIn("risk: ibkrv2stg-risk-snapshots lineage unavailable (lineage_events not present or not "
+                      "readable); judged by public.risk_analytics_snapshots alone", result["notes"])
+
+    # Case 4 -----------------------------------------------------------------------------
+
+    def test_enforce_waits_and_rechecks_until_risk_ends(self):
+        self._seed(_cycle, DAY)
+        run = str(uuid.uuid4())
+        self._seed(_lineage, RISK_JOB, "START", _at(DAY, "08:55"), run_id=run)
+        pauses = []
+
+        def sleep(seconds):
+            pauses.append(seconds)
+            if len(pauses) == 2:  # the risk run ends during the second pause
+                self._seed(_lineage, RISK_JOB, "COMPLETE", _at(DAY, "09:01"), run_id=run)
+
+        result, records = self._gate("month-end-factsheet", "09:00", "enforce", sleep=sleep,
+                                     INPUT_READINESS_WAIT_SECONDS="600", INPUT_READINESS_RECHECK_SECONDS="60")
+        self.assertEqual(pauses, [60.0, 60.0])
+        self.assertEqual([record["decision"] for record in records], ["wait", "continue"])
+        self.assertEqual((result["ready"], result["attempts"], result["waited_seconds"]), (True, 3, 120.0))
+
+    def test_enforce_stops_when_risk_is_still_running_after_the_wait(self):
+        self._seed(_cycle, DAY)
+        self._seed(_lineage, RISK_JOB, "START", _at(DAY, "08:55"), run_id=str(uuid.uuid4()))
+        pauses = []
+        with self.assertRaises(SystemExit) as stopped:
+            self._gate("month-end-factsheet", "09:00", "enforce", sleep=pauses.append,
+                       INPUT_READINESS_WAIT_SECONDS="120", INPUT_READINESS_RECHECK_SECONDS="60")
+        self.assertEqual(stopped.exception.code, readiness.EXIT_NOT_READY)
+        self.assertEqual(pauses, [60.0, 60.0])
+
+    def test_shadow_and_off_never_wait(self):
+        self._seed(_cycle, DAY)
+        self._seed(_lineage, RISK_JOB, "START", _at(DAY, "08:55"), run_id=str(uuid.uuid4()))
+        pauses = []
+        result, records = self._gate("month-end-factsheet", "09:00", "shadow", sleep=pauses.append,
+                                     INPUT_READINESS_WAIT_SECONDS="600")
+        self.assertEqual((pauses, len(records), result["ready"], result["decision"]), ([], 1, False, "continue"))
+        self.assertEqual(self._gate("month-end-factsheet", "09:00", None, sleep=pauses.append,
+                                    INPUT_READINESS_WAIT_SECONDS="600"), (None, []))
+        self.assertEqual(pauses, [])
+
+
+class WithoutLineageMigrationTests(_ReadinessDatabase):
+    """The same checks on a database where migration 071 was never applied."""
+    SKIPPED = frozenset({LINEAGE_MIGRATION})
+
+    def test_the_cycle_is_ready_as_before_and_the_notes_say_lineage_is_missing(self):
+        self._seed(_cycle, DAY)
+        for job, clock in (("derived-daily", "08:50"), ("month-end-factsheet", "09:00")):
+            with self.subTest(job=job):
+                result, records = self._gate(job, clock, "enforce")
+                self.assertEqual((result["ready"], result["reasons"], records[-1]["decision"]), (True, [], "continue"))
+        self.assertIn("risk: ibkrv2stg-risk-snapshots lineage unavailable (lineage_events not present or not "
+                      "readable); judged by public.risk_analytics_snapshots alone", result["notes"])
+        self.assertIn("benchmarks_fx: ibkrv2stg-sector-classification lineage unavailable (lineage_events not "
+                      "present or not readable); sectors not checked", result["notes"])
+
+    def test_a_subject_still_onboarding_does_not_hold_up_risk(self):
+        self._seed(_cycle, DAY)
+        self._seed(_calculation, "SYN-ONBOARDING", "failed", _at(DAY, "08:51"))
+        result, _ = self._gate("risk-snapshots", "08:55", "enforce")
+        self.assertEqual((result["ready"], result["evidence"]["derived"]["waiting"]), (True, 1))
+
+    def test_enforce_waits_for_evidence_that_arrives_in_the_tables(self):
+        # At 08:52 derived has not run today; it finishes during the first pause.
+        self._seed(_work_items, run_date="2026-10-18", completed=f"{DAY}T08:24:00+00:00")
+        self._seed(lambda c: c.execute(
+            "INSERT INTO ingestion_runs(run_type, started_at, completed_at, status) "
+            "VALUES ('staging-yfinance-benchmark', %s, %s, 'success')", (_at(DAY, "08:30"), _at(DAY, "08:33"))))
+        pauses = []
+
+        def sleep(seconds):
+            pauses.append(seconds)
+            self._seed(_calculation, "SYN-COMPOSITE", "validated", _at(DAY, "08:52"))
+
+        result, records = self._gate("risk-snapshots", "08:51", "enforce", sleep=sleep,
+                                     INPUT_READINESS_WAIT_SECONDS="300", INPUT_READINESS_RECHECK_SECONDS="60")
+        self.assertEqual(pauses, [60.0])
+        self.assertEqual([record["decision"] for record in records], ["wait", "continue"])
+        self.assertEqual(result["first_reasons"], ["derived: benchmarks_fx changed; recalculate",
+                                                   "derived: reconciliation changed; recalculate",
+                                                   "derived: stale data"])
 
 
 if __name__ == "__main__":

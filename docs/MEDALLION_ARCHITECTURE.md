@@ -364,6 +364,56 @@ none is built yet:
 5. Prune builds that were never published, and builds older than the retention period.
 6. Keep month-end report-only: the frozen packages already carry their own sha256.
 
+## Flows from silver (S6): `FLOWS_SOURCE`
+
+Every return figure takes its deposits and withdrawals from one reader,
+`provisional_benchmark._external_flows`: the website pages (through
+`web._subject_external_flows`, which the certified build and Modelling call too), the
+benchmark comparison, the monthly reports, the month-end snapshots and the website analyst's
+tools (`agent_tools`), the agent tool server and composite sleeves. For a physical account it
+reads bronze: the Transfers and CashTransactions rows of `flex_rows`, the known exception in
+the Gold row above. Filtered and composite portfolios read their silver cash ledger and are
+not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
+
+- **The setting:** `FLOWS_SOURCE`, set to the same value on every container app and job that
+  serves or builds return figures (the website, the certified build, derived-daily, the
+  monthly and month-end jobs).
+  - `off`, the default (also unset, or a value not understood, which logs one line once):
+    bronze, exactly as before.
+  - `fallback`: both are read. Silver is used only when it equals bronze on every date: the
+    same dates, the same amount per currency on each date (summed exactly), and the
+    base-currency total within a cent. Otherwise bronze is used and one line is logged,
+    `FLOWS_SOURCE {"dates_differing":1,"decision":"bronze","kinds":{"transfers_not_in_silver":1},"mode":"fallback","reason":"silver_differs","subject":"u…01"}`
+    (`reason` is `silver_differs` or `silver_unreadable`; counts and masked subjects only). To
+    read them: `ContainerAppConsoleLogs_CL | where Log_s startswith 'FLOWS_SOURCE '`.
+  - `on`: silver only. Not before two clean month-ends in `fallback`, and not before the
+    Transfers section has a silver table (below).
+- **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to
+  `silver.cash_transactions` in the same loop, under the parser's key. The daily 14-day
+  re-send updates the same row in both; a correction under the same key overwrites both; a
+  correction under a new key (no IBKR transaction id) adds a row to both. With
+  `IBKR_FLEX_LEGACY_KEY_COMPAT` silver keeps v1.1's key, so the comparison matches rows by
+  content, never by key. Two gaps keep bronze in `fallback`: silver has no table for the
+  Transfers section (the loader writes it to `flex_rows` only), and it cannot tell a
+  consolidated copy (`accountId` "-") from the account's own row, which bronze skips.
+- **Leave the agent tool server unset** until the agent schema has a view over silver flows:
+  its login reads only the `agent` views, so `fallback` there always logs
+  `silver_unreadable` and keeps bronze (the failed read is inside a savepoint). Removing
+  `agent.flex_rows` comes after that.
+- **Undo:** remove the setting. Nothing is written anywhere.
+- **Before switching on, on a restored copy:**
+  `python -m ibkr_etl.flows_source compare --database-url "<copy URL>" --tenant <tenant id>`
+  reads every subject over all history in READ ONLY transactions and prints counts: subjects,
+  accounts, matching, differing, errors, the kinds of difference (subjects and dates each),
+  and notes that explain them (`bronze_transfer_rows`, `bronze_consolidated_copies`,
+  `silver_rows_sharing_a_transaction_id`). It must show no errors, and every differing
+  account explained by its notes, for example an account-sync account whose bronze flows were
+  never backfilled (`only_in_silver`). Matching accounts are the ones `fallback` reads from
+  silver; the others keep bronze and log one line on every read.
+- **Before `on`:** two clean month-ends in `fallback`; a silver table for Transfers (a
+  migration, the loader writing it, and a fill from `flex_rows`), or proof that no account
+  has Transfers rows; and the agent view above.
+
 ## Release data report
 
 A release that touches silver or gold runs its jobs on a restored copy first, and

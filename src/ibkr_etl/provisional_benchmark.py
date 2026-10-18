@@ -371,6 +371,32 @@ def _portfolio_values(connection: Any, account_id: str, start_date: str,
 def _external_flows(
     connection: Any, account_id: str, *, subject_type: str | None = None
 ) -> dict[str, float]:
+    """Net external flows (deposits and withdrawals) per date, in the base currency.
+
+    The one flows reader every return figure uses. FLOWS_SOURCE chooses where a
+    physical account's flows come from (ibkr_etl.flows_source): off, the default,
+    reads bronze exactly as _bronze_external_flows does; fallback reads silver too
+    and uses it only when it equals bronze; on reads silver only. Portfolios read
+    their silver cash ledger in every mode.
+    """
+    from . import flows_source
+
+    selected = flows_source.selected_mode()
+    if selected == flows_source.OFF:
+        return _bronze_external_flows(connection, account_id, subject_type=subject_type)
+    return flows_source.external_flows(connection, account_id, subject_type=subject_type, selected=selected)
+
+
+def _bronze_external_flows(
+    connection: Any, account_id: str, *, subject_type: str | None = None,
+    records: list[tuple[str, str, str, float, float]] | None = None,
+) -> dict[str, float]:
+    """Today's reader: a physical account's flows from bronze flex_rows.
+
+    records, when given, receives one (source, date, currency, amount, base amount)
+    tuple for each row that is added up, for the comparison with silver. A cash
+    transaction's amount is in its currency; a transfer's is its base amount.
+    """
     if subject_type is None:
         subject = connection.execute(
             "SELECT subject_type FROM platform_subjects WHERE subject_id = ?",
@@ -428,6 +454,8 @@ def _external_flows(
                 amount = _convert(values.get("positionAmount"), rate)
         if amount is not None:
             flows[flow_date] += amount
+            if records is not None:
+                records.append(("transfer", flow_date, str(values.get("currency") or ""), amount, amount))
     # Bank deposits and withdrawals are reported as CashTransactions, not
     # Transfers. Older Flex files carry no `type`, so fall back to IBKR's
     # description. Consolidated copies (accountId "-") would double count.
@@ -451,6 +479,9 @@ def _external_flows(
         amount = _convert(values.get("amount"), rate)
         if amount is not None:
             flows[flow_date] += amount
+            if records is not None:
+                records.append(("cash", flow_date, str(values.get("currency") or ""),
+                                _number(values.get("amount")), amount))
     return dict(flows)
 
 

@@ -24,7 +24,8 @@ from typing import Any, Callable, Iterable
 from .db import connect, initialize, start_run
 from .loader import load_report
 from .parser import ParsedReport, parse_flex_xml
-from .provisional_benchmark import _external_flows, _is_external_cash_transaction
+# Bronze's reader whatever FLOWS_SOURCE says: the plan is about the bronze rows it would add.
+from .provisional_benchmark import _bronze_external_flows, _is_external_cash_transaction
 from .switch_dry_run import Statement, order_statements
 from .util import canonical_json, sha256_bytes, utc_now_iso
 
@@ -122,7 +123,7 @@ def plan(candidates_path: Path, *, accounts: Iterable[str], live: Any = None,
                         "DELETE FROM flex_rows WHERE account_id = ? AND section = ? AND record_type = ? AND source_key = ?",
                         (account_id, row["section"], row["record_type"], row["source_key"]),
                     )
-            flows = {day: amount for day, amount in sorted(_external_flows(
+            flows = {day: amount for day, amount in sorted(_bronze_external_flows(
                 connection, account_id, subject_type="physical_account").items()) if amount}
             external = [row for row in new if row["section"] == "CashTransactions"
                         and _is_external_cash_transaction(_json(row["data_json"]))]

@@ -77,10 +77,16 @@ class Difference:
 
 
 def catalog_objects(catalog_path: Path) -> dict[str, dict]:
-    """name -> catalog entry for every silver and gold object."""
+    """name -> catalog entry for every silver and gold object: moved from public, or created in its layer."""
     entries = json.loads(Path(catalog_path).read_text(encoding="utf-8"))["postgres"]
     return {key.split(".", 1)[1]: value for key, value in entries.items()
-            if key.startswith("public.") and value.get("layer") in LAYERS}
+            if key.split(".", 1)[0] in ("public", *LAYERS) and value.get("layer") in LAYERS}
+
+
+def held_migrations(catalog_path: Path, root: Path) -> list[Path]:
+    """Held migrations (kept outside migrations/postgres until their day) that create catalog objects."""
+    entries = json.loads(Path(catalog_path).read_text(encoding="utf-8"))["postgres"]
+    return [Path(root) / name for name in sorted({value["held"] for value in entries.values() if value.get("held")})]
 
 
 def contract_path(contracts_dir: Path, layer: str, name: str) -> Path:

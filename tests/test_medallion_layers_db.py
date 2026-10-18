@@ -41,6 +41,9 @@ TOLERATED_MIGRATIONS = {"027_legacy_external_market_data_approval.sql", "056_spe
 HELD_BACK = ("054_shadow_workflow_evidence.sql", "055_fx_evidence_versions.sql", "059_owner_codex_tasks.sql",
              "060_shadow_workflow_date_policies.sql", "061_shadow_workflow_leases.sql")
 LAYER_FILES = sorted(path.name for path in MIGRATIONS.glob("*_medallion_*.sql"))
+# Later migrations that create new layer objects and move them into their layer as 068 does,
+# so undoing a layer moves them back to public and running them again moves them in again.
+LAYER_CREATORS = ("073_certified_figures.sql",)
 # Production's ledger has this version, applied outside the repository.
 OUTSIDE = ("067_hong_kong_china_external_market_data_approval.sql",)
 LAYERS = ("bronze", "silver", "gold")
@@ -302,7 +305,7 @@ class LayerViewTests(unittest.TestCase):
             for layer in ("silver", "bronze", "gold"):
                 owner.execute(undo(layer))  # nothing left to undo
                 owner.commit()
-            for name in LAYER_FILES:
+            for name in [*LAYER_FILES, *LAYER_CREATORS]:
                 owner.execute((MIGRATIONS / name).read_text(encoding="utf-8"))
                 owner.commit()
             self.assertEqual(_layout(owner), self.after_layers)

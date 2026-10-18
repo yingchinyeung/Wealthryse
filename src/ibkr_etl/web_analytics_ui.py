@@ -68,6 +68,7 @@ const renderAnalytics=async asOf=>{
   document.querySelector('#monthly-returns').innerHTML=a.monthly_calendar.map(row=>`<tr><th class="text-col" scope="row">${esc(row.year)}</th>${row.months.map(calendarCell).join('')}${calendarCell(row.year_return).replace('heat-cell','heat-cell year-cell')}</tr>`).join('')||'<tr><td colspan="14">No monthly history is available.</td></tr>';
   fillAttributionMonths(a.monthly_calendar);
   document.querySelector('#monthly-returns-note').textContent='† History starts after the period began, so the return runs from the first NAV. * Period to date. Hover a cell for its exact NAV dates.';
+  certifiedLine(document.querySelector('#monthly-returns'),certifiedFor(a.certified,'performance'));certifiedLine(document.querySelector('#analytics-statistics'),certifiedFor(a.certified,'risk-statistics'));
   draw('#drawdown-chart',dd.series.map(x=>({date:x.date,drawdown:100*x.drawdown})),[{key:'drawdown',color:'#b42318',label:'Drawdown'}],{yLabel:'Drawdown (%)',unit:'%',niceYTicks:true,targetYIntervals:5,emptyMessage:'Drawdowns need at least two NAV dates.'});
   document.querySelector('#drawdown-episodes').innerHTML=dd.episodes.map((x,i)=>`<tr><td>${i+1}</td><td>${esc(analyticsDate(x.peak_date))}</td><td>${esc(analyticsDate(x.trough_date))}</td><td>${x.recovered?esc(analyticsDate(x.recovery_date)):'<span class="muted">Not yet</span>'}</td><td data-sort="${x.depth}"><span class="loss">${esc(pct2(x.depth))}</span></td><td>${esc(x.days_to_trough)}</td><td>${x.days_to_recover==null?'—':esc(x.days_to_recover)}</td><td>${esc(x.length_days)}${x.recovered?'':' <span class="muted">(ongoing)</span>'}</td></tr>`).join('')||'<tr><td colspan="8">No drawdown has occurred in this history.</td></tr>';
   const vol=a.rolling.filter(x=>x.volatility!=null).map(x=>({date:x.date,volatility:100*x.volatility})),trailing=a.rolling.filter(x=>x.trailing_return!=null).map(x=>({date:x.date,trailing_return:100*x.trailing_return}));
@@ -80,6 +81,7 @@ const renderAnalytics=async asOf=>{
 const renderConcentration=h=>{
   const c=h&&h.concentration,metrics=document.querySelector('#concentration-metrics'),bars=document.querySelector('#currency-exposure'),summary=document.querySelector('#concentration-summary'),note=document.querySelector('#concentration-note');
   if(!metrics)return;
+  certifiedLine(metrics,c&&c.available?h.certified:null);
   if(!c||!c.available){summary.textContent=(c&&c.reason)||'Concentration is not available for this portfolio.';metrics.innerHTML='';bars.innerHTML='';note.textContent='';return}
   summary.textContent=`${c.weighted_count} weighted holdings as of ${analyticsDate(h.snapshot_date)}. Weights are shares of ${c.weight_basis==='nav'?'net asset value':'gross holdings value'}.`;
   metrics.innerHTML=[

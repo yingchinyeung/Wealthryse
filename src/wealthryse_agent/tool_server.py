@@ -26,7 +26,7 @@ from . import access
 from .auth import Unauthorized, verify_service_token
 from .config import DatabaseSettings, ServiceAuthSettings
 from .database import connect, scoped
-from .tools import REGISTRY, TOOLS, ToolError, run_tool
+from .tools import REGISTRY, TOOLS, ToolError, run_tool, switched_on
 
 LOGGER = logging.getLogger("wealthryse_agent.tools")
 PROTOCOL_VERSION = "2025-06-18"
@@ -131,6 +131,8 @@ class ToolService:
 
 
 def _offered(spec: Any, job: str | None) -> bool:
+    if not switched_on(spec) or (job is not None and job in spec.not_jobs):
+        return False
     return not spec.only_jobs or job in spec.only_jobs
 
 

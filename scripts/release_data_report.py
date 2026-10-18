@@ -34,6 +34,14 @@ Database URLs come from environment variables (snapshot reads DATABASE_ADMIN_URL
 is written except the named output files. Row-level security applies as for
 medallion_layers.py: a login that does not bypass it reads the --tenant rows.
 
+The figures command compares each page's figures today with the certified figures on a
+restored copy (certified figures, U5; scripts/release_data_figures.py):
+
+    python scripts/release_data_report.py figures --batch 1 --private-dir <private folder>
+
+gold.v_certified_figures, the view every certified reader uses, is compared like a table by
+the key readers look figures up with, since which build's figure a reader sees can change.
+
 Exit codes: 0 nothing changed, 1 figures changed (read the report), 2 could not run.
 """
 from __future__ import annotations
@@ -78,6 +86,10 @@ DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 COMPACT_DAY = re.compile(r"(\d{4})(\d{2})(\d{2})")
 INDEX = re.compile(r"\[\d+\]")
 SEPARATOR = "\x1f"  # between segments of a path inside a json value
+# Views compared like tables, by the key readers look figures up with: they choose which
+# build's certified figure each reader sees.
+COMPARED_VIEWS = {"gold.v_certified_figures": ["tenant_id", "subject_id", "figure_id", "period", "item",
+                                               "benchmark_id", "as_of_date"]}
 FETCH_ROWS = 2000
 TOP = 10
 COMMENT_LIMIT = 60000  # GitHub refuses a PR comment over 65,536 characters
@@ -227,7 +239,7 @@ def encode_table(table: str, location: str, columns: list, key: list[str], rows)
 def catalog_tables(only: list[str] | None = None) -> list[dict]:
     """Silver and gold tables in the catalog, sorted by layer.name."""
     found = []
-    for item in medallion_layers.catalog_objects():
+    for item in medallion_layers.catalog_objects(created_in_layer=True):
         if item["layer"] not in LAYERS or item["kind"] != "table":
             continue
         qualified = f"{item['layer']}.{item['name']}"
@@ -238,8 +250,20 @@ def catalog_tables(only: list[str] | None = None) -> list[dict]:
 
 
 def catalog_views() -> list[str]:
-    return sorted(f"{item['layer']}.{item['name']}" for item in medallion_layers.catalog_objects()
-                  if item["layer"] in LAYERS and item["kind"] == "view")
+    """The views that are not compared (they read the tables)."""
+    return sorted(f"{item['layer']}.{item['name']}"
+                  for item in medallion_layers.catalog_objects(created_in_layer=True)
+                  if item["layer"] in LAYERS and item["kind"] == "view"
+                  and f"{item['layer']}.{item['name']}" not in COMPARED_VIEWS)
+
+
+def compared_views(only: list[str] | None = None) -> list[dict]:
+    found = []
+    for name in sorted(COMPARED_VIEWS):
+        layer, relation = name.split(".", 1)
+        if not only or name in only or relation in only:
+            found.append({"layer": layer, "name": relation, "kind": "view", "table": name})
+    return found
 
 
 def _key_columns(connection, oid) -> list[str]:
@@ -270,9 +294,10 @@ def _frozen(connection, schema: str) -> list[list]:
 def read_table(connection, item: dict) -> dict:
     from psycopg import sql
 
-    for schema in (item["layer"], "public"):  # public: a copy from before the layer moves
+    view = item.get("kind") == "view"
+    for schema in (item["layer"],) if view else (item["layer"], "public"):  # public: a copy from before the layer moves
         relation = medallion_layers._relation(connection, schema, item["name"])
-        if relation is not None and relation[1] in ("r", "p"):
+        if relation is not None and relation[1] in (("v",) if view else ("r", "p")):
             break
     else:
         return {"table": item["table"], "present": False}
@@ -282,7 +307,8 @@ def read_table(connection, item: dict) -> dict:
     with connection.cursor(name="release_data_report") as cursor:
         cursor.itersize = FETCH_ROWS
         cursor.execute(query)
-        entry = encode_table(item["table"], schema, columns, _key_columns(connection, relation[0]), cursor)
+        key = COMPARED_VIEWS[item["table"]] if view else _key_columns(connection, relation[0])
+        entry = encode_table(item["table"], schema, columns, key, cursor)
     if item["table"] == FROZEN_TABLE:
         entry["frozen"] = _frozen(connection, schema)
     return entry
@@ -325,7 +351,7 @@ def database_source(url: str, tenant: str, only: list[str] | None = None):
 
     def tables():
         try:
-            for item in catalog_tables(only):
+            for item in sorted(catalog_tables(only) + compared_views(only), key=lambda found: found["table"]):
                 yield read_table(connection, item)
         finally:
             connection.close()
@@ -1005,6 +1031,41 @@ def render_public_summary(report: dict) -> str:
     return mask("\n".join(lines) + "\n")
 
 
+# ---- the figures command ----
+
+def figures_command(args) -> int:
+    """Each page's figures today against the certified figures, on one restored copy."""
+    import release_data_figures as figures
+
+    try:
+        pages = figures.pages_for(args.batch, args.page)
+        folder = figures.private_folder(args.private_dir)
+        url = os.environ.get(args.url_env, "")
+        if not url:
+            raise ReportError(f"{args.url_env} is not set")
+        import psycopg
+
+        with psycopg.connect(_conninfo(url)) as connection:
+            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            connection.execute("SELECT set_config('app.tenant_id', %s, true)", (args.tenant,))
+            taken_at = _header(connection, args.tenant)["taken_at"]
+            subject_dates = figures.subjects_and_dates(connection, only=args.subject or None, sample=args.sample)
+            comparison = figures.compare(pages, figures.WebPages(url, args.tenant), connection, subject_dates)
+        report = figures.build_report(comparison, source=f"database ({args.url_env})", taken_at=taken_at)
+    except Exception as error:  # noqa: BLE001 - one clear line, then exit 2
+        print(f"release data report: ERROR {type(error).__name__}: {mask(str(error))}", file=sys.stderr)
+        return 2
+    markdown = figures.write_private(folder, "certified-figures-report.md", figures.render_markdown(report))
+    data = figures.write_private(folder, "certified-figures-report.json",
+                                 json.dumps(report, indent=1, sort_keys=True, ensure_ascii=False) + "\n")
+    public_summary = figures.render_public_summary(report)
+    Path(args.public_summary).write_text(public_summary, encoding="utf-8")
+    print(public_summary.rstrip())  # the values stay in the private files, out of terminal logs
+    print(f"\nPublic summary for the PR: {Path(args.public_summary).resolve()}")
+    print(f"Full report, keep private: {markdown} and {data}")
+    return 1 if figures.has_differences(report) else 0
+
+
 # ---- command line ----
 
 def main(argv: list[str] | None = None) -> int:
@@ -1024,6 +1085,22 @@ def main(argv: list[str] | None = None) -> int:
     compare.add_argument("--rel-tol", type=float, default=1e-9,
                          help="numbers this close (relative) count as unchanged")
     compare.add_argument("--abs-tol", type=float, default=1e-12)
+    figures = sub.add_parser("figures", help="compare each page's figures today with the certified figures "
+                                             "on a restored copy")
+    figures.add_argument("--batch", action="append", default=[], help="a batch of pages (1, 2 or 3); repeatable")
+    figures.add_argument("--page", action="append", default=[], help="one page, such as overview; repeatable")
+    figures.add_argument("--url-env", default="DATABASE_ADMIN_URL",
+                         help="environment variable holding the copy's database URL")
+    figures.add_argument("--subject", action="append", default=[],
+                         help="only this account or portfolio; repeatable")
+    figures.add_argument("--sample", type=int, default=12,
+                         help="other NAV dates per subject besides the latest and each month-end")
+    figures.add_argument("--private-dir", required=True,
+                         help="private folder for the full report, with values (outside the checkout)")
+    figures.add_argument("--public-summary", default="certified-figures-summary.md",
+                         help="counts, figure ids and page names only, for the PR")
+    figures.add_argument("--tenant", default=medallion_layers.DEFAULT_TENANT,
+                         help="app.tenant_id for a login that does not bypass row-level security")
     public = sub.add_parser("summary", help="write the public summary from a saved JSON report")
     public.add_argument("--report", default="release-data-report.json", help="full JSON report")
     public.add_argument("--out", default="release-data-summary.md", help="public summary for the PR")
@@ -1033,6 +1110,8 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--table", action="append", default=[],
                              help="only this table (layer.name or name); repeatable")
     args = parser.parse_args(argv)
+    if args.command == "figures":
+        return figures_command(args)
     if args.command == "summary":
         report = json.loads(Path(args.report).read_text(encoding="utf-8"))
         text = render_public_summary(report)

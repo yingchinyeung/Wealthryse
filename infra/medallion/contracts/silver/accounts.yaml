@@ -137,6 +137,7 @@ customProperties:
   - ibkr_etl.provisional_benchmark
   - ibkr_etl.report
   - ibkr_etl.service
+  - ibkr_etl.silver_history
   - ibkr_etl.snapshot_atomic_import
   - ibkr_etl.snapshot_preflight
   - ibkr_etl.subject_exports

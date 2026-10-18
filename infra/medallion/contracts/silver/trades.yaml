@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.trades
 name: trades
-version: 1.0.0
+version: 1.0.1
 status: active
 domain: silver
 dataProduct: portfolio-medallion
@@ -10,8 +10,9 @@ description:
   purpose: 'Trade executions per account from the Flex statements: quantity, price, proceeds, commission, net cash
     and realised P&L.'
   limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
-    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
-    are not versioned yet (review item 8).
+    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
+    item U8's history is switched on, every version is also kept in silver.trades_history, and silver.trades_as_known(at)
+    returns this table as it stood at any moment.
 tags:
 - silver
 - ibkr

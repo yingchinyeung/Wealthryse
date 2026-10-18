@@ -5,10 +5,10 @@
   python scripts/medallion_contracts.py check    [--dsn]   compare contracts with the schema
   python scripts/medallion_contracts.py generate [--dsn]   write the structural part of each contract
 
-Without --dsn, check and generate build a disposable database from migrations/postgres
-on the server named by AGENT_TEST_PG_ADMIN_DSN (a superuser DSN; CI's agent-database
-job has one), read it, and drop it. With --dsn they read an already-migrated database
-and change nothing in it.
+Without --dsn, check and generate build a disposable database from migrations/postgres,
+then the held migrations the catalog names (an entry's "held"), on the server named by
+AGENT_TEST_PG_ADMIN_DSN (a superuser DSN; CI's agent-database job has one), read it, and
+drop it. With --dsn they read an already-migrated database and change nothing in it.
 
 generate rewrites only what the schema decides: columns, types, nullability, keys, the
 freshness promise from ibkr_etl.layer_freshness and who reads and writes the table. It
@@ -70,8 +70,11 @@ def _params(admin_dsn: str, database: str, user: str | None = None, tenant: str 
     return params
 
 
-def build(admin_dsn: str, database: str, migrations: Path = MIGRATIONS) -> list[str]:
-    """Create `database` and apply every migration in order as a non-superuser owner, like a new environment."""
+def build(admin_dsn: str, database: str, migrations: Path = MIGRATIONS, held=()) -> list[str]:
+    """Create `database` and apply every migration in order as a non-superuser owner, like a new environment.
+
+    `held` files (migrations kept outside migrations/postgres until their day) are applied after them.
+    """
     import psycopg
 
     with psycopg.connect(admin_dsn, autocommit=True) as admin:
@@ -104,6 +107,10 @@ def build(admin_dsn: str, database: str, migrations: Path = MIGRATIONS) -> list[
                                   "VALUES (%s, 'Test', 'active', '2026-01-01')", (tenant,))
             owner.commit()
             applied.append(path.name)
+        for path in held:
+            owner.execute(Path(path).read_text(encoding="utf-8"))
+            owner.commit()
+            applied.append(Path(path).name)
     return applied
 
 
@@ -291,7 +298,7 @@ def _structure(args) -> dict[str, dict | None]:
         raise SystemExit(f"Give --dsn, or set {ADMIN_ENV} to a superuser DSN on a disposable server.")
     database = f"contracts_{uuid.uuid4().hex[:10]}"
     try:
-        build(admin, database, args.migrations)
+        build(admin, database, args.migrations, mc.held_migrations(args.catalog, ROOT))
         with psycopg.connect(**_params(admin, database, OWNER, TENANTS[-1])) as connection:
             return read_structure(connection, catalog)
     finally:

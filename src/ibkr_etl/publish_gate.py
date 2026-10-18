@@ -154,7 +154,9 @@ def mode(environ: Mapping[str, str] | None = None) -> tuple[str, str | None]:
 
 
 def contract_rules(contracts_dir: Path) -> dict[str, Any]:
-    """Every gold table's quality rules, read from its data contract."""
+    """The quality rules of each gold table the gate judges (TABLES), read from its data contract.
+    Other gold tables, such as the certified figures with their own build checks, are left to the
+    administrator's daily layer quality check."""
     from . import medallion_contracts as mc
 
     tables: dict[str, Any] = {}
@@ -162,6 +164,8 @@ def contract_rules(contracts_dir: Path) -> dict[str, Any]:
         if contract.get("domain") != "gold":
             continue
         obj = mc.table_object(contract)
+        if obj.get("physicalName") not in TABLES:
+            continue
         found = [(None, rule) for rule in obj.get("quality") or []]
         for prop in obj.get("properties") or []:
             found += [(prop.get("name"), rule) for rule in prop.get("quality") or []]

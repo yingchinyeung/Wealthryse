@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.nav_snapshots
 name: nav_snapshots
-version: 1.0.0
+version: 1.0.1
 status: active
 domain: silver
 dataProduct: portfolio-medallion
@@ -10,8 +10,9 @@ description:
   purpose: Net asset value per account and statement date, in total and by asset class, from the Flex NAV and equity
     summary sections. The source of every account NAV the platform reports.
   limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
-    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
-    are not versioned yet (review item 8).
+    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
+    item U8's history is switched on, every version is also kept in silver.nav_snapshots_history, and silver.nav_snapshots_as_known(at)
+    returns this table as it stood at any moment.
 tags:
 - silver
 - ibkr

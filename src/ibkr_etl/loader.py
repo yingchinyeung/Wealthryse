@@ -4,14 +4,20 @@ The optional legacy-key step (IBKR_FLEX_LEGACY_KEY_COMPAT) must not run while
 account-sync imports the same accounts. With it, bronze (flex_rows) keeps the
 parser's key while silver keeps the legacy key, so S6's replay will list those
 rows as rekeyed.
+
+The optional FX event step (IBKR_FX_EVENT_KEY, review item U8) needs the FX
+step's migration (silver.fx_transactions.event_key). With it, an FX row IBKR
+re-sends with restated amounts updates the row for the same FX event instead of
+adding a second one. Without it, nothing here reads or writes event_key.
 """
 from __future__ import annotations
 
 import os
 import sqlite3
+from collections import Counter
 from dataclasses import replace
 from decimal import Decimal
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from .parser import FlexRow, ParsedReport
 from .util import canonical_json, decimal_text, parse_date_text, pick, sha256_text, utc_now_iso
@@ -20,10 +26,46 @@ from .util import canonical_json, decimal_text, parse_date_text, pick, sha256_te
 # Off unless set: reuse the key of an existing event row that has identical raw
 # IBKR attributes, so rows imported by another path are updated, not duplicated.
 LEGACY_KEY_COMPAT_ENV = "IBKR_FLEX_LEGACY_KEY_COMPAT"
+# Off unless set: one fx_transactions row per FX event (docs/MEDALLION_AS_KNOWN_ON.md).
+FX_EVENT_KEY_ENV = "IBKR_FX_EVENT_KEY"
+# An FX row's identity without the two amounts IBKR restates (proceeds, realised P&L).
+FX_EVENT_FIELDS = ("account_id", "event_datetime", "report_date", "functional_currency", "fx_currency",
+                   "activity_description", "model_code", "quantity_text", "cost_text")
+FX_COLUMNS = ("account_id", "source_key", "event_datetime", "activity_description", "model_code",
+              "report_date", "functional_currency", "fx_currency", "quantity_text", "proceeds_text",
+              "cost_text", "realized_pnl_text", "row_sha256", "last_seen_run_id")
 
 
 def legacy_key_compat_enabled() -> bool:
     return os.environ.get(LEGACY_KEY_COMPAT_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def fx_event_key_enabled() -> bool:
+    return os.environ.get(FX_EVENT_KEY_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def fx_event_identity(values: Mapping[str, Any]) -> str:
+    """sha256 of an FX row's identity, from its silver column values. Empty and NULL count the same."""
+    return sha256_text(canonical_json({name: "" if values.get(name) is None else str(values[name])
+                                       for name in FX_EVENT_FIELDS}))
+
+
+def fx_event_key(identity: str, occurrence: int) -> str:
+    """The event key: the identity plus the row's place among identical-looking rows in one statement."""
+    return f"fx-event:v1:{identity}:{occurrence}"
+
+
+def fx_transaction_values(row: FlexRow, run_id: int) -> dict[str, Any]:
+    """The fx_transactions columns the loader writes for one Flex record."""
+    a = row.attributes
+    return dict(zip(FX_COLUMNS, (
+        row.account_id, row.source_key, pick(a, "dateTime"),
+        pick(a, "activityDescription"), pick(a, "model", "modelCode"), row.report_date,
+        pick(a, "functionalCurrency"), pick(a, "fxCurrency"),
+        decimal_text(pick(a, "quantity")), decimal_text(pick(a, "proceeds")),
+        decimal_text(pick(a, "cost")), decimal_text(pick(a, "realizedPL")),
+        row.row_sha256, run_id,
+    )))
 
 
 def _legacy_key(connection, table: str, row: FlexRow, unavailable: set[tuple[str, str]]) -> str | None:
@@ -420,6 +462,53 @@ def _upsert_fx_transaction(connection: sqlite3.Connection, row: FlexRow, run_id:
     )
 
 
+def _require_event_key(connection) -> None:
+    try:
+        connection.execute("SELECT event_key FROM fx_transactions WHERE 1 = 0").fetchall()
+    except Exception as error:  # noqa: BLE001 - any driver's "no such column"
+        raise RuntimeError(f"{FX_EVENT_KEY_ENV} is on but fx_transactions has no event_key column: apply the "
+                           f"FX step's migration first, or turn {FX_EVENT_KEY_ENV} off") from error
+
+
+def _upsert_fx_event(connection, row: FlexRow, run_id: int, occurrences: Counter) -> int:
+    """With IBKR_FX_EVENT_KEY: a re-sent FX event with new amounts updates its row. 1 when it did."""
+    values = fx_transaction_values(row, run_id)
+    identity = fx_event_identity(values)
+    occurrences[(row.account_id, identity)] += 1
+    event_key = fx_event_key(identity, occurrences[(row.account_id, identity)])
+    same_record = connection.execute(
+        "SELECT event_key FROM fx_transactions WHERE account_id = ? AND source_key = ?",
+        (row.account_id, row.source_key),
+    ).fetchone()
+    holder = connection.execute(
+        "SELECT source_key FROM fx_transactions WHERE account_id = ? AND event_key = ?",
+        (row.account_id, event_key),
+    ).fetchone()
+    names = [name for name in FX_COLUMNS if name != "account_id"]
+    if same_record is None and holder is not None:
+        # The same FX event under a new content key: restated amounts. One row, new values;
+        # source_key now names the bronze record of this latest version.
+        connection.execute(
+            f"UPDATE fx_transactions SET {', '.join(f'{name} = ?' for name in names)} "
+            "WHERE account_id = ? AND source_key = ?",
+            (*(values[name] for name in names), row.account_id, holder[0]),
+        )
+        return 1
+    # A new event, or the same record again as today. Claim the event key only while it is free.
+    claim = event_key if holder is None or holder[0] == row.source_key else None
+    connection.execute(
+        f"""
+        INSERT INTO fx_transactions({', '.join(FX_COLUMNS)}, event_key)
+        VALUES ({', '.join('?' for _ in FX_COLUMNS)}, ?)
+        ON CONFLICT(account_id, source_key) DO UPDATE SET
+            {', '.join(f'{name}=excluded.{name}' for name in names if name != 'source_key')},
+            event_key=COALESCE(fx_transactions.event_key, excluded.event_key)
+        """,
+        (*(values[name] for name in FX_COLUMNS), claim),
+    )
+    return 0
+
+
 def _upsert_fx_rate(connection: sqlite3.Connection, row: FlexRow, run_id: int) -> None:
     if not row.report_date:
         return
@@ -446,10 +535,18 @@ def load_report(
     run_id: int,
     *,
     legacy_key_compat: bool | None = None,
+    fx_event_keys: bool | None = None,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     if legacy_key_compat is None:
         legacy_key_compat = legacy_key_compat_enabled()
+    if fx_event_keys is None:
+        fx_event_keys = fx_event_key_enabled()
+    occurrences: Counter | None = None
+    restated = 0
+    if fx_event_keys:
+        _require_event_key(connection)
+        occurrences = Counter()
     # A legacy key is never taken over if this report uses it, or twice.
     unavailable = {(row.account_id, row.source_key) for row in report.rows} if legacy_key_compat else set()
     reused = 0
@@ -495,7 +592,12 @@ def load_report(
         elif "conversionrate" in kind or kind in {"fxrate", "currencyconversionrate"}:
             _upsert_fx_rate(connection, row, run_id)
         elif kind == "fxtransaction":
-            _upsert_fx_transaction(connection, compatible("fx_transactions", row), run_id)
+            if occurrences is None:
+                _upsert_fx_transaction(connection, compatible("fx_transactions", row), run_id)
+            else:
+                restated += _upsert_fx_event(connection, compatible("fx_transactions", row), run_id, occurrences)
     if reused:
         counts["legacy_source_keys_reused"] = reused
+    if restated:
+        counts["fx_events_restated"] = restated
     return counts

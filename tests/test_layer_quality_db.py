@@ -228,9 +228,18 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         for check_id, result in results.items():
             states.setdefault(result["state"], set()).add(check_id)
         self.assertNotIn("unavailable", states)
-        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 35)
+        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 43)
         self.assertEqual({c for c in states.get("fail", ()) if not c.startswith("value.")}, set())
-        self.assertEqual(len([c for c in states["skipped"] if c.startswith("rule.")]), 8)  # need an RLS bypass
+        # The corrections history (U8) is held: its checks wait for its migration.
+        held = {c for c in states["skipped"] if "held migration" in str(results[c]["detail"].get("reason"))}
+        self.assertEqual({results[c]["target"] for c in held}, layer_quality.held_relations(CONTRACTS) - {
+            "public.silver_history_settings"})
+        self.assertIn("volume.silver.trades_history", held)
+        self.assertIn("schema.silver.trades_history", held)
+        rls = {c for c in states["skipped"] - held if c.startswith("rule.")}
+        self.assertEqual(len(rls), 8)  # need an RLS bypass
+        self.assertEqual(results["volume.gold.certified_figures"]["state"], "recorded")  # no earlier total
+        self.assertEqual(results["schema.gold.certified_builds"]["state"], "pass")
         nav = results["volume.silver.nav_snapshots"]
         self.assertEqual((nav["state"], nav["observed"], nav["detail"]["date"]), ("pass", 3, "2026-10-15"))
         self.assertEqual(results["volume.silver.position_snapshots"]["observed"], 4)
@@ -283,7 +292,8 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         self.assertEqual(len(volumes), len(layer_quality.VOLUMES))
         self.assertNotIn("unavailable", volumes.values())
         self.assertEqual({daily["value.nav_move"]["state"], daily["value.positions_to_zero"]["state"]}, {"fail"})
-        self.assertEqual({r["state"] for k, r in daily.items() if k.startswith("schema.")}, {"pass"})
+        self.assertEqual({r["state"] for k, r in daily.items() if k.startswith("schema.")
+                          and r["target"] not in layer_quality.held_relations(CONTRACTS)}, {"pass"})
         unreadable = {k for k, r in daily.items() if r["state"] == "unavailable"}
         self.assertTrue(unreadable and all(k.startswith("rule.") for k in unreadable))
         self.assertEqual({k for k, r in daily.items() if r["state"] == "fail"},

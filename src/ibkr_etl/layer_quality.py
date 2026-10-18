@@ -168,6 +168,9 @@ class Volume:
     layer: str
     date_column: str | None = None  # the business date of each row; None: count the whole table
     judged: bool = True  # dated: against typical; whole table: must not shrink. False: recorded only
+    count_column: str | None = None  # whole table: the one column the count reads
+    qualified: bool = False  # created in its layer schema, with no public view: read as layer.table
+    held: bool = False  # created by a held migration: skipped until that migration has run
 
     @property
     def check_id(self) -> str:
@@ -177,10 +180,15 @@ class Volume:
     def target(self) -> str:
         return f"{self.layer}.{self.table}"
 
+    @property
+    def relation(self) -> str:
+        """The name the count reads: the public view, or layer.table when there is none."""
+        return self.target if self.qualified else self.table
+
 
 # Every silver and gold table in infra/medallion/catalog.json (views are counted through their tables).
 VOLUMES: tuple[Volume, ...] = (
-    Volume("accounts", "silver"),
+    Volume("accounts", "silver", count_column="account_id"),
     Volume("benchmark_prices", "silver", "observation_date"),
     Volume("cash_snapshots", "silver", "snapshot_date"),
     # Events: the number per day varies by nature, so it is recorded, not judged.
@@ -193,8 +201,8 @@ VOLUMES: tuple[Volume, ...] = (
     Volume("derived_portfolio_positions", "silver", "snapshot_date"),
     Volume("fx_rates", "silver", "rate_date"),
     Volume("fx_transactions", "silver", "report_date", judged=False),
-    Volume("instrument_classifications", "silver"),
-    Volume("instruments", "silver"),
+    Volume("instrument_classifications", "silver", count_column="conid"),
+    Volume("instruments", "silver", count_column="conid"),
     Volume("market_data_prices", "silver", "price_date"),
     Volume("nav_snapshots", "silver", "snapshot_date"),
     Volume("position_snapshots", "silver", "snapshot_date"),
@@ -202,19 +210,25 @@ VOLUMES: tuple[Volume, ...] = (
     Volume("risk_free_rates", "silver", "rate_date"),
     Volume("synthetic_portfolio_components", "silver", "snapshot_date"),
     Volume("trades", "silver", "trade_date", judged=False),
+    # Corrections history (U8): append-only, so the whole table must not shrink. Held until 9 Nov.
+    Volume("cash_transactions_history", "silver", count_column="version_id", qualified=True, held=True),
+    Volume("fx_rates_history", "silver", count_column="version_id", qualified=True, held=True),
+    Volume("fx_transactions_history", "silver", count_column="version_id", qualified=True, held=True),
+    Volume("nav_snapshots_history", "silver", count_column="version_id", qualified=True, held=True),
+    Volume("trades_history", "silver", count_column="version_id", qualified=True, held=True),
+    # Certified figures (U5): builds and figures are append-only, so neither may shrink.
+    Volume("certified_builds", "gold", count_column="build_id"),
+    Volume("certified_figures", "gold", count_column="build_id"),
     Volume("crisis_replay_components", "gold", "holdings_as_of"),
     Volume("crisis_replay_daily", "gold", "holdings_as_of"),
     Volume("crisis_scenario_results", "gold", "holdings_as_of"),
     Volume("performance_comparison_daily", "gold", "observation_date"),
-    Volume("reporting_snapshots", "gold"),
+    Volume("reporting_snapshots", "gold", count_column="snapshot_id"),
     Volume("risk_analytics_snapshots", "gold", "as_of_date"),
 )
-# The columns each count reads, for logins that cannot read the whole table (bootstrap grants
-# these to the approval login; a count needs SELECT on one column, row security needs none).
-COUNT_COLUMNS = {v.table: v.date_column or {"accounts": "account_id", "instruments": "conid",
-                                             "instrument_classifications": "conid",
-                                             "reporting_snapshots": "snapshot_id"}[v.table]
-                 for v in VOLUMES}
+# The columns each count reads, by relation, for logins that cannot read the whole table (bootstrap
+# grants these to the approval login; a count needs SELECT on one column, row security needs none).
+COUNT_COLUMNS = {v.relation: v.date_column or v.count_column for v in VOLUMES}
 
 NAV_MOVE_SQL = f"""
 WITH series AS (
@@ -305,6 +319,16 @@ def contracts_dir(environ: Mapping[str, str] | None = None) -> Path | None:
         if medallion:
             candidates.insert(0, Path(medallion) / "contracts")
     return next((path for path in candidates if (path / "silver").is_dir()), None)
+
+
+def held_relations(directory: Path) -> frozenset[str]:
+    """layer.table of the catalog objects a held migration creates (catalog.json beside the contracts)."""
+    catalog = Path(directory).parent / "catalog.json"
+    if not catalog.is_file():
+        return frozenset()
+    entries = json.loads(catalog.read_text(encoding="utf-8")).get("postgres", {})
+    return frozenset(f"{value.get('target_schema') or key.split('.', 1)[0]}.{key.split('.', 1)[1]}"
+                     for key, value in entries.items() if value.get("held"))
 
 
 def load_contracts(directory: Path) -> list[dict]:
@@ -620,8 +644,8 @@ def _rows(connection: Any, query: str, params: Any = None) -> list[dict[str, Any
 
 def _volume_sql(rule: Volume) -> str:
     if rule.date_column is None:
-        return f"SELECT count(*) AS total FROM {rule.table}"
-    return (f"SELECT left({rule.date_column}, 10) AS day, count(*) AS total FROM {rule.table} "
+        return f"SELECT count(*) AS total FROM {rule.relation}"
+    return (f"SELECT left({rule.date_column}, 10) AS day, count(*) AS total FROM {rule.relation} "
             f"WHERE {rule.date_column} >= %s AND {rule.date_column} <= %s GROUP BY 1")
 
 
@@ -635,6 +659,7 @@ class Plan:
     contracts_error: str | None = None
     previous_totals: Mapping[str, int] | None = None
     gate_rules: frozenset[str] = frozenset()
+    held: frozenset[str] = frozenset(v.target for v in VOLUMES if v.held)  # layer.table, held migrations
 
     def planned(self) -> list[tuple[str, str, str, str | None]]:
         """(check_id, kind, layer, target) of every check this pass makes."""
@@ -658,7 +683,8 @@ def plan(environ: Mapping[str, str] | None = None, *, previous_totals: Mapping[s
     try:
         contracts = load_contracts(directory)
         return Plan(contracts=tuple(contracts), rules=tuple(contract_rules(contracts)),
-                    previous_totals=previous_totals, gate_rules=frozenset(gate_rules))
+                    previous_totals=previous_totals, gate_rules=frozenset(gate_rules),
+                    held=Plan.held | held_relations(directory))
     except Exception as error:  # noqa: BLE001 - reported as unavailable
         return Plan(contracts_error=f"the data contracts could not be read ({type(error).__name__})",
                     previous_totals=previous_totals, gate_rules=frozenset(gate_rules))
@@ -710,8 +736,29 @@ def measure_daily(connection: Any, pass_plan: Plan, *, now: datetime, results: l
             results.append(_result(check_id, kind, layer, target, "unavailable",
                                    error=layer_freshness._error_label(error)))
 
+    # Tables a held migration creates are skipped, not failed, until that migration has run.
+    absent: set[str] = set()
+    if pass_plan.held:
+        try:
+            with _savepoint(connection):
+                absent = {str(row["relation"]) for row in _rows(
+                    connection, "SELECT r AS relation FROM unnest(%s::text[]) AS r WHERE to_regclass(r) IS NULL",
+                    (sorted(pass_plan.held),))}
+        except Exception:  # noqa: BLE001 - each check then reports for itself
+            absent = set()
+
+    def not_yet(check_id: str, kind: str, layer: str, target: str | None) -> bool:
+        if target not in absent:
+            return False
+        results.append(_result(check_id, kind, layer, target, "skipped",
+                               reason="created by a held migration that has not run yet"))
+        return True
+
     previous = pass_plan.previous_totals or {}
     for rule in pass_plan.volumes:
+        if not_yet(rule.check_id, "volume", rule.layer, rule.target):
+            continue
+
         def count(rule: Volume = rule) -> dict:
             if rule.date_column is None:
                 total = _rows(connection, _volume_sql(rule))[0]["total"]
@@ -734,6 +781,8 @@ def measure_daily(connection: Any, pass_plan: Plan, *, now: datetime, results: l
     tuples = _Tuples(connection)
     for contract in pass_plan.contracts:
         physical = str(medallion_contracts.table_object(contract).get("physicalName"))
+        if not_yet(f"schema.{physical}", "schema", str(contract.get("domain")), physical):
+            continue
         attempt(f"schema.{physical}", "schema", str(contract.get("domain")), physical,
                 lambda contract=contract, physical=physical: judge_schema(
                     contract, medallion_contracts.introspect(tuples, physical)))
@@ -741,6 +790,8 @@ def measure_daily(connection: Any, pass_plan: Plan, *, now: datetime, results: l
     bypass = _bypasses_row_security(connection) if pass_plan.rules else False
     for rule in pass_plan.rules:
         if rule.check_id in pass_plan.gate_rules:
+            continue
+        if not_yet(rule.check_id, "rule", rule.layer, rule.target):
             continue
         if rule.needs_rls_bypass and not bypass:
             results.append(_result(rule.check_id, "rule", rule.layer, rule.target, "skipped",

@@ -4,6 +4,12 @@ Every figure in an answer must match a number some tool returned, allowing
 for the rounding shown (12.3% matches 0.12345; $1.2m matches 1,234,567).
 Every citation must name a tool call made for this answer. Answers that fail
 are not shown to anyone.
+
+Certified figures (get_certified_figures, behind AGENT_CERTIFIED_FIGURES) are
+cited [F1], [F2]: the number beside an [F#] must be that figure's value, not
+just any number a tool returned. Until 8 Nov that check only warns
+(Validation.figure_warnings); it never rejects an answer. Without certified
+figures the check does not run and nothing changes.
 """
 from __future__ import annotations
 
@@ -21,6 +27,10 @@ _NUMBER = re.compile(
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _TIME = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 _CITATION = re.compile(r"\[T\d+\]")
+_FIGURE_CITATION = re.compile(r"\[F\d+\]")
+_FIGURE_ID = re.compile(r"F\d+")
+_ANY_CITATION = re.compile(r"\[[TF]\d+\]")
+_CLAUSE_END = re.compile(r"[.!?;](?=\s)|\n")
 _NAMED_NUMBER = re.compile(r"[A-Za-z].*\d|\d.*[A-Za-z]")
 _SCALE = {"k": 1e3, "thousand": 1e3, "m": 1e6, "million": 1e6, "bn": 1e9, "billion": 1e9}
 SMALL_COUNT_LIMIT = 10
@@ -33,6 +43,9 @@ class Validation:
     bad_citations: list[str] = field(default_factory=list)
     bad_dates: list[str] = field(default_factory=list)
     bad_visuals: list[str] = field(default_factory=list)
+    # Warn-only until 8 Nov: [F#] citations whose number is not that certified figure's value.
+    figure_warnings: list[str] = field(default_factory=list)
+    figure_checks: dict[str, str] = field(default_factory=dict)  # F# -> "ok" or "warning"
 
     def feedback(self) -> str:
         parts = []
@@ -167,14 +180,73 @@ def validate_visuals(visuals: list[Mapping[str, Any]], results: Mapping[str, Any
     return problems
 
 
+def _shown_matches(match: re.Match, value: float, unit: str) -> bool:
+    raw = match.group("num").replace(",", "")
+    decimals = len(raw.split(".")[1]) if "." in raw else 0
+    shown, symbol, sign = float(raw), (match.group("unit") or "").lower(), match.group("sign")
+    if symbol == "%":
+        candidates = [value * 100] if unit == "ratio" else [value, value * 100]
+        return _matches(shown, decimals, 1.0, candidates, sign)
+    if symbol in ("bp", "bps"):
+        return _matches(shown, decimals, 1.0, [value * 10000], sign)
+    if symbol in _SCALE:
+        return _matches(shown * _SCALE[symbol], decimals, _SCALE[symbol], [value], sign)
+    return _matches(shown, decimals, 1.0, [value], sign)
+
+
+def check_figure_citations(answer: str, figures: Mapping[str, Mapping[str, Any]]) -> tuple[list[str], dict[str, str]]:
+    """The number beside each [F#] (the last one between the previous citation or clause end and
+    the citation) must be that certified figure's value, allowing for the rounding shown.
+    Returns the warnings and each cited figure's result."""
+    warnings: list[str] = []
+    checks: dict[str, str] = {}
+    start = 0
+    for citation in _ANY_CITATION.finditer(answer):
+        span = answer[start:citation.start()]
+        start = citation.end()
+        ref = citation.group(0)[1:-1]
+        if not ref.startswith("F"):
+            continue
+        figure = figures.get(ref)
+        if figure is None:
+            warnings.append(f"{ref} is not a certified figure returned for this answer")
+            continue
+        ends = list(_CLAUSE_END.finditer(span))
+        clause = span[ends[-1].end():] if ends else span
+        unit, value = str(figure.get("unit") or ""), figure.get("value")
+        if unit in ("date", "text"):
+            ok = value is not None and str(value) in clause
+        else:
+            numbers = list(_NUMBER.finditer(_DATE.sub(" ", clause)))
+            ok = bool(numbers) and isinstance(value, (int, float)) and _shown_matches(numbers[-1], float(value), unit)
+        checks[ref] = checks.get(ref) if checks.get(ref) == "warning" else ("ok" if ok else "warning")
+        if not ok:
+            warnings.append(f"{ref} ({figure.get('figure_id')}) is {figure.get('display')}, but the text beside it "
+                            "does not show that value")
+    return warnings, checks
+
+
 def validate_answer(answer: str, citations: list[str], results: Mapping[str, Any], question: str = "",
-                    visuals: list[Mapping[str, Any]] | None = None) -> Validation:
-    """``results`` maps citation id (T1, T2…) to the tool result it labels."""
+                    visuals: list[Mapping[str, Any]] | None = None,
+                    figures: Mapping[str, Mapping[str, Any]] | None = None) -> Validation:
+    """``results`` maps citation id (T1, T2…) to the tool result it labels; ``figures`` maps F1, F2…
+    to the certified figures those results carried (None when there are none)."""
     known = known_numbers(results)
     values, percents, basis_points = known["values"], known["percents"], known["basis_points"]
     known_strings = set(_strings(list(results.values())))
     question_numbers = {m.group("num").replace(",", "") for m in _NUMBER.finditer(question or "")}
     report = Validation(ok=True)
+
+    figure_refs = [c for c in citations if figures is not None and _FIGURE_ID.fullmatch(c)]
+    citations = [c for c in citations if c not in figure_refs]
+    cited_figure = False
+    if figures is not None:
+        report.figure_warnings, report.figure_checks = check_figure_citations(answer, figures)
+        report.figure_warnings += [f"{c} is not a certified figure returned for this answer"
+                                   for c in figure_refs if c not in figures]
+        cited_figure = any(c in figures for c in figure_refs) or any(
+            m.group(0)[1:-1] in figures for m in _FIGURE_CITATION.finditer(answer))
+        answer = _FIGURE_CITATION.sub(" ", answer)
 
     report.bad_citations = sorted({c for c in citations if c not in results})
     inline = {m.group(0)[1:-1] for m in _CITATION.finditer(answer)}
@@ -219,7 +291,7 @@ def validate_answer(answer: str, citations: list[str], results: Mapping[str, Any
         if not ok:
             report.unverified.append(match.group(0).strip())
 
-    if checked and not citations and not inline:
+    if checked and not citations and not inline and not cited_figure:
         report.bad_citations.append("(none given)")
     report.bad_visuals = validate_visuals(list(visuals or []), results, known, known_strings)
     report.ok = not (report.unverified or report.bad_citations or report.bad_dates or report.bad_visuals)

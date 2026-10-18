@@ -450,8 +450,9 @@ def read_certified(connection, *, tenant_id: str, subject_id: str, figure_ids: I
         if row["published_at"] is not None and (newest is None or row["published_at"] > newest["published_at"]):
             newest = row
     if newest is not None:
+        published = newest["published_at"]
         certified.build_id = str(newest["build_id"])
-        certified.published_at = newest["published_at"].isoformat() if hasattr(newest["published_at"], "isoformat") else str(newest["published_at"])
+        certified.published_at = published.isoformat() if hasattr(published, "isoformat") else str(published)
     return certified
 
 

@@ -275,6 +275,7 @@ def prepare():
     state = {
         'head': head, 'deployed_commit': deployed, 'live_image': live,
         'fqdn': app['properties']['configuration']['ingress']['fqdn'],
+        'secrets': secret_kinds(app),
         'target_image': f'{REG}/ibkr-platform:web-{head}',
         'changed_files': [p for p in image_changes],
         'migrations_not_shipped': migrations,
@@ -713,6 +714,14 @@ def deploy():
     print('Website switched to', state['target_image'])
 
 
+def secret_kinds(app):
+    """{secret name: 'key-vault' or 'inline'} for the website; names and kinds only, never a value. Every step here
+    changes only the image or named settings, so this must be the same before and after (the network thread moves
+    secrets to Key Vault references, and an older inline value coming back would break sign-in or the broker)."""
+    secrets = (app.get('properties') or {}).get('configuration', {}).get('secrets') or []
+    return {s['name']: 'key-vault' if s.get('keyVaultUrl') else 'inline' for s in secrets if s.get('name')}
+
+
 def anonymous_status(fqdn, path):
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
@@ -743,8 +752,14 @@ def verify():
         code, location = anonymous_status(state['fqdn'], path)
         ok = code == 401 or (code == 302 and '/.auth/login/' in location)
         checks.append({'path': path, 'status': code, 'sign_in_required': ok})
-    report = {'revision': revision, 'health': rev.get('healthState'), 'running': rev.get('runningState'), 'checks': checks}
+    secrets = secret_kinds({'properties': app})
+    report = {'revision': revision, 'health': rev.get('healthState'), 'running': rev.get('runningState'), 'checks': checks,
+              'secrets': secrets}
     print(json.dumps(report, indent=2))
+    if 'secrets' in state and secrets != state['secrets']:
+        raise SystemExit('The website secrets are not as they were before this run (names and kinds above, before: '
+                         + json.dumps(state['secrets'], sort_keys=True) + '). This step never changes secrets: tell '
+                         'the network thread before anything else changes the website.')
     if rev.get('healthState') != 'Healthy' or not all(c['sign_in_required'] for c in checks):
         raise SystemExit('Verification failed')
 
@@ -771,6 +786,7 @@ def chat():
        '--set-env-vars', *[k + '=' + v for k, v in settings.items()], parse=False)
     STATE.write_text(json.dumps({'changed_files': ['AGENT_UI_MODE'], 'revision': APP + '--' + suffix,
                                  'fqdn': app['properties']['configuration']['ingress']['fqdn'],
+                                 'secrets': secret_kinds(app),
                                  'previous_mode': env.get('AGENT_UI_MODE', 'off')}, indent=2))
     print('Website chat set to', mode)
 
@@ -857,6 +873,7 @@ def pages():
        '--set-env-vars', PAGES_SETTING + '=' + after, parse=False)
     STATE.write_text(json.dumps({'changed_files': [PAGES_SETTING], 'revision': APP + '--' + suffix,
                                  'fqdn': app['properties']['configuration']['ingress']['fqdn'],
+                                 'secrets': secret_kinds(app),
                                  'previous_pages': before}, indent=2))
     print('Website pages set for', stage)
 

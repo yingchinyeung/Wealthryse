@@ -105,6 +105,7 @@ class PagesCommandTest(unittest.TestCase):
         self.assertEqual(state["previous_pages"], "off")
         self.assertEqual(state["changed_files"], [release.PAGES_SETTING])
         self.assertTrue(state["revision"].startswith("ibkrv2stg-web--pages-shadow-"))
+        self.assertEqual(state["secrets"], {})
 
     def test_a_website_without_the_readers_is_refused(self):
         with self.assertRaises(SystemExit):
@@ -145,6 +146,45 @@ class PagesCommandTest(unittest.TestCase):
                     mock.patch.object(release, "STATE", state), mock.patch("builtins.print"):
                 release.rollback()
         self.assertIn(release.PAGES_SETTING + "=off", calls[-1])
+
+
+class SecretsStayAsTheyWereTest(unittest.TestCase):
+    APP = {"configuration": {"secrets": [{"name": "credential-broker-auth", "keyVaultUrl": "https://vault/secrets/x",
+                                          "identity": "id"}, {"name": "database-web-url", "keyVaultUrl": "https://v/y"}]},
+           "latestReadyRevisionName": "ibkrv2stg-web--r1"}
+
+    def run_verify(self, secrets_before, app=None):
+        app = app or self.APP
+
+        def az(*args, parse=True):
+            if args[1] == "show":
+                return {"properties": app}
+            return {"properties": {"healthState": "Healthy", "runningState": "Running"}}
+
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder) / "release-state.json"
+            state.write_text(json.dumps({"changed_files": [release.PAGES_SETTING], "revision": "ibkrv2stg-web--r1",
+                                         "fqdn": "web.example", "secrets": secrets_before}))
+            with mock.patch.object(release, "az", az), mock.patch.object(release, "STATE", state), \
+                    mock.patch.object(release, "anonymous_status", return_value=(401, "")), \
+                    mock.patch("builtins.print"):
+                release.verify()
+
+    def test_kinds_only_never_values(self):
+        kinds = release.secret_kinds({"properties": {"configuration": {"secrets": [
+            {"name": "a", "keyVaultUrl": "https://v/a"}, {"name": "b", "value": "not-printed"}]}}})
+        self.assertEqual(kinds, {"a": "key-vault", "b": "inline"})
+
+    def test_unchanged_secrets_pass(self):
+        self.run_verify({"credential-broker-auth": "key-vault", "database-web-url": "key-vault"})
+
+    def test_a_secret_back_inline_fails(self):
+        with self.assertRaises(SystemExit) as stopped:
+            self.run_verify({"credential-broker-auth": "key-vault", "database-web-url": "key-vault"},
+                            app={**self.APP, "configuration": {"secrets": [
+                                {"name": "credential-broker-auth", "value": "old"},
+                                {"name": "database-web-url", "keyVaultUrl": "https://v/y"}]}})
+        self.assertIn("network thread", str(stopped.exception))
 
 
 class PrepareSeesThePagesSettingTest(unittest.TestCase):

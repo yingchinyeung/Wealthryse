@@ -88,6 +88,13 @@ class FakeConnection:
     def execute(self, sql, params=None):
         if "to_regclass" in sql:
             return FakeCursor([("gold.v_certified_figures",)])
+        if "min(as_of_date)" in sql:   # each subject's oldest certified date
+            (subjects,) = params
+            since = {}
+            for row in self.certified:
+                if row["subject_id"] in subjects:
+                    since[row["subject_id"]] = min(since.get(row["subject_id"], row["as_of_date"]), row["as_of_date"])
+            return FakeCursor(sorted(since.items()), ["subject_id", "since"])
         subjects, days, wanted = params
         rows = [tuple(row.get(name) for name in self.NAMES) for row in self.certified
                 if row["subject_id"] in subjects and row["as_of_date"] in days and row["figure_id"] in wanted]
@@ -110,8 +117,9 @@ def certified_from(answers, subject=ACCOUNT, day=DAY):
     return rows
 
 
-def run(answers, certified, pages=("overview", "holdings", "cash")):
-    comparison = figures.compare(list(pages), FakePages(answers), FakeConnection(certified), {ACCOUNT: [DAY]})
+def run(answers, certified, pages=("overview", "holdings", "cash"), subject_dates=None):
+    comparison = figures.compare(list(pages), FakePages(answers), FakeConnection(certified),
+                                 subject_dates or {ACCOUNT: [DAY]})
     return figures.build_report(comparison, source="test")
 
 
@@ -139,6 +147,19 @@ class FiguresCommandTests(unittest.TestCase):
         self.assertEqual(report["pages"]["holdings"]["differences"], 0)
         self.assertEqual(report["not_compared"], {"overview.data_freshness": figures.NOT_COMPARED["overview.data_freshness"]})
         self.assertFalse(figures.has_differences(report))
+
+    def test_dates_older_than_the_build_has_reached_are_not_built_yet(self):
+        answers = payloads()
+        older = "2026-09-30"
+        report = run(answers, certified_from(answers), subject_dates={ACCOUNT: [older, DAY]})
+        self.assertEqual(report["differences"], [])
+        self.assertEqual(report["not_built_yet"], 1)
+        self.assertIn("Dates not built yet, so not compared: 1.", figures.render_public_summary(report))
+        self.assertIn("Dates not built yet", figures.render_markdown(report))
+        # A subject with no certified figures at all is compared, and differs.
+        report = run(answers, [], subject_dates={ACCOUNT: [DAY]})
+        self.assertEqual(report["not_built_yet"], 0)
+        self.assertTrue(figures.has_differences(report))
 
     def test_tolerances_follow_the_unit(self):
         self.assertTrue(figures.same("money", 100.004, 100.0))

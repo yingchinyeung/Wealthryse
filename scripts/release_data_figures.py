@@ -369,6 +369,20 @@ CERTIFIED_SQL = """
 """
 
 
+# Each subject's oldest certified date: the build fills older dates in over several runs, newest
+# first, so a date before it is "not built yet", not a difference.
+CERTIFIED_SINCE_SQL = """
+    SELECT subject_id, min(as_of_date)::text AS since
+      FROM gold.v_certified_figures
+     WHERE subject_id = ANY(%s)
+     GROUP BY subject_id
+"""
+
+
+def certified_since(connection, subjects: list[str]) -> dict[str, str]:
+    return {subject: since for subject, since in connection.execute(CERTIFIED_SINCE_SQL, (subjects,)).fetchall()}
+
+
 def certified_rows(connection, subjects: list[str], days: list[str], figures: list[str]) -> list[dict]:
     if connection.execute("SELECT to_regclass('gold.v_certified_figures')").fetchone()[0] is None:
         raise FiguresError("gold.v_certified_figures is not in this database: apply migration 073 and run the build")
@@ -432,6 +446,7 @@ class Comparison:
     dates: set = field(default_factory=set)
     not_compared: dict = field(default_factory=dict)
     unavailable: Counter = field(default_factory=Counter)
+    not_built: int = 0                                        # subject dates older than the build has reached
 
     def add(self, page: str, subject: str, day: str, key: Key, unit: str, today, certified, source: str) -> None:
         self.compared[page] += 1
@@ -470,8 +485,12 @@ def compare(pages: list[str], api, connection, subject_dates: Mapping[str, list[
     days = sorted({day for values in subject_dates.values() for day in values})
     stored = _stored(certified_rows(connection, list(subject_dates), days, sorted(figures))
                      if subject_dates and days else [])
+    since = certified_since(connection, list(subject_dates)) if subject_dates else {}
     for subject, subject_days in subject_dates.items():
         for day in subject_days:
+            if day < since.get(subject, day):
+                result.not_built += 1
+                continue
             certified = stored.get((subject, day), {})
             for page, read in readers.items():
                 today = read(api, subject, day)
@@ -526,6 +545,7 @@ def build_report(comparison: Comparison, *, source: str, taken_at: str | None = 
         "compared": sum(comparison.compared.values()), "differences": differences,
         "not_compared": dict(sorted(comparison.not_compared.items())),
         "page_errors": dict(sorted(comparison.unavailable.items())),
+        "not_built_yet": comparison.not_built,
         "tolerance": {"ratio_and_number_relative": REL_TOL, "money_absolute": CENT, "date_and_text": "exact"},
     }
 
@@ -558,6 +578,9 @@ def render_markdown(report: Mapping, *, limit: int = 500) -> str:
     lines.append("")
     if report["not_compared"]:
         lines += ["**Not compared:**", ""] + [f"- `{name}`: {why}" for name, why in report["not_compared"].items()] + [""]
+    if report.get("not_built_yet"):
+        lines += [f"Dates not built yet (older than the subject's oldest certified date, so not compared): "
+                  f"{report['not_built_yet']:,}.", ""]
     if report["page_errors"]:
         lines += ["**Page answers that were errors** (counted, not compared):", ""] + \
             [f"- {name}: {count:,}" for name, count in report["page_errors"].items()] + [""]
@@ -601,6 +624,8 @@ def render_public_summary(report: Mapping) -> str:
         lines.append("")
     if report["not_compared"]:
         lines += ["Not compared: " + ", ".join(f"`{name}`" for name in report["not_compared"]) + ".", ""]
+    if report.get("not_built_yet"):
+        lines += [f"Dates not built yet, so not compared: {report['not_built_yet']:,}.", ""]
     if report["page_errors"]:
         lines += [f"Page answers that were errors: {sum(report['page_errors'].values()):,}.", ""]
     lines.append("Counts, figure ids and page names only. The full report, with the figures, is kept privately "

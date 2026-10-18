@@ -76,14 +76,54 @@ class CertifiedBuildTests(unittest.TestCase):
         self.assertEqual((result["new"], result["changed"], result["unchanged"], result["violations"]),
                          ([new], [moved, caused], 1, [moved]))
 
-    def test_dates_to_build(self):
+    def test_dates_due_every_run(self):
         subject = build.Subject("U9300001", {"reporting_currency": "USD"},
                                 [f"2026-10-{day:02d}" for day in range(1, 17)])
-        self.assertEqual(build.dates_to_build(subject, None, backfill=True), subject.dates)
-        self.assertEqual(build.dates_to_build(subject, "2026-10-14", backfill=False),
-                         ["2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"])
-        self.assertEqual(build.dates_to_build(subject, "2026-10-05", backfill=False), subject.dates[5:])
+        last_five = ["2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"]
+        self.assertEqual(build.due_dates(subject, []), last_five)            # nothing published: the rest is history
+        self.assertEqual(build.due_dates(subject, ["2026-10-14"]), last_five)
+        self.assertEqual(build.due_dates(subject, subject.dates[:5]), subject.dates[5:])
         self.assertEqual(build.expected_date(date(2026, 10, 19)), date(2026, 10, 16))  # Monday: Friday's data
+
+    def test_history_is_the_older_dates_without_figures_newest_first(self):
+        subject = build.Subject("U9300001", {"reporting_currency": "USD"},
+                                [f"2026-10-{day:02d}" for day in range(1, 17)])
+        published = subject.dates[8:]                                         # 9 to 16 Oct
+        due = build.due_dates(subject, published)
+        self.assertEqual(build.history_dates(subject, published, due, backfill=False),
+                         [f"2026-10-{day:02d}" for day in range(8, 0, -1)])
+        self.assertEqual(build.history_dates(subject, published, due, backfill=True),
+                         [f"2026-10-{day:02d}" for day in range(11, 0, -1)])     # every older date again
+
+    def test_the_plan_reads_due_dates_first_then_history_one_subject_at_a_time(self):
+        one = build.Subject("U9300001", {}, ["2026-10-01", "2026-10-02", "2026-10-05", "2026-10-06", "2026-10-07",
+                                             "2026-10-08", "2026-10-09"])
+        two = build.Subject("test-portfolio", {}, ["2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09"])
+        plan = [(subject.id, day) for subject, day in build.work_plan([one, two], {}, backfill=False)]
+        self.assertEqual(plan[:9], [("U9300001", day) for day in ("2026-10-05", "2026-10-06", "2026-10-07",
+                                                                  "2026-10-08", "2026-10-09")]
+                         + [("test-portfolio", day) for day in ("2026-10-06", "2026-10-07", "2026-10-08",
+                                                                "2026-10-09")])
+        self.assertEqual(plan[9:], [("U9300001", "2026-10-02"), ("U9300001", "2026-10-01")])
+        # Once 2 Oct onwards is published, only 1 Oct is history; the due dates stay the last five.
+        plan = build.work_plan([one], {"U9300001": one.dates[1:]}, backfill=False)
+        self.assertEqual([day for _, day in plan], ["2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
+                                                    "2026-10-09", "2026-10-01"])
+        # After days without a run, the new dates follow on from the published ones, so a run that
+        # stops among them leaves no gap.
+        plan = build.work_plan([one], {"U9300001": one.dates[:2]}, backfill=False)
+        self.assertEqual([day for _, day in plan], one.dates[2:])
+
+    def test_time_limit(self):
+        self.assertEqual(build.time_limit(None, {}), build.DEFAULT_MINUTES)
+        self.assertEqual(build.time_limit(None, {build.MINUTES_ENV: "12.5"}), 12.5)
+        self.assertEqual(build.time_limit(None, {build.MINUTES_ENV: "soon"}), build.DEFAULT_MINUTES)
+        self.assertEqual(build.time_limit(5, {build.MINUTES_ENV: "12.5"}), 5)
+        for bad in (0, -1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                build.time_limit(bad, {})
+        self.assertEqual(_script()._arguments(["--minutes", "7"]).minutes, 7.0)
+        self.assertIsNone(_script()._arguments([]).minutes)
 
     def test_freshness_follows_the_account_header(self):
         subject = build.Subject("U9300001", {"reporting_currency": "USD"}, ["2026-10-14", "2026-10-15", "2026-10-16"])

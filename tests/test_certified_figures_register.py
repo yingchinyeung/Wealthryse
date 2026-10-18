@@ -180,7 +180,11 @@ class CertifiedFiguresRegisterTests(unittest.TestCase):
             moves = day(batch["date"])
             with self.subTest(batch=number):
                 self.assertGreater(moves, previous)
-                self.assertLess(moves, retry_start)
+                if batch["pages"] == ["charts"]:
+                    # The charts move on the last move day, after the retries of the pages they sit on.
+                    self.assertEqual(moves, last_move)
+                else:
+                    self.assertLess(moves, retry_start)
                 self.assertNotIn(batch["date"], timeline["no_moves"])
                 for page_id in batch["pages"]:
                     self.assertEqual(self.pages[page_id]["batch"], int(number))
@@ -294,7 +298,7 @@ class CertifiedFiguresModuleTests(unittest.TestCase):
             with patch.object(cf, "REPOSITORY_DIR", Path(folder) / "absent"), patch.object(cf, "IMAGE_DIR", image):
                 self.assertEqual(cf.medallion_dir({}), image)
                 cf.reload()
-                self.assertEqual(len(cf.figures()), 71)
+                self.assertEqual(len(cf.figures()), 79)
                 # MEDALLION_DIR first, when it has the register.
                 elsewhere = Path(folder) / "elsewhere"
                 with patch.dict("os.environ", {"MEDALLION_DIR": str(elsewhere)}):
@@ -308,15 +312,15 @@ class CertifiedFiguresModuleTests(unittest.TestCase):
                     patch.dict("os.environ", {"MEDALLION_DIR": ""}):
                 self.assertEqual(cf.register_path(), cf.PACKAGED_REGISTER)
                 cf.reload()
-                self.assertEqual(len(cf.figures()), 71)
+                self.assertEqual(len(cf.figures()), 79)
                 # As in the website: its release ships only .py files, so the copy as code.
                 with patch.object(cf, "PACKAGED_REGISTER", Path(folder) / "absent.json"):
                     self.assertEqual(cf.register_path(), cf.PACKAGED_MODULE)
                     cf.reload()
                     self.assertEqual(cf.register(), json.loads(REGISTER.read_text(encoding="utf-8")))
-                    self.assertEqual(len(cf.figures()), 71)
+                    self.assertEqual(len(cf.figures()), 79)
         cf.reload()
-        self.assertEqual(len(cf.figures()), 71)
+        self.assertEqual(len(cf.figures()), 79)
 
     def test_the_packaged_copy_is_the_register(self) -> None:
         # After changing the register: python -m ibkr_etl.certified_figures --write
@@ -339,7 +343,7 @@ class CertifiedFiguresModuleTests(unittest.TestCase):
     def test_figures_carry_their_definition_and_version(self) -> None:
         figures = cf.figures()
         self.assertEqual(list(figures), list(cf.register()["figures"]))
-        self.assertEqual(len(figures), 71)
+        self.assertEqual(len(figures), 79)
         sharpe = cf.figure("risk.sharpe_ratio")
         self.assertEqual((sharpe.label, sharpe.definition_id, sharpe.link, sharpe.unit, sharpe.page, sharpe.batch),
                          ("Sharpe ratio", "metric-sharpe-ratio", "/metrics-guide#metric-sharpe-ratio", "number",
@@ -377,7 +381,7 @@ class CertifiedFiguresModuleTests(unittest.TestCase):
 
     def test_pages_batches_and_what_each_page_shows(self) -> None:
         self.assertEqual(list(cf.pages()), ["overview", "holdings", "cash", "performance", "risk-snapshot",
-                                            "risk-statistics", "combined-holdings"])
+                                            "risk-statistics", "combined-holdings", "charts"])
         self.assertEqual(cf.batch_for_page("performance"), cf.Batch(2, date(2026, 10, 23)))
         overview = [figure.id for figure in cf.figures_for_page("overview")]
         self.assertEqual(overview[0], "overview.as_of")
@@ -386,7 +390,7 @@ class CertifiedFiguresModuleTests(unittest.TestCase):
         self.assertEqual(combined, ["holdings.quantity", "holdings.market_value", "holdings.cost_basis",
                                     "holdings.unrealized_pnl"])
         per_page = sum(len([f for f in cf.figures().values() if f.page == page]) for page in cf.pages())
-        self.assertEqual(per_page, 71)
+        self.assertEqual(per_page, 79)
 
     def test_page_modes_default_off_and_ignore_typos(self) -> None:
         self.assertEqual(set(cf.page_modes(None).values()), {"off"})

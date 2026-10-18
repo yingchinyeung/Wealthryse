@@ -1087,7 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
     compare.add_argument("--abs-tol", type=float, default=1e-12)
     figures = sub.add_parser("figures", help="compare each page's figures today with the certified figures "
                                              "on a restored copy")
-    figures.add_argument("--batch", action="append", default=[], help="a batch of pages (1, 2 or 3); repeatable")
+    figures.add_argument("--batch", action="append", default=[], help="a batch of pages (1 to 4); repeatable")
     figures.add_argument("--page", action="append", default=[], help="one page, such as overview; repeatable")
     figures.add_argument("--url-env", default="DATABASE_ADMIN_URL",
                          help="environment variable holding the copy's database URL")

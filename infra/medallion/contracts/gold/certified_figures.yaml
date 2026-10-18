@@ -273,7 +273,8 @@ schema:
     query: SELECT COUNT(*) FROM gold.certified_figures f JOIN gold.certified_builds b ON b.tenant_id = f.tenant_id
       AND b.build_id = f.build_id WHERE b.published_at IS NOT NULL AND f.status = 'ok' AND f.figure_id IN ('risk.expected_max_drawdown_1y',
       'risk.actual_max_drawdown_1y', 'risk.tail_max_drawdown_1y', 'risk.crisis_max_drawdown_2008', 'risk.maximum_drawdown',
-      'risk.crisis_scenario_max_drawdown', 'stats.maximum_drawdown', 'stats.current_drawdown') AND f.value > 0
+      'risk.crisis_scenario_max_drawdown', 'stats.maximum_drawdown', 'stats.current_drawdown', 'table.drawdown_episodes')
+      AND f.value > 0
     mustBe: 0
     severity: error
     dimension: conformity
@@ -290,8 +291,17 @@ schema:
     description: A published correlation is between -1 and 1.
     type: sql
     query: SELECT COUNT(*) FROM gold.certified_figures f JOIN gold.certified_builds b ON b.tenant_id = f.tenant_id
-      AND b.build_id = f.build_id WHERE b.published_at IS NOT NULL AND f.status = 'ok' AND f.figure_id IN ('benchmark.correlation')
-      AND abs(f.value) > 1 + 1e-12
+      AND b.build_id = f.build_id WHERE b.published_at IS NOT NULL AND f.status = 'ok' AND f.figure_id IN ('benchmark.correlation',
+      'series.rolling_correlation_126d', 'matrix.holdings_correlation') AND abs(f.value) > 1 + 1e-12
+    mustBe: 0
+    severity: error
+    dimension: conformity
+  - name: published_indicators_in_range
+    description: A published RSI (14) is between 0 and 100 and a rolling volatility is not below zero.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.certified_figures f JOIN gold.certified_builds b ON b.tenant_id = f.tenant_id
+      AND b.build_id = f.build_id WHERE b.published_at IS NOT NULL AND f.status = 'ok' AND ((f.figure_id = 'indicator.rsi_14'
+      AND (f.value < 0 OR f.value > 100)) OR (f.figure_id = 'series.rolling_volatility_63d' AND f.value < 0))
     mustBe: 0
     severity: error
     dimension: conformity

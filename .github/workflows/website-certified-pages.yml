@@ -4,17 +4,19 @@ name: Website certified pages
 # setting CERTIFIED_FIGURES_PAGES on ibkrv2stg-web (docs/MEDALLION_CERTIFIED_FIGURES.md,
 # "How a page moves"). shadow: every page shows today's figures and logs any difference.
 # batch-1, batch-2, batch-3: those batches show the certified figures, the rest stay in
-# shadow. off: every page exactly as before. The image is left as it is. It refuses while
-# the daily runs publish (07:50 to 09:25 UTC), and from 1 to 7 Nov it only moves pages
-# back. Rolls back to the previous value if the checks fail.
+# shadow. batch-4: the charts too (page key charts: a certified chart is shown only where it
+# equals today's, otherwise today's with one log line; the live website must have
+# src/ibkr_etl/certified_charts.py). off: every page exactly as before. The image is left as
+# it is. It refuses while the daily runs publish (07:50 to 09:25 UTC), and from 1 to 7 Nov
+# it only moves pages back. Rolls back to the previous value if the checks fail.
 on:
   workflow_dispatch:
     inputs:
       stage:
-        description: shadow, batch-1, batch-2, batch-3 or off
+        description: shadow, batch-1, batch-2, batch-3, batch-4 or off
         required: true
         type: choice
-        options: [shadow, batch-1, batch-2, batch-3, 'off']
+        options: [shadow, batch-1, batch-2, batch-3, batch-4, 'off']
 
 permissions:
   contents: read

@@ -17,7 +17,7 @@ HEAD = "b" * 40
 LIVE = "a" * 40
 SQL = b"create 073\n"
 SHADOW = ("overview=shadow,holdings=shadow,cash=shadow,performance=shadow,risk-snapshot=shadow,"
-          "risk-statistics=shadow,combined-holdings=shadow")
+          "risk-statistics=shadow,combined-holdings=shadow,charts=shadow")
 
 
 def at(text):
@@ -32,7 +32,10 @@ class PagesValueTest(unittest.TestCase):
                          .replace("holdings=shadow,cash", "holdings=on,cash").replace("cash=shadow", "cash=on"))
         modes = release.page_modes(release.pages_value("batch-2"))
         self.assertEqual([p for p, m in modes.items() if m == "on"], ["overview", "holdings", "cash", "performance"])
-        self.assertEqual(set(release.page_modes(release.pages_value("batch-3")).values()), {"on"})
+        modes = release.page_modes(release.pages_value("batch-3"))
+        self.assertEqual([p for p, m in modes.items() if m != "on"], ["charts"])
+        self.assertEqual(modes["charts"], "shadow")
+        self.assertEqual(set(release.page_modes(release.pages_value("batch-4")).values()), {"on"})
 
     def test_the_stages_follow_the_register(self):
         # The same pages and modes the website reads (ibkr_etl.certified_figures.page_modes).
@@ -49,7 +52,7 @@ class PagesValueTest(unittest.TestCase):
         self.assertIsNone(release.pages_blocked(at("2026-10-22T09:25"), "off", SHADOW))
 
     def test_month_end_only_moves_pages_back(self):
-        on = release.pages_value("batch-3")
+        on = release.pages_value("batch-4")
         self.assertIn("month-end", release.pages_blocked(at("2026-11-03T12:00"), SHADOW, release.pages_value("batch-1")))
         self.assertIsNone(release.pages_blocked(at("2026-11-03T12:00"), on, release.pages_value("batch-2")))
         self.assertIsNone(release.pages_blocked(at("2026-11-03T12:00"), on, "off"))
@@ -62,7 +65,7 @@ class PagesCommandTest(unittest.TestCase):
         env = [{"name": release.PAGES_SETTING, "value": previous}] if previous is not None else []
         app = {"properties": {"template": {"containers": [{"image": image, "env": env}]},
                               "configuration": {"ingress": {"fqdn": "web.example"}}}}
-        calls = []
+        calls, checked = [], []
 
         def az(*args, parse=True):
             calls.append(args)
@@ -77,8 +80,9 @@ class PagesCommandTest(unittest.TestCase):
 
         def run(args, **kwargs):
             self.assertEqual(args[:3], ["git", "cat-file", "-e"])
-            self.assertEqual(args[3], LIVE + ":" + release.PAGES_READERS)
-            return mock.Mock(returncode=0 if readers else 1)
+            self.assertIn(args[3], (LIVE + ":" + release.PAGES_READERS, LIVE + ":" + release.CHARTS_READERS))
+            checked.append(args[3].split(":", 1)[1])
+            return mock.Mock(returncode=0 if readers is True or args[3].endswith(str(readers)) else 1)
 
         recorded = {"073_certified_figures.sql": {"sha256": hashlib.sha256(SQL).hexdigest()}} if applied else {}
         clock = mock.Mock(wraps=datetime)
@@ -97,6 +101,7 @@ class PagesCommandTest(unittest.TestCase):
                 state = json.loads(release.STATE.read_text())
         updates = [c for c in calls if c[1] == "update"]
         settings = dict(a.split("=", 1) for a in updates[-1][updates[-1].index("--set-env-vars") + 1:]) if updates else {}
+        self.checked = checked
         return settings, state
 
     def test_shadow_sets_every_page_and_records_the_previous_value(self):
@@ -112,6 +117,16 @@ class PagesCommandTest(unittest.TestCase):
             self.run_pages("shadow", readers=False)
         with self.assertRaises(SystemExit):
             self.run_pages("shadow", image="reg/ibkr-platform@sha256:" + "c" * 64)
+
+    def test_batch_4_needs_a_website_that_can_read_the_charts(self):
+        settings, state = self.run_pages("batch-4", previous=release.pages_value("batch-3"))
+        self.assertEqual(release.page_modes(settings[release.PAGES_SETTING])["charts"], "on")
+        self.assertEqual(self.checked, [release.PAGES_READERS, release.CHARTS_READERS])
+        self.assertEqual(state["previous_pages"], release.pages_value("batch-3"))
+        self.run_pages("batch-3", previous=SHADOW)
+        self.assertEqual(self.checked, [release.PAGES_READERS])  # the charts stay in shadow: not needed
+        with self.assertRaises(SystemExit):   # the live website has the register but not the charts
+            self.run_pages("batch-4", previous=release.pages_value("batch-3"), readers="certified_figures_register_data.py")
 
     def test_073_must_be_recorded_as_applied(self):
         with self.assertRaises(SystemExit):

@@ -21,13 +21,18 @@ page asked for an older date finds either that date's figures or none (and shows
 The checks:
 
 - rules: drawdowns at most zero, win rates and shares of months between 0 and 1, correlation
-  between -1 and 1 (the contract rules of gold.certified_figures);
+  between -1 and 1, RSI between 0 and 100, volatility not below zero (the contract rules of
+  gold.certified_figures);
 - same inputs, same answer: a figure that changes while its input fingerprint and
   calculation version are the same holds the build;
 - the page agrees: for each subject's newest date, the page handlers are called again on
   their own connections and must give the same figures;
 - readers: a page that fails for a reason the website would also show (an HTTP error) is
   counted; any other error holds the build.
+
+The charts (page "charts", ibkr_etl.certified_charts) are read only when CERTIFIED_FIGURES_CHARTS
+is fallback or on, or --page charts names them; in fallback a chart problem leaves the chart rows
+out and never holds the build.
 """
 from __future__ import annotations
 
@@ -62,9 +67,10 @@ BUILD_USER = {"email": "certified-figures-build", "object_id": "certified-figure
 DRAWDOWNS = frozenset({
     "risk.expected_max_drawdown_1y", "risk.actual_max_drawdown_1y", "risk.tail_max_drawdown_1y",
     "risk.crisis_max_drawdown_2008", "risk.maximum_drawdown", "risk.crisis_scenario_max_drawdown",
-    "stats.maximum_drawdown", "stats.current_drawdown"})
+    "stats.maximum_drawdown", "stats.current_drawdown", "table.drawdown_episodes"})
 SHARES = frozenset({"risk.win_rate", "benchmark.relative_win_rate", "stats.positive_months"})
-CORRELATIONS = frozenset({"benchmark.correlation"})
+CORRELATIONS = frozenset({"benchmark.correlation", "series.rolling_correlation_126d", "matrix.holdings_correlation"})
+BOUNDS = {"indicator.rsi_14": (0.0, 100.0), "series.rolling_volatility_63d": (0.0, math.inf)}
 COMPARED = ("value", "value_text", "unit", "currency", "status", "reason", "detail", "period_start", "period_end",
             "observations")
 KEY = ("subject_id", "figure_id", "period", "item", "benchmark_id", "as_of_date")
@@ -696,16 +702,34 @@ def page_rows(web, subject: Subject, as_of: str, pages: Iterable[str], *, today_
     payloads = Pages(web, subject, as_of)
     rows: list[Row] = []
     for page in pages:
-        for reader in READERS[page]:
+        for reader in _readers(page):
             try:
                 rows += reader(payloads)
             except PageUnavailable:
                 if notes is not None:
                     notes.setdefault("page_unavailable", {}).setdefault(page, 0)
                     notes["page_unavailable"][page] += 1
+            except Exception as error:  # a chart reader's error is counted; the charts' mode decides
+                if page in READERS or notes is None:
+                    raise
+                kinds = notes.setdefault("chart_errors", {}).setdefault(reader.__name__, {})
+                kinds[type(error).__name__] = kinds.get(type(error).__name__, 0) + 1
         if page == "overview" and today_hk is not None:
             rows += freshness_row(payloads, today_hk)
     return rows
+
+
+def _readers(page: str) -> tuple[Callable[[Pages], list[Row]], ...]:
+    if page in READERS:
+        return READERS[page]
+    return _charts().READERS[page]
+
+
+def _charts():
+    """ibkr_etl.certified_charts, imported when a run reads the charts (it imports this module)."""
+    from . import certified_charts
+
+    return certified_charts
 
 
 # The data contract versions of the silver tables whose values are copied unchanged (the
@@ -739,6 +763,8 @@ def rule_failures(rows: Iterable[Row]) -> list[str]:
             failures.append(row.figure_id)
         elif row.figure_id in CORRELATIONS and abs(row.value) > 1 + 1e-12:
             failures.append(row.figure_id)
+        elif row.figure_id in BOUNDS and not BOUNDS[row.figure_id][0] <= row.value <= BOUNDS[row.figure_id][1]:
+            failures.append(row.figure_id)
     return failures
 
 
@@ -764,7 +790,8 @@ def page_disagreements(web, subject: Subject, as_of: str, pages: Iterable[str], 
                        today_hk: date) -> list[str]:
     """Call the handlers again, each on its own connections as the website does, and compare."""
     with own_connections(web):
-        again = {row.key: row.compared() for row in page_rows(web, subject, as_of, pages, today_hk=today_hk)}
+        again = {row.key: row.compared() for row in page_rows(web, subject, as_of, pages, today_hk=today_hk,
+                                                              notes={})}
     built = {row.key: row.compared() for row in rows if row.subject_id == subject.id and row.as_of_date == as_of}
     return sorted({key[1] for key in set(again) | set(built) if again.get(key) != built.get(key)})
 
@@ -893,7 +920,7 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
     limit = time_limit(minutes)
     begun = clock()
     web = web or load_web()
-    pages = [page for page in (pages or cf.pages()) if page in READERS]
+    pages, charts_mode = _charts().run_pages(pages, READERS)
     started = now or datetime.now(timezone.utc)
     today_hk = hong_kong_today(started)
     with shared_web_database(web, database_url):
@@ -912,6 +939,8 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
             connection.rollback()
             published_dates: dict[str, set[str]] = {}
             for key in published:
+                if charts_mode and pages == [_charts().PAGE] and key[1] not in _charts().FIGURES:
+                    continue  # a run of the charts alone fills in the charts' own history
                 published_dates.setdefault(key[0], set()).add(key[5])
             plan = work_plan(found, published_dates, backfill=backfill)
             # Each subject's pages are asked again on its newest date right after that date is read, so
@@ -951,6 +980,7 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 if read.get(subject.id) and subject.id not in checked:
                     check(subject, max(read[subject.id]))
             result = compare(rows, published)
+            charts = _charts().settle(charts_mode, rows, result, disagreements, notes, errors) if charts_mode else None
             to_write = result["new"] + result["changed"]
             failures = rule_failures(to_write)
             checks = {
@@ -967,6 +997,8 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 # publish_gate.check's verdict goes here once that module is in (binding from 8 Nov).
                 "publish_gate": None,
             }
+            if charts is not None:
+                checks["charts"] = charts
             outcomes = {"contract_rules": not failures, "same_inputs_same_answer": not result["violations"],
                         "pages_agree": not disagreements, "pages_read": not errors}
             checks.update(passed=sum(outcomes.values()), total=len(outcomes),
@@ -984,6 +1016,8 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
             out(f"Read {len(rows)} figures: {len(result['new'])} new, {len(result['changed'])} changed, "
                 f"{result['unchanged']} unchanged. Checks: {len(result['violations'])} same-input changes, "
                 f"{len(failures)} rule failures, {len(disagreements)} page disagreements, {len(errors)} read errors.")
+            if charts is not None:
+                out(_charts().summary_line(charts))
             for line in errors[:20]:
                 out(f"  read error {line}")
             for who, figure_ids in sorted(disagreements.items()):   # figure ids only, no figures

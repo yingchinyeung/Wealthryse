@@ -6,7 +6,7 @@ copies equal)."""
 TEXT = r'''{
  "about": "Register of the figures to certify first (upgrade U5, stage S7). src/ibkr_etl/certified_figures.py reads it, or its packaged copy src/ibkr_etl/certified_figures_register.json (refresh with python -m ibkr_etl.certified_figures --write); nothing is switched on by it. docs/MEDALLION_CERTIFIED_FIGURES.md explains it. tests/test_certified_figures_register.py checks it against the Metrics guide, the factsheet bindings, the catalog, the contracts and the website's routes.",
  "status": "draft",
- "version": "0.2.0",
+ "version": "0.3.0",
  "units": {
   "ratio": "A fraction: 0.1234 is shown as 12.34%. The factsheet bindings use the same units.",
   "number": "A plain number, such as a ratio of ratios or a count.",
@@ -18,7 +18,7 @@ TEXT = r'''{
   "scalar": "One value for each subject and as-of date.",
   "per_period": "One value for each subject, as-of date and period (for example mtd, ytd, a calendar year or a month).",
   "per_item": "One value for each subject, as-of date and item (a holding, sector, currency or crisis scenario).",
-  "series": "One value for each date; the rows stay in their gold table and are served through the certified view."
+  "series": "One value for each date: the row for an as-of date is the series' point on that date, so a chart through a date is the rows for the dates up to it and no point is stored twice."
  },
  "methods": {
   "imported": "IBKR's own value as imported into silver, unchanged. The calculation version is the source table's contract version."
@@ -37,7 +37,9 @@ TEXT = r'''{
   "1": {"date": "2026-10-22", "pages": ["overview", "holdings", "cash"]},
   "2": {"date": "2026-10-23", "pages": ["performance"]},
   "3": {"date": "2026-10-24", "pages": ["risk-snapshot", "risk-statistics", "combined-holdings"],
-        "also": "The agents' typed read tool (get_certified_figures, trace_figure, list_certified_figures)."}
+        "also": "The agents' typed read tool (get_certified_figures, trace_figure, list_certified_figures)."},
+  "4": {"date": "2026-10-29", "pages": ["charts"],
+        "also": "After month-end item 4 (the charts, tables and indicators), brought forward on 18 Oct to the last move day. The charts page's on is the automatic fallback: a certified chart is shown only where it equals today's, otherwise today's with one log line."}
  },
  "pages": {
   "overview": {
@@ -58,7 +60,7 @@ TEXT = r'''{
    "routes": ["/accounts/{id}/holdings"],
    "apis": ["/api/portfolio/{id}/holdings", "/api/portfolio/{id}/sectors"],
    "guide_locations": ["Holdings"],
-   "deferred_here": ["RSI (14)"],
+   "deferred_here": [],
    "prerequisites": ["None new: positions, IBKR FX (silver.fx_rates) and sectors are already silver. The build calls today's FX reader, so the re-sent FX row duplicate (review item 8) carries over unchanged and the figures stay the same; its fix after month-end is a release with its own report."]
   },
   "cash": {
@@ -85,7 +87,7 @@ TEXT = r'''{
    "shows_from_other_pages": ["overview.as_of", "overview.nav", "overview.day_change", "overview.twr",
                               "overview.twr_annualised", "overview.irr_annualised", "overview.net_external_flows",
                               "overview.positions", "overview.reporting_currency", "overview.observations"],
-   "deferred_here": ["Cash-flow-adjusted daily portfolio return", "Daily benchmark return", "Benchmark return basis"],
+   "deferred_here": ["Benchmark return basis"],
    "prerequisites": ["None new. gold.performance_comparison_daily is rewritten in place; the build copies the figures it needs into its own versioned rows. Performance › Attribution stays on today's path until after month-end (see after_month_end)."]
   },
   "risk-snapshot": {
@@ -106,8 +108,7 @@ TEXT = r'''{
               "/accounts/{id}/risk/correlation"],
    "apis": ["/api/portfolio/{id}/analytics", "/api/portfolio/{id}/holdings-correlation"],
    "guide_locations": ["Risk › Statistics", "Risk › Drawdowns", "Risk › Rolling risk", "Risk › Correlation"],
-   "deferred_here": ["Drawdown episode", "Rolling 3-month volatility", "Rolling beta and correlation",
-                     "Holdings correlation"],
+   "deferred_here": [],
    "prerequisites": ["None new, as for the Overview: today's flows reader."]
   },
   "combined-holdings": {
@@ -122,6 +123,22 @@ TEXT = r'''{
    "deferred_here": [],
    "note": "Combines the certified holding records of the accounts the viewer may see, converted into the chosen currency with today's dated FX rule and added up when the page is read (holdings_view.combine_holdings). The sums and weights are not stored, because they depend on who is looking and which currency they choose. The guide describes them in the Holdings entries (Cost basis, Unrealized P&L, Holding weight).",
    "prerequisites": ["The Holdings page's certified records (batch 1)."]
+  },
+  "charts": {
+   "order": 8,
+   "batch": 4,
+   "title": "Charts, tables and indicators: the Vs benchmark chart, the drawdown episodes table, the rolling charts, the holdings correlation matrix and RSI (14)",
+   "routes": ["/accounts/{id}/performance/nav-chart", "/accounts/{id}/risk/drawdowns", "/accounts/{id}/risk/rolling",
+              "/accounts/{id}/risk/correlation", "/accounts/{id}/holdings"],
+   "apis": ["/api/portfolio/{id}/benchmark-comparison", "/api/portfolio/{id}/analytics",
+            "/api/portfolio/{id}/holdings-correlation", "/api/portfolio/{id}/holdings"],
+   "guide_locations": ["Performance › Vs benchmark", "Risk › Drawdowns", "Risk › Rolling risk", "Risk › Correlation",
+                       "Holdings"],
+   "shows_from_other_pages": ["benchmark.rebased_level", "stats.trailing_12m_return"],
+   "deferred_here": [],
+   "note": "Its own key in CERTIFIED_FIGURES_PAGES, because the charts move on their own day, after the pages they sit on, and are undone on their own. A series is stored one point per date (the as-of date's point), so a chart through a date is the rows up to it; the tables and RSI are stored per as-of date. The build reads them only when CERTIFIED_FIGURES_CHARTS is fallback or on (src/ibkr_etl/certified_charts.py). The underwater drawdown chart stays as today: its points are Current drawdown on each date, which the guide places on Risk › Statistics.",
+   "prerequisites": ["The pages it sits on have moved: Performance (batch 2) for the rebased levels and Risk › Statistics (batch 3) for the trailing 12-month return; a borrowed series is only compared until its own page is on.",
+                     "The build job with CERTIFIED_FIGURES_CHARTS=fallback, and its rows filled in for every date the pages let you pick."]
   }
  },
  "figures": {
@@ -342,21 +359,44 @@ TEXT = r'''{
    "method": "imported", "note": "One row per currency, plus the base-currency summary IBKR sends."},
   "cash.settled_cash": {"guide": "Settled cash", "unit": "money", "currency": "own", "kind": "per_item",
    "item": "currency", "page": "cash", "source": "new", "inputs": ["silver.subject_cash_balance_series"],
-   "method": "imported"}
+   "method": "imported"},
+
+  "series.portfolio_daily_return": {"guide": "Cash-flow-adjusted daily portfolio return", "unit": "ratio",
+   "kind": "series", "page": "charts", "source": "gold.performance_comparison_daily", "field": "portfolio_return",
+   "method": "benchmark-comparison-v1", "per_benchmark": true,
+   "note": "One point per common date with the benchmark. The Vs benchmark chart draws these compounded (benchmark.rebased_level), so the website compares them with the returns its drawn levels imply."},
+  "series.benchmark_daily_return": {"guide": "Daily benchmark return", "unit": "ratio", "kind": "series",
+   "page": "charts", "source": "gold.performance_comparison_daily", "field": "benchmark_return",
+   "method": "benchmark-comparison-v1", "per_benchmark": true,
+   "note": "One point per common date; the return basis (price or total return) travels with it."},
+  "series.rolling_volatility_63d": {"guide": "Rolling 3-month volatility", "unit": "ratio", "kind": "series",
+   "page": "charts", "source": "new", "inputs": ["silver.subject_nav_series"], "method": "portfolio-analytics-v1",
+   "note": "One point per NAV date, unavailable until 63 daily returns."},
+  "series.rolling_beta_126d": {"guide": "Rolling beta and correlation", "unit": "number", "kind": "series",
+   "page": "charts", "source": "gold.performance_comparison_daily", "field": "rolling_benchmark_statistics:beta",
+   "method": "portfolio-analytics-v1", "per_benchmark": true,
+   "note": "One point per common date, unavailable until 126 common-date returns."},
+  "series.rolling_correlation_126d": {"guide": "Rolling beta and correlation", "unit": "number", "kind": "series",
+   "page": "charts", "source": "gold.performance_comparison_daily",
+   "field": "rolling_benchmark_statistics:correlation", "method": "portfolio-analytics-v1", "per_benchmark": true,
+   "note": "One point per common date, unavailable until 126 common-date returns."},
+  "table.drawdown_episodes": {"guide": "Drawdown episode", "unit": "ratio", "kind": "per_item", "item": "episode",
+   "page": "charts", "source": "new", "inputs": ["silver.subject_nav_series"], "method": "portfolio-analytics-v1",
+   "note": "The five deepest episodes on the as-of date, each by its peak date; the value is the depth, and the trough, recovery, day counts and rank travel with it."},
+  "matrix.holdings_correlation": {"guide": "Holdings correlation", "unit": "number", "kind": "per_item",
+   "item": "holding_pair", "page": "charts", "source": "new", "inputs": ["silver.subject_position_series"],
+   "method": "portfolio-analytics-v1",
+   "note": "One row per pair of the ten largest holdings on the as-of date (conid|conid, the lower first), with the shared observations; the diagonal is 1 by definition and not stored. Not for composites."},
+  "indicator.rsi_14": {"guide": "RSI (14)", "unit": "number", "kind": "per_item", "item": "holding",
+   "page": "charts", "source": "new", "inputs": ["silver.subject_position_series"], "method": "portfolio-analytics-v1",
+   "note": "Per holding on the holdings date, from up to 300 calendar days of daily marks; the signal and the marks used travel with it. Not for composites."}
  },
  "deferred": {
-  "Cash-flow-adjusted daily portfolio return": "A daily series already stored in gold.performance_comparison_daily and drawn on the Vs benchmark chart as today; certified as a series after month-end.",
-  "Daily benchmark return": "A daily series already stored in gold.performance_comparison_daily and drawn on the Vs benchmark chart as today; certified as a series after month-end.",
   "Benchmark return basis": "A label (price or total return), carried in the detail of every benchmark figure rather than as a figure of its own.",
   "Contribution to return": "Performance › Attribution shares its engine (monthly_reporting_analytics) with the monthly reports that produce the 1 Nov client reports, so it stays on today's path with them until after month-end.",
-  "RSI (14)": "A price indicator per holding, worked out from daily mark prices; it stays calculated on the Holdings page until after month-end.",
   "Top 5 ETL contributors": "Shown by sorting the rows of risk.etl_contribution; not a figure of its own.",
   "Bottom 5 ETL contributors": "Shown by sorting the rows of risk.etl_contribution; not a figure of its own.",
   "Crisis scenario stand-ins (scaled)": "Evidence shown with each crisis scenario; carried in the detail of risk.crisis_scenario_max_drawdown.",
-  "Drawdown episode": "A table of episodes; it stays calculated on Risk › Drawdowns until after month-end.",
-  "Rolling 3-month volatility": "A daily series; the chart on Risk › Rolling risk stays calculated until after month-end.",
-  "Rolling beta and correlation": "A daily series; the chart on Risk › Rolling risk stays calculated until after month-end.",
-  "Holdings correlation": "A matrix of the largest holdings' price moves; it stays calculated on Risk › Correlation until after month-end.",
   "Cash activity amount": "One cash event's amount: a record in the Cash page's ledger, served by the silver read contract (subject_cash_activity_series), not a figure.",
   "Trade proceeds": "A field of one trade record on the Trade history page, served by the silver read contract. Trade history is out of scope.",
   "Commission": "A field of one trade record on the Trade history page, served by the silver read contract. Trade history is out of scope.",

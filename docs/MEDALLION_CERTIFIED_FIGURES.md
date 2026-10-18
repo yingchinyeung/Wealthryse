@@ -424,6 +424,10 @@ are another.
 
 ### Three modes per page
 
+The website gets the readers through the Deploy website workflow, which ships only the `.py`
+files of `src/ibkr_etl`. The website therefore reads the register from
+`certified_figures_register_data.py`, a generated copy of `infra/medallion/certified-figures.json`.
+
 One website setting, `CERTIFIED_FIGURES_PAGES`, for example
 `overview=on,holdings=on,cash=on,performance=shadow`. A page not listed is `off`.
 
@@ -452,7 +456,12 @@ One website setting, `CERTIFIED_FIGURES_PAGES`, for example
    are written down before the run (for example, a figure the page used to leave blank that the
    build can now fill).
 4. **The live shadow log shows no unexplained difference** on any day since Tue 20.
-5. **Switch the page on:** one setting, one website revision.
+5. **Switch the page on:** one setting, one website revision, through the **Website certified
+   pages** workflow (`.github/workflows/website-certified-pages.yml`, stages `shadow`,
+   `batch-1` to `batch-3` and `off`). It refuses unless the live website was released from a
+   commit whose readers can find the register and 073 is recorded as applied. It also refuses
+   between 07:50 and 09:25 UTC and, from 1 to 7 Nov, any move other than back. If the checks
+   fail it puts the previous value back.
 6. **Check** that afternoon and after the next morning's build that the page, its API and (from
    Sat 24) the read tool show the same figures.
 

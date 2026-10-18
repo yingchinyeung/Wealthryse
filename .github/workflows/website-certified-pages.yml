@@ -1,0 +1,52 @@
+name: Website certified pages
+
+# Manual: moves the website's pages between today's figures and the certified figures by
+# setting CERTIFIED_FIGURES_PAGES on ibkrv2stg-web (docs/MEDALLION_CERTIFIED_FIGURES.md,
+# "How a page moves"). shadow: every page shows today's figures and logs any difference.
+# batch-1, batch-2, batch-3: those batches show the certified figures, the rest stay in
+# shadow. off: every page exactly as before. The image is left as it is. It refuses while
+# the daily runs publish (07:50 to 09:25 UTC), and from 1 to 7 Nov it only moves pages
+# back. Rolls back to the previous value if the checks fail.
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: shadow, batch-1, batch-2, batch-3 or off
+        required: true
+        type: choice
+        options: [shadow, batch-1, batch-2, batch-3, 'off']
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-website
+  cancel-in-progress: false
+
+jobs:
+  pages:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AZURE_CLIENT_ID: 17708c85-b855-4209-81dd-a613a91315d3
+      AZURE_TENANT_ID: 0578a50b-a7a1-40a4-905b-8b20dba84124
+      AZURE_SUBSCRIPTION_ID: 3956e821-cee4-403f-8708-e84e2ed490eb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The live website's commit must be in the history to check it has the readers.
+          fetch-depth: 0
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      - name: Set the pages
+        run: python deploy/website_release.py pages "${{ inputs.stage }}"
+      - name: Check health and sign-in
+        run: python deploy/website_release.py verify
+      - name: Roll back if the change or checks failed
+        if: failure() && hashFiles('release-state.json') != ''
+        run: python deploy/website_release.py rollback

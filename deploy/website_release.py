@@ -12,6 +12,7 @@ Steps, each a subcommand so the workflow can show and stop at each one:
 State passes between steps in release-state.json.
 """
 import ast, base64, difflib, gzip, hashlib, json, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 
 RG = 'rg-ibkr-database-v11'
@@ -49,6 +50,8 @@ SWITCHES_NEEDING_MIGRATIONS = {
     'ONBOARDING_V2_ENABLED': ('064_broker_connections_and_onboarding_cases.sql', '065_onboarding_report_style.sql'),
     'CRISIS_SCENARIOS_ENABLED': ('066_crisis_scenarios.sql',),
     'FACTSHEET_DESIGN_AGENTS_ENABLED': ('067_factsheet_design_agents.sql',),
+    # Any page in shadow or on reads the certified figures (see pages below).
+    'CERTIFIED_FIGURES_PAGES': ('073_certified_figures.sql',),
 }
 # Migrations confirmed applied in production (this workflow cannot reach the database).
 APPLIED_MIGRATIONS = Path(__file__).resolve().parent / 'applied-migrations.json'
@@ -173,6 +176,13 @@ def change_set(state, merged=None):
     return diff.stdout, digest(before), digest(after)
 
 
+def switch_is_on(name, value):
+    """A website switch's value turns its code on: 'true', or for the pages setting any page not off."""
+    if name == PAGES_SETTING:
+        return any(mode != 'off' for mode in page_modes(value).values())
+    return str(value or '').strip().lower() == 'true'
+
+
 def unapplied_migrations(switches, commit):
     """Migrations the switched-on code needs that are not recorded as applied, as on main at commit."""
     needed = sorted({m for name in switches for m in SWITCHES_NEEDING_MIGRATIONS[name]})
@@ -222,7 +232,7 @@ def prepare():
     # A switch that turns on code needing tables the bootstrap job may not have
     # created yet stops the release; with the switch off that code stays dark.
     switched_on = [e['name'] for e in containers[0].get('env') or []
-                   if e.get('name') in SWITCHES_NEEDING_MIGRATIONS and str(e.get('value', '')).strip().lower() == 'true']
+                   if e.get('name') in SWITCHES_NEEDING_MIGRATIONS and switch_is_on(e['name'], e.get('value'))]
     missing = unapplied_migrations(switched_on, head)
     if missing:
         raise SystemExit('Switched on for the website: ' + ', '.join(switched_on) + '. Not recorded as applied '
@@ -765,8 +775,100 @@ def chat():
     print('Website chat set to', mode)
 
 
+# Website pages on the certified figures (docs/MEDALLION_CERTIFIED_FIGURES.md, "How a page moves").
+PAGES_SETTING = 'CERTIFIED_FIGURES_PAGES'
+PAGES_REGISTER = ROOT / 'infra' / 'medallion' / 'certified-figures.json'
+# A website built from a commit with this file can read the register (the release ships only .py files).
+PAGES_READERS = 'src/ibkr_etl/certified_figures_register_data.py'
+PAGES_STAGES = ('off', 'shadow', 'batch-1', 'batch-2', 'batch-3')
+PAGES_QUIET = ((7, 50), (9, 25))   # UTC: no changes while the daily runs publish
+PAGE_RANK = {'off': 0, 'shadow': 1, 'on': 2}
+
+
+def register_pages():
+    """The register's pages in move order: {page: batch}."""
+    pages = json.loads(PAGES_REGISTER.read_text(encoding='utf-8'))['pages']
+    return {page: item['batch'] for page, item in sorted(pages.items(), key=lambda kv: kv[1]['order'])}
+
+
+def page_modes(value):
+    """{page: off|shadow|on} from a CERTIFIED_FIGURES_PAGES value, read as ibkr_etl.certified_figures does."""
+    modes = {page: 'off' for page in register_pages()}
+    for part in str(value or '').split(','):
+        name, _, mode = part.partition('=')
+        name, mode = name.strip().lower(), mode.strip().lower()
+        if name in modes and mode in PAGE_RANK:
+            modes[name] = mode
+    return modes
+
+
+def pages_value(stage):
+    """The setting for a stage: off; every page in shadow; or batches 1 to N on and the rest in shadow."""
+    if stage == 'off':
+        return 'off'
+    through = 0 if stage == 'shadow' else int(stage.rsplit('-', 1)[1])
+    return ','.join(page + '=' + ('on' if batch <= through else 'shadow') for page, batch in register_pages().items())
+
+
+def pages_blocked(now, before, after):
+    """Why the pages may not change now, or None: never while the daily runs publish, and from 1 to
+    7 Nov (month-end) only towards today's figures."""
+    (h1, m1), (h2, m2) = PAGES_QUIET
+    if (h1, m1) <= (now.hour, now.minute) < (h2, m2):
+        return 'the daily runs publish between 07:50 and 09:25 UTC'
+    if now.month == 11 and now.day <= 7:
+        old, new = page_modes(before), page_modes(after)
+        raised = [page for page in new if PAGE_RANK[new[page]] > PAGE_RANK[old[page]]]
+        if raised:
+            return 'month-end (1 to 7 Nov) allows only moving pages back, not ' + ', '.join(raised)
+    return None
+
+
+def pages():
+    """Set CERTIFIED_FIGURES_PAGES on the website for a stage; leaves the image alone."""
+    stage = sys.argv[2]
+    if stage not in PAGES_STAGES:
+        raise SystemExit('Stage must be one of ' + ', '.join(PAGES_STAGES))
+    app = az('containerapp', 'show', '-n', APP, '-g', RG)
+    container = app['properties']['template']['containers'][0]
+    env = {e['name']: e.get('value') for e in container.get('env') or []}
+    before, after = env.get(PAGES_SETTING) or 'off', pages_value(stage)
+    print(PAGES_SETTING, 'was', repr(before), '; for', stage, ':', repr(after))
+    reason = pages_blocked(datetime.now(timezone.utc), before, after)
+    if reason:
+        raise SystemExit('Not now: ' + reason + '. Nothing was changed.')
+    if switch_is_on(PAGES_SETTING, after):
+        tag = container['image'].split(':')[-1] if '@' not in container['image'] else ''
+        deployed = tag[len('web-'):] if tag.startswith('web-') else ''
+        if not deployed or subprocess.run(['git', 'cat-file', '-e', deployed + ':' + PAGES_READERS], cwd=ROOT,
+                                          capture_output=True).returncode:
+            raise SystemExit('The live website (' + container['image'].split('/')[-1] + ') cannot read the certified '
+                             'figures yet: run Deploy website from main first. Nothing was changed.')
+        missing = unapplied_migrations([PAGES_SETTING], git('rev-parse', 'HEAD').strip())
+        if missing:
+            raise SystemExit('Not recorded as applied in deploy/applied-migrations.json: ' + ', '.join(missing)
+                             + '. Nothing was changed.')
+    if page_modes(before) == page_modes(after):
+        STATE.write_text(json.dumps({'changed_files': []}, indent=2))
+        print('The pages are already like that; nothing to change.')
+        return
+    suffix = 'pages-' + stage + '-' + str(int(time.time()))[-6:]
+    az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
+       '--set-env-vars', PAGES_SETTING + '=' + after, parse=False)
+    STATE.write_text(json.dumps({'changed_files': [PAGES_SETTING], 'revision': APP + '--' + suffix,
+                                 'fqdn': app['properties']['configuration']['ingress']['fqdn'],
+                                 'previous_pages': before}, indent=2))
+    print('Website pages set for', stage)
+
+
 def rollback():
     state = json.loads(STATE.read_text())
+    if 'previous_pages' in state:
+        suffix = 'pages-rollback-' + str(int(time.time()))[-6:]
+        az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
+           '--set-env-vars', PAGES_SETTING + '=' + state['previous_pages'], parse=False)
+        print('Website pages set back to', state['previous_pages'])
+        return
     if 'previous_mode' in state:
         suffix = 'chat-rollback-' + str(int(time.time()))[-6:]
         az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
@@ -779,5 +881,5 @@ def rollback():
 
 
 if __name__ == '__main__':
-    {'prepare': prepare, 'build': build, 'acr-build': acr_build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat,
+    {'prepare': prepare, 'build': build, 'acr-build': acr_build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat, 'pages': pages,
      'assurance-build': assurance_build, 'inventory': inventory}[sys.argv[1]]()

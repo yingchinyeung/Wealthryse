@@ -495,6 +495,7 @@ WIRED = {
     "staging-derived-refresh.bicep": ("run_self_service_derived_refresh.py", "ibkrv2stg-derived-daily", True),
     "staging-risk-snapshot-job.bicep": ("build_risk_snapshots.py", "ibkrv2stg-risk-snapshots", True),
     "staging-crisis-scenarios-job.bicep": ("refresh_crisis_scenarios.py", "ibkrv2stg-crisis-scenarios-daily", True),
+    "staging-certified-figures-job.bicep": ("build_certified_figures.py", "ibkrv2stg-certified-figures", True),
 }
 
 

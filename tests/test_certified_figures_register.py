@@ -309,6 +309,12 @@ class CertifiedFiguresModuleTests(unittest.TestCase):
                 self.assertEqual(cf.register_path(), cf.PACKAGED_REGISTER)
                 cf.reload()
                 self.assertEqual(len(cf.figures()), 71)
+                # As in the website: its release ships only .py files, so the copy as code.
+                with patch.object(cf, "PACKAGED_REGISTER", Path(folder) / "absent.json"):
+                    self.assertEqual(cf.register_path(), cf.PACKAGED_MODULE)
+                    cf.reload()
+                    self.assertEqual(cf.register(), json.loads(REGISTER.read_text(encoding="utf-8")))
+                    self.assertEqual(len(cf.figures()), 71)
         cf.reload()
         self.assertEqual(len(cf.figures()), 71)
 
@@ -318,6 +324,17 @@ class CertifiedFiguresModuleTests(unittest.TestCase):
         self.assertEqual(packaged.read_bytes(), REGISTER.read_bytes())
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn('"certified_figures_register.json"', pyproject)
+
+    def test_the_copy_as_code_is_the_register(self) -> None:
+        # The website release ships only .py files (deploy/website_release.py); refresh with --write.
+        from ibkr_etl import certified_figures_register_data as packaged
+
+        self.assertEqual(packaged.TEXT, REGISTER.read_text(encoding="utf-8"))
+        self.assertEqual(cf.PACKAGED_MODULE.read_text(encoding="utf-8"),
+                         cf.module_source(REGISTER.read_text(encoding="utf-8")))
+        self.assertEqual(cf.main([]), 0)
+        with self.assertRaises(ValueError):
+            cf.module_source("{\"a\": \"'''\"}")
 
     def test_figures_carry_their_definition_and_version(self) -> None:
         figures = cf.figures()

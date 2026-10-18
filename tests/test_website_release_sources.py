@@ -168,7 +168,7 @@ class AlreadyLiveFilesTest(unittest.TestCase):
 
 
 class PrepareTest(unittest.TestCase):
-    def run_prepare(self, changed, env=(), applied=None, migrations=None, pyproject=None):
+    def run_prepare(self, changed, env=(), applied=None, migrations=None, pyproject=None, files=None):
         app = {"properties": {"template": {"containers": [{"image": "reg/ibkr-platform:web-" + DEPLOYED, "env": list(env)}]},
                               "configuration": {"ingress": {"fqdn": "site.example"}}}}
 
@@ -181,6 +181,8 @@ class PrepareTest(unittest.TestCase):
                 return pyproject[args[1].split(":")[0]]
             if args[0] == "show" and args[1].startswith(HEAD + ":migrations/postgres/"):
                 return (migrations or {})[args[1].rsplit("/", 1)[1]]
+            if args[0] == "show" and args[1] in (files or {}):
+                return files[args[1]]
             raise AssertionError(args)
 
         import json, tempfile
@@ -223,6 +225,26 @@ class PrepareTest(unittest.TestCase):
     def test_other_image_files_still_stop_the_release(self):
         with self.assertRaises(SystemExit):
             self.run_prepare(["Dockerfile", "src/ibkr_etl/web.py"])
+
+    DOCKERFILE = "FROM python\nCOPY src ./src\nCOPY queries ./queries\n\nRUN pip install .\n"
+    MEDALLION = ("# Medallion data contracts and registers (infra/medallion), read by the layer quality checks\n"
+                 "# and the certified figures. The rest of infra/ stays out of the image.\n"
+                 "COPY infra/medallion ./medallion\nENV MEDALLION_DIR=/app/medallion\n")
+
+    def medallion_files(self, dockerfile_head=None):
+        return {DEPLOYED + ":Dockerfile.azure": self.DOCKERFILE,
+                HEAD + ":Dockerfile.azure": dockerfile_head or self.DOCKERFILE.replace("\n\nRUN", "\n" + self.MEDALLION + "\nRUN"),
+                DEPLOYED + ":.dockerignore": "tests\ninfra\n*.md\n",
+                HEAD + ":.dockerignore": "tests\ninfra\n!infra/medallion\n*.md\n"}
+
+    def test_the_lines_adding_infra_medallion_to_the_platform_image_do_not_stop_the_release(self):
+        state = self.run_prepare([".dockerignore", "Dockerfile.azure", "src/ibkr_etl/web.py"], files=self.medallion_files())
+        self.assertEqual(state["changed_files"], ["src/ibkr_etl/web.py"])
+
+    def test_any_other_change_to_those_files_still_stops_the_release(self):
+        head = self.DOCKERFILE.replace("\n\nRUN", "\n" + self.MEDALLION + "COPY infra ./infra\n\nRUN")
+        with self.assertRaises(SystemExit):
+            self.run_prepare(["Dockerfile.azure", "src/ibkr_etl/web.py"], files=self.medallion_files(head))
 
     ON = [{"name": "ONBOARDING_V2_ENABLED", "value": "True"}]
     SQL = {"064_broker_connections_and_onboarding_cases.sql": b"create 064\n",

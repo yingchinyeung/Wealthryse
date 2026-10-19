@@ -32,9 +32,10 @@ class AgentAppsBicepTest(unittest.TestCase):
         timeout = int(re.search(r"param chatTimeoutSeconds int = (\d+)", apps).group(1))
         self.assertLess(timeout, 240)
 
-    def test_website_chat_runs_in_pro_mode_and_has_room_for_it(self):
+    def test_website_chat_pro_mode_is_off_until_a_deploy_asks_for_it(self):
         apps, foundation = BICEP.read_text(), FOUNDATION.read_text()
-        self.assertIn("@allowed(['standard', 'pro'])\nparam chatReasoningMode string = 'pro'", apps)
+        # Other releases redeploy this template from main; pro waits for the 29 Oct release to pass it.
+        self.assertIn("@allowed(['standard', 'pro'])\nparam chatReasoningMode string = 'standard'", apps)
         self.assertEqual(apps.count("AGENT_CHAT_REASONING_MODE"), 1)  # set on the chat app only
         agent = apps[apps.index("resource agent 'Microsoft.App/containerApps"):apps.index("resource agentJobs")]
         self.assertIn("{ name: 'AGENT_CHAT_REASONING_MODE', value: chatReasoningMode }", agent)

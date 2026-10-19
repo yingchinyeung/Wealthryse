@@ -106,8 +106,12 @@ buttons, guide and case questions, exports and every scheduled job stay in stand
 mode.
 
 - **The setting.** `AGENT_CHAT_REASONING_MODE` on the agent service, from
-  `chatReasoningMode` in `infra/agent-apps.bicep` (default `pro`). **The undo is
-  `chatReasoningMode=standard`.**
+  `chatReasoningMode` in `infra/agent-apps.bicep`. The default stays `standard`, so
+  other releases that redeploy the agent apps from main leave chat as it is; the code
+  also reads a missing setting as `standard`. **Turning it on:** the Thu 29 Oct
+  release deploys with `chatReasoningMode=pro`. **Once it is on, every later deploy
+  of `infra/agent-apps.bicep` must pass `chatReasoningMode=pro`, or that deploy turns
+  pro off.** The undo is `chatReasoningMode=standard`.
 - **Cost and time.** Tokens cost the same per token, but each answer uses many
   more, all counted against the daily token budget. A call that runs out of the
   question's time ends with "The analysis took too long" rather than a dropped

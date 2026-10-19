@@ -35,9 +35,9 @@ param dailyTokenBudget int = 6000000
 @description('Reasoning effort for owner chat. The scheduled jobs keep the runtime default (low).')
 @allowed(['low', 'medium', 'high', 'xhigh'])
 param chatReasoningEffort string = 'xhigh'
-@description('Reasoning mode for website chat (/v1/chat) only: pro works longer on each model call, at the same token rates. standard is the undo.')
+@description('Reasoning mode for website chat (/v1/chat) only: pro works longer on each model call, at the same token rates. Stays standard until the 29 Oct release passes pro (docs/AGENTS.md).')
 @allowed(['standard', 'pro'])
-param chatReasoningMode string = 'pro'
+param chatReasoningMode string = 'standard'
 @description('Per-question limit. Stays under the 240-second Container Apps ingress request timeout.')
 @maxValue(220)
 param chatTimeoutSeconds int = 210

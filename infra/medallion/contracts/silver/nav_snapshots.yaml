@@ -21,8 +21,11 @@ description:
     at the official KRX close, so the account's positions add up to it to the won. cash_text is the deposit (d2_entra
     today, dbst_bal for a past day) plus any US deposits, and accruals_text Kiwoom's selling cost as a negative
     amount, worked out per stock (see kiwoom_selling_cost_rule), so stock + cash + accruals = total. Reports use
-    total_text as the account's NAV (decided 19 Oct 2026). A Kiwoom row's row_sha256 is the sha256 of the row as
-    written, not of a Flex row.
+    total_text as the account's NAV (decided 19 Oct 2026). The daily run (08:00 UTC, 17:00 KST, inside KRX's after-market)
+    writes today's row at the prices Kiwoom lists then; the next run's history pass writes the day again at the
+    official close. A Kiwoom row is final once a kiwoom_rest_history run has written it (last_seen_run_id), so a
+    month-end is final after the next trading day's run, and month-end reports render after it. A Kiwoom row's row_sha256
+    is the sha256 of the row as written, not of a Flex row.
 tags:
 - silver
 - ibkr

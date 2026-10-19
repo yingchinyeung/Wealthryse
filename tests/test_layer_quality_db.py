@@ -230,10 +230,11 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         self.assertNotIn("unavailable", states)
         self.assertEqual(len([c for c in results if c.startswith("schema.")]), 43)
         self.assertEqual({c for c in states.get("fail", ()) if not c.startswith("value.")}, set())
-        # The corrections history (U8) is held: its checks wait for its migration.
+        # The corrections history (U8) is held: its checks wait for its migration. Held objects
+        # with no silver or gold contract (the U8 setting, the Kiwoom bronze table) have no checks.
         held = {c for c in states["skipped"] if "held migration" in str(results[c]["detail"].get("reason"))}
-        self.assertEqual({results[c]["target"] for c in held}, layer_quality.held_relations(CONTRACTS) - {
-            "public.silver_history_settings"})
+        self.assertEqual({results[c]["target"] for c in held}, {
+            name for name in layer_quality.held_relations(CONTRACTS) if name.split(".", 1)[0] in {"silver", "gold"}})
         self.assertIn("volume.silver.trades_history", held)
         self.assertIn("schema.silver.trades_history", held)
         rls = {c for c in states["skipped"] - held if c.startswith("rule.")}

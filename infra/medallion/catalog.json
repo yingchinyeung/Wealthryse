@@ -1277,6 +1277,13 @@
    "target_schema": "public",
    "note": "Configuration: one row; recording turns the silver history triggers on (review item U8). Owner only.",
    "held": "infra/medallion/drafts/u8_silver_history.sql"
+  },
+  "bronze.kiwoom_responses": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Kiwoom REST inquiry answers exactly as received, one row per page, with the request's account number and query fields. Append-only and restricted. Silver's Kiwoom rows are rebuilt from it by ibkr_etl.kiwoom_conform. Never token calls, keys, secrets or tokens.",
+   "held": "infra/medallion/drafts/kiwoom_bronze.sql"
   }
  },
  "blob_containers": {

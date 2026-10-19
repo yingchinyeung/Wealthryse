@@ -12,7 +12,7 @@ Status: the catalog is in place. Nothing has moved yet, and every table is still
 
 | Layer | Holds | Rule |
 |---|---|---|
-| Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
+| Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, Kiwoom REST answers (from migration 080), live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
 | Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmark prices, FX closes, risk-free rates), sectors, derived and composite portfolios | Each table's `source` in the catalog says how it is rebuilt: `ibkr` tables from bronze (v2's own Flex pull from the switch on; v1.1's history from its archived statements), `market-data` tables once their raw responses are kept in bronze (from S3b), `derived` tables from other silver tables. A record IBKR re-sends replaces the earlier one here; every version stays in the raw statement files. |
 | Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: the benchmark comparison reads bronze `flex_rows` for cash flows, and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
 | Ops | Runs, approvals, audit, access, onboarding workflow, configuration and hand-maintained settings (subjects, benchmark list and mapping, metric catalogue), agent state | Control plane, not a data layer. Stays in `public`. |
@@ -429,6 +429,25 @@ rows added, removed and changed, and the largest changes per table and per accou
 subject. Its public summary (counts and names only) goes on the PR; the full report,
 with the figures, goes to the approver through the project's private folder.
 [MEDALLION_RELEASE_REPORT.md](MEDALLION_RELEASE_REPORT.md) has the steps.
+
+## Every source goes through bronze
+
+The layering covers the whole resource group (decided 19 Oct 2026): every source lands in
+bronze exactly as received before anything reaches silver, and silver is rebuilt from
+bronze alone. Where a source still writes silver straight from the live answer, this is
+the plan that closes the gap.
+
+| Source | Bronze | Silver written by | Plan |
+|---|---|---|---|
+| IBKR Flex | `ibkr-raw` files, `bronze.raw_reports`, `bronze.flex_rows` | The loader, from bronze (S5, 17 Oct) | Done. |
+| IBKR live (TWS) | `bronze.live_*` | Not used for silver | Done. |
+| Kiwoom REST | None yet | `ibkr_etl.kiwoom_collector`, from the live answer | `bronze.kiwoom_responses` (held draft `infra/medallion/drafts/kiwoom_bronze.sql`, migration 080 on 26 Oct). The collector stores every page first (`KIWOOM_BRONZE=on`), and `ibkr_etl.kiwoom_conform` builds silver from those rows with the collector's own parse functions. Each account's history is fetched again into bronze and silver rebuilt from it; any difference is kept as a restated version (U8) with a note. Open quality exceptions hold that account's reports until the owner accepts them by name. |
+| Market data | `bronze-market-data` files since 18 Oct, best effort | The fetchers, from the live answer | From 26 Oct a fetch whose raw copy cannot be stored fails, a rebuild check compares silver with what the stored files parse to, and the bronze file freshness checks turn on. Nothing raw exists before 18 Oct. |
+| One-off scripts | None | Hand-run backfills and cut-overs in `scripts/` | From 28 Oct only the named loaders' logins write silver, and a CI check refuses new code that writes silver anywhere else. |
+
+The Kiwoom table keeps inquiry answers only. Token calls are never stored, and
+`request_key` holds the account number and query fields, never a key, secret, token or
+header. Like every bronze table, the website, renderers and agents never read it.
 
 ## Stages
 

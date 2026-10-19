@@ -167,6 +167,8 @@ def _server(store, accounts=("U1",), citations=()):
             Tools.closed += 1
 
     class FakeAgent:
+        settings = SimpleNamespace(chat_reasoning_mode="pro")
+
         def run(self, **kwargs):
             store.runs.append(kwargs)
             yield {"type": "answer", "answer": "It is 1.2 [T1].", "citations": list(citations),
@@ -199,6 +201,7 @@ class AgentServerGuideTest(unittest.TestCase):
         self.assertIn('"Beta"', run["instructions"])
         self.assertIn("/metrics-guide#metric-beta", run["instructions"])
         self.assertEqual(store.conversations[0][0], "U1")
+        self.assertNotIn("reasoning_mode", run)  # pro is for website chat only
 
     def test_explain_metric_refuses_unknown_metrics_and_other_accounts(self):
         store = _Store()
@@ -218,6 +221,7 @@ class AgentServerGuideTest(unittest.TestCase):
         self.assertEqual((run["account_id"], run["allowed_tools"]), (None, ["get_metric_definition", "search_metrics_guide"]))
         self.assertIn("No account was picked", run["instructions"])
         self.assertEqual(store.conversations[0][0], "guide:general")
+        self.assertNotIn("reasoning_mode", run)
 
     def test_guide_question_with_an_account_checks_access_and_adds_its_tools(self):
         store = _Store()
@@ -240,6 +244,7 @@ class AgentServerGuideTest(unittest.TestCase):
         _events(client.post("/v1/chat", json={"user_object_id": USER, "account_id": "U1", "message": "What is beta?"}))
         self.assertIsInstance(store.runs[0]["tools"], guide_tools.GuideTools)
         self.assertIn("search_metrics_guide", store.runs[0]["instructions"])
+        self.assertEqual(store.runs[0]["reasoning_mode"], "pro")
 
 
 def _website(mode="owner"):

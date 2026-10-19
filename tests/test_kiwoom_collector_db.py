@@ -131,7 +131,9 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
 
     def _cancel(self, case_id):
         self.db.rollback()
-        self.db.execute("UPDATE broker_onboarding_cases SET status = 'cancelled' WHERE case_id = ?", (case_id,))
+        # A closed case stays closed; any other is cancelled so the next test can start one.
+        self.db.execute("UPDATE broker_onboarding_cases SET status = 'cancelled' WHERE case_id = ? "
+                        "AND stage <> 'closed'", (case_id,))
         self.db.commit()
 
     def test_a_new_case_loads_and_passes_stage_two(self):
@@ -263,6 +265,27 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         row = self.db.execute("SELECT status FROM broker_connections WHERE connection_id = ?",
                               (connection_id,)).fetchone()
         self.assertEqual(row["status"], "failing")
+
+    def test_releasing_the_first_month_end_closes_a_live_case(self):
+        from ibkr_etl.onboarding_v2_web import record_first_month_end
+
+        _, case_id = self._kiwoom_account("1034567890", start=date(2026, 10, 12))
+        self.addCleanup(self._cancel, case_id)
+        subject = "KIWOOM-1034567890"
+        self._run({"1034567890": FakeKiwoom()})
+        self._approve_terms(case_id)
+        self.assertIsNone(record_first_month_end(self.db, TENANT, subject, "2026-10-31"))  # not live yet
+        # Approval 2 and go-live are the website's; the case is moved straight to its live stage here.
+        self.db.execute("UPDATE broker_onboarding_cases SET stage = 'first_month_end', status = 'live', "
+                        "went_live_at = now() WHERE case_id = ?", (case_id,))
+        outcome = record_first_month_end(self.db, TENANT, subject, "2026-10-31")
+        self.db.commit()
+        self.assertEqual(outcome["stage"], "closed")
+        check = self.db.execute("SELECT status, evidence_json FROM broker_onboarding_checks WHERE case_id = ? "
+                                "AND check_id = 'first_month_end_released'", (case_id,)).fetchone()
+        self.assertEqual((check["status"], check["evidence_json"]), ("pass", {"period_end": "2026-10-31"}))
+        # A later month's release finds no case waiting.
+        self.assertIsNone(record_first_month_end(self.db, TENANT, subject, "2026-11-30"))
 
     def test_a_gap_fails_reconciliation_and_holds_the_case(self):
         _, case_id = self._kiwoom_account("3234567890")

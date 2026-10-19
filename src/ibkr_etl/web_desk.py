@@ -94,6 +94,14 @@ NO_SNAPSHOT = "No live snapshot has arrived for this account yet."
 NOTICE = pre_trade.NOTICE + " Nothing is placed or sent to IBKR."
 COST_NOTE = ("Daily volumes are not in silver yet, so square-root market impact (default coefficient 1.0) is not "
              "estimated for any order: the cost shown is half the live bid-ask spread only.")
+# Once silver daily_volumes exists (phase 3), the pre-trade check reads each holding's average daily
+# volume over its last VOLUME_SESSIONS sessions with volume, so market impact is estimated too.
+VOLUMES_TABLE = "daily_volumes"
+VOLUME_SESSIONS = 20
+VOLUME_WINDOW_DAYS = 45
+VOLUME_COST_NOTE = ("Square-root market impact (default coefficient 1.0) uses each holding's average daily volume over "
+                    f"its last {VOLUME_SESSIONS} sessions in silver (daily_volumes); an order in a holding without "
+                    "volume data, or in a new instrument, costs half the live bid-ask spread only.")
 STALE_STATUSES = ("stale", "no_quote", "no_quote_time", "quote_after_as_of")
 
 # Every Desk figure links to its Metrics guide entry (metrics_guide.DESK_DEFINITIONS).
@@ -497,6 +505,34 @@ def read_inputs(connection, tenant_id: str, account_id: str, *, reporting_curren
     return inputs
 
 
+def read_volumes(connection, tenant_id: str, inputs: Mapping[str, Any]) -> dict[str, float] | None:
+    """Each live holding's average daily volume (shares, its last VOLUME_SESSIONS sessions with
+    volume in silver daily_volumes), by conid. None until that table exists, and then the
+    pre-trade check keeps today's half-spread cost alone."""
+
+    if _relation(connection, VOLUMES_TABLE) is None:
+        return None
+    from . import market_inputs
+    from .quant.liquidity import average_daily_volume
+
+    today = inputs["now"].astimezone(timezone.utc).date()
+    # A holding's volumes are stored under its IBKR conid (daily_volumes.fetch_and_load).
+    conids = {str(position["conid"]): position["conid"] for position in inputs["positions"] if position["quantity"]}
+    found = market_inputs.read_daily_volumes(
+        connection, tenant_id=tenant_id, instrument_ids=conids,
+        start=(today - timedelta(days=VOLUME_WINDOW_DAYS)).isoformat(), end=today.isoformat())
+    if found is None:
+        return None
+    volumes = {}
+    for key, series in sorted(found.items()):
+        if key not in conids or not series:
+            continue
+        average = average_daily_volume(series, window=VOLUME_SESSIONS)["average_daily_volume"]
+        if average:
+            volumes[conids[key]] = average
+    return volumes
+
+
 # Analysis ------------------------------------------------------------------------------------
 
 
@@ -743,6 +779,7 @@ def pre_trade_payload(inputs: Mapping[str, Any], orders: Sequence[Mapping[str, A
                 engine_order["price"] = limit_price
         checked.append(engine_order)
     columns = analysis["columns"] if len(analysis["dates"]) >= MIN_OBSERVATIONS else {}
+    volumes = inputs.get("average_daily_volumes")   # None unless silver daily_volumes exists (read_volumes)
     covariance = None
     if columns:
         try:
@@ -753,8 +790,10 @@ def pre_trade_payload(inputs: Mapping[str, Any], orders: Sequence[Mapping[str, A
         book, checked, returns_history={"dates": analysis["dates"], "returns": columns} if columns else {},
         covariance=covariance, factor_model=analysis["model"],
         limits={key: value for key, value in limits.items() if key in pre_trade.LIMIT_METRICS},
-        average_daily_volumes=None, spreads=spreads, nav=nav, var_level=VAR_LEVEL, amber_at=settings["amber_at"])
-    notes = [COST_NOTE,
+        average_daily_volumes=None if volumes is None else {key: volumes[key] for key in book if key in volumes},
+        spreads=spreads, nav=nav, var_level=VAR_LEVEL, amber_at=settings["amber_at"])
+    notes = [COST_NOTE if volumes is None else
+             VOLUME_COST_NOTE + f" {sum(key in volumes for key in book)} of {len(book)} holdings have volume data.",
              "Positions, prices and spreads are today's live ones, in the reporting currency at today's daily FX rate."]
     if covariance is not None:
         notes.append(f"Ex-ante volatility uses a Ledoit-Wolf covariance of {len(analysis['dates'])} days of daily "
@@ -1106,11 +1145,15 @@ def install(
             raise HTTPException(status_code=404, detail=NOT_AVAILABLE)
         return access
 
-    def inputs_for(account_id: str, access: Mapping[str, Any], moment: datetime) -> dict[str, Any]:
+    def inputs_for(account_id: str, access: Mapping[str, Any], moment: datetime, *,
+                   volumes: bool = False) -> dict[str, Any]:
         with read_database() as connection:
-            return read_inputs(connection, tenant_id, account_id,
-                               reporting_currency=str(access.get("reporting_currency") or "USD"),
-                               comparison_version=comparison_version, now=moment)
+            inputs = read_inputs(connection, tenant_id, account_id,
+                                 reporting_currency=str(access.get("reporting_currency") or "USD"),
+                                 comparison_version=comparison_version, now=moment)
+            if volumes and inputs["summary"] is not None:
+                inputs["average_daily_volumes"] = read_volumes(connection, tenant_id, inputs)
+            return inputs
 
     @app.get("/api/portfolio/{account_id}/desk")
     def desk_live(
@@ -1135,7 +1178,7 @@ def install(
         """A hypothetical pre-trade check of proposed orders on today's live positions; nothing is placed."""
         access = desk_access(account_id, user)
         limits, settings, _source = desk_limits(environ)
-        inputs = inputs_for(account_id, access, now())
+        inputs = inputs_for(account_id, access, now(), volumes=True)
         if inputs["summary"] is None:
             raise HTTPException(status_code=409, detail=NO_SNAPSHOT)
         try:

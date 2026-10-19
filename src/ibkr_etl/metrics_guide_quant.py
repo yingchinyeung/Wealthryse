@@ -456,26 +456,190 @@ for _name, _targets in RELATED.items():
             raise RuntimeError(f"Invalid related metric for {_name}: {_target}")
 
 
+# --- Phase 3 sections (QUANT_ANALYTICS_PHASE3) ---------------------------------------------
+#
+# Shown only for the phase 3 sections a viewer may see (web_quant.allowed_phase3), each after its
+# page's section; with none, addition() is exactly as above. Their names and anchors are in
+# METRIC_ANCHORS like the others, so the audit and the card links find them.
+
+PHASE3_PAGES = {"factor_attribution": "performance", "liquidity": "risk", "macro": "risk", "crowding": "risk"}
+PHASE3_SUBPAGE_LABELS = {"factor_attribution": "Factor attribution", "liquidity": "Liquidity",
+                         "macro": "Macro exposures", "crowding": "Crowding"}
+PHASE3_DEFINITIONS: dict[str, tuple[MetricDefinition, ...]] = {
+    "factor_attribution": (
+        _D(
+            "Factor attribution",
+            "How much of the portfolio's return over cash came from its exposure to the market, size, value, profitability, investment and momentum factors, how much from alpha and how much was left over, for the year to date and the past year.",
+            "An OLS regression of the daily portfolio returns less the daily risk-free rate (RF, from the factor file) on the Fama-French five factors and momentum of the Developed markets region, the Modelling page's default, from silver factor_returns (Kenneth French's own figures at the latest vintage of each day; the ETF stand-ins for weeks the library has not published yet are left out). Each day's return splits exactly into beta × factor return for each factor, alpha (the intercept) and the residual; over the period the compounded return is split the same way with Carino (1999) linking, so the parts add up to it. The year to date runs from 1 January and the past year over the 365 days to the date, each to the last day the factor file covers. Model card attribution (quant-attribution-v1), built overnight in quant-analytics-v1.",
+            "A large factor share means the return mostly came from broad styles that can be bought cheaply; alpha is what is left once they are allowed for. Daily returns pair markets that close at different times, so a Hong Kong portfolio's betas to developed-market factors read low; the Modelling page's weekly factor model avoids that. " + NOT_ADVICE,
+        ),
+        _D(
+            "Factor alpha and residual",
+            "The parts of the return the factors do not explain: alpha, the regression's steady daily intercept, and the residual, the day-to-day remainder.",
+            "Alpha's contribution is the daily intercept on every day of the period, linked with the same Carino factors as the total; the residual is each day's return less alpha and the factor parts, linked the same way. Alpha's t-statistic is the intercept over its OLS standard error.",
+            "Alpha with a t-statistic under about 2 in size is not evidence of skill. A large residual means the factors explain little of the portfolio's moves (a low R²). " + NOT_ADVICE,
+        ),
+    ),
+    "liquidity": (
+        _D(
+            "Days to liquidate",
+            "How many trading days it would take to sell each holding without trading more than a fifth of its usual daily volume, and the value-weighted average over the holdings.",
+            "Days = |quantity| ÷ (20% × average daily volume), with the quantity on the latest holdings date. The value-weighted figure weights each holding's days by its market value in the reporting currency; days to sell everything is the slowest holding's, shown only when every holding has volume data, else the share of value without volume data is shown. Holdings without volume data count as unsold and are listed. Model card liquidity (liquidity-v1), built overnight in quant-analytics-v1.",
+            "Under a day means the holding could normally go in one session without dominating its market; several days means selling it quickly would cost more or move the price. Volume dries up in a sell-off, so selling can take longer than this. " + NOT_ADVICE,
+        ),
+        _D(
+            "Share sellable within 1, 5 and 20 days",
+            "The share of the holdings' value that could be sold within 1, 5 and 20 trading days, trading at most 20% of each holding's daily volume.",
+            "Within h days a holding sells min(1, h ÷ its days to liquidate) of itself; those shares are weighted by market value and added up. Holdings without volume data count as unsold, so the figures are a floor. Cash is not included.",
+            "A high one-day share means most of the holdings could be turned into cash quickly; a low 20-day share points to positions that are large against their market. It assumes every holding is sold at once at the same pace. " + NOT_ADVICE,
+        ),
+        _D(
+            "Average daily volume",
+            "The number of shares that usually trade in a holding in a day.",
+            "The mean of the last 20 sessions with a volume above zero in silver daily_volumes (as Yahoo reports it), up to the holdings date, skipping holidays and missing days; fewer sessions are used when fewer are stored. A holding's volumes are the rows stored under its IBKR contract id, which the daily volumes job fetches from Yahoo for every holding it can map to a Yahoo symbol. Holdings with volume data counts them; until that fetch is switched on (at first daily_volumes holds the benchmarks only) most have none, and with none the days to liquidate are not worked out while the liquidity-adjusted VaR still is.",
+            "It is the yardstick for how large a position is against its market. A short or patchy history makes it less reliable. " + NOT_ADVICE,
+        ),
+        _D(
+            "Liquidity-adjusted VaR",
+            "The one-day 99% VaR plus what it would cost to sell through the bid-ask spread on the same bad day.",
+            "Bangia, Diebold, Schuermann and Stroughair (1999): LVaR = VaR + Σ wᵢ·½(μᵢ + 3σᵢ), with wᵢ each holding's share of value and μᵢ and σᵢ the mean and standard deviation of its relative bid-ask spread. The VaR is the tail risk card's one-day 99% extreme-value VaR (conditional on tomorrow's GARCH volatility when that fit works, else unconditional). Bid-ask spreads are not stored in silver yet, so the spread cost is zero and LVaR equals VaR until they are.",
+            "The gap between the two figures is the price of having to sell in a hurry. While spreads are missing it is a floor, and it never includes the price impact of selling large blocks. " + NOT_ADVICE,
+        ),
+    ),
+    "macro": (
+        _D(
+            "Macro exposures",
+            "How the portfolio has moved with the US 10-year Treasury yield, the 10-year minus 2-year yield curve, the broad US dollar, Brent oil, the VIX and the US dollar against the offshore yuan.",
+            "Weekly portfolio returns (daily returns compounded between the last days of each week on which every series has a level) over up to three years, regressed on the weekly changes of the series together with an intercept: basis-point changes for the yield and the curve, log returns for the dollar index (DTWEXBGS), Brent (DCOILBRENTEU), the VIX (VIXCLS) and USD/CNH. The levels come from silver macro_series (FRED, and Yahoo for USD/CNH; the latest vintage of each day). A series not there is left out and the card says why: the VIX is Cboe copyright, so it is loaded only once its licence is confirmed (MACRO_SERIES_LICENSE_CONFIRMED=VIXCLS), and until then it is not in the model. t-statistics use Newey-West (1987) standard errors with 5 lags, and |t| ≥ 2 is marked significant. R² is the share of the weekly moves the series explain together. Model card macro-factors (macro-factors-v1), built overnight in quant-analytics-v1.",
+            "Each sensitivity is the portfolio's move with one series while the others are held still; series that move together share their effect, and the figures change as the holdings change. A low R² means these series explain little of the portfolio. " + NOT_ADVICE,
+        ),
+        _D(
+            "Macro shock impact",
+            "The move in the portfolio that the fitted macro sensitivities imply for each of seven standard shocks.",
+            "Each shock becomes the change the model was fitted on (basis points for the yield and the curve, the log of one plus the move otherwise), times the portfolio's beta to that series, summed over the series shocked; the 95% range is ±1.96 standard errors from the betas' Newey-West covariance. The shocks: the 10-year yield +100bp; the curve 50bp steeper with the 10-year unchanged; the dollar index +5%; Brent −20%; the VIX +50%; USD/CNH +5% (a 5% weaker yuan); and a risk-off week of the 10-year −50bp, the dollar +5%, Brent −20%, the VIX +50% and USD/CNH +3% together. A shock only to series left out of the model (the VIX +50% while the VIX is not loaded) is not worked out, and the risk-off week is then worked out without that part; the card says which.",
+            "Each is an instant, one-off move with every other series unchanged and the intercept left out. Large shocks stretch a linear model, and the range shows how uncertain the sensitivities are. " + NOT_ADVICE,
+        ),
+    ),
+    "crowding": (
+        _D(
+            "Fund ownership overlap",
+            "How much of the portfolio's US-listed holdings the largest US institutional managers also hold, from their quarterly 13F filings.",
+            "Shares with a US ISIN are matched to 13F CUSIPs (the ISIN's third to eleventh characters); other holdings are listed as not covered. Each filer's latest quarter filed on or before the date is used, in its latest accession, counting shares held outright only (no options or principal amounts) by reported value in US dollars, from silver institutional_holdings. The share in names the funds hold is the covered weight in holdings at least one filer reports. Shares outstanding are not in silver, so the share of each company the funds own together is not worked out. Model card crowding (crowding-v1), built overnight in quant-analytics-v1.",
+            "Names many large managers hold can fall together when those managers sell together. 13F filings arrive up to 45 days after each quarter, cover US-listed long positions only and leave out shorts, so they lag and miss part of each fund. " + NOT_ADVICE,
+        ),
+        _D(
+            "Most similar funds",
+            "The 13F filers whose holdings look most like the US-listed part of this portfolio.",
+            "Similarity is the cosine of the angle between the filer's weight vector (each stake's value over its whole filing) and the portfolio's weights in the covered holdings: 1 for the same mix, 0 for nothing in common. The whole filing counts: the stakes outside the portfolio's names enter through their total and the sum of their squares, which is all the cosine needs. The table adds the shared holdings, the share of the covered weight in the filer's names and the share of the filer in the portfolio's names.",
+            "A high similarity means the portfolio holds much the same book as that manager, so the manager's buying and selling may move it. It compares what is held, not how it moves. " + NOT_ADVICE,
+        ),
+    ),
+}
+PHASE3_CLIENT_CALCULATIONS = {
+    "Factor attribution": "We compare each day's return over cash with how the market, size, value, profitability, investment and momentum factors did that day, find the portfolio's sensitivity to each, and split the return into the factors' parts, a steady extra (alpha) and what is left over.",
+    "Factor alpha and residual": "After taking out what the factors explain, we split what is left into a steady daily amount (alpha) and the day-to-day remainder.",
+    "Days to liquidate": "For each holding we divide the shares held by a fifth of the shares that usually trade in a day.",
+    "Share sellable within 1, 5 and 20 days": "We work out how much of each holding could be sold in 1, 5 and 20 days at that pace, and add up the value.",
+    "Average daily volume": "We average the shares traded on the last 20 trading days that had any volume.",
+    "Liquidity-adjusted VaR": "We add to the one-day 99% VaR the cost of selling every holding at the bid instead of the middle price, allowing for spreads widening on a bad day.",
+    "Macro exposures": "We line up the portfolio's weekly returns with the weekly moves in US rates, the yield curve, the dollar, oil, the VIX and the yuan, and measure how much the portfolio has tended to move with each one.",
+    "Macro shock impact": "We apply a standard shock to one or more of those series and add up what the measured sensitivities say the portfolio would do.",
+    "Fund ownership overlap": "We match the portfolio's US-listed shares with what the largest US managers report owning each quarter, and see how much of the portfolio sits in names they hold.",
+    "Most similar funds": "We compare the mix of the portfolio's US-listed holdings with each manager's whole reported portfolio and rank the managers by how alike the two mixes are.",
+}
+PHASE3_ALIASES = {
+    "Factor attribution": ("Fama-French attribution", "factor contribution"),
+    "Days to liquidate": ("liquidation horizon", "time to liquidate", "liquidity risk"),
+    "Average daily volume": ("ADV",),
+    "Liquidity-adjusted VaR": ("LVaR", "liquidity VaR"),
+    "Macro exposures": ("macro betas", "rate sensitivity", "macro factors"),
+    "Macro shock impact": ("macro stress", "macro scenario"),
+    "Fund ownership overlap": ("13F", "institutional ownership", "ownership overlap"),
+    "Most similar funds": ("cosine similarity", "fund similarity"),
+}
+PHASE3_RELATED = {
+    "Factor attribution": ("Factor alpha and residual", "Factor beta", "Factor return contribution",
+                           "Explained by factors (R²)"),
+    "Factor alpha and residual": ("Factor attribution", "Alpha (factor model)"),
+    "Days to liquidate": ("Share sellable within 1, 5 and 20 days", "Average daily volume", "Liquidity-adjusted VaR"),
+    "Share sellable within 1, 5 and 20 days": ("Days to liquidate",),
+    "Average daily volume": ("Days to liquidate",),
+    "Liquidity-adjusted VaR": ("EVT VaR and expected shortfall", "Days to liquidate"),
+    "Macro exposures": ("Macro shock impact", "Factor beta"),
+    "Macro shock impact": ("Macro exposures", "Factor stress test impact"),
+    "Fund ownership overlap": ("Most similar funds", "Herfindahl index and effective number"),
+    "Most similar funds": ("Fund ownership overlap",),
+}
+PHASE3_SECTION_OF = {metric.name: section for section, items in PHASE3_DEFINITIONS.items() for metric in items}
+PHASE3_LOCATIONS = {name: f"{PHASE3_PAGES[section].title()} › {PHASE3_SUBPAGE_LABELS[section]}"
+                    for name, section in PHASE3_SECTION_OF.items()}
+
+if set(PHASE3_SECTION_OF) & set(_BY_NAME) or len(PHASE3_SECTION_OF) != sum(map(len, PHASE3_DEFINITIONS.values())):
+    raise RuntimeError("Phase 3 guide names must be unique")
+if {metric_anchor(name) for name in PHASE3_SECTION_OF} & (set(BASE_ANCHORS.values()) | set(METRIC_ANCHORS.values())):
+    raise RuntimeError("Phase 3 guide anchors must not reuse a Metrics guide anchor")
+if set(PHASE3_CLIENT_CALCULATIONS) != set(PHASE3_SECTION_OF) or set(PHASE3_ALIASES) - set(PHASE3_SECTION_OF) \
+        or set(PHASE3_RELATED) - set(PHASE3_SECTION_OF):
+    raise RuntimeError("Every phase 3 guide entry needs a plain explanation, and only phase 3 names")
+for _name, _targets in PHASE3_RELATED.items():
+    for _target in _targets:
+        if _target == _name or (_target not in _BY_NAME and _target not in PHASE3_SECTION_OF
+                                and _target not in BASE_ANCHORS):
+            raise RuntimeError(f"Invalid related metric for {_name}: {_target}")
+_BY_NAME.update({metric.name: metric for items in PHASE3_DEFINITIONS.values() for metric in items})
+METRIC_ANCHORS.update({name: metric_anchor(name) for name in PHASE3_SECTION_OF})
+CLIENT_CALCULATIONS.update(PHASE3_CLIENT_CALCULATIONS)
+ALIASES.update(PHASE3_ALIASES)
+RELATED.update(PHASE3_RELATED)
+LOCATIONS.update(PHASE3_LOCATIONS)
+
+
+def _phase3_sections(shown: list[str], phase3: tuple[str, ...] | list[str] | set[str]) -> list[str]:
+    return [section for section in PHASE3_DEFINITIONS if section in phase3 and PHASE3_PAGES[section] in shown]
+
+
+def _phase3_section(page: str, sections: list[str]) -> tuple[str, MetricSection]:
+    """One guide section for a page's phase 3 entries the viewer may see, after its quant section."""
+    mine = [section for section in sections if PHASE3_PAGES[section] == page]
+    labels = [PHASE3_SUBPAGE_LABELS[section] for section in mine]
+    title = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " and " + labels[-1].lower()
+    title = title[0] + title[1:].lower()
+    return (f"quant-{page}", MetricSection(
+        f"quant-{page}-phase3", title, title,
+        f"{title}, from the phase 3 market data in silver (quant-analytics-v1, built overnight).",
+        tuple(metric for section in mine for metric in PHASE3_DEFINITIONS[section]),
+        f"{page.title()} › " + ", ".join(labels)))
+
+
 def page_of(name: str) -> str:
+    if name in PHASE3_SECTION_OF:
+        return PHASE3_PAGES[PHASE3_SECTION_OF[name]]
     return next(page for page in PAGES if any(metric.name == name for metric in DEFINITIONS[page]))
 
 
-def addition(pages: tuple[str, ...] | list[str] | set[str]) -> GuideAddition | None:
+def addition(pages: tuple[str, ...] | list[str] | set[str],
+             phase3: tuple[str, ...] | list[str] | set[str] = ()) -> GuideAddition | None:
     """The guide sections for the pages a viewer may see; None when there are none.
 
-    A "See also" link to an entry on a page the viewer cannot see is dropped.
+    ``phase3`` names the phase 3 sections the viewer may see (each also needs its page); with
+    none the addition is the pages' alone. A "See also" link to an entry on a page the viewer
+    cannot see is dropped.
     """
 
     shown = [page for page in PAGES if page in pages]
     if not shown:
         return None
-    visible = {metric.name for page in shown for metric in DEFINITIONS[page]} | set(BASE_ANCHORS)
-    versions = [("quant-analytics-v1", "built overnight: " + "; ".join(OVERNIGHT_PAGES[page] for page in shown))]
+    extra = _phase3_sections(shown, phase3)
+    extra_names = {metric.name for section in extra for metric in PHASE3_DEFINITIONS[section]}
+    visible = {metric.name for page in shown for metric in DEFINITIONS[page]} | set(BASE_ANCHORS) | extra_names
+    versions = [("quant-analytics-v1", "built overnight: " + "; ".join(OVERNIGHT_PAGES[page] for page in shown)
+                 + ("; phase 3: " + ", ".join(PHASE3_SUBPAGE_LABELS[section] for section in extra) if extra else ""))]
     if "modelling" in shown:
         versions += REQUEST_TIME_VERSIONS
-    names = {metric.name for page in shown for metric in DEFINITIONS[page]}
+    names = {metric.name for page in shown for metric in DEFINITIONS[page]} | extra_names
     return GuideAddition(
-        sections=tuple(SECTIONS[page] for page in shown),
+        sections=tuple(SECTIONS[page] for page in shown)
+        + tuple(_phase3_section(page, extra) for page in shown if any(PHASE3_PAGES[s] == page for s in extra)),
         client_calculations={name: CLIENT_CALCULATIONS[name] for name in names},
         aliases={name: ALIASES[name] for name in names if name in ALIASES},
         related={name: tuple(t for t in RELATED.get(name, ()) if t in visible) for name in names},
@@ -588,3 +752,50 @@ WATCHED_SOURCES = {
     "ibkr_etl.quant.stress_engine:reverse_stress": ("Reverse stress test",),
     "ibkr_etl.web_quant:_advanced_optimisers": ("Advanced optimisers", "Robust mean-variance weights"),
 }
+
+# Phase 3 tiles (web_quant.PHASE3_SCRIPT) and engines.
+LABEL_MAP.update({
+    "Return over cash (past year)": "Factor attribution",
+    "Explained by factors (past year)": "Factor attribution",
+    "Factor fit R² (past year)": "Factor attribution",
+    "Return over cash (year to date)": "Factor attribution",
+    "Explained by factors (year to date)": "Factor attribution",
+    "Alpha (past year)": "Factor alpha and residual",
+    "Alpha (year to date)": "Factor alpha and residual",
+    "Residual (past year)": "Factor alpha and residual",
+    "Sellable in 1 day": "Share sellable within 1, 5 and 20 days",
+    "Sellable in 5 days": "Share sellable within 1, 5 and 20 days",
+    "Sellable in 20 days": "Share sellable within 1, 5 and 20 days",
+    "Value-weighted days to sell": "Days to liquidate",
+    "Days to sell everything": "Days to liquidate",
+    "Value without volume data": "Days to liquidate",
+    "Holdings with volume data": "Average daily volume",
+    "Liquidity-adjusted VaR (99%)": "Liquidity-adjusted VaR",
+    "VaR before liquidity (99%)": "Liquidity-adjusted VaR",
+    "Spread cost added": "Liquidity-adjusted VaR",
+    "US 10-year yield +100bp": "Macro shock impact",
+    "Yield curve 50bp steeper": "Macro shock impact",
+    "Dollar index +5%": "Macro shock impact",
+    "Brent oil −20%": "Macro shock impact",
+    "VIX +50%": "Macro shock impact",
+    "Yuan 5% weaker": "Macro shock impact",
+    "Risk-off week": "Macro shock impact",
+    "Macro R²": "Macro exposures",
+    "Weeks in the macro model": "Macro exposures",
+    "Funds compared": "Fund ownership overlap",
+    "Covered by 13F filings": "Fund ownership overlap",
+    "In names the funds hold": "Fund ownership overlap",
+    "Most widely held": "Fund ownership overlap",
+    "Most similar fund": "Most similar funds",
+})
+WATCHED_SOURCES.update({
+    "ibkr_etl.quant.attribution:factor_attribution": ("Factor attribution", "Factor alpha and residual"),
+    "ibkr_etl.quant.liquidity:average_daily_volume": ("Average daily volume",),
+    "ibkr_etl.quant.liquidity:days_to_liquidate": ("Days to liquidate", "Share sellable within 1, 5 and 20 days"),
+    "ibkr_etl.quant.liquidity:liquidity_adjusted_var": ("Liquidity-adjusted VaR",),
+    "ibkr_etl.quant.macro_factors:macro_exposures": ("Macro exposures",),
+    "ibkr_etl.quant.macro_factors:macro_sensitivity": ("Macro shock impact",),
+    "ibkr_etl.quant.crowding:ownership_overlap": ("Fund ownership overlap", "Most similar funds"),
+    "ibkr_etl.quant_snapshots:build_macro": ("Macro exposures", "Macro shock impact"),
+    "ibkr_etl.quant_snapshots:build_liquidity": ("Days to liquidate", "Liquidity-adjusted VaR"),
+})

@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS public.quant_analytics_snapshots (
     as_of_date TEXT NOT NULL CHECK (as_of_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
     section TEXT NOT NULL CHECK (section IN (
         'skill', 'decisions', 'currency', 'tail', 'regime', 'holdings_risk', 'correlation',
-        'concentration', 'execution')),
+        'concentration', 'execution', 'liquidity', 'factor_attribution', 'macro', 'crowding')),
     analytics_version TEXT NOT NULL CHECK (length(analytics_version) BETWEEN 1 AND 200),
     model_id TEXT NOT NULL CHECK (model_id ~ '^[a-z][a-z0-9-]*$'),
     model_version TEXT NOT NULL CHECK (length(model_version) BETWEEN 1 AND 200),

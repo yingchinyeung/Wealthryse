@@ -95,6 +95,261 @@ def synthetic_data(*, holdings: int = 8, days: int = 320, seed: int = 7, as_of: 
     return data
 
 
+# ---------------------------------------------------------------- phase 3 silver rows
+
+def _shift_day(day: str, days: int) -> str:
+    return (date.fromisoformat(day) + timedelta(days=days)).isoformat()
+
+
+def _isin(country: str, body: str) -> str:
+    from ibkr_etl.sec_13f import isin_check_digit
+
+    return f"{country}{body}{isin_check_digit(country + body)}"
+
+
+FACTOR_COLUMNS = ("Mkt-RF", "SMB", "HML", "RMW", "CMA", "MOM", "RF")
+MACRO_UNITS = {"DGS10": "percent", "DGS2": "percent", "DTWEXBGS": "index", "DCOILBRENTEU": "usd_per_barrel",
+               "VIXCLS": "index", "USDCNH": "cnh_per_usd"}
+FILERS = (  # cik, name: the 13F filers of synthetic_market()
+    ("0000100001", "Alpha Capital"), ("0000100002", "Beta Partners"), ("0000100003", "Gamma Fund"),
+    ("0000100004", "Gamma Fund"), ("0000100005", "Delta Advisors"), ("0000100006", "Echo Management"),
+    ("0000100007", "Hotel Holdings"))
+
+
+def synthetic_market(data: dict, *, seed: int = 5, vix: bool = False) -> dict:
+    """Rows of the four phase 3 silver tables for synthetic_data()'s account (phase3-schemas.md),
+    plus the ISINs its instruments carry. Deterministic. The cases the readers must get right:
+
+    * daily_volumes: each holding's volumes under its conid, as the holdings' own fetch stores
+      them; the last holding has none; a benchmark's chart rows (a market_data_prices instrument
+      with the first holding's symbol) that must never be read for a holding; a few days are
+      missing (not stored) and a few are zero (holidays, skipped).
+    * factor_returns: developed factors whose market factor is the account's benchmark return
+      less RF; dates in the last month have an older vintage with wrong values (the newer one
+      counts, holding only the rows it changed); the last fortnight only as ETF stand-ins
+      (left out); a us region that must not be read.
+    * macro_series: the series daily over three years, a few days missing, and a newer vintage
+      revising the last fortnight. VIXCLS only with vix=True: by default the loader leaves it out
+      (Cboe copyright, kept only when MACRO_SERIES_LICENSE_CONFIRMED=VIXCLS).
+    * institutional_holdings: an amendment (the later accession counts), one filed later under a
+      lower accession (the newest filed_at counts, not the highest accession), a quarter filed after
+      the date (not known yet), an older quarter, two filers with one name, an option and a
+      principal amount (not stakes), a zero value, a fund holding none of our names, one holding
+      exactly our US names in our proportions (similarity 1) and one filed on the date itself.
+    """
+    from ibkr_etl.sec_13f import cusip_from_isin
+
+    rng = random.Random(seed)
+    as_of = data["as_of"]
+    last = max(row["date"] for row in data["positions"] if row["date"] <= as_of)
+    held = {row["conid"]: row for row in data["positions"] if row["date"] == last}
+    conids = sorted(held)
+    instruments = {}
+    for conid in conids:
+        row = held[conid]
+        if conid == conids[-1]:
+            isin = None
+        elif row["currency"] == "HKD":
+            isin = _isin("HK", f"{conid}00000"[:9])
+        else:
+            isin = _isin("US", f"S{conid:0<8}")
+        instruments[conid] = {"symbol": row["symbol"], "listing_exchange": "", "currency": row["currency"],
+                              "isin": isin, "asset_category": "STK"}
+
+    # Volumes, for the 60 days to the date, under each holding's conid (the holdings' own fetch).
+    days = [day for day in business_days(as_of, 50) if day >= _shift_day(as_of, -60)]
+    prices, volumes = [], []
+    for index, conid in enumerate(conids[:-1]):  # the last holding has no volumes of its own
+        base = 150.0 if index == 1 else 40_000.0 * (1 + index)  # the second holding is slow to sell
+        for day in days:
+            draw = rng.random()
+            if draw < 0.05:
+                continue
+            volumes.append({"instrument_id": str(conid), "price_date": day,
+                            "volume": 0.0 if draw > 0.97 else float(round(base * rng.uniform(0.5, 1.5)))})
+    # A benchmark's chart rows, under its market_data_prices id with the first holding's symbol:
+    # never a holding's volumes, which are read by conid only.
+    first = instruments[conids[0]]["symbol"]
+    prices.append({"instrument_id": f"yahoo:{first}", "symbol": first})
+    volumes += [{"instrument_id": f"yahoo:{first}", "price_date": day, "volume": 7.0} for day in days[-5:]]
+
+    # Factor returns, from before 1 January and the year before the date.
+    start = _shift_day(min(f"{as_of[:4]}-01-01", _shift_day(as_of, -365)), -14)
+    old_vintage, new_vintage = _shift_day(as_of, -16), _shift_day(as_of, -1)
+    market = {row["date"]: row["benchmark_return"] for row in data["comparison"]
+              if row["benchmark_return"] is not None}
+    rf = 0.04 / 252
+    factors = []
+    for day in business_days(as_of, 420):
+        if day < start:
+            continue
+        values = {"Mkt-RF": market.get(day, rng.gauss(0.0, 0.01)) - rf, "SMB": rng.gauss(0.0, 0.004),
+                  "HML": rng.gauss(0.0, 0.004), "RMW": rng.gauss(0.0, 0.003), "CMA": rng.gauss(0.0, 0.003),
+                  "MOM": rng.gauss(0.0, 0.006), "RF": rf}
+        for factor in FACTOR_COLUMNS:
+            value = values[factor]
+            old = {"region": "developed", "factor": factor, "return_date": day, "source": "kenneth-french",
+                   "vintage": old_vintage, "fetched_at": f"{old_vintage}T06:00:00Z"}
+            new = {**old, "vintage": new_vintage, "fetched_at": f"{new_vintage}T06:00:00Z"}
+            if day > old_vintage:  # published since the older file: fund stand-ins until the next one
+                factors.append({**new, "value": value, "source": "etf-proxy"})
+            elif day > _shift_day(as_of, -30):  # revised in the newer file
+                factors += [{**old, "value": value + 0.01}, {**new, "value": value}]
+            else:
+                factors.append({**old, "value": value})
+                if day.endswith("-15"):
+                    factors.append({**old, "region": "us", "value": 9.0})
+
+    # Macro levels over three years and a little more.
+    level = {"DGS10": 4.0, "DGS2": 3.6, "DTWEXBGS": 120.0, "DCOILBRENTEU": 80.0, "VIXCLS": 18.0, "USDCNH": 7.2}
+    macro = []
+    for day in business_days(as_of, 820):
+        if day < _shift_day(as_of, -365 * 3 - 21):
+            continue
+        move = market.get(day, rng.gauss(0.0, 0.008))
+        level["DGS10"] = max(0.5, level["DGS10"] + 2.0 * move + rng.gauss(0.0, 0.04))
+        level["DGS2"] = max(0.3, level["DGS2"] + rng.gauss(0.0, 0.04))
+        level["DTWEXBGS"] *= math.exp(-0.3 * move + rng.gauss(0.0, 0.003))
+        level["DCOILBRENTEU"] *= math.exp(0.8 * move + rng.gauss(0.0, 0.015))
+        level["VIXCLS"] = max(9.0, level["VIXCLS"] * math.exp(-3.0 * move + rng.gauss(0.0, 0.04)))
+        level["USDCNH"] *= math.exp(-0.1 * move + rng.gauss(0.0, 0.002))
+        for series, value in level.items():
+            if rng.random() < 0.02 or (series == "VIXCLS" and not vix):
+                continue
+            old = {"series_id": series, "observation_date": day, "units": MACRO_UNITS[series],
+                   "source": "yahoo-chart" if series == "USDCNH" else "fred", "vintage": old_vintage,
+                   "fetched_at": f"{old_vintage}T07:00:00Z"}
+            if day > _shift_day(as_of, -14):
+                macro += [{**old, "value": value * 1.01},
+                          {**old, "value": value, "vintage": new_vintage, "fetched_at": f"{new_vintage}T07:00:00Z"}]
+            else:
+                macro.append({**old, "value": value})
+
+    # 13F filings, in whole dollars so the database sums them exactly.
+    ours = {cusip_from_isin(info["isin"]): conid for conid, info in instruments.items()
+            if cusip_from_isin(info["isin"])}
+    pool = [f"R{index:08d}" for index in range(200)]
+    holdings = []
+
+    def filing(cik, name, period, accession, filed_at, stakes):
+        for cusip, value, *kind in stakes:
+            put_call, shares_type = kind if kind else ("", "SH")
+            holdings.append({"filer_cik": cik, "filer_name": name, "period": period, "cusip": cusip,
+                             "issuer": f"Issuer {cusip}", "shares": float(round(value / 50.0)),
+                             "shares_type": shares_type, "value_usd": float(value), "put_call": put_call,
+                             "accession": accession, "filed_at": filed_at, "fetched_at": f"{filed_at}T08:00:00Z"})
+
+    def mix(count, with_ours=True):
+        mine = [(cusip, rng.randint(10_000, 2_000_000)) for cusip in sorted(ours) if with_ours and rng.random() < 0.7]
+        return mine + [(cusip, rng.randint(10_000, 2_000_000)) for cusip in sorted(rng.sample(pool[:190], count))]
+
+    (alpha, alpha_name), (beta, beta_name), (gamma, gamma_name), (gamma2, _), (delta, delta_name), \
+        (echo, echo_name), (hotel, hotel_name) = FILERS
+    some = sorted(ours)[0] if ours else pool[0]
+    filing(alpha, alpha_name, "2026-06-30", "0000100001-26-000001", "2026-08-10", mix(30))
+    filing(alpha, alpha_name, "2026-06-30", "0000100001-26-000002", "2026-08-20",
+           mix(30) + [(some, 500_000, "PUT", "SH"), (pool[199], 300_000, "", "PRN")])
+    filing(beta, beta_name, "2026-06-30", "0000100002-26-000001", "2026-08-14", mix(50) + [(pool[198], 0)])
+    filing(beta, beta_name, "2026-09-30", "0000100002-26-000002", "2026-11-13", mix(50))
+    filing(gamma, gamma_name, "2026-03-31", "0000100003-26-000001", "2026-05-15", mix(40))
+    filing(gamma2, gamma_name, "2026-06-30", "0000100004-26-000001", "2026-08-12", mix(20))
+    filing(delta, delta_name, "2026-06-30", "0000900001-26-000077", "2026-08-13", mix(60, with_ours=False))
+    # Its amendment, filed later by another agent under a lower accession: this one counts.
+    filing(delta, delta_name, "2026-06-30", "0000100005-26-000001", "2026-08-27", mix(60, with_ours=False))
+    # Our long US names at our values (a 13F reports long positions only, so a short is not in it).
+    filing(echo, echo_name, "2026-06-30", "0000100006-26-000001", "2026-08-11",
+           [(cusip, round(float(held[conid]["market_value"]))) for cusip, conid in sorted(ours.items())
+            if float(held[conid]["market_value"]) > 0])
+    filing(hotel, hotel_name, "2026-09-30", "0000100007-26-000001", as_of, mix(25))
+    return {"instruments": instruments, "prices": prices, "daily_volumes": volumes, "factor_returns": factors,
+            "macro_series": macro, "institutional_holdings": holdings}
+
+
+def market_from_raw(raw: dict, data: dict, *, as_of: str | None = None) -> dict:
+    """What qs.load_phase3_inputs() reads from synthetic_market()'s rows once the four tables are
+    in silver, worked out in plain Python: the reference the database readers are checked against."""
+    from collections import defaultdict
+
+    from ibkr_etl import market_inputs as mi
+
+    as_of = as_of or data["as_of"]
+    day = max(row["date"] for row in data["positions"] if row["date"] <= as_of)
+    held = sorted({row["conid"] for row in data["positions"] if row["date"] == day})
+    instruments = raw["instruments"]
+
+    series = defaultdict(dict)
+    for row in raw["daily_volumes"]:
+        if _shift_day(day, -qs.VOLUME_WINDOW_DAYS) <= row["price_date"] <= day and row["volume"] > 0:
+            series[row["instrument_id"]][row["price_date"]] = row["volume"]
+    # By conid only: a holding's volumes are stored under it.
+    volumes = {str(conid): {"instrument_id": str(conid), "volumes": dict(sorted(series[str(conid)].items()))}
+               for conid in held if series.get(str(conid))}
+
+    def latest(rows, key, start, field, wanted):
+        chosen = {}
+        for row in rows:
+            if wanted(row) and start <= row[field] <= as_of:
+                name = (row[key], row[field])
+                if name not in chosen or (row["vintage"], row["fetched_at"]) > (chosen[name]["vintage"],
+                                                                                chosen[name]["fetched_at"]):
+                    chosen[name] = row
+        return [chosen[name] for name in sorted(chosen)]
+
+    start = min(f"{as_of[:4]}-01-01", _shift_day(as_of, -365))
+    factors, sources, vintages = defaultdict(dict), defaultdict(int), []
+    for row in latest(raw["factor_returns"], "factor", start, "return_date",
+                      lambda r: r["region"] == qs.FACTOR_REGION and r["source"] == mi.FACTOR_SOURCE):
+        factors[row["return_date"]][row["factor"]] = row["value"]
+        sources[row["source"]] += 1
+        vintages.append(row["vintage"])
+    factor_returns = {"region": qs.FACTOR_REGION,
+                      "factors": {d: dict(sorted(v.items())) for d, v in sorted(factors.items())},
+                      "sources": dict(sorted(sources.items())),
+                      "vintages": [min(vintages), max(vintages)] if vintages else None}
+
+    levels, units, origins = defaultdict(dict), {}, {}
+    for row in latest(raw["macro_series"], "series_id", _shift_day(as_of, -365 * qs.MACRO_YEARS - 7),
+                      "observation_date", lambda r: r["series_id"] in mi.MACRO_SERIES):
+        levels[row["series_id"]][row["observation_date"]] = row["value"]
+        units[row["series_id"]], origins[row["series_id"]] = row["units"], row["source"]
+    macro = {"series": {name: dict(sorted(values.items())) for name, values in sorted(levels.items())},
+             "units": dict(sorted(units.items())), "sources": dict(sorted(origins.items()))}
+
+    from ibkr_etl.sec_13f import cusip_from_isin
+
+    cusips = {cusip_from_isin(instruments[conid]["isin"]) for conid in held} - {None}
+    known = [row for row in raw["institutional_holdings"] if row["period"] <= as_of and row["filed_at"] <= as_of]
+    newest = {}
+    for row in known:
+        rank = (row["period"], row["filed_at"], row["accession"])
+        if row["filer_cik"] not in newest or rank > newest[row["filer_cik"]][0]:
+            newest[row["filer_cik"]] = (rank, row)
+    chosen = [row for row in known if newest[row["filer_cik"]][0][::2] == (row["period"], row["accession"])
+              and row["put_call"] == "" and row["shares_type"] == "SH" and row["value_usd"] > 0]
+    filers = []
+    for cik in sorted(newest):
+        rows = [row for row in chosen if row["filer_cik"] == cik]
+        rest = [row["value_usd"] for row in rows if row["cusip"] not in cusips]
+        (period, filed_at, accession), first = newest[cik]
+        filers.append({"filer_cik": cik, "filer_name": first["filer_name"], "period": period, "accession": accession,
+                       "filed_at": filed_at, "positions": len(rows),
+                       "total_value": float(sum(row["value_usd"] for row in rows)),
+                       "rest_value": float(sum(rest)), "rest_squares": float(sum(v * v for v in rest)),
+                       "rest_positions": len(rest)})
+    stakes = [{"filer_cik": row["filer_cik"], "cusip": row["cusip"], "shares": row["shares"],
+               "value_usd": row["value_usd"]}
+              for row in sorted(chosen, key=lambda r: (r["filer_cik"], r["cusip"])) if row["cusip"] in cusips]
+    return {
+        "liquidity": {"volumes": volumes},
+        "factor_attribution": factor_returns,
+        "macro": macro,
+        "crowding": {"instruments": {conid: {"isin": instruments[conid]["isin"],
+                                             "asset_category": instruments[conid]["asset_category"]}
+                                     for conid in held},
+                     "filings": {"filers": filers, "stakes": stakes}},
+    }
+
+
 def _finite(value) -> bool:
     if isinstance(value, float):
         return math.isfinite(value)
@@ -406,7 +661,19 @@ class PerformanceTests(unittest.TestCase):
             payload = qs.BUILDERS[name](inputs[name])
             timings[name] = time.perf_counter() - section_started
             self.assertTrue(payload["available"], f"{name}: {payload['reason']}")
-        total = time.perf_counter() - started
+        # The phase 3 sections on their silver rows (QUANT_ANALYTICS_PHASE3), each timed too.
+        fixture_started = time.perf_counter()
+        market = market_from_raw(synthetic_market(data), data)  # the silver rows as read: not part of the build
+        fixture = time.perf_counter() - fixture_started
+        market_started = time.perf_counter()
+        phase3 = qs.prepare_phase3_inputs(data, inputs, market)
+        timings["prepare phase 3"] = time.perf_counter() - market_started
+        for name in qs.PHASE3_NAMES:
+            section_started = time.perf_counter()
+            payload = qs.BUILDERS[name](phase3[name])
+            timings[name] = time.perf_counter() - section_started
+            self.assertTrue(payload["available"], f"{name}: {payload['reason']}")
+        total = time.perf_counter() - started - fixture
         print("\nquant build, 60 holdings and 3 years: " + ", ".join(f"{k} {v:.2f}s" for k, v in timings.items())
               + f"; total {total:.2f}s")
         self.assertLess(total, 60.0)

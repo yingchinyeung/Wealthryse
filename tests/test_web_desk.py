@@ -595,6 +595,73 @@ class PreTradeTests(unittest.TestCase):
         self.assertEqual(self._post(body, environ={}).json(), {"detail": "Not Found"})
 
 
+class VolumeImpactTests(unittest.TestCase):
+    """Once silver daily_volumes exists (phase 3), the pre-trade check estimates market impact."""
+
+    # Under each holding's conid, as the holdings' own fetch stores them.
+    VOLUMES = ([{"instrument_id": AAPL, "price_date": day, "volume": 1_000_000.0} for day in DAYS[-25:]]
+               + [{"instrument_id": TENCENT, "price_date": day, "volume": 0.0 if i % 5 else 20_000_000.0}
+                  for i, day in enumerate(DAYS[-30:])])
+    ORDERS = {"orders": [{"symbol": "AAPL", "side": "BUY", "quantity": 10},
+                         {"symbol": "MSFT", "side": "SELL", "quantity": 5}]}
+
+    def _connection(self, volumes=True):
+        views = {"subject_live_executions": "silver", "benchmark_live_quotes": "silver"}
+        if volumes:
+            views["daily_volumes"] = "silver"
+        connection = FakeConnection(views=views)
+        connection.answers["FROM daily_volumes"] = list(self.VOLUMES)
+        return connection
+
+    def _post(self, connection):
+        client, _ = _client(connection)
+        response = client.post("/api/portfolio/U1/desk/pre-trade", json=self.ORDERS)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_with_volumes_the_impact_is_estimated_for_the_holdings_that_have_them(self):
+        connection = self._connection()
+        body = self._post(connection)
+        orders = {o["holding"]: o for o in body["results"]["pre_trade_check"]["orders"]}
+        aapl = orders[AAPL]
+        self.assertEqual(aapl["average_daily_volume"], 1_000_000.0)
+        self.assertAlmostEqual(aapl["impact"], aapl["daily_volatility"] * math.sqrt(10 / 1_000_000), places=15)
+        self.assertAlmostEqual(aapl["impact_cost"], aapl["impact"] * 1020.0, places=12)
+        self.assertAlmostEqual(aapl["cost"], aapl["spread_cost"] + aapl["impact_cost"], places=12)
+        self.assertEqual(aapl["missing_cost_data"], [])
+        # MSFT has no volumes in silver: half the spread only, as before.
+        self.assertIsNone(orders[MSFT]["impact_cost"])
+        self.assertEqual(orders[MSFT]["missing_cost_data"], ["impact"])
+        self.assertNotIn(web_desk.COST_NOTE, body["notes"])
+        self.assertIn(web_desk.VOLUME_COST_NOTE + " 2 of 4 holdings have volume data.", body["notes"])
+        # One read: each live holding's conid, the 45 days to today, zeros (holidays) left out.
+        (sql, parameters), = [(s, p) for s, p in connection.queries if "FROM daily_volumes" in s]
+        self.assertEqual(parameters, (TENANT, sorted([TENCENT, AAPL, MSFT, UNQUOTED]), "2026-08-29", "2026-10-13"))
+        self.assertIn("volume > 0", sql)
+        self.assertNotIn("market_data_prices", sql)
+        self.assertEqual(connection.savepoints[-1], "released")
+
+    def test_without_the_table_the_check_is_unchanged(self):
+        with_table = self._post(self._connection())
+        connection = self._connection(volumes=False)
+        body = self._post(connection)
+        self.assertEqual(connection.asked("FROM daily_volumes"), [])
+        self.assertIn(web_desk.COST_NOTE, body["notes"])
+        orders = {o["holding"]: o for o in body["results"]["pre_trade_check"]["orders"]}
+        self.assertIsNone(orders[AAPL]["impact_cost"])
+        # Only the liquidity figures, which need volumes, differ.
+        liquidity = {"liquidity_days", "value_weighted_liquidity_days", "sellable_within", "no_volume_data"}
+        before, volumes = body["results"]["pre_trade_check"]["before"], with_table["results"]["pre_trade_check"]["before"]
+        self.assertEqual({k: v for k, v in before.items() if k not in liquidity},
+                         {k: v for k, v in volumes.items() if k not in liquidity})
+        self.assertEqual((before["liquidity_days"], volumes["no_volume_data"]), (None, [MSFT]))
+
+    def test_the_live_snapshot_never_reads_volumes(self):
+        connection = self._connection()
+        self.assertEqual(_snapshot(connection).status_code, 200)
+        self.assertEqual(connection.asked("daily_volumes"), [])
+
+
 class AccountPageTests(unittest.TestCase):
     def _page(self, user, access, section="overview", part=None):
         with patch.object(web, "_account_directory", return_value=[]):

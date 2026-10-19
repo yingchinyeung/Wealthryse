@@ -30,7 +30,7 @@ from unittest.mock import patch
 
 import test_medallion_layers_db as layers
 from test_quant_snapshots import synthetic_data
-from ibkr_etl import layer_freshness, lineage
+from ibkr_etl import layer_freshness, lineage, market_inputs
 from ibkr_etl import publish_gate as gate
 from ibkr_etl import quant_snapshots as qs
 
@@ -246,7 +246,8 @@ class QuantAnalyticsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.environment = patch.dict(os.environ, {
             "IBKR_RUN_MIGRATIONS": "false", gate.MODE_ENV: "off", lineage.SWITCH_ENV: "",
-            qs.BUILD_SETTING: "", qs.MINUTES_SETTING: "", "PORTFOLIO_TENANT_ID": TENANT})
+            qs.BUILD_SETTING: "", qs.MINUTES_SETTING: "", market_inputs.PHASE3_SETTING: "",
+            "PORTFOLIO_TENANT_ID": TENANT})
         cls.environment.start()
         cls.database = None
         try:
@@ -531,7 +532,7 @@ class QuantAnalyticsTests(unittest.TestCase):
                                           as_of="2026-10-13"))
         self.assertIsNone(qs.read_section(web, tenant_id=OTHER_TENANT, subject_id=OTHER_ACCOUNT, section="tail"))
         with self.assertRaises(ValueError):
-            qs.read_section(web, tenant_id=TENANT, subject_id=SMALL, section="liquidity")
+            qs.read_section(web, tenant_id=TENANT, subject_id=SMALL, section="fair_value")
         # A failed row is never shown: the day before is.
         with self._owner() as owner:
             owner.execute("UPDATE gold.quant_analytics_snapshots SET quality_status = 'fail' WHERE subject_id = %s "

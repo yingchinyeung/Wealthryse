@@ -41,6 +41,7 @@ from datetime import date, timedelta
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import model_cards, publish_gate
+from .fama_french import DEFAULT_REGION as DEFAULT_FACTOR_REGION, REGIONS as FACTOR_REGIONS
 from .modelling import MODEL_VERSION as MODELLING_VERSION, ModellingInputError, holding_return_matrix
 from .util import canonical_json, utc_now_iso
 
@@ -96,6 +97,43 @@ SECTIONS: tuple[Section, ...] = (
 )
 SECTION_BY_NAME = {section.name: section for section in SECTIONS}
 SECTION_NAMES = tuple(SECTION_BY_NAME)
+
+# Phase 3: built only when QUANT_ANALYTICS_PHASE3 sets the section to shadow or on AND its silver
+# table exists (ibkr_etl.market_inputs). SECTION_NAMES and section_names() stay the nine v1 ones.
+PHASE3_SECTIONS: tuple[Section, ...] = (
+    Section("liquidity", "risk", "liquidity"),
+    Section("factor_attribution", "performance", "attribution"),
+    Section("macro", "risk", "macro-factors"),
+    Section("crowding", "risk", "crowding"),
+)
+SECTION_BY_NAME.update({section.name: section for section in PHASE3_SECTIONS})
+PHASE3_NAMES = tuple(section.name for section in PHASE3_SECTIONS)
+LIQUIDITY_PARTICIPATION = 0.20   # days to liquidate trading at most 20% of a day's volume
+LIQUIDITY_VAR_LEVEL = 0.99       # the tail section's one-day 99% VaR
+ADV_SESSIONS = 20                # average daily volume over the last 20 sessions with volume
+VOLUME_WINDOW_DAYS = 45          # calendar days of volumes read for those 20 sessions
+FACTOR_REGION = DEFAULT_FACTOR_REGION   # the Modelling page's factor model default (Developed markets)
+MACRO_YEARS = 3
+MACRO_CURVE = "DGS10-DGS2"
+MACRO_FACTORS = ("DGS10", MACRO_CURVE, "DTWEXBGS", "DCOILBRENTEU", "VIXCLS", "USDCNH")
+MACRO_TRANSFORMS = {"DGS10": "diff_bp", MACRO_CURVE: "diff_bp", "DTWEXBGS": "log_return",
+                    "DCOILBRENTEU": "log_return", "VIXCLS": "log_return", "USDCNH": "log_return"}
+# Standard shocks (basis points for the yield and the curve, a fraction of the level otherwise).
+MACRO_SHOCKS = {
+    "rates_up_100bp": {"DGS10": 100.0},
+    "curve_steeper_50bp": {MACRO_CURVE: 50.0},
+    "dollar_up_5pct": {"DTWEXBGS": 0.05},
+    "oil_down_20pct": {"DCOILBRENTEU": -0.20},
+    "volatility_up_50pct": {"VIXCLS": 0.50},
+    "yuan_down_5pct": {"USDCNH": 0.05},
+    "risk_off": {"DGS10": -50.0, "DTWEXBGS": 0.05, "DCOILBRENTEU": -0.20, "VIXCLS": 0.50, "USDCNH": 0.03},
+}
+# Series the macro loader keeps only once their licence is confirmed (ibkr_etl.macro_series): until
+# then the series is left out of the model, with this said, and so are the shocks to it alone.
+MACRO_LICENSED = {
+    "VIXCLS": "VIXCLS is Cboe copyright, so the macro series loader keeps it only when "
+              "MACRO_SERIES_LICENSE_CONFIRMED=VIXCLS.",
+}
 
 
 def build_enabled(environ: Mapping[str, str] | None = None) -> bool:
@@ -608,6 +646,302 @@ BUILDERS: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
 }
 
 
+# ---------------------------------------------------------------- phase 3 builders (pure)
+#
+# Built only for the sections QUANT_ANALYTICS_PHASE3 sets to shadow or on, and only once the
+# section's silver table exists (ibkr_etl.market_inputs). docs/QUANT_ANALYTICS.md, "Phase 3".
+
+
+def build_liquidity(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """average_daily_volume per holding (its last 20 sessions with volume), days_to_liquidate at
+    20% participation, and liquidity_adjusted_var on the one-day 99% VaR the tail section
+    forecasts (evt_var_es: conditional when the GARCH fit worked, else unconditional).
+
+    A holding without volumes in silver is listed under not_covered and counts as not sellable
+    (days_to_liquidate's no_volume_data). A holding's volumes are those stored under its conid.
+    With none covered (daily_volumes holds only the benchmarks until the holdings' own fetch,
+    DAILY_VOLUMES_FETCH, has run for them) the volume figures are unavailable and
+    the section still gives liquidity_adjusted_var, so it is never held back for volumes."""
+    from .quant.liquidity import average_daily_volume, days_to_liquidate, liquidity_adjusted_var
+    from .quant.tail_risk import evt_var_es
+
+    stopped = _not_covered("liquidity", inputs)
+    if stopped:
+        return stopped
+    holdings = list(inputs.get("holdings") or [])
+    volumes = dict(inputs.get("volumes") or {})
+    summary: dict[str, Any] = {
+        "holdings_date": inputs.get("holdings_date"), "holdings": len(holdings),
+        "participation": LIQUIDITY_PARTICIPATION, "volume_window_sessions": ADV_SESSIONS,
+        "with_volumes": sorted(name for name in volumes if volumes[name]),
+        "volume_instruments": dict(inputs.get("volume_instruments") or {}),
+        "var_level": LIQUIDITY_VAR_LEVEL, "var_horizon_days": 1, "var_basis": None,
+        "spreads": "No bid-ask spreads are stored in silver, so every holding is listed under no_spread_data "
+                   "and the spread cost is 0: liquidity-adjusted VaR equals VaR until spreads are loaded.",
+    }
+    if not holdings:
+        return _payload("liquidity", inputs, summary=summary,
+                        reason=str(inputs.get("no_holdings") or "There are no holdings on this date."))
+    results: dict[str, Any] = {}
+    adv: dict[str, Any] = {}
+    for holding in holdings:
+        series = volumes.get(str(holding["name"]))
+        if series:
+            try:
+                adv[str(holding["name"])] = average_daily_volume(series, window=ADV_SESSIONS)
+            except ModellingInputError as error:
+                adv[str(holding["name"])] = _unavailable_result(error)
+    known = {name: row for name, row in adv.items() if row.get("average_daily_volume") is not None}
+    missing = (f"No daily volume in silver (daily_volumes) in the {VOLUME_WINDOW_DAYS} days to "
+               f"{inputs.get('holdings_date')}.")
+    not_covered = [{"name": h["name"], "conid": h.get("conid"), "weight": h.get("weight"), "reason": missing}
+                   for h in holdings if str(h["name"]) not in known]
+    summary.update(not_covered=not_covered,
+                   not_covered_weight=math.fsum(float(h.get("weight") or 0.0) for h in not_covered))
+    no_volume = None if known else (
+        f"No holding has a daily volume in silver (daily_volumes) in the {VOLUME_WINDOW_DAYS} days to "
+        f"{inputs.get('holdings_date')}.")
+    if no_volume:
+        results["average_daily_volume"] = {"available": False, "reason": no_volume}
+        results["days_to_liquidate"] = {"available": False, "reason": no_volume}
+    else:
+        results["average_daily_volume"] = adv
+        positions = {str(h["name"]): {"quantity": float(h.get("quantity") or 0.0), "value": float(h["market_value"]),
+                                      "average_daily_volume": (known.get(str(h["name"])) or {}).get(
+                                          "average_daily_volume")}
+                     for h in holdings}
+        _call(results, "days_to_liquidate", days_to_liquidate, positions, participation=LIQUIDITY_PARTICIPATION)
+    daily = [float(value) for _, value in inputs.get("returns") or []]
+    if inputs.get("no_returns"):
+        results["liquidity_adjusted_var"] = {"available": False, "reason": str(inputs["no_returns"])}
+    else:
+        try:
+            fitted = evt_var_es(daily, levels=TAIL_LEVELS)
+            basis = "conditional" if fitted.get("conditional") else "unconditional"
+            var = fitted[basis]["levels"][f"{round(LIQUIDITY_VAR_LEVEL * 100, 4):g}"]["var"]
+            summary.update(var_basis=basis, var_observations=fitted.get("observations"))
+            _call(results, "liquidity_adjusted_var", liquidity_adjusted_var, var,
+                  {str(h["name"]): {"value": float(h["market_value"]), "spreads": None} for h in holdings})
+        except ModellingInputError as error:
+            results["liquidity_adjusted_var"] = _unavailable_result(error)
+    return _payload("liquidity", inputs, summary=summary, results=results)
+
+
+def _attribution_days(inputs: Mapping[str, Any], start: str, names: Sequence[str]) -> list[str]:
+    """Days from `start` to as_of with a portfolio return, every factor and the risk-free rate."""
+    returns, factors = inputs.get("returns") or {}, inputs.get("factors") or {}
+    needed = (*names, "RF")
+    return [day for day in sorted(returns) if start <= day <= str(inputs["as_of"])
+            and all(name in (factors.get(day) or {}) for name in needed)]
+
+
+def build_factor_attribution(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """factor_attribution of the daily portfolio returns, less the factor file's RF, on the French
+    factors of the Modelling page's default region (Developed markets): year to date (ytd, from 1
+    January) and the past year (past_year, the 365 days to as_of)."""
+    from .modelling import FACTOR_NAMES
+    from .quant.attribution import factor_attribution
+
+    stopped = _not_covered("factor_attribution", inputs)
+    if stopped:
+        return stopped
+    factors = dict(inputs.get("factors") or {})
+    names = [name for name in FACTOR_NAMES if any(name in row for row in factors.values())]
+    as_of = str(inputs["as_of"])
+    starts = {"ytd": date.fromisoformat(as_of).replace(month=1, day=1).isoformat(),
+              "past_year": _shift(as_of, -365)}
+    summary: dict[str, Any] = {
+        "region": inputs.get("region"), "region_label": inputs.get("region_label"), "factors": names,
+        "factor_sources": inputs.get("sources"), "factor_vintages": inputs.get("vintages"),
+        "factor_data_through": max(factors) if factors else None, "returns": "daily, less the daily RF",
+    }
+    if "Mkt-RF" not in names:
+        return _payload("factor_attribution", inputs, summary=summary,
+                        reason=f"There are no {inputs.get('region_label') or 'region'} market factor returns in "
+                               f"silver (factor_returns) for the year to {as_of}.")
+    results: dict[str, Any] = {}
+    for period, start in starts.items():
+        days = _attribution_days(inputs, start, names)
+        summary[period] = {"start": start, "observations": len(days),
+                           "window": [days[0], days[-1]] if days else None}
+        excess = [float(inputs["returns"][day]) - float(factors[day]["RF"]) for day in days]
+        _call(results, period, factor_attribution, excess,
+              {name: [float(factors[day][name]) for day in days] for name in names}, dates=days)
+    return _payload("factor_attribution", inputs, summary=summary, results=results)
+
+
+def _weekly_dates(days: Iterable[str]) -> list[str]:
+    """The last of the given days in each ISO week."""
+    weeks: dict[tuple[int, int], str] = {}
+    for day in sorted(days):
+        weeks[date.fromisoformat(day).isocalendar()[:2]] = day
+    return sorted(weeks.values())
+
+
+def _macro_missing_reason(name: str, levels: Mapping[str, Any]) -> str:
+    """Why a macro series is not in the model (it has no level in silver macro_series for the window)."""
+    if name == MACRO_CURVE:
+        absent = [part for part in ("DGS10", "DGS2") if not levels.get(part)]
+        return (f"Needs DGS10 and DGS2; {' and '.join(absent)} not in silver macro_series for the window."
+                if absent else "DGS10 and DGS2 have no day in common in the window.")
+    return " ".join(["Not in silver macro_series for the window.", MACRO_LICENSED.get(name, "")]).strip()
+
+
+def build_macro(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """macro_exposures of weekly portfolio returns on the US 10-year yield (DGS10), the 10y-2y curve,
+    the broad dollar (DTWEXBGS), Brent (DCOILBRENTEU), the VIX (VIXCLS) and USD/CNH, over up to
+    three years, and macro_sensitivity for each of MACRO_SHOCKS.
+
+    A series with no levels (the VIX until its licence is confirmed, MACRO_LICENSED) is left out of
+    the model and named with its reason in inputs.factors_missing_reasons; a shock to such series
+    alone is left out too (inputs.shocks_left_out), and a shock in part to them, the risk-off week,
+    is worked out on the rest (its result's factors_not_in_model). The section never fails for it."""
+    from .quant.macro_factors import align_series, macro_exposures, macro_sensitivity
+
+    stopped = _not_covered("macro", inputs)
+    if stopped:
+        return stopped
+    levels = {name: dict(values) for name, values in (inputs.get("levels") or {}).items()}
+    if levels.get("DGS10") and levels.get("DGS2"):
+        levels[MACRO_CURVE] = {day: levels["DGS10"][day] - levels["DGS2"][day]
+                               for day in levels["DGS10"] if day in levels["DGS2"]}
+    factors = {name: levels[name] for name in MACRO_FACTORS if levels.get(name)}
+    missing = [name for name in MACRO_FACTORS if name not in factors]
+    returns = {str(day): float(value) for day, value in (inputs.get("returns") or {}).items()}
+    summary: dict[str, Any] = {
+        "frequency": "weekly: the last day in each week with a portfolio return and every series",
+        "years": MACRO_YEARS, "factors": list(factors), "factors_missing": missing,
+        "factors_missing_reasons": {name: _macro_missing_reason(name, levels) for name in missing},
+        "transforms": {name: MACRO_TRANSFORMS[name] for name in factors},
+        "units": inputs.get("units"), "sources": inputs.get("sources"),
+        "shocks": {name: dict(shocks) for name, shocks in MACRO_SHOCKS.items()},
+        "shocks_left_out": {},
+    }
+    if not factors:
+        return _payload("macro", inputs, summary=summary,
+                        reason="None of the macro series is in silver (macro_series) for the window.")
+    if not returns:
+        return _payload("macro", inputs, summary=summary,
+                        reason=str(inputs.get("no_returns") or "There are no daily portfolio returns."))
+    common = set(returns).intersection(*(set(series) for series in factors.values()))
+    selected = _weekly_dates(common)
+    results: dict[str, Any] = {}
+    try:
+        if len(selected) < 2:
+            raise ModellingInputError("The portfolio and the macro series have fewer than two weeks in common.")
+        aligned = align_series({day: value for day, value in returns.items() if day >= selected[0]},
+                               {name: {day: series[day] for day in selected} for name, series in factors.items()},
+                               transforms={name: MACRO_TRANSFORMS[name] for name in factors})
+    except ModellingInputError as error:
+        results["macro_exposures"] = _unavailable_result(error)
+        results["macro_sensitivity"] = results["macro_exposures"]
+        return _payload("macro", inputs, summary=summary, results=results)
+    summary.update(observations=aligned["observations"], window=[aligned["dates"][0], aligned["dates"][-1]],
+                   multi_session_observations=aligned["multi_session_observations"],
+                   skipped_levels=aligned["skipped_levels"])
+    fitted = _call(results, "macro_exposures", macro_exposures, aligned["portfolio"], aligned["macro_changes"],
+                   dates=aligned["dates"], transforms=aligned["transforms"])
+    if fitted is None:
+        results["macro_sensitivity"] = results["macro_exposures"]
+    else:
+        in_model = {row["factor"] for row in fitted.get("exposures") or []}
+        scenarios: dict[str, Any] = {}
+        for name, shocks in MACRO_SHOCKS.items():
+            if not in_model.intersection(shocks):
+                why = " ".join(summary["factors_missing_reasons"].get(factor, "") for factor in shocks)
+                summary["shocks_left_out"][name] = " ".join([
+                    f"Not worked out: {' and '.join(shocks)} {'is' if len(shocks) == 1 else 'are'} not in the model.",
+                    why]).strip()
+                continue
+            _call(scenarios, name, macro_sensitivity, fitted, shocks)
+        results["macro_sensitivity"] = scenarios
+    return _payload("macro", inputs, summary=summary, results=results)
+
+
+def _rest_of_filing(rest_value: float, rest_squares: float, rest_positions: int) -> list[float]:
+    """Stand-in stakes for the part of a filing outside the portfolio's names.
+
+    As few values as there can be with the same sum and the same sum of squares as those stakes
+    (k - 1 equal values and one smaller, k = ceil(sum² / sum of squares), never more than the
+    stakes they stand for). A fund's total, its weights in our names and the length of its weight
+    vector are then exactly the full filing's, and those are all ownership_overlap's similarity
+    and shares use, so reading every row of every filing is not needed.
+    """
+    if rest_value <= 0 or rest_squares <= 0:
+        return []
+    count = max(1, min(max(1, int(rest_positions)), math.ceil(rest_value * rest_value / rest_squares - 1e-9)))
+    if count == 1:
+        return [rest_value]
+    root = math.sqrt(max(0.0, (count - 1) * (count * rest_squares - rest_value * rest_value)))
+    large = (rest_value * (count - 1) + root) / ((count - 1) * count)
+    small = rest_value - (count - 1) * large
+    return [large] * (count - 1) + ([small] if small > 0 else [])
+
+
+def build_crowding(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    """ownership_overlap of the US-listed holdings (a US ISIN, so a CUSIP) with the 13F filers'
+    latest filings known on the date (value stakes), and the most similar funds. Holdings without a
+    US ISIN are listed as not covered."""
+    from .quant.crowding import ownership_overlap
+
+    stopped = _not_covered("crowding", inputs)
+    if stopped:
+        return stopped
+    covered = list(inputs.get("covered") or [])
+    not_covered = list(inputs.get("not_covered") or [])
+    filers = list(inputs.get("filers") or [])
+    weights: dict[str, float] = defaultdict(float)
+    names: dict[str, list[str]] = defaultdict(list)
+    for holding in covered:
+        weights[str(holding["cusip"])] += float(holding["weight"])
+        names[str(holding["cusip"])].append(str(holding["name"]))
+    funds: dict[str, dict[str, float]] = {}
+    labels: dict[str, str] = {}
+    counts: dict[str, int] = defaultdict(int)
+    for filer in filers:
+        counts[str(filer["filer_name"])] += 1
+    for filer in filers:
+        name = str(filer["filer_name"])
+        labels[str(filer["filer_cik"])] = name if counts[name] == 1 else f"{name} ({filer['filer_cik']})"
+    stakes: dict[str, dict[str, float]] = defaultdict(dict)
+    for row in inputs.get("stakes") or []:
+        value = _number(row.get("value_usd"))
+        if value and value > 0 and str(row["filer_cik"]) in labels:
+            stakes[str(row["filer_cik"])][str(row["cusip"])] = value
+    for filer in filers:
+        cik = str(filer["filer_cik"])
+        fund = dict(stakes.get(cik) or {})
+        for index, value in enumerate(_rest_of_filing(float(filer.get("rest_value") or 0.0),
+                                                      float(filer.get("rest_squares") or 0.0),
+                                                      int(filer.get("rest_positions") or 0)), start=1):
+            fund[f"(other holdings {index})"] = value
+        funds[labels[cik]] = fund
+    summary = {
+        "holdings_date": inputs.get("holdings_date"), "unit": "value",
+        "covered": len(covered), "covered_weight": math.fsum(float(h["weight"]) for h in covered),
+        "not_covered": not_covered, "not_covered_weight": math.fsum(float(h["weight"]) for h in not_covered),
+        "securities": {cusip: " / ".join(sorted(found)) for cusip, found in sorted(names.items())},
+        "filers": [{"fund": labels[str(f["filer_cik"])], **{key: f.get(key) for key in (
+            "filer_cik", "period", "filed_at", "accession", "positions", "total_value")}} for f in filers],
+        "periods": sorted({str(f["period"]) for f in filers}),
+        "shares_outstanding": "Not in silver, so ownership and the crowding score are not computed; "
+                              "coverage is 0 and the overlap and similarity figures stand alone.",
+    }
+    if not covered:
+        return _payload("crowding", inputs, summary=summary,
+                        reason="No holding has a US ISIN, so none is in the 13F filings.")
+    results: dict[str, Any] = {}
+    _call(results, "ownership_overlap", ownership_overlap, dict(weights), funds, unit="value")
+    return _payload("crowding", inputs, summary=summary, results=results)
+
+
+PHASE3_BUILDERS: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
+    "liquidity": build_liquidity, "factor_attribution": build_factor_attribution, "macro": build_macro,
+    "crowding": build_crowding,
+}
+BUILDERS.update(PHASE3_BUILDERS)
+
+
 def quality_status(payload: Mapping[str, Any], replaced: int = 0) -> str:
     """pass: every call worked. warn: the section or one of its calls is unavailable, or a number
     that was not finite was stored as null. fail is never written here: it marks a row not to show."""
@@ -881,6 +1215,108 @@ def prepare_inputs(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return {name: finite_copy(value)[0] for name, value in prepared.items()}
 
 
+def _held_quantities(data: Mapping[str, Any], day: str | None) -> dict[str, float]:
+    found: dict[str, float] = defaultdict(float)
+    for row in data.get("positions") or []:
+        if day and _day(row.get("date")) == day and row.get("conid"):
+            found[str(row["conid"])] += _number(row.get("quantity")) or 0.0
+    return dict(found)
+
+
+def _not_in_13f(info: Mapping[str, Any]) -> str | None:
+    """Why a holding cannot be matched to 13F filings, or None when it can (a share with a US ISIN)."""
+    from .sec_13f import cusip_from_isin  # the 13F loader's own rule
+
+    category = str(info.get("asset_category") or "").strip().upper()
+    if category and category != "STK":
+        return "Only shares are in 13F filings."
+    if not str(info.get("isin") or "").strip():
+        return "No ISIN in silver instruments."
+    if cusip_from_isin(info.get("isin")) is None:
+        return "Not a US ISIN, so not in 13F filings."
+    return None
+
+
+def prepare_phase3_inputs(data: Mapping[str, Any], prepared: Mapping[str, Mapping[str, Any]],
+                          market: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """One plain, JSON-ready input dict per phase 3 section whose silver rows were read
+    (load_phase3_inputs gives None for a table that is not there yet, and that section is left
+    out). Uses prepare_inputs()'s holdings and returns, so the holdings and the VaR history are
+    exactly the v1 sections'. Pure."""
+    as_of = str(data["as_of"])
+    names = [name for name in PHASE3_NAMES if (market or {}).get(name) is not None]
+    if data.get("unavailable"):
+        return {name: {"as_of": as_of, "unavailable": str(data["unavailable"])} for name in names}
+    holdings = dict(prepared.get("holdings_risk") or {})
+    day = holdings.get("holdings_date")
+    tail = dict(prepared.get("tail") or {})
+    returns = {}
+    for row in data.get("comparison") or []:
+        found_day, value = _day(row.get("date")), _number(row.get("portfolio_return"))
+        if found_day and found_day <= as_of and value is not None:
+            returns[found_day] = value
+    returns = dict(sorted(returns.items()))
+    no_returns = None if returns else (
+        f"No primary benchmark comparison with daily returns is stored on or before {as_of}.")
+    found: dict[str, dict[str, Any]] = {}
+    if "liquidity" in names:
+        stored = dict((market["liquidity"] or {}).get("volumes") or {})
+        quantities = _held_quantities(data, day)
+        volumes, instruments, rows = {}, {}, []
+        for holding in holdings.get("holdings") or []:
+            entry = stored.get(str(holding["conid"])) or {}
+            series = {d: v for d, v in sorted((entry.get("volumes") or {}).items())
+                      if day and _shift(day, -VOLUME_WINDOW_DAYS) <= d <= day}
+            if series:
+                volumes[str(holding["name"])] = series
+                instruments[str(holding["name"])] = {"instrument_id": entry.get("instrument_id")}
+            rows.append({"name": holding["name"], "conid": holding["conid"], "weight": holding["weight"],
+                         "market_value": holding["market_value"],
+                         "quantity": quantities.get(str(holding["conid"]), 0.0)})
+        found["liquidity"] = {"as_of": as_of, "holdings_date": day, "holdings": rows,
+                              "no_holdings": holdings.get("no_holdings"), "volumes": volumes,
+                              "volume_instruments": instruments, "returns": list(tail.get("returns") or []),
+                              "no_returns": tail.get("unavailable")}
+    if "factor_attribution" in names:
+        stored = dict(market["factor_attribution"] or {})
+        start = min(date.fromisoformat(as_of).replace(month=1, day=1).isoformat(), _shift(as_of, -365))
+        found["factor_attribution"] = (
+            {"as_of": as_of, "unavailable": no_returns} if no_returns else
+            {"as_of": as_of, "region": FACTOR_REGION, "region_label": FACTOR_REGIONS[FACTOR_REGION][0],
+             "returns": {d: r for d, r in returns.items() if d >= start},
+             "factors": {d: dict(row) for d, row in sorted((stored.get("factors") or {}).items())
+                         if start <= d <= as_of},
+             "sources": stored.get("sources"), "vintages": stored.get("vintages")})
+    if "macro" in names:
+        stored = dict(market["macro"] or {})
+        start = _shift(as_of, -365 * MACRO_YEARS - 7)
+        found["macro"] = (
+            {"as_of": as_of, "unavailable": no_returns} if no_returns else
+            {"as_of": as_of, "returns": {d: r for d, r in returns.items() if d >= start},
+             "levels": {name: {d: v for d, v in sorted(series.items()) if start <= d <= as_of}
+                        for name, series in sorted((stored.get("series") or {}).items())},
+             "units": stored.get("units"), "sources": stored.get("sources")})
+    if "crowding" in names:
+        from .sec_13f import cusip_from_isin
+
+        stored = dict(market["crowding"] or {})
+        instruments = dict(stored.get("instruments") or {})
+        filings = dict(stored.get("filings") or {})
+        covered, not_covered = [], []
+        for holding in holdings.get("holdings") or []:
+            info = instruments.get(str(holding["conid"])) or {}
+            reason = _not_in_13f(info)
+            row = {"name": holding["name"], "conid": holding["conid"], "weight": holding["weight"]}
+            if reason:
+                not_covered.append({**row, "reason": reason})
+            else:
+                covered.append({**row, "cusip": cusip_from_isin(info.get("isin"))})
+        found["crowding"] = {"as_of": as_of, "holdings_date": day, "no_holdings": holdings.get("no_holdings"),
+                             "covered": covered, "not_covered": not_covered,
+                             "filers": list(filings.get("filers") or []), "stakes": list(filings.get("stakes") or [])}
+    return {name: finite_copy(value)[0] for name, value in found.items()}
+
+
 # ---------------------------------------------------------------- reading silver and gold
 
 
@@ -1037,6 +1473,76 @@ def _external_flows(connection, *, tenant_id: str, subject_id: str, start: str, 
     return found
 
 
+def phase3_section_names(sections: Iterable[str] | None = None,
+                         environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """The phase 3 sections to build: shadow or on in QUANT_ANALYTICS_PHASE3 (and among `sections`
+    when given). Unset, this is empty and the build reads nothing more than v1."""
+    from .market_inputs import enabled_sections
+
+    enabled = enabled_sections(environ)
+    if sections is None:
+        return enabled
+    chosen = {str(name) for name in sections}
+    return tuple(name for name in enabled if name in chosen)
+
+
+def load_phase3_inputs(connection, *, tenant_id: str, subject_id: str, as_of: str, data: Mapping[str, Any],
+                       sections: Iterable[str]) -> dict[str, Any]:
+    """The phase 3 silver rows for the sections asked for, for the holdings load_inputs() found:
+    `{section: rows}`, or `{section: None}` for a section whose table is not there yet (asked of
+    the catalog, then each read in a savepoint, so the build's transaction stays usable)."""
+    from . import market_inputs
+
+    wanted = [name for name in PHASE3_NAMES if name in set(sections)]
+    found: dict[str, Any] = {}
+    for name in wanted:
+        if not market_inputs.table_exists(connection, market_inputs.SECTION_TABLES[name]):
+            found[name] = None
+    present = [name for name in wanted if name not in found]
+    if not present or data.get("unavailable"):
+        return {**found, **{name: {} for name in present}}
+    dated = sorted({str(row["date"]) for row in data.get("positions") or [] if str(row["date"]) <= as_of})
+    day = dated[-1] if dated else None
+    rows = {str(row["conid"]): row for row in data.get("positions") or [] if day and str(row["date"]) == day}
+    held = sorted(rows)
+    instruments = market_inputs.read_instruments(connection, held) if held and "crowding" in present else {}
+    for name in present:
+        if name == "liquidity":
+            # Each holding's volumes are stored under its IBKR conid (daily_volumes.fetch_and_load).
+            volumes = (market_inputs.read_daily_volumes(connection, tenant_id=tenant_id, instrument_ids=held,
+                                                        start=_shift(day, -VOLUME_WINDOW_DAYS), end=day)
+                       if day else {})
+            found[name] = None if volumes is None else {"volumes": {
+                conid: {"instrument_id": conid, "volumes": series} for conid, series in sorted(volumes.items())
+                if series}}
+        elif name == "factor_attribution":
+            start = min(date.fromisoformat(as_of).replace(month=1, day=1).isoformat(), _shift(as_of, -365))
+            found[name] = market_inputs.read_factor_returns(connection, tenant_id=tenant_id, region=FACTOR_REGION,
+                                                            start=start, end=as_of)
+        elif name == "macro":
+            found[name] = market_inputs.read_macro_series(connection, tenant_id=tenant_id,
+                                                          start=_shift(as_of, -365 * MACRO_YEARS - 7), end=as_of)
+        elif name == "crowding":
+            from .sec_13f import cusip_from_isin  # the 13F loader's own rule
+
+            cusips = {cusip_from_isin(info.get("isin")) for info in instruments.values()}
+            filings = market_inputs.read_institutional_holdings(connection, tenant_id=tenant_id, as_of=as_of,
+                                                                cusips=sorted(c for c in cusips if c))
+            found[name] = None if filings is None else {
+                "instruments": {conid: {"isin": (instruments.get(conid) or {}).get("isin"),
+                                        "asset_category": (instruments.get(conid) or {}).get("asset_category")}
+                                for conid in held},
+                "filings": filings}
+    # Each phase 3 table read is one more input of the job's lineage run (a no-op unless recording;
+    # lineage.JOB_INPUTS lists the v1 inputs only, so nothing changes while the setting is off).
+    from . import lineage
+
+    for name in present:
+        if found.get(name) is not None:
+            lineage.current().input(f"silver.{market_inputs.SECTION_TABLES[name]}")
+    return found
+
+
 # ---------------------------------------------------------------- writing and reading gold
 
 
@@ -1071,21 +1577,38 @@ def build_quant_snapshot(connection, *, tenant_id: str, subject_id: str, as_of: 
     called before the commit, so a reader never sees a half-written day. An unchanged section
     (same fingerprint, not failed) is skipped. A section whose engine fails with anything other
     than ModellingInputError is not written and is reported under "errors". The publish gate's
-    BuildHeldBack (enforce mode) rolls everything back and propagates to the caller."""
+    BuildHeldBack (enforce mode) rolls everything back and propagates to the caller. A phase 3
+    section is built only when QUANT_ANALYTICS_PHASE3 sets it to shadow or on and its silver table
+    is there; one whose table is not is reported as skipped and nothing is written for it."""
     started = time.perf_counter()
-    names = section_names(sections)
+    requested = None if sections is None else [str(name) for name in sections]
+    names = section_names(None if requested is None else [name for name in requested if name not in PHASE3_NAMES])
+    phase3 = phase3_section_names(requested, environ)
     as_of = date.fromisoformat(as_of).isoformat()
     data = load_inputs(connection, tenant_id=tenant_id, subject_id=subject_id, as_of=as_of)
     load_ms = _ms(started)
     prepare_started = time.perf_counter()
     prepared = prepare_inputs(data)
     prepare_ms = _ms(prepare_started)
+    report: dict[str, dict[str, Any]] = {}
+    market_ms = 0.0
+    if phase3:  # QUANT_ANALYTICS_PHASE3: each section only once its silver table is there
+        from .market_inputs import SECTION_TABLES
+
+        market_started = time.perf_counter()
+        market = load_phase3_inputs(connection, tenant_id=tenant_id, subject_id=subject_id, as_of=as_of,
+                                    data=data, sections=phase3)
+        prepared = {**prepared, **prepare_phase3_inputs(data, prepared, market)}
+        market_ms = _ms(market_started)
+        for name in phase3:
+            if market.get(name) is None:
+                report[name] = {"status": "skipped", "reason": f"{SECTION_TABLES[name]} is not loaded yet"}
+        names = names + tuple(name for name in phase3 if name not in report)
     existing = {str(row["section"]): row for row in connection.execute(
         """
         SELECT section, source_data_sha256, quality_status FROM quant_analytics_snapshots
         WHERE tenant_id = ? AND subject_id = ? AND as_of_date = ? AND analytics_version = ?
         """, (tenant_id, subject_id, as_of, QUANT_ANALYTICS_VERSION)).fetchall()}
-    report: dict[str, dict[str, Any]] = {}
     errors: dict[str, str] = {}
     written = 0
     for name in names:
@@ -1108,7 +1631,8 @@ def build_quant_snapshot(connection, *, tenant_id: str, subject_id: str, as_of: 
         store_section(connection, tenant_id=tenant_id, subject_id=subject_id, as_of=as_of, payload=payload,
                       source_sha256=fingerprint, quality=quality, duration_ms=build_ms,
                       timings={"build_ms": build_ms, "load_ms": load_ms, "prepare_ms": prepare_ms,
-                               "non_finite_replaced": replaced})
+                               "non_finite_replaced": replaced,
+                               **({"market_load_ms": market_ms} if name in PHASE3_NAMES else {})})
         written += 1
         report[name] = {"status": "rebuilt", "available": payload["available"], "quality_status": quality,
                         "build_ms": build_ms}
@@ -1121,7 +1645,7 @@ def build_quant_snapshot(connection, *, tenant_id: str, subject_id: str, as_of: 
         connection.rollback()  # nothing to write: end the read transaction
     return {"status": "rebuilt" if written else "unchanged", "subject_id": subject_id, "as_of": as_of,
             "written": written, "sections": report, "errors": errors, "load_ms": load_ms,
-            "duration_ms": _ms(started)}
+            "duration_ms": _ms(started), **({"market_load_ms": market_ms} if phase3 else {})}
 
 
 @contextmanager
@@ -1192,7 +1716,8 @@ def read_section(connection, *, tenant_id: str, subject_id: str, section: str,
                  as_of: str | None = None) -> dict[str, Any] | None:
     """The latest stored section on or before `as_of` (latest overall without it) whose quality
     is not fail, for this analytics version; None when there is none."""
-    section_names([section])
+    if section not in PHASE3_NAMES:
+        section_names([section])
     if as_of is not None:
         as_of = date.fromisoformat(as_of).isoformat()
     row = connection.execute(

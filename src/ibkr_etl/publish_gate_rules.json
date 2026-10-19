@@ -326,7 +326,7 @@
      "dimension": "conformity",
      "mustBe": 0,
      "name": "section_allowed_values",
-     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE section NOT IN ('skill', 'decisions', 'currency', 'tail', 'regime', 'holdings_risk', 'correlation', 'concentration', 'execution')",
+     "query": "SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE section NOT IN ('skill', 'decisions', 'currency', 'tail', 'regime', 'holdings_risk', 'correlation', 'concentration', 'execution', 'liquidity', 'factor_attribution', 'macro', 'crowding')",
      "severity": "error"
     },
     {

@@ -299,7 +299,8 @@ QUANT_ROUTES = [f"quant/{section}" for section in web_quant.SECTIONS] + [
 
 
 def _setting(value: str | None):
-    environ = {k: v for k, v in os.environ.items() if k != web_quant.PAGES_SETTING}
+    # QUANT_ANALYTICS_PHASE3 stays unset too: these are the v1 pages (phase 3 is _settings, below).
+    environ = {k: v for k, v in os.environ.items() if k not in (web_quant.PAGES_SETTING, "QUANT_ANALYTICS_PHASE3")}
     if value is not None:
         environ[web_quant.PAGES_SETTING] = value
     return mock.patch.dict(os.environ, environ, clear=True)
@@ -1067,8 +1068,10 @@ class GuideTest(unittest.TestCase):
         base = render_metrics_guide()
         for name, anchor in quant_guide.METRIC_ANCHORS.items():
             page = quant_guide.page_of(name)
-            self.assertEqual(viewer.count(f'id="{anchor}"'), 1 if page == "performance" else 0, name)
-            self.assertEqual(owner.count(f'id="{anchor}"'), 1 if page in ("performance", "modelling") else 0, name)
+            later = name in quant_guide.PHASE3_SECTION_OF  # only with QUANT_ANALYTICS_PHASE3 (Phase3PageAndGuideTest)
+            self.assertEqual(viewer.count(f'id="{anchor}"'), 1 if page == "performance" and not later else 0, name)
+            self.assertEqual(owner.count(f'id="{anchor}"'),
+                             1 if page in ("performance", "modelling") and not later else 0, name)
         self.assertLess(owner.index('id="guide-benchmark"'), owner.index('id="guide-quant-performance"'))
         self.assertLess(owner.index('id="guide-quant-performance"'), owner.index('id="guide-holdings"'))
         self.assertLess(owner.index('id="guide-modelling-portfolio"'), owner.index('id="guide-quant-modelling"'))
@@ -1113,6 +1116,305 @@ class GuideTest(unittest.TestCase):
         for label in labels:
             name = audit.metric_for_label(label)
             self.assertIn(name, quant_guide.METRIC_ANCHORS, label)
+
+
+# ---------------------------------------------------------------- phase 3 (QUANT_ANALYTICS_PHASE3)
+
+PHASE3_ON = "liquidity=on,factor_attribution=on,macro=on,crowding=on"
+
+
+def _settings(pages: str | None, phase3: str | None):
+    """Both settings, and nothing else of either from the environment."""
+    from ibkr_etl import market_inputs
+
+    environ = {k: v for k, v in os.environ.items() if k not in (web_quant.PAGES_SETTING, market_inputs.PHASE3_SETTING)}
+    for key, value in ((web_quant.PAGES_SETTING, pages), (market_inputs.PHASE3_SETTING, phase3)):
+        if value is not None:
+            environ[key] = value
+    return mock.patch.dict(os.environ, environ, clear=True)
+
+
+def _phase3_payloads(volumes: bool = True, vix: bool = False) -> dict:
+    """What the overnight build stores for the phase 3 sections on its own synthetic data (without
+    the VIX by default, as the macro loader leaves it out until its licence is confirmed)."""
+    import test_quant_snapshots as build_data
+    from ibkr_etl import quant_snapshots
+
+    data = build_data.synthetic_data(days=560)
+    market = build_data.market_from_raw(build_data.synthetic_market(data, vix=vix), data)
+    if not volumes:
+        market["liquidity"] = {"volumes": {}}
+    inputs = quant_snapshots.prepare_phase3_inputs(data, quant_snapshots.prepare_inputs(data), market)
+    return {name: quant_snapshots.finite_copy(quant_snapshots.BUILDERS[name](inputs[name]))[0]
+            for name in quant_snapshots.PHASE3_NAMES}
+
+
+class Phase3SettingsTest(unittest.TestCase):
+    def test_unset_the_pages_get_exactly_their_v1_pieces(self):
+        for phase3 in (None, "", "liquidity=yes,macro"):
+            with self.subTest(phase3=phase3), _settings(ALL_ON, phase3):
+                for page in web_quant.PAGES:
+                    self.assertEqual(web_quant.subpages(page, OWNER), web_quant.QUANT_SUBPAGES.get(page, ()))
+                    self.assertEqual(web_quant.page_cards(page, OWNER), web_quant.QUANT_CARDS.get(page, ""))
+                self.assertEqual(web_quant.page_script(OWNER), web_quant.QUANT_SCRIPT)
+                self.assertEqual(web_quant.allowed_phase3(OWNER), ())
+                self.assertEqual(web_quant.guide_additions(OWNER), (quant_guide.addition(web_quant.PAGES),))
+
+    def test_a_section_needs_its_page_and_its_own_setting(self):
+        with _settings("risk=on", PHASE3_ON):
+            self.assertEqual(web_quant.allowed_phase3(VIEWER), ("liquidity", "macro", "crowding"))
+            self.assertEqual([slug for slug, *_ in web_quant.subpages("risk", VIEWER)][-3:],
+                             ["liquidity", "macro-exposures", "crowding"])
+            self.assertEqual(web_quant.subpages("performance", VIEWER), ())  # its page is off
+            self.assertIn(web_quant.PHASE3_SCRIPT, web_quant.page_script(VIEWER))
+        with _settings(None, PHASE3_ON):
+            for page in web_quant.PAGES:
+                self.assertEqual((web_quant.subpages(page, OWNER), web_quant.page_cards(page, OWNER)), ((), ""))
+            self.assertEqual(web_quant.page_script(OWNER), "")
+        with _settings("performance=on,risk=shadow", "factor_attribution=shadow,liquidity=on,crowding=off"):
+            self.assertEqual(web_quant.allowed_phase3(OWNER), ("factor_attribution", "liquidity"))
+            self.assertEqual(web_quant.allowed_phase3(VIEWER), ())  # shadow on either side is owners only
+            self.assertEqual(web_quant.page_script(VIEWER), web_quant.QUANT_SCRIPT)
+            self.assertIn('id="quant-factor-attribution" hidden', web_quant.page_cards("performance", OWNER))
+            self.assertNotIn("quant-factor-attribution", web_quant.page_cards("performance", VIEWER))
+            self.assertNotIn("quant-crowding", web_quant.page_cards("risk", OWNER))
+
+    def test_slugs_and_card_ids_are_new_and_each_card_is_once(self):
+        from ibkr_etl import web
+
+        for section, (slug, label, anchor) in web_quant.PHASE3_SUBPAGES.items():
+            page = web_quant.PHASE3_SECTIONS[section][0]
+            taken = {s for s, *_ in web.ACCOUNT_SUBPAGES[page]} | {s for s, *_ in web_quant.QUANT_SUBPAGES[page]}
+            self.assertNotIn(slug, taken, section)
+            self.assertEqual(web_quant.PHASE3_CARDS[section].count(f'id="{anchor}" hidden'), 1)
+            for cards in web_quant.QUANT_CARDS.values():
+                self.assertNotIn(f'id="{anchor}"', cards)
+            self.assertIn(f"['{section}','{anchor}',", web_quant.PHASE3_SCRIPT)
+            self.assertEqual(web_quant.PHASE3_SECTIONS[section][1], quant_snapshots_model(section))
+
+
+def quant_snapshots_model(section: str) -> str:
+    from ibkr_etl import quant_snapshots
+
+    return quant_snapshots.SECTION_BY_NAME[section].model_id
+
+
+class Phase3RouteTest(unittest.TestCase):
+    def setUp(self):
+        self.app = _App()
+        self.payloads = _phase3_payloads()
+        for section, payload in self.payloads.items():
+            self.app.connection.snapshots[section] = [_row(section, payload, "2026-10-16")]
+
+    def test_every_phase_3_route_is_404_and_reads_nothing_unless_both_settings_allow_it(self):
+        for pages, phase3 in ((None, None), (ALL_ON, None), (None, PHASE3_ON), ("performance=on", "liquidity=on"),
+                              ("risk=on", "factor_attribution=on")):
+            with self.subTest(pages=pages, phase3=phase3), _settings(pages, phase3):
+                for section in web_quant.PHASE3_SECTIONS:
+                    if pages and phase3 and web_quant.phase3_allowed(section, OWNER):
+                        continue
+                    response = self.app.get(f"quant/{section}")
+                    self.assertEqual((response.status_code, response.json()), (404, {"detail": "Not Found"}))
+        self.assertEqual(self.app.connection.quant_reads(), 0)
+
+    def test_shadow_shows_owners_only_and_on_shows_everyone(self):
+        with _settings(ALL_ON, "liquidity=shadow,macro=on"):
+            owner = self.app.get("quant/liquidity", as_of="2026-10-16")
+            macro = self.app.get("quant/macro")
+            self.app.user = dict(VIEWER)
+            viewer = self.app.get("quant/liquidity")
+            viewer_macro = self.app.get("quant/macro")
+        self.assertEqual(owner.status_code, 200, owner.text)
+        self.assertEqual((owner.json()["page_mode"], owner.json()["model_id"]), ("shadow", "liquidity"))
+        self.assertEqual(owner.json()["results"], self.payloads["liquidity"]["results"])
+        self.assertEqual(viewer.status_code, 404)
+        self.assertEqual((macro.json()["page_mode"], viewer_macro.status_code), ("on", 200))
+        with _settings(ALL_ON.replace("risk=on", "risk=shadow"), "macro=on"):
+            self.assertEqual(self.app.get("quant/macro").status_code, 404)  # a viewer, and the page is shadow
+            self.app.user = dict(OWNER)
+            self.assertEqual(self.app.get("quant/macro").json()["page_mode"], "shadow")
+
+    def test_a_date_before_any_row_says_so(self):
+        with _settings(ALL_ON, PHASE3_ON):
+            response = self.app.get("quant/crowding", as_of="2026-01-02")
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["detail"],
+                         "No crowding figures have been built for this account on or before this date yet.")
+
+
+@unittest.skipUnless(NODE, "Node is not installed in this test environment")
+class Phase3RenderingTest(unittest.TestCase):
+    """The phase 3 cards render what the overnight build stores, a figure in every tile."""
+
+    @classmethod
+    def _render(cls, payloads: dict) -> tuple[dict, dict]:
+        app = _App()
+        for section, payload in payloads.items():
+            app.connection.snapshots[section] = [_row(section, payload, "2026-10-16")]
+        with _settings(ALL_ON, PHASE3_ON):
+            responses = {f"quant/{section}": [200, app.get(f"quant/{section}").json()] for section in payloads}
+        code = _page_helpers() + web_quant.PHASE3_SCRIPT + f"responses={json.dumps(responses)};\n" + """
+(async()=>{const out={};for(const [section,id,render] of quantSections){if(!responses[`quant/${section}`])continue;
+  card(id);await quantLoadSection(section,id,render,'2026-10-16');out[section]=shown(id)}
+  console.log(JSON.stringify(out))})();
+"""
+        return _node(code), responses
+
+    @classmethod
+    def setUpClass(cls):
+        cls.out, cls.responses = cls._render(_phase3_payloads())
+        cls.bare, _ = cls._render({"liquidity": _phase3_payloads(volumes=False)["liquidity"]})
+        cls.vix, _ = cls._render({"macro": _phase3_payloads(vix=True)["macro"]})
+
+    def _tiles(self, shown):
+        self.assertFalse(shown["hidden"])
+        for text in (shown["body"], shown["note"], shown["model"]):
+            for bad in ("undefined", "NaN", "[object Object]", "null"):
+                self.assertNotIn(bad, text)
+        tiles = re.findall(r'<div class="label">([^<]*)</div><div class="value">(.*?)</div></div>', shown["body"])
+        self.assertTrue(tiles)
+        self.assertEqual([label for label, value in tiles if re.sub(r"<[^>]+>", "", value).strip() in ("", "—")], [])
+        return dict(tiles)
+
+    def test_every_tile_has_a_figure(self):
+        self.assertEqual(set(self.out), set(web_quant.PHASE3_SECTIONS))
+        for section in web_quant.PHASE3_SECTIONS:
+            with self.subTest(section=section):
+                shown = self.out[section]
+                self._tiles(shown)
+                self.assertNotIn("Not worked out", shown["note"])
+                self.assertIn("Model:", shown["model"])
+                self.assertIn(self.responses[f"quant/{section}"][1]["model_name"], shown["model"])
+
+    def test_known_figures_appear(self):
+        results = {s: self.responses[f"quant/{s}"][1]["results"] for s in web_quant.PHASE3_SECTIONS}
+        liquidity = self._tiles(self.out["liquidity"])
+        self.assertRegex(liquidity["Sellable in 1 day"], r"^\d+(\.\d+)?%$")
+        self.assertGreater(results["liquidity"]["days_to_liquidate"]["sellable_within"]["1"], 0)
+        self.assertEqual(liquidity["Holdings with volume data"], "7 of 8")  # synthetic_market leaves one out
+        self.assertIn("No volume data: SYN8.", self.out["liquidity"]["note"])
+        crowding = self._tiles(self.out["crowding"])
+        self.assertTrue(crowding["Most similar fund"].startswith("Echo Management · 1.00"))
+        self.assertIn("Not covered", self.out["crowding"]["note"])
+        macro = self._tiles(self.out["macro"])
+        self.assertEqual(macro["Weeks in the macro model"],
+                         str(results["macro"]["macro_exposures"]["window"]["observations"]))
+        # Without the VIX (the default): no VIX tile, the risk-off week on its other parts, and why.
+        self.assertNotIn("VIX +50%", macro)
+        self.assertIn("Risk-off week", macro)
+        self.assertIn('title="Yield −50bp, dollar +5%, Brent −20%, USD/CNH +3% together; VIX left out"',
+                      self.out["macro"]["body"])
+        self.assertIn("Left out of the model: VIX (not in silver macro_series for the window. VIXCLS is Cboe "
+                      "copyright, so the macro series loader keeps it only when "
+                      "MACRO_SERIES_LICENSE_CONFIRMED=VIXCLS).", self.out["macro"]["note"])
+        self.assertIn("Shocks left out, as their series are not in the model: VIX +50%.", self.out["macro"]["note"])
+        factor = self._tiles(self.out["factor_attribution"])
+        self.assertIn("Explained by factors (past year)", factor)
+        self.assertIn("Market", self.out["factor_attribution"]["body"])
+
+    def test_macro_with_the_vix_once_licensed(self):
+        tiles = self._tiles(self.vix["macro"])
+        self.assertIn("VIX +50%", tiles)
+        self.assertIn('title="Yield −50bp, dollar +5%, Brent −20%, VIX +50%, USD/CNH +3% together"',
+                      self.vix["macro"]["body"])
+        self.assertNotIn("Left out", self.vix["macro"]["note"])
+        self.assertIn("VIX", self.vix["macro"]["body"])  # its row in the table
+
+    def test_liquidity_without_volumes_shows_the_var_and_says_why(self):
+        tiles = self._tiles(self.bare["liquidity"])
+        self.assertEqual(tiles["Holdings with volume data"], "0 of 8")
+        self.assertIn("Liquidity-adjusted VaR (99%)", tiles)
+        self.assertNotIn("Sellable in 1 day", tiles)
+        self.assertIn("Not worked out: No holding has a daily volume", self.bare["liquidity"]["note"])
+
+
+class Phase3PageAndGuideTest(unittest.TestCase):
+    @staticmethod
+    def _render(user, section, part=None):
+        from ibkr_etl import web
+
+        return web._render_account_page(user, account_id=web.PILOT_ACCOUNT_ID, section=section, part=part)
+
+    def test_unset_the_account_pages_and_the_guide_are_as_with_phase_3_absent(self):
+        for section, part in (("performance", None), ("risk", None), ("risk", "correlation")):
+            with _settings(ALL_ON, None):
+                unset = self._render(OWNER, section, part)
+            with _settings(ALL_ON, "liquidity=shadow"):
+                self.assertEqual(self._render(VIEWER, section, part).count("quant-liquidity"), 0)
+            with _settings(ALL_ON, "liquidity=bogus,macro"):
+                self.assertEqual(self._render(OWNER, section, part), unset)
+            for marker in ("quant-liquidity", "quantRenderMacro", "quant-factor-attribution", "Fund ownership overlap"):
+                self.assertNotIn(marker, unset)
+        with _settings(ALL_ON, None):
+            unset = render_metrics_guide(web_quant.guide_additions(OWNER))
+        with _settings(ALL_ON, "crowding=off"):
+            self.assertEqual(render_metrics_guide(web_quant.guide_additions(OWNER)), unset)
+
+    def test_switched_on_the_risk_page_gains_the_cards_in_order(self):
+        with _settings("risk=on", "liquidity=on,macro=on,crowding=shadow"):
+            risk = self._render(OWNER, "risk", "liquidity")
+            viewer = self._render(VIEWER, "risk")
+        self.assertIn('href="/accounts/U16088571/risk/liquidity" data-part-link="quant-liquidity" aria-current="page"',
+                      risk)
+        ids = re.findall(r'\bid="([^"]+)"', risk)
+        self.assertEqual(sorted({x for x in ids if ids.count(x) > 1}), [])
+        order = [risk.index(f'id="{card_id}"') for card_id in (
+            "quant-concentration", "quant-liquidity", "quant-macro", "quant-crowding", "analytics-statistics-card")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("quantRenderCrowding", risk)
+        self.assertIn('id="quant-macro"', viewer)
+        self.assertNotIn('id="quant-crowding"', viewer)
+
+    @unittest.skipUnless(NODE, "Node is not installed in this test environment")
+    def test_rendered_scripts_parse_with_phase_3_on(self):
+        with _settings(ALL_ON, PHASE3_ON):
+            html = self._render(OWNER, "performance", "factor-attribution")
+        self.assertIn('data-part-link="quant-factor-attribution" aria-current="page"', html)
+        for code in re.findall(r"<script[^>]*>(.*?)</script>", html, re.S):
+            result = subprocess.run([NODE, "--check", "-"], input=code, text=True, encoding="utf-8",
+                                    capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_guide_places_each_section_s_entries_after_its_page(self):
+        with _settings("performance=on,risk=on", "factor_attribution=on,liquidity=on,crowding=shadow"):
+            owner = render_metrics_guide(web_quant.guide_additions(OWNER))
+            viewer = render_metrics_guide(web_quant.guide_additions(VIEWER))
+        for name, section in quant_guide.PHASE3_SECTION_OF.items():
+            anchor = quant_guide.METRIC_ANCHORS[name]
+            self.assertEqual(owner.count(f'id="{anchor}"'), 0 if section == "macro" else 1, name)
+            self.assertEqual(viewer.count(f'id="{anchor}"'), 0 if section in ("macro", "crowding") else 1, name)
+        self.assertLess(owner.index('id="guide-quant-risk"'), owner.index('id="guide-quant-risk-phase3"'))
+        self.assertLess(owner.index('id="guide-quant-performance"'), owner.index('id="guide-quant-performance-phase3"'))
+        self.assertIn("phase 3: Factor attribution, Liquidity, Crowding", owner)
+        for html in (owner, viewer):
+            ids = set(re.findall(r'<article id="([^"]+)"', html))
+            self.assertLessEqual(set(re.findall(r'<a href="#(metric-[^"]+)"', html)), ids)
+
+    def test_entries_follow_the_guide_style(self):
+        for section, definitions in quant_guide.PHASE3_DEFINITIONS.items():
+            page = web_quant.PHASE3_SECTIONS[section][0]
+            label = web_quant.PHASE3_SUBPAGES[section][1]
+            for metric in definitions:
+                with self.subTest(name=metric.name):
+                    self.assertTrue(metric.meaning and metric.calculation and metric.interpretation)
+                    self.assertTrue(quant_guide.CLIENT_CALCULATIONS[metric.name])
+                    self.assertEqual(quant_guide.LOCATIONS[metric.name], f"{page.title()} › {label}")
+                    self.assertEqual(quant_guide.page_of(metric.name), page)
+                    self.assertIn("not a forecast, a guarantee or investment advice", metric.interpretation)
+
+    def test_every_card_heading_and_tile_label_has_an_entry(self):
+        from ibkr_etl import metrics_guide_audit as audit
+
+        for section, cards in web_quant.PHASE3_CARDS.items():
+            links = re.findall(r'class="metric-guide-heading-link" href="/metrics-guide#([^"]+)"', cards)
+            self.assertEqual(len(links), 1)
+            name = next(n for n, a in quant_guide.METRIC_ANCHORS.items() if a == links[0])
+            self.assertEqual(quant_guide.PHASE3_SECTION_OF[name], section)
+        labels = re.findall(r"quantTile\('([^']+)'", web_quant.PHASE3_SCRIPT)
+        self.assertGreater(len(labels), 25)
+        for label in labels:
+            self.assertIn(audit.metric_for_label(label), quant_guide.PHASE3_SECTION_OF, label)
+        self.assertTrue(audit.audit().clean)
 
 
 if __name__ == "__main__":

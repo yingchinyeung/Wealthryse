@@ -3,13 +3,17 @@
 Wiring design sections 1 and 2 (`frontier-analytics/wiring-design.md`, 18 Oct 2026), as built.
 Everything here is **off**: the table is a held migration that no bootstrap or job applies, and the
 job does nothing unless `QUANT_ANALYTICS_BUILD=on`. Nothing changes live until the switch-on steps
-below are run, in order, on their day.
+below are run, in order, on their day. The four phase 3 sections (liquidity, factor attribution,
+macro, crowding) are off even then, until `QUANT_ANALYTICS_PHASE3` switches each on and its silver
+table exists ("Phase 3", below).
 
 | Part | File |
 |---|---|
 | Held migration (076 on Wed 11 Nov) and its undo | `infra/medallion/drafts/quant_analytics.sql`, `quant_analytics_undo.sql` |
 | The Desk page's two silver views, a separate held migration (077) and its undo | `infra/medallion/drafts/desk_live_views.sql`, `desk_live_views_undo.sql` |
 | Loaders, builders, writer, reader | `src/ibkr_etl/quant_snapshots.py` |
+| Phase 3 readers of the four silver tables and the `QUANT_ANALYTICS_PHASE3` setting (a holding's CUSIP is `ibkr_etl.sec_13f.cusip_from_isin`, the 13F loader's rule) | `src/ibkr_etl/market_inputs.py` |
+| Phase 3 tests | `tests/test_quant_phase3.py` (no database), `tests/test_quant_phase3_db.py` (PostgreSQL) |
 | The job | `scripts/build_quant_analytics.py`, `infra/staging-quant-analytics-job.bicep` (`ibkrv2stg-quant-analytics`, 09:30 UTC) |
 | Contracts | `infra/medallion/contracts/gold/quant_analytics_snapshots.yaml`, `silver/subject_live_executions.yaml`, `silver/benchmark_live_quotes.yaml` |
 | Tests | `tests/test_quant_snapshots.py` (no database), `tests/test_quant_snapshots_db.py` (PostgreSQL) |
@@ -25,7 +29,7 @@ One row per tenant, subject, NAV date, **section** and analytics version
 | tenant_id | Row security filters on it (`tenant_isolation`, forced), as on every gold table |
 | subject_id | An IBKR account number, or a portfolio or composite slug |
 | as_of_date | The NAV date the section is as of (`yyyy-MM-dd`) |
-| section | One of the nine below (a CHECK) |
+| section | One of the nine below, or one of the four phase 3 sections (a CHECK of all thirteen) |
 | analytics_version | `quant_snapshots.QUANT_ANALYTICS_VERSION`; part of the key |
 | model_id, model_version | The model card (`ibkr_etl.model_cards`) and its engine's `MODEL_VERSION` |
 | source_data_sha256 | sha256 of the section's canonical inputs and the versions; an unchanged one is not rebuilt |
@@ -131,6 +135,7 @@ copy on Fri 30 Oct, and if it cannot fit, the schedule moves to 10:00 (Medallion
 | `LINEAGE_RECORDING` | job (Bicep `lineageRecording`) | `true`, `false` | `true` in the Bicep |
 | `PUBLISH_GATE_MODE` | job | `off`, `shadow`, `enforce` (`MEDALLION_ARCHITECTURE.md`, the publish gate) | unset (off) |
 | `MEDALLION_DIR`, `IBKR_RUN_MIGRATIONS` | job | `/app/medallion`, `false` | as in the Bicep |
+| `QUANT_ANALYTICS_PHASE3` | job and website (the same value on both) | `section=mode` pairs, comma separated, for `liquidity`, `factor_attribution`, `macro`, `crowding`; mode `off`, `shadow` or `on`; a section not listed, misspelt or with another mode is off | unset (all off) |
 
 The website's own settings for the quant cards (`QUANT_ANALYTICS_PAGES`) and the Desk page
 (`DESK_PAGE`) belong to those changes; they read this table and the Desk views.
@@ -378,6 +383,153 @@ Each step is its own day's change. Stop at any step that does not end as describ
    076 and changes nothing existing: `agent.live_executions` and the other live views keep reading
    what they read today.
 
+## Phase 3: liquidity, factor attribution, macro and crowding
+
+Four more sections, built from the phase 3 silver tables (`frontier-analytics/phase3-data-design.md`;
+the tables and their loaders are the data changes, `docs/PHASE3_DATA.md` and
+`docs/PHASE3_DATA_MACRO_13F.md`). Each is **off** until
+`QUANT_ANALYTICS_PHASE3` sets it to `shadow` or `on`, and even then it is built only once its silver
+table exists. Unset, the job reads and writes exactly what it does above: not one more query. The
+four names are already in 076's section CHECK and in the contract's allowed values, so nothing in
+the table changes when they come on.
+
+| Section | Page › card (model_id) | Engine calls (`results` keys) | Silver inputs (`ibkr_etl.market_inputs`) |
+|---|---|---|---|
+| `liquidity` | Risk › Liquidity (liquidity) | `average_daily_volume` per holding (its last 20 sessions with a volume above zero, from the 45 days to the holdings date); `days_to_liquidate` at 20% of daily volume, with the share sellable in 1, 5 and 20 days; `liquidity_adjusted_var` (Bangia et al.) on the one-day 99% VaR, from `evt_var_es` on the same daily returns as `tail`: the conditional (GARCH) forecast when that fit works, else the unconditional one, as the tail card shows; `inputs.var_basis` says which | `daily_volumes`, each holding's rows by its IBKR conid (the `instrument_id` the holdings' fetch, `daily_volumes.fetch_and_load`, stores them under; the benchmarks' rows, under `market_data_prices` ids, are never read for a holding). Holdings, quantities and returns are `holdings_risk`'s and `tail`'s |
+| `factor_attribution` | Performance › Factor attribution (attribution) | `factor_attribution` for `ytd` (from 1 January) and `past_year` (the 365 days to the date): the daily portfolio return less the file's RF on Mkt-RF, SMB, HML, RMW, CMA and MOM (those stored), OLS with Carino linking | `factor_returns` for region `developed`, the Modelling page's default factor model (`fama_french.DEFAULT_REGION`); Kenneth French rows only (`source = 'kenneth-french'`: the ETF stand-ins are left out), the latest vintage of each factor and date; the primary benchmark comparison's daily returns |
+| `macro` | Risk › Macro exposures (macro-factors) | `macro_exposures` on weekly observations over up to three years (the last day of each week on which the portfolio and every series have a value; the daily returns in between compounded): the US 10-year yield (DGS10) and the curve (DGS10 − DGS2) as basis-point changes, the broad dollar (DTWEXBGS), Brent (DCOILBRENTEU), the VIX (VIXCLS, once licensed) and USD/CNH as log returns; Newey-West with 5 lags; at least 60 weeks. A series not in silver is left out, named with its reason in `inputs.factors_missing_reasons`. `macro_sensitivity` for each shock below | `macro_series`, the latest vintage of each series and date |
+| `crowding` | Risk › Crowding (crowding) | `ownership_overlap` (stakes by value) of the holdings that are shares with a US ISIN (CUSIP = ISIN characters 3 to 11) against each 13F filer's latest filing known on the date, and the most similar funds; the others are listed under `inputs.not_covered` with the reason. The CUSIP is `ibkr_etl.sec_13f.cusip_from_isin`, the loader's own rule | `institutional_holdings`: per filer, the latest quarter (`period` on or before the date) filed on or before the date, and that quarter's latest accession filed by then (the newest `filed_at`, then the highest accession, as `sec_13f.LATEST_SQL`); shares held outright only (`shares_type` SH, no PUT or CALL, value above zero); `instruments.isin` |
+
+The standard macro shocks (`quant_snapshots.MACRO_SHOCKS`; basis points for the yield and the curve,
+a share of the level otherwise):
+
+| Key | Shock |
+|---|---|
+| `rates_up_100bp` | DGS10 +100bp |
+| `curve_steeper_50bp` | DGS10 − DGS2 +50bp |
+| `dollar_up_5pct` | DTWEXBGS +5% |
+| `oil_down_20pct` | DCOILBRENTEU −20% |
+| `volatility_up_50pct` | VIXCLS +50% |
+| `yuan_down_5pct` | USD/CNH +5% (the yuan 5% weaker) |
+| `risk_off` | DGS10 −50bp, DTWEXBGS +5%, DCOILBRENTEU −20%, VIXCLS +50%, USD/CNH +3%, together |
+
+**Without the VIX.** VIXCLS is Cboe copyright, so the macro series loader keeps it only when
+`MACRO_SERIES_LICENSE_CONFIRMED=VIXCLS` (`docs/PHASE3_DATA_MACRO_13F.md`); by default it is not in
+silver. The section is built all the same: the VIX is left out of the model with that reason
+(`inputs.factors_missing`, `inputs.factors_missing_reasons`), `volatility_up_50pct` is not worked
+out (`inputs.shocks_left_out`, with the reason), and `risk_off` is worked out on its other four parts
+(its result's `factors_not_in_model` is `["VIXCLS"]`). The card says so. Any other series missing
+is treated the same way; the section is unavailable only when no series at all is there, or the
+portfolio and the series have fewer than 60 weeks in common.
+
+What to know about the figures:
+
+- **Liquidity.** At first `daily_volumes` holds only the benchmarks' rows, so the holdings have
+  no volume until the holdings' fetch (`DAILY_VOLUMES_FETCH=on`, `docs/PHASE3_DATA.md`) has stored
+  theirs, under each holding's conid; a holding it cannot map to a Yahoo symbol never has any. Those
+  holdings are listed under `inputs.not_covered` and count as unsold; with none covered, the volume
+  figures are unavailable (quality `warn`) and the section still gives the liquidity-adjusted VaR.
+  No bid-ask spreads are stored in silver, so the spread cost is 0 and LVaR equals VaR until they
+  are.
+- **Factor attribution and macro** use the latest vintage for every date, so a backfilled date sees
+  today's files, not the files as they were then. Factor attribution is daily: a Hong Kong book
+  against Developed factors that close later in the day is less well fitted than a US one.
+- **Crowding** is point in time: a filing counts from the day it was filed. The latest accession is
+  the newest `filed_at`, then the highest accession (an accession starts with the filing agent's id,
+  so the highest alone is not the newest filing), and it is the whole quarter's filing on its own:
+  a restatement holds its complete table, and the loader stores a new-holdings amendment as the
+  earlier report plus its new lines. Shares outstanding are not in silver, so
+  ownership shares and crowding scores are not computed; the overlap and similarity are. Each
+  filing is read as its stakes in our names plus the rest summed (value, sum of squares, count), and
+  the rest is stood in for by a few stakes with the same total and sum of squares, which gives the
+  full filing's similarity, shares and totals exactly.
+
+**How the build treats them.** `build_quant_snapshot` takes the phase 3 sections the setting
+switches on, asks the catalog (`pg_catalog`, readable by every login) whether each table exists,
+and reads each table in a savepoint, so a missing relation, schema, grant or column is "not loaded
+yet" and leaves the transaction usable. A section whose table is not there is reported in the job's
+output line as `{"status": "skipped", "reason": "<table> is not loaded yet"}` and no row is written.
+A built section is one more row in the same table, in the same transaction and through the same
+publish gate, with `market_load_ms` in its `timings_json`. Its fingerprint covers the silver rows it
+used, so a rerun writes nothing and a new vintage, filing or volume rebuilds only its own section.
+`read_section` and the job's `sections` argument accept the four names. Each table read is
+recorded as an input of the job's lineage run when recording is on (`lineage.JOB_INPUTS` keeps
+the v1 inputs, so with the setting unset lineage is unchanged).
+
+**Website.** One card each: Risk › Liquidity, Macro exposures and Crowding, Performance › Factor
+attribution (subpages `/risk/liquidity`, `/risk/macro-exposures`, `/risk/crowding`,
+`/performance/factor-attribution`), after the page's other quant cards. A card, its route
+(`/api/portfolio/{id}/quant/{section}`) and its Metrics guide entries show only when the page's
+`QUANT_ANALYTICS_PAGES` mode **and** the section's `QUANT_ANALYTICS_PHASE3` mode allow it: shadow on
+either side means owners only, and anything else is a 404 that reads nothing. With both settings
+unset the pages and the guide are byte for byte as before.
+
+**Desk.** Once `daily_volumes` exists, the pre-trade check (the POST only; the live snapshot never
+reads it) reads each live holding's average daily volume over its last 20 sessions with volume in
+the 45 days to today, by its conid, and passes it to `pre_trade_check`, so square-root market impact is estimated
+for the holdings that have volumes; the note says how many do. Before then it is exactly as today
+(half the spread, `COST_NOTE`). Still only where `DESK_PAGE` allows the Desk.
+
+**Run time.** Small next to v1: for 60 holdings over three years, without a database, the four
+build in about 0.05 seconds after 0.07 seconds of preparing (`PerformanceTests`); on the local
+test server the phase 3 reads take about 70 ms per subject and date and the four sections 25 ms
+(`tests/test_quant_phase3_db.py`). The 13F reads scan the filings known on the date, which grow
+with each quarter kept; measure them on the restored copy before switching `crowding` on.
+
+**Tests.**
+
+- `tests/test_quant_phase3.py`, no database: the setting; the CUSIP rule (`sec_13f.cusip_from_isin`)
+  as the crowding section uses it; the readers on a fake connection (a missing table is None inside
+  a savepoint; a holding's volumes read by its conid alone; zero volumes, ETF stand-ins and older
+  vintages left out); the tables read recorded as lineage inputs; known answers (the average
+  of a constant volume, the days to sell a known position, the VaR equal to the tail section's 99%
+  forecast, factor betas and alpha and macro sensitivities recovered from returns built from them,
+  a similarity of 1 for a fund with the portfolio's own mix, the reduced 13F filing equal to the
+  full one); the macro section without the VIX; and the gating (unset, no extra read or row; a
+  missing table, skipped). The Desk impact with and without volumes is in `tests/test_web_desk.py`,
+  and the cards, routes and guide entries in `tests/test_web_quant.py` (real builder output
+  rendered in Node, a figure in every tile).
+- `tests/test_quant_phase3_db.py`, PostgreSQL: the four tables from their held drafts when those
+  are in the tree (else from the test's own fixture SQL, the same columns), with the logins' grants
+  as bootstrap gives them; switched on before they exist, v1 only; the readers equal to a
+  plain-Python reference (latest vintage, the latest accession by `filed_at` then accession, the
+  other tenant out of sight); the job's build of both accounts equal to the pure builders, timed,
+  without the VIX as by default; an unchanged rerun and new rows rebuilding only their sections; one
+  section in shadow read by the website login; and a 13F filing counting from the day it was filed.
+
+### Switching phase 3 on, in order
+
+The gold table and the job are on (steps 1 to 4 above), and the page's `QUANT_ANALYTICS_PAGES` mode is
+`shadow` or `on`. `QUANT_ANALYTICS_PHASE3` is read by the job and by the website, so set it on both
+(the job's environment and the web app's settings; neither Bicep has a parameter for it yet). The
+modes add up: `liquidity=on,factor_attribution=shadow` is two sections. Each section comes on only
+after its silver table's own day, on a later day of its own:
+
+1. **Its silver table is in and loaded.** The table's held migration has run alone and its loader
+   has filled it (`docs/PHASE3_DATA.md`, `docs/PHASE3_DATA_MACRO_13F.md`): `daily_volumes` for `liquidity`, `factor_returns` for
+   `factor_attribution`, `macro_series` for `macro`, `institutional_holdings` for `crowding`. Check
+   the tenant has rows (`SELECT count(*), max(<date column>) FROM <table>`). For `liquidity` to
+   cover the holdings, the daily volumes job's holdings fetch is on too (`DAILY_VOLUMES_FETCH=on`,
+   `docs/PHASE3_DATA.md`): check that held conids have rows (`SELECT count(DISTINCT instrument_id)
+   FROM daily_volumes WHERE instrument_id ~ '^[0-9]+$'`). Without it the section is built with
+   no holding covered (quality `warn`).
+2. **Run the job once by hand for one subject, the section in shadow.** One execution of
+   `ibkrv2stg-quant-analytics` with `QUANT_ANALYTICS_BUILD=on`, `QUANT_ANALYTICS_PHASE3=<section>=shadow`
+   (plus the sections already on) and `--subject <one pilot account>`, outside 09:05 to 09:50.
+   Its output line shows the section `rebuilt`, the summary's `quality_rules` all passed, and the
+   row's `quality_status` is `pass` (for `liquidity`, `warn` while the holdings have no volumes of
+   their own is expected). A `skipped` status means the table is not visible to the job's login.
+3. **Shadow.** Set `QUANT_ANALYTICS_PHASE3` with `<section>=shadow` on the job and the website. The
+   next 09:30 run builds it for every subject; the card shows to owners only. Look at it for a few
+   days against what you expect (the Modelling page's factor model for `factor_attribution`).
+4. **On.** Set `<section>=on` on both. Everyone who can see the page sees the card.
+
+The Desk's market impact needs no setting: it follows `daily_volumes` existing (and `DESK_PAGE`).
+
+To take a section off, set it to `off` (or leave it out) on both: the job stops building it and
+the card, route and guide entries go; its rows stay and are not shown. If its table is dropped,
+the section is skipped from then on.
+
 ## Undoing
 
 - Lighter: redeploy with `quantAnalyticsBuild=off`. The rows stay; the website's cards are turned
@@ -394,12 +546,11 @@ Each step is its own day's change. Stop at any step that does not end as describ
 These need data that is not in silver yet (phase 3). Each needs a bronze capture and a silver
 table, so each is its own change with Medallion:
 
-- **Liquidity:** daily traded volumes.
-- **Macro exposures:** macro series.
-- **Factor attribution:** factor returns.
-- **Crowding from 13F filings:** the filings.
-- **Fair value:** dual-listing pairs.
-- **Spread paid:** quotes at the time of each fill.
+- **Liquidity, macro exposures, factor attribution and crowding from 13F filings:** built, and off
+  until switched on after their tables' days ("Phase 3", above).
+- **Fair value:** dual-listing pairs. Not built.
+- **Spread paid:** quotes at the time of each fill. Not built (and the liquidity section's spread
+  cost waits for spreads in silver).
 
 Also left out of v1: the Alpha World MS and T and the profiled composites (their own HKD
 pipelines), and the trade sections for derived subjects (no trades are stored for them).

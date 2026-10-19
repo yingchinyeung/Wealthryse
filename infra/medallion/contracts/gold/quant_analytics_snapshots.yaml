@@ -14,9 +14,10 @@ description:
     skip rows whose quality_status is fail. payload_json.results holds each engine's own output under the name of
     the call; an unavailable section says why in payload_json.reason.
   limitations: v1 covers physical accounts and derived subjects; Alpha World MS and T and profiled composites are
-    stored as unavailable. Liquidity, macro exposures, factor attribution, 13F crowding, fair value and spread paid
-    are not in v1 (their data is not in silver yet). Created by a held migration (infra/medallion/drafts/quant_analytics.sql,
-    076 on its day).
+    stored as unavailable. The phase 3 sections (liquidity, factor_attribution, macro, crowding) are written only when
+    QUANT_ANALYTICS_PHASE3 switches them on and their silver table exists; fair value and spread paid are not built
+    (their data is not in silver). Created by a held migration (infra/medallion/drafts/quant_analytics.sql, 076 on its
+    day).
 tags:
 - gold
 - derived
@@ -74,14 +75,15 @@ schema:
     primaryKey: true
     primaryKeyPosition: 4
     classification: internal
-    description: One of skill, decisions, currency, tail, regime, holdings_risk, correlation, concentration, execution;
-      part of the key.
+    description: One of skill, decisions, currency, tail, regime, holdings_risk, correlation, concentration, execution
+      (v1) or liquidity, factor_attribution, macro, crowding (phase 3); part of the key.
     quality:
     - name: section_allowed_values
-      description: section is one of the nine v1 sections (a CHECK constraint).
+      description: section is one of the nine v1 sections or the four phase 3 ones (a CHECK constraint).
       type: sql
       query: SELECT COUNT(*) FROM gold.quant_analytics_snapshots WHERE section NOT IN ('skill', 'decisions', 'currency',
-        'tail', 'regime', 'holdings_risk', 'correlation', 'concentration', 'execution')
+        'tail', 'regime', 'holdings_risk', 'correlation', 'concentration', 'execution', 'liquidity', 'factor_attribution',
+        'macro', 'crowding')
       mustBe: 0
       severity: error
       dimension: conformity

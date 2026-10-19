@@ -32,7 +32,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from fastapi import Depends, FastAPI, HTTPException
 
-from . import fama_french, model_cards, risk_forecasting
+from . import fama_french, market_inputs, model_cards, risk_forecasting
 from . import metrics_guide_quant as quant_guide
 from .metrics_guide import GuideAddition
 from .modelling import (
@@ -102,6 +102,23 @@ QUANT_SUBPAGES = {
     ),
 }
 
+# Phase 3 overnight sections. Each shows only when its page is allowed by QUANT_ANALYTICS_PAGES
+# AND the section by QUANT_ANALYTICS_PHASE3 (market_inputs.phase3_modes; shadow = owners only).
+PHASE3_SECTIONS = {
+    "factor_attribution": ("performance", "attribution"),
+    "liquidity": ("risk", "liquidity"),
+    "macro": ("risk", "macro-factors"),
+    "crowding": ("risk", "crowding"),
+}
+PHASE3_LABELS = {"factor_attribution": "factor attribution", "liquidity": "liquidity", "macro": "macro exposure",
+                 "crowding": "crowding"}
+PHASE3_SUBPAGES = {
+    "factor_attribution": ("factor-attribution", "Factor attribution", "quant-factor-attribution"),
+    "liquidity": ("liquidity", "Liquidity", "quant-liquidity"),
+    "macro": ("macro-exposures", "Macro exposures", "quant-macro"),
+    "crowding": ("crowding", "Crowding", "quant-crowding"),
+}
+
 OPTIMISER_LABELS = {
     "black_litterman": "Black-Litterman",
     "hierarchical_risk_parity": "Hierarchical risk parity",
@@ -146,14 +163,31 @@ def allowed_pages(user: Mapping[str, Any] | None, environ: Mapping[str, str] | N
     return tuple(page for page in PAGES if modes[page] == "on" or (modes[page] == "shadow" and role == "owner"))
 
 
+def phase3_allowed(section: str, user: Mapping[str, Any] | None, environ: Mapping[str, str] | None = None) -> bool:
+    """A phase 3 section shows when its page is allowed and QUANT_ANALYTICS_PHASE3 allows it."""
+
+    page = PHASE3_SECTIONS[section][0]
+    return page_allowed(page, user, environ) and market_inputs.section_allowed(section, user, environ)
+
+
+def allowed_phase3(user: Mapping[str, Any] | None, environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    return tuple(name for name in PHASE3_SECTIONS if phase3_allowed(name, user, environ))
+
+
+def _phase3_on(page: str, user: Mapping[str, Any] | None) -> tuple[str, ...]:
+    return tuple(name for name in allowed_phase3(user) if PHASE3_SECTIONS[name][0] == page)
+
+
 # --- Account page pieces (all empty when the page is off) --------------------------------
 
 def subpages(section: str, user: Mapping[str, Any] | None) -> tuple[tuple[str, str, str], ...]:
-    return QUANT_SUBPAGES.get(section, ()) if section in PAGES and page_allowed(section, user) else ()
+    return (QUANT_SUBPAGES.get(section, ()) + tuple(PHASE3_SUBPAGES[name] for name in _phase3_on(section, user))
+            if section in PAGES and page_allowed(section, user) else ())
 
 
 def page_cards(section: str, user: Mapping[str, Any] | None) -> str:
-    return QUANT_CARDS[section] if section in PAGES and page_allowed(section, user) else ""
+    return (QUANT_CARDS[section] + "".join(PHASE3_CARDS[name] for name in _phase3_on(section, user))
+            if section in PAGES and page_allowed(section, user) else "")
 
 
 def page_css(user: Mapping[str, Any] | None) -> str:
@@ -161,7 +195,7 @@ def page_css(user: Mapping[str, Any] | None) -> str:
 
 
 def page_script(user: Mapping[str, Any] | None) -> str:
-    return QUANT_SCRIPT if allowed_pages(user) else ""
+    return QUANT_SCRIPT + (PHASE3_SCRIPT if allowed_phase3(user) else "") if allowed_pages(user) else ""
 
 
 def render_hook(user: Mapping[str, Any] | None) -> str:
@@ -171,7 +205,7 @@ def render_hook(user: Mapping[str, Any] | None) -> str:
 
 
 def guide_additions(user: Mapping[str, Any] | None) -> tuple[GuideAddition, ...]:
-    addition = quant_guide.addition(allowed_pages(user))
+    addition = quant_guide.addition(allowed_pages(user), allowed_phase3(user))
     return (addition,) if addition else ()
 
 
@@ -612,10 +646,28 @@ def install(
     def model_error(error: Exception) -> HTTPException:
         return HTTPException(status_code=422, detail=str(error))
 
+    def phase3_section(account_id: str, section: str, as_of: str | None, user: Mapping[str, Any]) -> dict:
+        """A phase 3 section: 404 unless its page and QUANT_ANALYTICS_PHASE3 both allow it."""
+        page = PHASE3_SECTIONS[section][0]
+        if not phase3_allowed(section, user, environ):
+            raise HTTPException(status_code=404, detail=NOT_FOUND)
+        modes = (page_modes(environ)[page], market_inputs.phase3_modes(environ)[section])
+        access_context(account_id, user)
+        requested = parse_as_of(as_of)
+        with read_database() as connection:
+            row = read_snapshot(connection, tenant_id=tenant_id, subject_id=account_id, section=section,
+                                as_of=requested)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No {PHASE3_LABELS[section]} figures have been built "
+                                                        "for this account on or before this date yet.")
+        return section_response(account_id, section, row, "shadow" if "shadow" in modes else "on")
+
     @app.get("/api/portfolio/{account_id}/quant/{section}")
     def quant_section(account_id: str, section: str, as_of: str | None = None,
                       user: dict[str, Any] = Depends(authorized_user)) -> dict:
         """One overnight section: the newest row on or before as_of whose quality is not fail."""
+        if section in PHASE3_SECTIONS:
+            return phase3_section(account_id, section, as_of, user)
         if section not in SECTIONS:
             raise HTTPException(status_code=404, detail=NOT_FOUND)
         mode = require(SECTIONS[section][0], user)
@@ -934,6 +986,26 @@ QUANT_CARDS = {
     )),
 }
 
+# Phase 3 cards, added after their page's cards when QUANT_ANALYTICS_PHASE3 allows them.
+PHASE3_CARDS = {
+    "factor_attribution": _card(
+        "quant-factor-attribution", "Factor attribution", "Factor attribution",
+        "How much of the return over cash came from the market, size, value, profitability, investment and "
+        "momentum factors, how much from alpha and how much was left over, for the year to date and the past year."),
+    "liquidity": _card(
+        "quant-liquidity", "Liquidity", "Days to liquidate",
+        "How long the holdings would take to sell without trading more than a fifth of each one's daily volume, "
+        "and one-day VaR with the cost of selling added."),
+    "macro": _card(
+        "quant-macro", "Macro exposures", "Macro exposures",
+        "How the portfolio has moved with US rates, the yield curve, the dollar, oil, the VIX and the yuan, and "
+        "what standard shocks to them would mean for it."),
+    "crowding": _card(
+        "quant-crowding", "Crowding", "Fund ownership overlap",
+        "How much of the portfolio's US-listed holdings the largest US managers also hold, from their quarterly "
+        "13F filings, and which of their funds look most like it."),
+}
+
 QUANT_CSS = """
 .quant-card .quant-body{margin-top:12px}
 .quant-range{color:var(--muted,#667085);font-size:.78em;font-weight:400}
@@ -1151,4 +1223,86 @@ const renderQuant=async asOf=>{quantState.asOf=asOf;const view=document.querySel
   const jobs=quantSections.filter(([,id])=>view.querySelector('#'+id)).map(([section,id,render])=>quantLoadSection(section,id,render,asOf));
   [['#quant-optimisers',runQuantOptimisers],['#quant-rebalancing',runQuantRebalancing],['#quant-goals',runQuantGoals],['#quant-scenarios',runQuantScenarios]].forEach(([selector,run])=>{if(view.querySelector(selector))jobs.push(run())});
   await Promise.allSettled(jobs)};
+"""
+
+# Phase 3 renderers, appended to QUANT_SCRIPT only when a phase 3 section is allowed for the
+# viewer; each adds its section to quantSections, so renderQuant loads it with the others.
+PHASE3_SCRIPT = r"""
+const quantCount=n=>quantNum(n)?minus(new Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Number(n))):'—';
+const quantDays=n=>quantNum(n)?`${quantFixed(n,Number(n)<10?1:0)} ${Number(n)===1?'day':'days'}`:'—';
+const quantSigned=n=>quantNum(n)?toned(signedPct(n),n):'—';
+const quantFactorNames={'Mkt-RF':'Market','SMB':'Size','HML':'Value','RMW':'Profitability','CMA':'Investment','MOM':'Momentum'};
+const quantMacroNames={'DGS10':'US 10-year yield','DGS10-DGS2':'Yield curve (10-year minus 2-year)','DTWEXBGS':'Broad dollar index','DCOILBRENTEU':'Brent oil','VIXCLS':'VIX','USDCNH':'USD/CNH'};
+const quantRenderFactorAttribution=(r,p)=>{const y=r.past_year||{},t=r.ytd||{},inputs=(p||{}).inputs||{};
+  const ok=x=>x&&x.available!==false&&quantNum(x.cumulative_excess_return);const alpha=x=>(x.alpha||{}),rest=x=>(x.residual||{});
+  const tiles=quantTiles([
+    ok(y)?quantTile('Return over cash (past year)',quantSigned(y.cumulative_excess_return),`${y.observations} daily returns from ${analyticsDate(y.window_start)}`):'',
+    ok(y)?quantTile('Explained by factors (past year)',quantSigned(y.factors_cumulative),'The factor parts added up'):'',
+    ok(y)?quantTile('Alpha (past year)',quantSigned(alpha(y).cumulative_contribution),quantNum(alpha(y).t_statistic)?`t-statistic ${quantFixed(alpha(y).t_statistic,2)}`:''):'',
+    ok(y)?quantTile('Residual (past year)',quantSigned(rest(y).cumulative_contribution),'Left over after the factors and alpha'):'',
+    ok(y)?quantTile('Factor fit R² (past year)',pct(y.r_squared)):'',
+    ok(t)?quantTile('Return over cash (year to date)',quantSigned(t.cumulative_excess_return),`${t.observations} daily returns from ${analyticsDate(t.window_start)}`):'',
+    ok(t)?quantTile('Explained by factors (year to date)',quantSigned(t.factors_cumulative)):'',
+    ok(t)?quantTile('Alpha (year to date)',quantSigned(alpha(t).cumulative_contribution)):'',
+  ]);
+  const main=ok(y)?y:t,label=ok(y)?'past year':'year to date',other=Object.fromEntries((ok(y)&&ok(t)?t.exposures||[]:[]).map(x=>[x.factor,x]));
+  const head=['Factor',`Beta (${label})`,'t-statistic',`Contribution (${label})`].concat(ok(y)&&ok(t)?['Contribution (year to date)']:[]);
+  const rows=(main.exposures||[]).map(x=>quantRow(quantFactorNames[x.factor]||x.factor,[ratio(x.beta),quantFixed(x.t_statistic,2),quantSigned(x.cumulative_contribution)].concat(ok(y)&&ok(t)?[other[x.factor]?quantSigned(other[x.factor].cumulative_contribution):'—']:[])));
+  const sources=Object.keys(inputs.factor_sources||{}).map(s=>s==='etf-proxy'?'fund stand-ins':'the Kenneth French data library').join(' and ');
+  return [tiles+(rows.length?quantSub('By factor'):'')+quantTable(head,rows),quantText([inputs.region_label?`${inputs.region_label} factors${sources?` from ${sources}`:''}, through ${analyticsDate(inputs.factor_data_through)}; daily portfolio returns less the daily risk-free rate.`:'',main.method,main.disclaimer])]};
+const quantRenderLiquidity=(r,p)=>{const d=r.days_to_liquidate||{},lv=r.liquidity_adjusted_var||{},inputs=(p||{}).inputs||{},s=d.sellable_within||{};const lvar=lv.available!==false&&quantNum(lv.liquidity_adjusted_var),dl=d.available!==false&&quantNum(s['1']);
+  const total=Number(inputs.holdings)||0,without=(inputs.not_covered||[]).length;
+  const tiles=quantTiles([
+    dl?quantTile('Sellable in 1 day',pct(s['1']),quantNum(d.participation)?`Share of the holdings' value, trading at most ${pct(d.participation)} of daily volume`:''):'',
+    dl?quantTile('Sellable in 5 days',pct(s['5'])):'',
+    dl?quantTile('Sellable in 20 days',pct(s['20'])):'',
+    dl&&quantNum(d.value_weighted_days)?quantTile('Value-weighted days to sell',quantDays(d.value_weighted_days),'Each holding weighted by its value'):'',
+    dl?(quantNum(d.days_to_sell_everything)?quantTile('Days to sell everything',quantDays(d.days_to_sell_everything),'The slowest holding'):quantTile('Value without volume data',pct(d.share_without_volume_data),'Counted as not sellable')):'',
+    total?quantTile('Holdings with volume data',`${quantCount(total-without)} of ${quantCount(total)}`,'Holdings with daily volumes in silver over the last 45 days'):'',
+    lvar?quantTile('Liquidity-adjusted VaR (99%)',quantLoss(lv.liquidity_adjusted_var),'One day: VaR plus the cost of selling through the bid-ask spread'):'',
+    lvar?quantTile('VaR before liquidity (99%)',quantLoss(lv.var),inputs.var_basis?`The tail risk card's ${inputs.var_basis} one-day VaR`:''):'',
+    lvar?quantTile('Spread cost added',pct2(lv.liquidity_cost),'Zero until bid-ask spreads are stored'):'',
+  ]);
+  const rows=(d.holdings||[]).slice(0,10).map(x=>quantRow(x.key,[quantCount(x.quantity),quantCount(x.average_daily_volume),quantDays(x.days),weightPct(x.share_of_portfolio)]));
+  const missing=d.no_volume_data||[];
+  return [tiles+(rows.length?quantSub('Slowest holdings to sell'):'')+quantTable(['Holding','Quantity','Average daily volume','Days to sell','Share of holdings'],rows),quantText([missing.length?`No volume data: ${missing.join(', ')}.`:'',inputs.holdings_date?`Holdings on ${analyticsDate(inputs.holdings_date)}; average daily volume over the last ${inputs.volume_window_sessions||20} sessions with volume.`:'',d.method,lvar?lv.method:'',lvar?inputs.spreads:'',d.disclaimer])]};
+const quantShockNames={'rates_up_100bp':'US 10-year yield +100bp','curve_steeper_50bp':'Yield curve 50bp steeper','dollar_up_5pct':'Dollar index +5%','oil_down_20pct':'Brent oil −20%','volatility_up_50pct':'VIX +50%','yuan_down_5pct':'Yuan 5% weaker','risk_off':'Risk-off week'};
+const quantRiskOffParts={'DGS10':'yield −50bp','DTWEXBGS':'dollar +5%','DCOILBRENTEU':'Brent −20%','VIXCLS':'VIX +50%','USDCNH':'USD/CNH +3%'};
+const quantRenderMacro=(r,p)=>{const m=r.macro_exposures||{},sens=r.macro_sensitivity||{},inputs=(p||{}).inputs||{};
+  const has=k=>sens[k]&&quantNum(sens[k].impact);const shock=k=>quantSigned(sens[k].impact);
+  const range=k=>Array.isArray(sens[k].range_95)?`95% range ${signedPct(sens[k].range_95[0])} to ${signedPct(sens[k].range_95[1])}`:'';
+  const offOut=new Set((sens.risk_off||{}).factors_not_in_model||[]),offIn=Object.keys(quantRiskOffParts).filter(k=>!offOut.has(k)).map(k=>quantRiskOffParts[k]).join(', ');
+  const offHint=offIn?`${offIn.charAt(0).toUpperCase()}${offIn.slice(1)} together${offOut.size?`; ${[...offOut].map(k=>quantMacroNames[k]||k).join(', ')} left out`:''}`:'';
+  const tiles=quantTiles([
+    has('rates_up_100bp')?quantTile('US 10-year yield +100bp',shock('rates_up_100bp'),range('rates_up_100bp')):'',
+    has('curve_steeper_50bp')?quantTile('Yield curve 50bp steeper',shock('curve_steeper_50bp'),range('curve_steeper_50bp')):'',
+    has('dollar_up_5pct')?quantTile('Dollar index +5%',shock('dollar_up_5pct'),range('dollar_up_5pct')):'',
+    has('oil_down_20pct')?quantTile('Brent oil −20%',shock('oil_down_20pct'),range('oil_down_20pct')):'',
+    has('volatility_up_50pct')?quantTile('VIX +50%',shock('volatility_up_50pct'),range('volatility_up_50pct')):'',
+    has('yuan_down_5pct')?quantTile('Yuan 5% weaker',shock('yuan_down_5pct'),range('yuan_down_5pct')):'',
+    has('risk_off')?quantTile('Risk-off week',shock('risk_off'),offHint):'',
+    quantTile('Macro R²',pct(m.r_squared),'Share of the weekly moves the series explain together'),
+    quantTile('Weeks in the macro model',quantCount((m.window||{}).observations),(m.window||{}).start?`${analyticsDate(m.window.start)} to ${analyticsDate(m.window.end)}`:''),
+  ]);
+  const per=x=>x.transform==='diff_bp'?`${signedPct(Number(x.beta)*100)} per 100bp rise`:`${signedPct(Number(x.beta)*Math.log(1.1))} per 10% rise`;
+  const rows=(m.exposures||[]).map(x=>quantRow(quantMacroNames[x.factor]||x.factor,[quantNum(x.beta)?per(x):'—',quantFixed(x.t_statistic,2),x.significant?'Yes':'No']));
+  const why=inputs.factors_missing_reasons||{},plain=t=>String(t||'').replace(/\.$/,'');
+  const missing=(inputs.factors_missing||[]).map(x=>`${quantMacroNames[x]||x}${why[x]?` (${plain(why[x]).charAt(0).toLowerCase()}${plain(why[x]).slice(1)})`:''}`);
+  const skipped=Object.keys(inputs.shocks_left_out||{}).map(k=>quantShockNames[k]||k);
+  return [tiles+(rows.length?quantSub('Sensitivity to each series, the others held still'):'')+quantTable(['Series','Portfolio move','t-statistic (Newey-West)','Significant'],rows),quantText([missing.length?`Left out of the model: ${missing.join('; ')}.`:'',skipped.length?`Shocks left out, as their series are not in the model: ${skipped.join(', ')}.`:'',m.method,(Object.values(sens).find(x=>x&&x.method)||{}).method,m.disclaimer])]};
+const quantRenderCrowding=(r,p)=>{const o=r.ownership_overlap||{},inputs=(p||{}).inputs||{},names=inputs.securities||{},funds=o.most_similar_funds||[],top=funds[0];
+  const held=(o.holdings||[]).slice().sort((a,b)=>(Number(b.funds_holding)||0)-(Number(a.funds_holding)||0)||Math.abs(Number(b.weight)||0)-Math.abs(Number(a.weight)||0));const wide=held[0];
+  const periods=(inputs.periods||[]).map(analyticsDate).join(', ');
+  const tiles=quantTiles([
+    quantTile('Funds compared',quantCount(o.funds),periods?`13F filings for the quarter to ${periods}`:''),
+    quantTile('Covered by 13F filings',weightPct(inputs.covered_weight),'Share of NAV in shares with a US ISIN'),
+    quantTile('In names the funds hold',pct(o.share_in_names_funds_hold),'Share of the covered weight'),
+    top&&quantNum(top.similarity)?quantTile('Most similar fund',`${esc(top.fund)} · ${ratio(top.similarity)}`,'Cosine similarity: 1 is the same mix, 0 nothing in common'):'',
+    wide?quantTile('Most widely held',`${esc(names[wide.security]||wide.security)} · ${quantCount(wide.funds_holding)} ${Number(wide.funds_holding)===1?'fund':'funds'}`):'',
+  ]);
+  const fundRows=funds.map(f=>quantRow(f.fund,[ratio(f.similarity),quantCount(f.shared_holdings),weightPct(f.portfolio_weight_in_fund_names),weightPct(f.fund_weight_in_portfolio_names),`${money(f.reported_value)} USD`]));
+  const holdingRows=held.slice(0,10).map(x=>quantRow(names[x.security]||x.security,[weightPct(x.weight),quantCount(x.funds_holding)]));
+  const out=inputs.not_covered||[];
+  return [tiles+(fundRows.length?quantSub('Most similar funds'):'')+quantTable(['Fund','Similarity','Shared holdings','Our weight in its names','Its weight in our names','Reported value'],fundRows)+(holdingRows.length?quantSub('Covered holdings by number of funds'):'')+quantTable(['Holding','Weight','Funds holding'],holdingRows),quantText([out.length?`Not covered (${weightPct(inputs.not_covered_weight)} of NAV): ${out.map(x=>`${x.name} (${String(x.reason||'').replace(/\.$/,'').toLowerCase()})`).join(', ')}.`:'',inputs.shares_outstanding,o.method])]};
+quantSections.push(['factor_attribution','quant-factor-attribution',quantRenderFactorAttribution],['liquidity','quant-liquidity',quantRenderLiquidity],['macro','quant-macro',quantRenderMacro],['crowding','quant-crowding',quantRenderCrowding]);
 """

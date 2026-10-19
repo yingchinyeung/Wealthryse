@@ -13,6 +13,7 @@ below are run, in order, on their day.
 | The job | `scripts/build_quant_analytics.py`, `infra/staging-quant-analytics-job.bicep` (`ibkrv2stg-quant-analytics`, 09:30 UTC) |
 | Contracts | `infra/medallion/contracts/gold/quant_analytics_snapshots.yaml`, `silver/subject_live_executions.yaml`, `silver/benchmark_live_quotes.yaml` |
 | Tests | `tests/test_quant_snapshots.py` (no database), `tests/test_quant_snapshots_db.py` (PostgreSQL) |
+| Shadow run on a restored copy (Fri 30 Oct), temporary | `scripts/quant_shadow_run.py`, `infra/staging-quant-shadow-job.bicep` (`ibkrv2stg-quant-shadow`, started by hand, deleted the same day), `tests/test_quant_shadow_run.py`, `tests/test_quant_shadow_run_db.py` |
 
 ## What the table holds
 
@@ -151,6 +152,192 @@ job is off), `publish_gate.TABLES` (lineage, holds back) and `JOB_TABLES["quant-
 `lineage.TRACEABLE` and `JOB_INPUTS`. Checks on held objects wait for their migration, so the
 administrator's checks and reports read as today until 076 runs.
 
+## Shadow run on a restored copy (Fri 30 Oct)
+
+Wiring design section 5. On **Fri 30 Oct from 11:00 UTC** the build runs on a restored copy of the
+v2 server, never the live server and never through the bootstrap job. It does three things:
+
+1. It shows that the held migrations, 076 (`quant_analytics.sql`) and 077 (`desk_live_views.sql`),
+   apply cleanly on real data.
+2. It measures the daily job's run time. The job must fit 09:30 to 09:40 UTC; if it cannot, it
+   moves to 10:00 (Medallion review, note 3).
+3. It gives a review file with counts only: subjects appear as `u01`, `u02`, ... and there are no
+   client figures (note 5).
+
+The copy is deleted the same day. Medallion has priority on the admin VM that day, so the
+temporary job is the main path and the admin VM is the fallback. Nothing here runs between 07:50
+and 09:25 UTC.
+
+**Can a job reach the copy? Yes.**
+
+- The jobs run in `ibkrv2stg-env`, on the container-apps subnet `10.50.0.0/23` of `ibkrv2stg-vnet`.
+- Copies are restored into the `upgrade-recovery` subnet (`10.50.11.0/27`), as
+  `ibkrv2stg-upgrade-recovery-1009` was (`scripts/upgrade_fresh_recovery_20261009.py`).
+- That subnet's NSG, `ibkrv2stg-upgrade-recovery-nsg`, allows port 5432 from `10.50.0.0/23` (the
+  jobs), from `10.50.9.0/27` (the admin VM) and from itself, and denies all other inbound traffic.
+- A restored copy keeps the source's private DNS zone, which is linked to the VNet, so its name
+  resolves from the jobs.
+- Container Apps executions in this environment reached the recovery copy at 10.50.11.4 on 10 Oct.
+  `scripts/control_upgrade_g04_preflight_20261010.py` ran
+  `scripts/probe_upgrade_g04_preflight_20261010.py` as a job execution, and the probe checked that
+  the copy's name resolved inside `10.50.11.0/27`.
+- Medallion's own rehearsals (`MEDALLION_RELEASE_REPORT.md`) ran from the admin VM. That remains
+  the fallback below.
+
+### The tool: `scripts/quant_shadow_run.py`
+
+```
+python scripts/quant_shadow_run.py preflight  --copy-host <copy FQDN> [--copy-subnet 10.50.11.0/27]
+python scripts/quant_shadow_run.py apply-held --copy-host ...
+python scripts/quant_shadow_run.py run        --copy-host ... [--max-minutes 180] [--history-days 365]
+python scripts/quant_shadow_run.py review     --copy-host ... --out DIR
+python scripts/quant_shadow_run.py undo       --copy-host ...
+```
+
+**The guard** comes first in every command, before any connection. It reads the URL in
+`DATABASE_ADMIN_URL` (or the variable named by `--url-env`). It refuses, with exit 2 and
+`Refused: ... Nothing was connected.`, when:
+
+- the URL does not name exactly one host, or the host is not `--copy-host`;
+- the host is a live server: `ibkrv2stg-pg-auhecwc4itaoo.postgres.database.azure.com`, the alias
+  `ibkrv2stg.postgres.database.azure.com`, or any host in `LIVE_DATABASE_HOSTS` (the server name
+  is compared too, so another domain for the live server is also refused);
+- the server name contains none of `-recovery-`, `-restore-` or `-shadow-`;
+- with `--copy-subnet`, the name resolves to an address outside that subnet;
+- the URL carries `hostaddr` or `service` (or `PGHOSTADDR` or `PGSERVICE` is set), or the tool
+  runs inside the bootstrap job.
+
+When the guard passes, it prints `Restored copy: host ..., database ...` and only then connects.
+
+**The commands:**
+
+| Command | What it does |
+|---|---|
+| `preflight` | Read-only. Prints the server version and whether the 076 and 077 objects exist. It also prints the subjects by type and lifecycle, the latest NAV date of each subject the daily job builds (masked), and row counts of the inputs the build reads. |
+| `apply-held` | Applies `quant_analytics.sql`, then `desk_live_views.sql`, from `infra/medallion/drafts`, each in one transaction. Each one is recorded, with its sha256 and time, in `quant_shadow.draft_events` on the copy. It never touches `schema_migrations`, `migrations/postgres` or the bootstrap job. A draft whose objects are all there already is left alone, so running it again changes nothing. A half-applied draft is refused ("run undo first"). |
+| `run` | First, the daily job's pass. The same subjects, order, lock, transaction and `QUANT_ANALYTICS_MINUTES` budget as `scripts/build_quant_analytics.py`, then the contract rules on those dates, timed from the first connection. Then the past year of NAV dates of each subject, newest first. A subject-date that already has all nine sections is skipped, so a second run carries on where a spent `--max-minutes` stopped, and retries a failed section. The build setting is forced on in this process only, and the publish gate is off. Progress lines name subjects as `u01`, ... The run log is kept in `quant_shadow.passes` and `quant_shadow.builds` on the copy. |
+| `review --out DIR` | Writes `review.md` and `review.json` (mode 600), and prints both between `QUANT_SHADOW_REVIEW md BEGIN sha256=... lines=N` and `QUANT_SHADOW_REVIEW md END` (the same for `json`), one numbered line each, so they can be rebuilt from the job's logs. |
+| `undo` | Runs the two undo drafts and clears the run log, for a second rehearsal on the same copy. |
+
+Exit codes: 0 done; 1 something failed (a draft, a subject-date or a section); 2 refused or could
+not connect; 3 `run` stopped at `--max-minutes` with dates left (run it again to carry on).
+
+**The review** holds counts, names, dates and timings only:
+
+- rows by section and quality, and unavailable sections;
+- the unavailable reasons, grouped, with counts. Dates become `<date>` and numbers `<n>`;
+- per-subject coverage;
+- the input row counts;
+- the nine contract rules on every built date;
+- the 077 views' row counts;
+- each draft's outcome;
+- the errors, masked and cleaned the same way.
+
+Subjects are `u01`, `u02`, ... in sorted order. Any other account-like id in a message becomes
+`u??`. The mapping is never written anywhere; the real ids exist only in the run log on the copy,
+and they go when the copy is deleted.
+
+**Timing and the window.** These come from cold builds only (every section built):
+
+- seconds per subject-date (p50, p95, max), overall and for the daily job's pass;
+- the load time;
+- each section's milliseconds.
+
+The daily job's pass fits when it skipped nothing for time and took at most 600 s. That is, when
+09:30:00 plus its total is 09:40:00 or earlier. The review gives the end time and the seconds to
+spare. The container's start comes on top of that total, so read a small margin as not fitting.
+If it does not fit, the review says the job moves to 10:00. The job runs at the daily job's size
+(0.5 CPU, 1 GiB) and budget (8 minutes), so the timing is the job's. On the admin VM it is only an
+estimate: the review names the runner and its CPU count.
+
+### On the day: one PowerShell line
+
+**Approve once, before the line runs.** It does the following, in this order:
+
+1. **Checks the time.** It refuses to start outside 11:00 to 20:00 UTC. A run takes at most 4
+   hours, so nothing runs between 07:50 and 09:25 UTC.
+2. **Checks the identity.** It confirms that `ibkrv2stg-ingestion-identity` can already read
+   secrets in `ibkrv2stg-auhecwc4itaoo`. It assigns no role.
+3. **Restores the copy.** It makes a point-in-time restore of `ibkrv2stg-pg-auhecwc4itaoo` from 5
+   minutes earlier (after the daily cycle and the 09:45 certified run). The copy is
+   `ibkrv2stg-quant-shadow-1030`, in the `upgrade-recovery` subnet with the source's private DNS
+   zone. The live server is only read from.
+   - **Reusing Medallion's copy of that day instead:** set `$copy` to its name and `$ours=$false`.
+     Do this only if they agree and have finished with it, since our run adds the 076 and 077
+     objects and the `quant_shadow` schema. The line then neither restores the copy nor deletes it,
+     but it does give the copy a new admin password (step 4).
+4. **Sets a new admin password on the copy only.** It is random and never printed, so the live
+   admin password is never copied anywhere.
+5. **Writes the Key Vault secret.** It puts the copy's admin URL in `quant-shadow-copy-admin-url`.
+6. **Builds and pushes the image** `ibkr-platform:quant-shadow-<commit>` with ACR build, from a
+   clean `git worktree` of the current commit, so only tracked files are uploaded.
+7. **Deploys the job.** It deploys `infra/staging-quant-shadow-job.bicep` as
+   `ibkrv2stg-quant-shadow`: manual trigger only, no schedule and no role assignments. The job
+   runs `preflight`, `apply-held`, `run` and `review` against the copy with
+   `--copy-subnet 10.50.11.0/27`.
+8. **Starts one execution and waits** for it, for up to 4 hours (`replicaTimeoutSeconds` 14400;
+   `run` stops starting subject-dates 30 minutes before that).
+9. **Fetches the review.** It reads the review lines back from Log Analytics, rebuilds both files,
+   checks their sha256, and writes `quant-shadow-review-2026-10-30.md` and `.json` in the current
+   folder. **Ying uploads both into the thread.** The integrator then files them under
+   `frontier-analytics/shadow-2026-10-30/`.
+10. **Cleans up.** It always deletes the job and the secret. The vault's purge protection keeps
+    a deleted secret recoverable for 90 days, but this one holds only the copy's own password. It
+    deletes the copy only when the execution succeeded and the review was fetched. Otherwise the
+    copy is left for the admin VM variant and the line says so; the cleanup line below deletes
+    it. **It must still be deleted the same day.**
+
+Do not record the job in `deploy/deployed-images.json`. It is gone before Monday's drift check.
+
+Run it in PowerShell, with `az login` done, from the root of a clone at the commit that has these
+files:
+
+```powershell
+$ErrorActionPreference='Stop'; $path='job'; $copy='ibkrv2stg-quant-shadow-1030'; $ours=$true; function A { $o = & az @args; if ($LASTEXITCODE) { throw "az $($args[0..2] -join ' ') failed" }; ($o -join "`n").Trim() }; $now=(Get-Date).ToUniversalTime(); if ($now.TimeOfDay -lt [TimeSpan]'11:00' -or $now.TimeOfDay -gt [TimeSpan]'20:00') { throw 'Start between 11:00 and 20:00 UTC: never 07:50 to 09:25 UTC, and the run takes up to 4 hours.' }; if (-not (Test-Path scripts/quant_shadow_run.py)) { throw 'Run this at the root of a clone of the commit with scripts/quant_shadow_run.py.' }; $rg='rg-ibkr-database-v11'; $live='ibkrv2stg-pg-auhecwc4itaoo'; $kv='ibkrv2stg-auhecwc4itaoo'; $acr='ibkrv2stgauhecwc4itaoo'; $job='ibkrv2stg-quant-shadow'; $secret='quant-shadow-copy-admin-url'; $law='5264a124-10cd-45f6-93a5-6d65c37e9bfb'; $commit=(git rev-parse --short=12 HEAD); $tag="quant-shadow-$commit"; $src=Join-Path $env:TEMP $tag; $ok=$false; try { $identity = A identity show -g $rg -n ibkrv2stg-ingestion-identity --query id -o tsv; $principal = A identity show -g $rg -n ibkrv2stg-ingestion-identity --query principalId -o tsv; $vault = A keyvault show -n $kv --query id -o tsv; if ([int](A role assignment list --assignee $principal --scope $vault --include-inherited --query "length([?roleDefinitionName=='Key Vault Secrets User'])" -o tsv) -lt 1) { throw 'ibkrv2stg-ingestion-identity cannot read the vault: stop here.' }; if ($ours) { $subnet = (A postgres flexible-server show -g $rg -n $live --query network.delegatedSubnetResourceId -o tsv) -replace '/subnets/[^/]+$','/subnets/upgrade-recovery'; if ((A network vnet subnet show --ids $subnet --query addressPrefix -o tsv) -ne '10.50.11.0/27') { throw 'The upgrade-recovery subnet is not 10.50.11.0/27.' }; $zone = A postgres flexible-server show -g $rg -n $live --query network.privateDnsZoneArmResourceId -o tsv; Write-Host "Restoring $copy from $live (about 20 minutes)"; A postgres flexible-server restore -g $rg -n $copy --source-server $live --restore-time ($now.AddMinutes(-5).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")) --subnet $subnet --private-dns-zone $zone -o none }; $fqdn = A postgres flexible-server show -g $rg -n $copy --query fullyQualifiedDomainName -o tsv; $login = A postgres flexible-server show -g $rg -n $copy --query administratorLogin -o tsv; if ($fqdn -notmatch '^[a-z0-9-]*-(recovery|restore|shadow)-[a-z0-9-]*\.postgres\.database\.azure\.com$' -or $fqdn -like "$live.*") { throw "$fqdn does not look like a restored copy." }; $bytes = New-Object byte[] 24; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes); $pw = 'Qs1x' + ([Convert]::ToBase64String($bytes) -replace '[+/=]','x'); A postgres flexible-server update -g $rg -n $copy --admin-password $pw -o none; A keyvault secret set --vault-name $kv -n $secret --value "postgresql://${login}:$pw@${fqdn}:5432/ibkr_staging?sslmode=require" -o none; Remove-Variable pw, bytes; if ($path -eq 'vm') { Write-Host "Copy ready: $fqdn. Secret $secret is set. Now the admin VM steps, then the cleanup line."; $ok=$true } else { git worktree add --detach $src HEAD; if ($LASTEXITCODE) { throw 'git worktree add failed.' }; & az acr build -r $acr -t "ibkr-platform:$tag" -f (Join-Path $src 'Dockerfile.azure') --platform linux/amd64 $src -o none; if ($LASTEXITCODE) { throw 'The image build failed.' }; A deployment group create -g $rg -n $tag -f (Join-Path $src 'infra/staging-quant-shadow-job.bicep') -p registryName=$acr keyVaultName=$kv identityResourceId=$identity imageTag=$tag copyUrlSecretName=$secret copyHost=$fqdn -o none; $exec = A containerapp job start -g $rg -n $job --query name -o tsv; Write-Host "Execution $exec started at $((Get-Date).ToUniversalTime().ToString('HH:mm')) UTC; waiting (up to 4 hours)"; $until = (Get-Date).AddHours(4.5); do { Start-Sleep 120; $state = & az containerapp job execution show -g $rg -n $job --job-execution-name $exec --query properties.status -o tsv } until ($state -in 'Succeeded','Failed','Stopped','Degraded' -or (Get-Date) -gt $until); Write-Host "Execution $exec $state"; $q = "ContainerAppConsoleLogs_CL | where ContainerGroupName_s startswith '$exec-' | where Log_s startswith 'QUANT_SHADOW_REVIEW ' | project Log_s"; $files = @{}; foreach ($try in 1..30) { Start-Sleep 60; $logs = @(((& az monitor log-analytics query -w $law --analytics-query $q --timespan P1D -o json) -join "`n" | ConvertFrom-Json) | ForEach-Object { $_.Log_s }); foreach ($kind in 'md','json') { $head = @($logs -match "^QUANT_SHADOW_REVIEW $kind BEGIN ")[-1]; if ($head -notmatch 'sha256=([0-9a-f]{64}) lines=(\d+)') { continue }; $sha = $Matches[1]; $n = [int]$Matches[2]; $body = @{}; foreach ($line in $logs) { if ($line -match "^QUANT_SHADOW_REVIEW $kind (\d{5}) ?(.*)$") { $body[[int]$Matches[1]] = $Matches[2] } }; if ($body.Count -ne $n) { continue }; $text = ((1..$n | ForEach-Object { $body[$_] }) -join "`n") + "`n"; $hash = -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($text)) | ForEach-Object { $_.ToString('x2') }); if ($hash -eq $sha) { $files[$kind] = $text } }; if ($files.Count -eq 2) { break } }; if ($files.Count -ne 2) { throw "The review is not in the logs of $exec (state $state): read its console log in the portal." }; $out = Join-Path (Get-Location) 'quant-shadow-review-2026-10-30'; [IO.File]::WriteAllText("$out.md", $files['md']); [IO.File]::WriteAllText("$out.json", $files['json']); $t = ($files['json'] | ConvertFrom-Json).timing.latest_pass; Write-Host "Review: $out.md and $out.json. Upload both into the thread. Daily job pass: $($t.seconds) s, fits 09:30 to 09:40: $($t.fits_window), move to 10:00: $($t.move_to_10_00)."; $ok = $state -eq 'Succeeded' } } finally { $ErrorActionPreference='Continue'; if ($path -eq 'job') { & az containerapp job delete -g $rg -n $job --yes -o none; & az keyvault secret delete --vault-name $kv -n $secret -o none; if (Test-Path $src) { git worktree remove --force $src } }; if ($path -eq 'job' -and $ok -and $ours) { & az postgres flexible-server delete -g $rg -n $copy --yes; Write-Host "Deleted the job, the secret and the copy $copy." } else { Write-Host "Still there: the copy $copy$(if ($path -eq 'vm') { ' and the secret' }). Delete them today with the cleanup line (with Medallion, if the copy is theirs)." } }
+```
+
+**The cleanup line**, for whatever the line above left in place. It can be run again; what is
+already gone only gives a "not found". Leave out the last command when the copy is Medallion's:
+
+```powershell
+az containerapp job delete -g rg-ibkr-database-v11 -n ibkrv2stg-quant-shadow --yes -o none; az keyvault secret delete --vault-name ibkrv2stg-auhecwc4itaoo -n quant-shadow-copy-admin-url -o none; az postgres flexible-server delete -g rg-ibkr-database-v11 -n ibkrv2stg-quant-shadow-1030 --yes
+```
+
+### The admin VM variant (fallback)
+
+Use it when the execution cannot reach the copy (its `preflight` prints `Could not connect`), or
+when the job path cannot be used. Run it only after Medallion has finished with the VM, and never
+between 07:50 and 09:25 UTC.
+
+1. **Make the copy and its secret.** Run the line with `$path='vm'`. It does approval steps 1 to
+   5, prints the copy's host, and stops without deleting anything. If the job path already left our
+   copy in place, also set `$ours=$false`, so the line keeps that copy (as it would Medallion's)
+   instead of restoring another.
+2. **Run the tool on the VM**, through Bastion, in a clone at the same commit, as Medallion runs
+   its tools. Use the same settings as the job:
+
+   ```
+   export DATABASE_ADMIN_URL="$(az keyvault secret show --vault-name ibkrv2stg-auhecwc4itaoo -n quant-shadow-copy-admin-url --query value -o tsv)"
+   export LIVE_DATABASE_HOSTS=ibkrv2stg-pg-auhecwc4itaoo.postgres.database.azure.com,ibkrv2stg.postgres.database.azure.com,ibkrv11-pg-5rcc62xxqblay.postgres.database.azure.com
+   export IBKR_RUN_MIGRATIONS=false QUANT_ANALYTICS_MINUTES=8 PORTFOLIO_TENANT_ID=00000000-0000-0000-0000-000000000001
+   c="--copy-host <the copy's host> --copy-subnet 10.50.11.0/27"
+   python3 scripts/quant_shadow_run.py preflight $c && python3 scripts/quant_shadow_run.py apply-held $c && python3 scripts/quant_shadow_run.py run $c --runner admin-vm --max-minutes 210; python3 scripts/quant_shadow_run.py review $c --out ~/quant-shadow-review
+   ```
+
+   If the VM cannot read the vault, paste the copy's URL into `DATABASE_ADMIN_URL` by hand, as
+   Medallion's steps do. Never paste the live server's URL; the guard would refuse it anyway.
+3. **Bring back `~/quant-shadow-review/review.md` and `review.json`** as Medallion brings back its
+   reports, and upload both into the thread. Then delete that folder and `unset DATABASE_ADMIN_URL`.
+4. **Run the cleanup line** from the PC (with Medallion, if the copy is theirs).
+
+The VM is not the job's 0.5 CPU, so its window verdict is an estimate. The review says
+`admin-vm` and gives the CPU count. If the estimate is close to 600 s, treat it as not fitting.
+
+**A second rehearsal on the same copy:** `undo`, then `apply-held` and `run` again. This works
+from the VM, or from an execution of the job whose arguments are overridden for that execution
+only. `undo` drops the 076 and 077 objects and clears the run log, so the next daily-job pass is
+timed cold again.
+
 ## Switching on, in order
 
 Each step is its own day's change. Stop at any step that does not end as described.
@@ -231,3 +418,21 @@ pipelines), and the trade sections for derived subjects (no trades are stored fo
   nothing and a one-input change rebuilding only its sections; a failing day held back whole by
   the publish gate; the reader's fallback; the time budget and the lock; lineage; and both undos in
   either order leaving no trace.
+- `tests/test_quant_shadow_run.py`, no database, covers the shadow-run tool:
+  - the guard refuses, before anything connects, the live server, its alias, the hosts in
+    `LIVE_DATABASE_HOSTS`, a name that is not a copy's, a host other than `--copy-host`, a host
+    outside the subnet, and `hostaddr` and `service`;
+  - the masking;
+  - the percentile and window maths on known values;
+  - the review's log framing;
+  - the Bicep: manual trigger only, no role assignment, and a required image tag.
+- `tests/test_quant_shadow_run_db.py`, PostgreSQL, runs the shadow-run tool against the local
+  server, using the harness above:
+  - `preflight` changes nothing;
+  - `apply-held` is idempotent and never writes to `schema_migrations`;
+  - `run` with tiny budgets on a test clock carries on where it stopped, and retries a failed
+    section;
+  - the review: every id is masked (no `U9...` anywhere), no number from a stored payload appears,
+    and the timing maths is checked on known timings;
+  - `undo`, including after a half-applied or failing draft, leaves the database as it was, and a
+    second rehearsal runs.

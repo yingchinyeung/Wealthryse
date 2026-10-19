@@ -169,7 +169,9 @@ def snapshot_rows(account_id: str, day: date, valuation: AccountValuation, us: U
         add(holding, "KRX")
     stock_krw = sum((item.market_value for item in valuation.holdings), Decimal("0"))
     cash = [{"account_id": account_id, "snapshot_date": snapshot, "currency": BASE_CURRENCY,
-             "ending_cash_text": _text(valuation.deposit), "settled_cash_text": _text(valuation.deposit),
+             "ending_cash_text": _text(valuation.deposit),
+             "settled_cash_text": _text(valuation.deposit if valuation.settled_deposit is None
+                                        else valuation.settled_deposit),
              "fx_rate_to_base_text": "1"}]
     fx_rates: list[dict[str, Any]] = []
     total_krw = valuation.estimated_assets
@@ -399,11 +401,20 @@ def _register(connection, new_securities: Iterable[NewSecurity], instruments: It
         )
 
 
-def _clear_day(connection, account_id: str, day: date) -> None:
+def _clear_day(connection, account_id: str, day: date, fx_rates: Sequence[Mapping[str, Any]] = ()) -> None:
     # A day's snapshot is replaced whole, so a holding sold since the last run of the day disappears.
-    for table, column in (("position_snapshots", "snapshot_date"), ("cash_snapshots", "snapshot_date"),
-                          ("fx_rates", "rate_date")):
-        connection.execute(f"DELETE FROM {table} WHERE account_id = ? AND {column} = ?",
+    for table in ("position_snapshots", "cash_snapshots"):
+        connection.execute(f"DELETE FROM {table} WHERE account_id = ? AND snapshot_date = ?",
+                           (account_id, day.isoformat()))
+    # FX rates are upserted, and only a rate no longer returned is removed, so an unchanged
+    # rate keeps its row (and its silver history) when a day is collected again.
+    kept = sorted({str(row["from_currency"]) for row in fx_rates})
+    if kept:
+        marks = ", ".join("?" for _ in kept)
+        connection.execute(f"DELETE FROM fx_rates WHERE account_id = ? AND rate_date = ? "
+                           f"AND from_currency NOT IN ({marks})", (account_id, day.isoformat(), *kept))
+    else:
+        connection.execute("DELETE FROM fx_rates WHERE account_id = ? AND rate_date = ?",
                            (account_id, day.isoformat()))
 
 
@@ -426,7 +437,7 @@ def store(connection, collected: Collected, *, display_name: str, now: datetime)
          json.dumps({"source": SOURCE, "account_name": collected.valuation.account_name}, ensure_ascii=False)),
     )
     _register(connection, collected.new_securities, collected.rows["instruments"], stamp)
-    _clear_day(connection, collected.account_id, collected.day)
+    _clear_day(connection, collected.account_id, collected.day, collected.rows["fx_rates"])
     counts: dict[str, int] = {}
     for table, keys in _KEYS.items():
         rows = [{**row, "row_sha256": _sha(row), "last_seen_run_id": run_id} for row in collected.rows[table]]
@@ -449,31 +460,71 @@ def trading_weekdays(start: date, end: date) -> list[date]:
 
 
 def days_with_snapshots(connection, account_id: str, start: date, end: date) -> set[date]:
-    rows = connection.execute(
-        "SELECT DISTINCT snapshot_date FROM nav_snapshots WHERE account_id = ? AND asset_class = 'TOTAL' "
-        "AND snapshot_date BETWEEN ? AND ?",
-        (account_id, start.isoformat(), end.isoformat()),
-    ).fetchall()
-    return {date.fromisoformat(str(row["snapshot_date"])[:10]) for row in rows}
+    """Stored days whose holdings plus cash equal Kiwoom's total.
 
-
-def stored_gaps(connection, account_id: str, start: date, end: date) -> list[dict[str, str]]:
-    """Every stored day whose holdings plus cash differ from Kiwoom's total by more than 1 KRW.
-
-    Read from the stored totals, so days filled on earlier runs count too.
+    A day stored before cash was kept on a trade-date basis shows a gap on days
+    with unsettled trades; leaving it out here has the history fill it again.
     """
 
     rows = connection.execute(
         "SELECT snapshot_date, total_text, cash_text, stock_text FROM nav_snapshots "
-        "WHERE account_id = ? AND asset_class = 'TOTAL' AND snapshot_date BETWEEN ? AND ? ORDER BY snapshot_date",
+        "WHERE account_id = ? AND asset_class = 'TOTAL' AND snapshot_date BETWEEN ? AND ?",
         (account_id, start.isoformat(), end.isoformat()),
     ).fetchall()
-    gaps = []
-    for row in rows:
-        gap = Decimal(str(row["total_text"])) - Decimal(str(row["cash_text"])) - Decimal(str(row["stock_text"]))
-        if abs(gap) > Decimal("1"):
-            gaps.append({"date": str(row["snapshot_date"])[:10], "gap": _text(gap)})
-    return gaps
+    return {date.fromisoformat(str(row["snapshot_date"])[:10]) for row in rows
+            if abs(_nav_gap(row)) <= Decimal("1")}
+
+
+def _nav_gap(row) -> Decimal:
+    return Decimal(str(row["total_text"])) - Decimal(str(row["cash_text"])) - Decimal(str(row["stock_text"]))
+
+
+def history_issues(connection, account_id: str, start: date, end: date) -> list[dict[str, str]]:
+    """Stored days that do not reconcile, read from the stored rows so earlier runs' days count too.
+
+    Two checks a day, each to 1 KRW:
+    - total: holdings plus cash equal Kiwoom's total;
+    - unsettled: cash not yet settled (ending less settled KRW cash) equals the
+      net cash of Kiwoom's own trades on that day and the trading day before,
+      the two days still to settle. This catches anything else in Kiwoom's
+      total (funds, RP, receivables) that would otherwise pass as cash.
+    """
+
+    lead = start - timedelta(days=14)
+    nav = connection.execute(
+        "SELECT snapshot_date, total_text, cash_text, stock_text FROM nav_snapshots "
+        "WHERE account_id = ? AND asset_class = 'TOTAL' AND snapshot_date BETWEEN ? AND ? ORDER BY snapshot_date",
+        (account_id, lead.isoformat(), end.isoformat()),
+    ).fetchall()
+    cash = {str(row["snapshot_date"])[:10]: row for row in connection.execute(
+        "SELECT snapshot_date, ending_cash_text, settled_cash_text FROM cash_snapshots "
+        "WHERE account_id = ? AND currency = ? AND snapshot_date BETWEEN ? AND ?",
+        (account_id, BASE_CURRENCY, lead.isoformat(), end.isoformat()),
+    ).fetchall()}
+    traded: dict[str, Decimal] = {}
+    for row in connection.execute(
+        "SELECT trade_date, net_cash_text FROM trades WHERE account_id = ? AND currency = ? AND trade_date BETWEEN ? AND ?",
+        (account_id, BASE_CURRENCY, lead.isoformat(), end.isoformat()),
+    ).fetchall():
+        key = str(row["trade_date"])[:10]
+        traded[key] = traded.get(key, Decimal("0")) + Decimal(str(row["net_cash_text"] or "0"))
+    issues: list[dict[str, str]] = []
+    previous: str | None = None
+    for row in nav:
+        day = str(row["snapshot_date"])[:10]
+        if day >= start.isoformat():
+            gap = _nav_gap(row)
+            if abs(gap) > Decimal("1"):
+                issues.append({"date": day, "check": "total", "gap": _text(gap)})
+            balance = cash.get(day)
+            if balance is not None and balance["settled_cash_text"] is not None:
+                unsettled = Decimal(str(balance["ending_cash_text"])) - Decimal(str(balance["settled_cash_text"]))
+                expected = traded.get(day, Decimal("0")) + (traded.get(previous, Decimal("0")) if previous else Decimal("0"))
+                if abs(unsettled - expected) > Decimal("1"):
+                    issues.append({"date": day, "check": "unsettled", "gap": _text(unsettled - expected),
+                                   "unsettled": _text(unsettled), "trades": _text(expected)})
+        previous = day
+    return issues
 
 
 def build_history(connection, client: KiwoomClient, *, broker_account_id: str, history_start: date, today: date,
@@ -481,7 +532,7 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
     """Fill past trading days that have no snapshot, in the caller's transaction, and say what is left.
 
     Returns the history_built check: pending while days remain, then pass, or
-    warn when some past day's holdings plus cash differ from Kiwoom's total.
+    warn when some stored day does not reconcile (see history_issues).
     """
 
     account_id = platform_account_id(broker_account_id)
@@ -514,16 +565,19 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
         _register(connection, (securities.new[key] for key in sorted(securities.new)),
                   [row for rows in written for row in rows["instruments"]], stamp)
         for day, rows in zip(loaded, written):
-            _clear_day(connection, account_id, day)
+            _clear_day(connection, account_id, day, rows["fx_rates"])
             for table in ("position_snapshots", "cash_snapshots", "nav_snapshots", "fx_rates"):
                 _upsert(connection, table,
                         [{**row, "row_sha256": _sha(row), "last_seen_run_id": run_id} for row in rows[table]],
                         _KEYS[table])
-    gaps = stored_gaps(connection, account_id, history_start, end)
+    gaps = history_issues(connection, account_id, history_start, end)
     evidence: dict[str, Any] = {
         "from": history_start.isoformat(), "to": end.isoformat(), "loaded_this_run": len(loaded),
         "days_with_history": len(have) + len(loaded), "closed_days": [day.isoformat() for day in closed][:40],
-        "days_left": len(remaining), "gap_days": len(gaps), "gaps": gaps[:20], "us_holdings_listed_from_first_collected_day": include_us,
+        "days_left": len(remaining), "gap_days": len({gap["date"] for gap in gaps}), "gaps": gaps[:20],
+        "cash_basis": "trade date; settled cash kept as settled_cash_text",
+        "us_cash_basis": "settled" if include_us else "not collected",
+        "us_holdings_listed_from_first_collected_day": include_us,
     }
     if remaining:
         return {"status": "pending", "evidence": evidence,
@@ -531,12 +585,13 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
                            "next runs."}
     if gaps:
         return {"status": "warn", "evidence": evidence,
-                "message": f"Daily history from {history_start.isoformat()} is complete, but on {len(gaps)} days "
-                           f"holdings plus cash differ from Kiwoom's total, for example {gaps[0]['date']} by "
-                           f"{gaps[0]['gap']} KRW. Check those days before approving the reports."}
+                "message": f"Daily history from {history_start.isoformat()} is complete, but "
+                           f"{evidence['gap_days']} days do not reconcile, for example {gaps[0]['date']} "
+                           f"({gaps[0]['check']}, {gaps[0]['gap']} KRW). Check those days before approving "
+                           "the reports."}
     return {"status": "pass", "evidence": evidence,
             "message": f"Daily history from {history_start.isoformat()} is complete: "
-                       f"{len(have) + len(loaded)} trading days, each matching Kiwoom's total."}
+                       f"{len(have) + len(loaded)} trading days, each matching Kiwoom's total and its unsettled trades."}
 
 
 # The daily run ---------------------------------------------------------------------

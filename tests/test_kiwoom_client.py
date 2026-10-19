@@ -114,7 +114,7 @@ class KiwoomClientTests(unittest.TestCase):
         self.assertEqual([h.code for h in valuation.holdings], ["005930", "000660"])
         self.assertEqual(valuation.holdings[0].identifiers, [SecurityIdentifier("krx_code", "005930")])
         self.assertEqual(valuation.holdings[0].price, Decimal("71500"))
-        self.assertEqual(valuation.deposit, Decimal("500000"))
+        self.assertEqual((valuation.deposit, valuation.settled_deposit), (Decimal("500000"), Decimal("1000000")))
         token_calls = [r for r in fake.requests if r[0].endswith("/oauth2/token")]
         self.assertEqual(len(token_calls), 1)
         second_page = fake.requests[-1][1]
@@ -213,6 +213,13 @@ class KiwoomPastDayTests(unittest.TestCase):
         # A stock sold out by that day is left out.
         self.assertEqual([(h.code, h.quantity, h.price) for h in valuation.holdings],
                          [("005930", Decimal("100"), Decimal("70000"))])
+        self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
+
+    def test_a_past_days_cash_is_on_a_trade_date_basis(self) -> None:
+        # A buy not yet settled: dbst_bal still holds the cash, Kiwoom's total does not.
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dbst_bal="000000004000000")]})
+        valuation = _client(fake).balance_on(date(2025, 6, 2))
+        self.assertEqual((valuation.deposit, valuation.settled_deposit), (Decimal("1000000"), Decimal("4000000")))
         self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
 
     def test_a_closed_day_is_none(self) -> None:

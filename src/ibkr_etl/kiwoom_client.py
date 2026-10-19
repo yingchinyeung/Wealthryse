@@ -149,6 +149,9 @@ class AccountValuation:
     deposit: Decimal
     estimated_assets: Decimal
     holdings: tuple[Holding, ...]
+    # Cash already settled (D+0), when Kiwoom gives it; deposit minus this is
+    # what the last two trading days' trades still owe or bring.
+    settled_deposit: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -313,6 +316,7 @@ class KiwoomClient:
             deposit=kiwoom_number(account["d2_entra"] if "d2_entra" in account else _field(account, "entr")),
             estimated_assets=kiwoom_number(_field(account, "prsm_dpst_aset_amt")),
             holdings=tuple(holdings),
+            settled_deposit=kiwoom_number(account["entr"]) if "d2_entra" in account and "entr" in account else None,
         )
 
     def balance_on(self, day: date) -> AccountValuation | None:
@@ -320,6 +324,12 @@ class KiwoomClient:
 
         Kiwoom answers a closed day with another day's figures, so an answer
         dated differently from the day asked for is read as closed.
+
+        The answer's deposit (dbst_bal) is settled cash; its total counts trades
+        not yet settled (Korea settles two trading days later). So cash on a
+        trade-date basis, as IBKR's ending cash is, is the total less the
+        holdings, and dbst_bal is kept as the settled cash. The collector checks
+        the difference against Kiwoom's own trades of the last two trading days.
         """
 
         pages = self.inquire("ka01690", {"qry_dt": _yyyymmdd(day)})
@@ -341,11 +351,14 @@ class KiwoomClient:
                     price=kiwoom_number(_field(row, "cur_prc"), unsigned=True),
                     market_value=kiwoom_number(_field(row, "evlt_amt")),
                 ))
+        held = tuple(holding for holding in holdings if holding.quantity)
+        total = kiwoom_number(_field(first, "day_stk_asst"))
         return AccountValuation(
             account_name="",
-            deposit=kiwoom_number(_field(first, "dbst_bal")),
-            estimated_assets=kiwoom_number(_field(first, "day_stk_asst")),
-            holdings=tuple(holding for holding in holdings if holding.quantity),
+            deposit=total - sum((holding.market_value for holding in held), Decimal("0")),
+            estimated_assets=total,
+            holdings=held,
+            settled_deposit=kiwoom_number(_field(first, "dbst_bal")),
         )
 
     def transactions(self, start: date, end: date) -> list[CashMovement]:

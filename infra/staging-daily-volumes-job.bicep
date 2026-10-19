@@ -1,14 +1,17 @@
 targetScope = 'resourceGroup'
 
-// Daily traded volumes into silver.daily_volumes (docs/PHASE3_DATA.md). No new fetch: the job
-// reads the Yahoo chart responses already kept in bronze-market-data (feed yahoo-chart).
+// Daily traded volumes into silver.daily_volumes (docs/PHASE3_DATA.md). The job reads the Yahoo
+// chart responses kept in bronze-market-data (feed yahoo-chart). With dailyVolumesFetch=on it first
+// fetches the holdings' own charts, keeping each response there before it is parsed.
 param jobName string = 'ibkrv2stg-daily-volumes'
 param environmentName string = 'ibkrv2stg-env'
 param registryName string
 param keyVaultName string
 // The ingestion identity (staging.bicep), as the market-data jobs use: it reads the
-// database-app-url secret and holds Storage Blob Data Contributor on bronze-market-data, which
-// covers reading the captures. No new role assignment.
+// database-app-url secret and holds Storage Blob Data Contributor on the bronze-market-data
+// container itself (ingestionBronzeMarketDataContributor, made 18 Oct 2026), which covers reading
+// the captures and writing the fetch's raw copies, and stays when the account-wide role goes. No
+// new role assignment.
 param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
@@ -18,6 +21,11 @@ param bronzeContainer string = 'bronze-market-data'
 // backfill has been run by hand and checked (docs/PHASE3_DATA.md, switching on).
 @allowed(['off', 'on'])
 param dailyVolumesLoad string = 'off'
+// The holdings' own chart fetch (--fetch, which the job always passes) does nothing unless this is
+// on, and needs dailyVolumesLoad on too. Leave it off until one fetch has been run by hand and
+// checked (docs/PHASE3_DATA.md, switching on).
+@allowed(['off', 'on'])
+param dailyVolumesFetch string = 'off'
 // Lineage records each run, with the captures it read (U4).
 @allowed(['false', 'true'])
 param lineageRecording string = 'true'
@@ -90,7 +98,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           name: 'daily-volumes'
           image: '${registry.properties.loginServer}/ibkr-platform@${imageDigest}'
           command: ['python']
-          args: ['scripts/load_daily_volumes.py']
+          args: ['scripts/load_daily_volumes.py', '--fetch']
           env: [
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
@@ -99,6 +107,12 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${storageAccountName}.blob.${environment().suffixes.storage}' }
             { name: 'DAILY_VOLUMES_CONTAINER', value: bronzeContainer }
             { name: 'DAILY_VOLUMES_LOAD', value: dailyVolumesLoad }
+            { name: 'DAILY_VOLUMES_FETCH', value: dailyVolumesFetch }
+            // The fetch's raw copies go to the container the load reads (this job only; the jobs
+            // the publish gate binds are unchanged). Up to 60 responses a run: more than the
+            // default 30-second capture budget.
+            { name: 'MARKET_DATA_RAW_CONTAINER', value: bronzeContainer }
+            { name: 'MARKET_DATA_RAW_BUDGET_SECONDS', value: '120' }
             { name: 'LINEAGE_RECORDING', value: lineageRecording }
             // The app login cannot create tables, so the job must not try migrations.
             { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }

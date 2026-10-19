@@ -52,24 +52,25 @@ What every feed here has in common:
 | Held migration and its undo | `infra/medallion/drafts/daily_volumes.sql`, `daily_volumes_undo.sql` |
 | Job | `ibkrv2stg-daily-volumes`, `infra/staging-daily-volumes-job.bicep`, daily 06:30 UTC, 15 minutes at most |
 | Code | `scripts/load_daily_volumes.py`, `src/ibkr_etl/daily_volumes.py` |
-| Setting | `DAILY_VOLUMES_LOAD` (`off` unless set to `on`) |
-| Bronze | `bronze-market-data`, `yahoo-chart/`: read only, with no new fetch |
+| Settings | `DAILY_VOLUMES_LOAD`, and `DAILY_VOLUMES_FETCH` for the holdings' own fetch (each `off` unless set to `on`) |
+| Bronze | `bronze-market-data`, `yahoo-chart/`: read; with the fetch on, the holdings' responses are written there first |
 | Licence | `yfinance-internal-only` |
 | Freshness | `silver.daily_volumes`: due 07:00 UTC, 4 days old at most; held and not required |
 
 ### What it captures
 
-There is no new fetch. `ibkrv2stg-derived-daily` already asks Yahoo's chart API for the
-instruments in `market_data_prices`, through `market_data.fetch_daily_closes`. Today those are SPY
-and the Hang Seng index `^HSI`, from 13 Jan 2025 to today. Each response carries every day's volume
-beside its close. When raw capture is on, the response is kept as received under
+Two fetches leave Yahoo chart responses in bronze. `ibkrv2stg-derived-daily` asks Yahoo's chart
+API for the instruments in `market_data_prices`, through `market_data.fetch_daily_closes`. Today
+those are SPY and the Hang Seng index `^HSI`, from 13 Jan 2025 to today. This job's own fetch asks
+for the holdings (below). Each response carries every day's volume beside its close. When raw
+capture is on, the response is kept as received under
 `yahoo-chart/<yyyy>/<mm>/<dd>/<symbol>_<start>_<end>_1d-<sha>.json`, or under `yahoo-chart/history/`
 once its window has settled. This job reads those files:
 
-- **Instruments.** The job takes the chart rows of `market_data_prices` (source
-  `Yahoo Finance chart API`), each with the symbol and currency of its newest row. A capture belongs
-  to an instrument when its request key starts with the instrument's symbol, and the response's own
-  symbol and currency match.
+- **Instruments.** For the benchmarks, the job takes the chart rows of `market_data_prices` (source
+  `Yahoo Finance chart API`), each with the symbol and currency of its newest row. The holdings come
+  from the fetch below. A capture belongs to an instrument when its request key starts with the
+  instrument's symbol, and the response's own symbol and currency match.
 - **Dates.** They are the exchange's own, read the way `fetch_daily_closes` reads the closes, so a
   volume and its close share a date.
 - **Missing and zero volumes.** A day without a usable volume (null, not finite, or below zero) is
@@ -95,15 +96,80 @@ once its window has settled. This job reads those files:
     keeping its responses;
   - `failed` (exit 1): an instrument could not be written, or a capture could not be read.
 
-**Before switching on: the captures.** Today `ibkrv2stg-derived-daily` does not set
-`MARKET_DATA_RAW_CONTAINER`, so the chart responses are not kept, and this job would find nothing
-(`no_captures`). To keep them, add raw capture to that job (`infra/staging-derived-refresh.bicep`):
-`MARKET_DATA_RAW_CONTAINER=bronze-market-data`, with its identity able to write there. That job is
-one of the four the publish gate binds, so this is its own decision and its own day, and it is not
-part of this change.
+**Before switching on: the benchmarks' captures.** Today `ibkrv2stg-derived-daily` does not set
+`MARKET_DATA_RAW_CONTAINER`, so its chart responses are not kept, and this job finds none for SPY
+and `^HSI` (`no_captures`, unless the holdings' fetch kept something). To keep them, add raw capture
+to that job (`infra/staging-derived-refresh.bicep`): `MARKET_DATA_RAW_CONTAINER=bronze-market-data`,
+with its identity able to write there. That job is one of the four the publish gate binds, so this
+is its own decision and its own day, and it is not part of this change. The holdings do not need
+it: their fetch keeps its own responses.
 
-**Coverage.** This feed covers only the instruments the chart fetch asks for, which today are SPY
-and `^HSI`. The volumes of holdings would need a fetch of their own, which is not in this change.
+### The holdings' own fetch
+
+The Liquidity section and the pre-trade market impact need the holdings' volumes. The benchmarks'
+fetch above is not changed, so this job fetches the holdings itself. The job always passes
+`--fetch`. It fetches nothing unless `DAILY_VOLUMES_FETCH=on` (with `DAILY_VOLUMES_LOAD=on`); then,
+after the held check and before the benchmarks' load:
+
+- **Which holdings.** Every instrument held (quantity not zero) by a physical account on that
+  account's latest position date. They come from silver `subject_position_series` (`source_kind`
+  `physical_account`), with `instruments` and `instrument_classifications`. Derived subjects add
+  nothing of their own. No bronze table is read.
+- **Stored under the conid.** A holding's rows have its IBKR conid as `instrument_id`, the key the
+  gold sections join positions on. The benchmarks keep their `market_data_prices` ids.
+- **The Yahoo symbol.** It is worked out as the platform already does it:
+  - the candidates come from `sector_classification.candidate_symbols` (for example `0700.HK` for
+    SEHK 700, `BRK-B` for BRK B, and `.T`, `.AX`, `.KS` or `.KQ`, `.TW` or `.TWO`, `.L`);
+  - they are tried in order, as `crisis_replay` tries them;
+  - the symbol the sector lookup matched (`instrument_classifications.lookup_symbol`, provider
+    `Yahoo Finance search profile`) goes first when it is one of those candidates. An owner's override
+    to another line, such as a warrant's underlying, is not used;
+  - a candidate counts only when Yahoo answers with a chart for that symbol in the holding's currency.
+- **Never guessed.** These are listed in the summary (`not_mapped`) and not fetched:
+  - an IBKR asset category other than `STK` (options, warrants, bonds, funds);
+  - a receivable (`.REC`);
+  - a contract with no symbol in `instruments`, or no currency.
+
+  A holding whose every candidate Yahoo refuses (404, or another currency) is listed as `not_found`,
+  with the symbols tried.
+- **The fetch.** Each request is `market_data.fetch_daily_closes`, daily interval, so `raw_capture`
+  keeps the response as received under `yahoo-chart/<yyyy>/<mm>/<dd>/` first, and market_data's three
+  attempts with backoff apply. The volumes are then read back from bronze and parsed exactly as the
+  load above parses them. A response that was not kept is never parsed (`not_captured`, a failure).
+- **The window.** The last year for a holding with no volumes stored yet. After that, the last 10
+  days, or from the day before its latest stored day when that is older, so a pause leaves no gap.
+- **Pacing.**
+  - A fixed pause of 1 second between two requests.
+  - At most 60 requests a run (`--max-symbols`) and 480 seconds of fetching, well inside the
+    15-minute run.
+  - One request per symbol and window, even when two conids share it.
+  - What is left waits for the next run, which starts with the least recently loaded. The rest also
+    wait if Yahoo still answers 429 (too many requests) after market_data's retries, or if raw
+    capture switches itself off (a storage error, or its time budget used).
+- **Its raw copies.** `MARKET_DATA_RAW_CONTAINER=bronze-market-data`, with
+  `MARKET_DATA_RAW_BUDGET_SECONDS=120`, is set on this job only. With raw capture unset, or writing
+  to another container than the one the load reads, the fetch asks Yahoo for nothing and the run
+  fails (`capture_off`).
+- **The identity.** The job runs as the ingestion identity. It holds Storage Blob Data Contributor on
+  the `bronze-market-data` container itself (`ingestionBronzeMarketDataContributor` in
+  `infra/staging.bicep`, assigned 18 Oct 2026 in medallion S4a). That role covers the reads and the
+  writes, and it is not the account-wide role Medallion narrows on Thu 22 Oct, so no role assignment
+  is added. Step 7 below checks it is still there.
+- **Output.**
+  - First, one JSON line per holding: outcome, Yahoo symbol, symbols tried, window, captures and
+    the load's counts.
+  - Then the benchmarks' lines.
+  - Then the summary, with a `fetch` part: holdings, mapped, requests, fetched, captured, rows,
+    written, `not_mapped`, `not_found`, `failed`, `deferred` with the reason, and raw capture's
+    counts.
+  - The status is `failed` (exit 1) when a request failed, a response was not kept, a holding could
+    not be written, a capture could not be read, or raw capture is not set up. Holdings not mapped,
+    not found or deferred do not fail the run.
+- **Before switching on: the contract.** The silver contract
+  (`infra/medallion/contracts/silver/daily_volumes.yaml`) says `instrument_id` is as in
+  `market_data_prices`. Its warning rule `instrument_has_prices` counts every row whose instrument has
+  no closes there, so each holding's rows would count. The contract's owners need to let that
+  description and rule accept a conid in `instruments` (step 8).
 
 **Licence.** Yahoo chart data is `yfinance-internal-only`, as for the other Yahoo feeds. That
 licence is in the job's `dataLicense` tag and in the contract's `dataLicense` property. Internal use
@@ -116,8 +182,8 @@ migration number on that day: 078 if the quant drafts have taken 076 and 077 and
 come first. Factor returns can take the next free day after that; the two drafts are tested in
 either order.
 
-Run each line from a clone of `main` after `az login`. Run steps 3, 5 and 6 outside 07:50 to
-09:25 UTC.
+Run each line from a clone of `main` after `az login`. Run steps 3, 5, 6, 9 and 10 outside 07:50 to
+09:25 UTC. Steps 7 to 10 switch on the holdings' fetch, on a later free day once the load runs.
 
 | # | Where | PowerShell line | What it does |
 |---|---|---|---|
@@ -127,15 +193,22 @@ Run each line from a clone of `main` after `az login`. Run steps 3, 5 and 6 outs
 | 4 | Ying's PC | `az deployment group create -g rg-ibkr-database-v11 -f infra/staging-daily-volumes-job.bicep -p registryName=<registry> keyVaultName=<vault> identityResourceId=<ingestion identity id> imageDigest=<platform digest>` | Deploys the job with `dailyVolumesLoad=off`. Its 06:30 run prints `{"status": "off", ...}` and exits 0. Record the job in `deploy/deployed-images.json` in a PR. |
 | 5 | Ying's PC | `az containerapp job start -g rg-ibkr-database-v11 -n ibkrv2stg-daily-volumes --container-name daily-volumes --image <its image> --env-vars DAILY_VOLUMES_LOAD=on --args scripts/load_daily_volumes.py --from 2025-01-13` | One backfill by hand, needing the captures (above). Check the summary: `status` `success`, `written` above 0, and no unreadable captures. Then spot-check a few rows against Yahoo. |
 | 6 | Ying's PC | step 4's line with `dailyVolumesLoad=on` added to `-p` | From the next 06:30 run, each run loads the last three days' captures. Once it has run for a week, the freshness rule can be made required. |
+| 7 | Ying's PC | `az role assignment list --assignee <ingestion identity principal id> --scope <storage account id>/blobServices/default/containers/bronze-market-data --query "[].roleDefinitionName" -o tsv` | Read only. It should print `Storage Blob Data Contributor`. If it does not, stop: the job needs Storage Blob Data Contributor for the ingestion identity on the `bronze-market-data` container scope, added with Medallion's agreement, not by this change. |
+| 8 | PR | the contract change above | The contract's `instrument_id` and `instrument_has_prices` accept a conid in `instruments`, with its owners' review. |
+| 9 | Ying's PC | `az containerapp job start -g rg-ibkr-database-v11 -n ibkrv2stg-daily-volumes --container-name daily-volumes --image <its image> --env-vars DAILY_VOLUMES_LOAD=on DAILY_VOLUMES_FETCH=on --args scripts/load_daily_volumes.py --fetch --max-symbols 5` | One small fetch by hand. In the summary's `fetch`, check: `status` `success`, `captured` equal to `fetched`, and the `not_mapped` and `not_found` lists. Check the captures are in `yahoo-chart/<today>/`, then spot-check a few rows against Yahoo. |
+| 10 | Ying's PC | step 4's line with `dailyVolumesLoad=on dailyVolumesFetch=on` added to `-p` | From the next 06:30 run, the job fetches up to 60 holdings, then loads them and the benchmarks. Until every holding has volumes, each run fetches a year for up to 60 of them. |
 
 ### Undoing
 
+- **The fetch alone.** Redeploy with `dailyVolumesFetch=off`. The job loads only the benchmarks
+  again. The holdings' rows and their captures stay.
 - **Lighter.** Redeploy with `dailyVolumesLoad=off`. The rows stay, and nothing reads them until
   the gold section that uses them is switched on.
 - **Whole.** `daily_volumes_undo.sql` drops the table and its view, with their policy, comments and
   grants, and nothing else. `market_data_prices` and the bronze captures are untouched.
   - Run the undo as its own numbered migration with `--only-migration`, or by psql.
-  - No copy is needed first: a backfill rebuilds the rows from bronze.
+  - No copy is needed first. A backfill rebuilds the benchmarks' rows from bronze. The holdings'
+    rows come back from the fetch: each holding then held, with no rows, gets a year again.
   - If the migration should run again later, delete its ledger row by hand.
   - Remove the job with `az containerapp job delete -g rg-ibkr-database-v11 -n ibkrv2stg-daily-volumes`.
 

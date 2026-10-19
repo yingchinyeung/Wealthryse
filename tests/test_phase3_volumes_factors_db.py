@@ -12,6 +12,10 @@ captures (idempotent, the newest capture winning, an older one never replacing a
 dates); the factor table alone; its load with vintages kept and an unchanged rerun writing
 nothing; the ETF stand-ins only with the flag and only after the library's latest day; row
 security, constraints and contract rules on both; lineage.
+HoldingsFetchDbTests, its own database: the holdings' fetch as the job's app login. The holdings
+read from silver only (each physical account's latest date, quantity not zero, no derived subject,
+no other tenant, the sector lookup's symbol); a year fetched at first, then ten days; volumes under
+the conid; a rerun writing nothing; lineage naming the silver reads, the captures and the table.
 DraftUndoTests: each draft applied and undone alone in either order, leaving no trace, and both
 drafts on a database without the layers.
 """
@@ -27,16 +31,17 @@ import shutil
 import tempfile
 import unittest
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import test_medallion_layers_db as layers
-from test_phase3_volumes_factors import (FIVE_FACTOR_CSV, MOMENTUM_CSV, _Bronze, _Exploding, _Uploads, chart,
-                                         download, french_zip)
+from test_phase3_volumes_factors import (FETCH_NOW, FETCH_TODAY, FIVE_FACTOR_CSV, MOMENTUM_CSV, YEAR_AGO, _Bronze,
+                                         _capture_into, _CapturingBronze, _Exploding, _hk, _Uploads, _us, _Yahoo,
+                                         chart, download, french_zip)
 from ibkr_etl import daily_volumes as dv
 from ibkr_etl import factor_returns as fr
-from ibkr_etl import fama_french, layer_freshness, lineage, raw_capture
+from ibkr_etl import fama_french, layer_freshness, lineage, market_data, raw_capture
 
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
@@ -580,6 +585,197 @@ class Phase3TablesTests(unittest.TestCase):
                 else:
                     self.assertEqual(sorted(blobs), sorted(f"{CONTAINER}/{call['name']}" for call in self.uploads.calls))
                     self.assertEqual({call["metadata"]["job_run_id"] for call in self.uploads.calls}, {str(run_id)})
+
+
+def _seed_holdings(owner) -> None:
+    """Two physical accounts, each on its own latest date; a derived subject; another tenant's
+    account; and the sector lookup's classifications."""
+    owner.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+    run = owner.execute("INSERT INTO ingestion_runs (run_type, started_at, completed_at, status) VALUES "
+                        "('synthetic', '2026-10-16', '2026-10-16', 'success') RETURNING run_id").fetchone()[0]
+    with owner.cursor() as cursor:
+        cursor.executemany(
+            "INSERT INTO silver.instruments (conid, symbol, asset_category, currency, listing_exchange, first_seen_at, "
+            "last_seen_at, source_json) VALUES (%s, %s, %s, %s, %s, '2023-01-01', '2026-10-16', '{}')", [
+                ("9100001", "SYNA", "STK", "USD", "NASDAQ"),
+                ("9100002", "700", "STK", "HKD", "SEHK"),
+                ("9100003", "SYNA  261120C00050000", "OPT", "USD", "CBOE"),
+                ("9100004", "SYNB.REC", "STK", "USD", "NYSE"),
+                ("9100005", "SYNC", "STK", "USD", "NYSE"),  # held only before the latest date
+                ("9100006", "SYND", "STK", "USD", "NYSE"),  # quantity 0 on the latest date
+                ("9100007", "SYNE", "STK", "USD", "NYSE"),  # held by the derived subject only
+                ("9100008", "SYNF", "STK", "USD", "NYSE")])  # held by the other tenant only
+        for account in ("U9100001", "U9100002"):
+            cursor.execute("INSERT INTO silver.accounts (account_id, base_currency, first_seen_at, last_seen_at, "
+                           "source_json) VALUES (%s, 'USD', '2023-01-01', '2026-10-16', '{}')", (account,))
+        cursor.executemany(
+            "INSERT INTO silver.position_snapshots (account_id, snapshot_date, conid, currency, quantity_text, "
+            "mark_price_text, market_value_text, row_sha256, last_seen_run_id) VALUES (%s, %s, %s, %s, %s, '1', '1', "
+            "'p', %s)", [(*row, run) for row in (
+                ("U9100001", "2026-10-15", "9100001", "USD", "100"),
+                ("U9100001", "2026-10-15", "9100005", "USD", "50"),
+                ("U9100001", "2026-10-16", "9100001", "USD", "100"),
+                ("U9100001", "2026-10-16", "9100002", "HKD", "2000"),
+                ("U9100001", "2026-10-16", "9100003", "USD", "1"),
+                ("U9100001", "2026-10-16", "9100006", "USD", "0"),
+                # The second account's latest date is earlier: what it held then counts.
+                ("U9100002", "2026-10-09", "9100001", "USD", "10"),
+                ("U9100002", "2026-10-09", "9100004", "USD", "5"),
+                ("U9100002", "2026-10-09", "9100009", "USD", "-3"))])  # no instruments row; short
+        cursor.execute("INSERT INTO derived_portfolios (portfolio_id, name, source_account_id, base_currency, "
+                       "exclusion_rule_json, calculation_version, status, created_at, updated_at) VALUES "
+                       "('synthetic-derived', 'Synthetic derived', 'U9100001', 'USD', '{}', 'v1', 'active', "
+                       "'2026-10-16', '2026-10-16')")
+        cursor.execute("INSERT INTO silver.derived_portfolio_positions (portfolio_id, source_account_id, "
+                       "snapshot_date, conid, currency, quantity_text, generated_at) VALUES ('synthetic-derived', "
+                       "'U9100001', '2026-10-17', '9100007', 'USD', '10', '2026-10-17')")
+        cursor.executemany(
+            "INSERT INTO silver.instrument_classifications (conid, provider, symbol, lookup_symbol, sector, status, "
+            "quality_status, license_status, source_url, checked_at) VALUES (%s, %s, %s, %s, %s, %s, 'warn', "
+            "'restricted', 'synthetic', '2026-10-16')", [
+                ("9100002", dv.YAHOO_PROVIDER, "700", "0700.HK", "Communication Services", "classified"),
+                ("9100001", "synthetic", "SYNA", "WRONG", "Technology", "classified"),  # another provider
+                ("9100004", dv.YAHOO_PROVIDER, "SYNB.REC", None, None, "unclassified")])
+    owner.execute("SELECT set_config('app.tenant_id', %s, false)", (OTHER_TENANT,))
+    owner.execute("INSERT INTO silver.accounts (account_id, base_currency, first_seen_at, last_seen_at, source_json) "
+                  "VALUES ('U9200001', 'USD', '2023-01-01', '2026-10-16', '{}')")
+    owner.execute("INSERT INTO silver.position_snapshots (account_id, snapshot_date, conid, currency, quantity_text, "
+                  "mark_price_text, market_value_text, row_sha256, last_seen_run_id) VALUES ('U9200001', '2026-10-16', "
+                  "'9100008', 'USD', '10', '1', '1', 'p', %s)", (run,))
+    owner.execute("INSERT INTO silver.instrument_classifications (conid, provider, symbol, lookup_symbol, sector, "
+                  "status, quality_status, license_status, source_url, checked_at) VALUES ('9100001', %s, 'SYNA', "
+                  "'WRONG.OTHER', 'Technology', 'classified', 'warn', 'restricted', 'synthetic', '2026-10-16')",
+                  (dv.YAHOO_PROVIDER,))
+    owner.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+    owner.commit()
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class HoldingsFetchDbTests(unittest.TestCase):
+    """The holdings' own fetch as the job's app login, on its own database (in order): the holdings
+    read from silver only; a year fetched at first, then ten days; volumes under the conid; a rerun
+    writing nothing; lineage naming the silver reads and the captures."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.environment = patch.dict(os.environ, {
+            "IBKR_RUN_MIGRATIONS": "false", lineage.SWITCH_ENV: "", dv.SETTING: "", dv.FETCH_SETTING: "",
+            "PORTFOLIO_TENANT_ID": TENANT, raw_capture.CONTAINER_ENV: "", raw_capture.ACCOUNT_URL_ENV: ""})
+        cls.environment.start()
+        cls.database = None
+        try:
+            cls.database = _new_database("p3a_fetch_test")
+            _bootstrap(cls.database, "--only-migration", VOLUMES_FILE, "--allow-pending", FACTORS_FILE)
+            with layers._connect(cls.database) as owner:
+                _seed_holdings(owner)
+        except Exception:
+            cls.tearDownClass()
+            raise
+        cls.app_url = layers._url(cls.database, APP)
+        cls.bronze = _CapturingBronze()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.database:
+            layers._drop(cls.database, roles=ROLES)
+        cls.environment.stop()
+
+    def setUp(self):
+        lineage.reset()
+        _capture_into(self, self.bronze)
+
+    def _rows(self, sql: str, *parameters, user: str = WEB):
+        with layers._connect(self.database, user, TENANT) as connection:
+            return connection.execute(sql, parameters).fetchall()
+
+    def _job(self, yahoo, *args, entry: bool = False, now: datetime = FETCH_NOW):
+        script = _script("load_daily_volumes")
+        output = io.StringIO()
+        original = script.main
+        environment = {dv.SETTING: "on", dv.FETCH_SETTING: "on", "DATABASE_URL": self.app_url,
+                       lineage.SWITCH_ENV: "true" if entry else ""}
+        with patch.dict(os.environ, environment), patch.object(raw_capture, "utc_now", return_value=now), \
+                patch.object(script, "main", side_effect=lambda argv: original(
+                    argv, bronze=self.bronze, fetcher=yahoo, sleep=lambda seconds: None)), \
+                contextlib.redirect_stdout(output):
+            code = script.entry(["--fetch", *args]) if entry else script.main(["--fetch", *args])
+        lines = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith("{")]
+        return code, lines[-1], lines[:-1]
+
+    def test_1_the_holdings_are_read_from_silver_as_the_app_login(self):
+        from ibkr_etl.db import connect
+
+        connection = connect(Path("unused.sqlite"), self.app_url, TENANT)
+        try:
+            held = dv.held_instruments(connection)
+        finally:
+            connection.close()
+        self.assertEqual(held, [
+            dv.Holding("9100001", "SYNA", "NASDAQ", "USD", "STK"),  # the other provider's and tenant's lookups unseen
+            dv.Holding("9100002", "700", "SEHK", "HKD", "STK", "0700.HK"),
+            dv.Holding("9100003", "SYNA  261120C00050000", "CBOE", "USD", "OPT"),
+            dv.Holding("9100004", "SYNB.REC", "NYSE", "USD", "STK"),
+            dv.Holding("9100009", "", "", "USD", "")])
+        # Silver only, as the catalog files each relation the fetch reads.
+        catalog = json.loads((ROOT / "infra" / "medallion" / "catalog.json").read_text(encoding="utf-8"))["postgres"]
+        for name in dv.FETCH_INPUTS:
+            relation = name.split(".", 1)[1]
+            with self.subTest(relation=relation):
+                self.assertIn(f" {relation} ", dv.HOLDINGS_SQL)
+                self.assertEqual(catalog[f"public.{relation}"]["layer"], "silver")
+
+    def test_2_a_year_at_first_then_ten_days_stored_under_the_conid_and_a_rerun_writes_nothing(self):
+        charts = {"SYNA": _us("SYNA", [("2026-10-15", 1_200_000), ("2026-10-16", 1_350_000)]),
+                  "0700.HK": _hk("0700.HK", [("2026-10-16", 18_000_000), ("2026-10-19", 4_000_000)])}
+        yahoo = _Yahoo(self.bronze, charts)
+        code, summary, lines = self._job(yahoo)
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(yahoo.calls, [("SYNA", YEAR_AGO, FETCH_TODAY), ("0700.HK", YEAR_AGO, FETCH_TODAY)])
+        self.assertEqual({key: summary["fetch"][key] for key in ("status", "holdings", "mapped", "fetched", "captured",
+                                                                 "written")},
+                         {"status": "success", "holdings": 5, "mapped": 2, "fetched": 2, "captured": 2, "written": 3})
+        self.assertEqual([item["instrument_id"] for item in summary["fetch"]["not_mapped"]],
+                         ["9100003", "9100004", "9100009"])
+        self.assertEqual([line["instrument_id"] for line in lines], ["9100001", "9100002", "9100003", "9100004",
+                                                                      "9100009"])
+        self.assertEqual(self._rows("SELECT instrument_id, price_date, volume, source FROM daily_volumes ORDER BY 1, 2"),
+                         [("9100001", "2026-10-15", 1_200_000.0, "yahoo-chart"),
+                          ("9100001", "2026-10-16", 1_350_000.0, "yahoo-chart"),
+                          ("9100002", "2026-10-16", 18_000_000.0, "yahoo-chart")])  # 19 Oct still trading
+        self.assertEqual(self._rows("SELECT DISTINCT source_url FROM daily_volumes WHERE instrument_id = '9100001'"),
+                         [(market_data._chart_url("SYNA", YEAR_AGO, FETCH_TODAY),)])
+        # The next run: each has volumes now, so ten days; the same volumes again write nothing.
+        code, summary, _ = self._job(yahoo)
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(yahoo.calls[2:], [("SYNA", date(2026, 10, 9), FETCH_TODAY),
+                                           ("0700.HK", date(2026, 10, 9), FETCH_TODAY)])
+        self.assertEqual((summary["fetch"]["captured"], summary["fetch"]["rows"], summary["fetch"]["written"]),
+                         (2, 3, 0))
+        self.assertEqual(len(self._rows("SELECT 1 FROM daily_volumes")), 3)
+
+    def test_3_lineage_names_the_silver_reads_the_captures_and_the_table(self):
+        # The next morning's run, for one holding: Yahoo has revised 16 October's volume.
+        morning = datetime(2026, 10, 20, 6, 30, tzinfo=timezone.utc)
+        yahoo = _Yahoo(self.bronze, {"SYNA": _us("SYNA", [("2026-10-16", 1_400_000)])}, at=morning)
+        before = set(self.bronze.files)
+        code, summary, _ = self._job(yahoo, "--instrument", "9100001", entry=True, now=morning)
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(yahoo.calls, [("SYNA", date(2026, 10, 10), morning.date())])
+        self.assertEqual((summary["fetch"]["holdings"], summary["fetch"]["written"]), (1, 1))
+        [(run_id,)] = self._rows("SELECT run_id FROM lineage_events WHERE job_name = 'ibkrv2stg-daily-volumes' AND "
+                                 "event_type = 'COMPLETE'", user=layers.OWNER)
+        io_rows = {(d, ns, n): (rows, sha) for d, ns, n, rows, sha in self._rows(
+            "SELECT direction, namespace, name, row_count, sha256 FROM lineage_io WHERE run_id = %s", run_id,
+            user=layers.OWNER)}
+        for name in (*dv.FETCH_INPUTS, "silver.market_data_prices"):
+            self.assertIn(("input", "postgres", name), io_rows)
+        self.assertEqual(io_rows[("output", "postgres", "silver.daily_volumes")][0], 1)
+        [new] = sorted(set(self.bronze.files) - before)
+        self.assertEqual(io_rows[("input", "blob", f"{CONTAINER}/{new}")][1],
+                         hashlib.sha256(self.bronze.files[new][0]).hexdigest())
+        self.assertEqual(self.bronze.metadata[new]["job_run_id"], str(run_id))  # the raw copy names its run
+        self.assertEqual(self._rows("SELECT volume FROM daily_volumes WHERE instrument_id = '9100001' AND "
+                                    "price_date = '2026-10-16'"), [(1_400_000.0,)])
 
 
 @unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")

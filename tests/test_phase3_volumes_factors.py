@@ -9,6 +9,13 @@ vintage, and each file stored as received in bronze (kenneth-french, with its li
 parsed. Both loaders doing nothing when off, and stopping with the held exit code, having read and
 fetched nothing, when the table is missing. Their registrations and job definitions.
 
+The holdings' own volumes fetch, with a fake fetcher (or a fake Yahoo behind market_data's real
+fetch) and a fake bronze that raw capture writes into: the platform's symbol mapping and its order;
+holdings not mapped or not found listed, never guessed; each response kept in bronze before its
+volumes are parsed back from it; pacing with a fake clock (the pause, the cap, the time budget);
+nothing fetched when DAILY_VOLUMES_FETCH is off or raw capture is not set up; the held exit code
+still first; the job's Bicep and its identity's container role.
+
 The network is shut for the whole module: every fetch is a fake. The SQL is in
 test_phase3_volumes_factors_db.py.
 """
@@ -24,6 +31,7 @@ import json
 import os
 import re
 import unittest
+import urllib.error
 import zipfile
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -31,7 +39,8 @@ from unittest.mock import patch
 
 from ibkr_etl import daily_volumes as dv
 from ibkr_etl import factor_returns as fr
-from ibkr_etl import fama_french, layer_freshness, layer_quality, market_data, publish_gate, raw_capture
+from ibkr_etl import (fama_french, layer_freshness, layer_quality, market_data, publish_gate, raw_capture,
+                      sector_classification)
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = json.loads((ROOT / "infra" / "medallion" / "catalog.json").read_text(encoding="utf-8"))
@@ -321,6 +330,419 @@ class _Connection:
 
     def close(self):
         self.closed = True
+
+
+# ---------------------------------------------------------------- the holdings' own fetch
+
+
+FETCH_NOW = datetime(2026, 10, 19, 6, 30, tzinfo=timezone.utc)  # the job's 06:30 run
+FETCH_TODAY = FETCH_NOW.date()
+YEAR_AGO = date(2025, 10, 19)
+
+
+class _HoldingsConnection(_Connection):
+    """A load's connection that also answers the fetch's two reads: the holdings, and the latest
+    stored day of each instrument."""
+
+    def __init__(self, holdings=(), loaded=None, **kwargs):
+        super().__init__(**kwargs)
+        self.holding_rows, self.loaded = list(holdings), dict(loaded or {})
+
+    def execute(self, sql, params=()):
+        result = super().execute(sql, params)
+        if sql == dv.HOLDINGS_SQL:
+            rows = self.holding_rows
+        elif sql == dv.LOADED_SQL:
+            rows = [{"instrument_id": k, "latest": v} for k, v in self.loaded.items() if k in params[0]]
+        else:
+            return result
+
+        class _Rows:
+            def fetchall(self):
+                return rows
+
+        return _Rows()
+
+    def ran(self, sql) -> bool:
+        return " ".join(sql.split()) in [query for query, _ in self.queries]
+
+
+def _holding(conid, symbol, currency="USD", *, exchange="NASDAQ", category="STK", lookup=None):
+    return {"conid": conid, "symbol": symbol, "listing_exchange": exchange, "currency": currency,
+            "asset_category": category, "lookup_symbol": lookup}
+
+
+class _CapturingBronze(_Bronze):
+    """bronze-market-data that raw capture writes into (its uploader) and the load reads back, with
+    every capture and read in order beside the fetches."""
+
+    def __init__(self):
+        super().__init__()
+        self.events: list[tuple[str, str]] = []
+        self.metadata: dict[str, dict] = {}
+        self.fail_uploads = False
+
+    def factory(self, account_url, container):
+        return self.upload
+
+    def upload(self, name, content, *, content_type, metadata):
+        if self.fail_uploads:
+            raise OSError("storage is down")
+        self.events.append(("captured", name))
+        self.files[name] = (content, datetime.fromisoformat(metadata["requested_at"]))
+        self.metadata[name] = metadata
+        return f"{ACCOUNT_URL}/{CONTAINER}/{name}"
+
+    def list(self, prefix):
+        self.prefixes.append(prefix)
+        return [dv.CaptureRef(name, stored, self.metadata.get(name, {}).get("source_url", ""))
+                for name, (_, stored) in sorted(self.files.items()) if name.startswith(prefix)]
+
+    def read(self, name):
+        self.events.append(("read", name))
+        return super().read(name)
+
+
+def _capture_into(test: unittest.TestCase, bronze: _CapturingBronze, container: str = CONTAINER,
+                  account_url: str = ACCOUNT_URL) -> raw_capture.RawCapture:
+    capture = raw_capture.RawCapture(container=container, account_url=account_url, uploader_factory=bronze.factory)
+    raw_capture.reset(capture)
+    test.addCleanup(raw_capture.reset)
+    return capture
+
+
+def _not_found(url: str) -> RuntimeError:
+    """What market_data raises once Yahoo has answered 404 three times."""
+    error = RuntimeError(f"Market data request failed after 3 attempts: {url}")
+    error.__cause__ = urllib.error.HTTPError(url, 404, "Not Found", None, None)
+    return error
+
+
+class _Yahoo:
+    """market_data.fetch_daily_closes as the fetch calls it: the response is kept raw first, as
+    market_data._download_json keeps it, then checked as fetch_daily_closes checks it. charts maps a
+    Yahoo symbol to its response; a symbol not there is a 404, an exception is raised as it is."""
+
+    def __init__(self, bronze, charts, *, clock=None, seconds=0.5, at=FETCH_NOW):
+        self.bronze, self.charts, self.clock, self.seconds, self.at = bronze, charts, clock, seconds, at
+        self.calls: list[tuple[str, date, date]] = []
+
+    def __call__(self, instrument, start, end):
+        self.calls.append((instrument.symbol, start, end))
+        self.bronze.events.append(("fetch", instrument.symbol))
+        if self.clock is not None:
+            self.clock.now += self.seconds
+        url = market_data._chart_url(instrument.symbol, start, end)
+        answer = self.charts.get(instrument.symbol)
+        if answer is None:
+            raise _not_found(url)
+        if isinstance(answer, BaseException):
+            raise answer
+        raw_capture.capture_http("yahoo-chart", "Yahoo Finance chart API", url=url, body=answer,
+                                 key=raw_capture.request_key(instrument.symbol, start.isoformat(), end.isoformat(),
+                                                             "1d"),
+                                 status=200, extension="json", requested_at=self.at,
+                                 history=raw_capture.settled(end, now=self.at))
+        currency = json.loads(answer)["chart"]["result"][0]["meta"]["currency"]
+        if currency != instrument.currency:
+            raise RuntimeError(f"Unexpected currency for {instrument.symbol}: {currency}, expected {instrument.currency}")
+        return url, []
+
+
+class _Clock:
+    """A monotonic clock that moves only when the fetch sleeps or a fake request takes time."""
+
+    def __init__(self):
+        self.now, self.sleeps = 100.0, []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _us(symbol: str, bars) -> bytes:
+    return chart([(f"{day}T13:30:00", 50.0, volume) for day, volume in bars], symbol=symbol)
+
+
+def _hk(symbol: str, bars) -> bytes:
+    # Hong Kong trades 01:30 to 08:00 UTC, so at 06:30 UTC the 19 October bar is still trading.
+    return chart([(f"{day}T01:30:00", 400.0, volume) for day, volume in bars], symbol=symbol, currency="HKD",
+                 zone="Asia/Hong_Kong", regular=("2026-10-19T01:30:00", "2026-10-19T08:00:00"))
+
+
+def _kr(symbol: str, bars) -> bytes:
+    return chart([(f"{day}T00:00:00", 60_000.0, volume) for day, volume in bars], symbol=symbol, currency="KRW",
+                 zone="Asia/Seoul")
+
+
+class HoldingsMappingTests(unittest.TestCase):
+    def test_the_fetch_setting_is_on_only_when_it_says_on(self):
+        for value, expected in (("on", True), (" ON ", True), ("", False), ("off", False), ("true", False)):
+            with self.subTest(value=value):
+                self.assertIs(dv.fetch_enabled({dv.FETCH_SETTING: value}), expected)
+        self.assertFalse(dv.fetch_enabled({}))
+        self.assertFalse(dv.fetch_enabled({dv.SETTING: "on"}))  # the load's setting does not turn it on
+
+    def test_symbols_are_the_platforms_own_candidates_in_its_order(self):
+        def mapped(**kwargs):
+            return dv.yahoo_symbols(dv.Holding(**{"conid": "9100001", "listing_exchange": "", "asset_category": "STK",
+                                                  **kwargs}))
+
+        # Exactly sector_classification.candidate_symbols, tried in order as crisis_replay tries them.
+        for symbol, exchange, currency in (("BRK B", "NYSE", "USD"), ("700", "SEHK", "HKD"), ("7203", "TSEJ", "JPY"),
+                                           ("5930", "KRX", "KRW"), ("2330", "TWSE", "TWD"), ("VOD", "LSE", "GBP"),
+                                           ("2888.OLD", "TWSE", "TWD")):
+            with self.subTest(symbol=symbol):
+                self.assertEqual(mapped(symbol=symbol, listing_exchange=exchange, currency=currency),
+                                 (sector_classification.candidate_symbols(symbol, exchange, currency), None))
+        self.assertEqual(mapped(symbol="BRK B", currency="USD"), (["BRK-B"], None))
+        self.assertEqual(mapped(symbol="700", listing_exchange="SEHK", currency="HKD"), (["0700.HK", "700"], None))
+        # The symbol the sector lookup matched goes first when it is one of the candidates.
+        self.assertEqual(mapped(symbol="5930", listing_exchange="KRX", currency="KRW", lookup_symbol="005930.KQ"),
+                         (["005930.KQ", "005930.KS", "5930"], None))
+        # Not otherwise: an owner's override to another line (a warrant's underlying) is not its volume.
+        self.assertEqual(mapped(symbol="SKYD", currency="USD", lookup_symbol="PSKY"), (["SKYD"], None))
+
+    def test_a_holding_that_cannot_be_mapped_says_why_and_is_never_guessed(self):
+        for kwargs, reason in (
+                ({"symbol": "SYNA  261120C00050000", "asset_category": "OPT"}, "asset category OPT"),
+                ({"symbol": "SKYD WS", "asset_category": "WAR", "lookup_symbol": "SKYD"}, "asset category WAR"),
+                ({"symbol": "T 4 1/2 11/15/33", "asset_category": "BOND"}, "asset category BOND"),
+                ({"symbol": "SYNA", "asset_category": ""}, "asset category unknown"),
+                ({"symbol": "SYNB.REC"}, "receivable"),
+                ({"symbol": ""}, "no IBKR symbol"),
+                ({"symbol": "9100001"}, "no IBKR symbol"),  # the conid stands in for a missing symbol
+                ({"symbol": "SYNA", "currency": ""}, "no currency")):
+            with self.subTest(**kwargs):
+                holding = dv.Holding(**{"conid": "9100001", "listing_exchange": "", "currency": "USD",
+                                        "asset_category": "STK", **kwargs})
+                candidates, why = dv.yahoo_symbols(holding)
+                self.assertEqual(candidates, [])
+                self.assertIn(reason, why)
+
+    def test_the_window_is_a_year_at_first_then_ten_days_without_gaps(self):
+        today = FETCH_TODAY
+        for latest, start in ((None, YEAR_AGO), ("", YEAR_AGO), ("soon", YEAR_AGO),
+                              ("2026-10-16", date(2026, 10, 9)),  # recent: the last 10 days
+                              ("2026-10-18", date(2026, 10, 9)),
+                              ("2026-09-20", date(2026, 9, 19)),  # a pause: from the day before the latest
+                              ("2024-03-01", YEAR_AGO)):  # never more than a year
+            with self.subTest(latest=latest):
+                self.assertEqual(dv.fetch_window(latest, today), (start, today))
+
+
+class HoldingsFetchTests(unittest.TestCase):
+    def _run(self, connection, bronze, fetcher, **kwargs):
+        record = _Record()
+        clock = kwargs.pop("clock", None) or _Clock()
+        with patch.object(raw_capture, "utc_now", return_value=FETCH_NOW):
+            summary = dv.fetch_and_load(connection, bronze, fetcher=fetcher, sleep=clock.sleep, clock=clock,
+                                        record=record, **kwargs)
+        return summary, record
+
+    def test_each_holding_is_kept_in_bronze_first_and_its_volumes_parsed_from_that_capture(self):
+        bronze = _CapturingBronze()
+        _capture_into(self, bronze)
+        holdings = [
+            _holding("9100001", "SYNA"),
+            _holding("9100002", "700", "HKD", exchange="SEHK", lookup="0700.HK"),
+            _holding("9100003", "SYNA  261120C00050000", category="OPT"),
+            _holding("9100004", "SYNB.REC"),
+            _holding("9100005", ""),
+            _holding("9100006", "5930", "KRW", exchange="KRX"),
+            _holding("9100007", "GONE"),
+            _holding("9100008", "VOD", "GBP", exchange="LSE"),
+        ]
+        yahoo = _Yahoo(bronze, {
+            "SYNA": _us("SYNA", [("2026-10-15", 1_200_000), ("2026-10-16", 1_350_000)]),
+            "0700.HK": _hk("0700.HK", [("2026-10-16", 18_000_000), ("2026-10-19", 4_000_000)]),
+            "005930.KQ": _kr("005930.KQ", [("2026-10-16", 9_000_000)]),  # .KS is not on Yahoo
+            "VOD": _us("VOD", [("2026-10-16", 5_000_000)]),  # the US line, in dollars: not this holding
+        })
+        connection = _HoldingsConnection(holdings)
+        summary, record = self._run(connection, bronze, yahoo, today=FETCH_TODAY)
+
+        # Asked in order (none has volumes yet, so by conid), each for the last year.
+        self.assertEqual(yahoo.calls, [(symbol, YEAR_AGO, FETCH_TODAY) for symbol in (
+            "SYNA", "0700.HK", "005930.KS", "005930.KQ", "GONE", "VOD.L", "VOD")])
+        self.assertEqual({key: summary[key] for key in (
+            "status", "holdings", "mapped", "requests", "fetched", "captured", "rows", "written", "failed",
+            "deferred", "deferred_because", "unreadable_captures")},
+            {"status": "success", "holdings": 8, "mapped": 5, "requests": 7, "fetched": 3, "captured": 3,
+             "rows": 4, "written": 4, "failed": [], "deferred": [], "deferred_because": None,
+             "unreadable_captures": 0})
+        self.assertEqual([(item["instrument_id"], item["symbol"]) for item in summary["not_mapped"]],
+                         [("9100003", "SYNA  261120C00050000"), ("9100004", "SYNB.REC"), ("9100005", "")])
+        self.assertTrue(all(item["reason"] for item in summary["not_mapped"]))
+        self.assertEqual(summary["not_found"], [{"instrument_id": "9100007", "symbol": "GONE", "tried": ["GONE"]},
+                                                {"instrument_id": "9100008", "symbol": "VOD",
+                                                 "tried": ["VOD.L", "VOD"]}])
+        # One transaction per holding, under its conid; Hong Kong's 19 October bar was still trading.
+        self.assertEqual([[row[:3] for row in batch] for batch in connection.batches], [
+            [("9100001", "2026-10-15", 1_200_000.0), ("9100001", "2026-10-16", 1_350_000.0)],
+            [("9100002", "2026-10-16", 18_000_000.0)],
+            [("9100006", "2026-10-16", 9_000_000.0)]])
+        self.assertEqual(connection.commits, 3)
+        self.assertEqual({batch[0][4].split("?")[0] for batch in connection.batches},
+                         {f"{market_data.YAHOO_CHART_URL.format(symbol=s)}" for s in ("SYNA", "0700.HK", "005930.KQ")})
+        self.assertEqual({batch[0][5] for batch in connection.batches}, {"2026-10-19T06:30:00+00:00"})
+        # Every capture is written before anything is parsed, and each volume is read back from bronze.
+        events = bronze.events
+        last_fetch = max(i for i, (kind, _) in enumerate(events) if kind == "fetch")
+        reads = [(i, name) for i, (kind, name) in enumerate(events) if kind == "read"]
+        self.assertEqual(len(reads), 3)
+        for index, name in reads:
+            self.assertGreater(index, last_fetch)
+            self.assertLess(events.index(("captured", name)), index)
+            self.assertTrue(name.startswith("yahoo-chart/2026/10/19/"))
+        by_id = {item["instrument_id"]: item for item in summary["instruments"]}
+        self.assertEqual(by_id["9100006"]["tried"], ["005930.KS", "005930.KQ"])
+        self.assertEqual((by_id["9100006"]["outcome"], by_id["9100006"]["yahoo_symbol"]), ("loaded", "005930.KQ"))
+        self.assertNotIn("error", by_id["9100006"])  # the refusal of .KS is not carried on
+        self.assertEqual(by_id["9100002"]["skipped_days"], 1)
+        self.assertEqual(by_id["9100002"]["window"], ["2025-10-19", "2026-10-19"])
+        # Lineage: the captures used, and the rows written.
+        self.assertEqual(sorted(name for name, _ in record.inputs), sorted(f"blob://{CONTAINER}/{n}" for _, n in reads))
+        self.assertEqual(record.outputs, [(dv.TABLE, {"rows": 4})])
+        self.assertEqual(summary["raw_capture"]["written"], 4)  # the US VOD answer is kept too, never used
+
+    def test_one_request_per_symbol_and_window_and_a_failed_request_is_not_tried_further(self):
+        bronze = _CapturingBronze()
+        _capture_into(self, bronze)
+        down = RuntimeError("Market data request failed after 3 attempts")
+        down.__cause__ = OSError("connection reset")
+        yahoo = _Yahoo(bronze, {"SYNA": _us("SYNA", [("2026-10-16", 100)]), "0700.HK": down})
+        connection = _HoldingsConnection([_holding("9100001", "SYNA"), _holding("9100002", "SYNA"),
+                                          _holding("9100003", "700", "HKD", exchange="SEHK")])
+        summary, _ = self._run(connection, bronze, yahoo, today=FETCH_TODAY)
+        # Two holdings share a Yahoo line: asked once. A network failure is not a 404, so "700" is not tried.
+        self.assertEqual([call[0] for call in yahoo.calls], ["SYNA", "0700.HK"])
+        self.assertEqual([batch[0][0] for batch in connection.batches], ["9100001", "9100002"])
+        self.assertEqual((summary["status"], summary["requests"], summary["captured"]), ("failed", 2, 2))
+        self.assertEqual([(item["instrument_id"], item["reason"][:12]) for item in summary["failed"]],
+                         [("9100003", "RuntimeError")])
+
+    def test_pacing_with_a_fake_clock_a_cap_and_a_time_budget(self):
+        holdings = [_holding(f"910000{n}", f"SYN{n}") for n in range(1, 5)]
+        loaded = {"9100001": "2026-10-18", "9100002": "2026-10-16"}
+        charts = {f"SYN{n}": _us(f"SYN{n}", [("2026-10-16", 1000 * n)]) for n in range(1, 5)}
+
+        # The cap: three requests, a fixed pause between two of them and none before the first.
+        bronze = _CapturingBronze()
+        _capture_into(self, bronze)
+        clock = _Clock()
+        yahoo = _Yahoo(bronze, charts, clock=clock)
+        summary, _ = self._run(_HoldingsConnection(holdings, loaded), bronze, yahoo, today=FETCH_TODAY, clock=clock,
+                               max_symbols=3, pace_seconds=1.5, budget_seconds=100)
+        # The least recently loaded first: never loaded (by conid), then the oldest latest day.
+        self.assertEqual(yahoo.calls, [("SYN3", YEAR_AGO, FETCH_TODAY), ("SYN4", YEAR_AGO, FETCH_TODAY),
+                                       ("SYN2", date(2026, 10, 9), FETCH_TODAY)])
+        self.assertEqual(clock.sleeps, [1.5, 1.5])
+        self.assertEqual((summary["requests"], summary["deferred"], summary["deferred_because"], summary["status"]),
+                         (3, ["9100001"], "the cap of 3 Yahoo requests per run", "success"))
+        self.assertEqual((summary["max_symbols"], summary["pace_seconds"], summary["seconds"]), (3, 1.5, 4.5))
+
+        # The time budget: no new request once it is spent; the rest wait for the next run.
+        bronze = _CapturingBronze()
+        _capture_into(self, bronze)
+        clock = _Clock()
+        yahoo = _Yahoo(bronze, charts, clock=clock)
+        summary, _ = self._run(_HoldingsConnection(holdings, loaded), bronze, yahoo, today=FETCH_TODAY, clock=clock,
+                               pace_seconds=1.0, budget_seconds=2.0)
+        self.assertEqual([call[0] for call in yahoo.calls], ["SYN3", "SYN4"])
+        self.assertEqual(clock.sleeps, [1.0])
+        self.assertEqual((summary["deferred"], summary["deferred_because"]),
+                         (["9100001", "9100002"], "the fetch time budget of 2 seconds"))
+        self.assertEqual(summary["captured"], 2)
+
+    def test_yahoo_asking_us_to_slow_down_stops_the_run_asking(self):
+        bronze = _CapturingBronze()
+        _capture_into(self, bronze)
+        url = market_data._chart_url("SYN1", YEAR_AGO, FETCH_TODAY)
+        slow_down = RuntimeError(f"Market data request failed after 3 attempts: {url}")
+        slow_down.__cause__ = urllib.error.HTTPError(url, 429, "Too Many Requests", None, None)
+        yahoo = _Yahoo(bronze, {"SYN1": slow_down, "SYN2": _us("SYN2", [("2026-10-16", 20)])})
+        summary, _ = self._run(_HoldingsConnection([_holding("9100001", "SYN1"), _holding("9100002", "SYN2")]),
+                               bronze, yahoo, today=FETCH_TODAY)
+        self.assertEqual([call[0] for call in yahoo.calls], ["SYN1"])  # not "SYN1" again, nor SYN2
+        self.assertEqual((summary["status"], summary["failed"][0]["instrument_id"], summary["deferred"]),
+                         ("failed", "9100001", ["9100002"]))
+        self.assertIn("429", summary["deferred_because"])
+
+    def test_a_response_raw_capture_did_not_keep_is_never_parsed(self):
+        bronze = _CapturingBronze()
+        bronze.fail_uploads = True
+        _capture_into(self, bronze)
+        yahoo = _Yahoo(bronze, {"SYN1": _us("SYN1", [("2026-10-16", 10)]), "SYN2": _us("SYN2", [("2026-10-16", 20)])})
+        connection = _HoldingsConnection([_holding("9100001", "SYN1"), _holding("9100002", "SYN2")])
+        with self.assertLogs(raw_capture.LOGGER, "WARNING"):
+            summary, record = self._run(connection, bronze, yahoo, today=FETCH_TODAY)
+        # Storage failed, so capture switched itself off: the answer is not parsed and the rest wait.
+        self.assertEqual([call[0] for call in yahoo.calls], ["SYN1"])
+        self.assertEqual((summary["status"], summary["fetched"], summary["captured"], summary["written"]),
+                         ("failed", 1, 0, 0))
+        self.assertEqual(summary["failed"][0]["instrument_id"], "9100001")
+        self.assertIn("did not keep", summary["failed"][0]["reason"])
+        self.assertEqual(summary["deferred"], ["9100002"])
+        self.assertIn("raw capture is off for the rest of the run: OSError", summary["deferred_because"])
+        self.assertEqual((connection.batches, bronze.reads, bronze.prefixes), ([], [], []))
+        self.assertEqual(record.outputs, [(dv.TABLE, {"rows": 0})])
+
+    def test_with_raw_capture_off_or_elsewhere_nothing_is_fetched(self):
+        for container, account_url in (("", ""), ("", ACCOUNT_URL), (CONTAINER, ""), ("bronze-other", ACCOUNT_URL)):
+            with self.subTest(container=container, account_url=account_url):
+                bronze = _CapturingBronze()
+                _capture_into(self, bronze, container, account_url)
+                summary, _ = self._run(_HoldingsConnection([_holding("9100001", "SYN1"), _holding("9100002", "")]),
+                                       bronze, _Exploding(), today=FETCH_TODAY)
+                self.assertEqual((summary["status"], summary["requests"], summary["deferred"]),
+                                 ("capture_off", 0, ["9100001"]))
+                self.assertIn(f"MARKET_DATA_RAW_CONTAINER={CONTAINER}", summary["deferred_because"])
+                self.assertEqual(len(summary["not_mapped"]), 1)
+                self.assertEqual(bronze.events, [])
+
+    def test_the_chart_fetch_is_market_datas_own_with_its_retries_and_its_capture(self):
+        bronze = _CapturingBronze()
+        _capture_into(self, bronze)
+        body = _us("SYNA", [("2026-10-15", 700_000), ("2026-10-16", 800_000)])
+        requests, retries = [], []
+
+        def urlopen(request, timeout=None, context=None):
+            requests.append((request.full_url, request.get_header("User-agent"), timeout))
+            if "/chart/GONE?" in request.full_url:
+                raise urllib.error.HTTPError(request.full_url, 404, "Not Found", None, None)
+            if len(requests) == 1:
+                raise OSError("connection reset")  # one retry, after market_data's backoff
+            return _Response(body, {"Content-Type": "application/json"})
+
+        connection = _HoldingsConnection([_holding("9100001", "SYNA"), _holding("9100002", "GONE")])
+        clock = _Clock()
+        with patch("urllib.request.urlopen", side_effect=urlopen), \
+                patch.object(market_data.time, "sleep", side_effect=retries.append), \
+                patch.object(raw_capture, "utc_now", return_value=FETCH_NOW):
+            summary = dv.fetch_and_load(connection, bronze, sleep=clock.sleep, clock=clock, record=_Record())
+        url = market_data._chart_url("SYNA", YEAR_AGO, FETCH_TODAY)
+        self.assertEqual(requests[:2], [(url, market_data.USER_AGENT, dv.FETCH_TIMEOUT_SECONDS)] * 2)
+        self.assertEqual(len(requests), 5)  # SYNA twice, GONE three times (market_data's attempts)
+        self.assertEqual(retries, [1, 1, 2])  # market_data's backoff: SYNA's one retry, then GONE's two
+        self.assertEqual(clock.sleeps, [dv.PACE_SECONDS])  # and the fetch's own pause between the two
+        [name] = [name for kind, name in bronze.events if kind == "captured"]
+        self.assertEqual(bronze.files[name][0], body)  # as received
+        self.assertEqual(bronze.metadata[name]["source_url"], url)
+        self.assertEqual(connection.batches, [[
+            ("9100001", "2026-10-15", 700_000.0, "yahoo-chart", url, "2026-10-19T06:30:00+00:00"),
+            ("9100001", "2026-10-16", 800_000.0, "yahoo-chart", url, "2026-10-19T06:30:00+00:00")]])
+        self.assertEqual((summary["status"], summary["not_found"]),
+                         ("success", [{"instrument_id": "9100002", "symbol": "GONE", "tried": ["GONE"]}]))
+        # A response that came back but was not a usable chart (fetch_daily_closes's own check) is a refusal.
+        self.assertTrue(dv._refused(RuntimeError("No market data returned for X")))
+        reset = RuntimeError("failed")
+        reset.__cause__ = urllib.error.URLError("timed out")
+        self.assertFalse(dv._refused(reset))
+        self.assertTrue(dv._refused(_not_found("https://query1.finance.yahoo.com/v8/finance/chart/GONE")))
 
 
 # ---------------------------------------------------------------- synthetic French files
@@ -645,12 +1067,88 @@ class JobSwitchTests(unittest.TestCase):
                      and isinstance(node.func, ast.Attribute) and node.func.attr == "run_main"]
             self.assertEqual((names, script.JOB), (["JOB"], job))
 
+    def test_the_fetch_does_nothing_unless_its_setting_is_on(self):
+        script = _script("load_daily_volumes")
+        plain = None
+        for argv, value in (([], "on"), (["--fetch"], ""), (["--fetch"], "off"), (["--fetch"], "true")):
+            connection = _HoldingsConnection([_holding("9100001", "SYN1")])
+            with self.subTest(argv=argv, value=value), patch.object(script, "connect", return_value=connection), \
+                    patch.dict(os.environ, {dv.FETCH_SETTING: value}), \
+                    patch.object(raw_capture, "set_job_run_id", side_effect=AssertionError("capture touched")):
+                code, lines = self._run(script, "main", argv, setting=dv.SETTING, bronze=_Bronze(),
+                                        fetcher=_Exploding())
+            self.assertEqual(code, 0)
+            self.assertFalse(connection.ran(dv.HOLDINGS_SQL))  # the holdings are not even read
+            if not argv:  # on, but no --fetch (as Part A deployed the job): no fetch and no new key
+                self.assertNotIn("fetch", lines[-1])
+                plain = lines
+                continue
+            self.assertEqual(lines[-1]["fetch"]["status"], "off")
+            self.assertIn(dv.FETCH_SETTING, lines[-1]["fetch"]["note"])
+            # Otherwise the run is the load as it was: the same lines and summary.
+            self.assertEqual(lines[:-1], plain[:-1])
+            self.assertEqual({k: v for k, v in lines[-1].items() if k != "fetch"}, plain[-1])
+
+    def test_the_held_exit_code_still_comes_before_any_fetch(self):
+        script = _script("load_daily_volumes")
+        connection = _HoldingsConnection([_holding("9100001", "SYN1")], relation=None)
+        with patch.object(script, "connect", return_value=connection), patch.dict(os.environ, {dv.FETCH_SETTING: "on"}):
+            code, lines = self._run(script, "main", ["--fetch"], setting=dv.SETTING, bronze=_Exploding(),
+                                    fetcher=_Exploding())
+        self.assertEqual((code, lines), (65, [{"status": "held", "table": dv.TABLE, "exit_code": 65,
+                                               "note": lines[0]["note"]}]))
+        self.assertEqual(connection.queries, [("SELECT to_regclass(?) AS relation", (dv.RELATION,))])
+        # A table dropped while the fetch runs is held too.
+        with patch.object(script, "connect", return_value=_HoldingsConnection()), \
+                patch.dict(os.environ, {dv.FETCH_SETTING: "on"}), \
+                patch.object(dv, "fetch_and_load", side_effect=_Undefined("relation does not exist")):
+            code, lines = self._run(script, "main", ["--fetch"], setting=dv.SETTING, bronze=_Exploding())
+        self.assertEqual((code, lines[-1]["status"]), (65, "held"))
+
+    def test_on_it_prints_each_holding_then_the_load_then_a_summary_with_the_fetch(self):
+        script = _script("load_daily_volumes")
+        bronze = _CapturingBronze()
+        _capture_into(self, bronze)
+        yahoo = _Yahoo(bronze, {"SYN1": _us("SYN1", [("2026-10-16", 10)])})
+        connection = _HoldingsConnection([_holding("9100001", "SYN1"), _holding("9100002", "SYN2.REC")],
+                                         instruments=[{"instrument_id": "spy-settlement", "symbol": "SPY",
+                                                       "currency": "USD"}])
+        clock = _Clock()
+        with patch.object(script, "connect", return_value=connection), patch.dict(os.environ, {dv.FETCH_SETTING: "on"}), \
+                patch.object(raw_capture, "utc_now", return_value=FETCH_NOW):
+            code, lines = self._run(script, "main", ["--fetch", "--max-symbols", "5"], setting=dv.SETTING,
+                                    bronze=bronze, fetcher=yahoo, sleep=clock.sleep, clock=clock)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual([(line["instrument_id"], line.get("outcome")) for line in lines[:-1]],
+                         [("9100001", "loaded"), ("9100002", "not_mapped"), ("spy-settlement", None)])
+        summary = lines[-1]
+        # The benchmark had no capture (derived-daily keeps none), but the fetch did: not "no_captures".
+        self.assertEqual((summary["status"], summary["written"], summary["without_captures"]),
+                         ("success", 0, ["spy-settlement"]))
+        self.assertEqual({key: summary["fetch"][key] for key in ("status", "fetched", "captured", "written",
+                                                                 "max_symbols")},
+                         {"status": "success", "fetched": 1, "captured": 1, "written": 1, "max_symbols": 5})
+        self.assertEqual(summary["fetch"]["not_mapped"][0]["instrument_id"], "9100002")
+        self.assertNotIn("instruments", summary["fetch"])
+        self.assertEqual(connection.batches[0][0][:3], ("9100001", "2026-10-16", 10.0))
+        # Raw capture off while the fetch is on: nothing fetched, and the run fails so it is seen.
+        raw_capture.reset(raw_capture.RawCapture())
+        with patch.object(script, "connect", return_value=_HoldingsConnection([_holding("9100001", "SYN1")])), \
+                patch.dict(os.environ, {dv.FETCH_SETTING: "on"}):
+            code, lines = self._run(script, "main", ["--fetch"], setting=dv.SETTING, bronze=_Bronze(),
+                                    fetcher=_Exploding())
+        self.assertEqual((code, lines[-1]["status"], lines[-1]["fetch"]["status"]), (1, "failed", "capture_off"))
+
     def test_the_arguments(self):
         script = _script("load_daily_volumes")
         args = script._arguments(["--from", "2026-01-02", "--to", "2026-03-31", "--instrument", "spy-settlement"])
         self.assertEqual((args.since, args.until, args.instrument, args.days),
                          (date(2026, 1, 2), date(2026, 3, 31), ["spy-settlement"], dv.DEFAULT_DAYS))
-        for bad in (["--to", "2026-03-31"], ["--from", "2026-03-31", "--to", "2026-01-01"], ["--from", "soon"]):
+        self.assertEqual((args.fetch, args.max_symbols), (False, dv.DEFAULT_MAX_SYMBOLS))
+        args = script._arguments(["--fetch", "--max-symbols", "5", "--instrument", "9100001", "--days", "1"])
+        self.assertEqual((args.fetch, args.max_symbols, args.instrument, args.days), (True, 5, ["9100001"], 1))
+        for bad in (["--to", "2026-03-31"], ["--from", "2026-03-31", "--to", "2026-01-01"], ["--from", "soon"],
+                    ["--fetch", "--from", "2026-01-02"], ["--fetch", "--max-symbols", "0"]):
             with self.subTest(argv=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 script._arguments(bad)
         script = _script("load_factor_returns")
@@ -720,7 +1218,7 @@ class RegistrationTests(unittest.TestCase):
             with self.subTest(bicep=bicep):
                 self.assertIn(f"param jobName string = '{job}'", text)
                 self.assertIn(f"param {setting} string = 'off'", text)
-                self.assertIn(f"args: ['scripts/{script}']", text)
+                self.assertRegex(text, rf"args: \['scripts/{re.escape(script)}'(, '--[a-z-]+')*\]")
                 self.assertIn("ibkr-platform@${imageDigest}", text)
                 self.assertIn("{ name: 'IBKR_RUN_MIGRATIONS', value: 'false' }", text)
                 self.assertNotIn("roleAssignments", text)
@@ -734,9 +1232,38 @@ class RegistrationTests(unittest.TestCase):
                 others = [path.name for path in (ROOT / "infra").glob("*.bicep")
                           if path.name != bicep and script in path.read_text(encoding="utf-8")]
                 self.assertEqual(others, [])
-        # The volumes job only reads bronze, so it stores no raw copies of its own.
-        self.assertNotIn("MARKET_DATA_RAW_CONTAINER", (ROOT / "infra" / "staging-daily-volumes-job.bicep").read_text())
+        # Both keep the raw copies of what they fetch themselves.
+        self.assertIn("MARKET_DATA_RAW_CONTAINER", (ROOT / "infra" / "staging-daily-volumes-job.bicep").read_text())
         self.assertIn("MARKET_DATA_RAW_CONTAINER", (ROOT / "infra" / "staging-factor-returns-job.bicep").read_text())
+
+    def test_the_volumes_job_fetches_only_when_switched_on_and_keeps_its_raw_copies_where_it_reads(self):
+        text = (ROOT / "infra" / "staging-daily-volumes-job.bicep").read_text(encoding="utf-8")
+        for line in ("param dailyVolumesFetch string = 'off'",
+                     f"{{ name: '{dv.FETCH_SETTING}', value: dailyVolumesFetch }}",
+                     "args: ['scripts/load_daily_volumes.py', '--fetch']",
+                     f"param bronzeContainer string = '{dv.DEFAULT_CONTAINER}'",
+                     f"{{ name: '{dv.CONTAINER_ENV}', value: bronzeContainer }}",
+                     f"{{ name: '{raw_capture.CONTAINER_ENV}', value: bronzeContainer }}",
+                     f"{{ name: '{raw_capture.ACCOUNT_URL_ENV}', value:"):
+            with self.subTest(line=line):
+                self.assertIn(line, text)
+        budget = int(re.search(rf"{raw_capture.BUDGET_ENV}', value: '(\d+)'", text).group(1))
+        self.assertGreater(budget, raw_capture.DEFAULT_BUDGET_SECONDS)
+        # Run time: the fetch stops asking well inside the job's limit, leaving time to load.
+        timeout = int(re.search(r"replicaTimeout: (\d+)", text).group(1))
+        self.assertLessEqual(dv.FETCH_BUDGET_SECONDS + 3 * dv.FETCH_TIMEOUT_SECONDS + 3, timeout - 240)
+        # The job's identity can already write there: the ingestion identity's role on the
+        # bronze-market-data container itself (staging.bicep), so no role assignment is added.
+        staging = (ROOT / "infra" / "staging.bicep").read_text(encoding="utf-8")
+        block = re.search(r"resource ingestionBronzeMarketDataContributor [^\n]*\{(.*?)\n\}", staging, re.S).group(1)
+        for line in ("scope: bronzeMarketDataContainer", "principalId: ingestionIdentity.properties.principalId",
+                     "roleDefinitionId: storageBlobContributorRoleId"):
+            with self.subTest(line=line):
+                self.assertIn(line, block)
+        self.assertRegex(staging, r"resource bronzeMarketDataContainer [^\n]*existing = \{\s*parent: blobService\s*"
+                                  r"name: 'bronze-market-data'")
+        self.assertIn("'Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')", staging)
+        self.assertIn("identityResourceId=<ingestion identity id>", (ROOT / "docs" / "PHASE3_DATA.md").read_text())
 
     def test_the_stand_ins_store_their_fund_histories_under_a_known_feed(self):
         self.assertIn(fr.PROXY_CAPTURE_FEED, raw_capture.FEEDS)

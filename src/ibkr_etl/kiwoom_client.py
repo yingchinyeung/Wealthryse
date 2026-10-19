@@ -44,7 +44,7 @@ INQUIRY_APIS: Mapping[str, str] = {
     "kt00015": ACCOUNT_PATH,  # consolidated transaction history
     "kt00016": ACCOUNT_PATH,  # daily account return detail
     "kt00018": ACCOUNT_PATH,  # holdings valuation detail
-    "ka01690": ACCOUNT_PATH,  # daily balance return
+    "ka01690": ACCOUNT_PATH,  # daily balance return: holdings and cash on a past date
     "ka10074": ACCOUNT_PATH,  # realised profit by day
     "ust21070": US_ACCOUNT_PATH,  # US holdings
     "ust21100": US_ACCOUNT_PATH,  # US transaction history
@@ -299,6 +299,39 @@ class KiwoomClient:
             deposit=kiwoom_number(account["d2_entra"] if "d2_entra" in account else _field(account, "entr")),
             estimated_assets=kiwoom_number(_field(account, "prsm_dpst_aset_amt")),
             holdings=tuple(holdings),
+        )
+
+    def balance_on(self, day: date) -> AccountValuation | None:
+        """Holdings and cash at the close of a past trading day (ka01690), or None on a day KRX was closed.
+
+        Kiwoom answers a closed day with another day's figures, so an answer
+        dated differently from the day asked for is read as closed.
+        """
+
+        pages = self.inquire("ka01690", {"qry_dt": _yyyymmdd(day)})
+        first = pages[0]
+        answered = str(first.get("dt") or "").strip()
+        if answered and answered != _yyyymmdd(day):
+            return None
+        holdings: list[Holding] = []
+        for page in pages:
+            for row in page.get("day_bal_rt") or []:
+                code = str(row.get("stk_cd") or "").strip()
+                if not code:
+                    continue
+                holdings.append(Holding(
+                    security=SecurityIdentifier("krx_code", krx_code(code)),
+                    name=str(_field(row, "stk_nm")).strip(),
+                    quantity=kiwoom_number(_field(row, "rmnd_qty")),
+                    average_price=kiwoom_number(_field(row, "buy_uv"), unsigned=True),
+                    price=kiwoom_number(_field(row, "cur_prc"), unsigned=True),
+                    market_value=kiwoom_number(_field(row, "evlt_amt")),
+                ))
+        return AccountValuation(
+            account_name="",
+            deposit=kiwoom_number(_field(first, "dbst_bal")),
+            estimated_assets=kiwoom_number(_field(first, "day_stk_asst")),
+            holdings=tuple(holding for holding in holdings if holding.quantity),
         )
 
     def transactions(self, start: date, end: date) -> list[CashMovement]:

@@ -101,7 +101,8 @@ resource broker 'Microsoft.App/containerApps@2024-03-01' = {
           resources: {cpu: json('0.25'), memory: '0.5Gi'}
         }
       ]
-      scale: {minReplicas: 0, maxReplicas: 1}
+      // Always one replica: a cold start (~22s) made the first key save time out.
+      scale: {minReplicas: 1, maxReplicas: 1}
     }
   }
   dependsOn: [acrPull, secretWriterAssignment]

@@ -15,6 +15,7 @@ from ibkr_etl.kiwoom_collector import (
     movement_rows,
     platform_account_id,
     snapshot_rows,
+    trading_weekdays,
     stage_two_checks,
     windows,
     Collected,
@@ -56,6 +57,11 @@ class SwitchAndDatesTests(unittest.TestCase):
         self.assertFalse(collector_enabled({}))
         self.assertFalse(collector_enabled({"KIWOOM_COLLECTOR_ENABLED": "yes"}))
         self.assertTrue(collector_enabled({"KIWOOM_COLLECTOR_ENABLED": " TRUE "}))
+
+    def test_history_asks_for_weekdays_only(self):
+        days = trading_weekdays(date(2026, 10, 16), date(2026, 10, 20))
+        self.assertEqual(days, [date(2026, 10, 16), date(2026, 10, 19), date(2026, 10, 20)])
+        self.assertEqual(trading_weekdays(date(2026, 10, 20), date(2026, 10, 19)), [])
 
     def test_windows_cover_the_range_without_overlap(self):
         spans = windows(date(2025, 1, 1), date(2025, 7, 1), days=90)

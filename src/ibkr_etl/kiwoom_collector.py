@@ -21,9 +21,13 @@ Kiwoom's movement labels are Korean. Only the labels in ``_KINDS`` are read;
 any other label fails the transactions check with the label shown, instead of
 being guessed into a trade or a cash amount.
 
-Kiwoom answers with today's holdings only, so daily history starts on the
-first collected day. Rebuilding the days before that from the trades is the
-history build's job, not this module's.
+Once the case reaches Build history, each run also fills the trading days
+from the history start that have no snapshot yet, from Kiwoom's per-day
+balance (ka01690, and ust21132 for each US currency's value), and records the
+case's history_built check. A long history is filled over several runs, at
+most ``HISTORY_DAYS_PER_RUN`` days at a time. Kiwoom's past-day answer has no
+per-holding US detail, so US stocks count in a past day's total and cash but
+are listed as holdings only from the first collected day.
 """
 
 from __future__ import annotations
@@ -49,6 +53,8 @@ SECRET_PREFIX = "broker-kiwoom-rest-"
 TRANSACTION_WINDOW_DAYS = 90
 # Stages in which the collector loads an account. Live accounts keep loading every day.
 LOADING_STAGES = ("request", "load_and_reconcile", "build_history", "first_month_end", "closed")
+# Past days filled per run, so one run stays well inside the daily job's time limit.
+HISTORY_DAYS_PER_RUN = 250
 
 
 def collector_enabled(environ: Mapping[str, str] | None = None) -> bool:
@@ -367,6 +373,37 @@ def _upsert(connection, table: str, rows: Sequence[Mapping[str, Any]], keys: Seq
     return len(rows)
 
 
+def _register(connection, new_securities: Iterable[NewSecurity], instruments: Iterable[Mapping[str, Any]],
+              stamp: str) -> None:
+    for item in new_securities:
+        connection.execute(
+            "INSERT INTO security_master (security_key, display_name, asset_class, currency, primary_exchange, "
+            "status) VALUES (?, ?, 'STK', ?, ?, 'active') ON CONFLICT (security_key) DO NOTHING",
+            (item.key, item.name[:200], item.currency, item.exchange),
+        )
+        connection.execute(
+            "INSERT INTO security_identifiers (scheme, identifier, security_key, source) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (scheme, identifier) DO NOTHING",
+            (item.identifier.scheme, item.identifier.value, item.key, SOURCE),
+        )
+    for row in instruments:
+        connection.execute(
+            "INSERT INTO instruments (conid, symbol, description, asset_category, currency, listing_exchange, isin, "
+            "first_seen_at, last_seen_at, source_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (conid) "
+            "DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at",
+            (row["conid"], row["symbol"], row["description"], row["asset_category"], row["currency"],
+             row["listing_exchange"], row["isin"], stamp, stamp, json.dumps({"source": SOURCE})),
+        )
+
+
+def _clear_day(connection, account_id: str, day: date) -> None:
+    # A day's snapshot is replaced whole, so a holding sold since the last run of the day disappears.
+    for table, column in (("position_snapshots", "snapshot_date"), ("cash_snapshots", "snapshot_date"),
+                          ("fx_rates", "rate_date")):
+        connection.execute(f"DELETE FROM {table} WHERE account_id = ? AND {column} = ?",
+                           (account_id, day.isoformat()))
+
+
 def store(connection, collected: Collected, *, display_name: str, now: datetime) -> dict[str, int]:
     """Write one collection in the caller's transaction. Re-running a day replaces that day's rows."""
 
@@ -385,35 +422,107 @@ def store(connection, collected: Collected, *, display_name: str, now: datetime)
         (collected.account_id, display_name, BASE_CURRENCY, stamp, stamp,
          json.dumps({"source": SOURCE, "account_name": collected.valuation.account_name}, ensure_ascii=False)),
     )
-    for item in collected.new_securities:
-        connection.execute(
-            "INSERT INTO security_master (security_key, display_name, asset_class, currency, primary_exchange, "
-            "status) VALUES (?, ?, 'STK', ?, ?, 'active') ON CONFLICT (security_key) DO NOTHING",
-            (item.key, item.name[:200], item.currency, item.exchange),
-        )
-        connection.execute(
-            "INSERT INTO security_identifiers (scheme, identifier, security_key, source) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT (scheme, identifier) DO NOTHING",
-            (item.identifier.scheme, item.identifier.value, item.key, SOURCE),
-        )
+    _register(connection, collected.new_securities, collected.rows["instruments"], stamp)
+    _clear_day(connection, collected.account_id, collected.day)
     counts: dict[str, int] = {}
-    # A day's snapshot is replaced whole, so a holding sold since the last run of the day disappears.
-    for table, column in (("position_snapshots", "snapshot_date"), ("cash_snapshots", "snapshot_date"),
-                          ("fx_rates", "rate_date")):
-        connection.execute(f"DELETE FROM {table} WHERE account_id = ? AND {column} = ?",
-                           (collected.account_id, collected.day.isoformat()))
-    for row in collected.rows["instruments"]:
-        connection.execute(
-            "INSERT INTO instruments (conid, symbol, description, asset_category, currency, listing_exchange, isin, "
-            "first_seen_at, last_seen_at, source_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (conid) "
-            "DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at",
-            (row["conid"], row["symbol"], row["description"], row["asset_category"], row["currency"],
-             row["listing_exchange"], row["isin"], stamp, stamp, json.dumps({"source": SOURCE})),
-        )
     for table, keys in _KEYS.items():
         rows = [{**row, "row_sha256": _sha(row), "last_seen_run_id": run_id} for row in collected.rows[table]]
         counts[table] = _upsert(connection, table, rows, keys)
     return counts
+
+
+# History build ---------------------------------------------------------------------
+
+
+def trading_weekdays(start: date, end: date) -> list[date]:
+    """Monday to Friday from start to end inclusive; KRX holidays are found by asking Kiwoom."""
+
+    days, day = [], start
+    while day <= end:
+        if day.weekday() < 5:
+            days.append(day)
+        day += timedelta(days=1)
+    return days
+
+
+def days_with_snapshots(connection, account_id: str, start: date, end: date) -> set[date]:
+    rows = connection.execute(
+        "SELECT DISTINCT snapshot_date FROM nav_snapshots WHERE account_id = ? AND asset_class = 'TOTAL' "
+        "AND snapshot_date BETWEEN ? AND ?",
+        (account_id, start.isoformat(), end.isoformat()),
+    ).fetchall()
+    return {date.fromisoformat(str(row["snapshot_date"])[:10]) for row in rows}
+
+
+def _day_gap(valuation: AccountValuation) -> Decimal:
+    held = sum((item.market_value for item in valuation.holdings), Decimal("0"))
+    return valuation.estimated_assets - held - valuation.deposit
+
+
+def build_history(connection, client: KiwoomClient, *, broker_account_id: str, history_start: date, today: date,
+                  include_us: bool, now: datetime, limit: int = HISTORY_DAYS_PER_RUN) -> dict[str, Any]:
+    """Fill past trading days that have no snapshot, in the caller's transaction, and say what is left.
+
+    Returns the history_built check: pending while days remain, then pass, or
+    warn when some past day's holdings plus cash differ from Kiwoom's total.
+    """
+
+    account_id = platform_account_id(broker_account_id)
+    end = today - timedelta(days=1)
+    have = days_with_snapshots(connection, account_id, history_start, end)
+    missing = [day for day in trading_weekdays(history_start, end) if day not in have]
+    batch, remaining = missing[:limit], missing[limit:]
+    stamp = now.astimezone(timezone.utc).isoformat()
+    securities = Securities(known=known_identifiers(connection))
+    loaded: list[date] = []
+    closed: list[date] = []
+    gaps: list[dict[str, str]] = []
+    written: list[dict[str, list[dict[str, Any]]]] = []
+    for day in batch:
+        valuation = client.balance_on(day)
+        if valuation is None:
+            closed.append(day)
+            continue
+        us = UsValuation(holdings=(), balances=client.us_balances_on(day)) if include_us else None
+        rows = snapshot_rows(account_id, day, valuation, us, securities)
+        written.append(rows)
+        loaded.append(day)
+        gap = _day_gap(valuation)
+        if abs(gap) > Decimal("1"):
+            gaps.append({"date": day.isoformat(), "gap": _text(gap)})
+    if loaded:
+        payload = {"days": [day.isoformat() for day in loaded], "rows": written}
+        run_id = connection.execute(
+            "INSERT INTO ingestion_runs (run_type, requested_from, requested_to, started_at, completed_at, status, "
+            "raw_sha256, row_count) VALUES (?, ?, ?, ?, ?, 'success', ?, ?) RETURNING run_id",
+            ("kiwoom_rest_history", loaded[0].isoformat(), loaded[-1].isoformat(), stamp, stamp, _sha(payload),
+             sum(len(items) for rows in written for items in rows.values())),
+        ).fetchone()["run_id"]
+        _register(connection, (securities.new[key] for key in sorted(securities.new)),
+                  [row for rows in written for row in rows["instruments"]], stamp)
+        for day, rows in zip(loaded, written):
+            _clear_day(connection, account_id, day)
+            for table in ("position_snapshots", "cash_snapshots", "nav_snapshots", "fx_rates"):
+                _upsert(connection, table,
+                        [{**row, "row_sha256": _sha(row), "last_seen_run_id": run_id} for row in rows[table]],
+                        _KEYS[table])
+    evidence: dict[str, Any] = {
+        "from": history_start.isoformat(), "to": end.isoformat(), "loaded_this_run": len(loaded),
+        "days_with_history": len(have) + len(loaded), "closed_days": [day.isoformat() for day in closed][:40],
+        "days_left": len(remaining), "gaps": gaps[:20], "us_holdings_listed_from_first_collected_day": include_us,
+    }
+    if remaining:
+        return {"status": "pending", "evidence": evidence,
+                "message": f"{len(have) + len(loaded)} past days loaded; {len(remaining)} more are filled on the "
+                           "next runs."}
+    if gaps:
+        return {"status": "warn", "evidence": evidence,
+                "message": f"Daily history from {history_start.isoformat()} is complete, but on {len(gaps)} days "
+                           f"holdings plus cash differ from Kiwoom's total, for example {gaps[0]['date']} by "
+                           f"{gaps[0]['gap']} KRW. Check those days before approving the reports."}
+    return {"status": "pass", "evidence": evidence,
+            "message": f"Daily history from {history_start.isoformat()} is complete: "
+                       f"{len(have) + len(loaded)} trading days, each matching Kiwoom's total."}
 
 
 # The daily run ---------------------------------------------------------------------
@@ -483,6 +592,32 @@ def _record(connection, tenant_id: str, case_id: str, check_id: str, check: Mapp
     return str(outcome["stage"])
 
 
+def _history(connection, tenant_id: str, client: KiwoomClient, target: Target, *, today: date, now: datetime,
+             include_us: bool) -> dict[str, Any]:
+    """The history build for one account; a Kiwoom refusal fails the history check, not the day's load."""
+
+    assert target.case_id is not None and target.history_start is not None
+    previous = connection.execute(
+        "SELECT status FROM broker_onboarding_checks WHERE tenant_id = ? AND case_id = ? AND check_id = 'history_built'",
+        (tenant_id, target.case_id),
+    ).fetchone()
+    try:
+        check = build_history(connection, client, broker_account_id=target.broker_account_id,
+                              history_start=target.history_start, today=today, include_us=include_us, now=now)
+    except (KiwoomError, ValueError) as error:
+        connection.rollback()
+        check = {"status": "fail", "message": f"Kiwoom refused a past day's balance: {str(error)[:300]}",
+                 "evidence": {"from": target.history_start.isoformat()}}
+    # A finished history stays as recorded until something new is loaded.
+    if check["status"] == "pass" and previous is not None and previous["status"] == "pass" \
+            and not check["evidence"].get("loaded_this_run"):
+        connection.commit()
+        return {"check": "pass", "recorded": False}
+    _record(connection, tenant_id, target.case_id, "history_built", check)
+    connection.commit()
+    return {"check": check["status"], "recorded": True, "loaded": check["evidence"].get("loaded_this_run", 0)}
+
+
 def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClient], today: date,
         now: datetime, include_us: bool = True) -> list[dict[str, Any]]:
     """Collect every Kiwoom account. One account's failure never stops the others."""
@@ -520,6 +655,9 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
                     if stage != "load_and_reconcile":
                         break
             connection.commit()
+            if stage == "build_history":
+                result["history"] = _history(connection, tenant_id, client, target, today=today, now=now,
+                                             include_us=include_us)
             results.append({**result, "status": "loaded", "stage": stage, "rows": counts})
         except (KiwoomError, ValueError) as error:
             connection.rollback()

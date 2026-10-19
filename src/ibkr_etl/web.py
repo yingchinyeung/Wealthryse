@@ -3939,8 +3939,8 @@ def _record_first_month_end(connection, subject_id: str, period_end: str) -> Non
         with connection.transaction():  # a savepoint: a refusal here leaves the release intact
             onboarding_v2_web.record_first_month_end(
                 _portable_database_connection(connection), TENANT_ID, subject_id, period_end)
-    except onboarding_v2_web.OnboardingError:
-        logging.getLogger(__name__).warning("First month-end not recorded for %s %s", subject_id, period_end)
+    except Exception:  # noqa: BLE001 - the savepoint rolled the check back; the release stands
+        logging.getLogger(__name__).exception("First month-end not recorded for %s %s", subject_id, period_end)
 
 
 @app.post("/api/accounts/{subject_id}/reporting/monthly/{period_end}/release")

@@ -348,6 +348,11 @@ class KiwoomClient:
         pages = self.inquire("ka01690", {"qry_dt": _yyyymmdd(day)})
         first = pages[0]
         answered = str(first.get("dt") or "").strip()
+        if not answered and not str(first.get("day_stk_asst") or "").strip():
+            # Kiwoom rebuilds its daily records 01:00-03:00 and 04:00-07:00 KST and answers with
+            # empty figures meanwhile ("전일자 자동일지 데이터 생성 중입니다").
+            raise KiwoomError(f"ka01690 has no figures for {day.isoformat()} while Kiwoom rebuilds its daily records "
+                              f"(01:00-03:00 and 04:00-07:00 Korea time): {str(first.get('return_msg') or '')[:120]}")
         if answered and answered != _yyyymmdd(day):
             return None
         holdings: list[Holding] = []

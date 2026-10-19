@@ -241,6 +241,13 @@ class KiwoomPastDayTests(unittest.TestCase):
         fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20250530")]})
         self.assertIsNone(_client(fake).balance_on(date(2025, 6, 2)))
 
+    def test_the_nightly_rebuild_fails_loudly_instead_of_reading_empty_figures(self) -> None:
+        empty = {"return_code": 0, "dt": "", "dbst_bal": "", "day_stk_asst": "",
+                 "return_msg": "전일자 자동일지 데이터 생성 중입니다. (매일 오전 1~3시, 4~7시)",
+                 "day_bal_rt": [{"stk_cd": "", "rmnd_qty": "", "cur_prc": "", "evlt_amt": ""}]}
+        with self.assertRaisesRegex(KiwoomError, "rebuilds its daily records"):
+            _client(FakeKiwoom({"ka01690": [empty]})).balance_on(date(2026, 9, 14))
+
     def test_a_missing_total_fails_loudly(self) -> None:
         page = {key: value for key, value in DAY_BALANCE.items() if key != "day_stk_asst"}
         with self.assertRaisesRegex(KiwoomError, "day_stk_asst"):

@@ -120,8 +120,18 @@ class ProvisionalBenchmarkTests(unittest.TestCase):
         self.assertEqual(symbol, 'HKD=X')
         self.assertEqual(rows, [('2025-01-20',32.0),('2025-01-21',31.25)])
 
+    def test_krw_uses_reciprocal_to_usd_and_direct_quote_from_usd(self) -> None:
+        class KRWTicker(_FxTicker):
+            def __init__(self, symbol):
+                if symbol != 'KRW=X': raise AssertionError(symbol)
+        start, end = datetime(2025,1,20).date(), datetime(2025,1,21).date()
+        rows, symbol = fetch_fx_to_reporting_yfinance('KRW', 'USD', start, end, KRWTicker)
+        self.assertEqual((symbol, rows), ('KRW=X', [('2025-01-20',1/32.0),('2025-01-21',1/31.25)]))
+        rows, symbol = fetch_fx_to_reporting_yfinance('USD', 'KRW', start, end, KRWTicker)
+        self.assertEqual((symbol, rows), ('KRW=X', [('2025-01-20',32.0),('2025-01-21',31.25)]))
+
     def test_fx_unsupported_cross_pair_and_identical_currency_fail_closed(self) -> None:
-        for pair in (('CNY','HKD'), ('USD','EUR'), ('HKD','HKD')):
+        for pair in (('CNY','HKD'), ('USD','EUR'), ('HKD','HKD'), ('KRW','HKD'), ('USD','TWD')):
             with self.subTest(pair=pair), self.assertRaises((ValueError,RuntimeError)):
                 fetch_fx_to_reporting_yfinance(*pair, datetime(2025,1,20).date(),
                                                datetime(2025,1,21).date(), _FxTicker)

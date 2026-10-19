@@ -169,22 +169,34 @@ def _latest_common_day(connection, statement: str, subject_id: str, period_end: 
 # Brokers whose daily row can carry provisional prices that the next trading day's
 # history pass replaces (Kiwoom: after-market prices, later the official KRX close).
 NEXT_DAY_FINAL_BROKERS = frozenset({"kiwoom_rest"})
+HISTORY_RUN_TYPES = {"kiwoom_rest": "kiwoom_rest_history"}
 
 
-def _next_day_in(connection, subject_id: str, period_end: str) -> bool:
-    row = connection.execute(
+def _close_is_final(connection, subject_id: str, period_end: str, day: str) -> bool:
+    """The month's last NAV row was rewritten by a history run at the official close,
+    and a later trading day's row is in (the nav_snapshots contract's rule)."""
+
+    final = connection.execute(
+        "SELECT 1 AS final FROM nav_snapshots n JOIN ingestion_runs r ON r.run_id = n.last_seen_run_id "
+        "WHERE n.account_id = ? AND n.snapshot_date = ? AND n.asset_class = 'TOTAL' AND r.run_type = ?",
+        (subject_id, day, HISTORY_RUN_TYPES["kiwoom_rest"]),
+    ).fetchone()
+    if not final:
+        return False
+    later = connection.execute(
         "SELECT MIN(n.snapshot_date) AS day FROM nav_snapshots n "
         "WHERE n.account_id = ? AND n.snapshot_date > ? AND n.asset_class = 'TOTAL'",
         (subject_id, period_end),
     ).fetchone()
-    return bool(row and row["day"])
+    return bool(later and later["day"])
 
 
 def month_ready(connection, source_kind: str, subject_id: str, period_end: str, broker: str | None = None) -> bool:
     """Whether the month's data are in: the same rule as the month-end package for each kind of subject.
 
     For a broker whose month-end close is final only after the next trading day's
-    run, the month also waits until a later trading day's NAV is in.
+    run, the month also waits until its last NAV row comes from a history run
+    and a later trading day's NAV is in.
     """
 
     if source_kind == "composite_portfolio":
@@ -201,7 +213,7 @@ def month_ready(connection, source_kind: str, subject_id: str, period_end: str, 
     if not day or (date.fromisoformat(period_end) - date.fromisoformat(day)).days > STALE_AFTER_DAYS:
         return False
     if source_kind == "broker_account" and broker in NEXT_DAY_FINAL_BROKERS:
-        return _next_day_in(connection, subject_id, period_end)
+        return _close_is_final(connection, subject_id, period_end, day)
     return True
 
 

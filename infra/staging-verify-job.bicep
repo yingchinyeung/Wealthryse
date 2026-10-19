@@ -34,7 +34,7 @@ resource jobIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-3
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'onboarding', hop: 'quality-gate' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

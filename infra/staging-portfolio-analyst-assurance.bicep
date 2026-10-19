@@ -52,7 +52,7 @@ resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' existing = {
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'reporting', hop: 'quality-gate' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -120,7 +120,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
 resource failureAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   name: '${jobName}-failed-execution'
   location: 'global'
-  tags: tags
+  tags: union(tags, { layer: 'ops', component: 'alerts' })
   properties: {
     description: 'The daily portfolio-analyst data, metrics and report assurance job failed.'
     severity: 1

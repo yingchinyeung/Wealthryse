@@ -44,7 +44,7 @@ var privateDnsZoneName = '${prefix}.postgres.database.azure.com'
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: workspaceName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'logging' })
   properties: {
     retentionInDays: 30
     features: {
@@ -144,7 +144,7 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
 resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   name: registryName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'registry' })
   sku: {
     name: 'Basic'
   }
@@ -157,7 +157,7 @@ resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'data', component: 'storage', dataLayer: 'bronze+gold+ops' })
   sku: {
     name: 'Standard_LRS'
   }
@@ -245,7 +245,7 @@ resource approvedContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
 resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: vaultName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'secrets' })
   properties: {
     tenantId: tenant().tenantId
     enableRbacAuthorization: true
@@ -263,37 +263,37 @@ resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
 resource webIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-web-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource ingestionIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-ingestion-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource publisherIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-publisher-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource diagnosticsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-diagnostics-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource approvedActionsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-approved-actions-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
   name: postgresName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'data', component: 'database', dataLayer: 'bronze+silver+gold+ops' })
   sku: {
     name: postgresSkuName
     tier: postgresSkuTier

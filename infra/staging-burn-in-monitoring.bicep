@@ -93,7 +93,7 @@ resource vaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' =
 resource monitorJob 'Microsoft.App/jobs@2024-03-01' = {
   name: monitorJobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ops', component: 'monitoring', hop: 'ops' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -153,10 +153,28 @@ resource monitorJob 'Microsoft.App/jobs@2024-03-01' = {
   dependsOn: [registryPull, vaultSecretsUser]
 }
 
+// The Medallion tags step S4a put on each live alert, by job (infra/medallion/applied-tags.json).
+// Four of these alerts had no owner tag before S4a, so S4a gave them owner 'ying'.
+var medallionAlertTags = {
+  'ibkrv2stg-account-sync-daily': { layer: 'ops', component: 'alerts' }
+  'ibkrv2stg-benchmark-daily': { layer: 'ops', component: 'alerts' }
+  'ibkrv2stg-risk-free-daily': { layer: 'ops', component: 'alerts' }
+  'ibkrv2stg-sector-classification': { layer: 'ops', component: 'alerts' }
+  'ibkrv2stg-month-end-factsheet': { layer: 'ops', component: 'alerts' }
+  'ibkrv2stg-analyst-assurance': { layer: 'ops', component: 'alerts' }
+  'ibkrv2stg-autonomous-admin': { layer: 'ops', component: 'alerts' }
+  'ibkrv2stg-autonomy-review': { layer: 'ops', component: 'alerts' }
+  'ibkrv2stg-derived-daily': { layer: 'ops', component: 'alerts', owner: 'ying' }
+  'ibkrv2stg-risk-snapshots': { layer: 'ops', component: 'alerts', owner: 'ying' }
+  'ibkrv2stg-institutional-daily': { layer: 'ops', component: 'alerts', owner: 'ying' }
+  'ibkrv2stg-flex-discovery': { layer: 'ops', component: 'alerts', owner: 'ying' }
+  'ibkrv2stg-burn-in-monitor': { layer: 'ops', component: 'alerts' }
+}
+
 resource failedJobAlerts 'Microsoft.Insights/metricAlerts@2018-03-01' = [for jobName in monitoredJobNames: {
   name: '${jobName}-failed-execution'
   location: 'global'
-  tags: tags
+  tags: union(tags, contains(medallionAlertTags, jobName) ? medallionAlertTags[jobName] : { layer: 'ops', component: 'alerts' })
   properties: {
     description: jobName == 'ibkrv2stg-analyst-assurance'
       ? 'The daily portfolio-analyst data, metrics and report assurance job failed.'
@@ -196,7 +214,7 @@ resource failedJobAlerts 'Microsoft.Insights/metricAlerts@2018-03-01' = [for job
 resource webServerErrorAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   name: '${webAppName}-server-errors'
   location: 'global'
-  tags: tags
+  tags: union(tags, { layer: 'ops', component: 'alerts' })
   properties: {
     description: 'Burn-in alert: the private portfolio portal returned a server error.'
     severity: 1

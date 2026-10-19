@@ -61,7 +61,7 @@ resource jobAiInferenceRole 'Microsoft.Authorization/roleAssignments@2022-04-01'
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'reporting', hop: 'analytics+publish' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

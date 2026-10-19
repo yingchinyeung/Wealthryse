@@ -39,7 +39,7 @@ resource databaseSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing 
 resource shadowJob 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'daily-pipeline', hop: 'ops' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

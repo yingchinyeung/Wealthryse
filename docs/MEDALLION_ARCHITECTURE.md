@@ -35,6 +35,13 @@ Status: the catalog is in place. Nothing has moved yet, and every table is still
   - New containers are named `<layer>-<content>`.
 - **Jobs:** the catalog records each job's hops (ingest, conform, analytics,
   quality-gate, publish, serve, ops). Job names stay, and a tag carries the hop.
+- **Azure resources:** each one carries `layer` (foundation, data, apps, ai or ops),
+  `component` and `owner` tags, and jobs and apps also carry `hop`.
+  `infra/medallion/applied-tags.json` records what was added on 17 Oct 2026. A Bicep file
+  that deploys one of those resources sets the same tags with `union(tags, {...})`, so a
+  redeploy keeps them. `tests/test_bicep_medallion_tags.py` checks this. A new resource
+  in a Bicep file gets its three tags in the same PR. The resource group's audit rule
+  (Azure Policy, "Medallion rule") reports any resource without them.
 
 ## Adding a table, view or container
 

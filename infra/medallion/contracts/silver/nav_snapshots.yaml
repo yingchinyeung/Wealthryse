@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.nav_snapshots
 name: nav_snapshots
-version: 1.0.2
+version: 1.0.3
 status: active
 domain: silver
 dataProduct: portfolio-medallion
@@ -16,10 +16,13 @@ description:
     returns this table as it stood at any moment. Kiwoom accounts (written by ibkr_etl.kiwoom_collector) have one
     KRW TOTAL row per day. total_text is Kiwoom's own total (kt00004 prsm_dpst_aset_amt today, ka01690 day_stk_asst
     for a past day), which is after Kiwoom's estimated tax and fee for selling every holding, plus any US holdings
-    and deposits at Kiwoom's rate to KRW. stock_text is the holdings' value, cash_text the deposit (d2_entra today,
-    dbst_bal for a past day) plus any US deposits, and accruals_text the selling cost as a negative amount, so stock
-    + cash + accruals = total. Reports use total_text as the account's NAV (decided 19 Oct 2026). A Kiwoom row's
-    row_sha256 is the sha256 of the row as written, not of a Flex row.
+    and deposits at Kiwoom's rate to KRW. stock_text is Kiwoom's own value of the holdings (the holdings kt00004
+    lists today; kt00016 scrt_evlt_amt_to for a past day, whose entr_to must equal dbst_bal). From 14 Sep 2026 Kiwoom
+    can value a past day's holdings off the closing prices ka01690 lists, by up to about 1.1%, so on those days
+    the account's positions (which keep the listed closes) do not add up to stock_text. cash_text is the deposit
+    (d2_entra today, dbst_bal for a past day) plus any US deposits, and accruals_text the selling cost as a negative
+    amount, so stock + cash + accruals = total. Reports use total_text as the account's NAV (decided 19 Oct 2026).
+    A Kiwoom row's row_sha256 is the sha256 of the row as written, not of a Flex row.
 tags:
 - silver
 - ibkr
@@ -124,7 +127,8 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
-    description: Stocks as decimal text.
+    description: Stocks as decimal text. For a Kiwoom account, Kiwoom's own value of the holdings (kt00016 scrt_evlt_amt_to
+      for a past day), which from 14 Sep 2026 can differ from the sum of its positions at the listed closing prices.
     quality:
     - name: stock_text_is_decimal
       description: stock_text is plain decimal text when present. v_daily_nav casts these to double precision, so
@@ -197,7 +201,8 @@ schema:
     primaryKeyPosition: -1
     classification: confidential-financial
     description: 'Accruals as decimal text: the accruals field, or the sum of the CFD, withholding, dividend, interest
-      and margin accrual fields. For a Kiwoom account, Kiwoom''s estimated selling cost as a negative amount.'
+      and margin accrual fields. For a Kiwoom account, Kiwoom''s estimated selling cost as a negative amount (its
+      value of the holdings plus cash, less its total).'
     quality:
     - name: accruals_text_is_decimal
       description: accruals_text is plain decimal text when present. v_daily_nav casts these to double precision,

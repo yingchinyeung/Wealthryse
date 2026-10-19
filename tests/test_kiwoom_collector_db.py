@@ -220,14 +220,16 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
     def test_a_past_day_off_kiwooms_total_warns(self):
         _, case_id = self._kiwoom_account("6234567890", start=date(2026, 9, 1))
         self.addCleanup(self._cancel, case_id)
+        # The day is filled before approval; the run that records the check loads nothing new.
         self._run({"6234567890": FakeKiwoom(off_day=date(2026, 10, 5))})
         self._approve_terms(case_id)
-        self.db.execute("DELETE FROM nav_snapshots WHERE account_id = 'KIWOOM-6234567890' AND snapshot_date = '2026-10-05'")
-        self.db.commit()
-        result = self._run({"6234567890": FakeKiwoom(off_day=date(2026, 10, 5))})[0]
+        later = FakeKiwoom()
+        result = self._run({"6234567890": later})[0]
+        self.assertEqual(later.asked, [])
         self.assertEqual(result["history"]["check"], "warn")
         check = self._history_check(case_id)
         self.assertEqual(check["evidence_json"]["gaps"], [{"date": "2026-10-05", "gap": "5000"}])
+        self.assertEqual(check["evidence_json"]["gap_days"], 1)
 
     def test_a_history_refusal_fails_the_check_but_keeps_the_day(self):
         _, case_id = self._kiwoom_account("7234567890")

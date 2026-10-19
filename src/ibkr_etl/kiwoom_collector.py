@@ -457,9 +457,23 @@ def days_with_snapshots(connection, account_id: str, start: date, end: date) -> 
     return {date.fromisoformat(str(row["snapshot_date"])[:10]) for row in rows}
 
 
-def _day_gap(valuation: AccountValuation) -> Decimal:
-    held = sum((item.market_value for item in valuation.holdings), Decimal("0"))
-    return valuation.estimated_assets - held - valuation.deposit
+def stored_gaps(connection, account_id: str, start: date, end: date) -> list[dict[str, str]]:
+    """Every stored day whose holdings plus cash differ from Kiwoom's total by more than 1 KRW.
+
+    Read from the stored totals, so days filled on earlier runs count too.
+    """
+
+    rows = connection.execute(
+        "SELECT snapshot_date, total_text, cash_text, stock_text FROM nav_snapshots "
+        "WHERE account_id = ? AND asset_class = 'TOTAL' AND snapshot_date BETWEEN ? AND ? ORDER BY snapshot_date",
+        (account_id, start.isoformat(), end.isoformat()),
+    ).fetchall()
+    gaps = []
+    for row in rows:
+        gap = Decimal(str(row["total_text"])) - Decimal(str(row["cash_text"])) - Decimal(str(row["stock_text"]))
+        if abs(gap) > Decimal("1"):
+            gaps.append({"date": str(row["snapshot_date"])[:10], "gap": _text(gap)})
+    return gaps
 
 
 def build_history(connection, client: KiwoomClient, *, broker_account_id: str, history_start: date, today: date,
@@ -479,7 +493,6 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
     securities = Securities(known=known_identifiers(connection))
     loaded: list[date] = []
     closed: list[date] = []
-    gaps: list[dict[str, str]] = []
     written: list[dict[str, list[dict[str, Any]]]] = []
     for day in batch:
         valuation = client.balance_on(day)
@@ -490,9 +503,6 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
         rows = snapshot_rows(account_id, day, valuation, us, securities)
         written.append(rows)
         loaded.append(day)
-        gap = _day_gap(valuation)
-        if abs(gap) > Decimal("1"):
-            gaps.append({"date": day.isoformat(), "gap": _text(gap)})
     if loaded:
         payload = {"days": [day.isoformat() for day in loaded], "rows": written}
         run_id = connection.execute(
@@ -509,10 +519,11 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
                 _upsert(connection, table,
                         [{**row, "row_sha256": _sha(row), "last_seen_run_id": run_id} for row in rows[table]],
                         _KEYS[table])
+    gaps = stored_gaps(connection, account_id, history_start, end)
     evidence: dict[str, Any] = {
         "from": history_start.isoformat(), "to": end.isoformat(), "loaded_this_run": len(loaded),
         "days_with_history": len(have) + len(loaded), "closed_days": [day.isoformat() for day in closed][:40],
-        "days_left": len(remaining), "gaps": gaps[:20], "us_holdings_listed_from_first_collected_day": include_us,
+        "days_left": len(remaining), "gap_days": len(gaps), "gaps": gaps[:20], "us_holdings_listed_from_first_collected_day": include_us,
     }
     if remaining:
         return {"status": "pending", "evidence": evidence,

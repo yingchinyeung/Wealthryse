@@ -8,13 +8,13 @@ from __future__ import annotations
 
 import unittest
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 try:
-    from test_broker_onboarding_db import ADMIN_DSN, OWNER_ROLE, TENANT, _dsn, _MigratedDatabase
+    from test_broker_onboarding_db import ADMIN_DSN, IDENTITY, OWNER_ROLE, TENANT, _dsn, _MigratedDatabase
 except ImportError:  # run as tests.test_kiwoom_collector_db
-    from tests.test_broker_onboarding_db import ADMIN_DSN, OWNER_ROLE, TENANT, _dsn, _MigratedDatabase
+    from tests.test_broker_onboarding_db import ADMIN_DSN, IDENTITY, OWNER_ROLE, TENANT, _dsn, _MigratedDatabase
 
 from ibkr_etl.kiwoom_client import AccountValuation, CashMovement, Holding, KiwoomError
 from ibkr_etl.security_master import SecurityIdentifier
@@ -22,11 +22,13 @@ from ibkr_etl.security_master import SecurityIdentifier
 SAMSUNG = SecurityIdentifier("krx_code", "005930")
 NOW = datetime(2026, 10, 19, 8, 30, tzinfo=timezone.utc)
 TODAY = date(2026, 10, 19)
+CLOSED = date(2025, 3, 3)  # a KRX holiday in this synthetic history
 
 
 class FakeKiwoom:
-    def __init__(self, *, total="8000000", fail=False):
+    def __init__(self, *, total="8000000", fail=False, off_day=None, refuse_history=False):
         self.total, self.fail, self.revoked = Decimal(total), fail, False
+        self.off_day, self.refuse_history, self.asked = off_day, refuse_history, []
 
     def valuation(self):
         if self.fail:
@@ -39,6 +41,16 @@ class FakeKiwoom:
             return [CashMovement("2025-01-03", "", "입금", None, Decimal("0"), Decimal("7000000"), "KRW"),
                     CashMovement("2025-01-06", "", "매수", SAMSUNG, Decimal("100"), Decimal("6000000"), "KRW")]
         return []
+
+    def balance_on(self, day):
+        self.asked.append(day)
+        if self.refuse_history:
+            raise KiwoomError("Kiwoom refused the call (HTTP 200, code 2): no data before the account opened")
+        if day == CLOSED:
+            return None
+        total = Decimal("8005000") if day == self.off_day else Decimal("8000000")
+        return AccountValuation("", Decimal("1000000"), total, (
+            Holding(SAMSUNG, "삼성전자", Decimal("100"), Decimal("60000"), Decimal("70000"), Decimal("7000000")),))
 
     def us_valuation(self):
         raise AssertionError("US calls are off in this test")
@@ -85,6 +97,20 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         return run(self.db, TENANT, client_for=lambda target: clients[target.broker_account_id], today=TODAY,
                    now=NOW, include_us=False)
 
+    def _approve_terms(self, case_id):
+        from ibkr_etl.onboarding_v2_web import approve_case, case_detail
+
+        detail = case_detail(self.db, TENANT, case_id)
+        approved = approve_case(self.db, TENANT, case_id, approval="account_terms",
+                                terms_sha256=detail["account_terms_sha256"], acknowledge_warnings=[],
+                                confirmation=None, actor=IDENTITY)
+        self.db.commit()
+        self.assertEqual(approved["stage"], "build_history")
+
+    def _history_check(self, case_id):
+        return self.db.execute("SELECT status, message, evidence_json FROM broker_onboarding_checks "
+                               "WHERE case_id = ? AND check_id = 'history_built'", (case_id,)).fetchone()
+
     def _checks(self, case_id):
         rows = self.db.execute("SELECT check_id, status FROM broker_onboarding_checks WHERE case_id = ?",
                                (case_id,)).fetchall()
@@ -99,6 +125,7 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self.db.commit()
 
     def _cancel(self, case_id):
+        self.db.rollback()
         self.db.execute("UPDATE broker_onboarding_cases SET status = 'cancelled' WHERE case_id = ?", (case_id,))
         self.db.commit()
 
@@ -134,6 +161,63 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self._run({"1234567890": FakeKiwoom()})
         self.assertEqual(self._count("position_snapshots", account), 1)
         self.assertEqual(self._count("trades", account), 1)
+
+    def test_build_history_fills_past_days_over_two_runs(self):
+        from ibkr_etl.kiwoom_collector import HISTORY_DAYS_PER_RUN, trading_weekdays
+
+        _, case_id = self._kiwoom_account("5234567890")
+        self.addCleanup(self._cancel, case_id)
+        self._run({"5234567890": FakeKiwoom()})
+        self._approve_terms(case_id)
+        account = "KIWOOM-5234567890"
+        weekdays = trading_weekdays(date(2025, 1, 2), TODAY - timedelta(days=1))
+        self.assertGreater(len(weekdays), HISTORY_DAYS_PER_RUN)
+
+        first = FakeKiwoom()
+        result = self._run({"5234567890": first})[0]
+        self.assertEqual(result["history"]["check"], "pending")
+        self.assertEqual(first.asked, weekdays[:HISTORY_DAYS_PER_RUN])
+        self.assertEqual(self._history_check(case_id)["status"], "pending")
+
+        second = FakeKiwoom()
+        result = self._run({"5234567890": second})[0]
+        self.assertEqual(result["history"]["check"], "pass")
+        # Only the days still missing are asked for, plus the closed day, which has no snapshot.
+        self.assertEqual(second.asked, [CLOSED] + weekdays[HISTORY_DAYS_PER_RUN:])
+        check = self._history_check(case_id)
+        self.assertEqual(check["status"], "pass", check["message"])
+        days = self.db.execute("SELECT count(DISTINCT snapshot_date) AS n FROM nav_snapshots WHERE account_id = ?",
+                               (account,)).fetchone()["n"]
+        self.assertEqual(days, len(weekdays))  # every weekday but the closed one, plus today
+        self.assertEqual(self.db.execute("SELECT total_text FROM nav_snapshots WHERE account_id = ? AND "
+                                         "snapshot_date = '2025-06-02'", (account,)).fetchone()["total_text"],
+                         "8000000")
+
+        # A finished history is not recorded again on later runs.
+        result = self._run({"5234567890": FakeKiwoom()})[0]
+        self.assertEqual(result["history"], {"check": "pass", "recorded": False})
+
+    def test_a_past_day_off_kiwooms_total_warns(self):
+        from ibkr_etl.kiwoom_collector import build_history
+
+        _, case_id = self._kiwoom_account("6234567890")
+        self.addCleanup(self._cancel, case_id)
+        self._run({"6234567890": FakeKiwoom()})  # the day's load registers the account first
+        check = build_history(self.db, FakeKiwoom(off_day=date(2025, 6, 2)), broker_account_id="6234567890",
+                              history_start=date(2025, 5, 26), today=date(2025, 6, 9), include_us=False, now=NOW)
+        self.db.rollback()
+        self.assertEqual(check["status"], "warn")
+        self.assertEqual(check["evidence"]["gaps"], [{"date": "2025-06-02", "gap": "5000"}])
+
+    def test_a_history_refusal_fails_the_check_but_keeps_the_day(self):
+        _, case_id = self._kiwoom_account("7234567890")
+        self.addCleanup(self._cancel, case_id)
+        self._run({"7234567890": FakeKiwoom()})
+        self._approve_terms(case_id)
+        result = self._run({"7234567890": FakeKiwoom(refuse_history=True)})[0]
+        self.assertEqual((result["status"], result["history"]["check"]), ("loaded", "fail"))
+        self.assertIn("no data before the account opened", self._history_check(case_id)["message"])
+        self.assertEqual(self._count("position_snapshots", "KIWOOM-7234567890"), 1)
 
     def test_a_refusal_marks_the_connection_and_writes_nothing(self):
         connection_id, case_id = self._kiwoom_account("2234567890")

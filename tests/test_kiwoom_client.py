@@ -195,6 +195,36 @@ US_BALANCES = {"return_code": 0, "won_entr": "000000100000", "result_list": [
 ]}
 
 
+DAY_BALANCE = {"return_code": 0, "dt": "20250602", "dbst_bal": "000000001000000",
+               "day_stk_asst": "000000008000000", "day_bal_rt": [
+                   {"stk_cd": "A005930", "stk_nm": "삼성전자", "rmnd_qty": "000000000100", "buy_uv": "60000",
+                    "cur_prc": "+70000", "evlt_amt": "000007000000"},
+                   {"stk_cd": "000660", "stk_nm": "SK하이닉스", "rmnd_qty": "0", "buy_uv": "0", "cur_prc": "0",
+                    "evlt_amt": "0"},
+               ]}
+
+
+class KiwoomPastDayTests(unittest.TestCase):
+    def test_a_past_day_reads_holdings_and_cash(self) -> None:
+        fake = FakeKiwoom({"ka01690": [DAY_BALANCE]})
+        valuation = _client(fake).balance_on(date(2025, 6, 2))
+        self.assertEqual(fake.requests[-1][2], {"qry_dt": "20250602"})
+        self.assertEqual((valuation.deposit, valuation.estimated_assets), (Decimal("1000000"), Decimal("8000000")))
+        # A stock sold out by that day is left out.
+        self.assertEqual([(h.code, h.quantity, h.price) for h in valuation.holdings],
+                         [("005930", Decimal("100"), Decimal("70000"))])
+        self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
+
+    def test_a_closed_day_is_none(self) -> None:
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20250530")]})
+        self.assertIsNone(_client(fake).balance_on(date(2025, 6, 2)))
+
+    def test_a_missing_total_fails_loudly(self) -> None:
+        page = {key: value for key, value in DAY_BALANCE.items() if key != "day_stk_asst"}
+        with self.assertRaisesRegex(KiwoomError, "day_stk_asst"):
+            _client(FakeKiwoom({"ka01690": [page]})).balance_on(date(2025, 6, 2))
+
+
 class KiwoomUsTests(unittest.TestCase):
     def test_us_valuation_reads_holdings_and_balances(self) -> None:
         fake = FakeKiwoom({"ust21070": [US_HOLDINGS], "ust21120": [US_BALANCES]})

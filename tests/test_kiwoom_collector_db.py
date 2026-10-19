@@ -71,7 +71,7 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self.db = PostgresConnection(raw)
         self.addCleanup(raw.close)
 
-    def _kiwoom_account(self, account_id, *, case=True):
+    def _kiwoom_account(self, account_id, *, case=True, start=date(2025, 1, 2)):
         from ibkr_etl.onboarding_v2_web import start_case
 
         connection_id = uuid.uuid4()
@@ -87,7 +87,7 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         if case:
             case_id = start_case(self.db, TENANT, connection_id=str(connection_id), broker_account_id=account_id,
                                  display_name="Korea stocks", reporting_currency="KRW",
-                                 history_start_date=date(2025, 1, 2), actor=None, today=TODAY)["case_id"]
+                                 history_start_date=start, actor=None, today=TODAY)["case_id"]
         self.db.commit()
         return str(connection_id), case_id
 
@@ -102,7 +102,8 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
 
         detail = case_detail(self.db, TENANT, case_id)
         approved = approve_case(self.db, TENANT, case_id, approval="account_terms",
-                                terms_sha256=detail["account_terms_sha256"], acknowledge_warnings=[],
+                                terms_sha256=detail["account_terms_sha256"],
+                                acknowledge_warnings=["transactions_loaded"],
                                 confirmation=None, actor=IDENTITY)
         self.db.commit()
         self.assertEqual(approved["stage"], "build_history")
@@ -119,6 +120,10 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
     def _count(self, table, account):
         return self.db.execute(f"SELECT count(*) AS n FROM {table} WHERE account_id = ?", (account,)).fetchone()["n"]
 
+    def _today(self, table, account):
+        return self.db.execute(f"SELECT count(*) AS n FROM {table} WHERE account_id = ? AND snapshot_date = ?",
+                               (account, TODAY.isoformat())).fetchone()["n"]
+
     def _retire(self, connection_id):
         self.db.rollback()
         self.db.execute("UPDATE broker_connections SET status = 'retired' WHERE connection_id = ?", (connection_id,))
@@ -126,7 +131,9 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
 
     def _cancel(self, case_id):
         self.db.rollback()
-        self.db.execute("UPDATE broker_onboarding_cases SET status = 'cancelled' WHERE case_id = ?", (case_id,))
+        # A closed case stays closed; any other is cancelled so the next test can start one.
+        self.db.execute("UPDATE broker_onboarding_cases SET status = 'cancelled' WHERE case_id = ? "
+                        "AND stage <> 'closed'", (case_id,))
         self.db.commit()
 
     def test_a_new_case_loads_and_passes_stage_two(self):
@@ -145,10 +152,11 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
             "holdings_and_cash_loaded": "pass", "transactions_loaded": "pass", "securities_mapped": "pass",
             "nav_reconciled": "pass"})
         account = "KIWOOM-1234567890"
-        self.assertEqual(self._count("position_snapshots", account), 1)
+        self.assertEqual(self._today("position_snapshots", account), 1)
         self.assertEqual(self._count("trades", account), 1)
         self.assertEqual(self._count("cash_transactions", account), 1)
-        nav = self.db.execute("SELECT total_text FROM nav_snapshots WHERE account_id = ?", (account,)).fetchone()
+        nav = self.db.execute("SELECT total_text FROM nav_snapshots WHERE account_id = ? AND snapshot_date = ?",
+                              (account, TODAY.isoformat())).fetchone()
         self.assertEqual(nav["total_text"], "8000000")
         self.assertEqual(self.db.execute(
             "SELECT security_key FROM security_identifiers WHERE scheme = 'krx_code' AND identifier = '005930'"
@@ -159,26 +167,27 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
 
         # The same day again replaces rather than adds.
         self._run({"1234567890": FakeKiwoom()})
-        self.assertEqual(self._count("position_snapshots", account), 1)
+        self.assertEqual(self._today("position_snapshots", account), 1)
         self.assertEqual(self._count("trades", account), 1)
 
-    def test_build_history_fills_past_days_over_two_runs(self):
+    def test_history_fills_before_approval_and_is_recorded_after(self):
         from ibkr_etl.kiwoom_collector import HISTORY_DAYS_PER_RUN, trading_weekdays
 
         _, case_id = self._kiwoom_account("5234567890")
         self.addCleanup(self._cancel, case_id)
-        self._run({"5234567890": FakeKiwoom()})
-        self._approve_terms(case_id)
         account = "KIWOOM-5234567890"
         weekdays = trading_weekdays(date(2025, 1, 2), TODAY - timedelta(days=1))
         self.assertGreater(len(weekdays), HISTORY_DAYS_PER_RUN)
 
+        # Load and reconcile: the first run fills the first batch of days but records no history check.
         first = FakeKiwoom()
         result = self._run({"5234567890": first})[0]
-        self.assertEqual(result["history"]["check"], "pending")
+        self.assertEqual(result["history"], {"check": "pending", "recorded": False, "loaded": HISTORY_DAYS_PER_RUN - 1})
         self.assertEqual(first.asked, weekdays[:HISTORY_DAYS_PER_RUN])
-        self.assertEqual(self._history_check(case_id)["status"], "pending")
+        self.assertIsNone(self._history_check(case_id))
 
+        # Build history: the rest is filled and the check recorded.
+        self._approve_terms(case_id)
         second = FakeKiwoom()
         result = self._run({"5234567890": second})[0]
         self.assertEqual(result["history"]["check"], "pass")
@@ -197,17 +206,28 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         result = self._run({"5234567890": FakeKiwoom()})[0]
         self.assertEqual(result["history"], {"check": "pass", "recorded": False})
 
-    def test_a_past_day_off_kiwooms_total_warns(self):
-        from ibkr_etl.kiwoom_collector import build_history
-
-        _, case_id = self._kiwoom_account("6234567890")
+    def test_a_history_filled_before_approval_is_recorded_on_reaching_build_history(self):
+        _, case_id = self._kiwoom_account("8234567890", start=date(2026, 9, 1))
         self.addCleanup(self._cancel, case_id)
-        self._run({"6234567890": FakeKiwoom()})  # the day's load registers the account first
-        check = build_history(self.db, FakeKiwoom(off_day=date(2025, 6, 2)), broker_account_id="6234567890",
-                              history_start=date(2025, 5, 26), today=date(2025, 6, 9), include_us=False, now=NOW)
-        self.db.rollback()
-        self.assertEqual(check["status"], "warn")
-        self.assertEqual(check["evidence"]["gaps"], [{"date": "2025-06-02", "gap": "5000"}])
+        self._run({"8234567890": FakeKiwoom()})
+        self._approve_terms(case_id)
+        later = FakeKiwoom()
+        result = self._run({"8234567890": later})[0]
+        self.assertEqual(later.asked, [])
+        self.assertEqual(result["history"]["check"], "pass")
+        self.assertEqual(self._history_check(case_id)["status"], "pass")
+
+    def test_a_past_day_off_kiwooms_total_warns(self):
+        _, case_id = self._kiwoom_account("6234567890", start=date(2026, 9, 1))
+        self.addCleanup(self._cancel, case_id)
+        self._run({"6234567890": FakeKiwoom(off_day=date(2026, 10, 5))})
+        self._approve_terms(case_id)
+        self.db.execute("DELETE FROM nav_snapshots WHERE account_id = 'KIWOOM-6234567890' AND snapshot_date = '2026-10-05'")
+        self.db.commit()
+        result = self._run({"6234567890": FakeKiwoom(off_day=date(2026, 10, 5))})[0]
+        self.assertEqual(result["history"]["check"], "warn")
+        check = self._history_check(case_id)
+        self.assertEqual(check["evidence_json"]["gaps"], [{"date": "2026-10-05", "gap": "5000"}])
 
     def test_a_history_refusal_fails_the_check_but_keeps_the_day(self):
         _, case_id = self._kiwoom_account("7234567890")
@@ -217,7 +237,7 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         result = self._run({"7234567890": FakeKiwoom(refuse_history=True)})[0]
         self.assertEqual((result["status"], result["history"]["check"]), ("loaded", "fail"))
         self.assertIn("no data before the account opened", self._history_check(case_id)["message"])
-        self.assertEqual(self._count("position_snapshots", "KIWOOM-7234567890"), 1)
+        self.assertEqual(self._today("position_snapshots", "KIWOOM-7234567890"), 1)
 
     def test_a_refusal_marks_the_connection_and_writes_nothing(self):
         connection_id, case_id = self._kiwoom_account("2234567890")
@@ -230,6 +250,42 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self.assertEqual(row["status"], "failing")
         self.assertEqual(self._count("position_snapshots", "KIWOOM-2234567890"), 0)
         self.assertEqual(self._checks(case_id)["connection_sees_account"], "pending")
+
+    def test_any_other_error_is_recorded_on_the_connection_not_raised(self):
+        connection_id, case_id = self._kiwoom_account("9234567890")
+        self.addCleanup(self._cancel, case_id)
+
+        def unreachable(target):
+            raise TimeoutError("timed out reading the key")
+
+        from ibkr_etl.kiwoom_collector import run
+
+        results = run(self.db, TENANT, client_for=unreachable, today=TODAY, now=NOW, include_us=False)
+        self.assertEqual((results[0]["status"], results[0]["error"]), ("failed", "TimeoutError: timed out reading the key"))
+        row = self.db.execute("SELECT status FROM broker_connections WHERE connection_id = ?",
+                              (connection_id,)).fetchone()
+        self.assertEqual(row["status"], "failing")
+
+    def test_releasing_the_first_month_end_closes_a_live_case(self):
+        from ibkr_etl.onboarding_v2_web import record_first_month_end
+
+        _, case_id = self._kiwoom_account("1034567890", start=date(2026, 10, 12))
+        self.addCleanup(self._cancel, case_id)
+        subject = "KIWOOM-1034567890"
+        self._run({"1034567890": FakeKiwoom()})
+        self._approve_terms(case_id)
+        self.assertIsNone(record_first_month_end(self.db, TENANT, subject, "2026-10-31"))  # not live yet
+        # Approval 2 and go-live are the website's; the case is moved straight to its live stage here.
+        self.db.execute("UPDATE broker_onboarding_cases SET stage = 'first_month_end', status = 'live', "
+                        "went_live_at = now() WHERE case_id = ?", (case_id,))
+        outcome = record_first_month_end(self.db, TENANT, subject, "2026-10-31")
+        self.db.commit()
+        self.assertEqual(outcome["stage"], "closed")
+        check = self.db.execute("SELECT status, evidence_json FROM broker_onboarding_checks WHERE case_id = ? "
+                                "AND check_id = 'first_month_end_released'", (case_id,)).fetchone()
+        self.assertEqual((check["status"], check["evidence_json"]), ("pass", {"period_end": "2026-10-31"}))
+        # A later month's release finds no case waiting.
+        self.assertIsNone(record_first_month_end(self.db, TENANT, subject, "2026-11-30"))
 
     def test_a_gap_fails_reconciliation_and_holds_the_case(self):
         _, case_id = self._kiwoom_account("3234567890")

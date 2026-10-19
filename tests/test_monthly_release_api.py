@@ -74,8 +74,57 @@ def _payload(selected: list[str], *, selection_version: str = "c" * 64):
     )
 
 
+class _OnboardingConnection(_Connection):
+    """A database that has the new-onboarding tables, with savepoints."""
+
+    def __init__(self):
+        super().__init__()
+        self.savepoints = 0
+
+    def execute(self, statement, parameters, **kwargs):
+        if "to_regclass('public.broker_onboarding_cases')" in statement:
+            self.statements.append((statement, parameters))
+            return _Cursor({"t": "broker_onboarding_cases"})
+        return super().execute(statement, parameters, **kwargs)
+
+    def transaction(self):
+        self.savepoints += 1
+        return nullcontext()
+
+
 class MonthlyReleaseApiTests(unittest.TestCase):
     user = {"email": "owner@example.com", "object_id": "owner-123", "role": "owner"}
+
+    def _release_new_factsheet(self, connection, **first_month_end):
+        content = b"new validated report"
+        preview = _preview(approved=False, digest=hashlib.sha256(content).hexdigest())
+        preview["artifacts"][0]["source_kind"] = "review"
+        preview["artifacts"][0].pop("artifact_release_id")
+        with (
+            patch.object(web, "_portfolio_access_context", return_value={"preview_mode": False}),
+            patch.object(web, "_approval_database", return_value=nullcontext(connection)),
+            patch.object(web, "_monthly_release_candidate", return_value=preview),
+            patch.object(web, "AZURE_STORAGE_ACCOUNT_URL", "https://example.blob.core.windows.net"),
+            patch.object(web, "download_blob_bytes", return_value=content),
+            patch.object(web, "validate_factsheet_return_typography"),
+            patch.object(web, "upload_bytes", return_value=True),
+            patch.object(web.onboarding_v2_web, "record_first_month_end", **first_month_end) as recorded,
+        ):
+            result = web.release_subject_monthly_reports("U16088606", "2026-08-31", _payload(["factsheet"]), self.user)
+        return result, recorded
+
+    def test_a_factsheet_release_records_the_first_month_end(self):
+        connection = _OnboardingConnection()
+        result, recorded = self._release_new_factsheet(connection, return_value=None)
+        self.assertEqual(result["status"], "approval_updated")
+        self.assertEqual(recorded.call_args.args[1:], (web.TENANT_ID, "U16088606", "2026-08-31"))
+        self.assertEqual(connection.savepoints, 1)
+
+    def test_a_failure_recording_the_first_month_end_never_blocks_the_release(self):
+        for failure in (KeyError("stage"), RuntimeError("could not obtain lock")):
+            with self.subTest(failure=type(failure).__name__), self.assertLogs(web.__name__, "ERROR"):
+                result, _ = self._release_new_factsheet(_OnboardingConnection(), side_effect=failure)
+            self.assertEqual(result["status"], "approval_updated")
 
     def test_replacement_is_content_addressed_and_withdraws_prior_versions(self):
         content=b'new validated report';digest=hashlib.sha256(content).hexdigest()

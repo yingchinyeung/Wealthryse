@@ -21,10 +21,10 @@ Kiwoom's movement labels are Korean. Only the labels in ``_KINDS`` are read;
 any other label fails the transactions check with the label shown, instead of
 being guessed into a trade or a cash amount.
 
-Once the case reaches Build history, each run also fills the trading days
-from the history start that have no snapshot yet, from Kiwoom's per-day
-balance (ka01690, and ust21132 for each US currency's value), and records the
-case's history_built check. A long history is filled over several runs, at
+From Load and reconcile on, each run also fills the trading days from the
+history start that have no snapshot yet, from Kiwoom's per-day
+balance (ka01690, and ust21132 for each US currency's value); once the case
+is in Build history it records the case's history_built check. A long history is filled over several runs, at
 most ``HISTORY_DAYS_PER_RUN`` days at a time. Kiwoom's past-day answer has no
 per-holding US detail, so US stocks count in a past day's total and cash but
 are listed as holdings only from the first collected day.
@@ -53,6 +53,9 @@ SECRET_PREFIX = "broker-kiwoom-rest-"
 TRANSACTION_WINDOW_DAYS = 90
 # Stages in which the collector loads an account. Live accounts keep loading every day.
 LOADING_STAGES = ("request", "load_and_reconcile", "build_history", "first_month_end", "closed")
+# Stages in which past days are filled. Filling starts with Load and reconcile, so the
+# history is in place before approval 1; the history_built check is recorded only in Build history.
+HISTORY_STAGES = ("load_and_reconcile", "build_history")
 # Past days filled per run, so one run stays well inside the daily job's time limit.
 HISTORY_DAYS_PER_RUN = 250
 
@@ -593,8 +596,11 @@ def _record(connection, tenant_id: str, case_id: str, check_id: str, check: Mapp
 
 
 def _history(connection, tenant_id: str, client: KiwoomClient, target: Target, *, today: date, now: datetime,
-             include_us: bool) -> dict[str, Any]:
-    """The history build for one account; a Kiwoom refusal fails the history check, not the day's load."""
+             include_us: bool, record: bool = True) -> dict[str, Any]:
+    """The history build for one account; a Kiwoom refusal fails the history check, not the day's load.
+
+    Before Build history (``record`` false) the days are filled but no check is recorded.
+    """
 
     assert target.case_id is not None and target.history_start is not None
     previous = connection.execute(
@@ -608,6 +614,9 @@ def _history(connection, tenant_id: str, client: KiwoomClient, target: Target, *
         connection.rollback()
         check = {"status": "fail", "message": f"Kiwoom refused a past day's balance: {str(error)[:300]}",
                  "evidence": {"from": target.history_start.isoformat()}}
+    if not record:
+        connection.commit()
+        return {"check": check["status"], "recorded": False, "loaded": check["evidence"].get("loaded_this_run", 0)}
     # A finished history stays as recorded until something new is loaded.
     if check["status"] == "pass" and previous is not None and previous["status"] == "pass" \
             and not check["evidence"].get("loaded_this_run"):
@@ -655,15 +664,19 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
                     if stage != "load_and_reconcile":
                         break
             connection.commit()
-            if stage == "build_history":
+            if stage in HISTORY_STAGES:
                 result["history"] = _history(connection, tenant_id, client, target, today=today, now=now,
-                                             include_us=include_us)
+                                             include_us=include_us, record=stage == "build_history")
             results.append({**result, "status": "loaded", "stage": stage, "rows": counts})
-        except (KiwoomError, ValueError) as error:
+        except Exception as error:  # noqa: BLE001 - one account's failure, of any kind, never stops the run
             connection.rollback()
-            message = str(error)[:300]
-            _connection_result(connection, tenant_id, target, ok=False, message=message)
-            connection.commit()
+            message = str(error)[:300] if isinstance(error, (KiwoomError, ValueError)) \
+                else f"{type(error).__name__}: {str(error)[:250]}"
+            try:
+                _connection_result(connection, tenant_id, target, ok=False, message=message)
+                connection.commit()
+            except Exception:  # noqa: BLE001 - the database itself may be the failure
+                connection.rollback()
             results.append({**result, "status": "failed", "error": message})
         finally:
             if client is not None:

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import unittest
+from unittest import mock
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -81,6 +84,33 @@ class SwitchAndDatesTests(unittest.TestCase):
         self.assertEqual(module.snapshot_day(datetime(2026, 10, 18, 23, 0, tzinfo=timezone.utc)), date(2026, 10, 16))
         # Saturday: Friday's close.
         self.assertEqual(module.snapshot_day(datetime(2026, 10, 17, 8, 20, tzinfo=timezone.utc)), date(2026, 10, 16))
+
+
+class ScriptTests(unittest.TestCase):
+    def _module(self):
+        spec = importlib.util.spec_from_file_location("run_kiwoom_collector", ROOT / "scripts" / "run_kiwoom_collector.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_any_failure_still_exits_zero(self):
+        module = self._module()
+        environ = {"KIWOOM_COLLECTOR_ENABLED": "true", "DEPLOYMENT_ENVIRONMENT": "internal-production",
+                   "FLEX_TOKEN_VAULT_URI": "https://example.vault.azure.net", "AZURE_CLIENT_ID": "id",
+                   "DATABASE_URL": "postgresql://unused"}
+        with mock.patch.dict(os.environ, environ), \
+                mock.patch.object(module, "connect", side_effect=ConnectionResetError("reset by peer")), \
+                mock.patch("builtins.print") as printed:
+            self.assertEqual(module.main(), 0)
+        summary = json.loads(printed.call_args.args[0])
+        self.assertEqual(summary, {"status": "error", "error": "ConnectionResetError: reset by peer"})
+
+    def test_a_missing_setting_still_exits_zero(self):
+        module = self._module()
+        with mock.patch.dict(os.environ, {"KIWOOM_COLLECTOR_ENABLED": "true"}, clear=True), \
+                mock.patch("builtins.print") as printed:
+            self.assertEqual(module.main(), 0)
+        self.assertEqual(json.loads(printed.call_args.args[0])["status"], "error")
 
 
 class RowTests(unittest.TestCase):

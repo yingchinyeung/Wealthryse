@@ -4,7 +4,8 @@ Does nothing unless KIWOOM_COLLECTOR_ENABLED=true. Each Kiwoom connection's
 app key and secret are read from Key Vault for this run only and never logged;
 see ibkr_etl.kiwoom_collector for what is loaded and which checks are recorded.
 Prints one JSON summary with no secrets. One account's failure is recorded on
-its connection and never stops the others or the job.
+its connection and never stops the others; any other failure is printed in
+the summary, and the script still exits 0 so it never fails the daily job.
 """
 
 from __future__ import annotations
@@ -76,9 +77,19 @@ def read_secret(vault_uri: str, secret_name: str, client_id: str) -> dict[str, s
 
 
 def main() -> int:
+    """Always exits 0: the collector runs last in the institutional daily job and must never fail it."""
+
     if not collector_enabled():
         print(json.dumps({"status": "disabled"}))
         return 0
+    try:
+        return _collect()
+    except Exception as error:  # noqa: BLE001 - reported in the summary, never raised into the daily job
+        print(json.dumps({"status": "error", "error": f"{type(error).__name__}: {str(error)[:300]}"}))
+        return 0
+
+
+def _collect() -> int:
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() != "internal-production":
         raise RuntimeError("The Kiwoom collector is restricted to internal production")
     vault_uri, client_id = _required("FLEX_TOKEN_VAULT_URI"), _required("AZURE_CLIENT_ID")

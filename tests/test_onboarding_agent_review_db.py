@@ -366,6 +366,17 @@ class OnboardingReviewDatabaseTests(unittest.TestCase):
         self.assertEqual(record_agent_reviews(db, TENANT)[0]["check"], "pending")
         self.assertIsNone(case_detail(db, TENANT, case_id)["awaiting_approval"])
 
+        # A case in its owner's own design (no built-in style: a Kiwoom account, a filtered portfolio, a composite
+        # with no design) is listed and recorded the same way, so its approval 2 can unlock too.
+        db.execute("UPDATE broker_onboarding_cases SET report_style = NULL WHERE case_id = ?", (case_id,))
+        db.commit()
+        case, = self._call("list_onboarding_report_cases", "onboarding")["data"]["cases"]
+        self.assertEqual((case["case_id"], case["report_style"]), (case_id, None))
+        store.save(case, reports_digest(case["reports_rendered"]), Review("pass", "Every month is there.", [], {}, {}),
+                   "corr")
+        self.assertEqual(record_agent_reviews(db, TENANT), [{"case_id": case_id, "check": "pass", "recorded": True}])
+        self.assertEqual(case_detail(db, TENANT, case_id)["awaiting_approval"], "historical_reports")
+
     def test_the_platform_role_may_read_reviews_once_granted_and_never_write_them(self):
         import psycopg
 

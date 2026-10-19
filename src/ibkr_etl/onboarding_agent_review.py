@@ -1,7 +1,8 @@
 """Stage 3's agent_review_complete check, recorded from the history reviewer's findings.
 
-The history reviewer (wealthryse_agent.onboarding_review) reads a composite
-case's rendered historical reports and writes its review to
+The history reviewer (wealthryse_agent.onboarding_review) reads a case's
+rendered historical reports (a composite's, or those of a case in its owner's
+own design, such as a Kiwoom account) and writes its review to
 agent.onboarding_reviews; the agent cannot write any platform table. This
 module runs on the platform side, in the month-end report job after the
 composite reports, and records each review on its case through
@@ -50,7 +51,9 @@ def _cases(connection, tenant_id: str) -> list[dict]:
           ON r.tenant_id = c.tenant_id AND r.case_id = c.case_id AND r.check_id = 'reports_rendered'
         LEFT JOIN broker_onboarding_checks a
           ON a.tenant_id = c.tenant_id AND a.case_id = c.case_id AND a.check_id = 'agent_review_complete'
-        WHERE c.tenant_id = ? AND c.source_kind = 'composite_portfolio' AND c.report_style IS NOT NULL
+        WHERE c.tenant_id = ?
+          -- A composite in a built-in design, or any case in the owner's own design (designed_reports).
+          AND (c.report_style IS NULL OR c.source_kind = 'composite_portfolio')
           AND c.stage = 'build_history' AND c.status <> 'cancelled' AND r.status = 'pass'
         ORDER BY c.created_at
         """,

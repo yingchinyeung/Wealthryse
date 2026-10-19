@@ -61,16 +61,27 @@ class KiwoomError(RuntimeError):
     """A Kiwoom refusal or malformed answer. Never carries keys or tokens."""
 
 
+# Kiwoom answered Python's default user agent with a bare HTTP 400; the fixed-address probe
+# that got a token sent this one, as the platform's other HTTP clients do.
+USER_AGENT = "IBKR-Portfolio-Analytics/2.1"
+
+
 def _urllib_transport(url: str, headers: Mapping[str, str], body: bytes):
-    request = urllib.request.Request(url, data=body, method="POST", headers=dict(headers))
+    request = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"User-Agent": USER_AGENT, "Accept": "application/json", **headers})
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             return response.status, {k.lower(): v for k, v in response.headers.items()}, json.load(response)
     except urllib.error.HTTPError as error:
         try:
-            payload = json.load(error)
-        except (ValueError, OSError):
-            payload = {}
+            raw = error.read()
+        except OSError:
+            raw = b""
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            text = " ".join(raw.decode("utf-8", "replace").split())[:150]
+            payload = {"return_msg": f"non-JSON answer: {text}" if text else ""}
         return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, payload
 
 
@@ -229,7 +240,10 @@ class KiwoomClient:
         code = payload.get("return_code", 0)
         if status != 200 or str(code).strip() != "0":
             message = str(payload.get("return_msg") or "no message")[:200]
-            raise KiwoomError(f"Kiwoom refused the call (HTTP {status}, code {code}): {message}")
+            for secret in (self._app_key, self._app_secret):
+                message = message.replace(secret, "***")
+            call = headers.get("api-id") or path
+            raise KiwoomError(f"Kiwoom refused the call {call} (HTTP {status}, code {code}): {message}")
         return response_headers, payload
 
     def _bearer(self) -> str:

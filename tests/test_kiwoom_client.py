@@ -293,5 +293,40 @@ class KiwoomUsTests(unittest.TestCase):
             _client(FakeKiwoom({"ust21100": [missing]})).us_transactions(date(2026, 1, 1), date(2026, 1, 31))
 
 
+class KiwoomTransportTests(unittest.TestCase):
+    def test_sends_a_named_user_agent_and_reads_non_json_refusals(self) -> None:
+        import io
+        import urllib.error
+        from unittest import mock
+
+        from ibkr_etl import kiwoom_client
+
+        seen = {}
+
+        def refusing(request, timeout):
+            seen.update({k.lower(): v for k, v in request.header_items()})
+            raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {},
+                                         io.BytesIO(b"<html>\n<body>Bad Request</body></html>"))
+
+        with mock.patch.object(kiwoom_client.urllib.request, "urlopen", refusing):
+            status, _, payload = kiwoom_client._urllib_transport("https://api.kiwoom.com/oauth2/token",
+                                                                 {"Content-Type": "application/json"}, b"{}")
+        self.assertEqual(seen["user-agent"], kiwoom_client.USER_AGENT)
+        self.assertEqual(seen["content-type"], "application/json")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["return_msg"], "non-JSON answer: <html> <body>Bad Request</body></html>")
+
+    def test_refusal_names_the_call_and_masks_keys(self) -> None:
+        def refusing(url, headers, body):
+            return 400, {}, {"return_msg": f"bad appkey {APP_KEY}"}
+
+        client = KiwoomClient(environment="live", app_key=APP_KEY, app_secret=APP_SECRET,
+                              transport=refusing, min_interval_seconds=0)
+        with self.assertRaises(KiwoomError) as caught:
+            client.inquire("kt00004", {})
+        self.assertIn("/oauth2/token (HTTP 400", str(caught.exception))
+        self.assertNotIn(APP_KEY, str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

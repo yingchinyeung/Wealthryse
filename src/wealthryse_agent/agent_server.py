@@ -382,14 +382,17 @@ def create_app(services: Services) -> FastAPI:
                     LOGGER.warning("supervisor record did not start", extra={"correlation_id": correlation_id})
 
             try:
+                agent = services.agent()
+                mode = agent.settings.chat_reasoning_mode
                 if live:
                     team = supervisor_live.ClientTeam(
-                        services.agent(), services.tools_for, user=user, account_id=body.account_id,
-                        correlation_id=correlation_id, analyst_instructions=instructions, memory_block=remembered)
+                        agent, services.tools_for, user=user, account_id=body.account_id,
+                        correlation_id=correlation_id, analyst_instructions=instructions, memory_block=remembered,
+                        reasoning_mode=mode)
                     run = team.answer(body.message, history)
                 else:
-                    run = services.agent().run(question=body.message, account_id=body.account_id,
-                                               tools=recorder or tools, history=history, instructions=instructions)
+                    run = agent.run(question=body.message, account_id=body.account_id, tools=recorder or tools,
+                                    history=history, instructions=instructions, reasoning_mode=mode)
                 yield from _answers(run, store, user, conversation_id, correlation_id, remember=True,
                                     on_turn=observe if (watching or live) else None)
             except AgentError as error:

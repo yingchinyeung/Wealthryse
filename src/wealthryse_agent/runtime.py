@@ -16,7 +16,7 @@ from datetime import date
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from . import calculator, certified_tools
-from .config import ModelSettings
+from .config import REASONING_MODES, ModelSettings
 from .memory import MEMORY_SCHEMA
 from .prompts import ANALYST, ROUTER
 from .tool_client import ToolCallFailed, ToolClient
@@ -100,6 +100,7 @@ OUT_OF_SCOPE = ("I can explain your holdings and performance, but I can't recomm
 UNVERIFIED = ("I couldn't produce an answer whose figures all match the data, so I haven't shown one. "
               "Try asking about one account and one period.")
 MAX_QUESTION_CHARS = 2000
+TOO_LONG = "The analysis took too long. Try a narrower question."
 
 
 LOGGER = logging.getLogger("wealthryse_agent.runtime")
@@ -143,6 +144,8 @@ class Turn:
     # for the supervisor's writer; never saved.
     results: dict[str, Any] = field(default_factory=dict, repr=False)
     figures: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+    # The reasoning mode the model last answered in: pro drops to standard if Azure refuses it.
+    reasoning_mode: str = "standard"
 
 
 def default_model_client(settings: ModelSettings):
@@ -176,6 +179,7 @@ class Agent:
         self.settings = settings
         self.client = model_client or default_model_client(settings)
         self.clock = clock
+        self.pro_refused = False  # set once Azure refuses pro mode; standard mode from then on
 
     def _create(self, **request: Any) -> Any:
         try:
@@ -187,6 +191,13 @@ class Agent:
             # Azure's content filter (including prompt shields) refuses some prompts outright.
             if code == "content_filter":
                 raise AgentError("content_filtered", OUT_OF_SCOPE) from error
+            reasoning = request.get("reasoning") or {}
+            if "mode" in reasoning:
+                # Pro is only refused if the same request goes through in standard mode.
+                response = self._create(**{**request, "reasoning": {k: v for k, v in reasoning.items() if k != "mode"}})
+                LOGGER.warning("pro reasoning mode refused, answering in standard mode: code=%s param=%s", code, param)
+                self.pro_refused = True
+                return response
             LOGGER.warning("model rejected the request: code=%s param=%s", code, param)
             raise AgentError("model_rejected", "The analyst couldn't process that question. Try rephrasing it.") from error
 
@@ -208,13 +219,17 @@ class Agent:
             allowed_tools: Sequence[str] | None = None, instructions: str | None = None,
             skip_router: bool = False, extra_fields: Mapping[str, Any] | None = None,
             evidence: tuple[Mapping[str, Any], Mapping[str, Mapping[str, Any]]] | None = None,
-            ) -> Iterator[dict[str, Any]]:
+            reasoning_mode: str = "standard") -> Iterator[dict[str, Any]]:
         """``extra_fields`` adds lists of strings to the answer (for example a checker's concerns); their
         figures are checked with the answer's, and they come back in ``turn.extra``.
 
         ``evidence`` starts the turn with tool results (T#) and certified figures (F#) gathered by earlier
         runs, so a writer can cite and check them without calling the tools again (the supervisor's
-        planner). New calls continue the numbering."""
+        planner). New calls continue the numbering.
+
+        ``reasoning_mode`` ``pro`` asks the model to work longer on every call of this run (website chat)."""
+        if reasoning_mode not in REASONING_MODES:
+            raise ValueError("The reasoning mode is not one the model accepts")
         question = (question or "").strip()
         if not question or len(question) > MAX_QUESTION_CHARS:
             raise AgentError("invalid_question", f"Questions must be 1 to {MAX_QUESTION_CHARS} characters.")
@@ -252,14 +267,26 @@ class Agent:
                       "required": [*ANSWER_SCHEMA["required"], *extra_fields]}
 
         while True:
-            if self.clock() - started > self.settings.timeout_seconds:
-                raise AgentError("timeout", "The analysis took too long. Try a narrower question.")
-            response = self._create(
-                model=self.settings.deployment, instructions=system, input=conversation, tools=function_tools,
-                store=False, include=["reasoning.encrypted_content"], reasoning={"effort": self.settings.reasoning_effort},
-                max_output_tokens=self.settings.max_output_tokens, parallel_tool_calls=True,
-                text={"format": {"type": "json_schema", "name": "answer", "strict": True, "schema": schema}},
-            )
+            remaining = self.settings.timeout_seconds - (self.clock() - started)
+            if remaining < 0:
+                raise AgentError("timeout", TOO_LONG)
+            reasoning = {"effort": self.settings.reasoning_effort}
+            if reasoning_mode == "pro" and not self.pro_refused:
+                reasoning["mode"] = "pro"
+            # Each call gets only what is left of the question's time, so a slow one ends cleanly.
+            try:
+                response = self._create(
+                    model=self.settings.deployment, instructions=system, input=conversation, tools=function_tools,
+                    store=False, include=["reasoning.encrypted_content"], reasoning=reasoning,
+                    max_output_tokens=self.settings.max_output_tokens, parallel_tool_calls=True,
+                    text={"format": {"type": "json_schema", "name": "answer", "strict": True, "schema": schema}},
+                    timeout=max(remaining, 1.0),
+                )
+            except Exception as error:
+                if type(error).__name__ == "APITimeoutError":  # the OpenAI client's own time limit
+                    raise AgentError("timeout", TOO_LONG) from error
+                raise
+            turn.reasoning_mode = "pro" if reasoning_mode == "pro" and not self.pro_refused else "standard"
             _add_usage(turn, response)
             if getattr(response, "status", "completed") == "incomplete":
                 raise AgentError("model_incomplete", "The model stopped before finishing. Try a narrower question.")

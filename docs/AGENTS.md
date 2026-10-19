@@ -74,10 +74,11 @@ internal-reports, writes agent.month_* tables and agent.inbox only
   `gpt-6-astra` on Global Standard, so prompts may be processed in any Azure
   region (see `docs/AI_DATA_PROCESSING_APPROVAL_2026-09-22.md`). The older AI
   pieces still use the APAC Data Zone deployment.
-- **Bounded.** Owner chat runs at extra-high reasoning with at most 16 tool
-  calls, 32,000 output tokens per model call and 210 seconds per question
-  (under the 240-second ingress limit; the service sends a keepalive every 15
-  seconds while the model thinks). The scheduled jobs stay at low reasoning,
+- **Bounded.** Owner chat runs at extra-high reasoning in pro mode (below)
+  with at most 16 tool calls, 32,000 output tokens per model call and 210
+  seconds per question (under the 240-second ingress limit; the service sends
+  a keepalive every 15 seconds while the model thinks). Each model call gets
+  only what is left of the 210 seconds. The scheduled jobs stay at low reasoning,
   8 tool calls and 60 seconds. A daily token budget and 2,000-character
   questions apply to both.
 - **Off by default.** `AGENT_UI_MODE=off` on the website. `owner` shows it to
@@ -94,6 +95,38 @@ internal-reports, writes agent.month_* tables and agent.inbox only
   opens Administration with the question filled in. In the Administration chat,
   each update says whether the administrator, the operations agent or the
   connection agent wrote it.
+
+### Pro mode for website chat
+
+Website chat (`/v1/chat`) asks `gpt-6-astra` for pro mode (`reasoning.mode: pro`):
+the same model working longer on each call, which OpenAI sells as GPT-6 Astra Pro.
+It is a request setting on the same `wr-analyst-astra` deployment, with the same
+Global Standard processing, so the 13 October approval still covers it. The Explain
+buttons, guide and case questions, exports and every scheduled job stay in standard
+mode.
+
+- **The setting.** `AGENT_CHAT_REASONING_MODE` on the agent service, from
+  `chatReasoningMode` in `infra/agent-apps.bicep`. The default stays `standard`, so
+  other releases that redeploy the agent apps from main leave chat as it is; the code
+  also reads a missing setting as `standard`. **Turning it on:** the Thu 29 Oct
+  release deploys with `chatReasoningMode=pro`. **Once it is on, every later deploy
+  of `infra/agent-apps.bicep` must pass `chatReasoningMode=pro`, or that deploy turns
+  pro off.** The undo is `chatReasoningMode=standard`.
+- **Cost and time.** Tokens cost the same per token, but each answer uses many
+  more, all counted against the daily token budget. A call that runs out of the
+  question's time ends with "The analysis took too long" rather than a dropped
+  connection. If too many questions take too long, lower `chatReasoningEffort` to
+  `high` before turning pro off.
+- **If Azure refuses pro.** The call is repeated in standard mode, each replica logs
+  `pro reasoning mode refused` once, and chat stays in standard mode until it
+  restarts.
+- **Capacity.** `wr-analyst-astra` has 100,000 tokens per minute (`modelCapacity` in
+  `infra/agent-foundation.bicep`), up from 20,000, because chat's longer calls share
+  it with the scheduled jobs.
+- **Comparing.** `python -m wealthryse_agent.evaluate --user <id> --reasoning-mode
+  standard`, then the same with `--reasoning-mode pro`, asks the same questions both
+  ways and prints each one's time, tokens and mode. Without the flag it uses chat's
+  own mode.
 
 ## Turning it on (each Azure step needs Ying's typed approval)
 
@@ -776,6 +809,8 @@ today's analyst, with watch-only recording. Empty names nobody, so `live` on its
 own changes nothing anyone sees.
 
 - **The router** checks scope first, exactly as today.
+- **Reasoning.** Chat's mode (pro from the 29 Oct release) applies to the specialists, the writer
+  and today's analyst. The planner and the checker stay in standard mode at low and medium effort.
 - **Fast path.** When the rules place a question with one specialist, that
   specialist answers on its own with only its own tools (registry) and the same
   budget, figure check and memory as today's analyst.
@@ -847,8 +882,10 @@ is `dispatcherMode=off` (or `watch`), or `deployDispatcher=false`, which removes
 
 - Model tokens: each question is a few model calls, each resending tool
   results. Extra-high reasoning can use roughly ten times the tokens of low
-  on the same question. The daily budget caps it (`AGENT_DAILY_TOKEN_BUDGET`);
-  the reasoning level is `chatReasoningEffort` in `infra/agent-apps.bicep`.
+  on the same question, and chat's pro mode uses more again. The daily budget
+  caps it (`AGENT_DAILY_TOKEN_BUDGET`); the reasoning level is
+  `chatReasoningEffort` and the mode `chatReasoningMode` in
+  `infra/agent-apps.bicep`.
 - One private endpoint.
 - Two Container Apps that scale to zero, and three short jobs.
 - The month-end team, when deployed: an hourly job on six days a month, and

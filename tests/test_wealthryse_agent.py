@@ -7,6 +7,7 @@ import time
 import unittest
 from datetime import date
 from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("AGENT_TOOLS_AUTOSTART", "0")
 os.environ.setdefault("AGENT_API_AUTOSTART", "0")
@@ -248,6 +249,73 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Agent(ModelSettings(**{**SETTINGS.__dict__, "reasoning_effort": "maximum"}), model_client=object())
 
+    def test_pro_mode_is_asked_for_only_when_the_run_says_so(self):
+        settings = ModelSettings(**{**SETTINGS.__dict__, "reasoning_effort": "xhigh"})
+        for mode, reasoning in (("pro", {"effort": "xhigh", "mode": "pro"}), ("standard", {"effort": "xhigh"})):
+            model = _FakeModel([_final("Nothing to report.", [])])
+            events = list(Agent(settings, model_client=model).run(question="Hi", account_id="U1", tools=_FakeTools(),
+                                                                  reasoning_mode=mode))
+            self.assertEqual(model.requests[0]["reasoning"], reasoning)
+            self.assertEqual(events[-1]["turn"].reasoning_mode, mode)
+        model = _FakeModel([_final("Nothing to report.", [])])
+        list(Agent(settings, model_client=model).run(question="Hi", account_id="U1", tools=_FakeTools()))
+        self.assertEqual(model.requests[0]["reasoning"], {"effort": "xhigh"})  # standard unless asked
+        with self.assertRaises(ValueError):
+            list(Agent(settings, model_client=model).run(question="Hi", account_id="U1", tools=_FakeTools(),
+                                                         reasoning_mode="max"))
+        with self.assertRaises(ValueError):
+            Agent(ModelSettings(**{**SETTINGS.__dict__, "chat_reasoning_mode": "max"}), model_client=object())
+        with mock.patch.dict(os.environ, {"AGENT_CHAT_REASONING_MODE": "Pro"}):
+            self.assertEqual(ModelSettings.from_env().chat_reasoning_mode, "pro")
+        with mock.patch.dict(os.environ, {"AGENT_CHAT_REASONING_MODE": ""}):
+            self.assertEqual(ModelSettings.from_env().chat_reasoning_mode, "standard")
+
+    def test_a_refused_pro_mode_answers_in_standard_mode_from_then_on(self):
+        class RefusesPro(_FakeModel):
+            def _create(self, **kwargs):
+                if "mode" in kwargs["reasoning"]:
+                    self.requests.append(kwargs)
+                    error = Exception("rejected: secret prompt text")
+                    error.status_code, error.body = 400, {"code": "invalid_value", "param": "reasoning.mode"}
+                    raise error
+                return super()._create(**kwargs)
+
+        model = RefusesPro([_step(_call("get_performance", {"account_id": "U1"})), _final("Up 5.1% [T1].", ["T1"]),
+                            _final("Nothing to report.", [])])
+        agent = Agent(SETTINGS, model_client=model)
+        with self.assertLogs("wealthryse_agent.runtime", "WARNING") as logs:
+            events = list(agent.run(question="How did I do?", account_id="U1", tools=_FakeTools({"get_performance": PERF}),
+                                    reasoning_mode="pro"))
+        self.assertEqual(events[-1]["type"], "answer")
+        self.assertEqual(events[-1]["turn"].reasoning_mode, "standard")
+        self.assertIn("pro reasoning mode refused", logs.output[0])
+        self.assertNotIn("secret", logs.output[0])
+        self.assertEqual([r["reasoning"].get("mode") for r in model.requests], ["pro", None, None])
+        list(agent.run(question="Hi", account_id="U1", tools=_FakeTools(), reasoning_mode="pro"))
+        self.assertNotIn("mode", model.requests[-1]["reasoning"])  # not asked again
+
+    def test_pro_is_not_blamed_when_standard_is_refused_too(self):
+        agent = Agent(SETTINGS, model_client=_Rejecting(400, "unsupported_parameter"))
+        with self.assertLogs("wealthryse_agent.runtime", "WARNING"), self.assertRaises(AgentError) as caught:
+            list(agent.run(question="Hi", account_id="U1", tools=_FakeTools(), reasoning_mode="pro"))
+        self.assertEqual(caught.exception.code, "model_rejected")
+        self.assertFalse(agent.pro_refused)
+
+    def test_each_model_call_gets_only_the_time_left(self):
+        times = iter([0.0, 0.0, 50.0, 70.0])
+        settings = ModelSettings(**{**SETTINGS.__dict__, "timeout_seconds": 60})
+        model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})), _final("Up 5.1% [T1].", ["T1"])])
+        list(Agent(settings, model_client=model, clock=lambda: next(times)).run(
+            question="How did I do?", account_id="U1", tools=_FakeTools({"get_performance": PERF})))
+        self.assertEqual([r["timeout"] for r in model.requests], [60.0, 10.0])
+
+        class TimesOut:
+            responses = SimpleNamespace(create=lambda **_: (_ for _ in ()).throw(type("APITimeoutError", (Exception,), {})()))
+
+        with self.assertRaises(AgentError) as caught:
+            list(Agent(SETTINGS, model_client=TimesOut()).run(question="Hi", account_id="U1", tools=_FakeTools()))
+        self.assertEqual(caught.exception.code, "timeout")
+
     def test_calculation_on_tool_figures_can_be_quoted(self):
         model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})),
                             _step(_call("calculate", {"label": "doubled", "expression": "0.0512 * 2"}, "c2")),
@@ -391,6 +459,21 @@ class EvaluationTests(unittest.TestCase):
         self.assertTrue(result.passed, result.reasons)
         self.assertEqual(result.tools, ["get_performance"])
         self.assertEqual(result.tokens, 30)
+
+    def test_a_run_in_pro_mode_says_so_and_how_long_it_took(self):
+        model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})), _final("Up 5.1% [T1].", ["T1"])])
+        times = iter([100.0, 142.0])
+        result = evaluate.run_case(Agent(SETTINGS, model_client=model, clock=lambda: 0.0),
+                                   _FakeTools({"get_performance": PERF}),
+                                   evaluate.Case("p", "How did I do?", ("get_performance",)), "U1", "How did I do?",
+                                   reasoning_mode="pro", clock=lambda: next(times))
+        self.assertTrue(result.passed, result.reasons)
+        self.assertEqual((result.mode, result.seconds), ("pro", 42.0))
+        self.assertEqual(model.requests[0]["reasoning"]["mode"], "pro")
+        timed_out = evaluate.Result("t", "U1", False, ["error timeout"], seconds=210.0)
+        text, _ = evaluate.summary([result, timed_out])
+        self.assertIn("tokens: 30; 42 s; pro]", text)
+        self.assertIn("Time: median 126 s, slowest 210 s; 30 tokens; answered 1 in pro; 1 took too long.", text)
 
     def test_missing_tool_and_rejection_fail(self):
         model = _FakeModel([_step(_call("get_performance", {"account_id": "U1"})),
@@ -725,7 +808,7 @@ class _FakeStore:
 
 
 class AgentServerTests(unittest.TestCase):
-    def _client(self, store, events, accounts=("U1",)):
+    def _client(self, store, events, accounts=("U1",), chat_mode="standard"):
         from fastapi.testclient import TestClient
 
         from wealthryse_agent.agent_server import Services, create_app
@@ -740,6 +823,8 @@ class AgentServerTests(unittest.TestCase):
                 pass
 
         class FakeAgent:
+            settings = SimpleNamespace(chat_reasoning_mode=chat_mode)
+
             def run(self, **kwargs):
                 store.instructions.append(kwargs.get("instructions"))
                 store.last_run = kwargs
@@ -770,6 +855,14 @@ class AgentServerTests(unittest.TestCase):
         events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
         self.assertEqual([e["type"] for e in events], ["start", "status", "answer", "done"])
         self.assertEqual(store.messages_saved, [("user", "How did I do?", "ok"), ("assistant", "Up 5% [T1].", "ok")])
+
+    def test_chat_asks_for_the_chat_reasoning_mode(self):
+        for mode in ("pro", "standard"):
+            store = _FakeStore()
+            client = self._client(store, [{"type": "answer", "answer": "Up 5% [T1].", "citations": []}], chat_mode=mode)
+            client.post("/v1/chat", json={"user_object_id": "22222222-2222-2222-2222-222222222222",
+                                          "account_id": "U1", "message": "How did I do?"})
+            self.assertEqual(store.last_run["reasoning_mode"], mode)
 
     def test_long_thinking_sends_keepalives_and_visuals_are_saved(self):
         store = _FakeStore()

@@ -503,6 +503,24 @@ def record_platform_check(connection, tenant_id: str, case_id: str, check_id: st
     return {"case_id": case_id, "stage": case.stage, "status": case_status(case)}
 
 
+def record_first_month_end(connection, tenant_id: str, subject_id: str, period_end: str) -> dict | None:
+    """The owner released a subject's month-end factsheet: a live case waiting on its first month-end closes.
+
+    Called by the website's month-end release, in its transaction. Does nothing for a subject with no case in
+    the First month-end stage, so later months and older onboardings are unaffected.
+    """
+
+    row = connection.execute(
+        "SELECT case_id FROM broker_onboarding_cases WHERE tenant_id = ? AND target_subject_id = ? "
+        "AND stage = 'first_month_end' AND status <> 'cancelled'",
+        (tenant_id, subject_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return record_platform_check(connection, tenant_id, str(row["case_id"]), "first_month_end_released", "pass",
+                                 f"The {period_end} month-end factsheet was released.", {"period_end": period_end})
+
+
 def _evidence(check: Mapping[str, Any]) -> dict:
     value = check.get("evidence_json") or {}
     return json.loads(value) if isinstance(value, str) else dict(value)

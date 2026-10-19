@@ -382,6 +382,21 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual((effort["plan"], effort["objections"], effort["answer"]), ("low", "medium", "xhigh"))
         self.assertEqual(live._at_most("minimal", "medium"), "minimal")
 
+    def test_chat_pro_mode_reaches_the_specialists_and_writer_but_not_the_planner_or_checker(self):
+        model = _Model(plan=self.PLAN)
+        agent = Agent(SETTINGS, model_client=model)
+        team = live.ClientTeam(agent, lambda u, c: _Tools(), user=USER, account_id="U1", correlation_id="corr-1",
+                               analyst_instructions="A", today="2026-10-29", reasoning_mode="pro")
+        list(team.answer(self.QUESTION))
+        modes = {}
+        for r in model.requests:
+            name = (r.get("text") or {}).get("format", {}).get("name")
+            modes.setdefault(name, set()).add((r.get("reasoning") or {}).get("mode"))
+        self.assertEqual(modes["answer"], {"pro"})  # every specialist and the writer
+        self.assertEqual((modes["plan"], modes["objections"]), ({None}, {None}))
+        agent.pro_refused = True
+        self.assertTrue(team._agent(share=2).pro_refused)
+
     def test_a_plan_of_one_part_takes_the_fast_path_with_the_original_question(self):
         model = _Model(plan=[{"specialist": "modelling", "question": "Project account U1."},
                              {"specialist": "modelling", "question": "Again."}, {"specialist": "trading", "question": "x"}])

@@ -160,13 +160,16 @@ class ClientTeam:
     """One website chat question answered by the client analysis team.
 
     ``tools_for(user, correlation_id)`` opens a tool client acting for the person; each specialist
-    gets its own, under the request's correlation id.
+    gets its own, under the request's correlation id. ``reasoning_mode`` is chat's: the specialists,
+    the writer and today's analyst use it; the planner and the checker stay in standard mode.
     """
 
     def __init__(self, agent: Any, tools_for: Callable[[str, str], Any], *, user: str, account_id: str,
                  correlation_id: str, analyst_instructions: str, memory_block: str = "",
-                 today: str | None = None, clock: Callable[[], float] = time.monotonic) -> None:
+                 today: str | None = None, clock: Callable[[], float] = time.monotonic,
+                 reasoning_mode: str = "standard") -> None:
         self.agent = agent
+        self.reasoning_mode = reasoning_mode
         self.tools_for = tools_for
         self.user = user
         self.account_id = account_id
@@ -203,8 +206,10 @@ class ClientTeam:
         seconds = max(5, min(seconds, int(self._left())))
         if (calls, seconds) == (settings.max_tool_calls, settings.timeout_seconds):
             return self.agent
-        return type(self.agent)(replace(settings, max_tool_calls=calls, timeout_seconds=seconds),
-                                model_client=self.agent.client, clock=self.agent.clock)
+        agent = type(self.agent)(replace(settings, max_tool_calls=calls, timeout_seconds=seconds),
+                                 model_client=self.agent.client, clock=self.agent.clock)
+        agent.pro_refused = getattr(self.agent, "pro_refused", False)  # don't ask again once Azure said no
+        return agent
 
     def _client(self) -> watch.Recorder:
         return watch.Recorder(guide_tools.GuideTools(self.tools_for(self.user, self.correlation_id)))
@@ -308,7 +313,8 @@ class ClientTeam:
         step.recorder = self._client()
         try:
             for event in agent.run(tools=step.recorder, account_id=self.account_id, skip_router=True,
-                                   allowed_tools=list(registry.BY_NAME[step.name].tools or ()), **run_kwargs):
+                                   allowed_tools=list(registry.BY_NAME[step.name].tools or ()),
+                                   reasoning_mode=self.reasoning_mode, **run_kwargs):
                 if event["type"] in ("answer", "rejected"):
                     step.turn = event["turn"]
                     step.status = "done" if event["type"] == "answer" else "rejected"
@@ -337,7 +343,7 @@ class ClientTeam:
         try:
             for event in self._agent().run(question=question, account_id=self.account_id, tools=client,
                                            history=history, instructions=self.analyst_instructions,
-                                           skip_router=True):
+                                           skip_router=True, reasoning_mode=self.reasoning_mode):
                 if event["type"] in ("answer", "rejected"):
                     _add(self.lead_usage, event["turn"])
                     yield self._final(event)
@@ -403,7 +409,7 @@ class ClientTeam:
         for event in self._agent(writer=True).run(
                 question=question, account_id=self.account_id, tools=_NoTools(), history=history,
                 allowed_tools=[calculator.NAME], instructions=instructions, skip_router=True,
-                evidence=(results, figures)):
+                evidence=(results, figures), reasoning_mode=self.reasoning_mode):
             if event["type"] in ("answer", "rejected"):
                 final = event
                 _add(self.lead_usage, event["turn"])

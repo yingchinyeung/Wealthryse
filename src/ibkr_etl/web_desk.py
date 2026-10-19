@@ -94,8 +94,9 @@ NO_SNAPSHOT = "No live snapshot has arrived for this account yet."
 NOTICE = pre_trade.NOTICE + " Nothing is placed or sent to IBKR."
 COST_NOTE = ("Daily volumes are not in silver yet, so square-root market impact (default coefficient 1.0) is not "
              "estimated for any order: the cost shown is half the live bid-ask spread only.")
-# Once silver daily_volumes exists (phase 3), the pre-trade check reads each holding's average daily
-# volume over its last VOLUME_SESSIONS sessions with volume, so market impact is estimated too.
+# Once silver daily_volumes exists (phase 3) and the liquidity section is switched on for this viewer
+# (QUANT_ANALYTICS_PHASE3), the pre-trade check reads each holding's average daily volume over its last
+# VOLUME_SESSIONS sessions with volume, so market impact is estimated too.
 VOLUMES_TABLE = "daily_volumes"
 VOLUME_SESSIONS = 20
 VOLUME_WINDOW_DAYS = 45
@@ -1178,7 +1179,12 @@ def install(
         """A hypothetical pre-trade check of proposed orders on today's live positions; nothing is placed."""
         access = desk_access(account_id, user)
         limits, settings, _source = desk_limits(environ)
-        inputs = inputs_for(account_id, access, now(), volumes=True)
+        # Market impact from daily volumes follows the liquidity section's own switch
+        # (QUANT_ANALYTICS_PHASE3), so the Desk's costs change only on that section's day.
+        from . import market_inputs
+
+        volumes = market_inputs.section_allowed("liquidity", user, environ)
+        inputs = inputs_for(account_id, access, now(), volumes=volumes)
         if inputs["summary"] is None:
             raise HTTPException(status_code=409, detail=NO_SNAPSHOT)
         try:

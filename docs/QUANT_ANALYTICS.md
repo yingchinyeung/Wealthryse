@@ -464,11 +464,11 @@ attribution (subpages `/risk/liquidity`, `/risk/macro-exposures`, `/risk/crowdin
 either side means owners only, and anything else is a 404 that reads nothing. With both settings
 unset the pages and the guide are byte for byte as before.
 
-**Desk.** Once `daily_volumes` exists, the pre-trade check (the POST only; the live snapshot never
+**Desk.** Once `daily_volumes` exists and the liquidity section's mode allows it for the viewer (`QUANT_ANALYTICS_PHASE3`, `liquidity=shadow` for owners or `on`), the pre-trade check (the POST only; the live snapshot never
 reads it) reads each live holding's average daily volume over its last 20 sessions with volume in
 the 45 days to today, by its conid, and passes it to `pre_trade_check`, so square-root market impact is estimated
 for the holdings that have volumes; the note says how many do. Before then it is exactly as today
-(half the spread, `COST_NOTE`). Still only where `DESK_PAGE` allows the Desk.
+(half the spread, `COST_NOTE`), and so it is while liquidity is off. Still only where `DESK_PAGE` allows the Desk.
 
 **Run time.** Small next to v1: for 60 holdings over three years, without a database, the four
 build in about 0.05 seconds after 0.07 seconds of preparing (`PerformanceTests`); on the local
@@ -524,7 +524,7 @@ after its silver table's own day, on a later day of its own:
    days against what you expect (the Modelling page's factor model for `factor_attribution`).
 4. **On.** Set `<section>=on` on both. Everyone who can see the page sees the card.
 
-The Desk's market impact needs no setting: it follows `daily_volumes` existing (and `DESK_PAGE`).
+The Desk's market impact follows the liquidity section's mode, with the web app's `QUANT_ANALYTICS_PHASE3` (and `DESK_PAGE`), so the Desk's costs change on liquidity's day, not when the table is created.
 
 To take a section off, set it to `off` (or leave it out) on both: the job stops building it and
 the card, route and guide entries go; its rows stay and are not shown. If its table is dropped,

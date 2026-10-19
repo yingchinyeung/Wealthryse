@@ -613,8 +613,10 @@ class VolumeImpactTests(unittest.TestCase):
         connection.answers["FROM daily_volumes"] = list(self.VOLUMES)
         return connection
 
-    def _post(self, connection):
-        client, _ = _client(connection)
+    ON = {"DESK_PAGE": "on", "QUANT_ANALYTICS_PHASE3": "liquidity=on"}
+
+    def _post(self, connection, environ=None):
+        client, _ = _client(connection, environ=self.ON if environ is None else environ)
         response = client.post("/api/portfolio/U1/desk/pre-trade", json=self.ORDERS)
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
@@ -655,6 +657,20 @@ class VolumeImpactTests(unittest.TestCase):
         self.assertEqual({k: v for k, v in before.items() if k not in liquidity},
                          {k: v for k, v in volumes.items() if k not in liquidity})
         self.assertEqual((before["liquidity_days"], volumes["no_volume_data"]), (None, [MSFT]))
+
+    def test_volumes_wait_for_the_liquidity_switch(self):
+        """The table alone changes nothing: impact follows QUANT_ANALYTICS_PHASE3's liquidity mode."""
+        for environ, user, reads in (({"DESK_PAGE": "on"}, OWNER, False),
+                                     ({"DESK_PAGE": "on", "QUANT_ANALYTICS_PHASE3": "liquidity=off"}, OWNER, False),
+                                     ({"DESK_PAGE": "on", "QUANT_ANALYTICS_PHASE3": "liquidity=shadow"}, VIEWER, False),
+                                     ({"DESK_PAGE": "on", "QUANT_ANALYTICS_PHASE3": "liquidity=shadow"}, OWNER, True)):
+            with self.subTest(environ=environ, role=user.get("role")):
+                connection = self._connection()
+                client, _ = _client(connection, environ=environ, user=user)
+                response = client.post("/api/portfolio/U1/desk/pre-trade", json=self.ORDERS)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(bool(connection.asked("FROM daily_volumes")), reads)
+                self.assertEqual(web_desk.COST_NOTE in response.json()["notes"], not reads)
 
     def test_the_live_snapshot_never_reads_volumes(self):
         connection = self._connection()

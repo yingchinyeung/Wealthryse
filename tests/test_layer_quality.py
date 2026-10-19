@@ -180,9 +180,10 @@ class CatalogCoverageTests(unittest.TestCase):
         pass_plan = layer_quality.plan({layer_quality.CONTRACTS_DIR_ENV: str(CONTRACTS)})
         self.assertIsNone(pass_plan.contracts_error)
         # 46 contracts and 240 rules: the quant analytics table adds 9 rules, its two Desk views none.
-        self.assertEqual(len(pass_plan.contracts), 46)
-        self.assertEqual(len(pass_plan.rules), 240)
-        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 240)
+        # Phase 3 part A adds 2 contracts and 9 rules (daily_volumes 3, factor_returns 6).
+        self.assertEqual(len(pass_plan.contracts), 48)
+        self.assertEqual(len(pass_plan.rules), 249)
+        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 249)
         self.assertEqual(sum(r.needs_rls_bypass for r in pass_plan.rules), 13)
         self.assertIn("silver.nav_snapshots_history", pass_plan.held)
         self.assertIn("public.silver_history_settings", pass_plan.held)

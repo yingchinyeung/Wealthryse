@@ -174,7 +174,8 @@ class RuleCatalogTests(unittest.TestCase):
         feeds = {rule.feed for rule in RULES if rule.feed}
         # Crisis windows are finished history (one file each, under history/), so no
         # new file is expected daily and the gold crisis checks watch that job instead.
-        self.assertEqual(feeds, set(raw_capture.FEEDS) - {"yahoo-crisis-history"})
+        # So are the Kenneth French files (phase 3): silver.factor_returns watches that job.
+        self.assertEqual(feeds, set(raw_capture.FEEDS) - {"yahoo-crisis-history", "kenneth-french"})
         self.assertEqual({rule.feed for rule in RULES if rule.feed and rule.required},
                          {"yahoo-benchmark-history", "treasury-par-yield"})
         for target in ("public.raw_reports", "public.flex_rows", "public.nav_snapshots",

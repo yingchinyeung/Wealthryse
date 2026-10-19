@@ -216,6 +216,11 @@ VOLUMES: tuple[Volume, ...] = (
     Volume("fx_transactions_history", "silver", count_column="version_id", qualified=True, held=True),
     Volume("nav_snapshots_history", "silver", count_column="version_id", qualified=True, held=True),
     Volume("trades_history", "silver", count_column="version_id", qualified=True, held=True),
+    # Phase 3 market data (docs/PHASE3_DATA.md), held until their days. Daily volumes: one row per
+    # instrument and trading day, judged like market_data_prices.
+    Volume("daily_volumes", "silver", "price_date", held=True),
+    # Factor returns arrive a month at a time, with new vintages for old dates: recorded, not judged.
+    Volume("factor_returns", "silver", "return_date", judged=False, held=True),
     # Certified figures (U5): builds and figures are append-only, so neither may shrink.
     Volume("certified_builds", "gold", count_column="build_id"),
     Volume("certified_figures", "gold", count_column="build_id"),

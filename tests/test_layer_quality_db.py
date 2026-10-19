@@ -228,7 +228,7 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         for check_id, result in results.items():
             states.setdefault(result["state"], set()).add(check_id)
         self.assertNotIn("unavailable", states)
-        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 46)
+        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 48)  # 2 held from phase 3 part A
         self.assertEqual({c for c in states.get("fail", ()) if not c.startswith("value.")}, set())
         # The corrections history (U8) is held: its checks wait for its migration.
         held = {c for c in states["skipped"] if "held migration" in str(results[c]["detail"].get("reason"))}

@@ -1,0 +1,159 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.daily_volumes
+name: daily_volumes
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Shares traded per instrument and exchange trading date, for the liquidity figures (average daily volume,
+    days to sell, liquidity-adjusted VaR). Parsed from the Yahoo chart responses already kept in bronze-market-data
+    (feed yahoo-chart), so it can be rebuilt from bronze. Held: created by infra/medallion/drafts/daily_volumes.sql
+    on its day (docs/PHASE3_DATA.md).'
+  usage: Internal use only, as every Yahoo figure (dataLicense yfinance-internal-only). Readers take the rows of
+    an instrument_id as market_data_prices names it and skip zero volumes.
+tags:
+- silver
+- market-data
+schema:
+- name: daily_volumes
+  physicalName: silver.daily_volumes
+  physicalType: table
+  logicalType: object
+  description: Shares traded per instrument and exchange trading date, from the Yahoo chart responses kept in bronze-market-data
+    (docs/PHASE3_DATA.md). Written by the daily-volumes job; internal use only.
+  dataGranularityDescription: One row per tenant_id, instrument_id and price_date.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: instrument_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: Platform id of the instrument, the same as in market_data_prices (such as hang-seng-price-index
+      or spy-settlement).
+    quality:
+    - name: instrument_has_prices
+      description: Every instrument has closes in market_data_prices, whose chart rows the job reads.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.daily_volumes v WHERE NOT EXISTS (SELECT 1 FROM silver.market_data_prices
+        p WHERE p.tenant_id = v.tenant_id AND p.instrument_id = v.instrument_id)
+      mustBe: 0
+      severity: warning
+      dimension: consistency
+  - name: price_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: internal
+    description: Trading date in the exchange's own time zone, as market_data_prices dates it.
+    quality:
+    - name: price_date_is_iso_date
+      description: price_date is an ISO date (yyyy-MM-dd) (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.daily_volumes WHERE price_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: volume
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Shares (units) traded that day as Yahoo reports them; zero on a day without trading. A day without
+      a volume is not stored.
+    quality:
+    - name: volume_finite_and_not_negative
+      description: volume is a finite number, zero or more (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.daily_volumes WHERE NOT (volume >= 0 AND volume < 'Infinity'::double precision)
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: source
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The bronze feed the volume was read from (yahoo-chart).
+  - name: source_url
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The provider call that produced the capture, without credentials (the capture's source_url).
+  - name: fetched_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the capture that gave this volume was requested from Yahoo (UTC, ISO 8601).
+slaDefaultElement: daily_volumes.price_date
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: daily_volumes.price_date
+- property: timeOfAvailability
+  value: 07:00+00:00
+  element: daily_volumes.price_date
+  driver: operational
+- property: latency
+  value: 4
+  unit: d
+  element: daily_volumes.price_date
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: market-data
+- property: catalogNote
+  value: Shares traded per instrument and day, parsed from the Yahoo chart responses in bronze-market-data (docs/PHASE3_DATA.md).
+    Internal use only (yfinance-internal-only). Written by ibkrv2stg-daily-volumes, which does nothing unless DAILY_VOLUMES_LOAD=on.
+- property: consumers
+  value:
+  - ibkr_etl.layer_freshness
+- property: producers
+  value:
+  - ibkr_etl.daily_volumes
+- property: freshnessCheck
+  value:
+    checkId: silver.daily_volumes
+    measure: as_of_date
+    required: false
+    query: SELECT MAX(price_date) AS observed FROM daily_volumes
+    source: ibkr_etl.layer_freshness.RULES
+- property: dataLicense
+  value: yfinance-internal-only
+contractCreatedTs: '2026-10-18T00:00:00Z'

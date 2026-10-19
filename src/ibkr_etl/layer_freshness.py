@@ -121,6 +121,15 @@ RULES: tuple[Rule, ...] = (
     Rule("gold.quant_analytics_snapshots", "gold", "public.quant_analytics_snapshots", AS_OF,
          time(10, 0), timedelta(days=4),
          query="SELECT MAX(as_of_date) AS observed FROM quant_analytics_snapshots", required=False, held=True),
+    # Phase 3 (docs/PHASE3_DATA.md), each table from a held migration and not required while its job
+    # is off. Daily volumes (06:30, from the captures the chart fetch kept the day before).
+    Rule("silver.daily_volumes", "silver", "public.daily_volumes", AS_OF, time(7, 0), timedelta(days=4),
+         query="SELECT MAX(price_date) AS observed FROM daily_volumes", required=False, held=True),
+    # Factor returns (Saturdays 06:00): the library publishes a month at a time, about a month late.
+    # Its raw files are finished history, filed once under kenneth-french/history/, so this rule
+    # watches the job instead of a bronze feed rule.
+    Rule("silver.factor_returns", "silver", "public.factor_returns", AS_OF, time(7, 0), timedelta(days=75),
+         query="SELECT MAX(return_date) AS observed FROM factor_returns", required=False, held=True),
 )
 
 

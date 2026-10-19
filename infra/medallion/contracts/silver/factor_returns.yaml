@@ -1,0 +1,197 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.factor_returns
+name: factor_returns
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Daily factor returns (Mkt-RF, SMB, HML, RMW, CMA, RF and momentum) for the regions fama_french.py uses,
+    for factor attribution and the holdings factor risk model. From Kenneth French''s data library, each file kept
+    first in bronze-market-data (feed kenneth-french), so it can be rebuilt from bronze. Held: created by infra/medallion/drafts/factor_returns.sql
+    on its day (docs/PHASE3_DATA.md).'
+  usage: Every vintage is kept, and a vintage holds the rows it added or changed. Readers take the latest vintage
+    per region, factor and date; the series as published on vintage V is, per date, the latest vintage on or before
+    V. Rows with source etf-proxy are stand-ins for days the library has not published yet.
+  limitations: The library's terms for commercial use are not yet checked, so the data is for internal use only
+    and is not passed on.
+tags:
+- silver
+- market-data
+schema:
+- name: factor_returns
+  physicalName: silver.factor_returns
+  physicalType: table
+  logicalType: object
+  description: Daily factor returns per region, factor, date and vintage, from Kenneth French's data library (docs/PHASE3_DATA.md).
+    Written by the factor-returns job; internal use only until the library's terms are checked. Readers take the
+    latest vintage per date.
+  dataGranularityDescription: One row per tenant_id, region, factor, return_date and vintage.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: region
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: A region key of fama_french.REGIONS (us, developed, asia_pacific_ex_japan).
+  - name: factor
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: internal
+    description: Mkt-RF, SMB, HML, RMW, CMA or RF as the five-factor files name them, or MOM for momentum.
+    quality:
+    - name: factor_allowed_values
+      description: factor is one of the seven the job stores (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.factor_returns WHERE factor NOT IN ('Mkt-RF', 'SMB', 'HML', 'RMW', 'CMA',
+        'RF', 'MOM')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: return_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: internal
+    description: The trading day the return is for.
+    quality:
+    - name: return_date_is_iso_date
+      description: return_date is an ISO date (yyyy-MM-dd) (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.factor_returns WHERE return_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: value
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The daily simple return as a fraction (the library's percent divided by 100).
+    quality:
+    - name: value_is_a_daily_fraction
+      description: No daily factor return of 50% or more either way; one would mean a percent left undivided.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.factor_returns WHERE abs(value) >= 0.5
+      mustBe: 0
+      severity: warning
+      dimension: accuracy
+  - name: source
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: kenneth-french, or etf-proxy for the ETF stand-ins (stored only when the job is asked to).
+    quality:
+    - name: source_allowed_values
+      description: source is kenneth-french or etf-proxy (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.factor_returns WHERE source NOT IN ('kenneth-french', 'etf-proxy')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: vintage
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 5
+    classification: internal
+    description: The day the file was published (its Last-Modified date), or fetched when the server does not say.
+    quality:
+    - name: vintage_is_iso_date
+      description: vintage is an ISO date (yyyy-MM-dd) (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.factor_returns WHERE vintage !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+    - name: vintage_not_before_return_date
+      description: A file is published after the days it covers.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.factor_returns WHERE vintage < return_date
+      mustBe: 0
+      severity: warning
+      dimension: consistency
+  - name: fetched_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: When the file was fetched (UTC, ISO 8601).
+slaDefaultElement: factor_returns.return_date
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: factor_returns.return_date
+- property: timeOfAvailability
+  value: 07:00+00:00
+  element: factor_returns.return_date
+  driver: operational
+- property: latency
+  value: 75
+  unit: d
+  element: factor_returns.return_date
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: market-data
+- property: catalogNote
+  value: 'Kenneth French daily factor returns per region, with every vintage (docs/PHASE3_DATA.md). Raw files: bronze-market-data
+    kenneth-french/. Licence: commercial-use terms not yet checked, internal use only. Written by ibkrv2stg-factor-returns,
+    which does nothing unless FACTOR_RETURNS_LOAD=on.'
+- property: consumers
+  value:
+  - ibkr_etl.factor_returns
+  - ibkr_etl.layer_freshness
+- property: producers
+  value:
+  - ibkr_etl.factor_returns
+- property: freshnessCheck
+  value:
+    checkId: silver.factor_returns
+    measure: as_of_date
+    required: false
+    query: SELECT MAX(return_date) AS observed FROM factor_returns
+    source: ibkr_etl.layer_freshness.RULES
+- property: dataLicense
+  value: kenneth-french-terms-unchecked-internal-only
+contractCreatedTs: '2026-10-18T00:00:00Z'

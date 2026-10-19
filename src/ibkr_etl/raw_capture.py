@@ -65,7 +65,14 @@ FEEDS = frozenset({
     "treasury-par-yield",  # U.S. Treasury daily par yield curve (HTTP XML)
     "hkma-hibor",  # HKMA HIBOR fixing pages (HTTP JSON)
     "hkab-hibor",  # HKAB dated HIBOR fallback (HTTP JSON)
+    "kenneth-french",  # Kenneth French daily factor files behind factor_returns (HTTP zip)
 })
+# The licence recorded on each capture of a feed (blob metadata dataLicense). A feed not listed
+# records none on its files; its job carries the dataLicense tag (Yahoo: yfinance-internal-only).
+FEED_LICENSES = {
+    # Free to download; the terms for commercial use are not yet checked, so internal use only.
+    "kenneth-french": "kenneth-french-terms-unchecked-internal-only",
+}
 
 _SECRET_QUERY_KEYS = re.compile(r"(key|token|sig|secret|password|credential|auth|code)", re.I)
 _EXTENSIONS = (("xml", "xml"), ("json", "json"), ("csv", "csv"), ("html", "html"), ("text/plain", "txt"))
@@ -353,6 +360,7 @@ class RawCapture:
                 "request_key": request_key(key),
                 **({"job_run_id": self.job_run_id} if self.job_run_id else {}),
                 **({"job_execution": self.job_execution} if self.job_execution else {}),
+                **({"dataLicense": FEED_LICENSES[feed]} if feed in FEED_LICENSES else {}),
                 **{k: v for k, v in extra.items() if v not in (None, "")},
             }
             metadata = {k: _metadata_value(v) for k, v in metadata.items()}

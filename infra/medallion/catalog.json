@@ -256,6 +256,14 @@
    "note": "Hypothetical crisis scenarios.",
    "source": "derived"
   },
+  "public.daily_volumes": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Shares traded per instrument and day, parsed from the Yahoo chart responses in bronze-market-data (docs/PHASE3_DATA.md). Internal use only (yfinance-internal-only). Written by ibkrv2stg-daily-volumes, which does nothing unless DAILY_VOLUMES_LOAD=on.",
+   "source": "market-data",
+   "held": "infra/medallion/drafts/daily_volumes.sql"
+  },
   "public.data_quality_results": {
    "kind": "table",
    "layer": "ops",
@@ -302,6 +310,14 @@
    "layer": "ops",
    "target_schema": "public",
    "note": "Configuration: filtered-portfolio definitions."
+  },
+  "public.factor_returns": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Kenneth French daily factor returns per region, with every vintage (docs/PHASE3_DATA.md). Raw files: bronze-market-data kenneth-french/. Licence: commercial-use terms not yet checked, internal use only. Written by ibkrv2stg-factor-returns, which does nothing unless FACTOR_RETURNS_LOAD=on.",
+   "source": "market-data",
+   "held": "infra/medallion/drafts/factor_returns.sql"
   },
   "public.flex_request_state": {
    "kind": "table",
@@ -1633,12 +1649,27 @@
    "schedule": "09:20 UTC",
    "note": "Fetches Yahoo crisis-window history; raw copy to bronze-market-data history/ (MARKET_DATA_RAW_CONTAINER, on since 18 Oct 2026)."
   },
+  "ibkrv2stg-daily-volumes": {
+   "hops": [
+    "conform"
+   ],
+   "schedule": "06:30 UTC",
+   "note": "Reads the yahoo-chart captures in bronze-market-data (no fetch) into silver.daily_volumes (docs/PHASE3_DATA.md). Does nothing unless DAILY_VOLUMES_LOAD=on."
+  },
   "ibkrv2stg-derived-daily": {
    "hops": [
     "conform"
    ],
    "schedule": "08:50 UTC",
    "note": "Also reads reference_data.json from v1.1 analytics-reports. REFERENCE_DATA_SOURCE=database reads silver instrument_classifications and risk_free_rates instead."
+  },
+  "ibkrv2stg-factor-returns": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "Saturdays 06:00 UTC",
+   "note": "Fetches the Kenneth French daily factor files; raw copy to bronze-market-data kenneth-french/ (MARKET_DATA_RAW_CONTAINER), then silver.factor_returns (docs/PHASE3_DATA.md). Does nothing unless FACTOR_RETURNS_LOAD=on."
   },
   "ibkrv2stg-flex-discovery": {
    "hops": [

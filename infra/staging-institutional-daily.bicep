@@ -19,6 +19,8 @@ param scheduleUtc string = '20 8 * * *'
 ])
 param dispatchRunDate string = 'previous_hkt_day'
 param flexSendsEnabled bool = true
+// The Kiwoom collector runs after the Flex worker and stays off until switched on.
+param kiwoomCollectorEnabled bool = false
 
 var tags = {
   application: 'ibkr-portfolio-platform'
@@ -128,6 +130,8 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'INSTITUTIONAL_DISPATCH_RUN_DATE', value: dispatchRunDate }
             // No IBKR request at all unless this is on.
             { name: 'INSTITUTIONAL_FLEX_SENDS_ENABLED', value: flexSendsEnabled ? 'true' : 'false' }
+            // No Kiwoom call at all unless this is on.
+            { name: 'KIWOOM_COLLECTOR_ENABLED', value: kiwoomCollectorEnabled ? 'true' : 'false' }
             // The app login cannot create tables, so the import must not try migrations
             // (the v1.1 job sets the same).
             { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }

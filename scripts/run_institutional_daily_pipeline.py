@@ -12,6 +12,8 @@ def main() -> int:
     for script in (
         "dispatch_institutional_daily_work.py",
         "run_institutional_flex_worker.py",
+        # Does nothing unless KIWOOM_COLLECTOR_ENABLED=true.
+        "run_kiwoom_collector.py",
     ):
         subprocess.run(
             [sys.executable, str(ROOT / "scripts" / script)],

@@ -8268,7 +8268,8 @@ def _store_flex_token_via_broker(secret_name: str, token: str) -> dict[str, str]
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    # The broker scales to zero; a cold start takes about 25 seconds, so wait well past that.
+    with urllib.request.urlopen(request, timeout=60) as response:
         payload = json.load(response)
     if (
         payload.get("status") != "stored"

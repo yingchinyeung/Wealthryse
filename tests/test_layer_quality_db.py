@@ -238,7 +238,7 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         self.assertIn("volume.silver.trades_history", held)
         self.assertIn("schema.silver.trades_history", held)
         rls = {c for c in states["skipped"] - held if c.startswith("rule.")}
-        self.assertEqual(len(rls), 8)  # need an RLS bypass
+        self.assertEqual(len(rls), 10)  # need an RLS bypass
         self.assertEqual(results["volume.gold.certified_figures"]["state"], "recorded")  # no earlier total
         self.assertEqual(results["schema.gold.certified_builds"]["state"], "pass")
         nav = results["volume.silver.nav_snapshots"]

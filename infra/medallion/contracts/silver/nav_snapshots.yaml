@@ -17,12 +17,12 @@ description:
     KRW TOTAL row per day. total_text is Kiwoom's own total (kt00004 prsm_dpst_aset_amt today, ka01690 day_stk_asst
     for a past day), which is after Kiwoom's estimated tax and fee for selling every holding, plus any US holdings
     and deposits at Kiwoom's rate to KRW. stock_text is Kiwoom's own value of the holdings (the holdings kt00004
-    lists today; kt00016 scrt_evlt_amt_to for a past day, whose entr_to must equal dbst_bal). From 14 Sep 2026 Kiwoom
-    can value a past day's holdings off the closing prices ka01690 lists, by up to about 1.1%, so on those days
-    the account's positions (which keep the listed closes) do not add up to stock_text. cash_text is the deposit
-    (d2_entra today, dbst_bal for a past day) plus any US deposits, and accruals_text the selling cost as a negative
-    amount, so stock + cash + accruals = total. Reports use total_text as the account's NAV (decided 19 Oct 2026).
-    A Kiwoom row's row_sha256 is the sha256 of the row as written, not of a Flex row.
+    lists today; kt00016 scrt_evlt_amt_to for a past day, whose entr_to must equal dbst_bal), which is the holdings
+    at the official KRX close, so the account's positions add up to it to the won. cash_text is the deposit (d2_entra
+    today, dbst_bal for a past day) plus any US deposits, and accruals_text Kiwoom's selling cost as a negative
+    amount, worked out per stock (see kiwoom_selling_cost_rule), so stock + cash + accruals = total. Reports use
+    total_text as the account's NAV (decided 19 Oct 2026). A Kiwoom row's row_sha256 is the sha256 of the row as
+    written, not of a Flex row.
 tags:
 - silver
 - ibkr
@@ -127,8 +127,8 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
-    description: Stocks as decimal text. For a Kiwoom account, Kiwoom's own value of the holdings (kt00016 scrt_evlt_amt_to
-      for a past day), which from 14 Sep 2026 can differ from the sum of its positions at the listed closing prices.
+    description: 'Stocks as decimal text. For a Kiwoom account, Kiwoom''s own value of the holdings (kt00016 scrt_evlt_amt_to
+      for a past day): the holdings at the official KRX close, which its positions add up to.'
     quality:
     - name: stock_text_is_decimal
       description: stock_text is plain decimal text when present. v_daily_nav casts these to double precision, so
@@ -249,6 +249,34 @@ schema:
     mustBe: 0
     severity: warning
     dimension: consistency
+  - name: kiwoom_positions_add_up_to_stock
+    description: 'A Kiwoom account''s KRW TOTAL row: when all its positions that day are in KRW, they add up to
+      stock_text to the won (ibkr_etl.kiwoom_collector''s holdings check). A day stored at ka01690''s after-market
+      prices fails until it is collected again. Run with a role that bypasses row-level security.'
+    type: sql
+    query: SELECT COUNT(*) FROM silver.nav_snapshots n WHERE n.asset_class = 'TOTAL' AND n.currency = 'KRW' AND
+      EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id = n.account_id AND a.account_type = 'kiwoom') AND
+      NOT EXISTS (SELECT 1 FROM silver.position_snapshots p WHERE p.account_id = n.account_id AND p.snapshot_date
+      = n.snapshot_date AND p.currency <> 'KRW') AND COALESCE((SELECT SUM(p.market_value_text::numeric) FROM silver.position_snapshots
+      p WHERE p.account_id = n.account_id AND p.snapshot_date = n.snapshot_date), 0) <> n.stock_text::numeric
+    mustBe: 0
+    severity: warning
+    dimension: accuracy
+  - name: kiwoom_selling_cost_rule
+    description: 'A Kiwoom account''s KRW TOTAL row: minus accruals_text is Kiwoom''s selling cost worked out per
+      KRW position, within 1 KRW a position (ibkr_etl.kiwoom_client.kiwoom_selling_cost). Tax rounded down to the
+      won: 0.15% before 26 Dec 2025, then 0.05% and 0.15% rounded down apart; fee 0.015% rounded down to 10 won.
+      Run with a role that bypasses row-level security.'
+    type: sql
+    query: SELECT COUNT(*) FROM silver.nav_snapshots n CROSS JOIN LATERAL (SELECT COUNT(*) AS held, COALESCE(SUM(CASE
+      WHEN n.snapshot_date >= '2025-12-26' THEN floor(v.mv * 0.0005) + floor(v.mv * 0.0015) ELSE floor(v.mv * 0.0015)
+      END + floor(v.mv * 0.00015 / 10) * 10), 0) AS cost FROM (SELECT p.market_value_text::numeric AS mv FROM silver.position_snapshots
+      p WHERE p.account_id = n.account_id AND p.snapshot_date = n.snapshot_date AND p.currency = 'KRW') v) k WHERE
+      n.asset_class = 'TOTAL' AND n.currency = 'KRW' AND EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id
+      = n.account_id AND a.account_type = 'kiwoom') AND abs(k.cost + COALESCE(n.accruals_text::numeric, 0)) > k.held
+    mustBe: 0
+    severity: warning
+    dimension: accuracy
 slaDefaultElement: nav_snapshots.snapshot_date
 slaProperties:
 - property: frequency

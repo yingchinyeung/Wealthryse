@@ -157,16 +157,31 @@ class AccountValuation:
     holdings: tuple[Holding, ...]
     # Cash already settled (D+0), when Kiwoom gives it apart from the deposit.
     settled_deposit: Decimal | None = None
+    # Kiwoom's own value of the holdings for its total (kt00016 scrt_evlt_amt_to), when read.
+    # From 14 Sep 2026 it can differ from the holdings at their KRX closing prices.
+    securities_value: Decimal | None = None
 
     @property
     def holdings_value(self) -> Decimal:
         return sum((item.market_value for item in self.holdings), Decimal("0"))
 
     @property
-    def selling_cost(self) -> Decimal:
-        """What Kiwoom's total leaves out of holdings plus cash: its estimated cost of selling."""
+    def valued_holdings(self) -> Decimal:
+        """The holdings as Kiwoom's total values them."""
 
-        return self.holdings_value + self.deposit - self.estimated_assets
+        return self.holdings_value if self.securities_value is None else self.securities_value
+
+    @property
+    def price_basis_gap(self) -> Decimal:
+        """Kiwoom's value of the holdings less their value at the closing prices listed."""
+
+        return self.valued_holdings - self.holdings_value
+
+    @property
+    def selling_cost(self) -> Decimal:
+        """What Kiwoom's total leaves out of its holdings value plus cash: its estimated cost of selling."""
+
+        return self.valued_holdings + self.deposit - self.estimated_assets
 
 
 @dataclass(frozen=True)
@@ -341,8 +356,10 @@ class KiwoomClient:
         dated differently from the day asked for is read as closed.
 
         The deposit (dbst_bal) already moves on the trade date, so it is the
-        day's cash. The total (day_stk_asst) is after Kiwoom's estimated selling
-        costs, so it is a little below holdings plus cash.
+        day's cash. The total (day_stk_asst) is Kiwoom's value of the holdings
+        plus cash, after its estimated selling costs. Kiwoom's value of the
+        holdings is read from the day's account return (kt00016): from 14 Sep
+        2026 it can differ from the holdings at the closing prices ka01690 lists.
         """
 
         pages = self.inquire("ka01690", {"qry_dt": _yyyymmdd(day)})
@@ -369,11 +386,18 @@ class KiwoomClient:
                     price=kiwoom_number(_field(row, "cur_prc"), unsigned=True),
                     market_value=kiwoom_number(_field(row, "evlt_amt")),
                 ))
+        deposit = kiwoom_number(_field(first, "dbst_bal"))
+        total = kiwoom_number(_field(first, "day_stk_asst"))
+        detail = self.inquire("kt00016", {"fr_dt": _yyyymmdd(day), "to_dt": _yyyymmdd(day)})[0]
+        detail_cash = kiwoom_number(_field(detail, "entr_to"))
+        if detail_cash != deposit:
+            raise KiwoomError(f"kt00016 cash {detail_cash:,} differs from ka01690 cash {deposit:,} on {day.isoformat()}")
         return AccountValuation(
             account_name="",
-            deposit=kiwoom_number(_field(first, "dbst_bal")),
-            estimated_assets=kiwoom_number(_field(first, "day_stk_asst")),
+            deposit=deposit,
+            estimated_assets=total,
             holdings=tuple(holding for holding in holdings if holding.quantity),
+            securities_value=kiwoom_number(_field(detail, "scrt_evlt_amt_to")),
         )
 
     def transactions(self, start: date, end: date) -> list[CashMovement]:
@@ -475,7 +499,7 @@ def reconcile_valuation(valuation: AccountValuation, *, tolerance: Decimal = Dec
 
     holdings_value = valuation.holdings_value
     cost = valuation.selling_cost
-    allowed = holdings_value * MAX_SELLING_COST_RATE
+    allowed = valuation.valued_holdings * MAX_SELLING_COST_RATE
     status = "pass" if -tolerance <= cost <= allowed + tolerance else "fail"
     if status == "pass":
         message = (f"Holdings plus cash match Kiwoom's total of {valuation.estimated_assets:,} KRW"
@@ -492,6 +516,7 @@ def reconcile_valuation(valuation: AccountValuation, *, tolerance: Decimal = Dec
             "holdings_value": str(holdings_value),
             "deposit": str(valuation.deposit),
             "broker_total": str(valuation.estimated_assets),
+            "kiwoom_holdings_value": str(valuation.valued_holdings),
             "selling_cost": str(cost),
             "gap": str(cost),
             "holdings": len(valuation.holdings),

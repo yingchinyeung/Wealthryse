@@ -167,7 +167,9 @@ def snapshot_rows(account_id: str, day: date, valuation: AccountValuation, us: U
 
     for holding in valuation.holdings:
         add(holding, "KRX")
-    stock_krw = sum((item.market_value for item in valuation.holdings), Decimal("0"))
+    # Kiwoom's own value of the holdings, so holdings + cash + accruals is Kiwoom's total; the
+    # positions above keep the closing prices Kiwoom lists for each stock.
+    stock_krw = valuation.valued_holdings
     cash = [{"account_id": account_id, "snapshot_date": snapshot, "currency": BASE_CURRENCY,
              "ending_cash_text": _text(valuation.deposit),
              "settled_cash_text": _text(valuation.deposit if valuation.settled_deposit is None
@@ -478,8 +480,15 @@ def days_with_snapshots(connection, account_id: str, start: date, end: date) -> 
         (BASE_CURRENCY, account_id, start.isoformat(), end.isoformat()),
     ).fetchall()
     return {date.fromisoformat(str(row["snapshot_date"])[:10]) for row in rows
-            if abs(_nav_gap(row)) <= Decimal("1") and row["ending_cash_text"] is not None
+            if abs(_nav_gap(row)) <= Decimal("1") and _cost_in_band(row) and row["ending_cash_text"] is not None
             and row["ending_cash_text"] == row["settled_cash_text"]}
+
+
+def _cost_in_band(row) -> bool:
+    """The negative accrual is a selling cost: nothing to MAX_SELLING_COST_RATE of the holdings."""
+
+    cost = -_number(row["accruals_text"])
+    return Decimal("-1") <= cost <= _number(row["stock_text"]) * MAX_SELLING_COST_RATE + Decimal("1")
 
 
 def _number(value) -> Decimal:
@@ -515,8 +524,7 @@ def history_issues(connection, account_id: str, start: date, end: date) -> list[
             continue
         stock = _number(row["stock_text"])
         cost = -_number(row["accruals_text"])
-        allowed = stock * MAX_SELLING_COST_RATE
-        if cost < Decimal("-1") or cost > allowed + Decimal("1"):
+        if not _cost_in_band(row):
             issues.append({"date": day, "check": "selling_cost", "gap": _text(cost),
                            "share_of_holdings": f"{(cost / stock * 100) if stock else Decimal(0):.4f}%"})
     return issues
@@ -539,6 +547,7 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
     securities = Securities(known=known_identifiers(connection))
     loaded: list[date] = []
     closed: list[date] = []
+    price_basis: list[dict[str, str]] = []
     written: list[dict[str, list[dict[str, Any]]]] = []
     for day in batch:
         valuation = client.balance_on(day)
@@ -549,6 +558,10 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
         rows = snapshot_rows(account_id, day, valuation, us, securities)
         written.append(rows)
         loaded.append(day)
+        if valuation.price_basis_gap:
+            price_basis.append({"date": day.isoformat(), "kiwoom_holdings_value": _text(valuation.valued_holdings),
+                                "at_closing_prices": _text(valuation.holdings_value),
+                                "difference": _text(valuation.price_basis_gap)})
     if loaded:
         payload = {"days": [day.isoformat() for day in loaded], "rows": written}
         run_id = connection.execute(
@@ -571,6 +584,9 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
         "days_with_history": len(have) + len(loaded), "closed_days": [day.isoformat() for day in closed][:40],
         "days_left": len(remaining), "gap_days": len({gap["date"] for gap in gaps}), "gaps": gaps[:20],
         "cash_basis": "trade date (ka01690 dbst_bal); Kiwoom's estimated selling cost kept as accruals",
+        "holdings_basis": "Kiwoom's own value of the holdings (kt00016 scrt_evlt_amt_to); positions keep the "
+                          "closing prices ka01690 lists",
+        "price_basis_days_this_run": len(price_basis), "price_basis": price_basis[:30],
         "us_cash_basis": "settled" if include_us else "not collected",
         "us_holdings_listed_from_first_collected_day": include_us,
     }

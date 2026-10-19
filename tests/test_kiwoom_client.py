@@ -218,11 +218,17 @@ DAY_BALANCE = {"return_code": 0, "dt": "20250602", "dbst_bal": "000000001000000"
                ]}
 
 
+DAY_DETAIL = {"return_code": 0, "entr_fr": "000000001000000", "entr_to": "000000001000000",
+              "scrt_evlt_amt_fr": "000000006900000", "scrt_evlt_amt_to": "000000007000000",
+              "tot_amt_to": "000000008000000"}
+
+
 class KiwoomPastDayTests(unittest.TestCase):
     def test_a_past_day_reads_holdings_and_cash(self) -> None:
-        fake = FakeKiwoom({"ka01690": [DAY_BALANCE]})
+        fake = FakeKiwoom({"ka01690": [DAY_BALANCE], "kt00016": [DAY_DETAIL]})
         valuation = _client(fake).balance_on(date(2025, 6, 2))
-        self.assertEqual(fake.requests[-1][2], {"qry_dt": "20250602"})
+        self.assertEqual([body for _, headers, body in fake.requests if headers.get("api-id") == "ka01690"],
+                         [{"qry_dt": "20250602"}])
         self.assertEqual((valuation.deposit, valuation.estimated_assets), (Decimal("1000000"), Decimal("8000000")))
         # A stock sold out by that day is left out.
         self.assertEqual([(h.code, h.quantity, h.price) for h in valuation.holdings],
@@ -231,11 +237,32 @@ class KiwoomPastDayTests(unittest.TestCase):
 
     def test_a_past_days_cash_is_the_deposit_and_the_total_is_after_selling_cost(self) -> None:
         # Kiwoom's total is 11,550 KRW (0.165% of the holdings) below holdings plus the deposit.
-        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, day_stk_asst="000000007988450")]})
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, day_stk_asst="000000007988450")], "kt00016": [DAY_DETAIL]})
         valuation = _client(fake).balance_on(date(2025, 6, 2))
         self.assertEqual((valuation.deposit, valuation.settled_deposit), (Decimal("1000000"), None))
         self.assertEqual(valuation.selling_cost, Decimal("11550"))
         self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
+
+    def test_kiwooms_own_holdings_value_is_used_when_it_differs_from_the_closing_prices(self) -> None:
+        # From 14 Sep 2026 Kiwoom's total values the holdings at 7,100,000 KRW while the listed
+        # closing prices give 7,000,000; its total is cash + 7,100,000 less 0.215% of that.
+        detail = dict(DAY_DETAIL, scrt_evlt_amt_to="000000007100000")
+        total = 1000000 + 7100000 - 15265
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20260914", day_stk_asst=f"{total:015d}")],
+                           "kt00016": [detail]})
+        valuation = _client(fake).balance_on(date(2026, 9, 14))
+        self.assertEqual([body for _, headers, body in fake.requests if headers.get("api-id") == "kt00016"],
+                         [{"fr_dt": "20260914", "to_dt": "20260914"}])
+        self.assertEqual((valuation.holdings_value, valuation.valued_holdings, valuation.price_basis_gap),
+                         (Decimal("7000000"), Decimal("7100000"), Decimal("100000")))
+        self.assertEqual(valuation.selling_cost, Decimal("15265"))
+        result = reconcile_valuation(valuation)
+        self.assertEqual((result["status"], result["evidence"]["kiwoom_holdings_value"]), ("pass", "7100000"))
+
+    def test_the_account_return_must_hold_the_same_cash(self) -> None:
+        fake = FakeKiwoom({"ka01690": [DAY_BALANCE], "kt00016": [dict(DAY_DETAIL, entr_to="000000001000500")]})
+        with self.assertRaisesRegex(KiwoomError, "kt00016 cash"):
+            _client(fake).balance_on(date(2025, 6, 2))
 
     def test_a_closed_day_is_none(self) -> None:
         fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20250530")]})

@@ -26,9 +26,10 @@ CLOSED = date(2025, 3, 3)  # a KRX holiday in this synthetic history
 
 
 class FakeKiwoom:
-    def __init__(self, *, total="8000000", fail=False, off_day=None, refuse_history=False):
+    def __init__(self, *, total="8000000", fail=False, off_day=None, refuse_history=False, basis_day=None):
         self.total, self.fail, self.revoked = Decimal(total), fail, False
         self.off_day, self.refuse_history, self.asked = off_day, refuse_history, []
+        self.basis_day = basis_day
 
     def valuation(self):
         if self.fail:
@@ -51,8 +52,13 @@ class FakeKiwoom:
         # As the client reads ka01690: the deposit is the day's cash, and Kiwoom's total is
         # 11,550 KRW (0.165% of the holdings) below holdings plus cash, its estimated selling cost.
         total = Decimal("8005000") if day == self.off_day else Decimal("7988450")
+        # On the price-basis day Kiwoom values the holdings at 7,100,000 KRW, above their listed close.
+        valued = Decimal("7100000") if day == self.basis_day else None
+        if valued is not None:
+            total = Decimal("1000000") + valued - Decimal("15265")
         return AccountValuation("", Decimal("1000000"), total, (
-            Holding(SAMSUNG, "삼성전자", Decimal("100"), Decimal("60000"), Decimal("70000"), Decimal("7000000")),))
+            Holding(SAMSUNG, "삼성전자", Decimal("100"), Decimal("60000"), Decimal("70000"), Decimal("7000000")),),
+            securities_value=valued)
 
     def us_valuation(self):
         raise AssertionError("US calls are off in this test")
@@ -248,15 +254,34 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         # The day is filled before approval; the run that records the check loads nothing new.
         self._run({"6234567890": FakeKiwoom(off_day=date(2026, 10, 5))})
         self._approve_terms(case_id)
-        later = FakeKiwoom()
+        later = FakeKiwoom(off_day=date(2026, 10, 5))
         result = self._run({"6234567890": later})[0]
-        self.assertEqual(later.asked, [])
+        # A day that does not reconcile is asked for again on each run, in case Kiwoom has corrected it.
+        self.assertEqual(later.asked, [date(2026, 10, 5)])
         self.assertEqual(result["history"]["check"], "warn")
         check = self._history_check(case_id)
         # Kiwoom's total is 5,000 KRW above holdings plus cash, which no selling cost explains.
         self.assertEqual(check["evidence_json"]["gaps"], [
             {"date": "2026-10-05", "check": "selling_cost", "gap": "-5000", "share_of_holdings": "-0.0714%"}])
         self.assertEqual(check["evidence_json"]["gap_days"], 1)
+
+    def test_a_day_kiwoom_values_off_the_closing_prices_still_adds_up_to_its_total(self):
+        _, case_id = self._kiwoom_account("6334567890", start=date(2026, 9, 1))
+        self.addCleanup(self._cancel, case_id)
+        account = "KIWOOM-6334567890"
+        self._run({"6334567890": FakeKiwoom(basis_day=date(2026, 10, 5))})
+        self._approve_terms(case_id)
+        result = self._run({"6334567890": FakeKiwoom()})[0]
+        self.assertEqual(result["history"]["check"], "pass")
+        nav = self.db.execute("SELECT total_text, cash_text, stock_text, accruals_text FROM nav_snapshots "
+                              "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,)).fetchone()
+        # Kiwoom's own value of the holdings, so the day adds up to Kiwoom's total to the won.
+        self.assertEqual((nav["total_text"], nav["cash_text"], nav["stock_text"], nav["accruals_text"]),
+                         ("8084735", "1000000", "7100000", "-15265"))
+        # The position keeps the closing price Kiwoom lists.
+        position = self.db.execute("SELECT market_value_text FROM position_snapshots WHERE account_id = ? "
+                                   "AND snapshot_date = '2026-10-05'", (account,)).fetchone()
+        self.assertEqual(position["market_value_text"], "7000000")
 
     def test_a_history_refusal_fails_the_check_but_keeps_the_day(self):
         _, case_id = self._kiwoom_account("7234567890")

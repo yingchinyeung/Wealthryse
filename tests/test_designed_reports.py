@@ -46,6 +46,19 @@ class MonthTests(unittest.TestCase):
             self.assertEqual(dr.month_ready(answers, "broker_account", "U1234567", "2025-01-31"), ready, day)
             self.assertIn("asset_class = 'TOTAL'", answers.statements[0][0])
 
+    def test_a_kiwoom_month_waits_for_the_next_trading_day(self):
+        # The month's last row can carry after-market prices until the next trading day's run.
+        for later, ready in (("2025-02-03", True), (None, False)):
+            answers = _Answers(position_snapshots=[{"day": "2025-01-31"}], nav_snapshots=[{"day": later}])
+            self.assertEqual(dr.month_ready(answers, "broker_account", "K1", "2025-01-31", "kiwoom_rest"), ready)
+            self.assertEqual(answers.statements[1][1], ("K1", "2025-01-31"))
+            self.assertIn("snapshot_date > ?", answers.statements[1][0])
+        answers = _Answers(position_snapshots=[{"day": "2025-01-31"}], nav_snapshots=[{"day": None}])
+        self.assertTrue(dr.month_ready(answers, "broker_account", "U1", "2025-01-31", "ibkr_flex"))
+        self.assertEqual(len(answers.statements), 1)
+        answers = _Answers(position_snapshots=[{"day": "2025-01-20"}], nav_snapshots=[{"day": "2025-02-03"}])
+        self.assertFalse(dr.month_ready(answers, "broker_account", "K1", "2025-01-31", "kiwoom_rest"))
+
     def test_a_filtered_portfolio_reads_its_own_positions_and_nav(self):
         answers = _Answers(derived_portfolio_positions=[{"day": "2025-01-30"}])
         self.assertTrue(dr.month_ready(answers, "filtered_portfolio", "hk-only", "2025-01-31"))

@@ -142,7 +142,7 @@ def eligible_cases(connection, tenant_id: str) -> list[dict]:
 
     rows = connection.execute(
         """
-        SELECT c.case_id, c.source_kind, c.target_subject_id, c.reporting_currency, c.history_start_date,
+        SELECT c.case_id, c.source_kind, c.broker, c.target_subject_id, c.reporting_currency, c.history_start_date,
                k.status AS recorded, k.message AS recorded_message, k.evidence_json
         FROM broker_onboarding_cases c
         LEFT JOIN broker_onboarding_checks k
@@ -166,8 +166,26 @@ def _latest_common_day(connection, statement: str, subject_id: str, period_end: 
     return str(row["day"])[:10] if row and row["day"] else ""
 
 
-def month_ready(connection, source_kind: str, subject_id: str, period_end: str) -> bool:
-    """Whether the month's data are in: the same rule as the month-end package for each kind of subject."""
+# Brokers whose daily row can carry provisional prices that the next trading day's
+# history pass replaces (Kiwoom: after-market prices, later the official KRX close).
+NEXT_DAY_FINAL_BROKERS = frozenset({"kiwoom_rest"})
+
+
+def _next_day_in(connection, subject_id: str, period_end: str) -> bool:
+    row = connection.execute(
+        "SELECT MIN(n.snapshot_date) AS day FROM nav_snapshots n "
+        "WHERE n.account_id = ? AND n.snapshot_date > ? AND n.asset_class = 'TOTAL'",
+        (subject_id, period_end),
+    ).fetchone()
+    return bool(row and row["day"])
+
+
+def month_ready(connection, source_kind: str, subject_id: str, period_end: str, broker: str | None = None) -> bool:
+    """Whether the month's data are in: the same rule as the month-end package for each kind of subject.
+
+    For a broker whose month-end close is final only after the next trading day's
+    run, the month also waits until a later trading day's NAV is in.
+    """
 
     if source_kind == "composite_portfolio":
         return month_end_ready(connection, subject_id, period_end)
@@ -180,7 +198,11 @@ def month_ready(connection, source_kind: str, subject_id: str, period_end: str) 
                      "WHERE p.account_id = ? AND p.snapshot_date <= ? AND EXISTS (SELECT 1 FROM nav_snapshots n "
                      "WHERE n.account_id = p.account_id AND n.snapshot_date = p.snapshot_date AND n.asset_class = 'TOTAL')")
     day = _latest_common_day(connection, statement, subject_id, period_end)
-    return bool(day) and (date.fromisoformat(period_end) - date.fromisoformat(day)).days <= STALE_AFTER_DAYS
+    if not day or (date.fromisoformat(period_end) - date.fromisoformat(day)).days > STALE_AFTER_DAYS:
+        return False
+    if source_kind == "broker_account" and broker in NEXT_DAY_FINAL_BROKERS:
+        return _next_day_in(connection, subject_id, period_end)
+    return True
 
 
 def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, container: str,
@@ -214,7 +236,8 @@ def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, 
             snapshot_id = active_month_end_snapshot_id(connection, tenant_id=tenant_id, subject_id=subject_id,
                                                        period_end=period_end)
             if snapshot_id is None:
-                if not month_ready(connection, str(case["source_kind"]), subject_id, period_end):
+                if not month_ready(connection, str(case["source_kind"]), subject_id, period_end,
+                                   case.get("broker")):
                     waiting_for = period_end  # a later month cannot be ready before this one
                     break
                 try:

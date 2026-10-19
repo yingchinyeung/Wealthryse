@@ -151,7 +151,7 @@ class DesignedReportRunTests(_DesignedCase):
             return next(k for k in case_detail(db, TENANT, case_id)["checks"] if k["check_id"] == "reports_rendered")
 
         with patch.object(dr, "freeze_month_end_snapshot", freeze), \
-                patch.object(dr, "month_ready", lambda connection, kind, subject_id, period_end: period_end in ready), \
+                patch.object(dr, "month_ready", lambda connection, kind, subject_id, period_end, broker=None: period_end in ready), \
                 patch.object(onboarding_v2_web, "factsheet_design_enabled", lambda: True):
             # Without a design, the check waits and the case page sends the owner to the designer.
             self.assertEqual(run()[0]["check"], "pending")
@@ -245,7 +245,7 @@ class LiveMonthEndTests(_DesignedCase):
             return result
 
         with patch.object(dr, "freeze_month_end_snapshot", freeze), \
-                patch.object(dr, "month_ready", lambda connection, kind, subject_id, period_end: period_end in ready):
+                patch.object(dr, "month_ready", lambda connection, kind, subject_id, period_end, broker=None: period_end in ready):
             designs.append(self._submit_design(db, "Approved design"))
             dr.run_designed_report_cases(db, TENANT, container="internal-reports", today=date(2025, 3, 3),
                                          fetch=fetch, store=store, render=render)

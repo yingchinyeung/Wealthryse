@@ -16,7 +16,7 @@ try:
 except ImportError:  # run as tests.test_kiwoom_collector_db
     from tests.test_broker_onboarding_db import ADMIN_DSN, IDENTITY, OWNER_ROLE, TENANT, _dsn, _MigratedDatabase
 
-from ibkr_etl.kiwoom_client import AccountValuation, CashMovement, Holding, KiwoomError
+from ibkr_etl.kiwoom_client import AccountValuation, CashMovement, Holding, KiwoomError, kiwoom_selling_cost
 from ibkr_etl.security_master import SecurityIdentifier
 
 SAMSUNG = SecurityIdentifier("krx_code", "005930")
@@ -49,16 +49,18 @@ class FakeKiwoom:
             raise KiwoomError("Kiwoom refused the call (HTTP 200, code 2): no data before the account opened")
         if day == CLOSED:
             return None
-        # As the client reads ka01690: the deposit is the day's cash, and Kiwoom's total is
-        # 11,550 KRW (0.165% of the holdings) below holdings plus cash, its estimated selling cost.
-        total = Decimal("8005000") if day == self.off_day else Decimal("7988450")
-        # On the price-basis day Kiwoom values the holdings at 7,100,000 KRW, above their listed close.
-        valued = Decimal("7100000") if day == self.basis_day else None
-        if valued is not None:
-            total = Decimal("1000000") + valued - Decimal("15265")
+        # As the client reads ka01690: the deposit is the day's cash, and Kiwoom's total is holdings
+        # plus cash less its per-stock selling cost (11,550 KRW on 7,000,000 in 2025, 15,050 from 2026).
+        price = Decimal("71000") if day == self.basis_day else Decimal("70000")
+        value = price * 100
+        total = Decimal("1000000") + value - kiwoom_selling_cost(value, day)
+        if day == self.off_day:
+            total = Decimal("8005000")
+        # On the price-basis day ka01690 lists 70,000 (after-market) and the client prices the
+        # holding at the official close, 71,000, which adds up to Kiwoom's 7,100,000.
         return AccountValuation("", Decimal("1000000"), total, (
-            Holding(SAMSUNG, "삼성전자", Decimal("100"), Decimal("60000"), Decimal("70000"), Decimal("7000000")),),
-            securities_value=valued)
+            Holding(SAMSUNG, "삼성전자", Decimal("100"), Decimal("60000"), price, value),),
+            securities_value=value, repriced_at_close=day == self.basis_day)
 
     def us_valuation(self):
         raise AssertionError("US calls are off in this test")
@@ -265,7 +267,7 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
             {"date": "2026-10-05", "check": "selling_cost", "gap": "-5000", "share_of_holdings": "-0.0714%"}])
         self.assertEqual(check["evidence_json"]["gap_days"], 1)
 
-    def test_a_day_kiwoom_values_off_the_closing_prices_still_adds_up_to_its_total(self):
+    def test_a_day_priced_at_the_official_close_adds_up_to_kiwooms_total(self):
         _, case_id = self._kiwoom_account("6334567890", start=date(2026, 9, 1))
         self.addCleanup(self._cancel, case_id)
         account = "KIWOOM-6334567890"
@@ -275,13 +277,49 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self.assertEqual(result["history"]["check"], "pass")
         nav = self.db.execute("SELECT total_text, cash_text, stock_text, accruals_text FROM nav_snapshots "
                               "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,)).fetchone()
-        # Kiwoom's own value of the holdings, so the day adds up to Kiwoom's total to the won.
+        # Holdings at the close, cash, and Kiwoom's per-stock selling cost add up to its total to the won.
         self.assertEqual((nav["total_text"], nav["cash_text"], nav["stock_text"], nav["accruals_text"]),
-                         ("8084735", "1000000", "7100000", "-15265"))
-        # The position keeps the closing price Kiwoom lists.
-        position = self.db.execute("SELECT market_value_text FROM position_snapshots WHERE account_id = ? "
-                                   "AND snapshot_date = '2026-10-05'", (account,)).fetchone()
-        self.assertEqual(position["market_value_text"], "7000000")
+                         ("8084740", "1000000", "7100000", "-15260"))
+        position = self.db.execute("SELECT mark_price_text, market_value_text FROM position_snapshots "
+                                   "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,)).fetchone()
+        self.assertEqual((position["mark_price_text"], position["market_value_text"]), ("71000", "7100000"))
+
+    def test_a_day_stored_at_after_market_prices_is_collected_again(self):
+        _, case_id = self._kiwoom_account("6434567890", start=date(2026, 9, 1))
+        self.addCleanup(self._cancel, case_id)
+        account = "KIWOOM-6434567890"
+        self._run({"6434567890": FakeKiwoom(basis_day=date(2026, 10, 5))})
+        # As an earlier build stored it: the position at ka01690's after-market price, below
+        # Kiwoom's value of the holdings, and a selling cost Kiwoom's rule does not give.
+        self.db.execute("UPDATE position_snapshots SET mark_price_text = '70000', market_value_text = '7000000' "
+                        "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,))
+        self.db.execute("UPDATE nav_snapshots SET stock_text = '7000000', accruals_text = '84740' "
+                        "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,))
+        self.db.commit()
+        from ibkr_etl.kiwoom_collector import history_issues
+
+        self.assertEqual([gap["check"] for gap in history_issues(self.db, account, date(2026, 10, 5),
+                                                                 date(2026, 10, 5))], ["selling_cost"])
+        self.db.execute("UPDATE nav_snapshots SET accruals_text = '-15260' "
+                        "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,))
+        self.db.execute("UPDATE nav_snapshots SET total_text = '7984740' "
+                        "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,))
+        self.db.commit()
+        # Adds up and the cost is in band, but the position does not match Kiwoom's holdings value
+        # once stock_text is Kiwoom's: here the cost rule catches it (15,050 is due on 7,000,000).
+        self.assertEqual([gap["check"] for gap in history_issues(self.db, account, date(2026, 10, 5),
+                                                                 date(2026, 10, 5))], ["selling_cost_rule"])
+        self.db.execute("UPDATE nav_snapshots SET stock_text = '7100000', total_text = '8084740' "
+                        "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,))
+        self.db.commit()
+        self.assertEqual([gap["check"] for gap in history_issues(self.db, account, date(2026, 10, 5),
+                                                                 date(2026, 10, 5))], ["holdings", "selling_cost_rule"])
+        again = FakeKiwoom(basis_day=date(2026, 10, 5))
+        self._run({"6434567890": again})
+        self.assertEqual(again.asked, [date(2026, 10, 5)])
+        position = self.db.execute("SELECT market_value_text FROM position_snapshots "
+                                   "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,)).fetchone()
+        self.assertEqual(position["market_value_text"], "7100000")
 
     def test_a_history_refusal_fails_the_check_but_keeps_the_day(self):
         _, case_id = self._kiwoom_account("7234567890")

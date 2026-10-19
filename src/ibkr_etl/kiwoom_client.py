@@ -25,9 +25,9 @@ import json
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Callable, Mapping
 
 from .security_master import SecurityIdentifier
@@ -38,6 +38,7 @@ TOKEN_PATH = "/oauth2/token"
 REVOKE_PATH = "/oauth2/revoke"
 ACCOUNT_PATH = "/api/dostk/acnt"
 US_ACCOUNT_PATH = "/api/us/acnt"
+CHART_PATH = "/api/dostk/chart"
 INQUIRY_APIS: Mapping[str, str] = {
     "kt00001": ACCOUNT_PATH,  # deposit detail
     "kt00004": ACCOUNT_PATH,  # account valuation
@@ -46,6 +47,7 @@ INQUIRY_APIS: Mapping[str, str] = {
     "kt00018": ACCOUNT_PATH,  # holdings valuation detail
     "ka01690": ACCOUNT_PATH,  # daily balance return: holdings and cash on a past date
     "ka10074": ACCOUNT_PATH,  # realised profit by day
+    "ka10081": CHART_PATH,  # daily price chart: a stock's official KRX close by day
     "ust21070": US_ACCOUNT_PATH,  # US holdings
     "ust21100": US_ACCOUNT_PATH,  # US transaction history
     "ust21120": US_ACCOUNT_PATH,  # deposits and securities value by currency
@@ -145,6 +147,25 @@ class Holding:
 # selling every holding would cost: 0.165% of holdings in 2025, 0.215% from 26 Dec 2025 (0.20% tax
 # plus the fee). Up to this share of the holdings is read as that cost; ETFs pay no tax, so less is fine.
 MAX_SELLING_COST_RATE = Decimal("0.0025")
+# Kiwoom works the cost out per stock (kt00018 tax and sell_cmsn), each part rounded down: the
+# 0.015% fee to 10 won, the tax to the won. From 26 Dec 2025 the tax is 0.05% and 0.15%, rounded
+# down apart; before it, 0.15%. Matches Kiwoom to the won on every day checked.
+SELLING_FEE_RATE = Decimal("0.00015")
+SPLIT_TAX_FROM = date(2025, 12, 26)
+
+
+def _floor(value: Decimal, step: int = 1) -> Decimal:
+    return (value / step).to_integral_value(rounding=ROUND_FLOOR) * step
+
+
+def kiwoom_selling_cost(market_value: Decimal, day: date) -> Decimal:
+    """Kiwoom's estimated cost of selling one KOSPI holding: securities tax plus fee."""
+
+    if day >= SPLIT_TAX_FROM:
+        tax = _floor(market_value * Decimal("0.0005")) + _floor(market_value * Decimal("0.0015"))
+    else:
+        tax = _floor(market_value * Decimal("0.0015"))
+    return tax + _floor(market_value * SELLING_FEE_RATE, 10)
 
 
 @dataclass(frozen=True)
@@ -157,9 +178,11 @@ class AccountValuation:
     holdings: tuple[Holding, ...]
     # Cash already settled (D+0), when Kiwoom gives it apart from the deposit.
     settled_deposit: Decimal | None = None
-    # Kiwoom's own value of the holdings for its total (kt00016 scrt_evlt_amt_to), when read.
-    # From 14 Sep 2026 it can differ from the holdings at their KRX closing prices.
+    # Kiwoom's own value of the holdings for its total (kt00016 scrt_evlt_amt_to), when read:
+    # the holdings at the official KRX close.
     securities_value: Decimal | None = None
+    # True when ka01690 listed after-market prices and the holdings were repriced at the close.
+    repriced_at_close: bool = False
 
     @property
     def holdings_value(self) -> Decimal:
@@ -173,7 +196,7 @@ class AccountValuation:
 
     @property
     def price_basis_gap(self) -> Decimal:
-        """Kiwoom's value of the holdings less their value at the closing prices listed."""
+        """Kiwoom's value of the holdings less their value at the prices held here."""
 
         return self.valued_holdings - self.holdings_value
 
@@ -250,6 +273,7 @@ class KiwoomClient:
         self._last_call: datetime | None = None
         self._token: str | None = None
         self._token_expires: datetime | None = None
+        self._closes: dict[str, dict[str, Decimal]] = {}
 
     def __repr__(self) -> str:
         return f"KiwoomClient(environment={self.environment!r})"
@@ -307,14 +331,20 @@ class KiwoomClient:
         token, self._token, self._token_expires = self._token, None, None
         self._post(REVOKE_PATH, {}, {"appkey": self._app_key, "secretkey": self._app_secret, "token": token})
 
-    def inquire(self, api_id: str, body: Mapping[str, object]) -> list[Mapping[str, object]]:
-        """Run one inquiry, following Kiwoom's continuation keys; returns every page."""
+    def inquire(self, api_id: str, body: Mapping[str, object], *,
+                max_pages: int | None = None) -> list[Mapping[str, object]]:
+        """Run one inquiry, following Kiwoom's continuation keys; returns every page.
+
+        ``max_pages`` stops early on purpose, for answers that run on into the past (price charts).
+        """
 
         if api_id not in INQUIRY_APIS:
             raise KiwoomError(f"{api_id} is not an allowed Kiwoom inquiry")
         pages: list[Mapping[str, object]] = []
         continuation: dict[str, str] = {}
         for _ in range(MAX_PAGES):
+            if max_pages is not None and len(pages) >= max_pages:
+                return pages
             headers = {"authorization": f"Bearer {self._bearer()}", "api-id": api_id, **continuation}
             response_headers, payload = self._post(INQUIRY_APIS[api_id], headers, body)
             pages.append(payload)
@@ -392,13 +422,53 @@ class KiwoomClient:
         detail_cash = kiwoom_number(_field(detail, "entr_to"))
         if detail_cash != deposit:
             raise KiwoomError(f"kt00016 cash {detail_cash:,} differs from ka01690 cash {deposit:,} on {day.isoformat()}")
+        held = tuple(holding for holding in holdings if holding.quantity)
+        repriced = False
+        securities_value = kiwoom_number(_field(detail, "scrt_evlt_amt_to"))
+        if sum((item.market_value for item in held), Decimal("0")) != securities_value:
+            # From 14 Sep 2026 (KRX trading to 20:00) ka01690 lists each stock at its after-market
+            # price; Kiwoom's total values it at the official close. Use the close when that adds
+            # up to Kiwoom's value of the holdings, to the won; otherwise keep the listed prices.
+            closed = self._at_official_close(held, day)
+            if closed is not None and sum((item.market_value for item in closed), Decimal("0")) == securities_value:
+                held, repriced = closed, True
         return AccountValuation(
             account_name="",
             deposit=deposit,
             estimated_assets=total,
-            holdings=tuple(holding for holding in holdings if holding.quantity),
-            securities_value=kiwoom_number(_field(detail, "scrt_evlt_amt_to")),
+            holdings=held,
+            securities_value=securities_value,
+            repriced_at_close=repriced,
         )
+
+    def closing_price(self, code: str, day: date) -> Decimal | None:
+        """A stock's official KRX close on a past day (ka10081, unadjusted), or None if not listed.
+
+        One page reaches back far past any history run, so each stock is read once per run and
+        again only for a later day.
+        """
+
+        wanted = _yyyymmdd(day)
+        closes = self._closes.get(code)
+        if closes is None or (wanted not in closes and wanted > max(closes, default="")):
+            closes = {}
+            pages = self.inquire("ka10081", {"stk_cd": code, "base_dt": wanted, "upd_stkpc_tp": "0"}, max_pages=1)
+            for page in pages:
+                for row in page.get("stk_dt_pole_chart_qry") or []:
+                    dt = str(row.get("dt") or "").strip()
+                    if dt and str(row.get("cur_prc") or "").strip():
+                        closes[dt] = kiwoom_number(row["cur_prc"], unsigned=True)
+            self._closes[code] = closes
+        return closes.get(wanted)
+
+    def _at_official_close(self, holdings: tuple[Holding, ...], day: date) -> tuple[Holding, ...] | None:
+        repriced: list[Holding] = []
+        for item in holdings:
+            price = self.closing_price(item.code, day)
+            if price is None:
+                return None
+            repriced.append(replace(item, price=price, market_value=item.quantity * price))
+        return tuple(repriced)
 
     def transactions(self, start: date, end: date) -> list[CashMovement]:
         """Every trade, deposit, withdrawal and dividend between two dates (kt00015)."""

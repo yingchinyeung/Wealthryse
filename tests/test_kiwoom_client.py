@@ -7,12 +7,14 @@ from decimal import Decimal
 
 from ibkr_etl.kiwoom_client import (
     ACCOUNT_PATH,
+    CHART_PATH,
     HOSTS,
     INQUIRY_APIS,
     US_ACCOUNT_PATH,
     KiwoomClient,
     KiwoomError,
     kiwoom_number,
+    kiwoom_selling_cost,
     krx_code,
     reconcile_us_valuation,
     reconcile_valuation,
@@ -98,7 +100,9 @@ class KiwoomClientTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaisesRegex(KiwoomError, "inquiry calls"):
                 client._post(path, {}, {})
         self.assertEqual(fake.requests, [])
-        self.assertEqual(set(INQUIRY_APIS.values()), {ACCOUNT_PATH, US_ACCOUNT_PATH})
+        self.assertEqual(set(INQUIRY_APIS.values()), {ACCOUNT_PATH, US_ACCOUNT_PATH, CHART_PATH})
+        # The price chart path carries the daily close only; it has no order or account change.
+        self.assertEqual([api for api, path in INQUIRY_APIS.items() if path == CHART_PATH], ["ka10081"])
 
     def test_mock_and_live_hosts_only(self) -> None:
         self.assertEqual(set(HOSTS), {"live", "mock"})
@@ -243,21 +247,47 @@ class KiwoomPastDayTests(unittest.TestCase):
         self.assertEqual(valuation.selling_cost, Decimal("11550"))
         self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
 
-    def test_kiwooms_own_holdings_value_is_used_when_it_differs_from_the_closing_prices(self) -> None:
-        # From 14 Sep 2026 Kiwoom's total values the holdings at 7,100,000 KRW while the listed
-        # closing prices give 7,000,000; its total is cash + 7,100,000 less 0.215% of that.
+    def test_after_market_prices_are_replaced_by_the_official_close(self) -> None:
+        # From 14 Sep 2026 ka01690 lists the 20:00 after-market price (70,000); Kiwoom's total values
+        # the holdings at the official close (71,000: 7,100,000 KRW), less its per-stock selling cost.
         detail = dict(DAY_DETAIL, scrt_evlt_amt_to="000000007100000")
-        total = 1000000 + 7100000 - 15265
+        total = 1000000 + 7100000 - 15260
+        chart = {"return_code": 0, "stk_cd": "005930", "stk_dt_pole_chart_qry": [
+            {"dt": "20260915", "cur_prc": "72000"}, {"dt": "20260914", "cur_prc": "71000"},
+            {"dt": "20260911", "cur_prc": "69000"}]}
+        older = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20260910", "cur_prc": "1"}]}
         fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20260914", day_stk_asst=f"{total:015d}")],
-                           "kt00016": [detail]})
+                           "kt00016": [detail], "ka10081": [chart, older]})
         valuation = _client(fake).balance_on(date(2026, 9, 14))
-        self.assertEqual([body for _, headers, body in fake.requests if headers.get("api-id") == "kt00016"],
-                         [{"fr_dt": "20260914", "to_dt": "20260914"}])
-        self.assertEqual((valuation.holdings_value, valuation.valued_holdings, valuation.price_basis_gap),
-                         (Decimal("7000000"), Decimal("7100000"), Decimal("100000")))
-        self.assertEqual(valuation.selling_cost, Decimal("15265"))
-        result = reconcile_valuation(valuation)
-        self.assertEqual((result["status"], result["evidence"]["kiwoom_holdings_value"]), ("pass", "7100000"))
+        # One page of the chart only, unadjusted prices, with the close for the day asked.
+        self.assertEqual([(url, body) for url, headers, body in fake.requests if headers.get("api-id") == "ka10081"],
+                         [("https://mockapi.kiwoom.com/api/dostk/chart",
+                           {"stk_cd": "005930", "base_dt": "20260914", "upd_stkpc_tp": "0"})])
+        self.assertEqual([(h.price, h.market_value) for h in valuation.holdings],
+                         [(Decimal("71000"), Decimal("7100000"))])
+        self.assertEqual((valuation.holdings_value, valuation.price_basis_gap, valuation.repriced_at_close),
+                         (Decimal("7100000"), Decimal("0"), True))
+        self.assertEqual(valuation.selling_cost, kiwoom_selling_cost(Decimal("7100000"), date(2026, 9, 14)))
+        self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
+
+    def test_a_close_that_does_not_add_up_keeps_the_listed_prices(self) -> None:
+        detail = dict(DAY_DETAIL, scrt_evlt_amt_to="000000007100000")
+        total = 1000000 + 7100000 - 15260
+        chart = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20260914", "cur_prc": "70500"}]}
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20260914", day_stk_asst=f"{total:015d}")],
+                           "kt00016": [detail], "ka10081": [chart]})
+        valuation = _client(fake).balance_on(date(2026, 9, 14))
+        self.assertEqual((valuation.holdings_value, valuation.valued_holdings, valuation.repriced_at_close),
+                         (Decimal("7000000"), Decimal("7100000"), False))
+        self.assertEqual(valuation.selling_cost, Decimal("15260"))
+
+    def test_kiwooms_selling_cost_rule_per_stock(self) -> None:
+        # 2025: 0.15% tax; the 0.015% fee rounded down to 10 won.
+        self.assertEqual(kiwoom_selling_cost(Decimal("7000000"), date(2025, 6, 2)), Decimal("11550"))
+        # From 26 Dec 2025: 0.05% and 0.15%, each rounded down. Kiwoom's own kt00018 figures, 19 Oct 2026:
+        # DL 43 x 44,950 has tax 3,865 and fee 280; SK hynix 14 x 1,277,000 has 35,756 and 2,680.
+        self.assertEqual(kiwoom_selling_cost(Decimal("1932850"), date(2026, 10, 19)), Decimal("4145"))
+        self.assertEqual(kiwoom_selling_cost(Decimal("17878000"), date(2026, 10, 19)), Decimal("38436"))
 
     def test_the_account_return_must_hold_the_same_cash(self) -> None:
         fake = FakeKiwoom({"ka01690": [DAY_BALANCE], "kt00016": [dict(DAY_DETAIL, entr_to="000000001000500")]})

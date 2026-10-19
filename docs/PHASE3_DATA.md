@@ -165,11 +165,9 @@ after the held check and before the benchmarks' load:
   - The status is `failed` (exit 1) when a request failed, a response was not kept, a holding could
     not be written, a capture could not be read, or raw capture is not set up. Holdings not mapped,
     not found or deferred do not fail the run.
-- **Before switching on: the contract.** The silver contract
-  (`infra/medallion/contracts/silver/daily_volumes.yaml`) says `instrument_id` is as in
-  `market_data_prices`. Its warning rule `instrument_has_prices` counts every row whose instrument has
-  no closes there, so each holding's rows would count. The contract's owners need to let that
-  description and rule accept a conid in `instruments` (step 8).
+- **The contract.** The silver contract (`infra/medallion/contracts/silver/daily_volumes.yaml`)
+  describes `instrument_id` as a holding's conid or a benchmark's `market_data_prices` id, and its
+  warning rule `instrument_is_known` counts only rows that are neither.
 
 **Licence.** Yahoo chart data is `yfinance-internal-only`, as for the other Yahoo feeds. That
 licence is in the job's `dataLicense` tag and in the contract's `dataLicense` property. Internal use
@@ -194,7 +192,7 @@ Run each line from a clone of `main` after `az login`. Run steps 3, 5, 6, 9 and 
 | 5 | Ying's PC | `az containerapp job start -g rg-ibkr-database-v11 -n ibkrv2stg-daily-volumes --container-name daily-volumes --image <its image> --env-vars DAILY_VOLUMES_LOAD=on --args scripts/load_daily_volumes.py --from 2025-01-13` | One backfill by hand, needing the captures (above). Check the summary: `status` `success`, `written` above 0, and no unreadable captures. Then spot-check a few rows against Yahoo. |
 | 6 | Ying's PC | step 4's line with `dailyVolumesLoad=on` added to `-p` | From the next 06:30 run, each run loads the last three days' captures. Once it has run for a week, the freshness rule can be made required. |
 | 7 | Ying's PC | `az role assignment list --assignee <ingestion identity principal id> --scope <storage account id>/blobServices/default/containers/bronze-market-data --query "[].roleDefinitionName" -o tsv` | Read only. It should print `Storage Blob Data Contributor`. If it does not, stop: the job needs Storage Blob Data Contributor for the ingestion identity on the `bronze-market-data` container scope, added with Medallion's agreement, not by this change. |
-| 8 | PR | the contract change above | The contract's `instrument_id` and `instrument_has_prices` accept a conid in `instruments`, with its owners' review. |
+| 8 | (check) | none | After step 9, the next layer quality run must show the contract's `instrument_is_known` rule at 0 for `daily_volumes`: the holdings' rows are keyed by conid, which the rule accepts. |
 | 9 | Ying's PC | `az containerapp job start -g rg-ibkr-database-v11 -n ibkrv2stg-daily-volumes --container-name daily-volumes --image <its image> --env-vars DAILY_VOLUMES_LOAD=on DAILY_VOLUMES_FETCH=on --args scripts/load_daily_volumes.py --fetch --max-symbols 5` | One small fetch by hand. In the summary's `fetch`, check: `status` `success`, `captured` equal to `fetched`, and the `not_mapped` and `not_found` lists. Check the captures are in `yahoo-chart/<today>/`, then spot-check a few rows against Yahoo. |
 | 10 | Ying's PC | step 4's line with `dailyVolumesLoad=on dailyVolumesFetch=on` added to `-p` | From the next 06:30 run, the job fetches up to 60 holdings, then loads them and the benchmarks. Until every holding has volumes, each run fetches a year for up to 60 of them. |
 

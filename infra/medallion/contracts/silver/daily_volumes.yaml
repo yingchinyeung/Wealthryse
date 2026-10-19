@@ -42,14 +42,15 @@ schema:
     primaryKey: true
     primaryKeyPosition: 2
     classification: internal
-    description: Platform id of the instrument, the same as in market_data_prices (such as hang-seng-price-index
-      or spy-settlement).
+    description: 'The instrument: for a holding, its IBKR conid (as in instruments); for a benchmark, its id in
+      market_data_prices (such as hang-seng-price-index or spy-settlement).'
     quality:
-    - name: instrument_has_prices
-      description: Every instrument has closes in market_data_prices, whose chart rows the job reads.
+    - name: instrument_is_known
+      description: Every instrument is a holding's conid in instruments or a benchmark with closes in market_data_prices.
       type: sql
       query: SELECT COUNT(*) FROM silver.daily_volumes v WHERE NOT EXISTS (SELECT 1 FROM silver.market_data_prices
-        p WHERE p.tenant_id = v.tenant_id AND p.instrument_id = v.instrument_id)
+        p WHERE p.tenant_id = v.tenant_id AND p.instrument_id = v.instrument_id) AND NOT EXISTS (SELECT 1 FROM
+        silver.instruments i WHERE i.conid = v.instrument_id)
       mustBe: 0
       severity: warning
       dimension: consistency

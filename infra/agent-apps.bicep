@@ -57,6 +57,16 @@ param deployDispatcher bool = false
 param dispatcherMode string = 'watch'
 @description('With dispatcherMode live: the jobs it may run, comma-separated (holdings_explainer, risk_watch, weekly_brief). Empty: none.')
 param dispatcherJobs string = ''
+@description('The market news watch\'s job (ibkrv2stg-agent-market-news, docs/AGENTS.md): hourly it reads world stock market news and keeps the market changes it can confirm. Off until approved; needs migrations/agent/019 installed and the APAC report deployment.')
+param deployMarketNews bool = false
+@description('watch keeps news items and confirmed market changes and records each run in agent.tasks; live also posts one owner-only inbox card per new change.')
+@allowed(['off', 'watch', 'live'])
+param marketNewsMode string = 'watch'
+@description('Monthly token cap for the market news watch.')
+param marketNewsTokenBudget int = 2000000
+@description('on shows get_market_events to the agents (the onboarding NAV check, incident diagnosis and chat). Needs migrations/agent/019 installed.')
+@allowed(['off', 'on'])
+param marketEvents string = 'off'
 
 param agentAppName string = 'ibkrv2stg-agent'
 param toolsAppName string = 'ibkrv2stg-agent-tools'
@@ -188,6 +198,7 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AGENT_TOOLS_AUDIENCE', value: toolsAudience }
             { name: 'AGENT_TOOLS_USER_CALLERS', value: agentIdentity.properties.principalId }
             { name: 'AGENT_TOOLS_JOB_CALLERS', value: jobsIdentity.properties.principalId }
+            { name: 'AGENT_MARKET_EVENTS', value: marketEvents }
           ])
           resources: { cpu: json('0.5'), memory: '1Gi' }
           probes: probes
@@ -590,6 +601,55 @@ resource dispatcherJob 'Microsoft.App/jobs@2024-03-01' = if (deployDispatcher) {
             { name: 'AGENT_DB_USER', value: jobsIdentity.name }
             { name: 'AGENT_DISPATCHER', value: dispatcherMode }
             { name: 'AGENT_DISPATCHER_JOBS', value: dispatcherJobs }
+          ])
+          resources: { cpu: json('0.25'), memory: '0.5Gi' }
+        }
+      ]
+    }
+  }
+}
+
+// The market news watch: hourly it reads the news feeds of the markets in
+// src/wealthryse_agent/supervisor/markets.py (public news only, from those hosts only), asks the
+// APAC report deployment which items announce a market change, and keeps those code can confirm.
+// No client data goes to the model or to any news site.
+resource marketNewsJob 'Microsoft.App/jobs@2024-03-01' = if (deployMarketNews) {
+  name: 'ibkrv2stg-agent-market-news'
+  location: resourceGroup().location
+  tags: tags
+  dependsOn: [pulls]
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: { '${jobsIdentity.id}': {} }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 1200
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        cronExpression: '7 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [{ server: registry.properties.loginServer, identity: jobsIdentity.id }]
+    }
+    template: {
+      containers: [
+        {
+          name: 'job'
+          image: image
+          command: ['python', '-m', 'wealthryse_agent.supervisor.market_news']
+          env: concat(commonEnv, [
+            { name: 'AGENT_MODEL_ENDPOINT', value: modelEndpoint }
+            { name: 'AGENT_MODEL_DEPLOYMENT', value: reportModelDeployment }
+            { name: 'AGENT_MODEL_REGION', value: 'southeastasia' }
+            { name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }
+            { name: 'AGENT_MARKET_NEWS', value: marketNewsMode }
+            { name: 'AGENT_MARKET_NEWS_TOKEN_BUDGET', value: string(marketNewsTokenBudget) }
+            { name: 'AZURE_CLIENT_ID', value: jobsIdentity.properties.clientId }
+            { name: 'AGENT_DB_USER', value: jobsIdentity.name }
           ])
           resources: { cpu: json('0.25'), memory: '0.5Gi' }
         }

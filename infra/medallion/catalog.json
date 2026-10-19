@@ -985,6 +985,24 @@
    "target_schema": "agent",
    "note": "Agent state: the supervisor's task record (one tree per request)."
   },
+  "agent.market_events": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state: market changes the market news watch confirmed from public news (no client data)."
+  },
+  "agent.market_news_items": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state: news items the market news watch read, once each (link, title, date)."
+  },
+  "agent.market_news_requests": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "agent",
+   "note": "Agent state: dated news searches other agents asked the market news watch for."
+  },
   "agent.tool_calls": {
    "kind": "table",
    "layer": "ops",
@@ -1170,6 +1188,12 @@
    "layer": "consumer",
    "target_schema": "agent",
    "note": "Account-scoped facade the agents read."
+  },
+  "agent.market_events_feed": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Facade the agents read market events through (public news, no account scope)."
   },
   "agent.platform_subjects": {
    "kind": "view",

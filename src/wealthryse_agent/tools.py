@@ -1564,6 +1564,46 @@ def get_guide_conformance(connection, arguments: Mapping[str, Any]) -> dict[str,
                           _citation("metrics_guide", None, version=data["reference_version"])]}
 
 
+MARKET_EVENTS_SETTING = "AGENT_MARKET_EVENTS"
+MARKET_EVENT_SPAN_DAYS = 120
+
+
+def market_events_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """AGENT_MARKET_EVENTS=on shows get_market_events; anything else, or nothing, hides it."""
+    import os
+
+    environ = os.environ if environ is None else environ
+    return str(environ.get(MARKET_EVENTS_SETTING, "")).strip().lower() in ("on", "true", "1", "yes")
+
+
+def get_market_events(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Market changes the market news watch confirmed from the news, by the day they take effect.
+
+    Public news only: no account is involved, so every caller sees the same events.
+    """
+    end = _day(arguments["to_date"], "to_date") if arguments.get("to_date") else date.today().isoformat()
+    start = (_day(arguments["from_date"], "from_date") if arguments.get("from_date")
+             else (date.fromisoformat(end) - timedelta(days=30)).isoformat())
+    if start > end or (date.fromisoformat(end) - date.fromisoformat(start)).days > MARKET_EVENT_SPAN_DAYS:
+        raise ToolError("invalid_arguments", f"from_date must be on or before to_date, at most "
+                        f"{MARKET_EVENT_SPAN_DAYS} days apart.", 400)
+    market = str(arguments.get("market") or "").upper()
+    if market and not (len(market) == 4 and market.isalpha()):
+        raise ToolError("invalid_arguments", "market must be a four-letter market code such as XKRX.", 400)
+    rows = connection.execute(
+        "SELECT event_id, market, kind, effective_date, end_date, summary, quote, source_url, source_id, official, "
+        "published_at FROM market_events_feed WHERE COALESCE(end_date, effective_date) >= ?::date "
+        "AND effective_date <= ?::date AND (? = '' OR market = ?) ORDER BY effective_date, market LIMIT 200",
+        (start, end, market, market)).fetchall()
+    events = [{key: row[key] for key in ("event_id", "market", "kind", "effective_date", "end_date", "summary",
+                                          "quote", "source_url", "source_id", "official", "published_at")}
+              for row in rows]
+    return {"as_of": end, "data": {"from_date": start, "to_date": end, "market": market or None, "events": events},
+            "citations": [_citation("market_events", None, from_date=start, to_date=end,
+                                    url=e["source_url"]) for e in events[:20]] or
+                         [_citation("market_events", None, from_date=start, to_date=end)]}
+
+
 def _schema(properties: Mapping[str, Any], required: list[str]) -> dict[str, Any]:
     return {"type": "object", "properties": dict(properties), "required": required, "additionalProperties": False}
 
@@ -1735,6 +1775,13 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("get_operations_history", "Import runs over the last 14 days and the autonomous administrator's runs "
              "and actions over the last 7 days, newest first.", _schema({}, []), get_operations_history, False,
              only_jobs=OPERATIONS),
+    ToolSpec("get_market_events", "Changes to how a stock market works (trading hours, closing prices, closures, "
+             "halts, price limits, taxes, settlement, index rules), confirmed from the news by the day they take "
+             "effect, with the source sentence and link. Use it when a price, value or cost changes on a day for no "
+             "reason the account's own data shows.",
+             _schema({"market": {"type": "string", "description": "market code, e.g. XKRX, XHKG, XNYS; omit for all"},
+                      "from_date": _DATE, "to_date": _DATE}, []), get_market_events, False,
+             switch=market_events_enabled),
 )
 REGISTRY = {tool.name: tool for tool in TOOLS}
 

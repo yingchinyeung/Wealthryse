@@ -526,6 +526,7 @@ def onboarding(store: Store, tools: ToolClient, usage: dict, correlation_id: str
     from .month_team.agents import TeamModel
     from .month_team.settings import validate_report_model
     from .onboarding_intake import DraftStore, IntakeDrafter, IntakeSettings, draft_waiting_cases
+    from .supervisor.market_news import MarketNewsStore, ask_for_unexplained
     from .onboarding_reconcile import Reconciler, ReconciliationStore, reconcile_waiting_cases
     from .onboarding_review import HistoryReviewer, ReviewSettings, ReviewStore, review_waiting_cases
     from .connection_watch import watch_connections
@@ -552,8 +553,10 @@ def onboarding(store: Store, tools: ToolClient, usage: dict, correlation_id: str
 
     drafted = draft_waiting_cases(DraftStore(store.db, store.tenant_id), tools.call,
                                   IntakeDrafter(intake_settings, model), usage, correlation_id)
-    reconciled = reconcile_waiting_cases(ReconciliationStore(store.db, store.tenant_id), tools.call, Reconciler(model),
-                                         usage, correlation_id)
+    news = MarketNewsStore(store.db, store.tenant_id)
+    asks = (lambda issue, links: ask_for_unexplained(news, issue, links)) if news.ready() else None
+    reconciled = reconcile_waiting_cases(ReconciliationStore(store.db, store.tenant_id), tools.call,
+                                         Reconciler(model, unexplained=asks), usage, correlation_id)
     reviewed = review_waiting_cases(review_store, tools.call, HistoryReviewer(settings, model), usage, correlation_id)
     return drafted + reconciled + reviewed + watched
 

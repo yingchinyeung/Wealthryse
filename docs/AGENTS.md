@@ -878,6 +878,54 @@ with `dispatcherMode=watch` first, then from Tue 17 Nov `dispatcherMode=live` wi
 Mon 30 Nov. Each step is a redeploy of `infra/agent-apps.bicep` with Ying's approval. The undo
 is `dispatcherMode=off` (or `watch`), or `deployDispatcher=false`, which removes the job.
 
+### Market news watch: numbers that don't add up, checked against the news (off)
+
+Ying asked on 19 Oct that the supervisor team watch the world's stock markets and relate numbers
+that don't add up to the news. The case it was built on: from 14 Sep 2026 Kiwoom's per-stock prices
+for past days stopped matching the official 15:30 KRX closes, because KRX started continuous
+after-market trading until 20:00 that day. It was found by hand; this finds it on its own.
+
+- **The watch** (`supervisor/market_news.py`, job `ibkrv2stg-agent-market-news`, hourly). A data
+  and operations specialist. It reads the news feeds of each market in `supervisor/markets.py`
+  (exchange and regulator notices, financial news, and a news search in the market's own
+  language), from those hosts only. It starts with the markets the platform holds or compares
+  against: New York, Nasdaq, Hong Kong, Shanghai, Shenzhen, Taiwan and Korea; a test fails if a
+  calendar or benchmark market has no entry. Items that mention hours, closures, taxes, settlement,
+  price limits and the like go to the report model (APAC Data Zone), which says whether the item
+  announces a market change, its kind, market and first day, quoting the sentence that says so.
+  **Code keeps a change only when** the quote is in the article, the day is in the quote (in
+  English, Korean or Chinese forms), the article names the market, and every number in the summary
+  is in the article. Public news only: no client data goes to the model or to any news site.
+- **The link** (`supervisor/news_link.py`, code only). A number that doesn't add up names its
+  markets and the window it began in: from the last day that was right to the first that was
+  wrong. A change explains it when the market matches, the kind can move that kind of number (a
+  valuation gap: hours, closing price, a new venue, a closure; a cost: a tax or fee; a missing
+  price: a closure or halt), and the change takes effect in the window. Same-day matches come
+  first.
+- **Where it is used.**
+  - The onboarding NAV check: a positions-side break that nothing loaded explains gets the cause
+    `market_event` with the change, its source and a sentence like "This starts on 14 Sep 2026,
+    the day of a Korea Exchange change: …". When nothing explains a break, it asks the watch to
+    search that market's news for exactly that window (`agent.market_news_requests`); the next
+    hourly run does, and a new change makes the case be checked again.
+  - Incident diagnosis: the operations agent's sources include the changes from 10 days before
+    an incident began, so a data check that fails on a market change is diagnosed as one.
+  - Chat: `get_market_events` belongs to the holdings and performance specialist, and news,
+    trading-hours and closure questions route to it.
+- **The record.** Items (link, title, date; no text), confirmed changes (with the source sentence)
+  and search requests in `migrations/agent/019_market_news.sql`; each run is one tree in
+  `agent.tasks` (counts and market codes, never text).
+- **Feeds.** Their addresses were written without network access. `python -m
+  wealthryse_agent.supervisor.market_news --probe` reads each once and prints only its status and
+  item count; run it in staging before turning the job on and fix any that fail.
+
+**Turning it on.** Not before the 1 to 7 Nov freeze ends, each step with Ying's approval: rerun
+`scripts/install_agent_schema.py` (applies `019_market_news.sql`); rebuild the agent image; deploy
+`infra/agent-apps.bicep` with `deployMarketNews=true` and `marketNewsMode=watch`, then run the
+probe; after a week of kept changes looks right, `marketEvents=on` (the agents start using them)
+and `marketNewsMode=live` (owner inbox cards). The undo is `marketEvents=off` and
+`deployMarketNews=false`; the tables stay, unread.
+
 ## Cost drivers
 
 - Model tokens: each question is a few model calls, each resending tool
@@ -897,6 +945,8 @@ is `dispatcherMode=off` (or `watch`), or `deployDispatcher=false`, which removes
   model only for a new incident, with its own monthly budget (`opsTokenBudget`).
 - Weekly briefs: one model run per granted account per week, within the
   daily token budget.
+- The market news watch, when deployed: an hourly job that calls the model only for news items
+  that mention a market rule, with its own monthly budget (`marketNewsTokenBudget`).
 - Live market alerts: a short job every 15 minutes in trading hours that
   reads stored rows only and calls the model once per alert (at most one per
   rule, account and day), within the daily token budget.

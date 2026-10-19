@@ -14,6 +14,7 @@ import io
 import math
 import os
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 
 import test_certified_build_db as base
@@ -197,8 +198,11 @@ class ChartsBuildTests(_ChartsDatabase):
         build_id = str(uuid.uuid4())
         with layers._connect(self.database) as owner:
             owner.execute("SELECT set_config('app.tenant_id', %s, false)", (base.TENANT,))
+            # The runs here start at base.NOW, a fixed time. Start this build a day before it, not at the
+            # real clock, so a later test's newest build is still the one its run wrote, whatever the date.
             owner.execute("INSERT INTO gold.certified_builds(tenant_id, build_id, run_kind, started_at, status) "
-                          "VALUES (%s, %s, 'daily', now(), 'shadow')", (base.TENANT, build_id))
+                          "VALUES (%s, %s, 'daily', %s, 'shadow')",
+                          (base.TENANT, build_id, base.NOW - timedelta(days=1)))
             owner.execute(
                 "INSERT INTO gold.certified_figures(tenant_id, build_id, subject_id, figure_id, period, item, "
                 "benchmark_id, as_of_date, value, value_text, unit, currency, status, reason, detail, period_start, "

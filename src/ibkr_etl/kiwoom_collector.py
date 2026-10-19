@@ -41,8 +41,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .kiwoom_client import AccountValuation, CashMovement, Holding, KiwoomClient, KiwoomError, UsValuation, \
-    reconcile_us_valuation, reconcile_valuation
+from .kiwoom_client import MAX_SELLING_COST_RATE, AccountValuation, CashMovement, Holding, KiwoomClient, \
+    KiwoomError, UsValuation, reconcile_us_valuation, reconcile_valuation
 from .security_master import SecurityIdentifier, new_security_key
 
 SWITCH_NAME = "KIWOOM_COLLECTOR_ENABLED"
@@ -176,6 +176,9 @@ def snapshot_rows(account_id: str, day: date, valuation: AccountValuation, us: U
     fx_rates: list[dict[str, Any]] = []
     total_krw = valuation.estimated_assets
     cash_krw = valuation.deposit
+    # Kiwoom's total is after its estimated selling cost; that cost is kept as a negative accrual,
+    # so holdings + cash + accruals add up to Kiwoom's total.
+    accruals_krw = -valuation.selling_cost
     if us is not None:
         for holding in us.holdings:
             add(holding, holding.exchange or "US")
@@ -194,7 +197,7 @@ def snapshot_rows(account_id: str, day: date, valuation: AccountValuation, us: U
             total_krw += (balance.securities_value + balance.deposit) * rate
     nav = [{"account_id": account_id, "snapshot_date": snapshot, "currency": BASE_CURRENCY, "asset_class": "TOTAL",
             "total_text": _text(total_krw), "cash_text": _text(cash_krw), "stock_text": _text(stock_krw),
-            "options_text": "0", "futures_text": "0", "bonds_text": "0", "accruals_text": "0"}]
+            "options_text": "0", "futures_text": "0", "bonds_text": "0", "accruals_text": _text(accruals_krw)}]
     return {"position_snapshots": positions, "cash_snapshots": cash, "nav_snapshots": nav,
             "fx_rates": fx_rates, "instruments": instruments}
 
@@ -460,70 +463,62 @@ def trading_weekdays(start: date, end: date) -> list[date]:
 
 
 def days_with_snapshots(connection, account_id: str, start: date, end: date) -> set[date]:
-    """Stored days whose holdings plus cash equal Kiwoom's total.
+    """Stored days that reconcile on the current basis (holdings + cash + accruals = Kiwoom's total).
 
-    A day stored before cash was kept on a trade-date basis shows a gap on days
-    with unsettled trades; leaving it out here has the history fill it again.
+    A day stored on an earlier basis (cash as the total less the holdings, the
+    selling cost not kept apart) has its KRW cash differ from the settled cash;
+    leaving it out here has the history fill it again.
     """
 
     rows = connection.execute(
-        "SELECT snapshot_date, total_text, cash_text, stock_text FROM nav_snapshots "
-        "WHERE account_id = ? AND asset_class = 'TOTAL' AND snapshot_date BETWEEN ? AND ?",
-        (account_id, start.isoformat(), end.isoformat()),
+        "SELECT n.snapshot_date, n.total_text, n.cash_text, n.stock_text, n.accruals_text, "
+        "c.ending_cash_text, c.settled_cash_text FROM nav_snapshots n LEFT JOIN cash_snapshots c "
+        "ON c.account_id = n.account_id AND c.snapshot_date = n.snapshot_date AND c.currency = ? "
+        "WHERE n.account_id = ? AND n.asset_class = 'TOTAL' AND n.snapshot_date BETWEEN ? AND ?",
+        (BASE_CURRENCY, account_id, start.isoformat(), end.isoformat()),
     ).fetchall()
     return {date.fromisoformat(str(row["snapshot_date"])[:10]) for row in rows
-            if abs(_nav_gap(row)) <= Decimal("1")}
+            if abs(_nav_gap(row)) <= Decimal("1") and row["ending_cash_text"] is not None
+            and row["ending_cash_text"] == row["settled_cash_text"]}
+
+
+def _number(value) -> Decimal:
+    return Decimal(str(value)) if value not in (None, "") else Decimal("0")
 
 
 def _nav_gap(row) -> Decimal:
-    return Decimal(str(row["total_text"])) - Decimal(str(row["cash_text"])) - Decimal(str(row["stock_text"]))
+    return (_number(row["total_text"]) - _number(row["cash_text"]) - _number(row["stock_text"])
+            - _number(row["accruals_text"]))
 
 
 def history_issues(connection, account_id: str, start: date, end: date) -> list[dict[str, str]]:
     """Stored days that do not reconcile, read from the stored rows so earlier runs' days count too.
 
-    Two checks a day, each to 1 KRW:
-    - total: holdings plus cash equal Kiwoom's total;
-    - unsettled: cash not yet settled (ending less settled KRW cash) equals the
-      net cash of Kiwoom's own trades on that day and the trading day before,
-      the two days still to settle. This catches anything else in Kiwoom's
-      total (funds, RP, receivables) that would otherwise pass as cash.
+    Two checks a day:
+    - total: holdings + cash + accruals equal Kiwoom's total, to 1 KRW;
+    - selling_cost: the cost Kiwoom's total leaves out (the negative accrual)
+      is between nothing and MAX_SELLING_COST_RATE of the holdings. Anything
+      else in or missing from Kiwoom's total shows here.
     """
 
-    lead = start - timedelta(days=14)
-    nav = connection.execute(
-        "SELECT snapshot_date, total_text, cash_text, stock_text FROM nav_snapshots "
+    rows = connection.execute(
+        "SELECT snapshot_date, total_text, cash_text, stock_text, accruals_text FROM nav_snapshots "
         "WHERE account_id = ? AND asset_class = 'TOTAL' AND snapshot_date BETWEEN ? AND ? ORDER BY snapshot_date",
-        (account_id, lead.isoformat(), end.isoformat()),
+        (account_id, start.isoformat(), end.isoformat()),
     ).fetchall()
-    cash = {str(row["snapshot_date"])[:10]: row for row in connection.execute(
-        "SELECT snapshot_date, ending_cash_text, settled_cash_text FROM cash_snapshots "
-        "WHERE account_id = ? AND currency = ? AND snapshot_date BETWEEN ? AND ?",
-        (account_id, BASE_CURRENCY, lead.isoformat(), end.isoformat()),
-    ).fetchall()}
-    traded: dict[str, Decimal] = {}
-    for row in connection.execute(
-        "SELECT trade_date, net_cash_text FROM trades WHERE account_id = ? AND currency = ? AND trade_date BETWEEN ? AND ?",
-        (account_id, BASE_CURRENCY, lead.isoformat(), end.isoformat()),
-    ).fetchall():
-        key = str(row["trade_date"])[:10]
-        traded[key] = traded.get(key, Decimal("0")) + Decimal(str(row["net_cash_text"] or "0"))
     issues: list[dict[str, str]] = []
-    previous: str | None = None
-    for row in nav:
+    for row in rows:
         day = str(row["snapshot_date"])[:10]
-        if day >= start.isoformat():
-            gap = _nav_gap(row)
-            if abs(gap) > Decimal("1"):
-                issues.append({"date": day, "check": "total", "gap": _text(gap)})
-            balance = cash.get(day)
-            if balance is not None and balance["settled_cash_text"] is not None:
-                unsettled = Decimal(str(balance["ending_cash_text"])) - Decimal(str(balance["settled_cash_text"]))
-                expected = traded.get(day, Decimal("0")) + (traded.get(previous, Decimal("0")) if previous else Decimal("0"))
-                if abs(unsettled - expected) > Decimal("1"):
-                    issues.append({"date": day, "check": "unsettled", "gap": _text(unsettled - expected),
-                                   "unsettled": _text(unsettled), "trades": _text(expected)})
-        previous = day
+        gap = _nav_gap(row)
+        if abs(gap) > Decimal("1"):
+            issues.append({"date": day, "check": "total", "gap": _text(gap)})
+            continue
+        stock = _number(row["stock_text"])
+        cost = -_number(row["accruals_text"])
+        allowed = stock * MAX_SELLING_COST_RATE
+        if cost < Decimal("-1") or cost > allowed + Decimal("1"):
+            issues.append({"date": day, "check": "selling_cost", "gap": _text(cost),
+                           "share_of_holdings": f"{(cost / stock * 100) if stock else Decimal(0):.4f}%"})
     return issues
 
 
@@ -575,7 +570,7 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
         "from": history_start.isoformat(), "to": end.isoformat(), "loaded_this_run": len(loaded),
         "days_with_history": len(have) + len(loaded), "closed_days": [day.isoformat() for day in closed][:40],
         "days_left": len(remaining), "gap_days": len({gap["date"] for gap in gaps}), "gaps": gaps[:20],
-        "cash_basis": "trade date; settled cash kept as settled_cash_text",
+        "cash_basis": "trade date (ka01690 dbst_bal); Kiwoom's estimated selling cost kept as accruals",
         "us_cash_basis": "settled" if include_us else "not collected",
         "us_holdings_listed_from_first_collected_day": include_us,
     }
@@ -591,7 +586,7 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
                            "the reports."}
     return {"status": "pass", "evidence": evidence,
             "message": f"Daily history from {history_start.isoformat()} is complete: "
-                       f"{len(have) + len(loaded)} trading days, each matching Kiwoom's total and its unsettled trades."}
+                       f"{len(have) + len(loaded)} trading days, each matching Kiwoom's total after its estimated selling cost."}
 
 
 # The daily run ---------------------------------------------------------------------

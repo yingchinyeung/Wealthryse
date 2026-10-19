@@ -141,17 +141,32 @@ class Holding:
         return [self.security]
 
 
+# Kiwoom's totals (kt00004 prsm_dpst_aset_amt, ka01690 day_stk_asst) are after the tax and fee
+# selling every holding would cost: 0.165% of holdings in 2025, 0.215% from 26 Dec 2025 (0.20% tax
+# plus the fee). Up to this share of the holdings is read as that cost; ETFs pay no tax, so less is fine.
+MAX_SELLING_COST_RATE = Decimal("0.0025")
+
+
 @dataclass(frozen=True)
 class AccountValuation:
     account_name: str
-    # Cash after pending trades settle (D+2) when Kiwoom gives it, so a trade
-    # bought today is not counted twice against the estimated assets.
+    # Cash on a trade-date basis: a trade moves it on the trade date.
     deposit: Decimal
+    # Kiwoom's own total, after its estimated selling costs (see MAX_SELLING_COST_RATE).
     estimated_assets: Decimal
     holdings: tuple[Holding, ...]
-    # Cash already settled (D+0), when Kiwoom gives it; deposit minus this is
-    # what the last two trading days' trades still owe or bring.
+    # Cash already settled (D+0), when Kiwoom gives it apart from the deposit.
     settled_deposit: Decimal | None = None
+
+    @property
+    def holdings_value(self) -> Decimal:
+        return sum((item.market_value for item in self.holdings), Decimal("0"))
+
+    @property
+    def selling_cost(self) -> Decimal:
+        """What Kiwoom's total leaves out of holdings plus cash: its estimated cost of selling."""
+
+        return self.holdings_value + self.deposit - self.estimated_assets
 
 
 @dataclass(frozen=True)
@@ -325,11 +340,9 @@ class KiwoomClient:
         Kiwoom answers a closed day with another day's figures, so an answer
         dated differently from the day asked for is read as closed.
 
-        The answer's deposit (dbst_bal) is settled cash; its total counts trades
-        not yet settled (Korea settles two trading days later). So cash on a
-        trade-date basis, as IBKR's ending cash is, is the total less the
-        holdings, and dbst_bal is kept as the settled cash. The collector checks
-        the difference against Kiwoom's own trades of the last two trading days.
+        The deposit (dbst_bal) already moves on the trade date, so it is the
+        day's cash. The total (day_stk_asst) is after Kiwoom's estimated selling
+        costs, so it is a little below holdings plus cash.
         """
 
         pages = self.inquire("ka01690", {"qry_dt": _yyyymmdd(day)})
@@ -351,14 +364,11 @@ class KiwoomClient:
                     price=kiwoom_number(_field(row, "cur_prc"), unsigned=True),
                     market_value=kiwoom_number(_field(row, "evlt_amt")),
                 ))
-        held = tuple(holding for holding in holdings if holding.quantity)
-        total = kiwoom_number(_field(first, "day_stk_asst"))
         return AccountValuation(
             account_name="",
-            deposit=total - sum((holding.market_value for holding in held), Decimal("0")),
-            estimated_assets=total,
-            holdings=held,
-            settled_deposit=kiwoom_number(_field(first, "dbst_bal")),
+            deposit=kiwoom_number(_field(first, "dbst_bal")),
+            estimated_assets=kiwoom_number(_field(first, "day_stk_asst")),
+            holdings=tuple(holding for holding in holdings if holding.quantity),
         )
 
     def transactions(self, start: date, end: date) -> list[CashMovement]:
@@ -451,21 +461,25 @@ class KiwoomClient:
 
 
 def reconcile_valuation(valuation: AccountValuation, *, tolerance: Decimal = Decimal("1")) -> dict[str, object]:
-    """Holdings plus deposit should equal Kiwoom's own estimated assets.
+    """Holdings plus deposit, less Kiwoom's estimated selling cost, should equal Kiwoom's total.
 
-    Returns the check record for ``nav_reconciled``; a gap above the tolerance
-    (KRW) fails instead of being explained away.
+    Returns the check record for ``nav_reconciled``. The cost may be anywhere from
+    nothing to MAX_SELLING_COST_RATE of the holdings; any other gap (KRW) fails
+    instead of being explained away.
     """
 
-    holdings_value = sum((item.market_value for item in valuation.holdings), Decimal("0"))
-    computed = holdings_value + valuation.deposit
-    gap = computed - valuation.estimated_assets
-    status = "pass" if abs(gap) <= tolerance else "fail"
-    message = (
-        f"Holdings plus cash match Kiwoom's total of {valuation.estimated_assets:,} KRW."
-        if status == "pass"
-        else f"Holdings plus cash are {gap:+,} KRW away from Kiwoom's total; the platform will not guess why."
-    )
+    holdings_value = valuation.holdings_value
+    cost = valuation.selling_cost
+    allowed = holdings_value * MAX_SELLING_COST_RATE
+    status = "pass" if -tolerance <= cost <= allowed + tolerance else "fail"
+    if status == "pass":
+        message = (f"Holdings plus cash match Kiwoom's total of {valuation.estimated_assets:,} KRW"
+                   + (f" after its estimated selling cost of {cost:,} KRW." if cost > tolerance else "."))
+    elif cost < 0:
+        message = f"Kiwoom's total is {-cost:,} KRW above holdings plus cash; the platform will not guess why."
+    else:
+        message = (f"Kiwoom's total is {cost:,} KRW below holdings plus cash, more than its selling cost "
+                   f"could be ({allowed:,.0f} KRW); the platform will not guess why.")
     return {
         "status": status,
         "message": message,
@@ -473,7 +487,8 @@ def reconcile_valuation(valuation: AccountValuation, *, tolerance: Decimal = Dec
             "holdings_value": str(holdings_value),
             "deposit": str(valuation.deposit),
             "broker_total": str(valuation.estimated_assets),
-            "gap": str(gap),
+            "selling_cost": str(cost),
+            "gap": str(cost),
             "holdings": len(valuation.holdings),
         },
     }

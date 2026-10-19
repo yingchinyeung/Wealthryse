@@ -48,13 +48,11 @@ class FakeKiwoom:
             raise KiwoomError("Kiwoom refused the call (HTTP 200, code 2): no data before the account opened")
         if day == CLOSED:
             return None
-        # As the client reads ka01690: cash on a trade-date basis is the total less the holdings,
-        # and the settled cash still holds the 6 Jan buy until it settles two trading days later.
-        total = Decimal("8005000") if day == self.off_day else Decimal("8000000")
-        settled = Decimal("7000000") if day in (date(2025, 1, 6), date(2025, 1, 7)) else Decimal("1000000")
-        return AccountValuation("", total - Decimal("7000000"), total, (
-            Holding(SAMSUNG, "삼성전자", Decimal("100"), Decimal("60000"), Decimal("70000"), Decimal("7000000")),),
-            settled_deposit=settled)
+        # As the client reads ka01690: the deposit is the day's cash, and Kiwoom's total is
+        # 11,550 KRW (0.165% of the holdings) below holdings plus cash, its estimated selling cost.
+        total = Decimal("8005000") if day == self.off_day else Decimal("7988450")
+        return AccountValuation("", Decimal("1000000"), total, (
+            Holding(SAMSUNG, "삼성전자", Decimal("100"), Decimal("60000"), Decimal("70000"), Decimal("7000000")),))
 
     def us_valuation(self):
         raise AssertionError("US calls are off in this test")
@@ -204,21 +202,25 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self.assertEqual(days, len(weekdays))  # every weekday but the closed one, plus today
         self.assertEqual(self.db.execute("SELECT total_text FROM nav_snapshots WHERE account_id = ? AND "
                                          "snapshot_date = '2025-06-02'", (account,)).fetchone()["total_text"],
-                         "8000000")
+                         "7988450")
 
         # A finished history is not recorded again on later runs.
         result = self._run({"5234567890": FakeKiwoom()})[0]
         self.assertEqual(result["history"], {"check": "pass", "recorded": False})
 
-        # Settled and trade-date cash are both kept, and they differ while the 6 Jan buy settles.
+        # The deposit is the cash, and the selling cost is kept apart so the day adds up to Kiwoom's total.
+        nav = self.db.execute("SELECT total_text, cash_text, stock_text, accruals_text FROM nav_snapshots "
+                              "WHERE account_id = ? AND snapshot_date = '2025-01-07'", (account,)).fetchone()
+        self.assertEqual((nav["total_text"], nav["cash_text"], nav["stock_text"], nav["accruals_text"]),
+                         ("7988450", "1000000", "7000000", "-11550"))
         cash = self.db.execute("SELECT ending_cash_text, settled_cash_text FROM cash_snapshots "
                                "WHERE account_id = ? AND snapshot_date = '2025-01-07'", (account,)).fetchone()
-        self.assertEqual((cash["ending_cash_text"], cash["settled_cash_text"]), ("1000000", "7000000"))
+        self.assertEqual((cash["ending_cash_text"], cash["settled_cash_text"]), ("1000000", "1000000"))
 
-        # A day stored on the old basis (settled cash as the day's cash) is collected again.
-        self.db.execute("UPDATE nav_snapshots SET cash_text = '7000000' WHERE account_id = ? "
+        # A day stored on the earlier basis (cash as the total less the holdings) is collected again.
+        self.db.execute("UPDATE nav_snapshots SET cash_text = '988450', accruals_text = '0' WHERE account_id = ? "
                         "AND snapshot_date = '2025-01-07'", (account,))
-        self.db.execute("UPDATE cash_snapshots SET ending_cash_text = '7000000' WHERE account_id = ? "
+        self.db.execute("UPDATE cash_snapshots SET ending_cash_text = '988450' WHERE account_id = ? "
                         "AND snapshot_date = '2025-01-07'", (account,))
         self.db.commit()
         again = FakeKiwoom()
@@ -251,9 +253,9 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self.assertEqual(later.asked, [])
         self.assertEqual(result["history"]["check"], "warn")
         check = self._history_check(case_id)
-        # Kiwoom's total is 5,000 KRW above holdings plus settled cash with no trade to settle.
+        # Kiwoom's total is 5,000 KRW above holdings plus cash, which no selling cost explains.
         self.assertEqual(check["evidence_json"]["gaps"], [
-            {"date": "2026-10-05", "check": "unsettled", "gap": "5000", "unsettled": "5000", "trades": "0"}])
+            {"date": "2026-10-05", "check": "selling_cost", "gap": "-5000", "share_of_holdings": "-0.0714%"}])
         self.assertEqual(check["evidence_json"]["gap_days"], 1)
 
     def test_a_history_refusal_fails_the_check_but_keeps_the_day(self):

@@ -179,7 +179,21 @@ class ReconciliationTests(unittest.TestCase):
         fake = FakeKiwoom({"kt00004": [off], "kt00018": [HOLDINGS_PAGE_1, HOLDINGS_PAGE_2]})
         result = reconcile_valuation(_client(fake).valuation())
         self.assertEqual(result["status"], "fail")
-        self.assertIn("-10,000 KRW", result["message"])
+        self.assertIn("10,000 KRW above", result["message"])
+
+    def test_kiwoom_total_after_its_selling_cost_passes(self) -> None:
+        # 0.215% of 1,680,000 KRW of holdings: 0.20% tax plus the fee.
+        net = dict(ACCOUNT, prsm_dpst_aset_amt=f"{2180000 - 3612:015d}")
+        result = reconcile_valuation(_client(FakeKiwoom({"kt00004": [net], "kt00018": [HOLDINGS_PAGE_1,
+                                                                                         HOLDINGS_PAGE_2]})).valuation())
+        self.assertEqual((result["status"], result["evidence"]["selling_cost"]), ("pass", "3612"))
+        self.assertIn("selling cost of 3,612 KRW", result["message"])
+        # More than any selling cost could be is still a gap.
+        far = dict(ACCOUNT, prsm_dpst_aset_amt=f"{2180000 - 5000:015d}")
+        result = reconcile_valuation(_client(FakeKiwoom({"kt00004": [far], "kt00018": [HOLDINGS_PAGE_1,
+                                                                                         HOLDINGS_PAGE_2]})).valuation())
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("more than its selling cost", result["message"])
 
 
 US_HOLDINGS = {"return_code": 0, "crnc_code": "USD", "result_list": [
@@ -215,11 +229,12 @@ class KiwoomPastDayTests(unittest.TestCase):
                          [("005930", Decimal("100"), Decimal("70000"))])
         self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
 
-    def test_a_past_days_cash_is_on_a_trade_date_basis(self) -> None:
-        # A buy not yet settled: dbst_bal still holds the cash, Kiwoom's total does not.
-        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dbst_bal="000000004000000")]})
+    def test_a_past_days_cash_is_the_deposit_and_the_total_is_after_selling_cost(self) -> None:
+        # Kiwoom's total is 11,550 KRW (0.165% of the holdings) below holdings plus the deposit.
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, day_stk_asst="000000007988450")]})
         valuation = _client(fake).balance_on(date(2025, 6, 2))
-        self.assertEqual((valuation.deposit, valuation.settled_deposit), (Decimal("1000000"), Decimal("4000000")))
+        self.assertEqual((valuation.deposit, valuation.settled_deposit), (Decimal("1000000"), None))
+        self.assertEqual(valuation.selling_cost, Decimal("11550"))
         self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
 
     def test_a_closed_day_is_none(self) -> None:

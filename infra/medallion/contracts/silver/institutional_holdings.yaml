@@ -1,0 +1,284 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.institutional_holdings
+name: institutional_holdings
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'SEC EDGAR 13F-HR holdings of a reviewed list of large US filers, one row per filer, quarter, CUSIP,
+    put/call and accession (docs/PHASE3_DATA_MACRO_13F.md). Raw filings: bronze-market-data sec-13f/. Loaded by
+    ibkrv2stg-institutional-holdings, which does nothing unless INSTITUTIONAL_HOLDINGS_LOAD=on.'
+tags:
+- silver
+- market-data
+schema:
+- name: institutional_holdings
+  physicalName: silver.institutional_holdings
+  physicalType: table
+  logicalType: object
+  description: 13F-HR holdings of large US filers, one row per filer, quarter, CUSIP, put/call and accession; readers
+    take each filer's latest accession for a quarter. Written by the institutional-holdings job (docs/PHASE3_DATA_MACRO_13F.md).
+  dataGranularityDescription: One row per tenant_id, filer_cik, period, cusip, put_call and accession.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: filer_cik
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: The filer's SEC CIK, 10 digits, zero padded.
+    quality:
+    - name: filer_cik_is_ten_digits
+      description: filer_cik is the 10-digit, zero-padded SEC CIK (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE filer_cik !~ '^[0-9]{10}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: filer_name
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The filer's name as SEC EDGAR has it.
+  - name: period
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: internal
+    description: The quarter-end date the filing reports (yyyy-MM-dd).
+    quality:
+    - name: period_is_quarter_end
+      description: period is a quarter-end date (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE period !~ '^[0-9]{4}-(03-31|06-30|09-30|12-31)$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: cusip
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: internal
+    description: 'CUSIP of the security, 9 characters, upper case. Our instruments map through instruments.isin:
+      for a US ISIN, cusip = isin[2:11].'
+    quality:
+    - name: cusip_is_nine_characters
+      description: cusip is 9 upper-case letters or digits (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE cusip !~ '^[0-9A-Z]{9}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: issuer
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Name of the issuer as the filing gives it.
+  - name: shares
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Shares (SH) or principal amount (PRN) held, summed over the filing's lines for the CUSIP and put/call.
+    quality:
+    - name: shares_not_negative
+      description: 'shares is not negative: 13F reports long positions (a CHECK constraint).'
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE shares < 0
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: shares_type
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: SH (shares) or PRN (principal amount).
+    quality:
+    - name: shares_type_allowed_values
+      description: shares_type is SH or PRN (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE shares_type NOT IN ('SH', 'PRN')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: value_usd
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: 'Market value in US dollars. Filings made before 3 Jan 2023 report thousands of dollars: multiplied
+      by 1000.'
+    quality:
+    - name: value_usd_not_negative
+      description: value_usd is not negative (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE value_usd < 0
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: put_call
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 5
+    classification: internal
+    description: Empty for the security itself, PUT or CALL for options on it.
+    quality:
+    - name: put_call_allowed_values
+      description: put_call is empty, PUT or CALL (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE put_call NOT IN ('', 'PUT', 'CALL')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: accession
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 6
+    classification: internal
+    description: The filing's SEC accession number (0000000000-00-000000).
+    quality:
+    - name: accession_format
+      description: accession is an SEC accession number, 0000000000-00-000000 (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE accession !~ '^[0-9]{10}-[0-9]{2}-[0-9]{6}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: filed_at
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The date SEC EDGAR accepted the filing (yyyy-MM-dd).
+    quality:
+    - name: filed_at_is_iso_date
+      description: filed_at is an ISO date (yyyy-MM-dd) (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE filed_at !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: fetched_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) the row was last written.
+    quality:
+    - name: fetched_at_is_iso_timestamp
+      description: fetched_at is an ISO 8601 timestamp (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE fetched_at !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  quality:
+  - name: filed_after_the_quarter
+    description: A 13F report is filed after the quarter it reports ends.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.institutional_holdings WHERE filed_at <= period
+    mustBe: 0
+    severity: error
+    dimension: consistency
+  - name: one_filing_date_per_accession
+    description: Every row of one accession carries the same filer, quarter and filing date, as the loader writes
+      a filing whole.
+    type: sql
+    query: SELECT COUNT(*) FROM (SELECT accession FROM silver.institutional_holdings GROUP BY accession HAVING COUNT(DISTINCT
+      (filer_cik, period, filed_at)) > 1) AS mixed
+    mustBe: 0
+    severity: error
+    dimension: consistency
+slaDefaultElement: institutional_holdings.period
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: institutional_holdings.period
+- property: timeOfAvailability
+  value: 23:30+00:00
+  element: institutional_holdings.period
+  driver: operational
+- property: latency
+  value: 150
+  unit: d
+  element: institutional_holdings.period
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: market-data
+- property: catalogNote
+  value: 'SEC EDGAR 13F-HR holdings of a reviewed list of large US filers, one row per filer, quarter, CUSIP, put/call
+    and accession (docs/PHASE3_DATA_MACRO_13F.md). Raw filings: bronze-market-data sec-13f/. Loaded by ibkrv2stg-institutional-holdings,
+    which does nothing unless INSTITUTIONAL_HOLDINGS_LOAD=on.'
+- property: consumers
+  value:
+  - ibkr_etl.layer_freshness
+  - ibkr_etl.sec_13f
+- property: producers
+  value:
+  - ibkr_etl.sec_13f
+- property: freshnessCheck
+  value:
+    checkId: silver.institutional_holdings
+    measure: as_of_date
+    required: false
+    query: SELECT MAX(period) AS observed FROM institutional_holdings
+    source: ibkr_etl.layer_freshness.RULES
+contractCreatedTs: '2026-10-18T00:00:00Z'

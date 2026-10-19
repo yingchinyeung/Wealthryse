@@ -1,0 +1,224 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.macro_series
+name: macro_series
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Daily macro series (FRED Treasury yields, broad dollar and Brent; Yahoo USD/CNH), every vintage kept
+    (docs/PHASE3_DATA_MACRO_13F.md). Raw responses: bronze-market-data fred-series/ and yahoo-chart/. Loaded by
+    ibkrv2stg-macro-series, which does nothing unless MACRO_SERIES_LOAD=on.'
+tags:
+- silver
+- market-data
+schema:
+- name: macro_series
+  physicalName: silver.macro_series
+  physicalType: table
+  logicalType: object
+  description: Daily macro series (FRED and Yahoo USD/CNH), every vintage kept; readers take the latest vintage
+    per date. Written by the macro-series job (docs/PHASE3_DATA_MACRO_13F.md).
+  dataGranularityDescription: One row per tenant_id, series_id, observation_date and vintage.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: series_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: FRED id as FRED names it (DGS10, DGS2, DTWEXBGS, DCOILBRENTEU, VIXCLS once licensed) or USDCNH
+      (Yahoo CNH=X).
+    quality:
+    - name: series_id_is_reviewed
+      description: series_id is one of the reviewed series; ICE BofA (BAML) series are never kept.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.macro_series WHERE series_id NOT IN ('DGS10', 'DGS2', 'DTWEXBGS', 'DCOILBRENTEU',
+        'VIXCLS', 'USDCNH')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: observation_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: internal
+    description: Date of the observation (yyyy-MM-dd), as the source dates it.
+    quality:
+    - name: observation_date_is_iso_date
+      description: observation_date is an ISO date (yyyy-MM-dd) (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.macro_series WHERE observation_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: value
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: 'The observation in units: yields in percent as published (4.25 is 4.25%), index levels, US dollars
+      per barrel, offshore renminbi per US dollar.'
+    quality:
+    - name: value_in_unit_range
+      description: 'value is in its unit''s plausible range, as the loader checks before it writes: percent above
+        -5 and at most 30, index and US dollars per barrel above 0 and at most 1000, renminbi per US dollar above
+        1 and at most 20.'
+      type: sql
+      query: SELECT COUNT(*) FROM silver.macro_series WHERE (units = 'percent' AND (value <= -5 OR value > 30))
+        OR (units IN ('index', 'usd_per_barrel') AND (value <= 0 OR value > 1000)) OR (units = 'cnh_per_usd' AND
+        (value <= 1 OR value > 20))
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: units
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: percent, index, usd_per_barrel or cnh_per_usd.
+    quality:
+    - name: units_allowed_values
+      description: units is one of percent, index, usd_per_barrel, cnh_per_usd (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.macro_series WHERE units NOT IN ('percent', 'index', 'usd_per_barrel',
+        'cnh_per_usd')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: source
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: fred (keyless CSV download) or yahoo-chart.
+    quality:
+    - name: source_allowed_values
+      description: source is fred or yahoo-chart (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.macro_series WHERE source NOT IN ('fred', 'yahoo-chart')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: vintage
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: internal
+    description: UTC date (yyyy-MM-dd) the value was fetched. A revised value gets a new vintage; an unchanged one
+      is not stored again.
+    quality:
+    - name: vintage_is_iso_date
+      description: vintage is an ISO date (yyyy-MM-dd) (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.macro_series WHERE vintage !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: fetched_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) the row was last written.
+    quality:
+    - name: fetched_at_is_iso_timestamp
+      description: fetched_at is an ISO 8601 timestamp (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.macro_series WHERE fetched_at !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  quality:
+  - name: series_units_and_source_match
+    description: 'Each series has its own unit and source: the Treasury yields in percent, the dollar index and
+      VIX as index, Brent in US dollars per barrel, all from FRED, and USDCNH in renminbi per US dollar from yahoo-chart.'
+    type: sql
+    query: SELECT COUNT(*) FROM silver.macro_series WHERE (series_id IN ('DGS10', 'DGS2') AND units <> 'percent')
+      OR (series_id IN ('DTWEXBGS', 'VIXCLS') AND units <> 'index') OR (series_id = 'DCOILBRENTEU' AND units <>
+      'usd_per_barrel') OR (series_id = 'USDCNH' AND (units <> 'cnh_per_usd' OR source <> 'yahoo-chart')) OR (series_id
+      <> 'USDCNH' AND source <> 'fred')
+    mustBe: 0
+    severity: error
+    dimension: consistency
+  - name: vintage_not_before_observation
+    description: A value is fetched on or after the day it describes.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.macro_series WHERE vintage < observation_date
+    mustBe: 0
+    severity: error
+    dimension: consistency
+slaDefaultElement: macro_series.observation_date
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: macro_series.observation_date
+- property: timeOfAvailability
+  value: 23:30+00:00
+  element: macro_series.observation_date
+  driver: operational
+- property: latency
+  value: 4
+  unit: d
+  element: macro_series.observation_date
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: market-data
+- property: catalogNote
+  value: 'Daily macro series (FRED Treasury yields, broad dollar and Brent; Yahoo USD/CNH), every vintage kept (docs/PHASE3_DATA_MACRO_13F.md).
+    Raw responses: bronze-market-data fred-series/ and yahoo-chart/. Loaded by ibkrv2stg-macro-series, which does
+    nothing unless MACRO_SERIES_LOAD=on.'
+- property: consumers
+  value:
+  - ibkr_etl.layer_freshness
+  - ibkr_etl.macro_series
+- property: producers
+  value:
+  - ibkr_etl.macro_series
+- property: freshnessCheck
+  value:
+    checkId: silver.macro_series
+    measure: as_of_date
+    required: false
+    query: SELECT MAX(observation_date) AS observed FROM macro_series
+    source: ibkr_etl.layer_freshness.RULES
+contractCreatedTs: '2026-10-18T00:00:00Z'

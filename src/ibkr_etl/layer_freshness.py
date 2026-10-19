@@ -87,6 +87,9 @@ RULES: tuple[Rule, ...] = (
     _feed("hkma-hibor", time(23, 30), required=False),
     _feed("hkab-hibor", time(23, 30), required=False),
     _feed("yahoo-chart", time(9, 30), required=False),
+    # The macro-series job (22:30, off unless MACRO_SERIES_LOAD=on; docs/PHASE3_DATA_MACRO_13F.md).
+    # sec-13f has no daily rule: 13F filings come quarterly and each is filed once under history/.
+    _feed("fred-series", time(23, 30), required=False),
     # Silver.
     Rule("silver.nav_snapshots", "silver", "public.nav_snapshots", AS_OF, time(9, 30),
          timedelta(days=4), query="SELECT MAX(snapshot_date) AS observed FROM nav_snapshots"),
@@ -102,6 +105,14 @@ RULES: tuple[Rule, ...] = (
          timedelta(hours=6),
          query="SELECT MAX(fetched_at) AS observed FROM risk_free_rates "
                "WHERE currency = 'USD' AND quality_status <> 'fail'"),
+    # Phase 3 (docs/PHASE3_DATA_MACRO_13F.md): held migrations create these tables, and their jobs are
+    # off, so they are not checked until the table exists and never raised as incidents.
+    Rule("silver.macro_series", "silver", "public.macro_series", AS_OF, time(23, 30), timedelta(days=4),
+         query="SELECT MAX(observation_date) AS observed FROM macro_series", required=False, held=True),
+    # 13F reports come 45 days after each quarter end, loaded on the 20th of Feb, May, Aug and Nov.
+    Rule("silver.institutional_holdings", "silver", "public.institutional_holdings", AS_OF, time(23, 30),
+         timedelta(days=150),
+         query="SELECT MAX(period) AS observed FROM institutional_holdings", required=False, held=True),
     # Gold.
     Rule("gold.risk_analytics_snapshots", "gold", "public.risk_analytics_snapshots", AS_OF,
          time(10, 0), timedelta(days=4),

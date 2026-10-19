@@ -1,0 +1,22 @@
+{
+ "status": "STARTER LIST, NOT REVIEWED. The job refuses to run (exit 78) until this file says \"reviewed\": true.",
+ "purpose": "The SEC EDGAR 13F-HR filers whose holdings the institutional-holdings job loads (src/ibkr_etl/sec_13f.py, docs/PHASE3_DATA_MACRO_13F.md).",
+ "target": "The 50 largest US 13F filers by reported value. This starter list has 12 and needs review: check every CIK and name on EDGAR (https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=<cik>&type=13F-HR), complete the list to 50 from the latest quarter's filings, then set reviewed, reviewed_by and reviewed_on.",
+ "reviewed": false,
+ "reviewed_by": null,
+ "reviewed_on": null,
+ "filers": [
+  {"cik": "0000102909", "name": "Vanguard Group Inc"},
+  {"cik": "0001364742", "name": "BlackRock Inc.", "check": "BlackRock reorganised under a new holding company in 2024; confirm which CIK files its 13F-HR now."},
+  {"cik": "0000093751", "name": "State Street Corp"},
+  {"cik": "0000315066", "name": "FMR LLC"},
+  {"cik": "0000895421", "name": "Morgan Stanley"},
+  {"cik": "0000019617", "name": "JPMorgan Chase & Co"},
+  {"cik": "0000886982", "name": "Goldman Sachs Group Inc"},
+  {"cik": "0000070858", "name": "Bank of America Corp"},
+  {"cik": "0001214717", "name": "Geode Capital Management, LLC"},
+  {"cik": "0000073124", "name": "Northern Trust Corp"},
+  {"cik": "0000080255", "name": "T. Rowe Price Associates, Inc."},
+  {"cik": "0001067983", "name": "Berkshire Hathaway Inc"}
+ ]
+}

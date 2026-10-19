@@ -420,6 +420,14 @@
    "target_schema": "public",
    "note": "Load log for bronze batches (raw_sha256, raw_path)."
   },
+  "public.institutional_holdings": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "SEC EDGAR 13F-HR holdings of a reviewed list of large US filers, one row per filer, quarter, CUSIP, put/call and accession (docs/PHASE3_DATA_MACRO_13F.md). Raw filings: bronze-market-data sec-13f/. Loaded by ibkrv2stg-institutional-holdings, which does nothing unless INSTITUTIONAL_HOLDINGS_LOAD=on.",
+   "source": "market-data",
+   "held": "infra/medallion/drafts/institutional_holdings.sql"
+  },
   "public.institutional_shadow_reconciliations": {
    "kind": "table",
    "layer": "ops",
@@ -502,6 +510,14 @@
    "layer": "bronze",
    "target_schema": "bronze",
    "note": "Raw TWS API snapshots with a retention period. Flex stays the book of record."
+  },
+  "public.macro_series": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "Daily macro series (FRED Treasury yields, broad dollar and Brent; Yahoo USD/CNH), every vintage kept (docs/PHASE3_DATA_MACRO_13F.md). Raw responses: bronze-market-data fred-series/ and yahoo-chart/. Loaded by ibkrv2stg-macro-series, which does nothing unless MACRO_SERIES_LOAD=on.",
+   "source": "market-data",
+   "held": "infra/medallion/drafts/macro_series.sql"
   },
   "public.market_data_prices": {
    "kind": "table",
@@ -1699,6 +1715,14 @@
    "schedule": "08:20 UTC",
    "note": "v2's own Flex pull into ibkr-raw, then the loader."
   },
+  "ibkrv2stg-institutional-holdings": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "22:45 UTC on the 20th of Feb, May, Aug and Nov",
+   "note": "SEC EDGAR 13F-HR information tables into silver institutional_holdings, each raw filing to bronze-market-data sec-13f/ first (docs/PHASE3_DATA_MACRO_13F.md). Does nothing unless INSTITUTIONAL_HOLDINGS_LOAD=on; refuses to run without SEC_USER_AGENT or a reviewed filer list."
+  },
   "ibkrv2stg-institutional-shadow": {
    "hops": [
     "ops"
@@ -1710,6 +1734,14 @@
     "publish"
    ],
    "schedule": "manual"
+  },
+  "ibkrv2stg-macro-series": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "22:30 UTC",
+   "note": "FRED CSV series and Yahoo USD/CNH into silver macro_series, each raw response to bronze-market-data first (docs/PHASE3_DATA_MACRO_13F.md). Does nothing unless MACRO_SERIES_LOAD=on."
   },
   "ibkrv2stg-month-end-factsheet": {
    "hops": [

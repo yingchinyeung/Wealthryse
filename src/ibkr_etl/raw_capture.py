@@ -66,6 +66,8 @@ FEEDS = frozenset({
     "hkma-hibor",  # HKMA HIBOR fixing pages (HTTP JSON)
     "hkab-hibor",  # HKAB dated HIBOR fallback (HTTP JSON)
     "kenneth-french",  # Kenneth French daily factor files behind factor_returns (HTTP zip)
+    "fred-series",  # FRED keyless CSV downloads of public-domain macro series (macro_series.py)
+    "sec-13f",  # SEC EDGAR 13F-HR filings: submissions, filing index, cover page, information table
 })
 # The licence recorded on each capture of a feed (blob metadata dataLicense). A feed not listed
 # records none on its files; its job carries the dataLicense tag (Yahoo: yfinance-internal-only).
@@ -226,8 +228,10 @@ class RawCapture:
     def http(self, feed: str, provider: str, *, url: str, body: bytes, key: str,
              status: int | None = None, content_type: str | None = None,
              extension: str | None = None, requested_at: datetime | None = None,
-             history: bool = False) -> str | None:
-        """An HTTP response body exactly as received, with its status and URL."""
+             history: bool = False,
+             licence: str | None = None) -> str | None:
+        """An HTTP response body exactly as received, with its status and URL (and the licence
+        the data is kept under, when the caller names one)."""
         if not self._open():
             return None
         try:
@@ -241,7 +245,8 @@ class RawCapture:
                 content_type or _CONTENT_TYPES.get(extension, "application/octet-stream"),
                 key, requested_at, history,
                 {"source_url": safe_url(url), "http_status": "" if status is None else status,
-                 "content_format": "http-body"},
+                 "content_format": "http-body",
+                 "dataLicense": licence},
             )
         except Exception as error:  # noqa: BLE001 - capture must never fail the fetch
             self._item_failed(feed, error)

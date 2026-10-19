@@ -180,14 +180,17 @@ class CatalogCoverageTests(unittest.TestCase):
         pass_plan = layer_quality.plan({layer_quality.CONTRACTS_DIR_ENV: str(CONTRACTS)})
         self.assertIsNone(pass_plan.contracts_error)
         # 46 contracts and 240 rules: the quant analytics table adds 9 rules, its two Desk views none.
-        # Phase 3 part A adds 2 contracts and 9 rules (daily_volumes 3, factor_returns 6).
-        self.assertEqual(len(pass_plan.contracts), 48)
-        self.assertEqual(len(pass_plan.rules), 249)
-        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 249)
+        # Phase 3 adds 4 contracts and 30 rules: daily_volumes 3, factor_returns 6 (part A),
+        # macro_series 9 and institutional_holdings 12 (part B).
+        self.assertEqual(len(pass_plan.contracts), 50)
+        self.assertEqual(len(pass_plan.rules), 270)
+        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 270)
         self.assertEqual(sum(r.needs_rls_bypass for r in pass_plan.rules), 13)
         self.assertIn("silver.nav_snapshots_history", pass_plan.held)
         self.assertIn("public.silver_history_settings", pass_plan.held)
         self.assertIn("gold.quant_analytics_snapshots", pass_plan.held)
+        self.assertIn("silver.macro_series", pass_plan.held)
+        self.assertIn("silver.institutional_holdings", pass_plan.held)
         self.assertEqual(layer_quality.rule_check_id("silver.nav_snapshots", "total_text_is_decimal"),
                          "rule.silver.nav_snapshots.total_text_is_decimal")
         gate = {"rule.silver.nav_snapshots.total_text_is_decimal"}

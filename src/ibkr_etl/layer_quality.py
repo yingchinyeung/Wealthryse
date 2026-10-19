@@ -221,6 +221,10 @@ VOLUMES: tuple[Volume, ...] = (
     Volume("daily_volumes", "silver", "price_date", held=True),
     # Factor returns arrive a month at a time, with new vintages for old dates: recorded, not judged.
     Volume("factor_returns", "silver", "return_date", judged=False, held=True),
+    # Phase 3 (docs/PHASE3_DATA_MACRO_13F.md), held until their day. Recorded, not judged: macro series
+    # publish on their own calendars and lags, and 13F holdings all fall on quarter ends.
+    Volume("macro_series", "silver", "observation_date", judged=False, held=True),
+    Volume("institutional_holdings", "silver", "period", judged=False, held=True),
     # Certified figures (U5): builds and figures are append-only, so neither may shrink.
     Volume("certified_builds", "gold", count_column="build_id"),
     Volume("certified_figures", "gold", count_column="build_id"),

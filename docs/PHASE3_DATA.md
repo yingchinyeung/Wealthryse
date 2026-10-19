@@ -5,6 +5,9 @@ below: what it captures, its licence, its held migration and its day, how to swi
 to undo it. The gold sections read these tables through `src/ibkr_etl/market_inputs.py`, which is
 not part of this change.
 
+This file covers daily volumes and factor returns. Macro series and 13F fund holdings, built the
+same way, are in `docs/PHASE3_DATA_MACRO_13F.md`.
+
 Everything here is **off**. Each table comes from a held migration that no bootstrap or job
 applies. Each job does nothing unless its setting is `on`, and its Bicep deploys with the setting
 `off`. Nothing changes live until the switch-on steps below. The columns are the fixed phase 3

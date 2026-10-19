@@ -822,7 +822,10 @@ def list_month_end_packages(connection, arguments: Mapping[str, Any]) -> dict[st
 
 
 def list_onboarding_report_cases(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
-    """Composite cases in stage 3 whose historical reports are rendered, with the files to review."""
+    """Stage 3 cases whose historical reports are rendered, with the files to review.
+
+    A composite in the Alpha World MS or T design (report_style set), or any case in its owner's own design
+    (report_style null, such as a Kiwoom account); agent.onboarding_report_cases decides which (019)."""
     rows = connection.execute(
         "SELECT case_id::text AS case_id, subject_id, display_name, description, report_style, reporting_currency, "
         "history_start_date, reports_evidence_json, reports_checked_at FROM onboarding_report_cases ORDER BY case_id"
@@ -1616,7 +1619,7 @@ TOOLS: tuple[ToolSpec, ...] = (
              get_month_end_snapshot, only_jobs=MONTH_TEAM),
     ToolSpec("list_month_end_packages", "Every month with a built month-end package, and each file's status.",
              _schema({"account_id": _ACCOUNT}, ["account_id"]), list_month_end_packages, only_jobs=MONTH_TEAM),
-    ToolSpec("list_onboarding_report_cases", "Composite onboarding cases whose historical reports are rendered and "
+    ToolSpec("list_onboarding_report_cases", "Onboarding cases whose historical reports are rendered and "
              "waiting for the agent review, with each report's month, file, hash and private storage path.",
              _schema({}, []), list_onboarding_report_cases, False, only_jobs=ONBOARDING),
     ToolSpec("list_onboarding_intake_cases", "Onboarding cases waiting for approval 1 (the account terms), with "

@@ -226,6 +226,68 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("visual QA did not look at the pages", review.summary)
 
 
+KIWOOM = "Kiwoom Korea Equity"  # synthetic
+
+
+def designed_factsheet(lines: list[str], pages: int = 1) -> bytes:
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer)
+    for _ in range(pages):
+        for row, text in enumerate(lines):
+            pdf.drawString(72, 760 - row * 20, text)
+        pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
+
+
+def designed_case(files: Files) -> dict:
+    """A broker account in its owner's own design: report_style is null and the design is the submitted one."""
+    return {"case_id": "aaaaaaaa-0000-4000-8000-0000000000k1", "subject_id": "KIWOOM-0000000001",
+            "display_name": KIWOOM, "description": None, "report_style": None, "reporting_currency": "KRW",
+            "history_start_date": "2025-03-21",
+            "reports_rendered": {"design": {"title": "Korea monthly", "draft_id": "d", "version": 1,
+                                            "spec_sha256": "0" * 64},
+                                 "template_version": "spec:" + "0" * 64, "reports": list(files.reports),
+                                 "waiting_for": None}}
+
+
+class DesignedReviewTests(unittest.TestCase):
+    def test_an_owner_design_passes_on_any_page_count_and_date_form_with_the_standard_checklist(self):
+        files = Files()
+        files.add("2025-03-31", "factsheet", designed_factsheet([KIWOOM, "31 March 2025", "Holdings"], pages=3))
+        files.add("2025-04-30", "factsheet", designed_factsheet([KIWOOM, "2025-04-30"]))
+        team_model, responses = model()
+        review = reviewer(files, team_model).review(designed_case(files))
+        self.assertEqual(review.findings, [])
+        self.assertEqual(review.outcome, "pass", review.summary)
+        self.assertIn("in the owner's Korea monthly design", review.summary)
+        self.assertNotIn("Alpha World owner template", responses.calls[0]["input"][0]["content"][0]["text"])
+
+    def test_layout_points_in_an_owner_design_warn_and_never_block(self):
+        files = Files()
+        files.add("2025-03-31", "factsheet", designed_factsheet(["Another name", "No date here"]))
+        team_model, _ = model([finding(1, "high")])
+        review = reviewer(files, team_model).review(designed_case(files))
+        self.assertEqual(review.outcome, "warn", review.summary)
+        self.assertEqual({f["severity"] for f in review.findings}, {"medium"})
+        messages = {f["message"] for f in review.findings}
+        self.assertIn(f"Page 1 does not print the account's name ({KIWOOM}).", messages)
+        self.assertIn("No page shows the report month March 2025.", messages)
+
+    def test_a_missing_month_a_changed_file_or_commentary_still_fails_an_owner_design(self):
+        files = Files()
+        files.add("2025-03-31", "factsheet", designed_factsheet([KIWOOM, "March 2025"]))
+        files.add("2025-05-31", "factsheet", designed_factsheet([KIWOOM, "May 2025", "Portfolio analyst: up."]))
+        files.blobs[files.reports[0]["output_reference"].partition("/")[2]] += b"tampered"
+        team_model, _ = model()
+        review = reviewer(files, team_model).review(designed_case(files))
+        self.assertEqual(review.outcome, "fail")
+        messages = {f["message"] for f in review.findings if f["severity"] == "high"}
+        self.assertIn("1 month(s) between March 2025 and May 2025 have no reports.", messages)
+        self.assertIn("The stored file does not match the hash recorded when it was built.", messages)
+        self.assertIn("Page 1 prints commentary; the factsheet never carries commentary.", messages)
+
+
 class FakeStore:
     def __init__(self):
         self.saved = {}

@@ -1,4 +1,4 @@
-"""The history reviewer: the onboarding agent that reads a new composite's past reports before go-live.
+"""The history reviewer: the onboarding agent that reads a new case's past reports before go-live.
 
 Stage 3 of an onboarding case renders a factsheet for every month since the
 composite's inception, in the Alpha World MS or T design under the
@@ -13,6 +13,13 @@ month-end team reads each month's package:
     from the reference design;
   - visual QA looks at every factsheet page with the Alpha World layout's
     checklist, on the APAC report deployment.
+
+A case in its owner's own design (a broker account such as Kiwoom, a filtered
+portfolio, or a composite with no built-in design; ibkr_etl.designed_reports)
+gets the same coverage and hash checks. Its design is the owner's, so the
+page count, name, date and visual points that depend on the layout are
+warnings the owner reads and acknowledges at approval 2, never a block, and
+the reference-design text check does not apply.
 
 Per-account decks are no longer built (Ying, 14 October 2026): a deck listed
 in older evidence is not read.
@@ -131,6 +138,33 @@ def coverage_findings(reports: Sequence[Mapping[str, Any]]) -> list[dict[str, An
     return findings
 
 
+def date_forms(period_end: str) -> tuple[str, ...]:
+    """The ways an owner's design may print the report date or month."""
+    day = date.fromisoformat(period_end)
+    return (header_date(period_end), f"{day.day} {day:%B} {day.year}", f"{day:%B} {day.day}, {day.year}",
+            day.isoformat(), f"{day:%d/%m/%Y}", f"{day:%Y/%m/%d}", f"{day:%Y.%m.%d}", month_label(period_end),
+            f"{day:%b} {day.year}", f"{day:%b}-{day:%y}", f"{day.year}년 {day.month}월")
+
+
+def designed_factsheet_findings(pages: Sequence[str], *, period_end: str, display_name: str) -> list[dict]:
+    """A factsheet in the owner's own design: only what holds for every design blocks."""
+    findings = []
+    flat = [_flat(page) for page in pages]
+    if not flat or not any(flat):
+        return [_finding("high", period_end, "factsheet", "The factsheet has no readable page.")]
+    if _flat(display_name) not in flat[0]:
+        findings.append(_finding("medium", period_end, "factsheet",
+                                 f"Page 1 does not print the account's name ({display_name}).", 1))
+    if not any(form in text for text in flat for form in date_forms(period_end)):
+        findings.append(_finding("medium", period_end, "factsheet",
+                                 f"No page shows the report month {month_label(period_end)}."))
+    for number, text in enumerate(flat, 1):
+        if COMMENTARY_PREFIX in text:
+            findings.append(_finding("high", period_end, "factsheet", (
+                f"Page {number} prints commentary; the factsheet never carries commentary."), number))
+    return findings
+
+
 def factsheet_findings(pages: Sequence[str], *, period_end: str, display_name: str, own_text: str) -> list[dict]:
     findings = []
     flat = [_flat(page) for page in pages]
@@ -179,6 +213,7 @@ class HistoryReviewer:
         reports = sorted(evidence_in.get("reports") or [], key=lambda r: (str(r["period_end"]), str(r["report_type"])))
         display_name = str(case["display_name"])
         own_text = " ".join([display_name, str(case.get("description") or "")])
+        designed = not case.get("report_style")
         findings = coverage_findings(reports)
         usage: dict[str, int] = {}
         factsheets: dict[str, bytes] = {}
@@ -193,13 +228,16 @@ class HistoryReviewer:
                 file = documents.fetch(record, account_url=self.settings.storage_account_url,
                                        expected_container=self.settings.container, download=self.download)
                 pages = documents.pdf_text(file.content)
-                findings += factsheet_findings(pages, period_end=period_end, display_name=display_name,
-                                               own_text=own_text)
+                if designed:
+                    findings += designed_factsheet_findings(pages, period_end=period_end, display_name=display_name)
+                else:
+                    findings += factsheet_findings(pages, period_end=period_end, display_name=display_name,
+                                                   own_text=own_text)
                 factsheets[period_end] = file.content
                 files_checked += 1
             except documents.DocumentError as error:
                 findings.append(_finding("high", period_end, kind, error.message))
-        visual = self._visual(factsheets, findings, usage)
+        visual = self._visual(factsheets, findings, usage, designed=designed)
         months = sorted({str(item["period_end"]) for item in reports})
         evidence = {"files_checked": files_checked,
                     "files_listed": sum(str(item["report_type"]) in REVIEW_KINDS for item in reports),
@@ -208,13 +246,20 @@ class HistoryReviewer:
                     "design": evidence_in.get("design"), "visual_qa": visual,
                     "checks": ["every month has a factsheet, with no gap",
                                "each stored file matches the hash recorded when it was rendered",
+                               "factsheet: the account's name and the report month, no commentary "
+                               "(name and month are warnings in the owner's own design)",
+                               "visual QA of every factsheet page against the standard checklist "
+                               "(its points are warnings in the owner's own design)"] if designed else
+                              ["every month has a factsheet, with no gap",
+                               "each stored file matches the hash recorded when it was rendered",
                                "factsheet: two pages, the composite's name and each page's report date, "
                                "no commentary, no text left from the reference design",
                                "visual QA of every factsheet page against the Alpha World layout"]}
-        return Review(*_verdict(findings, visual, files_checked, months, evidence_in.get("design")), findings,
-                      evidence, usage)
+        return Review(*_verdict(findings, visual, files_checked, months, evidence_in.get("design"), designed=designed),
+                      findings, evidence, usage)
 
-    def _visual(self, factsheets: Mapping[str, bytes], findings: list[dict], usage: dict[str, int]) -> dict[str, Any]:
+    def _visual(self, factsheets: Mapping[str, bytes], findings: list[dict], usage: dict[str, int], *,
+                designed: bool = False) -> dict[str, Any]:
         newest = sorted(factsheets)[-self.settings.visual_months:]
         looked: list[str] = []
         notes: list[dict[str, Any]] = []
@@ -229,7 +274,8 @@ class HistoryReviewer:
                 continue
             try:
                 outcome = qa.inspect_factsheet(images, display_date=header_date(period_end),
-                                               period_label=month_label(period_end), alpha_world_layout=True)
+                                               period_label=month_label(period_end),
+                                               alpha_world_layout=not designed)
             except TeamModelError as error:
                 errors.append({"period_end": period_end, "error": error.code})
                 continue
@@ -241,7 +287,8 @@ class HistoryReviewer:
             looked.append(period_end)
             notes += [{"period_end": period_end, **n} for n in outcome.evidence.get("cosmetic_notes", [])]
             for objection in outcome.objections:
-                severity = "high" if "(high)" in objection["message"] else "medium"
+                # The standard checklist does not know an owner's own layout, so its points are for the owner to read.
+                severity = "high" if "(high)" in objection["message"] and not designed else "medium"
                 findings.append({**_finding(severity, period_end, "factsheet", objection["message"],
                                             objection.get("page")), "region": objection.get("region")})
         return {"months_looked_at": len(looked), "months_with_factsheets": len(factsheets),
@@ -250,8 +297,12 @@ class HistoryReviewer:
 
 
 def _verdict(findings: Sequence[Mapping[str, Any]], visual: Mapping[str, Any], files_checked: int,
-             months: Sequence[str], design: str | None) -> tuple[str, str]:
-    design_name = {"alpha-world-ms": "Alpha World MS", "alpha-world-t": "Alpha World T"}.get(str(design), "its")
+             months: Sequence[str], design: Any, *, designed: bool = False) -> tuple[str, str]:
+    if designed:
+        title = design.get("title") if isinstance(design, Mapping) else None
+        design_name = f"owner's {title}" if title else "owner's own"
+    else:
+        design_name = {"alpha-world-ms": "Alpha World MS", "alpha-world-t": "Alpha World T"}.get(str(design), "its")
     span = (f"{month_label(months[0])}" if len(months) == 1 else
             f"{month_label(months[0])} to {month_label(months[-1])}") if months else "no months"
     high = [f for f in findings if f["severity"] == "high"]
@@ -274,6 +325,10 @@ def _verdict(findings: Sequence[Mapping[str, Any]], visual: Mapping[str, Any], f
         parts = [f"{len(medium)} layout point(s) to look at: " + "; ".join(_point(f) for f in medium[:3])] if medium else []
         return "warn", _fit(f"The agent review read {files_checked} files for {span} in the {design_name} design with "
                             f"no blocking problem, but " + " and ".join(parts + gaps) + ".")
+    if designed:
+        return "pass", _fit(f"The agent review read all {files_checked} files for {span} in the {design_name} design: "
+                            "every month is there, every file matches its recorded hash, each factsheet prints the "
+                            "account's name and month with no commentary, and visual QA found no layout faults.")
     return "pass", _fit(f"The agent review read all {files_checked} files for {span} in the {design_name} design: "
                         "every month is there, every file matches its recorded hash, each factsheet prints the "
                         "composite's name and date with no commentary or reference-design text, and visual QA "

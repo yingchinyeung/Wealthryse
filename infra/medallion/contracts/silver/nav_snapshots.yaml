@@ -2,20 +2,28 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.nav_snapshots
 name: nav_snapshots
-version: 1.0.1
+version: 1.0.2
 status: active
 domain: silver
 dataProduct: portfolio-medallion
 description:
   purpose: Net asset value per account and statement date, in total and by asset class, from the Flex NAV and equity
-    summary sections. The source of every account NAV the platform reports.
+    summary sections, or for a Kiwoom account from Kiwoom's account answers. The source of every account NAV the
+    platform reports.
   limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
     account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
     item U8's history is switched on, every version is also kept in silver.nav_snapshots_history, and silver.nav_snapshots_as_known(at)
-    returns this table as it stood at any moment.
+    returns this table as it stood at any moment. Kiwoom accounts (written by ibkr_etl.kiwoom_collector) have one
+    KRW TOTAL row per day. total_text is Kiwoom's own total (kt00004 prsm_dpst_aset_amt today, ka01690 day_stk_asst
+    for a past day), which is after Kiwoom's estimated tax and fee for selling every holding, plus any US holdings
+    and deposits at Kiwoom's rate to KRW. stock_text is the holdings' value, cash_text the deposit (d2_entra today,
+    dbst_bal for a past day) plus any US deposits, and accruals_text the selling cost as a negative amount, so stock
+    + cash + accruals = total. Reports use total_text as the account's NAV (decided 19 Oct 2026). A Kiwoom row's
+    row_sha256 is the sha256 of the row as written, not of a Flex row.
 tags:
 - silver
 - ibkr
+- kiwoom
 schema:
 - name: nav_snapshots
   physicalName: silver.nav_snapshots
@@ -31,7 +39,7 @@ schema:
     primaryKey: true
     primaryKeyPosition: 1
     classification: restricted
-    description: 'IBKR account number. Restricted: never shown or logged in full.'
+    description: 'Broker account number (IBKR or Kiwoom). Restricted: never shown or logged in full.'
   - name: snapshot_date
     physicalType: text
     logicalType: date
@@ -79,7 +87,8 @@ schema:
     primaryKeyPosition: -1
     classification: confidential-financial
     description: Total NAV as decimal text (total, endingValue, netLiquidationValue or nav; for an equity summary
-      row without a total, the sum of its components and accruals).
+      row without a total, the sum of its components and accruals). For a Kiwoom account, Kiwoom's total after its
+      estimated selling cost.
     quality:
     - name: total_text_is_decimal
       description: total_text is plain decimal text when present. v_daily_nav casts these to double precision, so
@@ -188,7 +197,7 @@ schema:
     primaryKeyPosition: -1
     classification: confidential-financial
     description: 'Accruals as decimal text: the accruals field, or the sum of the CFD, withholding, dividend, interest
-      and margin accrual fields.'
+      and margin accrual fields. For a Kiwoom account, Kiwoom''s estimated selling cost as a negative amount.'
     quality:
     - name: accruals_text_is_decimal
       description: accruals_text is plain decimal text when present. v_daily_nav casts these to double precision,
@@ -206,7 +215,8 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: internal
-    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows.
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows. For a Kiwoom row,
+      the sha256 of the row as written.
     quality:
     - name: row_sha256_is_sha256
       description: row_sha256 is a lowercase hex sha256 (util.sha256_text of the row).
@@ -283,4 +293,7 @@ customProperties:
     required: true
     query: SELECT MAX(snapshot_date) AS observed FROM nav_snapshots
     source: ibkr_etl.layer_freshness.RULES
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
 contractCreatedTs: '2026-10-18T00:00:00Z'

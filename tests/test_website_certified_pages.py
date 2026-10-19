@@ -63,7 +63,7 @@ class PagesValueTest(unittest.TestCase):
 
 class PagesCommandTest(unittest.TestCase):
     def run_pages(self, stage, previous=None, image="reg/ibkr-platform:web-" + LIVE, readers=True, applied=True,
-                  now="2026-10-22T12:00"):
+                  now="2026-10-22T12:00", ancestor=True, same_register=True):
         env = [{"name": release.PAGES_SETTING, "value": previous}] if previous is not None else []
         app = {"properties": {"template": {"containers": [{"image": image, "env": env}]},
                               "configuration": {"ingress": {"fqdn": "web.example"}}}}
@@ -81,6 +81,13 @@ class PagesCommandTest(unittest.TestCase):
             raise AssertionError(args)
 
         def run(args, **kwargs):
+            if args[:3] == ["git", "merge-base", "--is-ancestor"]:
+                self.assertEqual(args[3:], [LIVE, "HEAD"])
+                return mock.Mock(returncode=0 if ancestor else 1)
+            if args[:3] == ["git", "diff", "--quiet"]:
+                self.assertEqual(args[3:], [LIVE, "HEAD", "--", "infra/medallion/certified-figures.json",
+                                            release.PAGES_READERS])
+                return mock.Mock(returncode=0 if same_register else 1)
             self.assertEqual(args[:3], ["git", "cat-file", "-e"])
             self.assertIn(args[3], (LIVE + ":" + release.PAGES_READERS, LIVE + ":" + release.CHARTS_READERS))
             checked.append(args[3].split(":", 1)[1])
@@ -135,6 +142,15 @@ class PagesCommandTest(unittest.TestCase):
             self.run_pages("batch-5", previous=release.pages_value("batch-4"), readers="certified_figures_register_data.py")
         # Attribution alone does not need them: batch-4 moves on such a website.
         self.run_pages("batch-4", previous=release.pages_value("batch-3"), readers="certified_figures_register_data.py")
+
+    def test_the_live_website_must_be_in_this_history_with_the_same_register(self):
+        with self.assertRaisesRegex(SystemExit, "not in this branch history"):
+            self.run_pages("batch-1", previous=SHADOW, ancestor=False)
+        with self.assertRaisesRegex(SystemExit, "register changed after the live website"):
+            self.run_pages("batch-1", previous=SHADOW, same_register=False)
+        # Moving every page back needs neither.
+        settings, _ = self.run_pages("off", previous=SHADOW, ancestor=False, same_register=False)
+        self.assertEqual(settings, {release.PAGES_SETTING: "off"})
 
     def test_073_must_be_recorded_as_applied(self):
         with self.assertRaises(SystemExit):

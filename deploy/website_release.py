@@ -863,6 +863,16 @@ def pages():
                                               capture_output=True).returncode for path in needed):
             raise SystemExit('The live website (' + container['image'].split('/')[-1] + ') cannot read the certified '
                              'figures yet: run Deploy website from main first. Nothing was changed.')
+        # The pages this run sets come from this commit's register, so the live website must be built from
+        # this branch's history and read the same register; otherwise a page could be named that it lacks.
+        if subprocess.run(['git', 'merge-base', '--is-ancestor', deployed, 'HEAD'], cwd=ROOT,
+                          capture_output=True).returncode:
+            raise SystemExit('The live website commit ' + deployed + ' is not in this branch history. '
+                             'Nothing was changed.')
+        if subprocess.run(['git', 'diff', '--quiet', deployed, 'HEAD', '--', str(PAGES_REGISTER.relative_to(ROOT)),
+                           PAGES_READERS], cwd=ROOT, capture_output=True).returncode:
+            raise SystemExit('The certified figures register changed after the live website (' + deployed[:7] + ') '
+                             'was built: run Deploy website from main first. Nothing was changed.')
         missing = unapplied_migrations([PAGES_SETTING], git('rev-parse', 'HEAD').strip())
         if missing:
             raise SystemExit('Not recorded as applied in deploy/applied-migrations.json: ' + ', '.join(missing)

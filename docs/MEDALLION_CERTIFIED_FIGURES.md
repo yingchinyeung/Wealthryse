@@ -568,7 +568,9 @@ One website setting, `CERTIFIED_FIGURES_PAGES`, for example
 5. **Switch the page on:** one setting, one website revision, through the **Website certified
    pages** workflow (`.github/workflows/website-certified-pages.yml`, stages `shadow`,
    `batch-1` to `batch-5` and `off`). It refuses unless the live website was released from a
-   commit whose readers can find the register and 073 is recorded as applied. It also refuses
+   commit whose readers can find the register, that commit is in main's history with the same
+   register as main (after a register change, run Deploy website first), and 073 is recorded as
+   applied. It also refuses
    between 07:50 and 09:25 UTC and, from 1 to 7 Nov, any move other than back. If the checks
    fail it puts the previous value back.
 6. **Check** that afternoon and after the next morning's build that the page, its API and (from

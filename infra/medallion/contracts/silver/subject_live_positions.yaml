@@ -256,4 +256,5 @@ customProperties:
 - property: consumers
   value:
   - ibkr_etl.live_view
+  - ibkr_etl.web_desk
 contractCreatedTs: '2026-10-18T00:00:00Z'

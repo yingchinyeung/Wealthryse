@@ -1407,21 +1407,21 @@
   },
   "ibkrv2stgauhecwc4itaoo/bronze-vendor-data": {
    "layer": "bronze",
-   "declared_in": null,
+   "declared_in": "infra/research.bicep",
    "new": true,
    "holds": "Planned: raw responses from licensed data vendors (option chains, point-in-time equity data, transcripts and news), captured like market data: content-hashed, append only.",
    "plan": "Frontier analytics phase 4. Append only, like the other bronze containers. Each vendor's licence is checked before legal hold or long retention; any legal hold is set and cleared only by the separately authorised administrator. Roles are scoped to this container (the vendor writer and the research identity), never to the account."
   },
   "ibkrv2stgauhecwc4itaoo/research-features": {
    "layer": "research",
-   "declared_in": null,
+   "declared_in": "infra/research.bicep",
    "new": true,
    "holds": "Planned: point-in-time Parquet exports of bronze and silver for research jobs, so experiments do not query the live server.",
    "plan": "Frontier analytics phase 1. Written and read only by the research job's identity. Roles are scoped to this container, never to the account; the web and agent identities get none."
   },
   "ibkrv2stgauhecwc4itaoo/research-experiments": {
    "layer": "research",
-   "declared_in": null,
+   "declared_in": "infra/research.bicep",
    "new": true,
    "holds": "Planned: experiment log, backtest results, model files and the research reports for the owner.",
    "plan": "Frontier analytics phase 1. Written and read only by the research job's identity; never read by the website or agents. Roles are scoped to this container, never to the account; the web and agent identities get none."
@@ -1796,6 +1796,20 @@
    ],
    "schedule": "see LIVE_STATE.md",
    "note": "Inline program, no Bicep."
+  },
+  "ibkrv2stg-research": {
+   "hops": [
+    "research"
+   ],
+   "schedule": "manual (optional weekly schedule outside 07:50 to 09:25 UTC; see infra/research.bicep)",
+   "note": "Research job (docs/RESEARCH_ZONE.md): point-in-time feature exports to research-features and backtests logged in research-experiments. Starts the research server at the beginning of a run and stops it at the end. Reads silver on the live server through the read-only research_reader login only."
+  },
+  "ibkrv2stg-research-idle-stop": {
+   "hops": [
+    "research"
+   ],
+   "schedule": "21:15 UTC",
+   "note": "Stops the research server if no research run is active (Azure restarts a stopped server after 7 days). Touches nothing else."
   }
  }
 }

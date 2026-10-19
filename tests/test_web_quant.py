@@ -674,6 +674,58 @@ responses['quant/skill']=[200,{section:'skill',model_id:'skill-statistics',model
             self.assertNotIn(bad, shown["body"] + shown["note"])
 
 
+
+@unittest.skipUnless(NODE, "Node is not installed in this test environment")
+class GoldBuilderRenderingTest(unittest.TestCase):
+    """The cards render what the overnight build (quant_snapshots) stores, not only the engines.
+
+    The payloads come from quant_snapshots.BUILDERS on the build's own synthetic data, stored as
+    store_section stores them (finite numbers only), then read back through the route.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import test_quant_snapshots as build_data
+        from ibkr_etl import quant_snapshots
+
+        inputs = quant_snapshots.prepare_inputs(build_data.synthetic_data(days=560))
+        cls.app = _App()
+        for section in web_quant.SECTIONS:
+            payload, _ = quant_snapshots.finite_copy(quant_snapshots.BUILDERS[section](inputs[section]))
+            cls.app.connection.snapshots[section] = [_row(section, payload, build_data.AS_OF)]
+        with _setting(ALL_ON):
+            cls.responses = {f"quant/{section}": [200, cls.app.get(f"quant/{section}").json()]
+                             for section in web_quant.SECTIONS}
+        code = _page_helpers() + f"responses={json.dumps(cls.responses)};\n" + """
+(async()=>{const out={};for(const [section,id,render] of quantSections){card(id);await quantLoadSection(section,id,render,'2026-10-16');out[section]=shown(id)}
+  console.log(JSON.stringify(out))})();
+"""
+        cls.out = _node(code)
+
+    def test_every_tile_has_a_figure(self):
+        for section in web_quant.SECTIONS:
+            with self.subTest(section=section):
+                shown = self.out[section]
+                self.assertFalse(shown["hidden"])
+                self.assertNotIn("Not worked out", shown["note"])
+                for text in (shown["body"], shown["note"], shown["model"]):
+                    for bad in ("undefined", "NaN", "[object Object]", "null"):
+                        self.assertNotIn(bad, text)
+                tiles = re.findall(r'<div class="label">([^<]*)</div><div class="value">(.*?)</div></div>', shown["body"])
+                self.assertTrue(tiles)
+                empty = [label for label, value in tiles if re.sub(r"<[^>]+>", "", value).strip() in ("", "—")]
+                self.assertEqual(empty, [], f"{section} tiles with no figure")
+
+    def test_the_local_market_and_currency_effects_add_up_to_the_excess_return(self):
+        ytd = self.responses["quant/currency"][1]["results"]["ytd"]
+        totals = ytd["totals"]
+        local = totals["allocation"] + totals["selection"] + totals["interaction"]
+        currency = totals["currency_allocation"] + totals["currency_compounding"]
+        self.assertAlmostEqual(local + currency, ytd["excess_return"], places=12)
+        body = self.out["currency"]["body"]
+        self.assertIn(("+" if local > 0 else "") + _percent(local), body)
+        self.assertIn(("+" if ytd["excess_return"] > 0 else "") + _percent(ytd["excess_return"]), body)
+
 class ModellingEndpointTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

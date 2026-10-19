@@ -291,6 +291,28 @@ class PrepareTest(unittest.TestCase):
         for env in ([], [{"name": "ONBOARDING_V2_ENABLED", "value": "false"}], [{"name": "OTHER", "secretRef": "x"}]):
             self.assertEqual(self.run_prepare(["src/ibkr_etl/web.py"], env=env)["changed_files"], ["src/ibkr_etl/web.py"])
 
+    def test_quant_and_desk_pages_need_their_held_migrations(self):
+        self.assertTrue(release.switch_is_on("QUANT_ANALYTICS_PAGES", "performance=shadow"))
+        self.assertTrue(release.switch_is_on("QUANT_ANALYTICS_PAGES", "performance=off, risk=On"))
+        for value in ("", "off", "performance=off,risk=off", "performance"):
+            self.assertFalse(release.switch_is_on("QUANT_ANALYTICS_PAGES", value), value)
+        self.assertTrue(release.switch_is_on("DESK_PAGE", "owners"))
+        self.assertTrue(release.switch_is_on("DESK_PAGE", " ON "))
+        for value in ("", "off", "true"):
+            self.assertFalse(release.switch_is_on("DESK_PAGE", value), value)
+        for name, value, migration in (("QUANT_ANALYTICS_PAGES", "risk=shadow", "076_quant_analytics.sql"),
+                                       ("DESK_PAGE", "owners", "077_desk_live_views.sql")):
+            with self.subTest(switch=name), self.assertRaises(SystemExit) as stopped:
+                self.run_prepare(["src/ibkr_etl/web.py"], env=[{"name": name, "value": value}],
+                                 migrations={migration: b"create\n"})
+            self.assertIn(migration, str(stopped.exception))
+        for env in ([{"name": "QUANT_ANALYTICS_PAGES", "value": "performance=off"}], [{"name": "DESK_PAGE", "value": "off"}]):
+            self.assertEqual(self.run_prepare(["src/ibkr_etl/web.py"], env=env)["changed_files"], ["src/ibkr_etl/web.py"])
+
+    def test_the_research_image_files_are_not_website_changes(self):
+        for path in ("Dockerfile.research", "requirements-research.lock"):
+            self.assertTrue(path.startswith(release.IGNORED_PREFIXES), path)
+
 
 if __name__ == "__main__":
     unittest.main()

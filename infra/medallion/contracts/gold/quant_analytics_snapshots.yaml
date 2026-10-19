@@ -273,6 +273,7 @@ customProperties:
   value:
   - ibkr_etl.layer_freshness
   - ibkr_etl.quant_snapshots
+  - ibkr_etl.web_quant
 - property: producers
   value:
   - ibkr_etl.quant_snapshots

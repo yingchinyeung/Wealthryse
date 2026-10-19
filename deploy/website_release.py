@@ -33,6 +33,8 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
                     'scripts/install_agent_schema.py',
                     # The live IBKR collector ships in its own image on the gateway VM.
                     'Dockerfile.live-collector', 'requirements-live.lock',
+                    # The research job ships in its own image (Dockerfile.research and its lock).
+                    'Dockerfile.research', 'requirements-research',
                     # Repository metadata, not copied into any image.
                     'LICENSE')
 # Lines that put infra/medallion into the platform and agent images (#152). The website image is
@@ -52,6 +54,9 @@ SWITCHES_NEEDING_MIGRATIONS = {
     'FACTSHEET_DESIGN_AGENTS_ENABLED': ('067_factsheet_design_agents.sql',),
     # Any page in shadow or on reads the certified figures (see pages below).
     'CERTIFIED_FIGURES_PAGES': ('073_certified_figures.sql',),
+    # Held until their days (docs/QUANT_ANALYTICS.md): the quant sections read 076, the Desk 077.
+    'QUANT_ANALYTICS_PAGES': ('076_quant_analytics.sql',),
+    'DESK_PAGE': ('077_desk_live_views.sql',),
 }
 # Migrations confirmed applied in production (this workflow cannot reach the database).
 APPLIED_MIGRATIONS = Path(__file__).resolve().parent / 'applied-migrations.json'
@@ -180,6 +185,10 @@ def switch_is_on(name, value):
     """A website switch's value turns its code on: 'true', or for the pages setting any page not off."""
     if name == PAGES_SETTING:
         return any(mode != 'off' for mode in page_modes(value).values())
+    if name == 'QUANT_ANALYTICS_PAGES':  # "performance=shadow,risk=on": any page in shadow or on
+        return any(part.partition('=')[2].strip().lower() in ('shadow', 'on') for part in str(value or '').split(','))
+    if name == 'DESK_PAGE':  # off, owners or on
+        return str(value or '').strip().lower() in ('owners', 'on')
     return str(value or '').strip().lower() == 'true'
 
 

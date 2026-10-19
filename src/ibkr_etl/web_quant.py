@@ -972,7 +972,7 @@ const quantRenderSkill=r=>{const s=r.skill_summary||{},c=s.confidence||{},level=
     c.information_ratio?quantTile('Information ratio range',quantRange(c.information_ratio,ratio)):'',
     quantTile('Probabilistic Sharpe ratio',pct2(s.probabilistic_sharpe_ratio),'Chance the true Sharpe ratio is above zero'),
     Number(s.trials)>1?quantTile('Deflated Sharpe ratio',pct2(s.deflated_sharpe_ratio),`Against the best of ${s.trials} strategies tried`):'',
-    quantTile('Track record needed',quantNum(s.minimum_track_record_years)?`${quantFixed(s.minimum_track_record_years,1)} years`:'—','For 95% confidence that the Sharpe ratio is above zero'),
+    quantTile('Track record needed',quantNum(s.minimum_track_record_years)?`${quantFixed(s.minimum_track_record_years,1)} years`:quantNum((s.estimates||{}).sharpe_ratio_daily)&&Number(s.estimates.sharpe_ratio_daily)<=0?'Not reachable':'—',quantNum(s.minimum_track_record_years)?'For 95% confidence that the Sharpe ratio is above zero':'No length of record shows a Sharpe ratio of zero or below to be above zero'),
     quantTile('Years of returns',quantNum(s.years)?`${quantFixed(s.years,1)} years`:'—'),
   ])+(s.verdict?`<p class="quant-verdict">${esc(s.verdict)}</p>`:'');
   return [html,quantText([s.window_start?`From ${analyticsDate(s.window_start)} to ${analyticsDate(s.window_end)}, ${s.observations} daily returns.`:'',s.method,s.disclaimer])]};
@@ -1002,8 +1002,7 @@ const quantRenderCurrency=r=>{const ca=r.currency_attribution||r,mtd=ca.mtd||{},
     quantTile('Currency effect (month to date)',signed(effect(mtd)),'Currency allocation plus currency compounding'),
     quantTile('Currency effect (year to date)',signed(effect(ytd)),'Currency allocation plus currency compounding'),
     quantTile('Excess return (year to date)',signed(ytd.excess_return),'Portfolio minus benchmark, in the reporting currency'),
-    quantTile('Allocation (year to date, local)',signed(t.allocation)),
-    quantTile('Selection (year to date, local)',signed(t.selection)),
+    quantTile('Local market effect (year to date)',signed(['allocation','selection','interaction'].every(k=>quantNum(t[k]))?Number(t.allocation)+Number(t.selection)+Number(t.interaction):null),'How the holdings did in their own currencies against the benchmark'),
   ]);
   const rows=(ytd.currencies||[]).map(x=>quantRow(x.currency,[weightPct(x.portfolio_weight),weightPct(x.benchmark_weight),signedPct(x.currency_return),signed(x.currency_allocation)]));
   return [tiles+(rows.length?quantSub('By currency, year to date'):'')+quantTable(['Currency','Portfolio weight','Benchmark weight','Currency move','Currency allocation'],rows),quantText([ytd.method||mtd.method,...(ytd.notes||[])])]};

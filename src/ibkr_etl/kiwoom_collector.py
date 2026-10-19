@@ -56,6 +56,9 @@ LOADING_STAGES = ("request", "load_and_reconcile", "build_history", "first_month
 # Stages in which past days are filled. Filling starts with Load and reconcile, so the
 # history is in place before approval 1; the history_built check is recorded only in Build history.
 HISTORY_STAGES = ("load_and_reconcile", "build_history")
+# After onboarding the history pass still runs, unrecorded, so a day the daily run stored during
+# KRX's after-market (15:30-20:00 KST) is collected again at the official close the next day.
+REFRESH_STAGES = ("first_month_end", "closed")
 # Past days filled per run, so one run stays well inside the daily job's time limit.
 HISTORY_DAYS_PER_RUN = 250
 
@@ -472,10 +475,13 @@ def days_with_snapshots(connection, account_id: str, start: date, end: date) -> 
     leaving it out here has the history fill it again.
     """
 
+    # Only a day written by the history pass counts: the daily run's row for a day can carry
+    # after-market prices, so the history pass collects that day again at the official close.
     rows = connection.execute(
         "SELECT n.snapshot_date, n.total_text, n.cash_text, n.stock_text, n.accruals_text, "
         "c.ending_cash_text, c.settled_cash_text FROM nav_snapshots n LEFT JOIN cash_snapshots c "
         "ON c.account_id = n.account_id AND c.snapshot_date = n.snapshot_date AND c.currency = ? "
+        "JOIN ingestion_runs r ON r.run_id = n.last_seen_run_id AND r.run_type = 'kiwoom_rest_history' "
         "WHERE n.account_id = ? AND n.asset_class = 'TOTAL' AND n.snapshot_date BETWEEN ? AND ?",
         (BASE_CURRENCY, account_id, start.isoformat(), end.isoformat()),
     ).fetchall()
@@ -788,7 +794,7 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
                     if stage != "load_and_reconcile":
                         break
             connection.commit()
-            if stage in HISTORY_STAGES:
+            if stage in HISTORY_STAGES or stage in REFRESH_STAGES:
                 result["history"] = _history(connection, tenant_id, client, target, today=today, now=now,
                                              include_us=include_us, record=stage == "build_history")
             results.append({**result, "status": "loaded", "stage": stage, "rows": counts})

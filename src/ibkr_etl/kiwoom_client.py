@@ -246,6 +246,18 @@ def _yyyymmdd(value: date) -> str:
     return value.strftime("%Y%m%d")
 
 
+def chart_closes(pages: list[Mapping[str, object]]) -> dict[str, Decimal]:
+    """Each day's close (YYYYMMDD) from ka10081 daily chart pages. Pure, so bronze can be re-read."""
+
+    closes: dict[str, Decimal] = {}
+    for page in pages:
+        for row in page.get("stk_dt_pole_chart_qry") or []:
+            dt = str(row.get("dt") or "").strip()
+            if dt and str(row.get("cur_prc") or "").strip():
+                closes[dt] = kiwoom_number(row["cur_prc"], unsigned=True)
+    return closes
+
+
 class KiwoomClient:
     def __init__(
         self,
@@ -451,14 +463,9 @@ class KiwoomClient:
         wanted = _yyyymmdd(day)
         closes = self._closes.get(code)
         if closes is None or (wanted not in closes and wanted > max(closes, default="")):
-            closes = {}
+            # The plain KRX code (no _NX/_AL suffix) and unadjusted prices: KRX's official close as it was.
             pages = self.inquire("ka10081", {"stk_cd": code, "base_dt": wanted, "upd_stkpc_tp": "0"}, max_pages=1)
-            for page in pages:
-                for row in page.get("stk_dt_pole_chart_qry") or []:
-                    dt = str(row.get("dt") or "").strip()
-                    if dt and str(row.get("cur_prc") or "").strip():
-                        closes[dt] = kiwoom_number(row["cur_prc"], unsigned=True)
-            self._closes[code] = closes
+            closes = self._closes[code] = chart_closes(pages)
         return closes.get(wanted)
 
     def _at_official_close(self, holdings: tuple[Holding, ...], day: date) -> tuple[Holding, ...] | None:

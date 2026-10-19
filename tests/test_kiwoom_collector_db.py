@@ -321,6 +321,25 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
                                    "WHERE account_id = ? AND snapshot_date = '2026-10-05'", (account,)).fetchone()
         self.assertEqual(position["market_value_text"], "7100000")
 
+    def test_a_day_the_daily_run_stored_is_collected_again_by_the_history_pass(self):
+        _, case_id = self._kiwoom_account("6534567890", start=date(2026, 9, 1))
+        self.addCleanup(self._cancel, case_id)
+        account = "KIWOOM-6534567890"
+        self._run({"6534567890": FakeKiwoom()})
+        # As if the daily run, during KRX's after-market, had written the day last.
+        daily = self.db.execute("SELECT max(run_id) AS run_id FROM ingestion_runs WHERE run_type = 'kiwoom_rest'"
+                                ).fetchone()["run_id"]
+        self.db.execute("UPDATE nav_snapshots SET last_seen_run_id = ? WHERE account_id = ? "
+                        "AND snapshot_date = '2026-10-05'", (daily, account))
+        self.db.commit()
+        again = FakeKiwoom()
+        self._run({"6534567890": again})
+        self.assertEqual(again.asked, [date(2026, 10, 5)])
+        run_type = self.db.execute("SELECT r.run_type FROM nav_snapshots n JOIN ingestion_runs r "
+                                   "ON r.run_id = n.last_seen_run_id WHERE n.account_id = ? "
+                                   "AND n.snapshot_date = '2026-10-05'", (account,)).fetchone()["run_type"]
+        self.assertEqual(run_type, "kiwoom_rest_history")
+
     def test_a_history_refusal_fails_the_check_but_keeps_the_day(self):
         _, case_id = self._kiwoom_account("7234567890")
         self.addCleanup(self._cancel, case_id)

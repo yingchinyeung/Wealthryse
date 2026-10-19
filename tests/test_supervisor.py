@@ -481,6 +481,8 @@ class ChatHookTests(unittest.TestCase):
                 pass
 
         class FakeAgent:
+            settings = mock.Mock(chat_reasoning_mode="standard")
+
             def run(self, **kwargs):
                 runs.append(kwargs)
                 if error:

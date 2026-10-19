@@ -9,6 +9,8 @@ APPROVED_REGION = "southeastasia"
 # docs/AI_DATA_PROCESSING_APPROVAL_2026-09-22.md.
 APPROVED_PROCESSING_SCOPES = frozenset({"apac-data-zone", "global"})
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
+# Pro runs the same model for longer on each call, at the same token rates (docs/AGENTS.md).
+REASONING_MODES = ("standard", "pro")
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
 
 
@@ -81,6 +83,8 @@ class ModelSettings:
     max_output_tokens: int = 2500
     timeout_seconds: int = 60
     reasoning_effort: str = "low"
+    # Website chat (/v1/chat) only; every other model call runs in standard mode.
+    chat_reasoning_mode: str = "standard"
 
     @classmethod
     def from_env(cls) -> "ModelSettings":
@@ -95,6 +99,7 @@ class ModelSettings:
             max_output_tokens=_int("AGENT_MAX_OUTPUT_TOKENS", 2500, 500, 64000),
             timeout_seconds=_int("AGENT_TIMEOUT_SECONDS", 60, 10, 600),
             reasoning_effort=(_env("AGENT_REASONING_EFFORT") or "low").lower(),
+            chat_reasoning_mode=(_env("AGENT_CHAT_REASONING_MODE") or "standard").lower(),
         )
 
     def validate(self) -> None:
@@ -106,6 +111,8 @@ class ModelSettings:
             raise ValueError("The model endpoint or deployment is not configured")
         if self.reasoning_effort not in REASONING_EFFORTS:
             raise ValueError("The reasoning effort is not one the model accepts")
+        if self.chat_reasoning_mode not in REASONING_MODES:
+            raise ValueError("The chat reasoning mode is not one the model accepts")
 
 
 @dataclass(frozen=True)

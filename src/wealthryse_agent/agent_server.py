@@ -369,8 +369,10 @@ def create_app(services: Services) -> FastAPI:
                     LOGGER.warning("supervisor watch did not start", extra={"correlation_id": correlation_id})
 
             try:
-                run = services.agent().run(question=body.message, account_id=body.account_id,
-                                           tools=recorder or tools, history=history, instructions=instructions)
+                agent = services.agent()
+                run = agent.run(question=body.message, account_id=body.account_id, tools=recorder or tools,
+                                history=history, instructions=instructions,
+                                reasoning_mode=agent.settings.chat_reasoning_mode)
                 yield from _answers(run, store, user, conversation_id, correlation_id, remember=True,
                                     on_turn=observe if watching else None)
             except AgentError as error:

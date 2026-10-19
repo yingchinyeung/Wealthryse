@@ -47,8 +47,11 @@ BENCHMARKS = (
 FX_TICKERS = {
     "CNY": "CNY=X",  # quoted as CNY per USD
     "HKD": "HKD=X",  # quoted as HKD per USD
+    "KRW": "KRW=X",  # quoted as KRW per USD
     "TWD": "TWD=X",  # quoted as TWD per USD
 }
+# Reporting currencies a USD benchmark may be converted into with the direct Yahoo quote.
+DIRECT_FROM_USD = {"HKD", "KRW"}
 
 
 def mapped_benchmarks(connection: Any, account_id: str) -> tuple[BenchmarkSpec, ...]:
@@ -236,21 +239,22 @@ def fetch_fx_to_reporting_yfinance(
 ) -> tuple[list[tuple[str, float]], str]:
     """Fetch native-currency-to-reporting-currency closes from Yahoo Finance.
 
-    Yahoo's ``TWD=X``/``CNY=X``/``HKD=X`` series are quoted as local
+    Yahoo's ``TWD=X``/``CNY=X``/``HKD=X``/``KRW=X`` series are quoted as local
     currency units per USD. Use the reciprocal for local -> USD, but use the
-    direct HKD=X quote for USD -> HKD. No additional cross pairs are approved.
+    direct HKD=X or KRW=X quote for USD -> HKD or USD -> KRW. No additional
+    cross pairs are approved.
     """
 
     native = from_currency.upper()
     reporting = reporting_currency.upper()
     if native == reporting:
         raise ValueError("FX retrieval is unnecessary for identical currencies")
-    direct_quote = native == "USD" and reporting == "HKD"
+    direct_quote = native == "USD" and reporting in DIRECT_FROM_USD
     if not direct_quote and (reporting != "USD" or native not in FX_TICKERS):
         raise RuntimeError(
             f"No approved provisional FX ticker maps {native} to {reporting}"
         )
-    symbol = FX_TICKERS["HKD"] if direct_quote else FX_TICKERS[native]
+    symbol = FX_TICKERS[reporting] if direct_quote else FX_TICKERS[native]
     quote_currency = reporting if direct_quote else native
     direct = fetch_benchmark_yfinance(
         BenchmarkSpec(

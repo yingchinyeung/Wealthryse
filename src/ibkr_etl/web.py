@@ -3937,6 +3937,20 @@ def preview_subject_monthly_release(
     }
 
 
+def _record_first_month_end(connection, subject_id: str, period_end: str) -> None:
+    """Close a new-onboarding case waiting on its first month-end; never blocks the release itself."""
+
+    found = connection.execute("SELECT to_regclass('public.broker_onboarding_cases') AS t", ()).fetchone()
+    if not found or found["t"] is None:
+        return
+    try:
+        with connection.transaction():  # a savepoint: a refusal here leaves the release intact
+            onboarding_v2_web.record_first_month_end(
+                _portable_database_connection(connection), TENANT_ID, subject_id, period_end)
+    except Exception:  # noqa: BLE001 - the savepoint rolled the check back; the release stands
+        logging.getLogger(__name__).exception("First month-end not recorded for %s %s", subject_id, period_end)
+
+
 @app.post("/api/accounts/{subject_id}/reporting/monthly/{period_end}/release")
 def release_subject_monthly_reports(
     subject_id: str,
@@ -4144,6 +4158,8 @@ def release_subject_monthly_reports(
                  "superseded_release_ids": {kind:by_type[kind].get('superseded_release_ids',[]) for kind in sorted(additions)},
              })),
         )
+        if "factsheet" in additions:
+            _record_first_month_end(connection, subject_id, period_end)
     return {
         "status": "approval_updated",
         "subject_id": subject_id,
@@ -8276,7 +8292,8 @@ def _store_flex_token_via_broker(secret_name: str, token: str) -> dict[str, str]
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    # The broker scales to zero; a cold start takes about 25 seconds, so wait well past that.
+    with urllib.request.urlopen(request, timeout=60) as response:
         payload = json.load(response)
     if (
         payload.get("status") != "stored"

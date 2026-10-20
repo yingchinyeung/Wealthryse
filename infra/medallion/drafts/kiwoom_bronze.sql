@@ -4,9 +4,9 @@
 -- (bootstrap_postgres.py --only-migration). kiwoom_bronze_undo.sql reverses it.
 --
 -- One row per page of one Kiwoom inquiry answer, exactly as received (body, as bytes).
--- Only inquiry APIs (ka*, kt* and the overseas ust* ids) are kept. Token calls (/oauth2/token,
--- /oauth2/revoke) are never stored: their bodies carry the access token and their requests the
--- app key and secret.
+-- Only inquiry APIs (ka*, kt*, the overseas account ust* ids and the overseas chart usa* ids)
+-- are kept. Token calls (/oauth2/token, /oauth2/revoke) are never stored: their bodies carry
+-- the access token and their requests the app key and secret.
 -- request_key holds the account number and the query fields (qry_dt, strt_dt, end_dt, ...),
 -- never a key, secret, token or header other than the two paging headers kept as columns.
 -- A refused call (http_status <> 200 or return_code <> 0) is stored too, so a gap in silver
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS bronze.kiwoom_responses (
     run_id BIGINT NOT NULL REFERENCES public.ingestion_runs(run_id),
     tenant_id UUID NOT NULL DEFAULT app_tenant_id() REFERENCES public.tenants(tenant_id),
     connection_id UUID NOT NULL,
-    api_id TEXT NOT NULL CHECK (api_id ~ '^(k[at][0-9]{5}|ust[0-9]{5})$'),
+    api_id TEXT NOT NULL CHECK (api_id ~ '^(k[at][0-9]{5}|ust[0-9]{5}|usa[0-9]{5})$'),
     request_key JSONB NOT NULL CHECK (jsonb_typeof(request_key) = 'object'),
     page_no INTEGER NOT NULL CHECK (page_no >= 1),
     cont_yn TEXT CHECK (cont_yn IN ('Y', 'N')),

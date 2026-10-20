@@ -729,13 +729,14 @@ def factsheet_inputs(
         snapshot["sector_allocation"].get("classification_basis")
         == "composite sleeve type"
     )
-    # KRX holdings (Kiwoom) carry Korean names and Yahoo labels: print the English name and the
-    # Korea iStrategy sectors instead, and stop on a code that has neither.
+    # KRX holdings (Kiwoom) carry Korean names: print Yahoo's English name and map Yahoo's
+    # industry to the Korea iStrategy sectors, and stop on a code that has neither.
     from .korea_securities import REGION as KOREA, KoreaSecurityError, is_krx, lookup as korea_lookup
     for holding in holdings:
         if not is_composite and is_krx(holding):
             try:
-                name, sector, sub_sector = korea_lookup(holding)
+                name, sector, sub_sector = korea_lookup(
+                    holding, classifications.get(str(holding.get("conid") or "")))
             except KoreaSecurityError as error:
                 raise MonthlyArtifactError(str(error)) from error
             holding["english_name"] = name

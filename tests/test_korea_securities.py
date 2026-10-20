@@ -1,6 +1,7 @@
-"""Korean holdings print their English names and the Korea iStrategy sectors, or stop the render."""
+"""Korean holdings print Yahoo's English names and the Korea iStrategy sectors, or stop the render."""
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -9,7 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ibkr_etl import monthly_artifacts as legacy  # noqa: E402
 from ibkr_etl.factsheet_spec import stress  # noqa: E402
-from ibkr_etl.korea_securities import SECURITIES  # noqa: E402
+from ibkr_etl.korea_securities import INDUSTRIES  # noqa: E402
+
+# What Yahoo returned on 20 Oct 2026 for every KRX code the account has held: (longName, sector, industry).
+YAHOO = json.loads(Path(__file__).with_name("fixtures").joinpath("krx_yahoo_2026-10-20.json").read_text())
 
 # The 31 Aug 2026 holdings, by KRX code with approximate market values in won, and the owner's
 # factsheet's sector table for that month (sub-sector: weight %).
@@ -37,8 +41,10 @@ def _korea_snapshot(values):
         conid = f"KRX:{code}"
         rows.append({"conid": conid, "symbol": code, "description": "한국어 이름", "currency": "KRW",
                      "market_value_text": f"{value:.2f}"})
-        classifications.append({"conid": conid, "symbol": code, "region": "Asia Pacific",
-                                "sector": "Technology", "sub_sector": "Semiconductors"})
+        if code in YAHOO:
+            name, sector, industry = YAHOO[code]
+            classifications.append({"conid": conid, "symbol": code, "region": "Asia Pacific",
+                                    "sector": sector, "sub_sector": industry, "long_name": name})
     snapshot["holdings"]["holdings"] = rows
     snapshot["sector_allocation"]["classifications"] = classifications
     snapshot["sector_allocation"]["gross_market_value"] = float(sum(values.values()))
@@ -50,8 +56,8 @@ class KoreaSecuritiesTests(unittest.TestCase):
     def test_english_names_south_korea_and_the_owners_sectors(self):
         inputs = legacy.factsheet_inputs(_korea_snapshot(AUG_31), reporting_currencies=("KRW",))
         self.assertEqual([h["company_name"] for h in inputs.top_holdings], [
-            "SK hynix Inc.", "Samsung Electronics Co., Ltd.", "HD Hyundai Heavy Industries Co.,Ltd.",
-            "Iljin Materials Co Ltd", "DAEDUCK ELECTRONICS Co., Ltd."])
+            "SK hynix Inc.", "Samsung Electronics Co., Ltd.", "HD Hyundai Heavy Industries Co., Ltd.",
+            "Lotte Energy Materials Corporation", "DAEDUCK ELECTRONICS Co., Ltd."])
         self.assertEqual({h["region"] for h in inputs.top_holdings}, {"South Korea"})
         self.assertEqual(inputs.top_holdings[0]["sector"], "Information Technology")
         printed = {row["sub_sector"]: row for row in inputs.sectors}
@@ -63,17 +69,34 @@ class KoreaSecuritiesTests(unittest.TestCase):
         order = [row["sub_sector"] for row in inputs.sectors]
         self.assertEqual(order, list(AUG_31_SECTORS))
 
-    def test_an_unknown_krx_code_stops_the_render_and_names_it(self):
-        with self.assertRaisesRegex(legacy.MonthlyArtifactError, "KRX code 999999"):
-            legacy.factsheet_inputs(_korea_snapshot({"999999": 1000000, "000660": 2000000}),
-                                    reporting_currencies=("KRW",))
+    def test_a_code_with_no_yahoo_name_stops_the_render_and_names_it(self):
+        snapshot = _korea_snapshot({"000660": 2000000, "005930": 1000000})
+        snapshot["sector_allocation"]["classifications"][1].pop("long_name")
+        with self.assertRaisesRegex(legacy.MonthlyArtifactError, "KRX code 005930"):
+            legacy.factsheet_inputs(snapshot, reporting_currencies=("KRW",))
 
-    def test_every_name_is_plain_ascii_so_the_factsheet_fonts_can_draw_it(self):
-        for code, (name, sector, sub_sector) in SECURITIES.items():
+    def test_a_korean_name_from_yahoo_stops_the_render(self):
+        snapshot = _korea_snapshot({"000660": 2000000})
+        snapshot["sector_allocation"]["classifications"][0]["long_name"] = "SK하이닉스"
+        with self.assertRaisesRegex(legacy.MonthlyArtifactError, "KRX code 000660"):
+            legacy.factsheet_inputs(snapshot, reporting_currencies=("KRW",))
+
+    def test_an_unmapped_yahoo_industry_stops_the_render_and_names_it(self):
+        snapshot = _korea_snapshot({"000660": 2000000})
+        snapshot["sector_allocation"]["classifications"][0]["sub_sector"] = "Shell Companies"
+        with self.assertRaisesRegex(legacy.MonthlyArtifactError, "KRX code 000660, Yahoo industry Shell Companies"):
+            legacy.factsheet_inputs(snapshot, reporting_currencies=("KRW",))
+
+    def test_every_industry_yahoo_gave_the_account_is_mapped(self):
+        for code, (name, sector, industry) in YAHOO.items():
             with self.subTest(code):
-                self.assertEqual(len(code), 6)
-                for text in (name, sector, sub_sector):
-                    self.assertTrue(text.isascii() and text.strip() == text and text)
+                self.assertIn(industry, INDUSTRIES)
+                self.assertTrue(name.isascii() and name)
+
+    def test_every_label_is_plain_ascii_so_the_factsheet_fonts_can_draw_it(self):
+        for industry, labels in INDUSTRIES.items():
+            for text in labels:
+                self.assertTrue(text.isascii() and text.strip() == text and text)
 
     def test_other_currencies_are_untouched(self):
         inputs = legacy.factsheet_inputs(stress.snapshot(currency="USD"), reporting_currencies=("USD",))

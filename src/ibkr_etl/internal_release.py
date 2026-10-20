@@ -14,6 +14,11 @@ ALLOWED_INTERNAL_BLOCKERS = frozenset(
         "sector_allocation:not_licensed_for_publication",
     }
 )
+# An owner's own design (factsheet_spec, template_version "spec:<sha>") has no crisis
+# replay component, so a missing replay leaves nothing on its pages unfilled (Korea
+# iStrategy, 20 October 2026). Every built-in design still requires one.
+CRISIS_REPLAY_BLOCKER = "risk:crisis_replay_unavailable"
+SPEC_TEMPLATE_PREFIX = "spec:"
 _BENCHMARK_LICENSE_BLOCKER = re.compile(
     r"(?:primary|secondary(?:_[1-9][0-9]*)?)_benchmark:not_licensed_for_publication\Z"
 )
@@ -47,9 +52,13 @@ def approve_internal_release(
 
     raw_blockers = snapshot.get("publication_blockers_json") or "[]"
     blockers = tuple(json.loads(raw_blockers) if isinstance(raw_blockers, str) else raw_blockers)
+    allowed = set(ALLOWED_INTERNAL_BLOCKERS)
+    if report_runs and all(str(row.get("template_version") or "").startswith(SPEC_TEMPLATE_PREFIX)
+                           for row in report_runs):
+        allowed.add(CRISIS_REPLAY_BLOCKER)
     unexpected = {
         blocker for blocker in blockers
-        if blocker not in ALLOWED_INTERNAL_BLOCKERS
+        if blocker not in allowed
         and not _BENCHMARK_LICENSE_BLOCKER.fullmatch(blocker)
     }
     if unexpected:

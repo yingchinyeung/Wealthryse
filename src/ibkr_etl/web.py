@@ -3853,7 +3853,7 @@ def _monthly_release_candidate(connection, subject_id: str, period_end: str, *, 
     runs = connection.execute(
         """
         SELECT generation_run_id, snapshot_id, report_type, status,
-               output_reference, output_sha256
+               output_reference, output_sha256, template_version
         FROM report_generation_runs
         WHERE tenant_id = %s AND snapshot_id = %s
           AND report_type IN ('factsheet', 'presentation')

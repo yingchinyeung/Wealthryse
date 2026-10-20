@@ -15,9 +15,11 @@ description:
     platform security key (silver.instruments), cost basis is Kiwoom''s average price times the quantity, and unrealised
     P&L is market value less cost basis. Today''s prices are those kt00004 lists. A past day''s are those ka01690
     lists, except from 14 Sep 2026, when ka01690 lists the 20:00 after-market price: each stock is then priced at
-    its official KRX close (ka10081, unadjusted), kept only when the holdings add up to Kiwoom''s own value (kt00016)
-    to the won. A KRW day''s positions add up to nav_snapshots.stock_text (rule kiwoom_positions_add_up_to_stock
-    there). A Kiwoom row''s row_sha256 is the sha256 of the row as written, not of a Flex row.'
+    its official KRX close, which is the next trading day''s base price on Kiwoom''s unadjusted daily chart (ka10081:
+    that day''s cur_prc less its pred_pre, since the chart''s own cur_prc is the last trade to 20:00), kept only
+    when the holdings add up to Kiwoom''s own value (kt00016) to the won. A KRW day''s positions add up to nav_snapshots.stock_text
+    (rule kiwoom_positions_add_up_to_stock there). A Kiwoom row''s row_sha256 is the sha256 of the row as written,
+    not of a Flex row.'
 tags:
 - silver
 - ibkr

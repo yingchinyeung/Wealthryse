@@ -339,6 +339,8 @@ def _factsheet_classification(
 
 
 def _company_name(holding: dict[str, Any]) -> str:
+    if holding.get("english_name"):
+        return str(holding["english_name"])
     symbol = str(holding.get("symbol") or "").upper()
     if symbol in FACTSHEET_COMPANY_NAMES:
         return FACTSHEET_COMPANY_NAMES[symbol]
@@ -727,6 +729,18 @@ def factsheet_inputs(
         snapshot["sector_allocation"].get("classification_basis")
         == "composite sleeve type"
     )
+    # KRX holdings (Kiwoom) carry Korean names and Yahoo labels: print the English name and the
+    # Korea iStrategy sectors instead, and stop on a code that has neither.
+    from .korea_securities import REGION as KOREA, KoreaSecurityError, is_krx, lookup as korea_lookup
+    for holding in holdings:
+        if not is_composite and is_krx(holding):
+            try:
+                name, sector, sub_sector = korea_lookup(holding)
+            except KoreaSecurityError as error:
+                raise MonthlyArtifactError(str(error)) from error
+            holding["english_name"] = name
+            classifications[str(holding.get("conid") or "")] = {
+                "symbol": holding.get("symbol"), "region": KOREA, "sector": sector, "sub_sector": sub_sector}
     if is_composite:
         for holding in holdings:
             component_type = str(holding.get("asset_category") or "").lower()

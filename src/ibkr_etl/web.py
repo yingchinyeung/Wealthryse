@@ -144,7 +144,7 @@ from .authorization import (
     subject_access_levels,
 )
 from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_guide
-from . import onboarding_v2_web
+from . import onboarding_v2_web, yahoo_disclosure
 from .broker_connections import onboarding_v2_enabled
 from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS, THEME_TOGGLE_HTML, WEB_FONT_FILES, web_font_bytes
@@ -242,23 +242,9 @@ ONBOARDING_REPORT_JOB_NAME = os.environ.get(
 ONBOARDING_ANALYTICS_JOB_NAME = os.environ.get(
     "ONBOARDING_ANALYTICS_JOB_NAME", "ibkrv2stg-onboard-analytics"
 ).strip()
-YAHOO_ONBOARDING_DISCLOSURE_VERSION = "yahoo-ticker-disclosure-v1"
-YAHOO_ONBOARDING_SCOPE = {
-    "data": ["current_ticker_symbols", "historical_ticker_symbols"],
-    "destination": "Yahoo Finance via yfinance",
-    "excluded": [
-        "raw_ibkr_files",
-        "ibkr_account_identifiers",
-        "flex_credentials",
-        "database_credentials",
-        "personal_information",
-    ],
-    "purposes": [
-        "provisional_sector_classification",
-        "crisis_period_price_retrieval",
-    ],
-}
-YAHOO_ONBOARDING_SCOPE_SHA256 = sha256_text(canonical_json(YAHOO_ONBOARDING_SCOPE))
+YAHOO_ONBOARDING_DISCLOSURE_VERSION = yahoo_disclosure.VERSION
+YAHOO_ONBOARDING_SCOPE = yahoo_disclosure.SCOPE
+YAHOO_ONBOARDING_SCOPE_SHA256 = yahoo_disclosure.SCOPE_SHA256
 COMPANY_LOGO_DATA_URI = (
     "data:image/png;base64,"
     "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"
@@ -334,6 +320,17 @@ SECURITY_HEADERS = {
         "form-action 'self'"
     ),
 }
+# A PDF the portal serves may be shown in a frame on the portal's own pages (the
+# factsheet designer's preview); every other response still refuses all framing.
+PDF_FRAME_ANCESTORS = "frame-ancestors 'self'"
+
+
+def security_headers_for(content_type: str | None) -> dict[str, str]:
+    headers = dict(SECURITY_HEADERS)
+    if (content_type or "").split(";")[0].strip().lower() == "application/pdf":
+        headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
+            "frame-ancestors 'none'", PDF_FRAME_ANCESTORS)
+    return headers
 
 
 def _identity_digest(value: str) -> str | None:
@@ -400,7 +397,7 @@ async def security_audit_middleware(request: Request, call_next):
         "SECURITY_AUDIT %s", json.dumps(event, sort_keys=True, separators=(",", ":"))
     )
     response.headers["X-Correlation-ID"] = request.state.correlation_id
-    for name, value in SECURITY_HEADERS.items():
+    for name, value in security_headers_for(response.headers.get("content-type")).items():
         response.headers[name] = value
     return response
 

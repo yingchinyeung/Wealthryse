@@ -61,7 +61,7 @@ def _with_overflow(spec: dict, overflow: str) -> dict:
 
 class SpecValidationTests(unittest.TestCase):
     def test_every_built_in_design_is_valid_and_hash_stable(self):
-        self.assertEqual(built_in_designs(), ["account-owner-template", "alpha-world-ms", "alpha-world-t"])
+        self.assertEqual(built_in_designs(), ["account-owner-template", "alpha-world-ms", "alpha-world-t", "korea-istrategy"])
         for design in built_in_designs():
             spec = load_design(design)
             self.assertEqual(spec_sha256(spec), spec_sha256(copy.deepcopy(spec)))

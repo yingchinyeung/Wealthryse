@@ -20,6 +20,8 @@ no model at all; with ``agent=None`` the result is the reader's draft, checked.
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,7 +29,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from . import bindings, components, compare, draft, patch, reader, stress
 from .engine import render_preview
-from .spec import spec_sha256
+from .spec import built_in_designs, load_design, spec_sha256
 
 MAX_ROUNDS = 6
 GOOD_ENOUGH = 0.985
@@ -138,6 +140,16 @@ def _render(spec: Mapping[str, Any], sample: Mapping[str, Any], template_path: s
     return pdf, result, comparison
 
 
+def measured_design(template_path: str | Path, currency: str) -> dict[str, Any] | None:
+    """The built-in design measured from this exact template (by SHA-256) in this currency, if there is one."""
+    digest = hashlib.sha256(Path(template_path).read_bytes()).hexdigest()
+    for design_id in built_in_designs():
+        design = load_design(design_id)
+        if design.get("template_sha256") == digest and currency in design.get("currencies", []):
+            return copy.deepcopy(design)
+    return None
+
+
 def build(template_path: str | Path, example_path: str | Path | None = None,
           snapshot: Mapping[str, Any] | None = None, *, design_id: str, title: str, currency: str,
           more_examples: Sequence[str | Path] = (), agent: DesignAgent | None = None, rounds: int = 4,
@@ -150,8 +162,16 @@ def build(template_path: str | Path, example_path: str | Path | None = None,
     found = reader.read(template_path, example_path, snapshot, more_examples=more_examples)
     drafted = draft.draft_spec(found, design_id=design_id, title=title, currency=currency, inputs=inputs)
     spec = drafted["spec"]
+    measured = measured_design(template_path, currency)
+    if measured is not None:
+        # The platform already has a design measured from this exact template: start from it, not
+        # from the reader's guesses. It is still rendered, stressed and checked below, with no repair rounds.
+        spec = {**measured, "design_id": design_id, "title": title}
+        drafted = {"spec": spec, "questions": []}
     sample = snapshot or stress.snapshot(currency=currency)
-    example_inv = found["example"]
+    # A measured design was checked against its completed example when it was made; an example
+    # exported again shifts the template's own text by a few points, which is not the design's doing.
+    example_inv = None if measured is not None else found["example"]
     # Without the example month's snapshot the preview prints other names and dates than the example,
     # so those cells are left out of the comparison; figures still match by shape and place.
     ignore = list(found["charts"]) + ([] if snapshot is not None else [
@@ -166,7 +186,7 @@ def build(template_path: str | Path, example_path: str | Path | None = None,
         if best is None or _score(entry) > best[0]:
             best = (_score(entry), spec, pdf)
         failed = entry.error is not None or (entry.checks or {}).get("status") == "fail"
-        if agent is None or (not failed and (comparison is None or comparison["score"] >= GOOD_ENOUGH)):
+        if agent is None or measured is not None or (not failed and (comparison is None or comparison["score"] >= GOOD_ENOUGH)):
             break
         if number == min(rounds, MAX_ROUNDS):
             break

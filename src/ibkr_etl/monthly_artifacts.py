@@ -7,7 +7,7 @@ import math
 import random
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -1123,6 +1123,33 @@ def _account_chart_month_ticks(start: date, end: date) -> tuple[date, ...]:
     return tuple(ticks)
 
 
+def _account_chart_date_labels(start: date, end: date) -> tuple[tuple[date, str], ...]:
+    """The account chart's dated gridlines and their labels.
+
+    The odd-month cadence leaves a history of a few weeks or months with one
+    label or none (Korea iStrategy's March and April 2025 factsheets, 20 October
+    2026). Such a history steps to every month, then to every Monday, so its
+    bottom axis is always dated.
+    """
+    ticks = _account_chart_month_ticks(start, end)
+    if len(ticks) < 2:
+        monthly = []
+        index = start.year * 12 + start.month  # the first of the month after start
+        while (tick := date(index // 12, index % 12 + 1, 1)) <= end:
+            monthly.append(tick)
+            index += 1
+        ticks = tuple(monthly)
+    if len(ticks) >= 2:
+        return tuple((tick, str(tick.year) if tick.month == 1 else tick.strftime("%b")) for tick in ticks)
+    mondays = []
+    day = start + timedelta(days=7 - start.weekday())
+    step = 7 if (end - start).days <= 42 else 14
+    while day <= end:
+        mondays.append(day)
+        day += timedelta(days=step)
+    return tuple((tick, f"{tick.day} {tick:%b}") for tick in mondays)
+
+
 def _draw_factsheet_page_two(
     c: canvas.Canvas, inputs: FactsheetInputs, page_width: float, page_height: float
 ) -> None:
@@ -1191,14 +1218,13 @@ def _draw_account_nav_chart(
     end_date = date.fromisoformat(normalized_nav[-1]["date"])
     start_ordinal = start_date.toordinal()
     ordinal_span = max(1, end_date.toordinal() - start_ordinal)
-    date_ticks = _account_chart_month_ticks(start_date, end_date)
+    date_ticks = _account_chart_date_labels(start_date, end_date)
     c.setFont("Helvetica", 6.5)
-    for tick_date in date_ticks:
+    for tick_date, label in date_ticks:
         x = x0 + width * (tick_date.toordinal() - start_ordinal) / ordinal_span
         c.setDash(2, 2)
         c.line(x, y0, x, y0 + height)
         c.setDash()
-        label = str(tick_date.year) if tick_date.month == 1 else tick_date.strftime("%b")
         c.saveState()
         c.translate(x - 2, y0 - 8)
         c.rotate(-45)

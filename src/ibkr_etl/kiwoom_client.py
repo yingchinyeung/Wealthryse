@@ -54,6 +54,9 @@ INQUIRY_APIS: Mapping[str, str] = {
     "ust21132": US_ACCOUNT_PATH,  # the same, on a past date
 }
 MAX_PAGES = 50
+# A slow or dropped answer is asked for again; every call this client can make only reads.
+TRANSPORT_TRIES = 3
+TRANSPORT_RETRY_SECONDS = 5
 TOKEN_MARGIN = timedelta(minutes=5)
 
 Transport = Callable[[str, Mapping[str, str], bytes], tuple[int, Mapping[str, str], Mapping[str, object]]]
@@ -299,11 +302,21 @@ class KiwoomClient:
                 self._sleep(self._min_interval - waited)
         self._last_call = self._clock()
         encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        status, response_headers, payload = self._transport(
-            self._host + path,
-            {"Content-Type": "application/json;charset=UTF-8", **headers},
-            encoded,
-        )
+        call = headers.get("api-id") or path
+        for attempt in range(TRANSPORT_TRIES):
+            try:
+                status, response_headers, payload = self._transport(
+                    self._host + path,
+                    {"Content-Type": "application/json;charset=UTF-8", **headers},
+                    encoded,
+                )
+                break
+            except OSError as error:  # a timeout or dropped connection; every call here only reads
+                if attempt + 1 == TRANSPORT_TRIES:
+                    raise KiwoomError(f"Kiwoom did not answer the call {call} after {TRANSPORT_TRIES} tries: "
+                                      f"{type(error).__name__}: {str(error)[:120]}") from error
+                self._sleep(TRANSPORT_RETRY_SECONDS * (attempt + 1))
+                self._last_call = self._clock()
         if not isinstance(payload, Mapping):
             raise KiwoomError(f"Kiwoom returned a non-JSON answer (HTTP {status})")
         code = payload.get("return_code", 0)
@@ -311,7 +324,6 @@ class KiwoomClient:
             message = str(payload.get("return_msg") or "no message")[:200]
             for secret in (self._app_key, self._app_secret):
                 message = message.replace(secret, "***")
-            call = headers.get("api-id") or path
             raise KiwoomError(f"Kiwoom refused the call {call} (HTTP {status}, code {code}): {message}")
         return response_headers, payload
 

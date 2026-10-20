@@ -104,6 +104,31 @@ class KiwoomClientTests(unittest.TestCase):
         # The price chart path carries the daily close only; it has no order or account change.
         self.assertEqual([api for api, path in INQUIRY_APIS.items() if path == CHART_PATH], ["ka10081"])
 
+    def test_a_slow_answer_is_asked_again_then_named(self) -> None:
+        fake = FakeKiwoom({"kt00004": [ACCOUNT]})
+        calls = []
+
+        def flaky(url, headers, body):
+            calls.append(headers.get("api-id"))
+            if headers.get("api-id") == "kt00004" and calls.count("kt00004") == 1:
+                raise TimeoutError("The read operation timed out")
+            return fake(url, headers, body)
+
+        client = KiwoomClient(environment="mock", app_key=APP_KEY, app_secret=APP_SECRET, transport=flaky,
+                              clock=fake.clock, sleep=fake.sleep)
+        self.assertEqual(client.inquire("kt00004", {})[0]["acnt_nm"], "Synthetic")
+        self.assertEqual(calls.count("kt00004"), 2)
+
+        def dead(url, headers, body):
+            if url.endswith("/oauth2/token"):
+                return fake(url, headers, body)
+            raise TimeoutError("The read operation timed out")
+
+        client = KiwoomClient(environment="mock", app_key=APP_KEY, app_secret=APP_SECRET, transport=dead,
+                              clock=fake.clock, sleep=fake.sleep)
+        with self.assertRaisesRegex(KiwoomError, "did not answer the call ka10081 after 3 tries"):
+            client.inquire("ka10081", {})
+
     def test_mock_and_live_hosts_only(self) -> None:
         self.assertEqual(set(HOSTS), {"live", "mock"})
         with self.assertRaises(ValueError):

@@ -113,7 +113,8 @@ class AccountParityTests(unittest.TestCase):
                     _same_paint(self, old, new)
 
     def test_the_korea_design_paints_what_the_live_account_factsheets_paint(self):
-        spec = dict(load_design("korea-istrategy"), template_sha256=None)
+        # With legacy truncation switched on, as AccountParityTests does for the account design.
+        spec = dict(_with_overflow(load_design("korea-istrategy"), "clip"), template_sha256=None)
         cases = [(case.case_id, case.build("USD")) for case in stress.CASES
                  if case.case_id in ("baseline", "long_names", "many_sectors", "five_years")]
         with tempfile.TemporaryDirectory() as root:

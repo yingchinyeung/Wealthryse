@@ -237,13 +237,7 @@ class MeasuredDesignTests(Files):
         self.assertEqual(korea["currencies"], ["KRW"])
         self.assertEqual(korea["template_sha256"],
                          "c286de93ca667ba1acc9d8d29647a8b4f9725a2d2235a45f27928b647542e780")
-        clipped = copy.deepcopy(account["pages"])
-        for page in clipped:
-            for layer in page["layers"]:
-                for op in layer.get("ops", []):
-                    if op["op"] == "table":
-                        op["overflow"] = "clip"
-        self.assertEqual(korea["pages"], clipped)
+        self.assertEqual(korea["pages"], account["pages"])
 
     def test_an_empty_overlay_renders(self):
         from ibkr_etl.factsheet_spec import stress

@@ -2,7 +2,7 @@
  "spec_version": 1,
  "design_id": "korea-istrategy",
  "title": "Korea iStrategy",
- "notes": "The Korea iStrategy factsheet (Kiwoom 5057-3559-11, KRW). Its template is the two-page account layout, so this is the account design pinned to the Korea template, measured against the completed 31 Aug 2026 factsheet. The designer starts a draft from it when that template is uploaded. Tables clip long names as the live account factsheets (Greater China, US Tech & Biotech, China & Hong Kong) do, so it paints exactly what their renderer paints.",
+ "notes": "The Korea iStrategy factsheet (Kiwoom 5057-3559-11, KRW). Its template is the two-page account layout, so this is the account design pinned to the Korea template, measured against the completed 31 Aug 2026 factsheet. The designer starts a draft from it when that template is uploaded. It paints exactly what the live account factsheets (Greater China, US Tech & Biotech, China & Hong Kong) paint, except that a name too long for its column is set smaller instead of cut short with '...', which the platform's checks refuse.",
  "inputs": "account",
  "base": "template",
  "template_sha256": "c286de93ca667ba1acc9d8d29647a8b4f9725a2d2235a45f27928b647542e780",
@@ -113,7 +113,7 @@
        "body_height": 8.5,
        "font_size": 4.7,
        "padding": 4.0,
-       "overflow": "clip"
+       "overflow": "shrink"
       },
       {
        "id": "p1.sectors",
@@ -190,7 +190,7 @@
        "header_height": 10.4,
        "body_height": 8.55,
        "font_size": 4.7,
-       "overflow": "clip"
+       "overflow": "shrink"
       },
       {
        "id": "p1.history",
@@ -254,7 +254,7 @@
        "header_height": 20.4,
        "body_height": 8.6,
        "font_size": 5.2,
-       "overflow": "clip"
+       "overflow": "shrink"
       },
       {
        "id": "p1.trailing_return",

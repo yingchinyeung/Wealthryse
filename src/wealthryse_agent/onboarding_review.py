@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Mapping, Sequence
@@ -108,6 +109,28 @@ def header_date(period_end: str) -> str:
 
 def month_label(period_end: str) -> str:
     return date.fromisoformat(period_end).strftime("%B %Y")
+
+
+# Text the visual QA quotes from a page, in straight or curly double quotes.
+_QUOTED = re.compile(r'["\u201c]([^"\u201c\u201d]{1,200})["\u201d]')
+
+
+def _squash(text: str) -> str:
+    return "".join(text.split()).casefold()
+
+
+def unconfirmed_quotes(message: str, pages: Sequence[str], page: int | None) -> list[str]:
+    """Quoted dates or figures in a visual QA point that the factsheet's own text does not contain.
+
+    Visual QA reads page images and can misread a digit (20 October 2026: it read the December 2025
+    table's last date 2025-12-30 as 2025-12-28). The PDF's text layer is what was printed, so a point
+    that quotes a date or figure the text does not have is a misreading, not a fault.
+    """
+    if not pages:
+        return []
+    texts = [pages[page - 1]] if page and 0 < page <= len(pages) else list(pages)
+    text = _squash(" ".join(texts))
+    return [q for q in _QUOTED.findall(message) if any(c.isdigit() for c in q) and _squash(q) not in text]
 
 
 def _finding(severity: str, period_end: str | None, report_type: str | None, message: str,
@@ -217,6 +240,7 @@ class HistoryReviewer:
         findings = coverage_findings(reports)
         usage: dict[str, int] = {}
         factsheets: dict[str, bytes] = {}
+        texts: dict[str, list[str]] = {}
         files_checked = 0
         for item in reports:
             period_end, kind = str(item["period_end"]), str(item["report_type"])
@@ -234,10 +258,11 @@ class HistoryReviewer:
                     findings += factsheet_findings(pages, period_end=period_end, display_name=display_name,
                                                    own_text=own_text)
                 factsheets[period_end] = file.content
+                texts[period_end] = list(pages)
                 files_checked += 1
             except documents.DocumentError as error:
                 findings.append(_finding("high", period_end, kind, error.message))
-        visual = self._visual(factsheets, findings, usage, designed=designed)
+        visual = self._visual(factsheets, findings, usage, designed=designed, texts=texts)
         months = sorted({str(item["period_end"]) for item in reports})
         evidence = {"files_checked": files_checked,
                     "files_listed": sum(str(item["report_type"]) in REVIEW_KINDS for item in reports),
@@ -259,10 +284,11 @@ class HistoryReviewer:
                       findings, evidence, usage)
 
     def _visual(self, factsheets: Mapping[str, bytes], findings: list[dict], usage: dict[str, int], *,
-                designed: bool = False) -> dict[str, Any]:
+                designed: bool = False, texts: Mapping[str, Sequence[str]] | None = None) -> dict[str, Any]:
         newest = sorted(factsheets)[-self.settings.visual_months:]
         looked: list[str] = []
         notes: list[dict[str, Any]] = []
+        misread: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         skipped = None
         qa = VisualQA(self.model()) if newest else None
@@ -287,13 +313,21 @@ class HistoryReviewer:
             looked.append(period_end)
             notes += [{"period_end": period_end, **n} for n in outcome.evidence.get("cosmetic_notes", [])]
             for objection in outcome.objections:
+                quotes = unconfirmed_quotes(objection["message"], (texts or {}).get(period_end, ()),
+                                            objection.get("page"))
+                if quotes:
+                    # Not raised to the owner: the page's text does not say what the point quotes.
+                    misread.append({"period_end": period_end, "page": objection.get("page"),
+                                    "message": objection["message"][:500], "not_in_page_text": quotes[:5]})
+                    continue
                 # The standard checklist does not know an owner's own layout, so its points are for the owner to read.
                 severity = "high" if "(high)" in objection["message"] and not designed else "medium"
                 findings.append({**_finding(severity, period_end, "factsheet", objection["message"],
                                             objection.get("page")), "region": objection.get("region")})
         return {"months_looked_at": len(looked), "months_with_factsheets": len(factsheets),
                 "not_looked_at": sorted(set(factsheets) - set(looked)), "skipped": skipped,
-                "model_errors": errors, "cosmetic_notes": notes[:20]}
+                "model_errors": errors, "cosmetic_notes": notes[:20],
+                "dismissed_as_misread": misread[:20]}
 
 
 def _verdict(findings: Sequence[Mapping[str, Any]], visual: Mapping[str, Any], files_checked: int,

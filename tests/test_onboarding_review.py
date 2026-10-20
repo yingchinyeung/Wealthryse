@@ -274,6 +274,28 @@ class DesignedReviewTests(unittest.TestCase):
         self.assertIn(f"Page 1 does not print the account's name ({KIWOOM}).", messages)
         self.assertIn("No page shows the report month March 2025.", messages)
 
+    def test_a_point_quoting_a_date_the_page_does_not_print_is_dismissed_as_a_misreading(self):
+        # 20 October 2026: visual QA read the December table's last date 2025-12-30 as 2025-12-28.
+        files = Files()
+        files.add("2025-12-31", "factsheet", designed_factsheet([KIWOOM, "December 2025", "2025-12-30 1.00"]))
+        misread = finding(1, "high", "wrong_period",
+                          'The heading runs to 31 Dec 2025, but the table\'s last printed date is "2025-12-28".')
+        team_model, _ = model([misread])
+        review = reviewer(files, team_model).review(designed_case(files))
+        self.assertEqual(review.findings, [])
+        self.assertEqual(review.outcome, "pass", review.summary)
+        dismissed = review.evidence["visual_qa"]["dismissed_as_misread"]
+        self.assertEqual([(d["period_end"], d["not_in_page_text"]) for d in dismissed], [("2025-12-31", ["2025-12-28"])])
+
+    def test_a_point_quoting_what_the_page_does_print_is_kept(self):
+        files = Files()
+        files.add("2025-12-31", "factsheet", designed_factsheet([KIWOOM, "December 2025", "2025-12-30 1.00"]))
+        team_model, _ = model([finding(1, "high", "wrong_period", 'The table ends on "2025-12-30", a day early.')])
+        review = reviewer(files, team_model).review(designed_case(files))
+        self.assertEqual(review.outcome, "warn", review.summary)
+        self.assertEqual(len(review.findings), 1)
+        self.assertEqual(review.evidence["visual_qa"]["dismissed_as_misread"], [])
+
     def test_a_missing_month_a_changed_file_or_commentary_still_fails_an_owner_design(self):
         files = Files()
         files.add("2025-03-31", "factsheet", designed_factsheet([KIWOOM, "March 2025"]))

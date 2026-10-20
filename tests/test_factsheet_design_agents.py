@@ -239,6 +239,14 @@ class MeasuredDesignTests(Files):
                          "c286de93ca667ba1acc9d8d29647a8b4f9725a2d2235a45f27928b647542e780")
         self.assertEqual(korea["pages"], account["pages"])
 
+    def test_the_us_design_is_the_account_design_pinned_to_its_template(self):
+        from ibkr_etl.factsheet_spec.spec import load_design
+        us, account = load_design("us-istrategy"), load_design("account-owner-template")
+        self.assertEqual(us["currencies"], ["USD", "KRW"])
+        self.assertEqual(us["template_sha256"],
+                         "6c6fd9e2eab7bb4d629103506df89a074bd22792a10b652134c77fefb0ed9c7c")
+        self.assertEqual(us["pages"], account["pages"])
+
     def test_an_empty_overlay_renders(self):
         from ibkr_etl.factsheet_spec import stress
         from ibkr_etl.factsheet_spec.engine import render_preview

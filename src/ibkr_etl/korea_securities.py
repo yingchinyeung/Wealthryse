@@ -12,6 +12,7 @@ reaches a factsheet.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 REGION = "South Korea"
@@ -83,7 +84,9 @@ def lookup(holding: Mapping[str, Any], classification: Mapping[str, Any] | None)
     if not name or not name.isascii():
         raise KoreaSecurityError(
             f"Yahoo has no English name stored for KRX code {symbol}; run the sector job for the account")
-    industry = " ".join(str(classification.get("sub_sector") or "").split())
+    # Yahoo's search writes some industries with a dash ("Banks—Regional") where its profile
+    # writes " - " ("Banks - Regional"); the sector job stores whichever answered.
+    industry = re.sub(r"\s*[\u2013\u2014]\s*", " - ", " ".join(str(classification.get("sub_sector") or "").split()))
     try:
         sector, sub_sector = INDUSTRIES[industry]
     except KeyError:

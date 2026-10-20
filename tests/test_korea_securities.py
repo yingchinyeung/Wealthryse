@@ -87,6 +87,15 @@ class KoreaSecuritiesTests(unittest.TestCase):
         with self.assertRaisesRegex(legacy.MonthlyArtifactError, "KRX code 000660, Yahoo industry Shell Companies"):
             legacy.factsheet_inputs(snapshot, reporting_currencies=("KRW",))
 
+    def test_yahoo_search_dashes_map_like_the_profile(self):
+        # Yahoo's search answered "Banks\u2014Regional" on 20 Oct 2026 where the profile says "Banks - Regional".
+        snapshot = _korea_snapshot({"105560": 2000000, "000100": 1000000})
+        snapshot["sector_allocation"]["classifications"][0]["sub_sector"] = "Banks\u2014Regional"
+        snapshot["sector_allocation"]["classifications"][1]["sub_sector"] = "Drug Manufacturers\u2014Specialty & Generic"
+        inputs = legacy.factsheet_inputs(snapshot, reporting_currencies=("KRW",))
+        self.assertEqual([row["sub_sector"] for row in inputs.sectors],
+                         ["Banks", "Pharmaceuticals, Biotechnology & Life Sciences"])
+
     def test_every_industry_yahoo_gave_the_account_is_mapped(self):
         for code, (name, sector, industry) in YAHOO.items():
             with self.subTest(code):

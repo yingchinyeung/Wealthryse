@@ -8,8 +8,10 @@ is loaded here instead, in USD, from the U.S. account calls:
     (ust21120);
   - each past U.S. trading day: USD cash and securities value (ust21132), which
     is Kiwoom's own daily total for the account. Kiwoom's past-day answer has no
-    per-holding rows, so a past day's positions are rebuilt from the movements
-    and must add up to that total before the day counts as stored;
+    per-holding rows, so a past day's positions are rebuilt from the movements,
+    Kiwoom's per-stock daily holding (usa21730) and daily closes (usa06012)
+    (UsHistoryPositions), and must add up to that total before the day counts as
+    stored;
   - every movement since the history start (ust21100), with the U.S. labels in
     ``US_KINDS``. Anything else fails the transactions check with the label
     shown.
@@ -18,8 +20,9 @@ The Korea path is untouched: ``is_usd_account`` decides per account, and an
 account in KRW never reaches this module.
 
 Kiwoom dates a past day by its U.S. trading day (ust21132 base_dt); its movement
-list (ust21100 deal_dt) is the Korean posting date, a day or two later for a
-trade. Cash and securities in Kiwoom's daily total are on the trade date.
+list (ust21100 deal_dt) is the Korean posting date, one or two U.S. trading days
+after the trade. Cash and securities in Kiwoom's daily total are on the trade
+date, as is its per-stock daily holding.
 """
 
 from __future__ import annotations
@@ -390,13 +393,174 @@ def stored_holdings(connection, account_id: str, day: date) -> list[Holding]:
     return held
 
 
+class UsHistoryPositions:
+    """Each past U.S. trading day's holdings at that day's close, from Kiwoom's own answers only.
+
+    - Shares: the movement list (ust21100) replayed, each trade counted from the Korean date on which
+      Kiwoom's per-stock daily holding (usa21730) changes by that trade. Kiwoom posts a trade a day or two
+      after the U.S. trade date, so the posting date alone is not used. A corporate action counts from its
+      posting date. A trade in a stock Kiwoom no longer lists counts from the day the other trades posted
+      with it count from, else two U.S. trading days before its posting date.
+    - Prices: each stock's unadjusted close for the day (usa06012), on the first exchange Kiwoom knows it on.
+    - A stock Kiwoom no longer lists (delisted after a merger or a paid cancellation) has no close. Its value
+      is what is left of Kiwoom's own securities value for the day (ust21132) after every listed stock. When
+      several are held, each takes its last known price except the one leaving the account soonest, which
+      takes the rest. Those prices are derived, not quoted, and the evidence says so.
+
+    Kiwoom is asked once per run, on the first day asked for.
+    """
+
+    def __init__(self, client: KiwoomClient, movements: Sequence[CashMovement], *, since: date, through: date,
+                 held_today: Iterable[str] = ()):
+        self._client = client
+        self._since, self._through = since, through
+        self._held_today = set(held_today)
+        self._moves: list[tuple[date, str, Decimal, bool, Decimal]] = []  # posted, ticker, shares, trade, cash
+        for movement in movements:
+            found = us_classify(movement)
+            if found is None or found[0] not in SHARE_KINDS or movement.security is None or not movement.quantity:
+                continue
+            self._moves.append((date.fromisoformat(movement.trade_date[:10]), movement.security.value,
+                                abs(movement.quantity) * SHARE_KINDS[found[0]], found[0] in ("BUY", "SELL"),
+                                abs(movement.amount)))
+        self._ready = False
+        self.closes: dict[str, dict[date, Decimal]] = {}
+        self.exchanges: dict[str, str] = {}
+        self.unlisted: set[str] = set()
+        self.counted_from: dict[tuple[date, str], date] = {}
+        self.derived: list[dict[str, str]] = []
+        self._last_price: dict[str, Decimal] = {}
+
+    def _prepare(self) -> None:
+        from .kiwoom_client import US_EXCHANGES, KiwoomUnknownStock
+
+        for ticker in sorted({ticker for _, ticker, *_ in self._moves} | self._held_today):
+            for exchange in US_EXCHANGES:
+                try:
+                    self.closes[ticker] = self._client.us_daily_closes(ticker, exchange, self._since, self._through)
+                except KiwoomUnknownStock:
+                    continue
+                self.exchanges[ticker] = exchange
+                break
+            else:
+                self.unlisted.add(ticker)
+        # Net shares each posting date moved, per stock, and Kiwoom's own day for it.
+        groups: dict[tuple[date, str], tuple[Decimal, bool]] = {}
+        for posted, ticker, shares, trade, _ in self._moves:
+            total, was_trade = groups.get((posted, ticker), (Decimal("0"), False))
+            groups[(posted, ticker)] = (total + shares, was_trade or trade)
+        for ticker, exchange in sorted(self.exchanges.items()):
+            posted_days = sorted(posted for posted, item in groups if item == ticker)
+            quantities: dict[date, Decimal] = {}
+            for start, end in _windows_around(posted_days, floor=self._since - timedelta(days=1)):
+                quantities.update(self._client.us_stock_quantities(ticker, exchange, start, end))
+            for posted in posted_days:
+                shares = groups[(posted, ticker)][0]
+                for back in range(8):
+                    day = posted - timedelta(days=back)
+                    before, after = quantities.get(day - timedelta(days=1)), quantities.get(day)
+                    if before is not None and after is not None and after - before == shares:
+                        self.counted_from[(posted, ticker)] = day
+                        break
+        for (posted, ticker), (_, trade) in sorted(groups.items()):
+            if (posted, ticker) in self.counted_from:
+                continue
+            if not trade:
+                self.counted_from[(posted, ticker)] = posted
+                continue
+            alongside = [day for (other_posted, _), day in self.counted_from.items() if other_posted == posted]
+            self.counted_from[(posted, ticker)] = (max(set(alongside), key=alongside.count) if alongside
+                                                   else _sessions_before(posted, 2))
+        self._ready = True
+
+    def __call__(self, day: date, figures: UsDay) -> list[Holding] | None:
+        if not self._ready:
+            self._prepare()
+        held: dict[str, Decimal] = {}
+        cost: dict[str, Decimal] = {}
+        for posted, ticker, shares, trade, cash in sorted(self._moves, key=lambda item: item[0]):
+            if self.counted_from[(posted, ticker)] > day:
+                continue
+            before = held.get(ticker, Decimal("0"))
+            if trade and shares > 0:
+                cost[ticker] = cost.get(ticker, Decimal("0")) + cash
+                self._last_price.setdefault(ticker, cash / shares)
+            elif before:
+                cost[ticker] = cost.get(ticker, Decimal("0")) * (before + shares) / before
+            held[ticker] = before + shares
+        holdings, unlisted = [], []
+        listed_value = Decimal("0")
+        for ticker, quantity in sorted(held.items()):
+            if not quantity:
+                continue
+            if ticker in self.unlisted:
+                if ticker in self._held_today:
+                    return None  # a stock still held must have Kiwoom's close
+                unlisted.append(ticker)
+                continue
+            close = self.closes.get(ticker, {}).get(day)
+            if close is None:
+                return None
+            value = quantity * close
+            listed_value += value
+            holdings.append(self._holding(ticker, quantity, cost.get(ticker, Decimal("0")), close, value))
+        if unlisted:
+            rest = figures.securities_value - listed_value
+            leaving = min(unlisted, key=lambda ticker: (self._next_exit(ticker, day), ticker))
+            values = {ticker: held[ticker] * self._last_price.get(ticker, Decimal("0"))
+                      for ticker in unlisted if ticker != leaving}
+            values[leaving] = rest - sum(values.values(), Decimal("0"))
+            if any(value < 0 for value in values.values()):
+                values = {ticker: held[ticker] * self._last_price.get(ticker, Decimal("0")) for ticker in unlisted}
+            for ticker in unlisted:
+                price = (values[ticker] / held[ticker]).quantize(Decimal("0.0001"))
+                if ticker == leaving or len(unlisted) == 1:
+                    self._last_price[ticker] = price
+                self.derived.append({"date": day.isoformat(), "ticker": ticker, "price": _text(price)})
+                holdings.append(self._holding(ticker, held[ticker], cost.get(ticker, Decimal("0")), price,
+                                              values[ticker]))
+        return holdings
+
+    def _next_exit(self, ticker: str, day: date) -> date:
+        exits = [self.counted_from[(posted, item)] for posted, item, shares, *_ in self._moves
+                 if item == ticker and shares < 0 and self.counted_from[(posted, item)] > day]
+        return min(exits) if exits else date.max
+
+    def _holding(self, ticker: str, quantity: Decimal, cost: Decimal, price: Decimal, value: Decimal) -> Holding:
+        return Holding(SecurityIdentifier("us_ticker", ticker), ticker, quantity, cost / quantity if quantity else
+                       Decimal("0"), price, value, BASE_CURRENCY, self.exchanges.get(ticker) and "US")
+
+
+def _sessions_before(day: date, count: int) -> date:
+    from .market_calendar import CALENDARS
+
+    for _ in range(count):
+        day -= timedelta(days=1)
+        while not CALENDARS["XNYS"].is_session(day):
+            day -= timedelta(days=1)
+    return day
+
+
+def _windows_around(days: Sequence[date], *, floor: date) -> list[tuple[date, date]]:
+    """Date ranges covering a week before to a day after each posting date, merged where they touch."""
+
+    windows: list[list[date]] = []
+    for day in sorted(days):
+        start, end = max(day - timedelta(days=6), floor), day + timedelta(days=1)
+        if windows and start <= windows[-1][1] + timedelta(days=1):
+            windows[-1][1] = max(windows[-1][1], end)
+        else:
+            windows.append([start, end])
+    return [(start, end) for start, end in windows]
+
+
 def build_us_history(connection, client: KiwoomClient, *, account_id: str, display_name: str, history_start: date,
                      today: date, now: datetime, positions_on=None,
                      limit: int = US_HISTORY_DAYS_PER_RUN) -> dict[str, Any]:
     """Fill past U.S. trading days from Kiwoom's daily total (ust21132) and say what is left.
 
-    ``positions_on(day)`` gives a past day's holdings at that day's close, or None
-    while Kiwoom's per-stock prices are not read yet. A day is stored either way
+    ``positions_on(day, figures)`` gives a past day's holdings at that day's close
+    (UsHistoryPositions), or None when a stock's close is missing. A day is stored either way
     (its total and cash are Kiwoom's), but only counts as done once its positions
     add up to Kiwoom's securities value; until then the check stays pending.
     """
@@ -412,8 +576,8 @@ def build_us_history(connection, client: KiwoomClient, *, account_id: str, displ
     without_positions, gaps = [], []
     for day in batch:
         figures = collect_past_day(client, day)
-        holdings = positions_on(day) if positions_on is not None else None
-        if holdings is None:
+        holdings = positions_on(day, figures) if positions_on is not None else None
+        if holdings is None or abs(position_gap(figures, holdings)) > Decimal("0.01") * max(1, len(holdings)):
             # The daily run's positions for the day stay when they add up to Kiwoom's total for it.
             kept = stored_holdings(connection, account_id, day)
             if kept and abs(position_gap(figures, kept)) <= Decimal("0.01") * len(kept):
@@ -434,11 +598,18 @@ def build_us_history(connection, client: KiwoomClient, *, account_id: str, displ
                 "days_done": done, "days_left": len(remaining),
                 "days_without_positions_this_run": len(without_positions),
                 "without_positions": without_positions[:20], "gaps": gaps[:20],
-                "basis": "Kiwoom's daily USD cash and securities value (ust21132), U.S. trading days"}
+                "basis": "Kiwoom's daily USD cash and securities value (ust21132), U.S. trading days; each "
+                         "stock's shares (ust21100 dated by usa21730) at its close (usa06012)"}
+    derived = getattr(positions_on, "derived", None)
+    if derived:
+        evidence["derived_prices"] = {"days": len({item["date"] for item in derived}),
+                                      "tickers": sorted({item["ticker"] for item in derived}),
+                                      "basis": "Kiwoom's securities value less every listed stock at its close, "
+                                               "for stocks Kiwoom no longer lists"}
     if remaining or without_positions or gaps:
         reason = (f"{len(remaining)} more days are filled on the next runs" if remaining else
                   f"{len(gaps)} days' positions do not add up to Kiwoom's securities value" if gaps else
-                  "each day's per-stock values wait on Kiwoom's U.S. daily prices")
+                  "some days have a stock without Kiwoom's close for the day")
         return {"status": "pending", "evidence": evidence,
                 "message": f"{done} past days complete; {reason}."}
     return {"status": "pass", "evidence": evidence,
@@ -486,9 +657,13 @@ def run_target(connection, tenant_id: str, client: KiwoomClient, target, *, now:
     result: dict[str, Any] = {"status": "loaded", "stage": stage, "market": "US",
                               "rows": {table: len(items) for table, items in {**rows, **moved}.items()}}
     if stage in HISTORY_STAGES or stage in REFRESH_STAGES:
+        positions = UsHistoryPositions(client, movements, since=target.history_start, through=day,
+                                       held_today=[holding.code for holding in valuation.holdings])
+
         def build():
             return build_us_history(connection, client, account_id=account_id, display_name=target.display_name,
-                                    history_start=target.history_start, today=day, now=now)
+                                    history_start=target.history_start, today=day, now=now,
+                                    positions_on=positions)
 
         result["history"] = _history_record(connection, tenant_id, target, build, record=stage == "build_history")
     return result

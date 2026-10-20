@@ -5,10 +5,11 @@ import unittest
 from datetime import date, datetime, timezone
 from decimal import Decimal
 
-from ibkr_etl.kiwoom_client import CashMovement, CurrencyBalance, Holding, KiwoomError, UsValuation
+from ibkr_etl.kiwoom_client import CashMovement, CurrencyBalance, Holding, KiwoomError, KiwoomUnknownStock, UsValuation
 from ibkr_etl.kiwoom_collector import Securities
 from ibkr_etl.kiwoom_us_account import (
     UsDay,
+    UsHistoryPositions,
     day_from_balances,
     is_usd_account,
     position_gap,
@@ -143,6 +144,92 @@ class RowAndCheckTests(unittest.TestCase):
         self.assertEqual(checks["transactions_loaded"]["status"], "fail")
         self.assertIn("AMGN", checks["transactions_loaded"]["message"])
 
+
+
+class FakeHistoryKiwoom:
+    """Kiwoom's closes and per-stock daily holdings for a synthetic account; GONE is no longer listed."""
+
+    def __init__(self, closes, quantities):
+        self.closes, self.quantities, self.calls = closes, quantities, []
+
+    def us_daily_closes(self, ticker, exchange, since, through):
+        self.calls.append(("usa06012", ticker, exchange))
+        if ticker not in self.closes or exchange != "NY":
+            raise KiwoomUnknownStock("[1903:no such stock]")
+        return {day: price for day, price in self.closes[ticker].items() if since <= day <= through}
+
+    def us_stock_quantities(self, ticker, exchange, start, end):
+        self.calls.append(("usa21730", ticker, exchange))
+        return {day: count for day, count in self.quantities.get(ticker, {}).items() if start <= day <= end}
+
+
+def _days(*pairs):
+    return {date.fromisoformat(day): Decimal(value) for day, value in pairs}
+
+
+GONE = SecurityIdentifier("us_ticker", "GONE")
+LATE = SecurityIdentifier("us_ticker", "LATE")
+
+
+class HistoryPositionTests(unittest.TestCase):
+    def setUp(self):
+        # AMGN bought on Mon 2 Mar 2026 (posted Wed 4 Mar, Kiwoom counts it from 2 Mar); GONE bought with it and
+        # cancelled for cash posted 6 Mar; LATE bought on 3 Mar and cancelled later, never listed either.
+        self.moves = [
+            _move("20260304", "매수", "매매", AMGN, "2", "600.00"),
+            _move("20260304", "매수", "매매", GONE, "10", "300.00"),
+            _move("20260305", "매수", "매매", LATE, "5", "100.00"),
+            _move("20260306", "유상소각출고(적요)", "입출고", GONE, "10", "0"),
+            _move("20260310", "유상소각출고(적요)", "입출고", LATE, "5", "0"),
+        ]
+        self.kiwoom = FakeHistoryKiwoom(
+            {"AMGN": _days(("2026-02-27", "290"), ("2026-03-02", "300"), ("2026-03-03", "310"),
+                           ("2026-03-04", "305"), ("2026-03-05", "320"), ("2026-03-06", "330"))},
+            {"AMGN": _days(("2026-02-27", "0"), ("2026-03-01", "0"), ("2026-03-02", "2"), ("2026-03-03", "2"),
+                           ("2026-03-04", "2"), ("2026-03-05", "2"))})
+        self.positions = UsHistoryPositions(self.kiwoom, self.moves, since=date(2026, 2, 27),
+                                            through=date(2026, 3, 6), held_today=["AMGN"])
+
+    def _on(self, day, securities_value):
+        held = self.positions(date.fromisoformat(day), UsDay(date.fromisoformat(day), Decimal("0"),
+                                                             Decimal(securities_value), Decimal("1400")))
+        return {h.code: (h.quantity, h.price, h.market_value) for h in held}
+
+    def test_a_trade_counts_from_the_day_kiwoom_counts_it(self):
+        self.assertEqual(self._on("2026-02-27", "0"), {})
+        held = self._on("2026-03-02", "900")
+        self.assertEqual(held["AMGN"], (Decimal("2"), Decimal("300"), Decimal("600")))
+        # GONE has no per-stock holding at Kiwoom; it counts from the day the trade posted with it counts from.
+        self.assertEqual(held["GONE"], (Decimal("10"), Decimal("30"), Decimal("300")))
+
+    def test_one_unlisted_stock_takes_the_rest_of_kiwooms_total(self):
+        held = self._on("2026-03-02", "912.50")
+        self.assertEqual(held["GONE"], (Decimal("10"), Decimal("31.25"), Decimal("312.50")))
+        self.assertEqual(sum(value for *_, value in held.values()), Decimal("912.50"))
+
+    def test_with_two_unlisted_the_one_leaving_soonest_takes_the_rest(self):
+        self._on("2026-03-02", "912.50")
+        # LATE is two U.S. sessions before its posting date (no other trade posted with it): Tue 3 Mar.
+        held = self._on("2026-03-03", "1050")
+        self.assertEqual(held["LATE"], (Decimal("5"), Decimal("20"), Decimal("100")))  # its trade price
+        self.assertEqual(held["GONE"][2], Decimal("1050") - 620 - 100)
+
+    def test_a_corporate_action_counts_from_its_posting_date(self):
+        self.assertIn("GONE", self._on("2026-03-05", "1000"))
+        self.assertNotIn("GONE", self._on("2026-03-06", "760"))
+
+    def test_a_stock_still_held_without_a_close_leaves_the_day_open(self):
+        positions = UsHistoryPositions(FakeHistoryKiwoom({}, {}), self.moves, since=date(2026, 2, 27),
+                                       through=date(2026, 3, 6), held_today=["AMGN"])
+        self.assertIsNone(positions(date(2026, 3, 2), UsDay(date(2026, 3, 2), Decimal(0), Decimal(900),
+                                                            Decimal(1400))))
+
+    def test_kiwoom_is_asked_once_per_run(self):
+        self._on("2026-03-02", "900")
+        asked = len(self.kiwoom.calls)
+        self._on("2026-03-03", "1050")
+        self.assertEqual(len(self.kiwoom.calls), asked)
+        self.assertIn(("usa06012", "AMGN", "NY"), self.kiwoom.calls)
 
 if __name__ == "__main__":
     unittest.main()

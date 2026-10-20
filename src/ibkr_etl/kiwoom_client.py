@@ -38,6 +38,7 @@ TOKEN_PATH = "/oauth2/token"
 REVOKE_PATH = "/oauth2/revoke"
 ACCOUNT_PATH = "/api/dostk/acnt"
 US_ACCOUNT_PATH = "/api/us/acnt"
+US_CHART_PATH = "/api/us/chart"
 CHART_PATH = "/api/dostk/chart"
 INQUIRY_APIS: Mapping[str, str] = {
     "kt00001": ACCOUNT_PATH,  # deposit detail
@@ -52,7 +53,11 @@ INQUIRY_APIS: Mapping[str, str] = {
     "ust21100": US_ACCOUNT_PATH,  # US transaction history
     "ust21120": US_ACCOUNT_PATH,  # deposits and securities value by currency
     "ust21132": US_ACCOUNT_PATH,  # the same, on a past date
+    "usa06012": US_CHART_PATH,  # US daily price chart: a stock's close by U.S. trading day
+    "usa21730": US_ACCOUNT_PATH,  # US per-stock daily holding: shares held on each Korean date
 }
+# Kiwoom's U.S. exchange codes (stex_tp): NASDAQ, NYSE, AMEX. A stock is asked for on each in turn.
+US_EXCHANGES = ("ND", "NY", "NA")
 MAX_PAGES = 50
 # A slow or dropped answer is asked for again; every call this client can make only reads.
 TRANSPORT_TRIES = 3
@@ -64,6 +69,10 @@ Transport = Callable[[str, Mapping[str, str], bytes], tuple[int, Mapping[str, st
 
 class KiwoomError(RuntimeError):
     """A Kiwoom refusal or malformed answer. Never carries keys or tokens."""
+
+
+class KiwoomUnknownStock(KiwoomError):
+    """Kiwoom has no such stock on that exchange (its code 1903), e.g. one delisted after a merger."""
 
 
 # Kiwoom answered Python's default user agent with a bare HTTP 400; the fixed-address probe
@@ -249,6 +258,10 @@ def _yyyymmdd(value: date) -> str:
     return value.strftime("%Y%m%d")
 
 
+def _kiwoom_date(value: object) -> date:
+    return datetime.strptime(str(value).strip().replace("-", ""), "%Y%m%d").date()
+
+
 def chart_closes(pages: list[Mapping[str, object]]) -> dict[str, Decimal]:
     """Each day's official 15:30 KRX close (YYYYMMDD) from ka10081 daily chart pages. Pure, so bronze
     can be re-read.
@@ -333,7 +346,8 @@ class KiwoomClient:
             message = str(payload.get("return_msg") or "no message")[:200]
             for secret in (self._app_key, self._app_secret):
                 message = message.replace(secret, "***")
-            raise KiwoomError(f"Kiwoom refused the call {call} (HTTP {status}, code {code}): {message}")
+            refusal = KiwoomUnknownStock if "[1903:" in message else KiwoomError
+            raise refusal(f"Kiwoom refused the call {call} (HTTP {status}, code {code}): {message}")
         return response_headers, payload
 
     def _bearer(self) -> str:
@@ -560,6 +574,33 @@ class KiwoomClient:
         if len(set(currencies)) != len(currencies):
             raise KiwoomError("Kiwoom listed a currency twice")
         return tuple(balances)
+
+    def us_daily_closes(self, ticker: str, exchange: str, since: date, through: date) -> dict[date, Decimal]:
+        """A U.S. stock's unadjusted close in USD for each U.S. trading day from since to through (usa06012).
+
+        Kiwoom's chart runs backwards from strt_dt, about 100 trading days a page.
+        """
+
+        body = {"stex_tp": exchange, "stk_cd": ticker, "strt_dt": _yyyymmdd(through), "upd_stkpc_tp": "0",
+                "exrt_appl_tp": "0"}
+        closes: dict[date, Decimal] = {}
+        for page in self.inquire("usa06012", body, max_pages=(through - since).days // 140 + 2):
+            for row in page.get("result_list") or []:
+                day = _kiwoom_date(_field(row, "dt"))
+                if since <= day <= through:
+                    closes[day] = kiwoom_number(_field(row, "cur_prc"), unsigned=True)
+        return closes
+
+    def us_stock_quantities(self, ticker: str, exchange: str, start: date, end: date) -> dict[date, Decimal]:
+        """Shares of one U.S. stock held at each Korean date from start to end (usa21730)."""
+
+        quantities: dict[date, Decimal] = {}
+        body = {"from": _yyyymmdd(start), "to": _yyyymmdd(end), "stex_tp": exchange, "stk_cd": ticker}
+        for page in self.inquire("usa21730", body):
+            for row in page.get("result_list") or []:
+                quantities.setdefault(_kiwoom_date(_field(row, "frst_base_dt")), kiwoom_number(row["frst_qty"]))
+                quantities[_kiwoom_date(_field(row, "last_base_dt"))] = kiwoom_number(_field(row, "last_qty"))
+        return quantities
 
     def us_transactions(self, start: date, end: date) -> list[CashMovement]:
         """Every US trade, deposit, currency exchange and dividend between two dates (ust21100)."""

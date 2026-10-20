@@ -425,8 +425,8 @@ US_NOW = datetime(2026, 10, 20, 8, 30, tzinfo=timezone.utc)  # shows Monday 19 O
 class FakeUsKiwoom:
     """A U.S.-only account: one stock bought on the first day, USD cash, Kiwoom's daily totals."""
 
-    def __init__(self, *, extra_shares="0"):
-        self.revoked, self.asked, self.extra = False, [], Decimal(extra_shares)
+    def __init__(self, *, extra_shares="0", listed=True):
+        self.revoked, self.asked, self.extra, self.listed = False, [], Decimal(extra_shares), listed
 
     def valuation(self):
         raise AssertionError("A USD account is never read through the domestic calls")
@@ -451,6 +451,25 @@ class FakeUsKiwoom:
         self.asked.append(day)
         return (CurrencyBalance("USD", Decimal("100"), Decimal("800"), Decimal("1400")),)
 
+    def us_daily_closes(self, ticker, exchange, since, through):
+        from ibkr_etl.kiwoom_client import KiwoomUnknownStock
+
+        if not self.listed or exchange != "ND":
+            raise KiwoomUnknownStock("Kiwoom refused the call usa06012 (HTTP 200, code 7): [1903:no such stock]")
+        day, closes = since, {}
+        while day <= through:
+            closes[day] = Decimal("400")
+            day += timedelta(days=1)
+        return closes
+
+    def us_stock_quantities(self, ticker, exchange, start, end):
+        # Kiwoom counts the buy posted on 2 Sep from the U.S. trade day, 1 Sep.
+        day, held = start, {}
+        while day <= end:
+            held[day] = Decimal("2") if day >= date(2026, 9, 1) else Decimal("0")
+            day += timedelta(days=1)
+        return held
+
     def revoke(self):
         self.revoked = True
 
@@ -465,17 +484,17 @@ class KiwoomUsAccountDatabaseTests(KiwoomCollectorDatabaseTests):
         super().setUp()
 
     def test_us_a_usd_case_loads_in_usd_and_passes_stage_two(self):
-        connection_id, case_id = self._kiwoom_account("6346000001", start=date(2026, 9, 1), currency="USD")
+        connection_id, case_id = self._kiwoom_account("9900000001", start=date(2026, 9, 1), currency="USD")
         self.addCleanup(self._cancel, case_id)
         client = FakeUsKiwoom()
-        result = self._run({"6346000001": client}, now=US_NOW)[0]
+        result = self._run({"9900000001": client}, now=US_NOW)[0]
         self.assertEqual((result["status"], result["market"]), ("loaded", "US"))
         self.assertTrue(client.revoked)
         self.assertEqual(self._checks(case_id), {
             "connection_sees_account": "pass", "account_not_already_onboarded": "pass",
             "holdings_and_cash_loaded": "pass", "transactions_loaded": "pass", "securities_mapped": "pass",
             "nav_reconciled": "pass"})
-        account = "KIWOOM-6346000001"
+        account = "KIWOOM-9900000001"
         nav = self.db.execute("SELECT currency, total_text, stock_text, cash_text FROM nav_snapshots "
                               "WHERE account_id = ? AND snapshot_date = '2026-10-19'", (account,)).fetchone()
         self.assertEqual((nav["currency"], nav["total_text"], nav["stock_text"], nav["cash_text"]),
@@ -490,33 +509,46 @@ class KiwoomUsAccountDatabaseTests(KiwoomCollectorDatabaseTests):
                          "USD")
 
     def test_us_shares_that_do_not_add_up_fail_transactions(self):
-        _, case_id = self._kiwoom_account("6346000002", start=date(2026, 9, 1), currency="USD")
+        _, case_id = self._kiwoom_account("9900000002", start=date(2026, 9, 1), currency="USD")
         self.addCleanup(self._cancel, case_id)
-        self._run({"6346000002": FakeUsKiwoom(extra_shares="1")}, now=US_NOW)
+        self._run({"9900000002": FakeUsKiwoom(extra_shares="1")}, now=US_NOW)
         self.assertEqual(self._checks(case_id)["transactions_loaded"], "fail")
 
-    def test_us_history_stores_kiwoom_totals_and_waits_for_positions(self):
-        _, case_id = self._kiwoom_account("6346000003", start=date(2026, 9, 1), currency="USD")
+    def test_us_history_rebuilds_each_day_from_kiwoom(self):
+        _, case_id = self._kiwoom_account("9900000003", start=date(2026, 9, 1), currency="USD")
         self.addCleanup(self._cancel, case_id)
         client = FakeUsKiwoom()
-        result = self._run({"6346000003": client}, now=US_NOW)[0]
+        result = self._run({"9900000003": client}, now=US_NOW)[0]
         # Load and reconcile: past New York sessions are filled, no check recorded yet.
         self.assertEqual(result["history"]["recorded"], False)
         self.assertNotIn(date(2026, 9, 7), client.asked)  # Labor Day
         self.assertEqual(client.asked[0], date(2026, 9, 1))
         self.assertEqual(client.asked[-1], date(2026, 10, 16))
-        self.assertEqual(result["history"]["check"], "pending")
+        self.assertEqual(result["history"]["check"], "pass")
+        account = "KIWOOM-9900000003"
         stored = self.db.execute("SELECT count(*) AS n FROM nav_snapshots WHERE account_id = ? AND currency = 'USD'",
-                                 ("KIWOOM-6346000003",)).fetchone()["n"]
+                                 (account,)).fetchone()["n"]
         self.assertEqual(stored, len(client.asked) + 1)
+        first = self.db.execute("SELECT quantity_text, mark_price_text, market_value_text FROM position_snapshots "
+                                "WHERE account_id = ? AND snapshot_date = '2026-09-01'", (account,)).fetchone()
+        self.assertEqual((first["quantity_text"], first["mark_price_text"], first["market_value_text"]),
+                         ("2", "400", "800"))
+
+    def test_us_a_stock_kiwoom_does_not_list_takes_the_rest_of_its_total(self):
+        _, case_id = self._kiwoom_account("9900000005", start=date(2026, 9, 1), currency="USD")
+        self.addCleanup(self._cancel, case_id)
+        client = FakeUsKiwoom(listed=False)
+        result = self._run({"9900000005": client}, now=US_NOW)[0]
+        # Still held today, so the stock must have Kiwoom's close: the past days wait.
+        self.assertEqual(result["history"]["check"], "pending")
 
     def test_us_the_history_pass_keeps_the_daily_positions_that_add_up(self):
-        _, case_id = self._kiwoom_account("6346000004", start=date(2026, 10, 1), currency="USD")
+        _, case_id = self._kiwoom_account("9900000004", start=date(2026, 10, 1), currency="USD")
         self.addCleanup(self._cancel, case_id)
-        account = "KIWOOM-6346000004"
-        self._run({"6346000004": FakeUsKiwoom()}, now=US_NOW)
+        account = "KIWOOM-9900000004"
+        self._run({"9900000004": FakeUsKiwoom()}, now=US_NOW)
         client = FakeUsKiwoom()
-        self._run({"6346000004": client}, now=US_NOW + timedelta(days=1))
+        self._run({"9900000004": client}, now=US_NOW + timedelta(days=1))
         self.assertIn(date(2026, 10, 19), client.asked)
         row = self.db.execute(
             "SELECT r.run_type, (SELECT count(*) FROM position_snapshots p WHERE p.account_id = n.account_id "

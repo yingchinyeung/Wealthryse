@@ -5,8 +5,10 @@ for every other account: the sector job stores Yahoo's English company name
 (long_name) and its sector and industry with each classification. Yahoo's
 labels are not the ones the U.S. iStrategy factsheet prints, so Yahoo's
 industry is mapped to the sector and sub-sector of the owner's 31 Aug 2026
-factsheet; the map reproduces that month's sector table, and the industries the
-account held in other months follow the same groups. Every holding prints
+factsheet, and the industries the account held in other months follow the same
+groups. Yahoo's industry decides each holding's row: the owner chose Yahoo's
+current label for QXO (Industrial Distribution, so Capital Goods) over the
+Software & Services row the 31 Aug factsheet printed. Every holding prints
 "United States" as its region. A holding with no Yahoo name, or an industry the
 map does not know, stops the render and names the ticker, so a guessed name or
 sector never reaches a factsheet.
@@ -96,14 +98,6 @@ INDUSTRIES: dict[str, tuple[str, str]] = {
     "Other Industrial Metals & Mining": (MAT, "Metals & Mining"),
 }
 
-# Tickers the owner's factsheet places apart from Yahoo's current industry. Yahoo now files QXO
-# under Industrial Distribution (after its building-products acquisition); the owner's 31 Aug 2026
-# factsheet prints it in Software & Services.
-SYMBOLS: dict[str, tuple[str, str]] = {
-    "QXO": (IT, SOFTWARE),
-}
-
-
 class UsIstrategySecurityError(ValueError):
     pass
 
@@ -119,8 +113,6 @@ def lookup(holding: Mapping[str, Any], classification: Mapping[str, Any] | None)
     # Yahoo's search writes some industries with a dash ("Banks—Diversified") where its profile
     # writes " - " ("Banks - Diversified"); the sector job stores whichever answered.
     industry = re.sub(r"\s*[–—]\s*", " - ", " ".join(str(classification.get("sub_sector") or "").split()))
-    if symbol in SYMBOLS:
-        return name, *SYMBOLS[symbol]
     try:
         sector, sub_sector = INDUSTRIES[industry]
     except KeyError:

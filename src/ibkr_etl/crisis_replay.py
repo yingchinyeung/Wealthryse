@@ -805,14 +805,38 @@ def refresh_crisis_replay(
     if not holdings:
         raise RuntimeError(f"No holdings are available for {account_id} on {latest}")
     cache = price_cache if price_cache is not None else {}
-    reporting = (reporting_currency or _subject_reporting_currency(connection, account_id, sqlite)).upper()
+    reporting = (reporting_currency or (
+        # Only a subject holding won needs its reporting currency looked up.
+        _subject_reporting_currency(connection, account_id, sqlite)
+        if any(str(row["currency"] or "").strip().upper() == "KRW" for row in holdings) else "USD"
+    )).upper()
     if reporting == "KRW":
         components, fetched, calendar = _krw_components(holdings, ticker_factory, cache)
-        return _store_replay(
-            connection, account_id=account_id, requested=requested, latest=latest,
-            components=components, prices=fetched, calendar=calendar, portfolio_nav=portfolio_nav,
-            persisted_price_symbols=persisted_price_symbols, currency="KRW",
+    else:
+        components, fetched, calendar = _usd_components(
+            connection, account_id=account_id, latest=latest, holdings=holdings,
+            ticker_factory=ticker_factory, cache=cache,
         )
+    result = _store_replay(
+        connection, account_id=account_id, requested=requested, latest=latest,
+        components=components, prices=fetched, calendar=calendar, portfolio_nav=portfolio_nav,
+        persisted_price_symbols=persisted_price_symbols, currency=reporting,
+    )
+    _before_commit(connection, account_id, latest)
+    connection.commit()
+    return result
+
+
+
+def _usd_components(
+    connection: Any,
+    *,
+    account_id: str,
+    latest: str,
+    holdings: Iterable[Mapping[str, Any]],
+    ticker_factory: Callable[[str], Any] | None,
+    cache: dict[str, dict[str, float]],
+) -> tuple[list[ReplayComponent], dict[str, dict[str, float]], list[str]]:
     fx_cache: dict[str, list[tuple[str, float]]] = {}
 
     def load_prices(symbol: str) -> dict[str, float]:
@@ -921,12 +945,7 @@ def refresh_crisis_replay(
                 proxy_reason=reason,
             )
         )
-
-    return _store_replay(
-        connection, account_id=account_id, requested=requested, latest=latest,
-        components=components, prices=fetched, calendar=calendar, portfolio_nav=portfolio_nav,
-        persisted_price_symbols=persisted_price_symbols, currency="USD",
-    )
+    return components, fetched, calendar
 
 
 def _store_replay(
@@ -1017,8 +1036,6 @@ def _store_replay(
              row["drawdown"], CRISIS_START.isoformat(), CRISIS_END.isoformat(),
              CALCULATION_VERSION, generated_at),
         )
-    _before_commit(connection, account_id, latest)
-    connection.commit()
     direct_count = sum(component.mapping_method == "direct" for component in components)
     proxy_count = len(components) - direct_count
     return {

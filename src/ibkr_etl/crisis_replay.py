@@ -666,6 +666,99 @@ def load_crisis_replay(
     }
 
 
+# A Korean-won account (Kiwoom) is replayed in won, on its own market: each KRX
+# holding's adjusted close, or the KOSPI or KOSDAQ index for a holding with no
+# complete crisis history. The window and its trading days are the same SPY
+# calendar every other account uses; a KRX close is carried across Korean
+# holidays (Chuseok closed KRX on 15 September 2008) from the latest earlier
+# close, never a later one.
+KRX_PROXY_BY_SUFFIX = {".KS": "^KS11", ".KQ": "^KQ11"}
+KRX_PROXY_NAMES = {"^KS11": "KOSPI Composite Index", "^KQ11": "KOSDAQ Composite Index"}
+PROXY_NAMES.update(KRX_PROXY_NAMES)
+
+
+def _subject_reporting_currency(connection: Any, account_id: str, sqlite: bool) -> str:
+    if sqlite:
+        return "USD"
+    row = _execute(
+        connection, "SELECT reporting_currency FROM platform_subjects WHERE subject_id = ?", (account_id,),
+    ).fetchone()
+    return str((row["reporting_currency"] if row else None) or "USD")
+
+
+def _krx_complete(series: Mapping[str, float], market_days: list[str]) -> bool:
+    """A KRX close on or before the window opens, and one on every KRX trading day in it."""
+    return bool(series) and min(series) <= CRISIS_START.isoformat() and all(day in series for day in market_days)
+
+
+def _krw_components(
+    holdings: Iterable[Mapping[str, Any]],
+    ticker_factory: Callable[[str], Any] | None,
+    cache: dict[str, dict[str, float]],
+) -> tuple[list[ReplayComponent], dict[str, dict[str, float]], list[str]]:
+    start = CRISIS_START - timedelta(days=CRISIS_OPENING_LOOKBACK_DAYS)
+
+    def load(symbol: str, *, lookback: bool) -> dict[str, float]:
+        key = f"{symbol}@lookback" if lookback else symbol
+        if key not in cache:
+            cache[key] = fetch_adjusted_history(
+                symbol, ticker_factory, start_date=start if lookback else CRISIS_START, capture_feed=RAW_FEED)
+        return cache[key]
+
+    spy = load("SPY", lookback=False)
+    calendar = list(spy)
+    if not _complete(spy, calendar) or calendar[0] != CRISIS_START.isoformat() or calendar[-1] != CRISIS_END.isoformat():
+        raise RuntimeError("SPY does not provide a complete crisis-period calendar")
+    kospi = load("^KS11", lookback=True)
+    market_days = [day for day in kospi if CRISIS_START.isoformat() <= day <= CRISIS_END.isoformat()]
+    if not market_days or min(kospi) > CRISIS_START.isoformat():
+        raise RuntimeError("The KOSPI index does not cover the crisis window")
+    fetched: dict[str, dict[str, float]] = {"^KS11": _align_to_calendar(kospi, calendar)}
+    if not _krx_complete(kospi, market_days):
+        raise RuntimeError("Market proxy ^KS11 lacks complete crisis-period data")
+
+    def proxy_for(suffix: str) -> str:
+        # KOSDAQ names take the KOSDAQ index when Yahoo has it for the whole window, else KOSPI.
+        proxy = KRX_PROXY_BY_SUFFIX[suffix]
+        if proxy not in fetched:
+            series = load(proxy, lookback=True)
+            if not _krx_complete(series, market_days):
+                return "^KS11"
+            fetched[proxy] = _align_to_calendar(series, calendar)
+        return proxy
+    components: list[ReplayComponent] = []
+    for row in holdings:
+        symbol = str(row["symbol"]).strip().upper()
+        currency = str(row["currency"] or "").strip().upper()
+        if currency != "KRW":
+            raise RuntimeError(f"{symbol} is held in {currency or 'no currency'}; a won replay takes KRW holdings only")
+        source_symbol, listed_suffix = "", ".KS"
+        for candidate in candidate_symbols(symbol, str(row["listing_exchange"] or ""), currency):
+            suffix = next((s for s in KRX_PROXY_BY_SUFFIX if candidate.endswith(s)), None)
+            if suffix is None:
+                continue
+            series = load(candidate, lookback=True)
+            if series and suffix == ".KQ":
+                listed_suffix = ".KQ"
+            if _krx_complete(series, market_days):
+                source_symbol = candidate
+                fetched[candidate] = _align_to_calendar(series, calendar)
+                break
+        if source_symbol:
+            mapping_method, reason = "direct", None
+        else:
+            source_symbol = proxy_for(listed_suffix)
+            mapping_method = "market_proxy"
+            reason = f"{symbol} lacks a complete adjusted-close series for the crisis window"
+        components.append(ReplayComponent(
+            conid=str(row["conid"]), symbol=symbol, description=str(row["description"] or ""),
+            currency="KRW", market_value=float(row["market_value"]), source_symbol=source_symbol,
+            mapping_method=mapping_method, proxy_reason=reason,
+        ))
+    used = {component.source_symbol for component in components}
+    return components, {symbol: series for symbol, series in fetched.items() if symbol in used}, calendar
+
+
 def refresh_crisis_replay(
     connection: Any,
     *,
@@ -674,6 +767,7 @@ def refresh_crisis_replay(
     ticker_factory: Callable[[str], Any] | None = None,
     price_cache: dict[str, dict[str, float]] | None = None,
     persisted_price_symbols: set[str] | None = None,
+    reporting_currency: str | None = None,
 ) -> dict[str, Any]:
     requested = _iso_date(holdings_as_of)
     latest = resolve_holdings_as_of(
@@ -711,6 +805,14 @@ def refresh_crisis_replay(
     if not holdings:
         raise RuntimeError(f"No holdings are available for {account_id} on {latest}")
     cache = price_cache if price_cache is not None else {}
+    reporting = (reporting_currency or _subject_reporting_currency(connection, account_id, sqlite)).upper()
+    if reporting == "KRW":
+        components, fetched, calendar = _krw_components(holdings, ticker_factory, cache)
+        return _store_replay(
+            connection, account_id=account_id, requested=requested, latest=latest,
+            components=components, prices=fetched, calendar=calendar, portfolio_nav=portfolio_nav,
+            persisted_price_symbols=persisted_price_symbols, currency="KRW",
+        )
     fx_cache: dict[str, list[tuple[str, float]]] = {}
 
     def load_prices(symbol: str) -> dict[str, float]:
@@ -820,6 +922,29 @@ def refresh_crisis_replay(
             )
         )
 
+    return _store_replay(
+        connection, account_id=account_id, requested=requested, latest=latest,
+        components=components, prices=fetched, calendar=calendar, portfolio_nav=portfolio_nav,
+        persisted_price_symbols=persisted_price_symbols, currency="USD",
+    )
+
+
+def _store_replay(
+    connection: Any,
+    *,
+    account_id: str,
+    requested: str | None,
+    latest: str,
+    components: list[ReplayComponent],
+    prices: Mapping[str, Mapping[str, float]],
+    calendar: list[str],
+    portfolio_nav: float,
+    persisted_price_symbols: set[str] | None,
+    currency: str,
+) -> dict[str, Any]:
+    """Calculate the fixed-unit replay and store it with its components and prices."""
+
+    fetched = prices
     replay = calculate_fixed_unit_replay(
         components=components,
         portfolio_nav=portfolio_nav,
@@ -841,13 +966,13 @@ def refresh_crisis_replay(
                 INSERT INTO market_data_prices(
                     instrument_id, price_date, symbol, instrument_name, price_type,
                     currency, price, source, source_url, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tenant_id, instrument_id, price_date, price_type)
                 DO UPDATE SET price = excluded.price, source = excluded.source,
                     source_url = excluded.source_url, fetched_at = excluded.fetched_at
                 """,
                 (instrument_id, price_date, source_symbol, instrument_name, PRICE_TYPE,
-                 price, PROVIDER,
+                 currency, price, PROVIDER,
                  f"yfinance:TICKER({source_symbol}):history(auto_adjust=False):Adj Close",
                  generated_at),
             )
@@ -912,5 +1037,6 @@ def refresh_crisis_replay(
         "provider": PROVIDER,
         "price_type": PRICE_TYPE,
         "calculation_version": CALCULATION_VERSION,
+        "reporting_currency": currency,
         "publication_allowed": False,
     }

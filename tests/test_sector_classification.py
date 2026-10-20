@@ -241,7 +241,8 @@ class SectorClassificationTests(unittest.TestCase):
         connection.row_factory = sqlite3.Row
         connection.executescript(
             """
-            CREATE TABLE instruments(conid TEXT PRIMARY KEY, symbol TEXT, listing_exchange TEXT, currency TEXT);
+            CREATE TABLE instruments(conid TEXT PRIMARY KEY, symbol TEXT, description TEXT, listing_exchange TEXT,
+                                     currency TEXT);
             CREATE TABLE position_snapshots(account_id TEXT, snapshot_date TEXT, conid TEXT, currency TEXT,
                                             quantity_text TEXT);
             CREATE TABLE instrument_classifications(
@@ -253,8 +254,8 @@ class SectorClassificationTests(unittest.TestCase):
                 checked_at TEXT NOT NULL,
                 UNIQUE(tenant_id, conid, provider)
             );
-            INSERT INTO instruments VALUES ('KRX:000660', '000660', 'KRX', 'KRW');
-            INSERT INTO instruments VALUES ('1', 'AAPL', 'NASDAQ', 'USD');
+            INSERT INTO instruments VALUES ('KRX:000660', '000660', 'SK하이닉스', 'KRX', 'KRW');
+            INSERT INTO instruments VALUES ('1', 'AAPL', 'APPLE INC', 'NASDAQ', 'USD');
             INSERT INTO position_snapshots VALUES ('K1', '2026-08-31', 'KRX:000660', 'KRW', '14');
             INSERT INTO position_snapshots VALUES ('K1', '2026-08-31', '1', 'USD', '1');
             INSERT INTO instrument_classifications VALUES (
@@ -287,6 +288,7 @@ class SectorClassificationTests(unittest.TestCase):
                 fetcher=self._fetcher(transmitted))
             stored = connection.execute(
                 "SELECT long_name FROM instrument_classifications WHERE conid = 'KRX:000660'").fetchone()
+            names = dict(connection.execute("SELECT conid, description FROM instruments").fetchall())
             again: list[str] = []
             refresh_sector_classifications_range(
                 connection, subject_id="K1", start_date="2026-08-01", end_date="2026-08-31", workers=1,
@@ -296,6 +298,8 @@ class SectorClassificationTests(unittest.TestCase):
         self.assertEqual(transmitted, ["000660.KS"])  # the USD holding with a sector is left alone
         self.assertEqual(result["previously_classified"], 1)
         self.assertEqual(stored["long_name"], "SK hynix Inc.")
+        # The website shows the English name in place of Kiwoom's Korean one; English names stay as they are.
+        self.assertEqual(names, {"KRX:000660": "SK hynix Inc.", "1": "APPLE INC"})
         self.assertEqual(again, [])  # named now, so not looked up again
 
     def test_before_migration_080_nothing_changes(self) -> None:

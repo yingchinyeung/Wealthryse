@@ -471,6 +471,11 @@ def _classify_and_store(
                 *((result.get("long_name"),) if named else ()),
             ),
         )
+    if named:
+        # An instrument named in another script (Kiwoom names stocks in Korean) shows Yahoo's English name.
+        from .kiwoom_english import apply_english_names
+
+        apply_english_names(connection, [result["conid"] for result in results])
     connection.commit()
     return results
 

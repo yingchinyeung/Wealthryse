@@ -65,6 +65,11 @@ class UsIstrategySecuritiesTests(unittest.TestCase):
         ])
         self.assertEqual({row["region"] for row in inputs.sectors}, {"United States"})
 
+    def test_qxo_prints_where_the_owners_factsheet_puts_it(self):
+        snapshot = _us_snapshot({"QXO": (100.0, "QXO, Inc.", "Industrial Distribution")})
+        row = _inputs(snapshot).sectors[0]
+        self.assertEqual((row["sector"], row["sub_sector"]), ("Information Technology", "Software & Services"))
+
     def test_yahoo_dash_spellings_read_the_same(self):
         snapshot = _us_snapshot({"JPM": (100.0, "JPMorgan Chase & Co.", "Banks—Diversified")})
         self.assertEqual(_inputs(snapshot).sectors[0]["sub_sector"], "Banks")

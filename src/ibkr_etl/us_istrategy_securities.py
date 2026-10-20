@@ -96,6 +96,13 @@ INDUSTRIES: dict[str, tuple[str, str]] = {
     "Other Industrial Metals & Mining": (MAT, "Metals & Mining"),
 }
 
+# Tickers the owner's factsheet places apart from Yahoo's current industry. Yahoo now files QXO
+# under Industrial Distribution (after its building-products acquisition); the owner's 31 Aug 2026
+# factsheet prints it in Software & Services.
+SYMBOLS: dict[str, tuple[str, str]] = {
+    "QXO": (IT, SOFTWARE),
+}
+
 
 class UsIstrategySecurityError(ValueError):
     pass
@@ -112,6 +119,8 @@ def lookup(holding: Mapping[str, Any], classification: Mapping[str, Any] | None)
     # Yahoo's search writes some industries with a dash ("Banks—Diversified") where its profile
     # writes " - " ("Banks - Diversified"); the sector job stores whichever answered.
     industry = re.sub(r"\s*[–—]\s*", " - ", " ".join(str(classification.get("sub_sector") or "").split()))
+    if symbol in SYMBOLS:
+        return name, *SYMBOLS[symbol]
     try:
         sector, sub_sector = INDUSTRIES[industry]
     except KeyError:

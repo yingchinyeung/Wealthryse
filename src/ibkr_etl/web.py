@@ -334,6 +334,17 @@ SECURITY_HEADERS = {
         "form-action 'self'"
     ),
 }
+# A PDF the portal serves may be shown in a frame on the portal's own pages (the
+# factsheet designer's preview); every other response still refuses all framing.
+PDF_FRAME_ANCESTORS = "frame-ancestors 'self'"
+
+
+def security_headers_for(content_type: str | None) -> dict[str, str]:
+    headers = dict(SECURITY_HEADERS)
+    if (content_type or "").split(";")[0].strip().lower() == "application/pdf":
+        headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
+            "frame-ancestors 'none'", PDF_FRAME_ANCESTORS)
+    return headers
 
 
 def _identity_digest(value: str) -> str | None:
@@ -400,7 +411,7 @@ async def security_audit_middleware(request: Request, call_next):
         "SECURITY_AUDIT %s", json.dumps(event, sort_keys=True, separators=(",", ":"))
     )
     response.headers["X-Correlation-ID"] = request.state.correlation_id
-    for name, value in SECURITY_HEADERS.items():
+    for name, value in security_headers_for(response.headers.get("content-type")).items():
         response.headers[name] = value
     return response
 

@@ -112,6 +112,23 @@ class AccountParityTests(unittest.TestCase):
                     engine.render(spec, snapshot, template_path=template, output_path=new, run_checks=False)
                     _same_paint(self, old, new)
 
+    def test_the_korea_design_paints_what_the_live_account_factsheets_paint(self):
+        spec = dict(load_design("korea-istrategy"), template_sha256=None)
+        cases = [(case.case_id, case.build("USD")) for case in stress.CASES
+                 if case.case_id in ("baseline", "long_names", "many_sectors", "five_years")]
+        with tempfile.TemporaryDirectory() as root:
+            template = _blank_template(Path(root, "template.pdf"))
+            for name, snapshot in cases:
+                with self.subTest(name):
+                    snapshot["subject_id"] = "U16088606"
+                    old, new = Path(root, f"{name}-old.pdf"), Path(root, f"{name}-new.pdf")
+                    # The live renderer only takes USD; the account page prints no currency, so the same
+                    # month in KRW must paint the same.
+                    legacy.render_factsheet(copy.deepcopy(snapshot), template_path=template, output_path=old)
+                    engine.render(spec, dict(snapshot, reporting_currency="KRW"), template_path=template,
+                                  output_path=new, run_checks=False)
+                    _same_paint(self, old, new)
+
     def test_the_default_spec_shrinks_long_names_instead_of_cutting_them(self):
         spec = load_design("account-owner-template")
         snapshot = stress.snapshot(subject_id="U16088606", names=stress.LONG_NAMES)

@@ -11,8 +11,10 @@ from ibkr_etl.kiwoom_client import (
     HOSTS,
     INQUIRY_APIS,
     US_ACCOUNT_PATH,
+    US_CHART_PATH,
     KiwoomClient,
     KiwoomError,
+    KiwoomUnknownStock,
     kiwoom_number,
     chart_closes,
     kiwoom_selling_cost,
@@ -101,9 +103,10 @@ class KiwoomClientTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaisesRegex(KiwoomError, "inquiry calls"):
                 client._post(path, {}, {})
         self.assertEqual(fake.requests, [])
-        self.assertEqual(set(INQUIRY_APIS.values()), {ACCOUNT_PATH, US_ACCOUNT_PATH, CHART_PATH})
-        # The price chart path carries the daily close only; it has no order or account change.
+        self.assertEqual(set(INQUIRY_APIS.values()), {ACCOUNT_PATH, US_ACCOUNT_PATH, CHART_PATH, US_CHART_PATH})
+        # The price chart paths carry the daily close only; they have no order or account change.
         self.assertEqual([api for api, path in INQUIRY_APIS.items() if path == CHART_PATH], ["ka10081"])
+        self.assertEqual([api for api, path in INQUIRY_APIS.items() if path == US_CHART_PATH], ["usa06012"])
 
     def test_a_slow_answer_is_asked_again_then_named(self) -> None:
         fake = FakeKiwoom({"kt00004": [ACCOUNT]})
@@ -454,6 +457,38 @@ class KiwoomTransportTests(unittest.TestCase):
         self.assertIn("/oauth2/token (HTTP 400", str(caught.exception))
         self.assertNotIn(APP_KEY, str(caught.exception))
 
+
+
+class UsPriceAndQuantityTests(unittest.TestCase):
+    """usa06012 (daily chart, read backwards) and usa21730 (shares held per Korean date)."""
+
+    def test_daily_closes_start_at_the_latest_day_and_keep_the_asked_range(self) -> None:
+        chart = [{"return_code": 0, "result_list": [
+            {"dt": "20250402", "cur_prc": "152.5000"}, {"dt": "20250401", "cur_prc": "+150.0100"}]},
+                 {"return_code": 0, "result_list": [{"dt": "20250331", "cur_prc": "149.0000"},
+                                                     {"dt": "20250328", "cur_prc": "147.0000"}]}]
+        fake = FakeKiwoom({"usa06012": chart})
+        closes = _client(fake).us_daily_closes("SYN", "NY", date(2025, 3, 31), date(2025, 4, 2))
+        self.assertEqual(closes, {date(2025, 4, 2): Decimal("152.5000"), date(2025, 4, 1): Decimal("150.0100"),
+                                  date(2025, 3, 31): Decimal("149.0000")})
+        url, headers, body = fake.requests[1]
+        self.assertTrue(url.endswith(US_CHART_PATH))
+        self.assertEqual(body, {"stex_tp": "NY", "stk_cd": "SYN", "strt_dt": "20250402", "upd_stkpc_tp": "0",
+                                "exrt_appl_tp": "0"})
+
+    def test_quantities_are_read_per_korean_date(self) -> None:
+        fake = FakeKiwoom({"usa21730": [{"return_code": 0, "result_list": [
+            {"frst_base_dt": "2026-02-12", "last_base_dt": "2026-02-13", "frst_qty": "96", "last_qty": "96"},
+            {"frst_base_dt": "2026-02-11", "last_base_dt": "2026-02-12", "frst_qty": "0", "last_qty": "96"}]}]})
+        quantities = _client(fake).us_stock_quantities("SYN", "NY", date(2026, 2, 11), date(2026, 2, 13))
+        self.assertEqual(quantities, {date(2026, 2, 11): Decimal(0), date(2026, 2, 12): Decimal(96),
+                                      date(2026, 2, 13): Decimal(96)})
+        self.assertEqual(fake.requests[1][2], {"from": "20260211", "to": "20260213", "stex_tp": "NY", "stk_cd": "SYN"})
+
+    def test_a_stock_kiwoom_does_not_know_is_its_own_refusal(self) -> None:
+        fake = FakeKiwoom({"usa06012": [{"return_code": 7, "return_msg": "error[1903:no such stock, stex_tp=ND]"}]})
+        with self.assertRaises(KiwoomUnknownStock):
+            _client(fake).us_daily_closes("GONE", "ND", date(2025, 3, 27), date(2025, 4, 2))
 
 if __name__ == "__main__":
     unittest.main()

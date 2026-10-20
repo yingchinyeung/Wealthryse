@@ -354,6 +354,8 @@ def _specific_region(
 
     if holding.get("composite_sleeve"):
         return "Multi-asset"
+    if holding.get("factsheet_region"):
+        return str(holding["factsheet_region"])
 
     # USD-valued report snapshots retain native currency as listing evidence.
     # Reporting currency must not relabel Hong Kong or Taiwan holdings as US.
@@ -669,13 +671,17 @@ def _factsheet_sector_rows(
 
 
 def factsheet_inputs(
-    snapshot: dict[str, Any], *, reporting_currencies: Iterable[str] | None = None
+    snapshot: dict[str, Any], *, reporting_currencies: Iterable[str] | None = None,
+    securities: str | None = None,
 ) -> FactsheetInputs:
     """The validated values every account-design factsheet prints.
 
     ``reporting_currencies`` lets a design spec that is qualified for other
     currencies use the same builder; left out, the approved rule applies
     (HKD for Alpha World MS, USD for every other subject).
+    ``securities="us_istrategy"`` prints every holding with Yahoo's English
+    name, "United States" and the U.S. iStrategy sectors (us_istrategy_securities),
+    except in a synthetic preview snapshot, whose made-up tickers Yahoo cannot know.
     """
     required = {
         "period_end",
@@ -742,6 +748,20 @@ def factsheet_inputs(
             holding["english_name"] = name
             classifications[str(holding.get("conid") or "")] = {
                 "symbol": holding.get("symbol"), "region": KOREA, "sector": sector, "sub_sector": sub_sector}
+    if securities == "us_istrategy" and not is_composite and not snapshot.get("synthetic_data"):
+        from .us_istrategy_securities import REGION as UNITED_STATES, UsIstrategySecurityError, lookup as us_lookup
+        for holding in holdings:
+            try:
+                name, sector, sub_sector = us_lookup(
+                    holding, classifications.get(str(holding.get("conid") or "")))
+            except UsIstrategySecurityError as error:
+                raise MonthlyArtifactError(str(error)) from error
+            holding["english_name"] = name
+            holding["factsheet_region"] = UNITED_STATES
+            classifications[str(holding.get("conid") or "")] = {
+                "symbol": holding.get("symbol"), "region": UNITED_STATES, "sector": sector, "sub_sector": sub_sector}
+    elif securities is not None and securities != "us_istrategy":
+        raise MonthlyArtifactError(f"Unknown factsheet securities: {securities}")
     if is_composite:
         for holding in holdings:
             component_type = str(holding.get("asset_category") or "").lower()

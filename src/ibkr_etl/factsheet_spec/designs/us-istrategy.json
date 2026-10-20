@@ -3,7 +3,7 @@
  "design_id": "us-istrategy",
  "title": "U.S. iStrategy",
  "notes": "The U.S. iStrategy factsheet (a Kiwoom account holding US stocks). Its template is the two-page account layout, so this is the account design pinned to the U.S. template, measured against the completed 31 Aug 2026 factsheet. The designer starts a draft from it when that template is uploaded.",
- "inputs": "account",
+ "inputs": "us_istrategy",
  "base": "template",
  "template_sha256": "6c6fd9e2eab7bb4d629103506df89a074bd22792a10b652134c77fefb0ed9c7c",
  "page_size": [

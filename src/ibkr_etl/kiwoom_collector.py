@@ -671,6 +671,8 @@ class Target:
     stage: str | None
     display_name: str
     history_start: date | None
+    # The onboarding case's reporting currency; a USD case is loaded by kiwoom_us_account.
+    reporting_currency: str | None = None
 
 
 def targets(connection, tenant_id: str) -> list[Target]:
@@ -678,7 +680,8 @@ def targets(connection, tenant_id: str) -> list[Target]:
 
     rows = connection.execute(
         "SELECT b.connection_id, b.environment, b.key_vault_secret_name, a.broker_account_id, c.case_id, c.stage, "
-        "COALESCE(c.display_name, a.account_name, b.display_name) AS display_name, c.history_start_date "
+        "COALESCE(c.display_name, a.account_name, b.display_name) AS display_name, c.history_start_date, "
+        "c.reporting_currency "
         "FROM broker_connections b JOIN broker_connection_accounts a "
         "ON a.tenant_id = b.tenant_id AND a.connection_id = b.connection_id "
         "LEFT JOIN broker_onboarding_cases c ON c.tenant_id = b.tenant_id AND c.connection_id = b.connection_id "
@@ -697,12 +700,13 @@ def targets(connection, tenant_id: str) -> list[Target]:
             case_id=str(row["case_id"]) if row["case_id"] else None, stage=row["stage"],
             display_name=str(row["display_name"]),
             history_start=date.fromisoformat(str(start)[:10]) if start else None,
+            reporting_currency=str(row["reporting_currency"]) if row["reporting_currency"] else None,
         ))
     return found
 
 
 def _connection_result(connection, tenant_id: str, target: Target, *, ok: bool, message: str,
-                       account_name: str | None = None) -> None:
+                       account_name: str | None = None, base_currency: str = BASE_CURRENCY) -> None:
     connection.execute(
         "UPDATE broker_connections SET status = ?, last_checked_at = now(), last_check_json = ?::jsonb, "
         "updated_at = now() WHERE tenant_id = ? AND connection_id = ?",
@@ -713,7 +717,7 @@ def _connection_result(connection, tenant_id: str, target: Target, *, ok: bool, 
         connection.execute(
             "UPDATE broker_connection_accounts SET account_name = COALESCE(?, account_name), base_currency = ?, "
             "last_seen_at = now() WHERE tenant_id = ? AND connection_id = ? AND broker_account_id = ?",
-            (account_name or None, BASE_CURRENCY, tenant_id, target.connection_id, target.broker_account_id),
+            (account_name or None, base_currency, tenant_id, target.connection_id, target.broker_account_id),
         )
 
 
@@ -733,13 +737,25 @@ def _history(connection, tenant_id: str, client: KiwoomClient, target: Target, *
     """
 
     assert target.case_id is not None and target.history_start is not None
+
+    def build() -> dict[str, Any]:
+        return build_history(connection, client, broker_account_id=target.broker_account_id,
+                             history_start=target.history_start, today=today, include_us=include_us, now=now)
+
+    return _history_record(connection, tenant_id, target, build, record=record)
+
+
+def _history_record(connection, tenant_id: str, target: Target, build: Callable[[], dict[str, Any]], *,
+                    record: bool = True) -> dict[str, Any]:
+    """Run one account's history build and record its history_built check (shared by KRW and USD accounts)."""
+
+    assert target.case_id is not None and target.history_start is not None
     previous = connection.execute(
         "SELECT status FROM broker_onboarding_checks WHERE tenant_id = ? AND case_id = ? AND check_id = 'history_built'",
         (tenant_id, target.case_id),
     ).fetchone()
     try:
-        check = build_history(connection, client, broker_account_id=target.broker_account_id,
-                              history_start=target.history_start, today=today, include_us=include_us, now=now)
+        check = build()
     except (KiwoomError, ValueError) as error:
         connection.rollback()
         check = {"status": "fail", "message": f"Kiwoom refused a past day's balance: {str(error)[:300]}",
@@ -775,6 +791,12 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
                                    account_name=valuation.account_name)
                 connection.commit()
                 results.append({**result, "status": "checked"})
+                continue
+            from .kiwoom_us_account import is_usd_account, run_target as run_usd_target
+
+            if is_usd_account(target.reporting_currency):
+                # A USD case holds U.S. stocks only and is loaded from Kiwoom's U.S. account calls.
+                results.append({**result, **run_usd_target(connection, tenant_id, client, target, now=now)})
                 continue
             collected = collect(client, broker_account_id=target.broker_account_id,
                                 history_start=target.history_start, today=today,

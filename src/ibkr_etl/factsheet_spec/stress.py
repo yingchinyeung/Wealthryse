@@ -125,7 +125,7 @@ CASES = (
 
 def cases_for(spec: dict[str, Any]) -> list[StressCase]:
     """The stress cases a design's inputs can read (MS and T read their own methodology inputs)."""
-    return list(CASES) if spec.get("inputs") == "account" else []
+    return list(CASES) if spec.get("inputs") in ("account", "us_istrategy") else []
 
 
 def run(spec: dict[str, Any], *, template_path, example_path=None) -> list[dict[str, Any]]:

@@ -43,6 +43,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .kiwoom_client import MAX_SELLING_COST_RATE, AccountValuation, CashMovement, Holding, KiwoomClient, \
     KiwoomError, UsValuation, kiwoom_selling_cost, reconcile_us_valuation, reconcile_valuation
+from .kiwoom_english import apply_english_names, movement_description
 from .security_master import SecurityIdentifier, new_security_key
 
 SWITCH_NAME = "KIWOOM_COLLECTOR_ENABLED"
@@ -240,13 +241,15 @@ def movement_rows(account_id: str, movements: Iterable[CashMovement],
                 "trade_price_text": _text(abs(movement.amount) / abs(movement.quantity)) if movement.quantity else None,
                 "proceeds_text": _text(amount), "commission_text": None, "commission_currency": movement.currency,
                 "net_cash_text": _text(amount), "realized_pnl_text": None, "currency": movement.currency,
-                "order_reference": movement.description[:200] or None, "model_code": "",
+                # Kiwoom's remark is Korean; the website shows only English text.
+                "order_reference": None, "model_code": "",
             })
         else:
             cash.append({
                 "account_id": account_id, "source_key": source_key, "transaction_id": source_key,
                 "event_datetime": movement.trade_date, "model_code": "", "effective_date": movement.trade_date,
-                "settle_date": None, "transaction_type": kind, "description": movement.description[:500] or kind,
+                "settle_date": None, "transaction_type": kind,
+                "description": movement_description(kind, movement.security.value if movement.security else None),
                 "amount_text": _text(amount), "currency": movement.currency, "conid": key,
             })
     return {"trades": trades, "cash_transactions": cash}, unknown
@@ -388,6 +391,7 @@ def _upsert(connection, table: str, rows: Sequence[Mapping[str, Any]], keys: Seq
 
 def _register(connection, new_securities: Iterable[NewSecurity], instruments: Iterable[Mapping[str, Any]],
               stamp: str) -> None:
+    instruments = list(instruments)
     for item in new_securities:
         connection.execute(
             "INSERT INTO security_master (security_key, display_name, asset_class, currency, primary_exchange, "
@@ -407,6 +411,8 @@ def _register(connection, new_securities: Iterable[NewSecurity], instruments: It
             (row["conid"], row["symbol"], row["description"], row["asset_category"], row["currency"],
              row["listing_exchange"], row["isin"], stamp, stamp, json.dumps({"source": SOURCE})),
         )
+    # Kiwoom names stocks in Korean; the website shows Yahoo's English name (or the code until there is one).
+    apply_english_names(connection, [row["conid"] for row in instruments])
 
 
 def _clear_day(connection, account_id: str, day: date, fx_rates: Sequence[Mapping[str, Any]] = ()) -> None:

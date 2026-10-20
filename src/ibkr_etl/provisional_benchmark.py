@@ -54,6 +54,10 @@ FX_TICKERS = {
 DIRECT_FROM_USD = {"HKD", "KRW"}
 
 
+class NoBenchmarkContract(RuntimeError):
+    """The subject has no active benchmark mapping, so there is nothing to compare it with."""
+
+
 def mapped_benchmarks(connection: Any, account_id: str) -> tuple[BenchmarkSpec, ...]:
     """Load the approved account contract instead of assuming the pilot benchmark set."""
 
@@ -72,7 +76,7 @@ def mapped_benchmarks(connection: Any, account_id: str) -> tuple[BenchmarkSpec, 
         (account_id,),
     ).fetchall()
     if not rows:
-        raise RuntimeError(f"No active benchmark contract is configured for {account_id}")
+        raise NoBenchmarkContract(f"No active benchmark contract is configured for {account_id}")
     specs = tuple(
         BenchmarkSpec(
             benchmark_id=str(row["benchmark_id"]),

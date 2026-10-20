@@ -274,6 +274,9 @@ class NoBenchmarkCollectionTests(unittest.TestCase):
 
         def tool(connection, context, name, arguments):
             calls.append((name, arguments.get("benchmark_id")))
+            if name == "get_risk_metrics" and not connection.mappings:
+                return _result({"metrics": {"observations": 0}, "benchmark_id": None, "crisis_replay": None},
+                               quality="fail")
             return _result({"name": name}, as_of="2026-08-31")
 
         with mock.patch.object(rs, "execute_tool", tool), \
@@ -291,6 +294,8 @@ class NoBenchmarkCollectionTests(unittest.TestCase):
             self.assertFalse(results[name]["data"]["available"])
             self.assertFalse(results[name]["data"]["publication_allowed"])
             self.assertEqual(results[name]["data"]["series"], [])
+        self.assertEqual(results["risk"]["quality_status"], "warn")
+        self.assertIn("benchmark", results["risk"]["data"]["reason"])
 
     def test_any_other_account_without_benchmarks_is_still_refused(self):
         with self.assertRaisesRegex(ReportingSnapshotError, "benchmark must be configured"):

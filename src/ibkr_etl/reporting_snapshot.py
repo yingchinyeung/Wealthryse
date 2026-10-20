@@ -413,6 +413,13 @@ def _collect_tool_results(
                 "data": {"available": False, "series": [], "metrics": {}, "publication_allowed": False,
                          "reason": "No benchmark is configured: a new-onboarding account has no benchmark step"},
             }
+        # Risk metrics are computed on the benchmark comparison, so with none they are not
+        # available rather than failed; the factsheet of such an account prints none.
+        risk = dict(results["risk"])
+        if risk.get("quality_status") == "fail" and (risk.get("data") or {}).get("benchmark_id") is None:
+            risk["quality_status"] = "warn"
+            risk["data"] = {**risk["data"], "reason": "Risk metrics need a benchmark comparison; none is configured"}
+            results["risk"] = risk
     else:
         for name, benchmark_id in (("primary_benchmark", benchmark_ids[0]), ("secondary_benchmark", benchmark_ids[1])):
             results[name] = execute_tool(

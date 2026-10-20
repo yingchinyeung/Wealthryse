@@ -1,6 +1,6 @@
--- Medallion: Kiwoom's raw answers in bronze. HELD MIGRATION, 081 on its day (Mon 26 Oct 2026).
+-- Medallion: Kiwoom's raw answers in bronze. HELD MIGRATION, 082 on its day (Mon 26 Oct 2026).
 -- Lives in infra/medallion/drafts/ until then, so no bootstrap or job applies it early; on its
--- day it moves to migrations/postgres/081_kiwoom_bronze.sql and runs alone
+-- day it moves to migrations/postgres/082_kiwoom_bronze.sql and runs alone
 -- (bootstrap_postgres.py --only-migration). kiwoom_bronze_undo.sql reverses it.
 --
 -- One row per page of one Kiwoom inquiry answer, exactly as received (body, as bytes).

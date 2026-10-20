@@ -14,6 +14,7 @@ from ibkr_etl.kiwoom_client import (
     KiwoomClient,
     KiwoomError,
     kiwoom_number,
+    chart_closes,
     kiwoom_selling_cost,
     krx_code,
     reconcile_us_valuation,
@@ -277,17 +278,20 @@ class KiwoomPastDayTests(unittest.TestCase):
         # the holdings at the official close (71,000: 7,100,000 KRW), less its per-stock selling cost.
         detail = dict(DAY_DETAIL, scrt_evlt_amt_to="000000007100000")
         total = 1000000 + 7100000 - 15260
+        # The chart's cur_prc is the day's last trade (70,000 on 14 Sep, after-market); the official
+        # close is 15 Sep's base price: 72,000 less its +1,000 change.
         chart = {"return_code": 0, "stk_cd": "005930", "stk_dt_pole_chart_qry": [
-            {"dt": "20260915", "cur_prc": "72000"}, {"dt": "20260914", "cur_prc": "71000"},
-            {"dt": "20260911", "cur_prc": "69000"}]}
-        older = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20260910", "cur_prc": "1"}]}
+            {"dt": "20260915", "cur_prc": "72000", "pred_pre": "+1000"},
+            {"dt": "20260914", "cur_prc": "70000", "pred_pre": "-500"},
+            {"dt": "20260911", "cur_prc": "70500", "pred_pre": "0"}]}
+        older = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20260910", "cur_prc": "1", "pred_pre": "0"}]}
         fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20260914", day_stk_asst=f"{total:015d}")],
                            "kt00016": [detail], "ka10081": [chart, older]})
         valuation = _client(fake).balance_on(date(2026, 9, 14))
         # One page of the chart only, unadjusted prices, with the close for the day asked.
         self.assertEqual([(url, body) for url, headers, body in fake.requests if headers.get("api-id") == "ka10081"],
                          [("https://mockapi.kiwoom.com/api/dostk/chart",
-                           {"stk_cd": "005930", "base_dt": "20260914", "upd_stkpc_tp": "0"})])
+                           {"stk_cd": "005930", "base_dt": "20261013", "upd_stkpc_tp": "0"})])
         self.assertEqual([(h.price, h.market_value) for h in valuation.holdings],
                          [(Decimal("71000"), Decimal("7100000"))])
         self.assertEqual((valuation.holdings_value, valuation.price_basis_gap, valuation.repriced_at_close),
@@ -298,13 +302,25 @@ class KiwoomPastDayTests(unittest.TestCase):
     def test_a_close_that_does_not_add_up_keeps_the_listed_prices(self) -> None:
         detail = dict(DAY_DETAIL, scrt_evlt_amt_to="000000007100000")
         total = 1000000 + 7100000 - 15260
-        chart = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20260914", "cur_prc": "70500"}]}
+        chart = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20260915", "cur_prc": "71000", "pred_pre": "+500"},
+                                                             {"dt": "20260914", "cur_prc": "70000", "pred_pre": "0"}]}
         fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20260914", day_stk_asst=f"{total:015d}")],
                            "kt00016": [detail], "ka10081": [chart]})
         valuation = _client(fake).balance_on(date(2026, 9, 14))
         self.assertEqual((valuation.holdings_value, valuation.valued_holdings, valuation.repriced_at_close),
                          (Decimal("7000000"), Decimal("7100000"), False))
         self.assertEqual(valuation.selling_cost, Decimal("15260"))
+
+    def test_the_official_close_is_the_next_days_base_price(self) -> None:
+        # Kiwoom's chart, SK hynix, 14-16 Sep 2026: cur_prc 1,683,000 on 14 Sep is the 20:00 last
+        # trade; 15 Sep's base price 1,712,000 - 15,000 = 1,697,000 is the official 15:30 close.
+        pages = [{"stk_dt_pole_chart_qry": [
+            {"dt": "20260916", "cur_prc": "1757000", "pred_pre": "+67000"},
+            {"dt": "20260915", "cur_prc": "1712000", "pred_pre": "+15000"},
+            {"dt": "20260914", "cur_prc": "1683000", "pred_pre": "-129000"},
+            {"dt": "20260911", "cur_prc": "1812000", "pred_pre": "-41000"}]}]
+        self.assertEqual(chart_closes(pages), {"20260911": Decimal("1812000"), "20260914": Decimal("1697000"),
+                                               "20260915": Decimal("1690000")})
 
     def test_kiwooms_selling_cost_rule_per_stock(self) -> None:
         # 2025: 0.15% tax; the 0.015% fee rounded down to 10 won.

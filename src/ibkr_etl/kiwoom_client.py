@@ -250,15 +250,24 @@ def _yyyymmdd(value: date) -> str:
 
 
 def chart_closes(pages: list[Mapping[str, object]]) -> dict[str, Decimal]:
-    """Each day's close (YYYYMMDD) from ka10081 daily chart pages. Pure, so bronze can be re-read."""
+    """Each day's official 15:30 KRX close (YYYYMMDD) from ka10081 daily chart pages. Pure, so bronze
+    can be re-read.
 
-    closes: dict[str, Decimal] = {}
+    From 14 Sep 2026 the chart's cur_prc is the day's last trade, after-market included (to 20:00).
+    The official close is the next trading day's base price: that day's cur_prc less its change
+    (pred_pre). So the newest day on a page has no close yet. On an ex-rights day the base price is
+    adjusted and differs from the close; the caller's check to Kiwoom's own value catches that.
+    """
+
+    rows: list[tuple[str, Decimal, Decimal]] = []
     for page in pages:
         for row in page.get("stk_dt_pole_chart_qry") or []:
             dt = str(row.get("dt") or "").strip()
-            if dt and str(row.get("cur_prc") or "").strip():
-                closes[dt] = kiwoom_number(row["cur_prc"], unsigned=True)
-    return closes
+            if dt and str(row.get("cur_prc") or "").strip() and str(row.get("pred_pre") or "").strip():
+                rows.append((dt, kiwoom_number(row["cur_prc"], unsigned=True), kiwoom_number(row["pred_pre"])))
+    rows.sort()
+    return {day: later_price - later_change
+            for (day, _, _), (_, later_price, later_change) in zip(rows, rows[1:])}
 
 
 class KiwoomClient:
@@ -466,19 +475,19 @@ class KiwoomClient:
         )
 
     def closing_price(self, code: str, day: date) -> Decimal | None:
-        """A stock's official KRX close on a past day (ka10081, unadjusted), or None if not listed.
+        """A stock's official KRX close on a past day (ka10081, unadjusted), or None if not known yet.
 
-        One page reaches back far past any history run, so each stock is read once per run and
-        again only for a later day.
+        The chart is read up to today, once per stock per run: one page reaches back far past any
+        history run, and a day's close needs the trading day after it (see chart_closes).
         """
 
-        wanted = _yyyymmdd(day)
         closes = self._closes.get(code)
-        if closes is None or (wanted not in closes and wanted > max(closes, default="")):
+        if closes is None:
             # The plain KRX code (no _NX/_AL suffix) and unadjusted prices: KRX's official close as it was.
-            pages = self.inquire("ka10081", {"stk_cd": code, "base_dt": wanted, "upd_stkpc_tp": "0"}, max_pages=1)
+            today = _yyyymmdd(self._clock().date())
+            pages = self.inquire("ka10081", {"stk_cd": code, "base_dt": today, "upd_stkpc_tp": "0"}, max_pages=1)
             closes = self._closes[code] = chart_closes(pages)
-        return closes.get(wanted)
+        return closes.get(_yyyymmdd(day))
 
     def _at_official_close(self, holdings: tuple[Holding, ...], day: date) -> tuple[Holding, ...] | None:
         repriced: list[Holding] = []

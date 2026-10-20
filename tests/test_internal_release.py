@@ -75,6 +75,22 @@ class InternalReleasePolicyTests(unittest.TestCase):
             ):
                 approve_internal_release(snapshot, _runs(), user_acceptance_recorded=True)
 
+    def test_an_owner_design_without_a_crisis_replay_can_be_released(self) -> None:
+        # An owner's own design (template_version "spec:<sha>") prints no crisis replay.
+        designed = [{**_runs()[0], "template_version": "spec:" + "0" * 64}]
+        snapshot = _snapshot(publication_blockers_json='["risk:crisis_replay_unavailable"]')
+        approval = approve_internal_release(snapshot, designed, user_acceptance_recorded=True)
+        self.assertEqual(approval.blockers, ("risk:crisis_replay_unavailable",))
+        # A built-in design still needs its replay, and so does a mix of the two.
+        builtin = [{**_runs()[0], "template_version": "alpha-world-ms-v3"}]
+        for runs in (builtin, [designed[0], {**_runs()[1], "template_version": "deck-v1"}]):
+            with self.subTest(runs=runs), self.assertRaises(InternalReleaseError):
+                approve_internal_release(snapshot, runs, user_acceptance_recorded=True)
+        # Only the crisis replay is excused, never another missing input.
+        with self.assertRaises(InternalReleaseError):
+            approve_internal_release(_snapshot(publication_blockers_json='["summary:quality_fail"]'), designed,
+                                     user_acceptance_recorded=True)
+
     def test_internal_release_requires_recorded_acceptance_and_complete_pair(self) -> None:
         with self.assertRaises(InternalReleaseError):
             approve_internal_release(_snapshot(), _runs(), user_acceptance_recorded=False)

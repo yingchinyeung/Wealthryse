@@ -169,7 +169,8 @@ def _latest_common_day(connection, statement: str, subject_id: str, period_end: 
 # Brokers whose daily row can carry provisional prices that the next trading day's
 # history pass replaces (Kiwoom: after-market prices, later the official KRX close).
 NEXT_DAY_FINAL_BROKERS = frozenset({"kiwoom_rest"})
-HISTORY_RUN_TYPES = {"kiwoom_rest": "kiwoom_rest_history"}
+# A Kiwoom account in USD (kiwoom_us_account) is filled by its own U.S. history pass.
+HISTORY_RUN_TYPES = {"kiwoom_rest": ("kiwoom_rest_history", "kiwoom_rest_us_history")}
 
 
 def _close_is_final(connection, subject_id: str, period_end: str, day: str) -> bool:
@@ -178,8 +179,8 @@ def _close_is_final(connection, subject_id: str, period_end: str, day: str) -> b
 
     final = connection.execute(
         "SELECT 1 AS final FROM nav_snapshots n JOIN ingestion_runs r ON r.run_id = n.last_seen_run_id "
-        "WHERE n.account_id = ? AND n.snapshot_date = ? AND n.asset_class = 'TOTAL' AND r.run_type = ?",
-        (subject_id, day, HISTORY_RUN_TYPES["kiwoom_rest"]),
+        "WHERE n.account_id = ? AND n.snapshot_date = ? AND n.asset_class = 'TOTAL' AND r.run_type IN (?, ?)",
+        (subject_id, day, *HISTORY_RUN_TYPES["kiwoom_rest"]),
     ).fetchone()
     if not final:
         return False

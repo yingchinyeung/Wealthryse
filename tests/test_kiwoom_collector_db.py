@@ -81,7 +81,7 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self.db = PostgresConnection(raw)
         self.addCleanup(raw.close)
 
-    def _kiwoom_account(self, account_id, *, case=True, start=date(2025, 1, 2)):
+    def _kiwoom_account(self, account_id, *, case=True, start=date(2025, 1, 2), currency="KRW"):
         from ibkr_etl.onboarding_v2_web import start_case
 
         connection_id = uuid.uuid4()
@@ -96,16 +96,17 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         case_id = None
         if case:
             case_id = start_case(self.db, TENANT, connection_id=str(connection_id), broker_account_id=account_id,
-                                 display_name="Korea stocks", reporting_currency="KRW",
+                                 display_name="Korea stocks" if currency == "KRW" else "U.S. stocks",
+                                 reporting_currency=currency,
                                  history_start_date=start, actor=None, today=TODAY)["case_id"]
         self.db.commit()
         return str(connection_id), case_id
 
-    def _run(self, clients):
+    def _run(self, clients, now=NOW):
         from ibkr_etl.kiwoom_collector import run
 
         return run(self.db, TENANT, client_for=lambda target: clients[target.broker_account_id], today=TODAY,
-                   now=NOW, include_us=False)
+                   now=now, include_us=False)
 
     def _approve_terms(self, case_id):
         from ibkr_etl.onboarding_v2_web import approve_case, case_detail
@@ -415,3 +416,111 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+AMGN = SecurityIdentifier("us_ticker", "AMGN")
+US_NOW = datetime(2026, 10, 20, 8, 30, tzinfo=timezone.utc)  # shows Monday 19 Oct's New York close
+
+
+class FakeUsKiwoom:
+    """A U.S.-only account: one stock bought on the first day, USD cash, Kiwoom's daily totals."""
+
+    def __init__(self, *, extra_shares="0"):
+        self.revoked, self.asked, self.extra = False, [], Decimal(extra_shares)
+
+    def valuation(self):
+        raise AssertionError("A USD account is never read through the domestic calls")
+
+    def us_valuation(self):
+        from ibkr_etl.kiwoom_client import CurrencyBalance, UsValuation
+
+        shares = Decimal("2") + self.extra
+        return UsValuation(
+            holdings=(Holding(AMGN, "암젠", shares, Decimal("306"), Decimal("400"), shares * 400, "USD", "미국"),),
+            balances=(CurrencyBalance("USD", Decimal("100"), shares * 400, Decimal("1350")),))
+
+    def us_transactions(self, start, end):
+        if start <= date(2026, 9, 2) <= end:
+            return [CashMovement("20260902", "매수", "매매", AMGN, Decimal("2"), Decimal("612"), "USD"),
+                    CashMovement("20260915", "배당금(외화)입금", "입출금", AMGN, Decimal("0"), Decimal("4.25"), "USD")]
+        return []
+
+    def us_balances_on(self, day):
+        from ibkr_etl.kiwoom_client import CurrencyBalance
+
+        self.asked.append(day)
+        return (CurrencyBalance("USD", Decimal("100"), Decimal("800"), Decimal("1400")),)
+
+    def revoke(self):
+        self.revoked = True
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class KiwoomUsAccountDatabaseTests(KiwoomCollectorDatabaseTests):
+    """A USD case is loaded in USD from the U.S. calls; only these tests run here (the Korea ones run above)."""
+
+    def setUp(self):
+        if not self._testMethodName.startswith("test_us_"):
+            self.skipTest("Korea test, run in KiwoomCollectorDatabaseTests")
+        super().setUp()
+
+    def test_us_a_usd_case_loads_in_usd_and_passes_stage_two(self):
+        connection_id, case_id = self._kiwoom_account("6346000001", start=date(2026, 9, 1), currency="USD")
+        self.addCleanup(self._cancel, case_id)
+        client = FakeUsKiwoom()
+        result = self._run({"6346000001": client}, now=US_NOW)[0]
+        self.assertEqual((result["status"], result["market"]), ("loaded", "US"))
+        self.assertTrue(client.revoked)
+        self.assertEqual(self._checks(case_id), {
+            "connection_sees_account": "pass", "account_not_already_onboarded": "pass",
+            "holdings_and_cash_loaded": "pass", "transactions_loaded": "pass", "securities_mapped": "pass",
+            "nav_reconciled": "pass"})
+        account = "KIWOOM-6346000001"
+        nav = self.db.execute("SELECT currency, total_text, stock_text, cash_text FROM nav_snapshots "
+                              "WHERE account_id = ? AND snapshot_date = '2026-10-19'", (account,)).fetchone()
+        self.assertEqual((nav["currency"], nav["total_text"], nav["stock_text"], nav["cash_text"]),
+                         ("USD", "900", "800", "100"))
+        base = self.db.execute("SELECT base_currency FROM accounts WHERE account_id = ?", (account,)).fetchone()
+        self.assertEqual(base["base_currency"], "USD")
+        kinds = {row["transaction_type"] for row in self.db.execute(
+            "SELECT transaction_type FROM cash_transactions WHERE account_id = ?", (account,)).fetchall()}
+        self.assertEqual(kinds, {"DIVIDEND"})
+        self.assertEqual(self.db.execute("SELECT base_currency FROM broker_connection_accounts "
+                                         "WHERE connection_id = ?", (connection_id,)).fetchone()["base_currency"],
+                         "USD")
+
+    def test_us_shares_that_do_not_add_up_fail_transactions(self):
+        _, case_id = self._kiwoom_account("6346000002", start=date(2026, 9, 1), currency="USD")
+        self.addCleanup(self._cancel, case_id)
+        self._run({"6346000002": FakeUsKiwoom(extra_shares="1")}, now=US_NOW)
+        self.assertEqual(self._checks(case_id)["transactions_loaded"], "fail")
+
+    def test_us_history_stores_kiwoom_totals_and_waits_for_positions(self):
+        _, case_id = self._kiwoom_account("6346000003", start=date(2026, 9, 1), currency="USD")
+        self.addCleanup(self._cancel, case_id)
+        client = FakeUsKiwoom()
+        result = self._run({"6346000003": client}, now=US_NOW)[0]
+        # Load and reconcile: past New York sessions are filled, no check recorded yet.
+        self.assertEqual(result["history"]["recorded"], False)
+        self.assertNotIn(date(2026, 9, 7), client.asked)  # Labor Day
+        self.assertEqual(client.asked[0], date(2026, 9, 1))
+        self.assertEqual(client.asked[-1], date(2026, 10, 16))
+        self.assertEqual(result["history"]["check"], "pending")
+        stored = self.db.execute("SELECT count(*) AS n FROM nav_snapshots WHERE account_id = ? AND currency = 'USD'",
+                                 ("KIWOOM-6346000003",)).fetchone()["n"]
+        self.assertEqual(stored, len(client.asked) + 1)
+
+    def test_us_the_history_pass_keeps_the_daily_positions_that_add_up(self):
+        _, case_id = self._kiwoom_account("6346000004", start=date(2026, 10, 1), currency="USD")
+        self.addCleanup(self._cancel, case_id)
+        account = "KIWOOM-6346000004"
+        self._run({"6346000004": FakeUsKiwoom()}, now=US_NOW)
+        client = FakeUsKiwoom()
+        self._run({"6346000004": client}, now=US_NOW + timedelta(days=1))
+        self.assertIn(date(2026, 10, 19), client.asked)
+        row = self.db.execute(
+            "SELECT r.run_type, (SELECT count(*) FROM position_snapshots p WHERE p.account_id = n.account_id "
+            "AND p.snapshot_date = n.snapshot_date) AS positions FROM nav_snapshots n "
+            "JOIN ingestion_runs r ON r.run_id = n.last_seen_run_id WHERE n.account_id = ? "
+            "AND n.snapshot_date = '2026-10-19'", (account,)).fetchone()
+        self.assertEqual((row["run_type"], row["positions"]), ("kiwoom_rest_us_history", 1))

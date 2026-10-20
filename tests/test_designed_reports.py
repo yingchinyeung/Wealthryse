@@ -53,7 +53,7 @@ class MonthTests(unittest.TestCase):
             answers = _Answers(position_snapshots=[{"day": "2025-01-30"}], ingestion_runs=final,
                                nav_snapshots=[{"day": later}])
             self.assertEqual(dr.month_ready(answers, "broker_account", "K1", "2025-01-31", "kiwoom_rest"), ready)
-            self.assertEqual(answers.statements[1][1], ("K1", "2025-01-30", "kiwoom_rest_history"))
+            self.assertEqual(answers.statements[1][1], ("K1", "2025-01-30", "kiwoom_rest_history", "kiwoom_rest_us_history"))
             self.assertIn("r.run_id = n.last_seen_run_id", answers.statements[1][0])
             if final:
                 self.assertEqual(answers.statements[2][1], ("K1", "2025-01-31"))

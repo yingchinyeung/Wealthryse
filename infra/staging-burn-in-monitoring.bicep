@@ -155,7 +155,6 @@ resource monitorJob 'Microsoft.App/jobs@2024-03-01' = {
 // The Medallion tags step S4a put on each live alert, by job (infra/medallion/applied-tags.json).
 // Four of these alerts had no owner tag before S4a, so S4a gave them owner 'ying'.
 var medallionAlertTags = {
-  'ibkrv2stg-account-sync-daily': { layer: 'ops', component: 'alerts' }
   'ibkrv2stg-benchmark-daily': { layer: 'ops', component: 'alerts' }
   'ibkrv2stg-risk-free-daily': { layer: 'ops', component: 'alerts' }
   'ibkrv2stg-sector-classification': { layer: 'ops', component: 'alerts' }

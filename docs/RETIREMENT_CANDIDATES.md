@@ -6,7 +6,10 @@ Each item needs the owner's go-ahead before anything is removed.
 **Update, 21 Oct 2026:** v1.1 was deleted: its vault, storage, registry,
 Postgres server, environment, jobs, identity, workspace, action group and
 alerts, with its data archived into v2 storage first. Its network stays.
-account-sync, which only imported v1.1's export, was retired in the repo too.
+account-sync, which only imported v1.1's export, and institutional-shadow,
+which compared v2's schedules with v1.1's daily job, were retired too: their
+jobs and Bicep files are gone. institutional-shadow's script and its table
+stay, because the website still shows the last reconciliation.
 
 ## How this list was made
 

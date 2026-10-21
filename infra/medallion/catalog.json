@@ -1595,12 +1595,6 @@
    "schedule": "08:20 UTC",
    "note": "v2's own Flex pull into ibkr-raw, then the loader."
   },
-  "ibkrv2stg-institutional-shadow": {
-   "hops": [
-    "ops"
-   ],
-   "schedule": "manual"
-  },
   "ibkrv2stg-internal-release": {
    "hops": [
     "publish"

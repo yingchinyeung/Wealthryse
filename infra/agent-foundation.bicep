@@ -73,17 +73,17 @@ resource peSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01' existin
 resource agentIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: 'id-wr-agent'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 resource toolsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: 'id-wr-agent-tools'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 resource jobsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: 'id-wr-agent-jobs'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource foundry 'Microsoft.CognitiveServices/accounts@2025-06-01' = {

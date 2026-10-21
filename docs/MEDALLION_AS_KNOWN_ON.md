@@ -241,6 +241,87 @@ rate, so a corrected rate replaces the old one. The history now keeps the old ra
 workflow input checks and the per-run row counts do, and will count each conversion
 once. The release data report shows the exact number of rows removed.
 
+## The FX step in October
+
+Ying's October decision (18 Oct) moves the FX step to **Thu 29 Oct**, a week after recording
+goes live (Thu 22 Oct, migration `074_silver_history.sql`). The dates in "Order of work"
+below are the design's; this section is what applies now.
+
+**The setting: `IBKR_FX_EVENT_KEY`**, on the jobs that load Flex statements into the live
+database (institutional-daily, where the daily 14-day pull brings the re-sends).
+
+- **off** (unset, or anything but `1`, `true`, `yes`, `on`): today's loader, unchanged. It
+  never reads or writes `event_key`, and a re-sent FX row with new amounts is a second row.
+- **on** (`true`): an FX row whose event (below) already has a current row updates that row
+  instead of adding one: new amounts, and `source_key` names the newest bronze record. The
+  trigger keeps the old amounts as a closed version. Needs the FX migration; without its
+  column the loader refuses before writing anything.
+
+There is no fallback mode: no NAV, return, certified figure, page or agent view reads FX
+rows, so no figure can change. The safety is the dry run, the history (a merged row is a
+closed version; nothing is lost) and the undo below.
+
+**The rule: when two FX rows are the same FX event.** Same account, IBKR `dateTime`, report
+date, functional and FX currency, activity description, model, quantity and cost, and the
+same place among rows alike in all of those within one statement. Proceeds and realised
+P&L, the two amounts IBKR restated on the re-sent row, are left out. Two rows that were ever
+in one statement together are never the same event. Its risks:
+
+- a re-send that also changes an identity field (cost, report date, time, quantity) is not
+  recognised and stays a second row, as today. `fx-check` counts rows alike apart from report
+  date or cost, never reported together (`possible_resends_outside_the_rule`);
+- an FX record sent without `reportDate` takes the statement's end date, so its re-send on
+  another day is not recognised either (`fx_records_without_report_date`);
+- two different conversions alike in all of the above and never in one statement together
+  would be merged. That needs the same second, quantity and cost; the history keeps both;
+- look-alike rows that IBKR reorders on the day it restates them can swap amounts between
+  their two rows; the number of rows stays right;
+- the merge keeps the latest report: v1.1's archived statements in name order (their date
+  folders), then v2's in load order. A wrong pick inside the 14-day window is corrected by
+  the next pull.
+
+**Who reads `fx_transactions`.** No website page or figure. The analyst export (`SELECT *`:
+one row per event after the step, plus the `event_key` column), the workflow input checks
+(`workflow_financial_inputs`: row counts and fingerprints change for accounts with merged
+rows; `workflow_fx_dependencies`' dated currency demands do not), reconcile's per-run counts,
+the layer volume record (recorded, not judged), the release data report and these tools.
+derived-daily lists it as a lineage input but reads no FX row.
+
+**The day, in order** (outside 07:55 to 09:20 UTC; recording must be on):
+
+1. `scripts/medallion_silver_history.py fx-check`: the counts before (read-only).
+2. The FX migration by itself: `infra/medallion/drafts/u8_fx_event_key.sql` moves unchanged
+   to `migrations/postgres/075_fx_event_key.sql`, then
+   `bootstrap_postgres.py --only-migration 075_fx_event_key.sql`. With it,
+   `silver/fx_transactions.yaml` and `silver/fx_transactions_history.yaml` gain `event_key`.
+3. `fx-merge` (a dry run, counts only), then `fx-merge --apply`, which refuses while a raw
+   statement is missing (`statement_files_missing`). A second `--apply` finds nothing to
+   merge and writes nothing.
+4. `IBKR_FX_EVENT_KEY=true` on institutional-daily.
+5. After the next daily load: `fx-check` exits 0 and `check` passes.
+
+**What the rehearsal on a restored copy must show** (Sat 24 or Sun 25, with the real raw
+statements: `--storage-account-url`, plus `--v11-prefix v11-archive/<tenant>/`):
+
+- `fx-check` before: `events_with_more_than_one_current_row` (expected: the 17 Oct
+  duplicate and any like it), `events_with_more_than_one_current_row_after_merge` 0,
+  `possible_resends_outside_the_rule` 0, `fx_records_without_report_date` 0, and
+  `not_in_any_statement` 0 or each row explained;
+- the `fx-merge` dry run's `merged` equals `fx-check`'s `rows_the_merge_removes`;
+- after the merge and a load of the newest raw statement with the setting on
+  (`ibkr-etl import-file <file>` against the copy, with `IBKR_FX_EVENT_KEY=true`,
+  `IBKR_RUN_MIGRATIONS=false` and a local raw folder): `fx-check` exits 0, `rows` fell by
+  `rows_the_merge_removes`, `history_rows_closed_as_merged` equals it, and `check` passes;
+- the release data report: `fx_transactions` rows removed equal to the merge, the new
+  `event_key` column, `fx_transactions_history` rows added, nothing else;
+- the undo on the copy: `fx-check` shows the before counts again.
+
+**Undo**, in order: take `IBKR_FX_EVENT_KEY` off (the loader is today's again; new re-sends
+become second rows); `fx-unmerge` (dry run), then `fx-unmerge --apply`, which puts each
+merged row back from its closed version and is safe to run twice; then
+`u8_fx_event_key_undo.sql`, which refuses while a merged row is missing. Recording stays on
+throughout, so the merge and its undo are both in the history.
+
 ## The migration
 
 ### What is built (nothing switched on)

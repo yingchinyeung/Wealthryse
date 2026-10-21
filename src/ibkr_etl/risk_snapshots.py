@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 from dataclasses import asdict
 from typing import Any, Mapping
 
@@ -23,6 +23,36 @@ from .market_calendar import BENCHMARK_MARKETS, CALENDARS, CALENDAR_VERSION, ben
 
 LOGGER = logging.getLogger(__name__)
 RISK_ANALYTICS_VERSION = "risk-analytics-v2"
+# Reporting currencies with their own risk-free series in risk_free_rates (see korea_cd_rate).
+OWN_CURRENCY_RISK_FREE = {"KRW": "KRW"}
+# A won rate older than this is not used: the monthly OECD series runs one to two months
+# behind, so a quarter without a new month means the feed has stopped.
+OWN_RATE_MAX_AGE_DAYS = 100
+
+
+def own_rate_cutoff(as_of: str) -> str:
+    return (date.fromisoformat(str(as_of)[:10]) - timedelta(days=OWN_RATE_MAX_AGE_DAYS)).isoformat()
+
+
+def risk_free_rate(connection, *, tenant_id: str, reporting_currency: str, as_of: str):
+    """The latest validated risk-free observation for a subject reporting in this currency.
+
+    A won account takes the won CD rate once it is loaded and recent; until then, and for
+    every other currency here, the U.S. 3-month Treasury rate as before.
+    """
+    own_rate = OWN_CURRENCY_RISK_FREE.get(str(reporting_currency or "USD").upper(), "USD")
+    return connection.execute(
+        """
+        SELECT rate_date, series_id, currency, tenor, annual_rate, provider,
+               quality_status
+        FROM risk_free_rates
+        WHERE tenant_id = ? AND currency IN (?, 'USD') AND rate_date <= ?
+          AND (currency = 'USD' OR rate_date >= ?)
+          AND quality_status IN ('pass', 'warn')
+        ORDER BY (currency = ?) DESC, rate_date DESC LIMIT 1
+        """,
+        (tenant_id, own_rate, as_of, own_rate_cutoff(as_of), own_rate),
+    ).fetchone()
 
 
 class RiskInputsNotReady(ValueError):
@@ -158,12 +188,15 @@ def load_risk_inputs(
     query_started = time.perf_counter()
     subject = connection.execute(
         """
-        SELECT subject_type FROM platform_subjects
+        SELECT subject_type, COALESCE(reporting_currency, base_currency) AS reporting_currency
+        FROM platform_subjects
         WHERE tenant_id = ? AND subject_id = ?
         """,
         (tenant_id, subject_id),
     ).fetchone()
     subject_type = str(subject["subject_type"]) if subject else "physical_account"
+    # The NAV, comparison and holdings below are in this currency; so is the risk-free rate.
+    reporting_currency = str((subject["reporting_currency"] if subject else None) or "USD").upper()
     from .profiled_composite import is_profiled
     if (subject_type == 'composite_portfolio' and subject_id not in ('alpha-world-ms','alpha-world-t')
             and is_profiled(connection, subject_id, tenant_id=tenant_id)):
@@ -230,17 +263,7 @@ def load_risk_inputs(
             as_of,
         ),
     ).fetchall()
-    risk_free = connection.execute(
-        """
-        SELECT rate_date, series_id, currency, tenor, annual_rate, provider,
-               quality_status
-        FROM risk_free_rates
-        WHERE tenant_id = ? AND currency = 'USD' AND rate_date <= ?
-          AND quality_status IN ('pass', 'warn')
-        ORDER BY rate_date DESC LIMIT 1
-        """,
-        (tenant_id, as_of),
-    ).fetchone()
+    risk_free = risk_free_rate(connection, tenant_id=tenant_id, reporting_currency=reporting_currency, as_of=as_of)
     rows = _rows(records)
     timings["comparison_and_rate_query_ms"] = round(
         (time.perf_counter() - query_started) * 1000, 3
@@ -254,13 +277,13 @@ def load_risk_inputs(
             """
             SELECT p.snapshot_date, p.conid, p.model_code,
                    CASE
-                     WHEN UPPER(COALESCE(p.currency, '')) = 'USD' THEN 'USD'
-                     WHEN fx.rate IS NOT NULL THEN 'USD'
+                     WHEN UPPER(COALESCE(p.currency, '')) = ? THEN ?
+                     WHEN fx.rate IS NOT NULL THEN ?
                      ELSE p.currency
                    END AS currency,
                    p.quantity_text,
                    CASE
-                     WHEN UPPER(COALESCE(p.currency, '')) = 'USD'
+                     WHEN UPPER(COALESCE(p.currency, '')) = ?
                        THEN p.market_value_text
                      WHEN fx.rate IS NOT NULL
                        THEN (COALESCE(NULLIF(p.market_value_text, ''), '0')::numeric * fx.rate)::text
@@ -274,19 +297,20 @@ def load_risk_inputs(
                 FROM reference_fx_rates AS r
                 WHERE r.tenant_id = ?
                   AND r.from_currency = UPPER(COALESCE(p.currency, ''))
-                  AND r.to_currency = 'USD'
+                  AND r.to_currency = ?
                   AND r.quality_status IN ('pass', 'warn')
                   AND r.rate_date <= p.snapshot_date
                   AND r.rate_date >= (p.snapshot_date::date - INTERVAL '4 days')::text
                 ORDER BY r.rate_date DESC
                 LIMIT 1
-            ) AS fx ON UPPER(COALESCE(p.currency, '')) <> 'USD'
+            ) AS fx ON UPPER(COALESCE(p.currency, '')) <> ?
             WHERE p.tenant_id = ? AND p.subject_id = ?
               AND p.snapshot_date = ANY(?::text[])
               AND UPPER(COALESCE(i.symbol, '')) NOT LIKE '%%.REC'
             ORDER BY p.snapshot_date, p.conid, p.model_code
             """,
-            (tenant_id, tenant_id, subject_id, required_dates),
+            (reporting_currency, reporting_currency, reporting_currency, reporting_currency,
+             tenant_id, reporting_currency, reporting_currency, tenant_id, subject_id, required_dates),
         ).fetchall()
     timings["tail_position_query_ms"] = round(
         (time.perf_counter() - positions_started) * 1000, 3
@@ -301,6 +325,7 @@ def load_risk_inputs(
     return {
         "subject_id": subject_id, "subject_type": subject_type, "as_of": as_of,
         "benchmark_id": benchmark["benchmark_id"] if benchmark else None,
+        "reporting_currency": reporting_currency,
         "rows": rows, "positions": [dict(row) for row in position_records],
         "risk_free": dict(risk_free) if risk_free else None,
         "crisis_replay": dict(crisis_replay) if crisis_replay else None,
@@ -396,7 +421,7 @@ def compute_risk_snapshot(
         rows, float(risk_free["annual_rate"]) if risk_free else None
     )
     contributors = expected_tail_loss_contributors(
-        rows, position_records, reporting_currency="USD"
+        rows, position_records, reporting_currency=str(inputs.get("reporting_currency") or "USD")
     )
     timings["deterministic_metrics_ms"] = round(
         (time.perf_counter() - analytics_started) * 1000, 3
@@ -417,7 +442,7 @@ def compute_risk_snapshot(
         "risk_free": dict(risk_free) if risk_free else None,
         "quality_status": quality_status,
         "message": (
-            "Risk metrics use validated, cash-flow-adjusted portfolio returns on common primary-benchmark trading dates. Sharpe is unavailable until a validated USD risk-free series is loaded."
+            "Risk metrics use validated, cash-flow-adjusted portfolio returns on common primary-benchmark trading dates. Sharpe is unavailable until a validated risk-free series is loaded."
             if rows and risk_free is None
             else (
                 "Risk metrics use validated, cash-flow-adjusted portfolio returns on common primary-benchmark trading dates."

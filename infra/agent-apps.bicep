@@ -157,7 +157,7 @@ var probes = [
 resource tools 'Microsoft.App/containerApps@2024-03-01' = {
   name: toolsAppName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls]
   identity: {
     type: 'UserAssigned'
@@ -202,7 +202,7 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
 resource agent 'Microsoft.App/containerApps@2024-03-01' = {
   name: agentAppName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls]
   identity: {
     type: 'UserAssigned'
@@ -281,7 +281,7 @@ var jobs = [
 resource agentJobs 'Microsoft.App/jobs@2024-03-01' = [for j in jobs: {
   name: j.name
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls, tools]
   identity: {
     type: 'UserAssigned'
@@ -362,7 +362,7 @@ resource onboardingIntakeReader 'Microsoft.Authorization/roleAssignments@2022-04
 resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
   name: 'ibkrv2stg-agent-month-team'
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls, tools, monthTeamReader]
   identity: {
     type: 'UserAssigned'
@@ -417,7 +417,7 @@ resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
 resource onboardingJob 'Microsoft.App/jobs@2024-03-01' = if (deployOnboarding && deployMonthTeam) {
   name: 'ibkrv2stg-agent-onboarding'
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls, tools, monthTeamReader, onboardingIntakeReader]
   identity: {
     type: 'UserAssigned'
@@ -504,7 +504,7 @@ var opsGithubEnv = empty(opsGithubTokenSecretUri) ? [] : [
 resource operationsJob 'Microsoft.App/jobs@2024-03-01' = if (deployOperations) {
   name: 'ibkrv2stg-agent-ops'
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'ops' })
   dependsOn: [pulls, tools, opsReader, opsLogReader]
   identity: {
     type: 'UserAssigned'

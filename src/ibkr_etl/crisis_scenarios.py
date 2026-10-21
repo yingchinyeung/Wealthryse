@@ -1,7 +1,9 @@
 """Hypothetical crisis scenarios for every account, portfolio and composite.
 
 Each scenario replays the subject's current holdings, held as fixed units,
-through one historical sell-off. Holdings with their own prices for the window
+through one historical sell-off, in the subject's own reporting currency (an
+account in Korean won is replayed in won; holdings in another currency are
+converted at each day's Yahoo FX). Holdings with their own prices for the window
 use them; the rest use a stand-in ETF (crisis_replay's proxy map), scaled by
 the holding's own sensitivity to that stand-in: its beta on weekly returns over
 the two years to the holdings date, kept between 0.25 and 3. Composites
@@ -56,6 +58,11 @@ BETA_MIN_RETURNS = 40         # about ten months of weekly returns
 BETA_BOUNDS = (0.25, 3.0)
 HEDGES = {"hang-seng-price-index": ("^HSI", "HKD"), "spy-settlement": ("SPY", "USD")}
 SLEEVE_TYPES = {"account", "portfolio", "filtered_portfolio"}
+# A won holding with no prices of its own stands in on the KOSPI index (in won), not on SPY.
+# Kept here rather than in crisis_replay's PROXY_BY_CURRENCY, which the 2008 USD replay
+# requires to be complete for every entry.
+STAND_IN_BY_CURRENCY = {**PROXY_BY_CURRENCY, "KRW": "^KS11"}
+STAND_IN_CURRENCY = {"^KS11": "KRW"}  # every other stand-in is a U.S.-listed fund in USD
 PARAMOUNT_CONID = "804144296"
 LIMITATIONS = ("Hypothetical replay of current holdings held as fixed units; not actual performance. "
                "Provisional Yahoo Finance prices; stand-ins scaled by each holding's two-year weekly beta. "
@@ -212,7 +219,7 @@ def _holdings(connection, account_id: str, latest: str) -> tuple[float, list[dic
 
 
 def _holding_scenario(prices: Prices, holding: Mapping[str, Any], scenario: Scenario, calendar: list[str],
-                      latest: date) -> tuple[list[float], dict[str, Any]]:
+                      latest: date, reporting: str = "USD") -> tuple[list[float], dict[str, Any]]:
     symbol, currency = holding["symbol"], holding["currency"]
     window = (scenario.start - timedelta(days=LOOKBACK_DAYS), scenario.end)
     candidates = candidate_symbols(symbol, holding["listing_exchange"], currency)
@@ -220,23 +227,24 @@ def _holding_scenario(prices: Prices, holding: Mapping[str, Any], scenario: Scen
     if not paramount:
         for candidate in candidates:
             try:
-                own = prices.in_currency(candidate, currency, "USD", *window)
+                own = prices.in_currency(candidate, currency, reporting, *window)
             except RuntimeError:
                 continue
             if has_own_history(own, calendar):
                 aligned = align(own, calendar)
                 if aligned is not None:
                     return scaled_path(aligned, calendar, 1.0), {"source_symbol": candidate, "method": "direct"}
-    stand_in = "SPY" if paramount else PROXY_BY_SYMBOL.get(symbol, PROXY_BY_CURRENCY.get(currency, "SPY"))
-    proxy = align(prices.history(stand_in, *window), calendar)
+    stand_in = "SPY" if paramount else PROXY_BY_SYMBOL.get(symbol, STAND_IN_BY_CURRENCY.get(currency, "SPY"))
+    stand_in_currency = STAND_IN_CURRENCY.get(stand_in, "USD")
+    proxy = align(prices.in_currency(stand_in, stand_in_currency, reporting, *window), calendar)
     if proxy is None:
         raise RuntimeError(f"Stand-in {stand_in} has no prices at the start of the {scenario.label} window")
     recent = (latest - timedelta(days=BETA_HISTORY_DAYS), latest)
-    stand_in_recent = prices.history(stand_in, *recent)
+    stand_in_recent = prices.in_currency(stand_in, stand_in_currency, reporting, *recent)
     beta = {"beta": 1.0, "weekly_returns": 0, "basis": "unscaled-no-recent-history"}
     for candidate in candidates:
         try:
-            own_recent = prices.in_currency(candidate, currency, "USD", *recent)
+            own_recent = prices.in_currency(candidate, currency, reporting, *recent)
         except RuntimeError:
             continue
         if own_recent:
@@ -248,11 +256,25 @@ def _holding_scenario(prices: Prices, holding: Mapping[str, Any], scenario: Scen
                                                         "reason": reason, **beta}
 
 
+def _reporting_currency(connection, subject_id: str) -> str:
+    """The subject's reporting currency, which its NAV is in; USD when it has none recorded."""
+
+    try:
+        row = _execute(connection, "SELECT reporting_currency FROM platform_subjects WHERE subject_id = ?",
+                       (subject_id,)).fetchone()
+    except Exception:  # noqa: BLE001 - a store without the subjects table (old local files) reports in USD
+        if not type(connection).__module__.startswith("sqlite3"):
+            raise
+        return "USD"
+    return str((row["reporting_currency"] if row else None) or "USD").strip().upper()
+
+
 def account_scenarios(connection, account_id: str, prices: Prices, *, as_of: str | None = None) -> dict[str, Any]:
-    """Every scenario for an account or portfolio, in USD per opening NAV of one."""
+    """Every scenario for an account or portfolio, in its reporting currency per opening NAV of one."""
 
     latest = resolve_holdings_as_of(connection, account_id=account_id, as_of=as_of)
     nav, holdings = _holdings(connection, account_id, latest)
+    reporting = _reporting_currency(connection, account_id)
     values = {}
     for holding in holdings:
         holding["symbol"] = str(holding["symbol"]).strip().upper()
@@ -260,7 +282,8 @@ def account_scenarios(connection, account_id: str, prices: Prices, *, as_of: str
         holding["conid"] = str(holding["conid"])
         if holding["symbol"].endswith(".REC"):
             continue  # a receivable is in NAV already; it stays in the flat residual
-        rate = _fx_rate_as_of(connection, from_currency=holding["currency"], to_currency="USD", as_of=latest)
+        # NAV is in the reporting currency, so each holding's weight must be too.
+        rate = _fx_rate_as_of(connection, from_currency=holding["currency"], to_currency=reporting, as_of=latest)
         values[holding["conid"]] = float(holding["market_value"]) * rate
     results = []
     for scenario in SCENARIOS:
@@ -271,14 +294,14 @@ def account_scenarios(connection, account_id: str, prices: Prices, *, as_of: str
                 if holding["conid"] not in values:
                     continue
                 paths[holding["conid"]], mapping = _holding_scenario(prices, holding, scenario, calendar,
-                                                                     date.fromisoformat(latest))
+                                                                     date.fromisoformat(latest), reporting)
                 evidence.append({"conid": holding["conid"], "symbol": holding["symbol"],
                                  "weight": values[holding["conid"]] / nav, **mapping})
             replay = combine({k: v / nav for k, v in values.items()}, paths, calendar)
-            results.append(_result(scenario, replay, evidence, "USD"))
+            results.append(_result(scenario, replay, evidence, reporting))
         except (RuntimeError, ValueError) as error:
             results.append(_unavailable(scenario, str(error)))
-    return {"subject_id": account_id, "holdings_as_of": latest, "reporting_currency": "USD", "scenarios": results}
+    return {"subject_id": account_id, "holdings_as_of": latest, "reporting_currency": reporting, "scenarios": results}
 
 
 # Composites ------------------------------------------------------------------------
@@ -326,7 +349,6 @@ def composite_scenarios(connection, subject_id: str, prices: Prices, sleeve_resu
     for scenario in SCENARIOS:
         try:
             calendar = prices.calendar(scenario)
-            usd = _fx_path(prices, "USD", currency, scenario, calendar)
             weights, paths, evidence = {}, {}, []
             for component in components:
                 key, kind = str(component["component_id"]), component["component_type"]
@@ -339,7 +361,10 @@ def composite_scenarios(connection, subject_id: str, prices: Prices, sleeve_resu
                         raise RuntimeError(f"Sleeve {key} has no {scenario.label} result: {why}")
                     if [r["date"] for r in found["daily"]] != calendar:
                         raise RuntimeError(f"Sleeve {key}'s {scenario.label} dates differ")
-                    path = [r["value"] * f for r, f in zip(found["daily"], usd)]
+                    # A sleeve's path is in its own reporting currency (USD for the IBKR sleeves).
+                    sleeve_currency = str(sleeves[key].get("reporting_currency") or "USD").upper()
+                    fx = _fx_path(prices, sleeve_currency, currency, scenario, calendar)
+                    path = [r["value"] * f for r, f in zip(found["daily"], fx)]
                     detail = {"method": "sleeve scenario", "sleeve_holdings_as_of": sleeves[key]["holdings_as_of"],
                               "direct_components": found["direct_components"],
                               "proxy_components": found["proxy_components"],

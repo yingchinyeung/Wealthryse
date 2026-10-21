@@ -66,7 +66,7 @@ resource tokenVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${jobName}-identity'
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', owner: 'ying' })
 }
 
 resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -117,7 +117,7 @@ resource rawArchiveWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' =
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', hop: 'ingest+ops', owner: 'ying' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

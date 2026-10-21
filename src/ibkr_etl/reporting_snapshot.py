@@ -294,6 +294,20 @@ def _check_hkd_design(payload, *, label, analyze, version, reporting_currency, i
     payload['month_end_performance'] = [points[key] for key in sorted(points)]
 
 
+def _onboarded_without_benchmarks(connection, subject_id: str) -> bool:
+    """A subject that went through new onboarding (broker_onboarding_cases), which asks for no
+    benchmark. Its snapshot is collected with no comparison, or with its one primary benchmark
+    once a benchmark contract is approved, instead of being refused."""
+    try:
+        if connection.execute("SELECT to_regclass('public.broker_onboarding_cases')").fetchone()[0] is None:
+            return False
+    except Exception:  # SQLite: no to_regclass, and no new onboarding
+        return False
+    return connection.execute(
+        "SELECT 1 FROM broker_onboarding_cases WHERE target_subject_id = ? AND source_kind = 'broker_account' LIMIT 1",
+        (subject_id,)).fetchone() is not None
+
+
 def _collect_tool_results(
     connection,
     *,
@@ -368,6 +382,10 @@ def _collect_tool_results(
     if len(benchmark_ids) < 2:
         if subject_id == "U16088571":
             benchmark_ids = ["GSPC", "IXIC"]
+        elif _onboarded_without_benchmarks(connection, subject_id):
+            # New onboarding asks for no benchmark: none, or the one primary benchmark approved for the
+            # account (benchmark contract), is collected below; a missing secondary is not configured.
+            pass
         else:
             raise ReportingSnapshotError(
                 "At least one primary and one secondary benchmark must be configured"
@@ -385,24 +403,36 @@ def _collect_tool_results(
         "holdings": execute_tool(
             connection, context, "get_holdings", {**common, "limit": 200}
         ),
-        "primary_benchmark": execute_tool(
-            connection,
-            context,
-            "compare_with_benchmarks",
-            {**common, "benchmark_id": benchmark_ids[0]},
-        ),
-        "secondary_benchmark": execute_tool(
-            connection,
-            context,
-            "compare_with_benchmarks",
-            {**common, "benchmark_id": benchmark_ids[1]},
-        ),
         "risk": execute_tool(connection, context, "get_risk_metrics", common),
         "freshness": execute_tool(connection, context, "get_data_freshness", common),
         "sector_allocation": execute_tool(
             connection, context, "get_sector_allocation", common
         ),
     }
+    if not benchmark_ids:
+        for name in ("primary_benchmark", "secondary_benchmark"):
+            results[name] = {
+                "as_of": results["summary"].get("as_of"), "quality_status": "warn", "citations": [],
+                "data": {"available": False, "series": [], "metrics": {}, "publication_allowed": False,
+                         "reason": "No benchmark is configured: a new-onboarding account has no benchmark step"},
+            }
+        # Risk metrics are computed on the benchmark comparison, so with none they are not
+        # available rather than failed; the factsheet of such an account prints none.
+        risk = dict(results["risk"])
+        if risk.get("quality_status") == "fail" and (risk.get("data") or {}).get("benchmark_id") is None:
+            risk["quality_status"] = "warn"
+            risk["data"] = {**risk["data"], "reason": "Risk metrics need a benchmark comparison; none is configured"}
+            results["risk"] = risk
+    else:
+        for name, benchmark_id in zip(("primary_benchmark", "secondary_benchmark"), benchmark_ids):
+            results[name] = execute_tool(
+                connection, context, "compare_with_benchmarks", {**common, "benchmark_id": benchmark_id})
+        if len(benchmark_ids) == 1:
+            results["secondary_benchmark"] = {
+                "as_of": results["summary"].get("as_of"), "quality_status": "warn", "citations": [],
+                "data": {"available": False, "series": [], "metrics": {}, "publication_allowed": False,
+                         "reason": "No secondary benchmark is configured: the account has one primary benchmark"},
+            }
     for index, benchmark_id in enumerate(benchmark_ids[2:], start=1):
         results[f"additional_benchmark_{index}"] = execute_tool(
             connection,
@@ -420,7 +450,7 @@ def _collect_tool_results(
     return normalize_collected_report_holdings(connection, subject_id, reporting_currency, results)
 
 
-def freeze_month_end_snapshot(
+def build_month_end_payload(
     connection,
     *,
     tenant_id: str,
@@ -428,8 +458,15 @@ def freeze_month_end_snapshot(
     period_start: str,
     period_end: str,
     reporting_currency: str,
-    reject_quality_fail: bool = False,
-) -> ReportingSnapshotResult:
+    environ: Mapping[str, str] | None = None,
+    out=None,
+) -> tuple[dict[str, Any], str, bool, tuple[str, ...], dict[str, Any] | None]:
+    """The month-end payload a freeze stores, without storing it: collected, assembled, and with
+    the certified figures applied as MONTHLY_REPORTS_CERTIFIED says (certified_reports; off, the
+    default, leaves it exactly as assembled and reads nothing). Returns the payload, its quality,
+    publication_allowed, the blockers and the certified comparison (None when off)."""
+    from .certified_reports import apply_certified
+
     tool_results = _collect_tool_results(
         connection,
         tenant_id=tenant_id,
@@ -443,6 +480,29 @@ def freeze_month_end_snapshot(
         period_end=period_end,
         reporting_currency=reporting_currency,
         tool_results=tool_results,
+    )
+    comparison = apply_certified(connection, tenant_id=tenant_id, subject_id=subject_id, payload=payload,
+                                 environ=environ, out=out)
+    return payload, quality, publication_allowed, blockers, comparison
+
+
+def freeze_month_end_snapshot(
+    connection,
+    *,
+    tenant_id: str,
+    subject_id: str,
+    period_start: str,
+    period_end: str,
+    reporting_currency: str,
+    reject_quality_fail: bool = False,
+) -> ReportingSnapshotResult:
+    payload, quality, publication_allowed, blockers, _ = build_month_end_payload(
+        connection,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
+        period_start=period_start,
+        period_end=period_end,
+        reporting_currency=reporting_currency,
     )
     if reject_quality_fail and (
         quality == "fail" or not (payload.get("monthly_reporting") or {}).get("available")

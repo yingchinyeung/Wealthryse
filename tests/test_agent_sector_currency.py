@@ -33,6 +33,7 @@ class Connection:
         if 'SELECT subject_type FROM' in sql: return Cursor(dict(subject_type=self.kind))
         if sql.lstrip().startswith('SELECT COALESCE(reporting_currency'): return Cursor(dict(reporting_currency=self.currency))
         if 'subject_calculation_definitions' in sql: return Cursor(dict(source_account_id='APPROVED_SOURCE'))
+        if 'information_schema.columns' in sql: return Cursor(None)  # before migration 080's long_name
         if 'FROM fx_rates' in sql: return Cursor(rows=self.fx)
         if 'FROM synthetic_portfolio_components' in sql: return Cursor(rows=[dict(sector='equity', market_value=230)])
         if 'FROM subject_position_series p' in sql: return Cursor(rows=self.rows)

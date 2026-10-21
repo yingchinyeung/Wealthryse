@@ -4,13 +4,12 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from audit_azure_runtime import az, RG
-from ibkr_etl.schedule_monitor import DAILY_V1, DAILY_V2, HEARTBEATS, daily_query, heartbeat_query
+from ibkr_etl.schedule_monitor import DAILY_V2, HEARTBEATS, daily_query, heartbeat_query
 from ibkr_etl.azure_inventory import read_collection
 from deploy_metadata_monitor import request, BASE
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKSPACES = {
-    'ibkrv11-logs': 'f594ac4f-31eb-4684-a5af-a8adc5020cfa',
     'ibkrv2stg-logs': '5264a124-10cd-45f6-93a5-6d65c37e9bfb',
 }
 
@@ -30,7 +29,7 @@ def main():
     jobs = az('containerapp', 'job', 'list', '-g', RG, '--query',
               '[].{name:name,trigger:properties.configuration.triggerType,cron:properties.configuration.scheduleTriggerConfig.cronExpression,timeout:properties.configuration.replicaTimeout}')
     by_name = {row['name']: row for row in jobs}
-    for name, offset, runtime in DAILY_V1 + DAILY_V2:
+    for name, offset, runtime in DAILY_V2:
         observed = by_name[name]
         if (observed['trigger'] != 'Schedule' or observed['cron'] != f'{offset % 60} {offset // 60} * * *'
                 or observed['timeout'] != runtime * 60):
@@ -38,11 +37,8 @@ def main():
     for name in HEARTBEATS:
         if by_name[name]['trigger'] != 'Schedule' or by_name[name]['cron'] != '*/5 * * * *':
             raise RuntimeError('Heartbeat schedule drift: ' + name)
-    # With IBKR_DAILY_FEED=direct_flex v1.1's pull has stopped, so it has no rule;
-    # disable or delete the deployed ibkr-v11-daily-schedule-watchdog separately.
-    rules = ([
-        {'name': 'ibkr-v11-daily-schedule-watchdog', 'workspaceName': 'ibkrv11-logs', 'query': daily_query(DAILY_V1)},
-    ] if DAILY_V1 else []) + [
+    # v1.1's ibkr-v11-daily and its watchdog rule on ibkrv11-logs were deleted with v1.1 on 21 Oct 2026.
+    rules = [
         {'name': 'ibkr-v2-daily-schedule-watchdog', 'workspaceName': 'ibkrv2stg-logs', 'query': daily_query(DAILY_V2)},
         {'name': 'ibkr-v2-background-heartbeat-watchdog', 'workspaceName': 'ibkrv2stg-logs', 'query': heartbeat_query()},
     ]
@@ -70,8 +66,7 @@ def main():
         empty = 'datatable(TimeGenerated:datetime,JobName_s:string,Reason_s:string,ExecutionName_s:string)[]'
         simulated = az('monitor', 'log-analytics', 'query', '-w', workspace,
                        '--analytics-query', rule['query'].replace('ContainerAppSystemLogs_CL', empty))
-        expected = (len(DAILY_V1) if rule['workspaceName'] == 'ibkrv11-logs'
-                    else len(HEARTBEATS) if 'heartbeat' in rule['name'] else len(DAILY_V2))
+        expected = len(HEARTBEATS) if 'heartbeat' in rule['name'] else len(DAILY_V2)
         if len(simulated) != expected:
             raise RuntimeError('Synthetic missing-telemetry detection failed')
         evidence['queries'].append({'name': rule['name'], 'live_issues': rows, 'synthetic_issues': len(simulated)})

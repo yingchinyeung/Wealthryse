@@ -180,9 +180,9 @@ class CatalogCoverageTests(unittest.TestCase):
         pass_plan = layer_quality.plan({layer_quality.CONTRACTS_DIR_ENV: str(CONTRACTS)})
         self.assertIsNone(pass_plan.contracts_error)
         self.assertEqual(len(pass_plan.contracts), 43)
-        self.assertEqual(len(pass_plan.rules), 231)
-        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 231)
-        self.assertEqual(sum(r.needs_rls_bypass for r in pass_plan.rules), 13)
+        self.assertEqual(len(pass_plan.rules), 234)
+        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 234)
+        self.assertEqual(sum(r.needs_rls_bypass for r in pass_plan.rules), 15)
         self.assertIn("silver.nav_snapshots_history", pass_plan.held)
         self.assertIn("public.silver_history_settings", pass_plan.held)
         self.assertEqual(layer_quality.rule_check_id("silver.nav_snapshots", "total_text_is_decimal"),

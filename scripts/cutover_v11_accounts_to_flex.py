@@ -3,6 +3,8 @@
 Dry run by default: it checks and prints the plan and writes nothing. --apply
 writes the cutover in one transaction with an audit event; --revert restores
 the existing_v11 registrations the cutover closed. Both are safe to re-run.
+v1.1 was deleted on 21 Oct 2026 and account-sync retired with it, so a revert
+now leaves the accounts with no daily feed: do not use --revert.
 
   DATABASE_URL            the approval login is enough (no DELETE is used)
   PORTFOLIO_TENANT_ID     optional, defaults to the platform tenant

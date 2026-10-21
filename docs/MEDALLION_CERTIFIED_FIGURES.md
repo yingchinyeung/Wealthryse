@@ -15,12 +15,16 @@ one daily build that checks itself before it publishes. It carries its definitio
 version), its as-of date, how fresh it is, its calculation version and the run that made it.
 Pages read these rows instead of calculating; the agents read them through one typed tool,
 `get_certified_figures`, and cite each figure they quote. The first list has 71 figures on
-seven pages. The layer is built the day after approval and runs in shadow from **Tue 20
+seven pages; with Attribution and the charts the register has 84 figures on nine pages. The layer is built the day after approval and runs in shadow from **Tue 20
 Oct**. Pages then move in three batches, each a website release checked with the release
 data report: **Thu 22** Overview, Holdings and Cash; **Fri 23** Performance; **Sat 24** Risk,
 Combined holdings and the agents' read tool. Sun 25 to Thu 29 are spare days for a page that
 failed its report; nothing moves after Thu 29, and month-end (1 to 7 Nov) has no changes.
-Monthly reports, the factsheet and Performance › Attribution stay on today's path until 8 Nov.
+The factsheet stays on the frozen month-end snapshot until 8 Nov. Performance › Attribution and
+the monthly reports move on **Tue 27 Oct** in the automatic fallback, which keeps every report
+exactly as today's code makes it ("Monthly reports and Attribution on certified figures").
+The charts, tables and indicators move on **Thu 29 Oct** (batch 5), also in the automatic
+fallback ("The charts, tables and indicators").
 One setting undoes any page.
 
 ## The dates
@@ -35,6 +39,8 @@ One setting undoes any page.
 | **Fri 23** | **Batch 2:** Performance | Yes |
 | **Sat 24** | **Batch 3:** Risk, Combined holdings, the agents' read tool | Yes |
 | Sun 25 to Thu 29 | Spare days for any page that failed its report | Only for those pages |
+| **Tue 27** | **Batch 4:** Performance › Attribution; the monthly reports in the automatic fallback | Yes: the same figures, with "Certified · as of" |
+| **Thu 29** | **Batch 5:** the charts, tables and indicators, in the automatic fallback | Yes: the same charts, with "Certified · as of" |
 | Fri 30 to Sat 31 | Watching; no moves (open question 8) | No |
 | 1 to 7 Nov | Month-end, no changes. Undoing a page is the only change allowed (open question 9) | No |
 | From 8 Nov | Monthly reports, the factsheet check, Attribution, the charts, the publish gate, flows from silver ("After month-end") | One release at a time |
@@ -55,8 +61,11 @@ One setting undoes any page.
 **Stay on today's path until after month-end (from 8 Nov):**
 
 - **Monthly reports.** They produce the 1 Nov client reports from the frozen month-end snapshot.
+  From Tue 27 Oct they compare their figures with the certified ones in the automatic fallback,
+  which changes nothing in them ("Monthly reports and Attribution on certified figures").
 - **The factsheet renderers.** They read the frozen snapshot, and their job moves on Wed 21.
-- **Performance › Attribution.** It uses the monthly reports' engine (`monthly_reporting_analytics`), so it moves with them.
+- **Performance › Attribution.** It uses the monthly reports' engine (`monthly_reporting_analytics`),
+  so it moves with them: its own page key `attribution`, batch 4, Tue 27 Oct.
 - **The agents' month-end commentary job** (`month_end_drafter`, 2 to 7 Nov). It keeps its own tool list, so its drafts match the frozen reports.
 
 **Out of scope:** Modelling (hypothetical models, labelled as such: open question 7), Trade
@@ -317,7 +326,9 @@ Risk snapshot only, and its text still says the every-date version is on the Per
 - **Charts, tables, indicators and labels** (12 guide entries, each with a reason in the
   register): daily return series, rolling series, drawdown episodes, the holdings correlation
   matrix, RSI, attribution; and labels carried with other figures (benchmark return basis, the
-  top and bottom 5 contributors, crisis stand-ins).
+  top and bottom 5 contributors, crisis stand-ins). The charts, tables and RSI were brought
+  forward on 18 Oct to batch 5 (Thu 29): see [The charts](#the-charts-tables-and-indicators-batch-5-thu-29);
+  attribution to batch 4 (Tue 27): see "Monthly reports and Attribution on certified figures".
 - **Records, not figures** (5): a cash event's amount, and the fields of a trade.
 - **Trade history's measures** (3): trading activity, turnover and commissions / NAV, with the
   page that is out of scope.
@@ -388,7 +399,7 @@ certified figures for that day are the same, with that date in their source key.
 
 | Tool | Parameters | Answers |
 |---|---|---|
-| `get_certified_figures` | `account_id` (required); `figures` (1 to 25 figure ids) or `page` (one of the seven pages); `as_of` (optional, default the newest published date); `period` (optional, such as `ytd`, `year_2025`, `month_2026-10`); `benchmark_id` (optional, default the primary benchmark) | The JSON above: each figure with value, unit, definition, versions, freshness, lineage and publish status, plus the figures that are unavailable and why |
+| `get_certified_figures` | `account_id` (required); `figures` (1 to 25 figure ids) or `page` (one of the register's nine pages); `as_of` (optional, default the newest published date); `period` (optional, such as `ytd`, `year_2025`, `month_2026-10`); `benchmark_id` (optional, default the primary benchmark) | The JSON above: each figure with value, unit, definition, versions, freshness, lineage and publish status, plus the figures that are unavailable and why |
 | `trace_figure` | `account_id`; `figure_id` with `as_of` (and `period`, `item`, `benchmark_id` where they apply) | Where the number came from, from `lineage.trace()`: the build and its checks, each job run back to the IBKR statement or market-data file, with times, code versions and file sha256. Steps inferred from timing are marked so |
 | `list_certified_figures` | none | The register: ids, labels, units, pages, periods and guide links. No client data, so it sits with the guide tools (`guide_tools.py`) |
 
@@ -398,6 +409,14 @@ closest ids), an account the caller may not see, a figure whose page has not mov
 tool that still answers it), or no published figure on or before the date (with when the next
 build is due). A held build is not an error: the tool returns the last published figures,
 marked `behind`, with the reason.
+
+Attribution (batch 4) and the charts (batch 5) follow the same rule. A period asks for the
+newest date that has it, so `month_2026-09` finds September's last NAV date, where that month's
+Attribution is kept (`per_period_item`: one row per month and holding or sector). A series gives
+its point on the as-of date (ask with an earlier `as_of` for an earlier point); the tables give
+their rows on the date. For these two pages each figure also carries its row's `detail` (a
+holding's symbol and sector, an episode's trough and recovery, a pair's observations, RSI's
+signal), because the item alone is an id. The other pages' answers are unchanged.
 
 All three are read-only, go through the existing tool server and its audit, and see exactly
 one account per call, as every tool does today.
@@ -431,6 +450,84 @@ The agent schema is installed by `scripts/install_agent_schema.py` on purpose, s
 view (`agent.certified_figures`, through a `SECURITY DEFINER` function like the others) is one
 approved run of that script on Tue 20, while the tools are still off. The removed grants later
 are another.
+
+### The figure tools on certified figures, with the automatic fallback
+
+The "From 8 Nov" column above, built behind three settings that are all off by default. With
+them unset every tool answer, tool list, prompt and figure check is as before.
+
+| Setting | Set on | Modes | What it does |
+|---|---|---|---|
+| `AGENT_CERTIFIED_FIGURE_TOOLS` | the tool server (the agents' tools) and the website (the website analyst's) | `off` (the default, and any other value), `fallback`, `on` | The figure tools read certified figures alongside their own |
+| `AGENT_CERTIFIED_MONTH_END` | the tool server and the jobs | off, `on` | The month-end commentary job gets `get_certified_figures` and `trace_figure` (with `AGENT_CERTIFIED_FIGURES=on`) |
+| `AGENT_CERTIFIED_FIGURE_CHECK` | the agent service and the jobs | `warn` (the default), `enforce` | The `[F#]` check fails an answer instead of warning |
+
+**Fallback.** Each tool works its figures out as today. Every figure that has a certified
+version with the same definition is then compared with the published one for the same subject,
+date, period, item and benchmark, with the release report's tolerances (ratios and numbers
+relative 1e-9, money to the cent, dates and text exactly). Equal: the certified value is used,
+and the agents' tools list it in a `certified` block so the answer can cite it `[F#]` (only for
+figures whose page is on, as `get_certified_figures` serves them). Different, not published or
+not readable: today's value stays, the answer marks it in `figures_source`
+(`{"/data/periods/2/irr_annualized": "fallback"}`, for a different or unreadable figure), and one
+`CERTIFIED_FIGURE_TOOLS` log line per call gives counts by figure id, the mode, the masked
+subject and the read time; never values or account ids. The read runs inside the tool's own
+read-only transaction in a savepoint with a 2-second limit (1 second on the website, on its own
+read-only connection), so a slow or missing view never breaks a tool. `on` uses the certified
+value even when it differs; it is not used before two clean month-ends.
+
+**Which figures.** `get_performance`: NAV and, for every period the website shows (MTD, QTD,
+YTD, each year, since inception), TWR, annualised TWR, annualised IRR and net flows.
+`compare_to_benchmark`: each period's portfolio return. `get_nav_history` from inception: each
+point's NAV and since-inception return. `get_risk_metrics` over the whole history only: total
+return, maximum drawdown, best and worst day and month. `get_sector_allocation`: each sector's
+weight. The website analyst: `compare_with_benchmarks`' comparison metrics, `get_risk_metrics`'
+Risk snapshot metrics, `get_sector_allocation`'s weights. Where a definition differs, today's
+value stays and nothing is compared: `get_risk_metrics`' one-year window (its base is the last
+valuation before the same date a year earlier, not 365 days), its volatility, downside deviation
+and benchmark statistics (annualised by valuations a year, not √252), its annualised return
+(365.25-day years) and positive months (a count, not a share); the benchmark returns of
+`compare_to_benchmark` and `get_nav_history` (the benchmark's own price return over each window,
+not the comparison series); `get_holdings`' weights (of gross holdings, not of NAV); and
+`get_performance`'s description, which promises a 1Y period it does not return (no certified
+one-year figure exists, and the description stays as it is). `wealthryse_agent/certified_fallback.py`
+lists each case.
+
+**The month-end snapshot builder cannot change.** `ibkr_etl/agent_tools.py` applies the setting
+only when its caller passes `certified_mode`, and only the website analyst (`ai_analyst.py`)
+does. `reporting_snapshot.py`, the pages and every other caller never pass it, so the frozen
+snapshots keep today's numbers whatever the setting says (a test checks it).
+
+**Enforce.** In `enforce` an answer fails the figure check, as an unmatched number does, when the
+number beside an `[F#]` is not that figure's value (or the ref does not exist), or when a number
+whose only source is a certified figure is quoted from the tool call (`[T#]`) instead of its
+`[F#]`; a number another tool result also returned is allowed. The runtime sends the answer back
+once with the reasons. If the second answer fails too, it is blocked: the person sees "I couldn't
+produce an answer whose figures all match the data", the run is `rejected`, and a scheduled job
+writes no inbox item. Each failure logs `CERTIFIED_FIGURE_CHECK` with the mode, `retry` or
+`rejected`, counts, refs and figure ids.
+
+**Before switching on: the rehearsal on a restored copy.** Restore a copy after the certified
+build has run, and run, read-only:
+
+    DATABASE_ADMIN_URL=... python scripts/compare_agent_certified_figures.py [--as-of YYYY-MM-DD]
+
+For every active subject it calls each figure tool today's way and the fallback way and prints
+counts only (equal, different, missing, error per tool and figure; calls refused; values the
+fallback changed). Switch to `fallback` only when it shows:
+
+- `Values the fallback changed beyond the certified tolerance: 0`;
+- `error` 0 everywhere (the reads work within their time limits);
+- `different` 0, or each figure that differs explained; a figure that differs on every subject
+  means a definition differs, and its comparison is taken out before go-live;
+- `missing` only where the build has not certified that date or benchmark (for example NAV
+  history dates before the backfill, or a benchmark other than the page's);
+- the same refusals both ways (they are the tools refusing today).
+
+Run it for the latest date and for the last month-end (`--as-of`). Before `enforce`, the warn
+mode's `CERTIFIED_FIGURE_CHECK` lines should be rare and explained, and the agent evaluation
+(`python -m wealthryse_agent.evaluate`) run with `AGENT_CERTIFIED_FIGURE_CHECK=enforce` should
+reject no answer.
 
 ## How a page moves
 
@@ -470,8 +567,10 @@ One website setting, `CERTIFIED_FIGURES_PAGES`, for example
 4. **The live shadow log shows no unexplained difference** on any day since Tue 20.
 5. **Switch the page on:** one setting, one website revision, through the **Website certified
    pages** workflow (`.github/workflows/website-certified-pages.yml`, stages `shadow`,
-   `batch-1` to `batch-3` and `off`). It refuses unless the live website was released from a
-   commit whose readers can find the register and 073 is recorded as applied. It also refuses
+   `batch-1` to `batch-5` and `off`). It refuses unless the live website was released from a
+   commit whose readers can find the register, that commit is in main's history with the same
+   register as main (after a register change, run Deploy website first), and 073 is recorded as
+   applied. It also refuses
    between 07:50 and 09:25 UTC and, from 1 to 7 Nov, any move other than back. If the checks
    fail it puts the previous value back.
 6. **Check** that afternoon and after the next morning's build that the page, its API and (from
@@ -513,6 +612,115 @@ The read tool follows its pages: it serves only figures whose page is on.
 - **The agents:** `AGENT_CERTIFIED_FIGURES=off` hides the new tools.
 - **The whole layer:** every page `off`, then `CERTIFIED_FIGURES_BUILD=off` on the build job.
   The tables stay, unread.
+
+## The charts, tables and indicators (batch 5, Thu 29)
+
+After month-end item 4, brought forward to the last move day. The code is
+`src/ibkr_etl/certified_charts.py`; the register's page is `charts`. Attribution is not part of
+it: it has its own page key, `attribution`, and moves with the monthly reports in batch 4 (Tue 27).
+
+### The figures
+
+| Figure id | Guide entry | Drawn on | Stored |
+|---|---|---|---|
+| `series.portfolio_daily_return` | Cash-flow-adjusted daily portfolio return | Performance › NAV chart, Vs benchmark | one row per common date, per benchmark |
+| `series.benchmark_daily_return` | Daily benchmark return | the same chart | one row per common date, per benchmark |
+| `series.rolling_volatility_63d` | Rolling 3-month volatility | Risk › Rolling risk | one row per NAV date |
+| `series.rolling_beta_126d`, `series.rolling_correlation_126d` | Rolling beta and correlation | Risk › Rolling risk | one row per common date, per benchmark |
+| `table.drawdown_episodes` | Drawdown episode | Risk › Drawdowns, Deepest drawdowns | per as-of date, item = the peak date |
+| `matrix.holdings_correlation` | Holdings correlation | Risk › Correlation | per as-of date, item = `conid\|conid` (lower first) |
+| `indicator.rsi_14` | RSI (14) | Holdings, the RSI column | per as-of date, item = conid |
+
+The ids name what the page shows: `series.` for a line drawn through every date, `table.`,
+`matrix.` and `indicator.` for what is shown for one as-of date; the suffix is the window the
+page uses (63 and 126 observations, 14 days). The chart also draws two figures other pages
+already store for every date: the rebased levels (`benchmark.rebased_level`, Performance) and
+the trailing 12-month return (`stats.trailing_12m_return`, Risk › Statistics). The underwater
+drawdown chart stays as today: its points are Current drawdown on each date, which the guide
+places on Risk › Statistics.
+
+**No migration.** They use `gold.certified_figures` as it is, with the item column for the
+holding, pair or episode. A series point on a date is the same whatever later date the chart is
+drawn to (each rolling window ends on its date; each daily return is that day's), so a series
+is stored once per date, as the row for that as-of date, and the chart through a date is the
+rows up to it. The tables are stored for each as-of date, as the page shows them. Every value
+is read from the payload of the handler that draws it today, so certified equals what the page
+shows; the daily returns are the comparison table's own, which the chart draws compounded.
+
+**Rows.** For each subject and NAV date: up to five series rows (the four benchmark ones only on
+dates shared with the benchmark), up to five episodes, up to 45 pairs (the ten largest holdings)
+and one RSI per holding. An account with 25 holdings has about 80 a date, about 35,000 for 440
+dates; a composite has only the series and the episodes. A daily run writes only the new dates
+and the last five rechecked, and only rows that changed.
+
+### Two settings, both off by default
+
+- **`CERTIFIED_FIGURES_CHARTS`, on the build job: `off` | `fallback` | `on`.** `off` (unset):
+  the build reads no chart; every run is exactly as before. `fallback`: it reads them as well.
+  A chart row that breaks a contract rule (episodes at most zero, correlations between -1 and 1,
+  RSI between 0 and 100, volatility not below zero), changes with the same inputs and version,
+  or reads differently the second time is left out and counted under `checks.charts`; a chart
+  reader's error is counted. A chart never holds the build, so batches 1 to 4 are never held up
+  by it. `on`: chart rows are checked like every other figure and a problem holds the build;
+  not before two clean month-ends.
+- **The page key `charts` in `CERTIFIED_FIGURES_PAGES`, on the website: `off` | `shadow` | `on`.**
+  Its own key, rather than a mode on the pages the charts sit on, because the charts move on
+  their own day, after those pages, and are undone on their own (`batch-4` puts them back in
+  `shadow`). The workflow's `shadow` and `batch-1` to `batch-4` stages leave it in `shadow`;
+  `batch-5` turns it on, and refuses unless the live website has `certified_charts.py`.
+  - `off`: the answers are today's, untouched: no query, no log line.
+  - `shadow`: today's charts, and one `CERTIFIED_FIGURES` line per answer, with
+    `"page":"charts"`, the status (`match`, `differ`, `none`), the figure ids that differ, are
+    missing or are extra, with counts, and the subject masked (`u…01`). No values.
+  - `on` is the automatic fallback: the website still works out today's chart and reads the
+    certified points (one query on its own read-only connection, cut short after one second).
+    A figure's certified points are shown only when every one equals today's, within the
+    certified comparisons' tolerances (relative 1e-9, absolute 1e-12); otherwise, or when they
+    are missing or behind, that figure is today's and one line says so (`"status":"fallback"`,
+    the figure ids used and not used, with counts). The answer gains a `certified_charts` block
+    and the card a "Certified · as of" line; a borrowed series is shown from the certified
+    figures only once its own page is on. A failing read is today's with an `error` line.
+    A later `on` that skips today's calculation is not built: today's code stays until two
+    clean month-ends, as for every page.
+
+### Filling in the history
+
+A daily run with `CERTIFIED_FIGURES_CHARTS=fallback` keeps the charts current. The dates
+before it are filled by runs of the charts alone: `--page charts` counts only the charts' rows
+as published, so each run carries on where the last stopped, newest first, within the 30-minute
+read limit. Run the job with `--page charts` until it prints `Read N of N subject dates.`
+
+### What the rehearsal on a restored copy must show before switch-on
+
+On the copy, with the website's read-only login (each command writes nothing):
+
+```
+DATABASE_URL=<web login on the copy> python scripts/check_certified_charts.py --dates 0
+CERTIFIED_FIGURES_BUILD=on CERTIFIED_FIGURES_CHARTS=fallback DATABASE_URL=<app login on the copy> \
+    python scripts/build_certified_figures.py --page charts --dry-run
+python scripts/release_data_report.py figures --batch 5 --private-dir <private folder>
+```
+
+`check_certified_charts.py` runs the build's chart readers for each subject's dates (newest
+first, `--dates N` for fewer) and prints counts only: rows by figure, rule failures, new,
+changed and unchanged against the published figures, changes with the same inputs, page
+disagreements on a second read on the website's own connections, reader errors, what
+`charts=on` would show for each figure on each subject's newest date, with the read time, and
+the rows the whole history needs. Before Thu 29 it must show:
+
+1. reader errors 0, and pages that answer with an error only where the website does too;
+2. rule failures 0 and changes with the same inputs 0;
+3. page disagreements 0;
+4. after a charts build on the copy (the fill above, then a daily run): every figure on every
+   subject's newest date `shows certified` (no differ, missing or extra), with reads well under
+   the one-second limit;
+5. the `figures` command for batch 5 with no unexplained difference;
+6. a row count within the estimate above, and a fill that fits the days left.
+
+Then: the charts in `shadow` on live with no unexplained line, and the switch with the
+**Website certified pages** workflow, stage `batch-5`. To undo: stage `batch-4` (charts back
+to `shadow`) or `off`; `CERTIFIED_FIGURES_CHARTS=off` on the job stops the reads. Nothing is
+deleted.
 
 ## Security
 
@@ -579,13 +787,16 @@ difference that takes longer, batch 1 uses a spare day, not Wed 21.
 ### After month-end (from 8 Nov), each its own release with a report
 
 1. The publish gate's verdict becomes binding for the build's sources.
-2. Monthly reports and Attribution read certified figures; the factsheet stays on the frozen
+2. Monthly reports and Attribution read certified figures (brought forward to 27 Oct in the
+   automatic fallback: "Monthly reports and Attribution on certified figures"); the factsheet stays on the frozen
    snapshot, and the October and November month-end figures are checked against it (open
    question 13).
 3. The month-end commentary job gets the read tool; the existing agent figure tools read
    certified figures; the `[F#]` check is enforced.
 4. The charts, tables and indicators: daily return series, rolling series, drawdown episodes,
-   holdings correlation, RSI.
+   holdings correlation, RSI. Brought forward to batch 5 (Thu 29), with its own settings: see
+   [The charts](#the-charts-tables-and-indicators-batch-5-thu-29). Attribution moves with the
+   monthly reports (item 2), in batch 4 (Tue 27).
 5. Flows from silver (S6); then the agent reader loses `agent.flex_rows` and
    `agent.benchmark_prices`.
 6. The FX duplicate fix (U8).
@@ -604,6 +815,104 @@ difference that takes longer, batch 1 uses a spare day, not Wed 21.
 - **Release data report (U6).** The `figures` command and the view comparison (part 6).
 - **"As known on" history (U8).** Nothing before month-end. Certified rows already keep every
   published version of a figure.
+
+## Monthly reports and Attribution on certified figures (from Tue 27 Oct)
+
+Item 2 of "After month-end", brought forward by the owner's decision of 18 Oct. The October
+client reports (made 1 to 7 Nov) are made with it switched on, so its first mode, the
+automatic fallback, keeps every report exactly as today's code makes it.
+
+### The setting: `MONTHLY_REPORTS_CERTIFIED`
+
+Read by `reporting_snapshot.build_month_end_payload`, which every month-end freeze uses
+(`freeze_month_end_snapshot`: the month-end factsheet job's `generate_month_end_package.py`,
+`render_onboarding_composite_reports.py` through `composite_reports` and `designed_reports`,
+`historical_reporting`, `generate_month_end_factsheet.py` and `scripts/freeze_month_end_snapshot.py`).
+The code is `ibkr_etl.certified_reports`.
+
+| Mode | What a month-end report does |
+|---|---|
+| `off` (the default: unset, empty or any other value) | Today's code exactly. Nothing is read and nothing is logged. |
+| `fallback` | Today's report, byte for byte (the same snapshot sha256, so the same snapshot id and factsheet). The certified figures for the report's data date (`data_as_of`, its last NAV date on or before the month end) are read alongside, inside a savepoint on the report's own connection, and every field below is compared. A certified value is used only when it is exactly today's, so nothing changes; a value within the certified tolerance (relative 1e-9, money to the cent) counts as close and today's is kept, as for a different or missing one. One line per report, `CERTIFIED_REPORTS {json}`, gives the mode, the subject masked (`u…01`), the status (`match`, `differ`, `none`, `error`, `not_applicable`) and the counts and figure ids that were close, different or missing: never values. A failed read is logged as `error` and the report is today's. |
+| `on` | The certified value replaces today's in every field the mapping writes, wherever one exists. Not used before two clean month-ends (November and December). |
+
+The Alpha World MS and T reports and the profiled design composites are made from their own
+approved HKD design, not from the website's figures, so they are not compared
+(`not_applicable`).
+
+### Which report fields have a certified version
+
+All are read for `as_of_date = data_as_of`. "Compared only" fields are never written, not even by
+`on`, because the report works them out on another basis.
+
+| Report field (snapshot payload) | Certified figure | Period, item, benchmark |
+|---|---|---|
+| `portfolio_summary.latest_nav.total_text` | `overview.nav` | |
+| `portfolio_summary.positions` | `overview.positions` | |
+| `risk.metrics.<name>` (15 fields, as on Risk › Risk snapshot) | `risk.*` (`cvar_95_daily` and `daily_expected_tail_loss` are both `risk.etl_95_daily`) | |
+| `benchmark_comparisons[].metrics.<name>` (also `performance_comparison`, `secondary_performance_comparison`: the same objects) | `benchmark.portfolio_total_return`, `benchmark_total_return`, `excess_total_return`, `tracking_error`, `information_ratio`, `beta`, `correlation`, `relative_win_rate` | benchmark: that comparison's. The build certifies each subject's default benchmark, so a secondary benchmark's are missing |
+| `monthly_reporting.portfolio_monthly_return`, `.equity_contribution`, `.residual_contribution` | `attribution.portfolio_return`, `attribution.holdings_contribution`, `attribution.residual_contribution` | `month_YYYY-MM` of the report month |
+| `monthly_reporting.security_contributions[].contribution` | `attribution.holding_contribution` | the month; item: conid |
+| `monthly_reporting.sector_contributions[].contribution` | `attribution.sector_contribution` | the month; item: sector |
+| Compared only: `month_end_performance[].portfolio_monthly_return` | `performance.monthly_return` | `month_YYYY-MM`. The report's is the ratio of the benchmark comparison's month-end levels (dates shared with the benchmark); the certified one is the time-weighted return over every NAV date |
+| Compared only: `sector_allocation.gross_market_value`, `.allocation[].weight` | `holdings.gross_market_value`, `holdings.sector_allocation` (item: sector) | The report converts with its own dated reporting FX |
+
+No certified version (the report keeps today's): `month_end_performance[].benchmark_monthly_return`
+and the comparison series themselves (only their last point is certified, as
+`benchmark.rebased_level`, a chart figure); `performance.series` (the NAV records); the holding
+records (`holdings`, from the agents' holdings tool with the report's own reporting-currency
+step); `monthly_reporting.cash_activity` (dividends, interest and fees: cash records);
+`freshness`; the crisis replay detail; and the composites' attribution (below). MTD, QTD, YTD and
+the other period returns are not in the snapshot: the factsheet works them out from its own NAV
+index when it renders, and stays on the frozen snapshot (open question 13).
+
+### Attribution as certified figures
+
+Five figures on their own page key, `attribution` (batch 4, Tue 27 Oct; the website workflow's
+`batch-4` stage), all from the engine the reports use: `attribution.portfolio_return`,
+`attribution.holdings_contribution` and `attribution.residual_contribution` per month, and
+`attribution.holding_contribution` and `attribution.sector_contribution` per month and holding
+or sector (the kind `per_period_item`). The build (`certified_build.attribution_rows`) calls the
+page's own handler, so certified equals what the page shows. Because the page works a month out
+to its calendar end whatever the as-of date, a month is read only on its last NAV date, and the
+month in progress on the newest date; other dates give no rows and cost nothing. Its input
+fingerprint is every row the handler read, in order. The page reads its month's figures only
+(`period`), and never shows figures from an earlier date (`exact`): it keeps today's answer and
+logs `behind`. The composite portfolios keep today's figures: their engine adds the sleeves in
+set order, which changes from one run to the next, so totals can move in the last digit with the
+same inputs, which would hold the build.
+
+### Before switch-on: the rehearsal on the restored copy (Sat 24 / Sun 25)
+
+1. Fill the past month-ends: `CERTIFIED_FIGURES_BUILD=on python scripts/build_certified_figures.py
+   --backfill --page attribution` (the daily runs read only the latest dates). It must publish, not hold.
+2. The release data report's `figures` command, which now reads the Attribution page on
+   month-ends and the newest date: no differences for `attribution`.
+3. `DATABASE_URL=<the copy> python scripts/compare_monthly_report_figures.py --month 2026-09 --out
+   <private file outside the repository>`. Read-only: the session is `READ ONLY`, every subject is
+   rolled back, no snapshot is inserted, nothing is uploaded or rendered. It makes each subject's
+   September report with the setting `off`, `fallback` and `on`, prints counts only and exits 0
+   when every report today's code can make is identical with `off` and `fallback`. It must show
+   **"Identical with MONTHLY_REPORTS_CERTIFIED off and fallback: N of N"** and **"failed only
+   with the setting: 0"**. The equal, close, different and missing counts per field say what `on`
+   would change; they do not change any report in `fallback`, and each difference in a written
+   field is explained before `on` is considered. "Today's payload equals the stored frozen
+   snapshot" shows whether today's code still makes September's frozen snapshot from the copy.
+   Subjects that went live through the new onboarding freeze their month-end through that path
+   (`onboarding_month_end`), so their reports are made as well, with that path's own arguments
+   (a composite's report profile inception and currency; otherwise the case's history start and
+   currency), when the path would freeze the month: not already frozen, its data in, and its
+   report profile or approved design accepted. They count in the same "N of N" line and the exit
+   code; the "Live new-onboarding subjects" line counts them and the ones the path would not make.
+
+### Switch-on and undo
+
+Tue 27 Oct: `MONTHLY_REPORTS_CERTIFIED=fallback` on the month-end factsheet job
+(`ibkrv2stg-month-end-factsheet`) and on any other process that freezes snapshots, and the
+website workflow's `batch-4` stage (or `attribution=shadow` first). From 1 Nov, watch the
+`CERTIFIED_REPORTS` lines. Undo: remove the setting (off), and the workflow's `batch-3` stage for
+the page (from Thu 29 it puts the charts back in `shadow` too).
+
 
 ## Open questions for Ying
 
@@ -631,8 +940,8 @@ difference that takes longer, batch 1 uses a spare day, not Wed 21.
 Nothing is built and nothing is switched on. Two files make the list concrete, and no code
 reads either:
 
-- `infra/medallion/certified-figures.json`: the draft register of the 71 figures, the seven
-  pages and their three batches with dates, the entries left for later, the pages that wait
+- `infra/medallion/certified-figures.json`: the draft register of the figures (71 in this
+  first list; 84 on nine pages, in five batches, once Attribution and the charts were added) with dates, the entries left for later, the pages that wait
   until after month-end and the pages out of scope, each with a reason.
 - `tests/test_certified_figures_register.py`: checks that every figure names a guide entry the
   guide places on its page (two known gaps are recorded: open question 4); that every entry in

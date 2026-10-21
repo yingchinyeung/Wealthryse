@@ -387,6 +387,8 @@ def render(spec: Mapping[str, Any], snapshot: Mapping[str, Any], *, template_pat
                 counts = remove_content(page, layer["boxes"], images=bool(layer.get("images")))
                 page_removed = {k: page_removed[k] + counts[k] for k in page_removed}
             elif layer["kind"] == "overlay":
+                if not layer["ops"]:  # an empty canvas saves no page, so there is nothing to merge
+                    continue
                 page.merge_page(_overlay(layer, ctx, size, drawn, page_number))
             else:
                 components.REGISTRY[layer["name"]].fn(page, ctx, layer.get("params", {}), state)

@@ -347,6 +347,7 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
         preview = self.db.execute("SELECT feature_state FROM subject_feature_states WHERE subject_id = "
                                   "'KIWOOM-5012345610' AND feature_key = 'data_ingestion'").fetchone()
         self.assertEqual(preview["feature_state"], "preview")
+        self._yahoo_consent(case_id, detail)
         nothing_built = terms_digest({"subject_id": "KIWOOM-5012345610", "display_name": "Synthetic Korea",
                                       "checks": {}})
         with self.assertRaisesRegex(OnboardingError, "must finish without failing"):
@@ -360,6 +361,35 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
         overview = onboarding_overview(self.db, TENANT, today=date(2026, 10, 13), platform_ip=None)
         self.assertEqual([c["case_id"] for c in overview["cases"]], [case_id])
         self.assertFalse(overview["can_start"])
+
+    def _yahoo_consent(self, case_id, before_terms):
+        """After approval 1 the owner records Yahoo consent where the sector job looks for it."""
+        from ibkr_etl import yahoo_disclosure
+        from ibkr_etl.onboarding_v2_web import OnboardingError, approve_external_data, case_detail
+
+        self.assertIsNone(before_terms["external_data"])
+        # Migration 027 makes case_id optional; here its data row fails (no U16088571), so the whole file is skipped.
+        self.db.execute("ALTER TABLE account_onboarding_approvals ALTER COLUMN case_id DROP NOT NULL")
+        shown = case_detail(self.db, TENANT, case_id)["external_data"]
+        self.assertEqual((shown["approved"], shown["open"], shown["scope_sha256"]),
+                         (False, True, yahoo_disclosure.SCOPE_SHA256))
+        with self.assertRaisesRegex(OnboardingError, "changed after this page loaded"):
+            approve_external_data(self.db, TENANT, case_id, disclosure_version=yahoo_disclosure.VERSION,
+                                  scope_sha256="f" * 64, actor=IDENTITY)
+        first = approve_external_data(self.db, TENANT, case_id, disclosure_version=yahoo_disclosure.VERSION,
+                                      scope_sha256=yahoo_disclosure.SCOPE_SHA256, actor=IDENTITY)
+        again = approve_external_data(self.db, TENANT, case_id, disclosure_version=yahoo_disclosure.VERSION,
+                                      scope_sha256=yahoo_disclosure.SCOPE_SHA256, actor=IDENTITY)
+        self.assertEqual((first["status"], again["status"], again["approval_id"]),
+                         ("approved", "already_approved", first["approval_id"]))
+        # The sector job's own check (scripts/refresh_staging_sector_classifications.py).
+        row = self.db.execute(
+            "SELECT case_id, metadata_json FROM account_onboarding_approvals WHERE subject_id = %s "
+            "AND approval_type = 'external_market_data' AND approval_status = 'approved' AND revoked_at IS NULL "
+            "AND disclosure_version = 'yahoo-ticker-disclosure-v1'", ("KIWOOM-5012345610",)).fetchone()
+        self.assertEqual((row["case_id"], row["metadata_json"]),
+                         (None, {"channel": "broker_onboarding_v2", "broker_case_id": case_id}))
+        self.assertTrue(case_detail(self.db, TENANT, case_id)["external_data"]["approved"])
 
     def test_ibkr_account_from_flex_discovery_goes_straight_to_loading(self):
         from datetime import date

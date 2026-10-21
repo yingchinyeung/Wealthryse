@@ -12,7 +12,7 @@ Status: the catalog is in place. Nothing has moved yet, and every table is still
 
 | Layer | Holds | Rule |
 |---|---|---|
-| Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
+| Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, Kiwoom REST answers (from migration 082), live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
 | Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmark prices, FX closes, risk-free rates), sectors, derived and composite portfolios | Each table's `source` in the catalog says how it is rebuilt: `ibkr` tables from bronze (v2's own Flex pull from the switch on; v1.1's history from its archived statements), `market-data` tables once their raw responses are kept in bronze (from S3b), `derived` tables from other silver tables. A record IBKR re-sends replaces the earlier one here; every version stays in the raw statement files. |
 | Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: the benchmark comparison reads bronze `flex_rows` for cash flows, and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
 | Ops | Runs, approvals, audit, access, onboarding workflow, configuration and hand-maintained settings (subjects, benchmark list and mapping, metric catalogue), agent state | Control plane, not a data layer. Stays in `public`. |
@@ -35,6 +35,13 @@ Status: the catalog is in place. Nothing has moved yet, and every table is still
   - New containers are named `<layer>-<content>`.
 - **Jobs:** the catalog records each job's hops (ingest, conform, analytics,
   quality-gate, publish, serve, ops). Job names stay, and a tag carries the hop.
+- **Azure resources:** each one carries `layer` (foundation, data, apps, ai or ops),
+  `component` and `owner` tags, and jobs and apps also carry `hop`.
+  `infra/medallion/applied-tags.json` records what was added on 17 Oct 2026. A Bicep file
+  that deploys one of those resources sets the same tags with `union(tags, {...})`, so a
+  redeploy keeps them. `tests/test_bicep_medallion_tags.py` checks this. A new resource
+  in a Bicep file gets its three tags in the same PR. The resource group's audit rule
+  (Azure Policy, "Medallion rule") reports any resource without them.
 
 ## Adding a table, view or container
 
@@ -364,6 +371,56 @@ none is built yet:
 5. Prune builds that were never published, and builds older than the retention period.
 6. Keep month-end report-only: the frozen packages already carry their own sha256.
 
+## Flows from silver (S6): `FLOWS_SOURCE`
+
+Every return figure takes its deposits and withdrawals from one reader,
+`provisional_benchmark._external_flows`: the website pages (through
+`web._subject_external_flows`, which the certified build and Modelling call too), the
+benchmark comparison, the monthly reports, the month-end snapshots and the website analyst's
+tools (`agent_tools`), the agent tool server and composite sleeves. For a physical account it
+reads bronze: the Transfers and CashTransactions rows of `flex_rows`, the known exception in
+the Gold row above. Filtered and composite portfolios read their silver cash ledger and are
+not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
+
+- **The setting:** `FLOWS_SOURCE`, set to the same value on every container app and job that
+  serves or builds return figures (the website, the certified build, derived-daily, the
+  monthly and month-end jobs).
+  - `off`, the default (also unset, or a value not understood, which logs one line once):
+    bronze, exactly as before.
+  - `fallback`: both are read. Silver is used only when it equals bronze on every date: the
+    same dates, the same amount per currency on each date (summed exactly), and the
+    base-currency total within a cent. Otherwise bronze is used and one line is logged,
+    `FLOWS_SOURCE {"dates_differing":1,"decision":"bronze","kinds":{"transfers_not_in_silver":1},"mode":"fallback","reason":"silver_differs","subject":"u…01"}`
+    (`reason` is `silver_differs` or `silver_unreadable`; counts and masked subjects only). To
+    read them: `ContainerAppConsoleLogs_CL | where Log_s startswith 'FLOWS_SOURCE '`.
+  - `on`: silver only. Not before two clean month-ends in `fallback`, and not before the
+    Transfers section has a silver table (below).
+- **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to
+  `silver.cash_transactions` in the same loop, under the parser's key. The daily 14-day
+  re-send updates the same row in both; a correction under the same key overwrites both; a
+  correction under a new key (no IBKR transaction id) adds a row to both. With
+  `IBKR_FLEX_LEGACY_KEY_COMPAT` silver keeps v1.1's key, so the comparison matches rows by
+  content, never by key. Two gaps keep bronze in `fallback`: silver has no table for the
+  Transfers section (the loader writes it to `flex_rows` only), and it cannot tell a
+  consolidated copy (`accountId` "-") from the account's own row, which bronze skips.
+- **Leave the agent tool server unset** until the agent schema has a view over silver flows:
+  its login reads only the `agent` views, so `fallback` there always logs
+  `silver_unreadable` and keeps bronze (the failed read is inside a savepoint). Removing
+  `agent.flex_rows` comes after that.
+- **Undo:** remove the setting. Nothing is written anywhere.
+- **Before switching on, on a restored copy:**
+  `python -m ibkr_etl.flows_source compare --database-url "<copy URL>" --tenant <tenant id>`
+  reads every subject over all history in READ ONLY transactions and prints counts: subjects,
+  accounts, matching, differing, errors, the kinds of difference (subjects and dates each),
+  and notes that explain them (`bronze_transfer_rows`, `bronze_consolidated_copies`,
+  `silver_rows_sharing_a_transaction_id`). It must show no errors, and every differing
+  account explained by its notes, for example an account-sync account whose bronze flows were
+  never backfilled (`only_in_silver`). Matching accounts are the ones `fallback` reads from
+  silver; the others keep bronze and log one line on every read.
+- **Before `on`:** two clean month-ends in `fallback`; a silver table for Transfers (a
+  migration, the loader writing it, and a fill from `flex_rows`), or proof that no account
+  has Transfers rows; and the agent view above.
+
 ## Release data report
 
 A release that touches silver or gold runs its jobs on a restored copy first, and
@@ -372,6 +429,25 @@ rows added, removed and changed, and the largest changes per table and per accou
 subject. Its public summary (counts and names only) goes on the PR; the full report,
 with the figures, goes to the approver through the project's private folder.
 [MEDALLION_RELEASE_REPORT.md](MEDALLION_RELEASE_REPORT.md) has the steps.
+
+## Every source goes through bronze
+
+The layering covers the whole resource group (decided 19 Oct 2026): every source lands in
+bronze exactly as received before anything reaches silver, and silver is rebuilt from
+bronze alone. Where a source still writes silver straight from the live answer, this is
+the plan that closes the gap.
+
+| Source | Bronze | Silver written by | Plan |
+|---|---|---|---|
+| IBKR Flex | `ibkr-raw` files, `bronze.raw_reports`, `bronze.flex_rows` | The loader, from bronze (S5, 17 Oct) | Done. |
+| IBKR live (TWS) | `bronze.live_*` | Not used for silver | Done. |
+| Kiwoom REST | None yet | `ibkr_etl.kiwoom_collector`, from the live answer | `bronze.kiwoom_responses` (migration 082, applied alone after the U8 record; first capture on the 23 Oct daily run). The collector stores every page first (`KIWOOM_BRONZE=true`, `ibkr_etl.kiwoom_bronze`), and a conform step (`ibkr_etl.kiwoom_conform`, to come) will build silver from those rows with the collector's own parse functions. Each account's history is fetched again into bronze and silver rebuilt from it; any difference is kept as a restated version (U8) with a note. A past day is Kiwoom's daily balance (`ka01690`) with its account return for that day (`kt00016`, Kiwoom's own value of the holdings) and, when `ka01690` lists after-market prices, each stock's official KRX close, read as the next trading day's base price on the unadjusted daily chart (`ka10081`), so a day's close is known from the next trading day; all three are kept in bronze. Silver checks each Kiwoom day to the won: the positions add up to Kiwoom's holdings value, and the selling cost follows Kiwoom's per-stock rule. History fetches run outside 16:00–18:00 and 19:00–22:00 UTC, when `ka01690` answers with empty figures; the 08:00 UTC daily run is unaffected. Open quality exceptions hold that account's reports until the owner accepts them by name. |
+| Market data | `bronze-market-data` files since 18 Oct, best effort | The fetchers, from the live answer | From 26 Oct a fetch whose raw copy cannot be stored fails, a rebuild check compares silver with what the stored files parse to, and the bronze file freshness checks turn on. Nothing raw exists before 18 Oct. |
+| One-off scripts | None | Hand-run backfills and cut-overs in `scripts/` | From 28 Oct only the named loaders' logins write silver, and a CI check refuses new code that writes silver anywhere else. |
+
+The Kiwoom table keeps inquiry answers only. Token calls are never stored, and
+`request_key` holds the account number and query fields, never a key, secret, token or
+header. Like every bronze table, the website, renderers and agents never read it.
 
 ## Stages
 

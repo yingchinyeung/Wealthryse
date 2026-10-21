@@ -2,19 +2,28 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.position_snapshots
 name: position_snapshots
-version: 1.0.0
+version: 1.0.1
 status: active
 domain: silver
 dataProduct: portfolio-medallion
 description:
-  purpose: 'Open positions per account and statement date from the Flex statements: quantity, cost, mark price,
-    market value and unrealised P&L.'
-  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
-    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
-    are not versioned yet (review item 8).
+  purpose: 'Open positions per account and statement date from the Flex statements, or for a Kiwoom account from
+    Kiwoom''s account answers: quantity, cost, mark price, market value and unrealised P&L.'
+  limitations: 'Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks
+    the account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
+    are not versioned yet (review item 8). Kiwoom accounts (written by ibkr_etl.kiwoom_collector): conid is the
+    platform security key (silver.instruments), cost basis is Kiwoom''s average price times the quantity, and unrealised
+    P&L is market value less cost basis. Today''s prices are those kt00004 lists. A past day''s are those ka01690
+    lists, except from 14 Sep 2026, when ka01690 lists the 20:00 after-market price: each stock is then priced at
+    its official KRX close, which is the next trading day''s base price on Kiwoom''s unadjusted daily chart (ka10081:
+    that day''s cur_prc less its pred_pre, since the chart''s own cur_prc is the last trade to 20:00), kept only
+    when the holdings add up to Kiwoom''s own value (kt00016) to the won. A KRW day''s positions add up to nav_snapshots.stock_text
+    (rule kiwoom_positions_add_up_to_stock there). A Kiwoom row''s row_sha256 is the sha256 of the row as written,
+    not of a Flex row.'
 tags:
 - silver
 - ibkr
+- kiwoom
 schema:
 - name: position_snapshots
   physicalName: silver.position_snapshots
@@ -30,7 +39,7 @@ schema:
     primaryKey: true
     primaryKeyPosition: 1
     classification: restricted
-    description: 'IBKR account number. Restricted: never shown or logged in full.'
+    description: 'Broker account number (IBKR or Kiwoom). Restricted: never shown or logged in full.'
   - name: snapshot_date
     physicalType: text
     logicalType: date
@@ -59,7 +68,8 @@ schema:
     primaryKey: true
     primaryKeyPosition: 3
     classification: confidential-financial
-    description: IBKR contract id (silver.instruments.conid), or a synthetic FLEX- id.
+    description: IBKR contract id (silver.instruments.conid), or a synthetic FLEX- id; for a Kiwoom account, the
+      platform security key.
   - name: model_code
     physicalType: text
     logicalType: string
@@ -124,7 +134,8 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
-    description: Mark price as decimal text.
+    description: Mark price as decimal text. For a Kiwoom account, the price Kiwoom lists, or the official KRX close
+      (see limitations).
     quality:
     - name: mark_price_text_is_decimal
       description: mark_price_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
@@ -143,7 +154,8 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
-    description: Market value (positionValue) as decimal text, in currency.
+    description: Market value (positionValue) as decimal text, in currency. For a Kiwoom account, quantity times
+      the mark price.
     quality:
     - name: market_value_text_is_decimal
       description: market_value_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
@@ -269,4 +281,7 @@ customProperties:
     required: true
     query: SELECT MAX(snapshot_date) AS observed FROM position_snapshots
     source: ibkr_etl.layer_freshness.RULES
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
 contractCreatedTs: '2026-10-18T00:00:00Z'

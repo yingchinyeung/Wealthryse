@@ -237,8 +237,28 @@ class OnboardingV2WebTests(unittest.TestCase):
                 "/api/onboarding-v2/cases/00000000-0000-0000-0000-000000000001/approvals/account_terms",
                 json={"terms_sha256": "a" * 64})
             self.assertEqual(approval.status_code, 403)
+            consent = self.client.post(
+                "/api/onboarding-v2/cases/00000000-0000-0000-0000-000000000001/external-market-data",
+                json={"disclosure_version": "yahoo-ticker-disclosure-v1", "scope_sha256": "a" * 64,
+                      "approved": True})
+            self.assertEqual(consent.status_code, 403)
             added = self.client.post("/api/broker-connections", json={"broker": "kiwoom_rest", "display_name": "x"})
             self.assertEqual(added.status_code, 403)
+
+    def test_the_owner_records_yahoo_consent_on_the_case(self):
+        connection = _RecordingConnection()
+        with patch.dict(os.environ, ON), \
+                patch.object(web, "_approval_database", return_value=_database(connection)), \
+                patch.object(onboarding_v2_web, "approve_external_data",
+                             return_value={"status": "approved"}) as consent:
+            response = self.client.post(
+                "/api/onboarding-v2/cases/00000000-0000-0000-0000-000000000001/external-market-data",
+                json={"disclosure_version": "yahoo-ticker-disclosure-v1", "scope_sha256": "b" * 64,
+                      "approved": True})
+        self.assertEqual(response.json(), {"status": "approved"})
+        self.assertEqual(consent.call_args.args[1:], (web.TENANT_ID, "00000000-0000-0000-0000-000000000001"))
+        self.assertEqual(consent.call_args.kwargs["scope_sha256"], "b" * 64)
+        self.assertEqual(web.YAHOO_ONBOARDING_SCOPE_SHA256, onboarding_v2_web.yahoo_disclosure.SCOPE_SHA256)
 
     def test_refusals_come_back_as_plain_messages(self):
         connection = _RecordingConnection()

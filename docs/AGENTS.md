@@ -745,11 +745,11 @@ answer check is as before (`tests/test_certified_agent_tools.py`).
   table name and sha256, never storage paths; `list_certified_figures` lists the
   register and sits with the guide tools. A figure is served only once its page is
   on in `CERTIFIED_FIGURES_PAGES`, so set that on the tool server to the website's
-  value. The month-end commentary job (`month_end_drafter`) never gets them before
-  8 Nov.
+  value. The month-end commentary job (`month_end_drafter`) does not get them unless
+  `AGENT_CERTIFIED_MONTH_END=on` (below).
 - **Citations.** The runtime numbers certified figures `F1`, `F2` across a turn.
-  The number beside each `[F#]` must be that figure's value; until 8 Nov a mismatch
-  only warns (`Turn.figure_warnings`, a `CERTIFIED_FIGURE_CHECK` log line with refs
+  The number beside each `[F#]` must be that figure's value; unless
+  `AGENT_CERTIFIED_FIGURE_CHECK=enforce` (below) a mismatch only warns (`Turn.figure_warnings`, a `CERTIFIED_FIGURE_CHECK` log line with refs
   and figure ids, never values). The message keeps each cited figure's id, subject,
   date, period, build and definition version.
 
@@ -757,6 +757,21 @@ answer check is as before (`tests/test_certified_agent_tools.py`).
 `scripts/install_agent_schema.py` (applies `017_certified_figures.sql`), then set
 `AGENT_CERTIFIED_FIGURES=on` and `CERTIFIED_FIGURES_PAGES` on the tool server and
 `AGENT_CERTIFIED_FIGURES=on` on the agent service.
+
+**The figure tools, the month-end job and the enforced check** (each off by default;
+`docs/MEDALLION_CERTIFIED_FIGURES.md`, "The figure tools on certified figures"):
+
+- `AGENT_CERTIFIED_FIGURE_TOOLS=fallback` (tool server, and the website for its analyst):
+  `get_performance`, `compare_to_benchmark`, `get_risk_metrics`, `get_nav_history` and
+  `get_sector_allocation` use a certified figure only when it equals their own; otherwise they
+  keep their own, mark it in `figures_source` and log counts (`CERTIFIED_FIGURE_TOOLS`). `on`
+  is not used before two clean month-ends. The month-end snapshot builder never reads them.
+- `AGENT_CERTIFIED_MONTH_END=on` (tool server and jobs): `month_end_drafter` also gets
+  `get_certified_figures` and `trace_figure`.
+- `AGENT_CERTIFIED_FIGURE_CHECK=enforce` (agent service and jobs): an `[F#]` mismatch, or a
+  certified figure quoted without its `[F#]`, fails the answer: one retry, then it is not shown.
+- The rehearsal on a restored copy: `python scripts/compare_agent_certified_figures.py`
+  (read-only, counts only).
 
 ## Supervisor (off)
 

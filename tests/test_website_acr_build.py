@@ -30,8 +30,9 @@ STATE = {"head": "h" * 40, "deployed_commit": "d" * 40, "changed_files": ["src/i
 
 
 class AcrBuildTest(unittest.TestCase):
-    def context(self, folder):
-        with mock.patch.object(release, "sides", return_value=(dict(BEFORE), dict(AFTER))):
+    def context(self, folder, designs=None):
+        with mock.patch.object(release, "sides", return_value=(dict(BEFORE), dict(AFTER))), \
+                mock.patch.object(release, "design_files", return_value=dict(designs or {})):
             return release.acr_context(STATE, folder)
 
     def live_tree(self, folder, files):
@@ -78,6 +79,18 @@ class AcrBuildTest(unittest.TestCase):
             self.run_apply({"web.py": b"live-only change\n"})
         self.assertIn("web.py", str(stop.exception))
 
+    def test_built_in_designs_are_written_whole_and_checked(self):
+        design = {"factsheet_spec/designs/korea-istrategy.json": b'{"design_id": "korea-istrategy"}\n'}
+        with tempfile.TemporaryDirectory() as tmp:
+            built = self.context(Path(tmp), design)
+            self.assertEqual(built["imported"]["factsheet_spec/designs/korea-istrategy.json"],
+                             hashlib.sha256(design["factsheet_spec/designs/korea-istrategy.json"]).hexdigest())
+            built["runtime_user"] = f"{os.getuid()}:{os.getgid()}"
+            src = self.live_tree(tmp, {"web.py": BEFORE["web.py"]})
+            apply_script.apply(built, src=src, files=Path(tmp) / "release" / "files")
+            self.assertEqual((src / "factsheet_spec" / "designs" / "korea-istrategy.json").read_bytes(),
+                             design["factsheet_spec/designs/korea-istrategy.json"])
+
     def test_another_runtime_user_stops_the_build(self):
         with tempfile.TemporaryDirectory() as tmp:
             built = self.context(Path(tmp))
@@ -94,6 +107,7 @@ class AcrBuildTest(unittest.TestCase):
             state_file.write_text(json.dumps(STATE))
             with mock.patch.object(release, "STATE", state_file), \
                  mock.patch.object(release, "sides", return_value=(dict(BEFORE), dict(AFTER))), \
+                 mock.patch.object(release, "design_files", return_value={}), \
                  mock.patch.object(release.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
                  mock.patch.object(release, "az", return_value=runs):
                 release.acr_build()

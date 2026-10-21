@@ -24,7 +24,7 @@ import json
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 
 from .composite_reports import (
     CHECK_ID, KINDS, STALE_AFTER_DAYS, CompositeReportError, _existing_run, _frozen_payload, _store,
@@ -142,7 +142,7 @@ def eligible_cases(connection, tenant_id: str) -> list[dict]:
 
     rows = connection.execute(
         """
-        SELECT c.case_id, c.source_kind, c.target_subject_id, c.reporting_currency, c.history_start_date,
+        SELECT c.case_id, c.source_kind, c.broker, c.target_subject_id, c.reporting_currency, c.history_start_date,
                k.status AS recorded, k.message AS recorded_message, k.evidence_json
         FROM broker_onboarding_cases c
         LEFT JOIN broker_onboarding_checks k
@@ -166,8 +166,39 @@ def _latest_common_day(connection, statement: str, subject_id: str, period_end: 
     return str(row["day"])[:10] if row and row["day"] else ""
 
 
-def month_ready(connection, source_kind: str, subject_id: str, period_end: str) -> bool:
-    """Whether the month's data are in: the same rule as the month-end package for each kind of subject."""
+# Brokers whose daily row can carry provisional prices that the next trading day's
+# history pass replaces (Kiwoom: after-market prices, later the official KRX close).
+NEXT_DAY_FINAL_BROKERS = frozenset({"kiwoom_rest"})
+# A Kiwoom account in USD (kiwoom_us_account) is filled by its own U.S. history pass.
+HISTORY_RUN_TYPES = {"kiwoom_rest": ("kiwoom_rest_history", "kiwoom_rest_us_history")}
+
+
+def _close_is_final(connection, subject_id: str, period_end: str, day: str) -> bool:
+    """The month's last NAV row was rewritten by a history run at the official close,
+    and a later trading day's row is in (the nav_snapshots contract's rule)."""
+
+    final = connection.execute(
+        "SELECT 1 AS final FROM nav_snapshots n JOIN ingestion_runs r ON r.run_id = n.last_seen_run_id "
+        "WHERE n.account_id = ? AND n.snapshot_date = ? AND n.asset_class = 'TOTAL' AND r.run_type IN (?, ?)",
+        (subject_id, day, *HISTORY_RUN_TYPES["kiwoom_rest"]),
+    ).fetchone()
+    if not final:
+        return False
+    later = connection.execute(
+        "SELECT MIN(n.snapshot_date) AS day FROM nav_snapshots n "
+        "WHERE n.account_id = ? AND n.snapshot_date > ? AND n.asset_class = 'TOTAL'",
+        (subject_id, period_end),
+    ).fetchone()
+    return bool(later and later["day"])
+
+
+def month_ready(connection, source_kind: str, subject_id: str, period_end: str, broker: str | None = None) -> bool:
+    """Whether the month's data are in: the same rule as the month-end package for each kind of subject.
+
+    For a broker whose month-end close is final only after the next trading day's
+    run, the month also waits until its last NAV row comes from a history run
+    and a later trading day's NAV is in.
+    """
 
     if source_kind == "composite_portfolio":
         return month_end_ready(connection, subject_id, period_end)
@@ -180,7 +211,11 @@ def month_ready(connection, source_kind: str, subject_id: str, period_end: str) 
                      "WHERE p.account_id = ? AND p.snapshot_date <= ? AND EXISTS (SELECT 1 FROM nav_snapshots n "
                      "WHERE n.account_id = p.account_id AND n.snapshot_date = p.snapshot_date AND n.asset_class = 'TOTAL')")
     day = _latest_common_day(connection, statement, subject_id, period_end)
-    return bool(day) and (date.fromisoformat(period_end) - date.fromisoformat(day)).days <= STALE_AFTER_DAYS
+    if not day or (date.fromisoformat(period_end) - date.fromisoformat(day)).days > STALE_AFTER_DAYS:
+        return False
+    if source_kind == "broker_account" and broker in NEXT_DAY_FINAL_BROKERS:
+        return _close_is_final(connection, subject_id, period_end, day)
+    return True
 
 
 def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, container: str,
@@ -214,7 +249,8 @@ def render_case_reports(connection, tenant_id: str, case: Mapping[str, Any], *, 
             snapshot_id = active_month_end_snapshot_id(connection, tenant_id=tenant_id, subject_id=subject_id,
                                                        period_end=period_end)
             if snapshot_id is None:
-                if not month_ready(connection, str(case["source_kind"]), subject_id, period_end):
+                if not month_ready(connection, str(case["source_kind"]), subject_id, period_end,
+                                   case.get("broker")):
                     waiting_for = period_end  # a later month cannot be ready before this one
                     break
                 try:
@@ -292,8 +328,9 @@ def _message(evidence: Mapping[str, Any]) -> tuple[str, str]:
 
 def run_designed_report_cases(connection, tenant_id: str, *, container: str, today: date,
                               fetch: Callable[[str, str], bytes], store: Callable[[str, str, bytes, str], None],
-                              render: Callable[..., Mapping[str, Any]] = engine.render) -> list[dict]:
-    """Render and record every eligible case. One case's failure never stops the others."""
+                              render: Callable[..., Mapping[str, Any]] = engine.render,
+                              case_ids: Collection[str] | None = None) -> list[dict]:
+    """Render and record every eligible case (or only ``case_ids``). One case's failure never stops the others."""
 
     # The designer's tables come with migration 067; until then there is no design to render from.
     if connection.execute("SELECT to_regclass('public.factsheet_design_drafts') AS present").fetchone()["present"] is None:
@@ -301,6 +338,8 @@ def run_designed_report_cases(connection, tenant_id: str, *, container: str, tod
     results = []
     for case in eligible_cases(connection, tenant_id):
         case_id = str(case["case_id"])
+        if case_ids is not None and case_id not in case_ids:
+            continue
         recorded = (case["recorded"], case["recorded_message"], _evidence(case))
         try:
             evidence = render_case_reports(connection, tenant_id, case, container=container, today=today,

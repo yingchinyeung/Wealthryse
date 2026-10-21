@@ -46,8 +46,10 @@ class OnboardingTablesDatabaseTests(unittest.TestCase):
         self.bundle = dict(rollout.bundle(), web_role=WEB, approval_role=APPROVAL)
         self.database = "onboard_test_" + uuid.uuid4().hex[:8]
         self.bundle["database"] = self.database
-        # The medallion layer migrations (068 on) came after this rollout and move its tables.
+        # The medallion layer migrations (068 on) came after this rollout and move its tables; 082
+        # (Kiwoom's raw answers in bronze) came after it too and refers to its broker_connections.
         later = {path.name for path in (ROOT / "migrations" / "postgres").glob("*_medallion_*.sql")}
+        later.add("082_kiwoom_bronze.sql")
         self.bundle["expected"] = {k: v for k, v in self.bundle["expected"].items() if k not in later}
         skipped = (set(self.bundle["targets"]) | set(self.bundle["held_back"]) | set(self.bundle["other_rollouts"])
                    | later)

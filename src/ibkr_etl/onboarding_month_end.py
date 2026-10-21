@@ -38,7 +38,7 @@ def live_cases(connection, tenant_id: str) -> list[dict]:
     rows = connection.execute(
         """
         SELECT DISTINCT ON (c.target_subject_id)
-               c.case_id, c.source_kind, c.target_subject_id, c.reporting_currency, c.history_start_date,
+               c.case_id, c.source_kind, c.broker, c.target_subject_id, c.reporting_currency, c.history_start_date,
                c.report_style, c.definition_sha256
         FROM broker_onboarding_cases c
         WHERE c.tenant_id = ? AND c.stage IN ('first_month_end', 'closed') AND c.status <> 'cancelled'

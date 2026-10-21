@@ -77,11 +77,21 @@ if ($blocked -and -not $AllowRegistryAccess) {
 if (-not $blocked) { Write-Host "   allowed ($(if ($firstMatch) { "rule '$($firstMatch[7])'" } else { 'network default' }))" }
 if ($blocked) {
     # The registry's own private addresses, from its private endpoint in this network.
-    [string[]]$peIds = (AzRun acr show -n $Registry --query 'privateEndpointConnections[].privateEndpoint.id' -o tsv) -split "`r?`n" | Where-Object { $_ }
-    [string[]]$regIps = $peIds | ForEach-Object { (AzRun network private-endpoint show --ids $_ --query 'customDnsConfigs[].ipAddresses[]' -o tsv) -split "`r?`n" } |
-        Where-Object { $_ -match '^10\.50\.10\.\d+$' } | Sort-Object -Unique
+    # Endpoints can be found from the registry side or the endpoint side; use both.
+    $fromRegistry = @((AzRun acr show -n $Registry --query 'privateEndpointConnections[].privateEndpoint.id' -o tsv) -split "`r?`n")
+    $fromEndpoints = @((AzRun network private-endpoint list -g $ResourceGroup --query '[].[id, privateLinkServiceConnections[0].privateLinkServiceId, manualPrivateLinkServiceConnections[0].privateLinkServiceId]' -o tsv) -split "`r?`n" |
+        Where-Object { $_ -match "/registries/$Registry(\s|$)" } | ForEach-Object { ($_ -split "`t")[0] })
+    [string[]]$peIds = $fromRegistry + $fromEndpoints | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object -Unique
+    # The addresses live on the endpoint's network card; the DNS list is often empty
+    # when a private DNS zone is attached, so read both.
+    [string[]]$found = foreach ($pe in $peIds) {
+        (AzRun network private-endpoint show --ids $pe --query 'customDnsConfigs[].ipAddresses[]' -o tsv) -split "`r?`n"
+        [string[]]$nics = (AzRun network private-endpoint show --ids $pe --query 'networkInterfaces[].id' -o tsv) -split "`r?`n" | Where-Object { $_ }
+        foreach ($nic in $nics) { (AzRun network nic show --ids $nic --query 'ipConfigurations[].privateIPAddress' -o tsv) -split "`r?`n" }
+    }
+    [string[]]$regIps = $found | Where-Object { $_ -match '^10\.50\.10\.\d+$' } | Sort-Object -Unique
     # Needs both the login and the data address, or pushes fail after login.
-    if (@($regIps).Count -lt 2) { throw "STOPPED, nothing changed: found $(@($regIps).Count) of the registry's 2 private addresses in 10.50.10.0/24." }
+    if (@($regIps).Count -lt 2) { throw "STOPPED, nothing changed: found $(@($regIps).Count) of the registry's 2 private addresses in 10.50.10.0/24 (endpoints: $(@($peIds).Count); addresses seen: $((@($found) | Where-Object { $_ }) -join ', '))." }
     [int[]]$taken = $rows | ForEach-Object { [int](($_ -split "`t")[0]) }
     $priority = ([int]$firstMatch[0]) - 1
     while ($priority -ge 100 -and $taken -contains $priority) { $priority-- }

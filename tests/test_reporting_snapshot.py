@@ -306,3 +306,18 @@ class NoBenchmarkCollectionTests(unittest.TestCase):
                     {"benchmark_id": "KS200", "mapping_type": "secondary"}]
         results, calls = self._collect(_NewOnboardingConnection(mappings=mappings))
         self.assertEqual([b for name, b in calls if name == "compare_with_benchmarks"], ["KS11", "KS200"])
+
+    def test_a_new_onboarding_account_with_one_primary_benchmark_is_compared_with_it(self):
+        mappings = [{"benchmark_id": "GSPC", "mapping_type": "primary"}]
+        results, calls = self._collect(_NewOnboardingConnection(mappings=mappings))
+        self.assertEqual([b for name, b in calls if name == "compare_with_benchmarks"], ["GSPC"])
+        self.assertEqual(results["primary_benchmark"]["data"], {"name": "compare_with_benchmarks"})
+        secondary = results["secondary_benchmark"]["data"]
+        self.assertFalse(secondary["available"])
+        self.assertFalse(secondary["publication_allowed"])
+        self.assertIn("secondary", secondary["reason"])
+
+    def test_any_other_account_with_one_benchmark_is_still_refused(self):
+        mappings = [{"benchmark_id": "GSPC", "mapping_type": "primary"}]
+        with self.assertRaisesRegex(ReportingSnapshotError, "benchmark must be configured"):
+            self._collect(_NewOnboardingConnection(onboarded=False, mappings=mappings))

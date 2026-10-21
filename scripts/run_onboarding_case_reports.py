@@ -50,7 +50,7 @@ def us_security_problems(connection, subject_id: str, start: str, end: str, prov
     from ibkr_etl.us_istrategy_securities import UsIstrategySecurityError, lookup
 
     rows = connection.execute(
-        "SELECT DISTINCT p.conid, COALESCE(i.symbol, p.conid) AS symbol, c.long_name, c.sub_sector "
+        "SELECT DISTINCT p.conid, COALESCE(i.symbol, p.conid) AS symbol, c.long_name, c.industry AS sub_sector "
         "FROM subject_position_series p LEFT JOIN instruments i ON i.conid = p.conid "
         "LEFT JOIN instrument_classifications c ON c.conid = p.conid AND c.provider = ? "
         "WHERE p.subject_id = ? AND p.snapshot_date BETWEEN ? AND ? AND p.conid LIKE 'US:%%' "

@@ -7,12 +7,17 @@ from decimal import Decimal
 
 from ibkr_etl.kiwoom_client import (
     ACCOUNT_PATH,
+    CHART_PATH,
     HOSTS,
     INQUIRY_APIS,
     US_ACCOUNT_PATH,
+    US_CHART_PATH,
     KiwoomClient,
     KiwoomError,
+    KiwoomUnknownStock,
     kiwoom_number,
+    chart_closes,
+    kiwoom_selling_cost,
     krx_code,
     reconcile_us_valuation,
     reconcile_valuation,
@@ -98,7 +103,35 @@ class KiwoomClientTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaisesRegex(KiwoomError, "inquiry calls"):
                 client._post(path, {}, {})
         self.assertEqual(fake.requests, [])
-        self.assertEqual(set(INQUIRY_APIS.values()), {ACCOUNT_PATH, US_ACCOUNT_PATH})
+        self.assertEqual(set(INQUIRY_APIS.values()), {ACCOUNT_PATH, US_ACCOUNT_PATH, CHART_PATH, US_CHART_PATH})
+        # The price chart paths carry the daily close only; they have no order or account change.
+        self.assertEqual([api for api, path in INQUIRY_APIS.items() if path == CHART_PATH], ["ka10081"])
+        self.assertEqual([api for api, path in INQUIRY_APIS.items() if path == US_CHART_PATH], ["usa06012"])
+
+    def test_a_slow_answer_is_asked_again_then_named(self) -> None:
+        fake = FakeKiwoom({"kt00004": [ACCOUNT]})
+        calls = []
+
+        def flaky(url, headers, body):
+            calls.append(headers.get("api-id"))
+            if headers.get("api-id") == "kt00004" and calls.count("kt00004") == 1:
+                raise TimeoutError("The read operation timed out")
+            return fake(url, headers, body)
+
+        client = KiwoomClient(environment="mock", app_key=APP_KEY, app_secret=APP_SECRET, transport=flaky,
+                              clock=fake.clock, sleep=fake.sleep)
+        self.assertEqual(client.inquire("kt00004", {})[0]["acnt_nm"], "Synthetic")
+        self.assertEqual(calls.count("kt00004"), 2)
+
+        def dead(url, headers, body):
+            if url.endswith("/oauth2/token"):
+                return fake(url, headers, body)
+            raise TimeoutError("The read operation timed out")
+
+        client = KiwoomClient(environment="mock", app_key=APP_KEY, app_secret=APP_SECRET, transport=dead,
+                              clock=fake.clock, sleep=fake.sleep)
+        with self.assertRaisesRegex(KiwoomError, "did not answer the call ka10081 after 3 tries"):
+            client.inquire("ka10081", {})
 
     def test_mock_and_live_hosts_only(self) -> None:
         self.assertEqual(set(HOSTS), {"live", "mock"})
@@ -114,7 +147,7 @@ class KiwoomClientTests(unittest.TestCase):
         self.assertEqual([h.code for h in valuation.holdings], ["005930", "000660"])
         self.assertEqual(valuation.holdings[0].identifiers, [SecurityIdentifier("krx_code", "005930")])
         self.assertEqual(valuation.holdings[0].price, Decimal("71500"))
-        self.assertEqual(valuation.deposit, Decimal("500000"))
+        self.assertEqual((valuation.deposit, valuation.settled_deposit), (Decimal("500000"), Decimal("1000000")))
         token_calls = [r for r in fake.requests if r[0].endswith("/oauth2/token")]
         self.assertEqual(len(token_calls), 1)
         second_page = fake.requests[-1][1]
@@ -179,7 +212,21 @@ class ReconciliationTests(unittest.TestCase):
         fake = FakeKiwoom({"kt00004": [off], "kt00018": [HOLDINGS_PAGE_1, HOLDINGS_PAGE_2]})
         result = reconcile_valuation(_client(fake).valuation())
         self.assertEqual(result["status"], "fail")
-        self.assertIn("-10,000 KRW", result["message"])
+        self.assertIn("10,000 KRW above", result["message"])
+
+    def test_kiwoom_total_after_its_selling_cost_passes(self) -> None:
+        # 0.215% of 1,680,000 KRW of holdings: 0.20% tax plus the fee.
+        net = dict(ACCOUNT, prsm_dpst_aset_amt=f"{2180000 - 3612:015d}")
+        result = reconcile_valuation(_client(FakeKiwoom({"kt00004": [net], "kt00018": [HOLDINGS_PAGE_1,
+                                                                                         HOLDINGS_PAGE_2]})).valuation())
+        self.assertEqual((result["status"], result["evidence"]["selling_cost"]), ("pass", "3612"))
+        self.assertIn("selling cost of 3,612 KRW", result["message"])
+        # More than any selling cost could be is still a gap.
+        far = dict(ACCOUNT, prsm_dpst_aset_amt=f"{2180000 - 5000:015d}")
+        result = reconcile_valuation(_client(FakeKiwoom({"kt00004": [far], "kt00018": [HOLDINGS_PAGE_1,
+                                                                                         HOLDINGS_PAGE_2]})).valuation())
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("more than its selling cost", result["message"])
 
 
 US_HOLDINGS = {"return_code": 0, "crnc_code": "USD", "result_list": [
@@ -204,20 +251,103 @@ DAY_BALANCE = {"return_code": 0, "dt": "20250602", "dbst_bal": "000000001000000"
                ]}
 
 
+DAY_DETAIL = {"return_code": 0, "entr_fr": "000000001000000", "entr_to": "000000001000000",
+              "scrt_evlt_amt_fr": "000000006900000", "scrt_evlt_amt_to": "000000007000000",
+              "tot_amt_to": "000000008000000"}
+
+
 class KiwoomPastDayTests(unittest.TestCase):
     def test_a_past_day_reads_holdings_and_cash(self) -> None:
-        fake = FakeKiwoom({"ka01690": [DAY_BALANCE]})
+        fake = FakeKiwoom({"ka01690": [DAY_BALANCE], "kt00016": [DAY_DETAIL]})
         valuation = _client(fake).balance_on(date(2025, 6, 2))
-        self.assertEqual(fake.requests[-1][2], {"qry_dt": "20250602"})
+        self.assertEqual([body for _, headers, body in fake.requests if headers.get("api-id") == "ka01690"],
+                         [{"qry_dt": "20250602"}])
         self.assertEqual((valuation.deposit, valuation.estimated_assets), (Decimal("1000000"), Decimal("8000000")))
         # A stock sold out by that day is left out.
         self.assertEqual([(h.code, h.quantity, h.price) for h in valuation.holdings],
                          [("005930", Decimal("100"), Decimal("70000"))])
         self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
 
+    def test_a_past_days_cash_is_the_deposit_and_the_total_is_after_selling_cost(self) -> None:
+        # Kiwoom's total is 11,550 KRW (0.165% of the holdings) below holdings plus the deposit.
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, day_stk_asst="000000007988450")], "kt00016": [DAY_DETAIL]})
+        valuation = _client(fake).balance_on(date(2025, 6, 2))
+        self.assertEqual((valuation.deposit, valuation.settled_deposit), (Decimal("1000000"), None))
+        self.assertEqual(valuation.selling_cost, Decimal("11550"))
+        self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
+
+    def test_after_market_prices_are_replaced_by_the_official_close(self) -> None:
+        # From 14 Sep 2026 ka01690 lists the 20:00 after-market price (70,000); Kiwoom's total values
+        # the holdings at the official close (71,000: 7,100,000 KRW), less its per-stock selling cost.
+        detail = dict(DAY_DETAIL, scrt_evlt_amt_to="000000007100000")
+        total = 1000000 + 7100000 - 15260
+        # The chart's cur_prc is the day's last trade (70,000 on 14 Sep, after-market); the official
+        # close is 15 Sep's base price: 72,000 less its +1,000 change.
+        chart = {"return_code": 0, "stk_cd": "005930", "stk_dt_pole_chart_qry": [
+            {"dt": "20260915", "cur_prc": "72000", "pred_pre": "+1000"},
+            {"dt": "20260914", "cur_prc": "70000", "pred_pre": "-500"},
+            {"dt": "20260911", "cur_prc": "70500", "pred_pre": "0"}]}
+        older = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20260910", "cur_prc": "1", "pred_pre": "0"}]}
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20260914", day_stk_asst=f"{total:015d}")],
+                           "kt00016": [detail], "ka10081": [chart, older]})
+        valuation = _client(fake).balance_on(date(2026, 9, 14))
+        # One page of the chart only, unadjusted prices, with the close for the day asked.
+        self.assertEqual([(url, body) for url, headers, body in fake.requests if headers.get("api-id") == "ka10081"],
+                         [("https://mockapi.kiwoom.com/api/dostk/chart",
+                           {"stk_cd": "005930", "base_dt": "20261013", "upd_stkpc_tp": "0"})])
+        self.assertEqual([(h.price, h.market_value) for h in valuation.holdings],
+                         [(Decimal("71000"), Decimal("7100000"))])
+        self.assertEqual((valuation.holdings_value, valuation.price_basis_gap, valuation.repriced_at_close),
+                         (Decimal("7100000"), Decimal("0"), True))
+        self.assertEqual(valuation.selling_cost, kiwoom_selling_cost(Decimal("7100000"), date(2026, 9, 14)))
+        self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
+
+    def test_a_close_that_does_not_add_up_keeps_the_listed_prices(self) -> None:
+        detail = dict(DAY_DETAIL, scrt_evlt_amt_to="000000007100000")
+        total = 1000000 + 7100000 - 15260
+        chart = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20260915", "cur_prc": "71000", "pred_pre": "+500"},
+                                                             {"dt": "20260914", "cur_prc": "70000", "pred_pre": "0"}]}
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20260914", day_stk_asst=f"{total:015d}")],
+                           "kt00016": [detail], "ka10081": [chart]})
+        valuation = _client(fake).balance_on(date(2026, 9, 14))
+        self.assertEqual((valuation.holdings_value, valuation.valued_holdings, valuation.repriced_at_close),
+                         (Decimal("7000000"), Decimal("7100000"), False))
+        self.assertEqual(valuation.selling_cost, Decimal("15260"))
+
+    def test_the_official_close_is_the_next_days_base_price(self) -> None:
+        # Kiwoom's chart, SK hynix, 14-16 Sep 2026: cur_prc 1,683,000 on 14 Sep is the 20:00 last
+        # trade; 15 Sep's base price 1,712,000 - 15,000 = 1,697,000 is the official 15:30 close.
+        pages = [{"stk_dt_pole_chart_qry": [
+            {"dt": "20260916", "cur_prc": "1757000", "pred_pre": "+67000"},
+            {"dt": "20260915", "cur_prc": "1712000", "pred_pre": "+15000"},
+            {"dt": "20260914", "cur_prc": "1683000", "pred_pre": "-129000"},
+            {"dt": "20260911", "cur_prc": "1812000", "pred_pre": "-41000"}]}]
+        self.assertEqual(chart_closes(pages), {"20260911": Decimal("1812000"), "20260914": Decimal("1697000"),
+                                               "20260915": Decimal("1690000")})
+
+    def test_kiwooms_selling_cost_rule_per_stock(self) -> None:
+        # 2025: 0.15% tax; the 0.015% fee rounded down to 10 won.
+        self.assertEqual(kiwoom_selling_cost(Decimal("7000000"), date(2025, 6, 2)), Decimal("11550"))
+        # From 26 Dec 2025: 0.05% and 0.15%, each rounded down. Kiwoom's own kt00018 figures, 19 Oct 2026:
+        # DL 43 x 44,950 has tax 3,865 and fee 280; SK hynix 14 x 1,277,000 has 35,756 and 2,680.
+        self.assertEqual(kiwoom_selling_cost(Decimal("1932850"), date(2026, 10, 19)), Decimal("4145"))
+        self.assertEqual(kiwoom_selling_cost(Decimal("17878000"), date(2026, 10, 19)), Decimal("38436"))
+
+    def test_the_account_return_must_hold_the_same_cash(self) -> None:
+        fake = FakeKiwoom({"ka01690": [DAY_BALANCE], "kt00016": [dict(DAY_DETAIL, entr_to="000000001000500")]})
+        with self.assertRaisesRegex(KiwoomError, "kt00016 cash"):
+            _client(fake).balance_on(date(2025, 6, 2))
+
     def test_a_closed_day_is_none(self) -> None:
         fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20250530")]})
         self.assertIsNone(_client(fake).balance_on(date(2025, 6, 2)))
+
+    def test_the_nightly_rebuild_fails_loudly_instead_of_reading_empty_figures(self) -> None:
+        empty = {"return_code": 0, "dt": "", "dbst_bal": "", "day_stk_asst": "",
+                 "return_msg": "전일자 자동일지 데이터 생성 중입니다. (매일 오전 1~3시, 4~7시)",
+                 "day_bal_rt": [{"stk_cd": "", "rmnd_qty": "", "cur_prc": "", "evlt_amt": ""}]}
+        with self.assertRaisesRegex(KiwoomError, "rebuilds its daily records"):
+            _client(FakeKiwoom({"ka01690": [empty]})).balance_on(date(2026, 9, 14))
 
     def test_a_missing_total_fails_loudly(self) -> None:
         page = {key: value for key, value in DAY_BALANCE.items() if key != "day_stk_asst"}
@@ -261,6 +391,28 @@ class KiwoomUsTests(unittest.TestCase):
         result = reconcile_us_valuation(_client(fake).us_valuation())
         self.assertIn("no USD total", result["message"])
 
+    def test_us_holdings_are_checked_against_the_total_in_the_same_answer(self) -> None:
+        # As on 21 Oct 2026: ust21070 carries its own total of the holdings, and ust21120, asked a
+        # moment later, prices the same holdings after U.S. prices moved.
+        holdings = dict(US_HOLDINGS, tot_evlt_amt="4802.5000")
+        moved = dict(US_BALANCES, result_list=[dict(US_BALANCES["result_list"][0], evlt_amt="4801.76")])
+        valuation = _client(FakeKiwoom({"ust21070": [holdings], "ust21120": [moved]})).us_valuation()
+        self.assertEqual(valuation.holdings_totals, {"USD": Decimal("4802.5000")})
+        result = reconcile_us_valuation(valuation)
+        self.assertEqual(result["status"], "pass", result["message"])
+        usd = result["evidence"]["currencies"]["USD"]
+        self.assertEqual((usd["gap"], usd["price_move_between_requests"]), ("0.0000", "-0.7400"))
+        # A holding missing from the answer still fails against its own total.
+        short = dict(holdings, result_list=US_HOLDINGS["result_list"][:1])
+        result = reconcile_us_valuation(_client(FakeKiwoom({"ust21070": [short], "ust21120": [moved]})).us_valuation())
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("-1,800.0000 USD away", result["message"])
+        # A balance further off than prices move between two requests (0.5%) fails too.
+        far = dict(US_BALANCES, result_list=[dict(US_BALANCES["result_list"][0], evlt_amt="4700.00")])
+        result = reconcile_us_valuation(_client(FakeKiwoom({"ust21070": [holdings], "ust21120": [far]})).us_valuation())
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("more than prices move between two requests", result["message"])
+
     def test_a_currency_listed_twice_is_refused(self) -> None:
         twice = dict(US_BALANCES, result_list=US_BALANCES["result_list"] * 2)
         fake = FakeKiwoom({"ust21070": [US_HOLDINGS], "ust21120": [twice]})
@@ -292,6 +444,73 @@ class KiwoomUsTests(unittest.TestCase):
         with self.assertRaisesRegex(KiwoomError, "missing fc_exct_amt"):
             _client(FakeKiwoom({"ust21100": [missing]})).us_transactions(date(2026, 1, 1), date(2026, 1, 31))
 
+
+class KiwoomTransportTests(unittest.TestCase):
+    def test_sends_a_named_user_agent_and_reads_non_json_refusals(self) -> None:
+        import io
+        import urllib.error
+        from unittest import mock
+
+        from ibkr_etl import kiwoom_client
+
+        seen = {}
+
+        def refusing(request, timeout):
+            seen.update({k.lower(): v for k, v in request.header_items()})
+            raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {},
+                                         io.BytesIO(b"<html>\n<body>Bad Request</body></html>"))
+
+        with mock.patch.object(kiwoom_client.urllib.request, "urlopen", refusing):
+            status, _, payload = kiwoom_client._urllib_transport("https://api.kiwoom.com/oauth2/token",
+                                                                 {"Content-Type": "application/json"}, b"{}")
+        self.assertEqual(seen["user-agent"], kiwoom_client.USER_AGENT)
+        self.assertEqual(seen["content-type"], "application/json")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["return_msg"], "non-JSON answer: <html> <body>Bad Request</body></html>")
+
+    def test_refusal_names_the_call_and_masks_keys(self) -> None:
+        def refusing(url, headers, body):
+            return 400, {}, {"return_msg": f"bad appkey {APP_KEY}"}
+
+        client = KiwoomClient(environment="live", app_key=APP_KEY, app_secret=APP_SECRET,
+                              transport=refusing, min_interval_seconds=0)
+        with self.assertRaises(KiwoomError) as caught:
+            client.inquire("kt00004", {})
+        self.assertIn("/oauth2/token (HTTP 400", str(caught.exception))
+        self.assertNotIn(APP_KEY, str(caught.exception))
+
+
+
+class UsPriceAndQuantityTests(unittest.TestCase):
+    """usa06012 (daily chart, read backwards) and usa21730 (shares held per Korean date)."""
+
+    def test_daily_closes_start_at_the_latest_day_and_keep_the_asked_range(self) -> None:
+        chart = [{"return_code": 0, "result_list": [
+            {"dt": "20250402", "cur_prc": "152.5000"}, {"dt": "20250401", "cur_prc": "+150.0100"}]},
+                 {"return_code": 0, "result_list": [{"dt": "20250331", "cur_prc": "149.0000"},
+                                                     {"dt": "20250328", "cur_prc": "147.0000"}]}]
+        fake = FakeKiwoom({"usa06012": chart})
+        closes = _client(fake).us_daily_closes("SYN", "NY", date(2025, 3, 31), date(2025, 4, 2))
+        self.assertEqual(closes, {date(2025, 4, 2): Decimal("152.5000"), date(2025, 4, 1): Decimal("150.0100"),
+                                  date(2025, 3, 31): Decimal("149.0000")})
+        url, headers, body = fake.requests[1]
+        self.assertTrue(url.endswith(US_CHART_PATH))
+        self.assertEqual(body, {"stex_tp": "NY", "stk_cd": "SYN", "strt_dt": "20250402", "upd_stkpc_tp": "0",
+                                "exrt_appl_tp": "0"})
+
+    def test_quantities_are_read_per_korean_date(self) -> None:
+        fake = FakeKiwoom({"usa21730": [{"return_code": 0, "result_list": [
+            {"frst_base_dt": "2026-02-12", "last_base_dt": "2026-02-13", "frst_qty": "96", "last_qty": "96"},
+            {"frst_base_dt": "2026-02-11", "last_base_dt": "2026-02-12", "frst_qty": "0", "last_qty": "96"}]}]})
+        quantities = _client(fake).us_stock_quantities("SYN", "NY", date(2026, 2, 11), date(2026, 2, 13))
+        self.assertEqual(quantities, {date(2026, 2, 11): Decimal(0), date(2026, 2, 12): Decimal(96),
+                                      date(2026, 2, 13): Decimal(96)})
+        self.assertEqual(fake.requests[1][2], {"from": "20260211", "to": "20260213", "stex_tp": "NY", "stk_cd": "SYN"})
+
+    def test_a_stock_kiwoom_does_not_know_is_its_own_refusal(self) -> None:
+        fake = FakeKiwoom({"usa06012": [{"return_code": 7, "return_msg": "error[1903:no such stock, stex_tp=ND]"}]})
+        with self.assertRaises(KiwoomUnknownStock):
+            _client(fake).us_daily_closes("GONE", "ND", date(2025, 3, 27), date(2025, 4, 2))
 
 if __name__ == "__main__":
     unittest.main()

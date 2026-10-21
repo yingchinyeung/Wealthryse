@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping
 
 from .benchmark_analytics import ComparisonRow, comparison_metrics, portfolio_risk_metrics
 from .crisis_replay import load_crisis_replay
-from .sector_classification import YAHOO_PROVIDER, aggregate_sector_allocation
+from .sector_classification import YAHOO_PROVIDER, aggregate_sector_allocation, has_long_name
 from .util import canonical_json, utc_now_iso
 from .subject_read_contract import ACTIVE_NAV_CURRENCY_SQL, require_ms_hkd_contract, synthetic_exposure
 
@@ -648,7 +648,7 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
         """
         SELECT p.conid, i.symbol, p.market_value_text, p.currency, p.snapshot_date,
                i.listing_exchange, c.sector, c.industry, c.exchange,
-               c.checked_at, c.quality_status, c.license_status
+               c.checked_at, c.quality_status, c.license_status{long_name}
         FROM subject_position_series p
         LEFT JOIN instruments i ON i.conid = p.conid
         LEFT JOIN instrument_classifications c
@@ -656,7 +656,7 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
         WHERE p.subject_id = %s AND p.snapshot_date = %s
           AND COALESCE(NULLIF(p.quantity_text, ''), '0')::numeric <> 0
         ORDER BY ABS(COALESCE(NULLIF(p.market_value_text, ''), '0')::numeric) DESC
-        """,
+        """.format(long_name=", c.long_name" if has_long_name(connection) else ""),
         (YAHOO_PROVIDER, subject_id, position_date),
     ).fetchall()
     data = aggregate_sector_allocation([dict(row) for row in records])

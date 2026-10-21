@@ -236,5 +236,93 @@ class SectorClassificationTests(unittest.TestCase):
         self.assertEqual(transmitted, ["MSFT"])
 
 
+    def _krw_database(self, *, with_name_column: bool):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE instruments(conid TEXT PRIMARY KEY, symbol TEXT, description TEXT, listing_exchange TEXT,
+                                     currency TEXT);
+            CREATE TABLE position_snapshots(account_id TEXT, snapshot_date TEXT, conid TEXT, currency TEXT,
+                                            quantity_text TEXT);
+            CREATE TABLE instrument_classifications(
+                tenant_id TEXT NOT NULL DEFAULT 'tenant-1', conid TEXT NOT NULL,
+                provider TEXT NOT NULL, symbol TEXT NOT NULL, lookup_symbol TEXT,
+                sector TEXT, industry TEXT, exchange TEXT, status TEXT NOT NULL,
+                quality_status TEXT NOT NULL, license_status TEXT NOT NULL,
+                source_url TEXT NOT NULL, response_sha256 TEXT, error_code TEXT,
+                checked_at TEXT NOT NULL,
+                UNIQUE(tenant_id, conid, provider)
+            );
+            INSERT INTO instruments VALUES ('KRX:000660', '000660', 'SK하이닉스', 'KRX', 'KRW');
+            INSERT INTO instruments VALUES ('1', 'AAPL', 'APPLE INC', 'NASDAQ', 'USD');
+            INSERT INTO position_snapshots VALUES ('K1', '2026-08-31', 'KRX:000660', 'KRW', '14');
+            INSERT INTO position_snapshots VALUES ('K1', '2026-08-31', '1', 'USD', '1');
+            INSERT INTO instrument_classifications VALUES (
+                'tenant-1', 'KRX:000660', 'Yahoo Finance search profile', '000660', '000660.KS',
+                'Technology', 'Semiconductors', 'KSC', 'classified', 'warn', 'restricted', 'test', 'd', NULL, '2026-10-01');
+            INSERT INTO instrument_classifications VALUES (
+                'tenant-1', '1', 'Yahoo Finance search profile', 'AAPL', 'AAPL',
+                'Technology', 'Consumer Electronics', 'NMS', 'classified', 'warn', 'restricted', 'test', 'd', NULL,
+                '2026-10-01');
+            """
+        )
+        if with_name_column:
+            connection.execute("ALTER TABLE instrument_classifications ADD COLUMN long_name TEXT")
+        return connection
+
+    @staticmethod
+    def _fetcher(transmitted):
+        def fetch(symbol: str, timeout: int):
+            transmitted.append(symbol)
+            return {"quotes": [{"symbol": symbol, "sector": "Technology", "industry": "Semiconductors",
+                                "exchange": "KSC", "longname": "SK hynix Inc.", "shortname": "SK HYNIX"}]}
+        return fetch
+
+    def test_a_krw_holding_without_its_english_name_is_looked_up_again_and_stores_it(self) -> None:
+        connection = self._krw_database(with_name_column=True)
+        transmitted: list[str] = []
+        try:
+            result = refresh_sector_classifications_range(
+                connection, subject_id="K1", start_date="2026-08-01", end_date="2026-08-31", workers=1,
+                fetcher=self._fetcher(transmitted))
+            stored = connection.execute(
+                "SELECT long_name FROM instrument_classifications WHERE conid = 'KRX:000660'").fetchone()
+            names = dict(connection.execute("SELECT conid, description FROM instruments").fetchall())
+            again: list[str] = []
+            refresh_sector_classifications_range(
+                connection, subject_id="K1", start_date="2026-08-01", end_date="2026-08-31", workers=1,
+                fetcher=self._fetcher(again))
+        finally:
+            connection.close()
+        self.assertEqual(transmitted, ["000660.KS"])  # the USD holding with a sector is left alone
+        self.assertEqual(result["previously_classified"], 1)
+        self.assertEqual(stored["long_name"], "SK hynix Inc.")
+        # The website shows the English name in place of Kiwoom's Korean one; English names stay as they are.
+        self.assertEqual(names, {"KRX:000660": "SK hynix Inc.", "1": "APPLE INC"})
+        self.assertEqual(again, [])  # named now, so not looked up again
+
+    def test_before_migration_080_nothing_changes(self) -> None:
+        connection = self._krw_database(with_name_column=False)
+        transmitted: list[str] = []
+        try:
+            result = refresh_sector_classifications_range(
+                connection, subject_id="K1", start_date="2026-08-01", end_date="2026-08-31", workers=1,
+                fetcher=self._fetcher(transmitted))
+        finally:
+            connection.close()
+        self.assertEqual(transmitted, [])
+        self.assertEqual(result["previously_classified"], 2)
+
+    def test_the_allocation_carries_the_english_name(self) -> None:
+        result = aggregate_sector_allocation([
+            {"conid": "KRX:000660", "symbol": "000660", "currency": "KRW", "market_value_text": "10",
+             "sector": "Technology", "industry": "Semiconductors", "long_name": "SK hynix Inc."},
+            {"conid": "1", "symbol": "AAPL", "currency": "USD", "market_value_text": "5",
+             "sector": "Technology", "industry": "Consumer Electronics"}])
+        names = {row["conid"]: row.get("long_name") for row in result["classifications"]}
+        self.assertEqual(names, {"KRX:000660": "SK hynix Inc.", "1": None})
+
+
 if __name__ == "__main__":
     unittest.main()

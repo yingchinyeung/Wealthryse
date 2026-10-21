@@ -313,6 +313,9 @@ def inputs_builder(kind: str, currencies: tuple[str, ...]) -> Callable[[dict[str
     """How a design reads the snapshot: the account rules, or MS or T's own methodology."""
     if kind == "account":
         return lambda snapshot: legacy.factsheet_inputs(snapshot, reporting_currencies=currencies)
+    if kind == "us_istrategy":
+        return lambda snapshot: legacy.factsheet_inputs(
+            snapshot, reporting_currencies=currencies, securities="us_istrategy")
     if kind == "alpha_world_ms":
         def ms(snapshot):
             if snapshot.get("subject_id") != "alpha-world-ms":

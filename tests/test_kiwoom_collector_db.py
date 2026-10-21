@@ -523,12 +523,13 @@ class KiwoomUsAccountDatabaseTests(KiwoomCollectorDatabaseTests):
         self.assertEqual(result["history"]["recorded"], False)
         self.assertNotIn(date(2026, 9, 7), client.asked)  # Labor Day
         self.assertEqual(client.asked[0], date(2026, 9, 1))
-        self.assertEqual(client.asked[-1], date(2026, 10, 16))
+        # The latest closed day, Monday 19 Oct, is filled from Kiwoom's close like every other day.
+        self.assertEqual(client.asked[-1], date(2026, 10, 19))
         self.assertEqual(result["history"]["check"], "pass")
         account = "KIWOOM-9900000003"
         stored = self.db.execute("SELECT count(*) AS n FROM nav_snapshots WHERE account_id = ? AND currency = 'USD'",
                                  (account,)).fetchone()["n"]
-        self.assertEqual(stored, len(client.asked) + 1)
+        self.assertEqual(stored, len(client.asked))
         first = self.db.execute("SELECT quantity_text, mark_price_text, market_value_text FROM position_snapshots "
                                 "WHERE account_id = ? AND snapshot_date = '2026-09-01'", (account,)).fetchone()
         self.assertEqual((first["quantity_text"], first["mark_price_text"], first["market_value_text"]),
@@ -542,17 +543,20 @@ class KiwoomUsAccountDatabaseTests(KiwoomCollectorDatabaseTests):
         # Still held today, so the stock must have Kiwoom's close: the past days wait.
         self.assertEqual(result["history"]["check"], "pending")
 
-    def test_us_the_history_pass_keeps_the_daily_positions_that_add_up(self):
+    def test_us_live_holdings_are_never_stored_as_a_close(self):
+        # The account holds a stock bought before its history start, so the movements cannot rebuild
+        # the day. Kiwoom's live holdings (priced at the moment of asking) do not stand in for the close:
+        # the day keeps Kiwoom's daily total and stays open.
         _, case_id = self._kiwoom_account("9900000004", start=date(2026, 10, 1), currency="USD")
         self.addCleanup(self._cancel, case_id)
         account = "KIWOOM-9900000004"
-        self._run({"9900000004": FakeUsKiwoom()}, now=US_NOW)
         client = FakeUsKiwoom()
-        self._run({"9900000004": client}, now=US_NOW + timedelta(days=1))
+        result = self._run({"9900000004": client}, now=US_NOW)[0]
         self.assertIn(date(2026, 10, 19), client.asked)
+        self.assertEqual(result["history"]["check"], "pending")
         row = self.db.execute(
-            "SELECT r.run_type, (SELECT count(*) FROM position_snapshots p WHERE p.account_id = n.account_id "
+            "SELECT r.run_type, n.stock_text, (SELECT count(*) FROM position_snapshots p WHERE p.account_id = n.account_id "
             "AND p.snapshot_date = n.snapshot_date) AS positions FROM nav_snapshots n "
             "JOIN ingestion_runs r ON r.run_id = n.last_seen_run_id WHERE n.account_id = ? "
             "AND n.snapshot_date = '2026-10-19'", (account,)).fetchone()
-        self.assertEqual((row["run_type"], row["positions"]), ("kiwoom_rest_us_history", 1))
+        self.assertEqual((row["run_type"], row["stock_text"], row["positions"]), ("kiwoom_rest_us_history", "800", 0))

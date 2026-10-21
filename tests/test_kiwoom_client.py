@@ -391,6 +391,28 @@ class KiwoomUsTests(unittest.TestCase):
         result = reconcile_us_valuation(_client(fake).us_valuation())
         self.assertIn("no USD total", result["message"])
 
+    def test_us_holdings_are_checked_against_the_total_in_the_same_answer(self) -> None:
+        # As on 21 Oct 2026: ust21070 carries its own total of the holdings, and ust21120, asked a
+        # moment later, prices the same holdings after U.S. prices moved.
+        holdings = dict(US_HOLDINGS, tot_evlt_amt="4802.5000")
+        moved = dict(US_BALANCES, result_list=[dict(US_BALANCES["result_list"][0], evlt_amt="4801.76")])
+        valuation = _client(FakeKiwoom({"ust21070": [holdings], "ust21120": [moved]})).us_valuation()
+        self.assertEqual(valuation.holdings_totals, {"USD": Decimal("4802.5000")})
+        result = reconcile_us_valuation(valuation)
+        self.assertEqual(result["status"], "pass", result["message"])
+        usd = result["evidence"]["currencies"]["USD"]
+        self.assertEqual((usd["gap"], usd["price_move_between_requests"]), ("0.0000", "-0.7400"))
+        # A holding missing from the answer still fails against its own total.
+        short = dict(holdings, result_list=US_HOLDINGS["result_list"][:1])
+        result = reconcile_us_valuation(_client(FakeKiwoom({"ust21070": [short], "ust21120": [moved]})).us_valuation())
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("-1,800.0000 USD away", result["message"])
+        # A balance further off than prices move between two requests (0.5%) fails too.
+        far = dict(US_BALANCES, result_list=[dict(US_BALANCES["result_list"][0], evlt_amt="4700.00")])
+        result = reconcile_us_valuation(_client(FakeKiwoom({"ust21070": [holdings], "ust21120": [far]})).us_valuation())
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("more than prices move between two requests", result["message"])
+
     def test_a_currency_listed_twice_is_refused(self) -> None:
         twice = dict(US_BALANCES, result_list=US_BALANCES["result_list"] * 2)
         fake = FakeKiwoom({"ust21070": [US_HOLDINGS], "ust21120": [twice]})

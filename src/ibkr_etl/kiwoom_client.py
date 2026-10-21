@@ -25,7 +25,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Callable, Mapping
@@ -233,6 +233,9 @@ class CurrencyBalance:
 class UsValuation:
     holdings: tuple[Holding, ...]
     balances: tuple[CurrencyBalance, ...]
+    # Kiwoom's securities value per currency in the same answer as the holdings (ust21070 tot_evlt_amt).
+    # ust21120's value is a separate request priced a moment later, so U.S. prices can move in between.
+    holdings_totals: Mapping[str, Decimal] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -538,7 +541,13 @@ class KiwoomClient:
         """US holdings (ust21070) and each currency's cash and securities value (ust21120)."""
 
         holdings: list[Holding] = []
+        totals: dict[str, Decimal] = {}
         for page in self.inquire("ust21070", {"stex_tp": "", "stk_cd": ""}):
+            if page.get("tot_evlt_amt") not in (None, ""):
+                currency = _currency(page.get("crnc_code") or "", "USD")
+                if currency in totals and totals[currency] != kiwoom_number(page["tot_evlt_amt"]):
+                    raise KiwoomError("Kiwoom gave two different U.S. holdings totals for " + currency)
+                totals[currency] = kiwoom_number(page["tot_evlt_amt"])
             for row in page.get("result_list") or []:
                 holdings.append(Holding(
                     security=SecurityIdentifier("us_ticker", _field(row, "stk_cd")),
@@ -552,7 +561,7 @@ class KiwoomClient:
                     market_value_krw=kiwoom_number(_field(row, "evlt_amt_krw")),
                 ))
         balances = self._balances(self.inquire("ust21120", {"cmsn_incl_tp": "0", "exrt_tp": "0"}))
-        return UsValuation(holdings=tuple(holdings), balances=balances)
+        return UsValuation(holdings=tuple(holdings), balances=balances, holdings_totals=totals)
 
     def us_balances_on(self, day: date) -> tuple[CurrencyBalance, ...]:
         """Each currency's cash and securities value at the close of a past date (ust21132)."""
@@ -663,12 +672,17 @@ def reconcile_valuation(valuation: AccountValuation, *, tolerance: Decimal = Dec
     }
 
 
-def reconcile_us_valuation(valuation: UsValuation, *, cent: Decimal = Decimal("0.01")) -> dict[str, object]:
+def reconcile_us_valuation(valuation: UsValuation, *, cent: Decimal = Decimal("0.01"),
+                           drift: Decimal = Decimal("0.005")) -> dict[str, object]:
     """US holdings should add up to Kiwoom's own securities value in each currency.
 
-    Each holding's quantity times price must also match its value, which
-    catches a field read in the wrong unit. Rounding allows one cent per
-    holding. Returns the check record for ``nav_reconciled``.
+    Kiwoom's value per holding is quantity times its current price, and the holdings answer
+    (ust21070) carries Kiwoom's total of exactly those values, so the holdings are checked against
+    that total. The per-currency balance (ust21120) is a separate request priced a moment later;
+    U.S. prices move between the two outside the Korean night too, so it may differ by up to
+    ``drift`` (0.5%) of the value, which is shown, never hidden. Each holding's quantity times price
+    must also match its value, which catches a field read in the wrong unit. Rounding allows one
+    cent per holding. Returns the check record for ``nav_reconciled``.
     """
 
     balances = {item.currency: item for item in valuation.balances}
@@ -677,23 +691,32 @@ def reconcile_us_valuation(valuation: UsValuation, *, cent: Decimal = Decimal("0
         by_currency.setdefault(holding.currency, []).append(holding)
     problems: list[str] = []
     currencies: dict[str, dict[str, str | int]] = {}
-    for currency in sorted(set(by_currency) | {c for c, b in balances.items() if b.securities_value}):
+    for currency in sorted(set(by_currency) | {c for c, b in balances.items() if b.securities_value}
+                           | set(valuation.holdings_totals)):
         held = by_currency.get(currency, [])
         holdings_value = sum((item.market_value for item in held), Decimal("0"))
         balance = balances.get(currency)
         if balance is None:
             problems.append(f"Kiwoom gave no {currency} total to check {len(held)} holdings against.")
             continue
-        gap = holdings_value - balance.securities_value
+        same_answer = valuation.holdings_totals.get(currency)
+        reference = balance.securities_value if same_answer is None else same_answer
+        gap = holdings_value - reference
+        moved = balance.securities_value - reference
         currencies[currency] = {
             "holdings_value": str(holdings_value),
+            "kiwoom_holdings_total": str(same_answer) if same_answer is not None else None,
             "broker_securities_value": str(balance.securities_value),
+            "price_move_between_requests": str(moved),
             "deposit": str(balance.deposit),
             "gap": str(gap),
             "holdings": len(held),
         }
         if abs(gap) > cent * max(1, len(held)):
             problems.append(f"{currency} holdings are {gap:+,} {currency} away from Kiwoom's total.")
+        elif abs(moved) > max(cent * max(1, len(held)), abs(reference) * drift):
+            problems.append(f"Kiwoom's {currency} balance is {moved:+,} {currency} away from its own holdings total, "
+                            "more than prices move between two requests.")
     mispriced = [
         item.code for item in valuation.holdings
         if abs(item.quantity * item.price - item.market_value) > max(cent, abs(item.market_value) / 200)

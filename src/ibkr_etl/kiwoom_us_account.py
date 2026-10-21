@@ -4,9 +4,11 @@ The Korea collector (kiwoom_collector) values an account in KRW from the domesti
 calls. An account whose onboarding case reports in USD and holds only U.S. stocks
 is loaded here instead, in USD, from the U.S. account calls:
 
-  - today: holdings (ust21070) and each currency's cash and securities value
-    (ust21120);
-  - each past U.S. trading day: USD cash and securities value (ust21132), which
+  - now: holdings (ust21070) and each currency's cash and securities value
+    (ust21120), for the onboarding checks only. Kiwoom prices them at the moment
+    of asking, after-hours and overnight trading included, so they are never
+    stored as a day's figures;
+  - each closed U.S. trading day, the latest one included: USD cash and securities value (ust21132), which
     is Kiwoom's own daily total for the account. Kiwoom's past-day answer has no
     per-holding rows, so a past day's positions are rebuilt from the movements,
     Kiwoom's per-stock daily holding (usa21730) and daily closes (usa06012)
@@ -77,13 +79,15 @@ def us_classify(movement: CashMovement) -> tuple[str, int] | None:
 
 
 def us_snapshot_day(now: datetime) -> date:
-    """The U.S. trading day whose close Kiwoom shows at this moment: the last NYSE session before today
-    (UTC) until 21:00 UTC, after the 16:00 New York close, then today if it is a session."""
+    """The latest U.S. trading day that has closed: today in New York from 17:00 New York time, an hour
+    after the 16:00 close (summer or winter), else the last NYSE session before it."""
+
+    from zoneinfo import ZoneInfo
 
     from .market_calendar import CALENDARS
 
-    utc = now.astimezone(timezone.utc)
-    day = utc.date() if utc.hour >= 21 else utc.date() - timedelta(days=1)
+    local = now.astimezone(ZoneInfo("America/New_York"))
+    day = local.date() if local.hour >= 17 else local.date() - timedelta(days=1)
     while not CALENDARS["XNYS"].is_session(day):
         day -= timedelta(days=1)
     return day
@@ -555,9 +559,13 @@ def _windows_around(days: Sequence[date], *, floor: date) -> list[tuple[date, da
 
 
 def build_us_history(connection, client: KiwoomClient, *, account_id: str, display_name: str, history_start: date,
-                     today: date, now: datetime, positions_on=None,
+                     through: date, now: datetime, positions_on=None,
                      limit: int = US_HISTORY_DAYS_PER_RUN) -> dict[str, Any]:
-    """Fill past U.S. trading days from Kiwoom's daily total (ust21132) and say what is left.
+    """Fill closed U.S. trading days up to ``through`` from Kiwoom's daily total (ust21132), say what is left.
+
+    Every stored day is Kiwoom's close for that day, the latest one included: the holdings answer
+    (ust21070) prices at the moment of asking, after-hours and overnight trading included, so it is
+    never stored as a day's close.
 
     ``positions_on(day, figures)`` gives a past day's holdings at that day's close
     (UsHistoryPositions), or None when a stock's close is missing. A day is stored either way
@@ -567,7 +575,7 @@ def build_us_history(connection, client: KiwoomClient, *, account_id: str, displ
 
     from .kiwoom_collector import Securities, known_identifiers
 
-    end = today - timedelta(days=1)
+    end = through
     have = us_days_stored(connection, account_id, history_start, end)
     missing = [day for day in us_trading_days(history_start, end) if day not in have]
     batch, remaining = missing[:limit], missing[limit:]
@@ -578,7 +586,7 @@ def build_us_history(connection, client: KiwoomClient, *, account_id: str, displ
         figures = collect_past_day(client, day)
         holdings = positions_on(day, figures) if positions_on is not None else None
         if holdings is None or abs(position_gap(figures, holdings)) > Decimal("0.01") * max(1, len(holdings)):
-            # The daily run's positions for the day stay when they add up to Kiwoom's total for it.
+            # Positions an earlier history pass stored for the day stay when they add up to Kiwoom's total.
             kept = stored_holdings(connection, account_id, day)
             if kept and abs(position_gap(figures, kept)) <= Decimal("0.01") * len(kept):
                 holdings = kept
@@ -637,7 +645,10 @@ def run_target(connection, tenant_id: str, client: KiwoomClient, target, *, now:
     rows = us_rows(account_id, figures, valuation.holdings, securities)
     moved, unknown = us_movement_rows(account_id, movements, securities)
     new = [securities.new[key] for key in sorted(securities.new)]
-    _store_rows(connection, account_id, target.display_name, [(day, {**rows, **moved})], run_type="kiwoom_rest_us",
+    # Today's holdings are priced at this moment, not at a close: only the securities and the movements
+    # are stored from them. The day itself is stored from Kiwoom's close below (build_us_history).
+    _store_rows(connection, account_id, target.display_name,
+                [(day, {"instruments": rows["instruments"], **moved})], run_type="kiwoom_rest_us",
                 raw={"day": day.isoformat(), "rows": rows, **moved}, new_securities=new, now=now)
     _connection_result(connection, tenant_id, target, ok=True, message="Kiwoom answered and the U.S. account loaded.",
                        base_currency=BASE_CURRENCY)
@@ -662,7 +673,7 @@ def run_target(connection, tenant_id: str, client: KiwoomClient, target, *, now:
 
         def build():
             return build_us_history(connection, client, account_id=account_id, display_name=target.display_name,
-                                    history_start=target.history_start, today=day, now=now,
+                                    history_start=target.history_start, through=day, now=now,
                                     positions_on=positions)
 
         result["history"] = _history_record(connection, tenant_id, target, build, record=stage == "build_history")

@@ -586,7 +586,7 @@ def build_us_history(connection, client: KiwoomClient, *, account_id: str, displ
         figures = collect_past_day(client, day)
         holdings = positions_on(day, figures) if positions_on is not None else None
         if holdings is None or abs(position_gap(figures, holdings)) > Decimal("0.01") * max(1, len(holdings)):
-            # The daily run's positions for the day stay when they add up to Kiwoom's total for it.
+            # Positions an earlier history pass stored for the day stay when they add up to Kiwoom's total.
             kept = stored_holdings(connection, account_id, day)
             if kept and abs(position_gap(figures, kept)) <= Decimal("0.01") * len(kept):
                 holdings = kept

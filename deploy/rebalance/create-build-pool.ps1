@@ -130,7 +130,7 @@ if (-not $existing) {
 }
 $poolId = AzRun acr agentpool show -r $Registry -n $PoolName --query id -o tsv
 # Same labels as the registry it belongs to, so it shows up with the rest of the foundation.
-AzRun resource tag --ids $poolId --tags layer=foundation component=registry owner=ying -i | Out-Null
+AzRun resource tag --ids $poolId --api-version 2025-03-01-preview --tags layer=foundation component=registry owner=ying -i | Out-Null
 $state = AzRun acr agentpool show -r $Registry -n $PoolName --query provisioningState -o tsv
 $count = AzRun acr agentpool show -r $Registry -n $PoolName --query count -o tsv
 Write-Host ''

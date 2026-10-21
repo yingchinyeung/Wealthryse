@@ -44,7 +44,7 @@ var privateDnsZoneName = '${prefix}.postgres.database.azure.com'
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: workspaceName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'logging' })
   properties: {
     retentionInDays: 30
     features: {
@@ -144,7 +144,7 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
 resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   name: registryName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'registry' })
   sku: {
     name: 'Basic'
   }
@@ -157,7 +157,7 @@ resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'data', component: 'storage', dataLayer: 'bronze+gold+ops' })
   sku: {
     name: 'Standard_LRS'
   }
@@ -245,7 +245,7 @@ resource approvedContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
 resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: vaultName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'secrets' })
   properties: {
     tenantId: tenant().tenantId
     enableRbacAuthorization: true
@@ -263,37 +263,37 @@ resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
 resource webIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-web-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource ingestionIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-ingestion-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource publisherIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-publisher-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource diagnosticsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-diagnostics-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource approvedActionsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-approved-actions-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
   name: postgresName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'data', component: 'database', dataLayer: 'bronze+silver+gold+ops' })
   sku: {
     name: postgresSkuName
     tier: postgresSkuTier
@@ -405,27 +405,11 @@ resource publisherSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-
 // The web identity's account-wide Storage Blob Data Reader came off on 18 Oct 2026; it reads
 // only through its container roles (staging-web-report-reader.bicep, staging-onboarding-intake.bicep).
 
-// Account-wide Contributor for ingestion and publisher stays until the narrowing around
-// 10 Nov 2026; the container roles below already cover what each identity uses.
-resource ingestionBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, ingestionIdentity.id, storageBlobContributorRoleId)
-  scope: storage
-  properties: {
-    principalId: ingestionIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: storageBlobContributorRoleId
-  }
-}
-
-resource publisherBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, publisherIdentity.id, storageBlobContributorRoleId)
-  scope: storage
-  properties: {
-    principalId: publisherIdentity.properties.principalId
-    principalType: 'ServicePrincipal'
-    roleDefinitionId: storageBlobContributorRoleId
-  }
-}
+// The ingestion and publisher identities' account-wide Storage Blob Data Contributor came off on
+// 21 Oct 2026 (medallion S4a storage narrowing); each keeps only the container roles below and in
+// staging-internal-release.bicep. A deployment leaves an assignment it no longer declares in place, so
+// the removal was a separate step (storage_narrow.py), and its undo puts both back under their earlier
+// names, guid(storage.id, <identity>.id, storageBlobContributorRoleId).
 
 // Containers made outside this file (onboarding-intake by staging-onboarding-intake.bicep,
 // bronze-market-data by the medallion S2 step), referenced for the container roles below.
@@ -436,6 +420,16 @@ resource onboardingIntakeContainer 'Microsoft.Storage/storageAccounts/blobServic
 resource bronzeMarketDataContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
   parent: blobService
   name: 'bronze-market-data'
+}
+// Made by staging-internal-release.bicep, which also gives the publisher identity its role there.
+resource internalReportsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'internal-reports'
+}
+// Made by staging-flex-discovery.bicep; the Flex identity writes the raw statements there.
+resource rawStatementsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'ibkr-raw'
 }
 
 // Container-scope storage roles (medallion S4a). Each name is the assignment made on
@@ -467,6 +461,41 @@ resource ingestionInputContributor 'Microsoft.Authorization/roleAssignments@2022
     principalId: ingestionIdentity.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: storageBlobContributorRoleId
+  }
+}
+
+// The bootstrap job reads the raw statements as the ingestion identity: the corrections history
+// backfill and check, the FX step and the rehearsals on restored copies. Read only; the container is
+// under legal hold. The name is the assignment the narrowing step made.
+resource ingestionRawReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: 'f2cbbd24-51eb-4cf6-b159-3e8ec4d55785'
+  scope: rawStatementsContainer
+  properties: {
+    principalId: ingestionIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobReaderRoleId
+  }
+}
+
+// The onboarding render job (as the ingestion identity) writes rendered factsheets to internal-reports
+// and reads the onboarding uploads. The names are the assignments the narrowing step made.
+resource ingestionInternalReportsContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: 'f2ab1682-51fe-44d9-a209-9426919e0f40'
+  scope: internalReportsContainer
+  properties: {
+    principalId: ingestionIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobContributorRoleId
+  }
+}
+
+resource ingestionIntakeReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: '943026b5-f7a1-4087-b4a7-68803110ede1'
+  scope: onboardingIntakeContainer
+  properties: {
+    principalId: ingestionIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobReaderRoleId
   }
 }
 

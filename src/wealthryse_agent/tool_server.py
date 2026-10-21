@@ -22,7 +22,7 @@ from typing import Any, Iterator
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import access
+from . import access, certified_tools
 from .auth import Unauthorized, verify_service_token
 from .config import DatabaseSettings, ServiceAuthSettings
 from .database import connect, scoped
@@ -131,7 +131,8 @@ class ToolService:
 
 
 def _offered(spec: Any, job: str | None) -> bool:
-    if not switched_on(spec) or (job is not None and job in spec.not_jobs):
+    if not switched_on(spec) or (job is not None and job in spec.not_jobs
+                                 and not certified_tools.released(spec.name, job)):
         return False
     return not spec.only_jobs or job in spec.only_jobs
 

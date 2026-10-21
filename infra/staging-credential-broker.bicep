@@ -21,6 +21,7 @@ resource vault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${appName}-identity'
   location: resourceGroup().location
+  tags: { layer: 'foundation', component: 'identity', owner: 'ying' }
 }
 
 resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -64,6 +65,7 @@ resource secretWriterAssignment 'Microsoft.Authorization/roleAssignments@2022-04
 resource broker 'Microsoft.App/containerApps@2024-03-01' = {
   name: appName
   location: resourceGroup().location
+  tags: { layer: 'apps', component: 'credentials', hop: 'ops', owner: 'ying' }
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {'${identity.id}': {}}

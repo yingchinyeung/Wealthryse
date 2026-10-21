@@ -161,13 +161,14 @@ class KiwoomExternalFlowTests(unittest.TestCase):
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(
             """
-            CREATE TABLE accounts (account_id TEXT, base_currency TEXT);
+            CREATE TABLE accounts (account_id TEXT, base_currency TEXT, account_type TEXT);
             CREATE TABLE fx_rates (account_id TEXT, rate_date TEXT, from_currency TEXT,
                                    to_currency TEXT, rate_text TEXT);
             CREATE TABLE flex_rows (account_id TEXT, section TEXT, data_json TEXT);
             CREATE TABLE cash_transactions (account_id TEXT, effective_date TEXT, transaction_type TEXT,
                                             amount_text TEXT, currency TEXT);
-            INSERT INTO accounts VALUES ('KIWOOM-US', 'USD'), ('KIWOOM-KR', 'KRW'), ('U1', 'USD');
+            INSERT INTO accounts VALUES ('KIWOOM-US', 'USD', 'kiwoom'), ('KIWOOM-KR', 'KRW', 'kiwoom'),
+                ('U1', 'USD', 'Individual'), ('U2', 'USD', 'Individual');
             """
         )
 
@@ -197,6 +198,12 @@ class KiwoomExternalFlowTests(unittest.TestCase):
         self.connection.execute("INSERT INTO flex_rows VALUES ('U1', 'Trades', '{}')")
         self.cash("U1", "2026-01-08", "DEPOSIT", "100", "USD")
         self.assertEqual(self.flows("U1"), {})
+
+    def test_an_ibkr_account_never_reads_cash_rows_even_without_a_flex_file(self):
+        # The agents' scoped views have no cash_transactions, so reading it would fail there.
+        self.cash("U2", "2026-01-08", "DEPOSIT", "100", "USD")
+        self.connection.execute("DROP TABLE cash_transactions")
+        self.assertEqual(self.flows("U2"), {})
 
 
 class AttributionCashClassifierTests(unittest.TestCase):

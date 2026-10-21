@@ -5,7 +5,7 @@
 targetScope = 'resourceGroup'
 
 param actionGroupName string = 'ibkrv2stg-alerts'
-// The owner address that ibkr-v11-daily-alerts uses; passed at deploy time.
+// The owner's alert address, the one email receiver; passed at deploy time.
 param alertEmail string
 
 resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {

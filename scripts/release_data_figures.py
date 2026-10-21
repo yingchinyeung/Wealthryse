@@ -51,7 +51,7 @@ OK = ("fail", "empty")  # period statuses the page shows as a dash
 # Figures this command does not compare, and why. Shown in both reports.
 NOT_COMPARED = {
     "overview.data_freshness": "worked out in the browser from the day the page is read",
-    "benchmark.rebased_level": "a chart series: compared with the charts after month-end",
+    "benchmark.rebased_level": "a chart series: checked through the daily returns it compounds (series.*_daily_return, batch 5)",
     "risk.crisis_scenario_max_drawdown": "read from the crisis scenarios table: not compared yet",
 }
 # The pages whose figures are another page's, read when the page is opened.
@@ -295,9 +295,57 @@ def risk_statistics_today(api, subject: str, day: str) -> dict[Key, Any]:
     return found
 
 
+ATTRIBUTION_TOTALS = {"attribution.portfolio_return": "portfolio_monthly_return",
+                      "attribution.holdings_contribution": "equity_contribution",
+                      "attribution.residual_contribution": "residual_contribution"}
+
+
+def attribution_today(api, subject: str, day: str) -> dict[Key, Any] | None:
+    """Performance › Attribution for the date's month. The page works a month out to its calendar
+    end whatever the as-of date, so it shows a date's figures only on the month's last date (and
+    the newest date); on any other date it returns None: not comparable, nothing counted."""
+    view = api.call("attribution", subject, day)
+    if view is None:
+        return {}
+    if not view.get("available") or "position_coverage" not in view:
+        return {}  # unavailable, or a composite's (not certified)
+    if str(view.get("period_end") or "") != day:
+        return None
+    period = f"month_{day[:7]}"
+    found: dict[Key, Any] = {(figure, period, "", ""): _number(view.get(name))
+                             for figure, name in ATTRIBUTION_TOTALS.items()}
+    for row in view.get("security_contributions") or []:
+        found[("attribution.holding_contribution", period, str(row.get("conid")), "")] = _number(row.get("contribution"))
+    for row in view.get("sector_contributions") or []:
+        found[("attribution.sector_contribution", period, str(row.get("sector")), "")] = _number(row.get("contribution"))
+    return found
+
+
+def charts_today(api, subject: str, day: str) -> dict[Key, Any]:
+    """The charts, tables and indicators (ibkr_etl.certified_charts): each series' point on the date,
+    and the tables on the date, read from the answers the pages draw them from."""
+    from ibkr_etl import certified_charts as charts
+
+    found: dict[Key, Any] = {}
+    for name, extract in (("analytics", charts.analytics_points), ("benchmark", charts.benchmark_points),
+                          ("holdings", charts.holdings_points),
+                          ("holdings_correlation", charts.correlation_points)):
+        answer = api.call(name, subject, day)
+        points = extract(answer) if answer is not None else charts.Points()
+        for figure_id, values in points.figures.items():
+            if figure_id not in charts.FIGURES:
+                continue  # another page's figure, compared there
+            item_benchmark = points.benchmark_id if register.figure(figure_id).per_benchmark else ""
+            for (point_day, item), (value, _detail) in values.items():
+                if point_day == day:
+                    found[(figure_id, "", item, item_benchmark)] = value
+    return found
+
+
 TODAY: dict[str, Callable] = {
     "overview": overview_today, "holdings": holdings_today, "cash": cash_today, "performance": performance_today,
-    "risk-snapshot": risk_snapshot_today, "risk-statistics": risk_statistics_today,
+    "risk-snapshot": risk_snapshot_today, "risk-statistics": risk_statistics_today, "attribution": attribution_today,
+    "charts": charts_today,
 }
 
 
@@ -339,6 +387,8 @@ class WebPages:
             "benchmark": lambda: web.benchmark_comparison(subject, as_of=day, user=user),
             "risk": lambda: web.risk_analytics(subject, as_of=day, user=user),
             "risk_details": lambda: web.risk_analytics_details(subject, as_of=day, user=user),
+            "attribution": lambda: web.monthly_attribution_view(subject, month=str(day)[:7], as_of=day, user=user),
+            "holdings_correlation": lambda: web.holdings_correlation_view(subject, as_of=day, user=user),
         }
         return json.loads(json.dumps(calls[name](), default=str))
 
@@ -494,6 +544,8 @@ def compare(pages: list[str], api, connection, subject_dates: Mapping[str, list[
             certified = stored.get((subject, day), {})
             for page, read in readers.items():
                 today = read(api, subject, day)
+                if today is None:  # the page cannot show this date's figures (Attribution between month-ends)
+                    continue
                 own = {key for key in certified if key[0] in figures and figures[key[0]].page == page}
                 for key in sorted(set(today) | own):
                     if key[0] in figures and key[0] not in NOT_COMPARED:

@@ -63,7 +63,8 @@ class FakeConnection:
                       "source_account_id": None}]
         elif "MAX(as_of_date)" in sql:
             days = [r["as_of_date"] for r in self.rows if r["figure_id"] in params[1]
-                    and (params[2] is None or r["as_of_date"].isoformat() <= params[2])]
+                    and (params[2] is None or r["as_of_date"].isoformat() <= params[2])
+                    and (not params[4] or r["period"] in ("", params[4]))]
             found = [{"d": max(days) if days else None}]
         elif "portfolio_benchmark_mapping" in sql:
             found = [{"benchmark_id": "SPY-TR"}]
@@ -73,7 +74,9 @@ class FakeConnection:
             found = [{"trace": self.trace}]
         elif "FROM certified_figures" in sql:
             found = sorted((r for r in self.rows if r["figure_id"] in params[1]
-                            and r["as_of_date"].isoformat() == params[2]), key=lambda r: r["figure_id"])
+                            and r["as_of_date"].isoformat() == params[2]
+                            and (not params[3] or r["period"] in ("", params[3]))),
+                           key=lambda r: (r["figure_id"], r["period"], r["item"]))
         else:
             raise AssertionError(f"unexpected query: {sql}")
         return SimpleNamespace(fetchone=lambda: found[0] if found else None, fetchall=lambda: list(found))
@@ -250,6 +253,120 @@ class ToolsWhenOnTest(unittest.TestCase):
         self.assertEqual(len(wrapped.call(certified_tools.LIST, {"page": "cash"})["data"]["figures"]), 2)
         with self.assertRaises(ToolCallFailed):
             wrapped.call(certified_tools.LIST, {"page": "nowhere"})
+
+
+class AttributionAndChartsTest(unittest.TestCase):
+    """The pages that moved after the read tool (Attribution, batch 4; the charts, batch 5): their
+    kinds (per_period_item; series one point a date; per_item tables) and the refusal text."""
+
+    PAGES = "overview=on,attribution=on,charts=on"
+    SEPTEMBER, OCTOBER = date(2026, 9, 30), date(2026, 10, 21)
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {certified_tools.AGENT_SETTING: "on",
+                                               certified_tools.PAGES_SETTING: self.PAGES})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _attribution(self):
+        rows = []
+        for day, month, holding, sector in ((self.SEPTEMBER, "month_2026-09", 0.0123, 0.0101),
+                                            (self.OCTOBER, "month_2026-10", -0.004, -0.003)):
+            common = {"as_of_date": day, "period": month, "source_table": "silver.subject_position_series"}
+            rows += [_row("attribution.portfolio_return", holding + 0.001, "ratio", detail={"quality_status": "pass"},
+                          **common),
+                     _row("attribution.holding_contribution", holding, "ratio", item="265598",
+                          detail={"symbol": "AAPL", "sector": "Technology"}, **common),
+                     _row("attribution.sector_contribution", sector, "ratio", item="Technology", **common)]
+        return rows
+
+    def test_every_page_names_the_tools_that_still_answer_it(self):
+        self.assertEqual(set(certified_tools.STILL_ANSWERED_BY), set(register.pages()))
+        for page, text in certified_tools.STILL_ANSWERED_BY.items():
+            named = [word for word in text.replace(",", " ").split() if word in REGISTRY]
+            self.assertTrue(named, page)
+        description = certified_tools.LIST_SPEC["inputSchema"]["properties"]["page"]["description"]
+        for page in register.pages():
+            self.assertIn(page, description)
+
+    def test_a_month_of_attribution_is_found_on_its_last_date(self):
+        connection = FakeConnection(self._attribution())
+        result = run_tool(connection, certified_tools.GET, {"account_id": "U1", "page": "attribution",
+                                                            "period": "month_2026-09"})
+        self.assertEqual(result["as_of"], "2026-09-30")
+        self.assertEqual({(f["figure_id"], f["period_key"], f.get("item")) for f in result["figures"]},
+                         {("attribution.portfolio_return", "month_2026-09", None),
+                          ("attribution.holding_contribution", "month_2026-09", "265598"),
+                          ("attribution.sector_contribution", "month_2026-09", "Technology")})
+        holding = next(f for f in result["figures"] if f["figure_id"] == "attribution.holding_contribution")
+        self.assertEqual((holding["value"], holding["display"]), (0.0123, "1.23%"))
+        self.assertEqual(holding["detail"], {"symbol": "AAPL", "sector": "Technology"})
+        newest = run_tool(FakeConnection(self._attribution()), certified_tools.GET,
+                          {"account_id": "U1", "figures": ["attribution.holding_contribution"]})
+        self.assertEqual(newest["as_of"], "2026-10-21")
+        self.assertEqual([(f["period_key"], f["value"]) for f in newest["figures"]], [("month_2026-10", -0.004)])
+        with self.assertRaises(ToolError) as caught:
+            run_tool(FakeConnection(self._attribution()), certified_tools.GET,
+                     {"account_id": "U1", "page": "attribution", "period": "ytd"})
+        self.assertEqual(caught.exception.code, "invalid_arguments")
+
+    def test_trace_finds_the_month_and_the_item(self):
+        connection = FakeConnection(self._attribution(), trace={"build": {"status": "published"}, "runs": []})
+        result = run_tool(connection, certified_tools.TRACE, {
+            "account_id": "U1", "figure_id": "attribution.holding_contribution", "period": "month_2026-09",
+            "item": "265598"})
+        self.assertEqual(result["as_of"], "2026-09-30")
+        self.assertEqual((result["data"]["period"], result["data"]["item"]), ("month_2026-09", "265598"))
+        sql, params = [q for q in connection.queries if "certified_figure_trace" in q[0]][0]
+        self.assertEqual(params, ("U1", "attribution.holding_contribution", "month_2026-09", "265598", "",
+                                  "2026-09-30"))
+
+    def test_the_charts_give_a_series_point_and_tables_on_the_date(self):
+        rows = [_row("series.rolling_volatility_63d", 0.1534, "ratio", as_of_date=date(2026, 10, 20)),
+                _row("series.rolling_volatility_63d", 0.1541, "ratio"),
+                _row("series.benchmark_daily_return", 0.0021, "ratio", benchmark_id="SPY-TR",
+                     detail={"return_basis": "total_return"}),
+                _row("indicator.rsi_14", 63.25, item="265598", detail={"signal": "neutral", "observations": 15}),
+                _row("matrix.holdings_correlation", 0.42, item="265598|5212", detail={"observations": 250}),
+                _row("table.drawdown_episodes", -0.081, "ratio", item="2026-03-02",
+                     detail={"rank": 1, "trough_date": "2026-04-07"})]
+        result = run_tool(FakeConnection(rows), certified_tools.GET, {"account_id": "U1", "page": "charts"})
+        self.assertEqual(result["as_of"], "2026-10-21")
+        found = {(f["figure_id"], f.get("item"), f.get("benchmark_id")): f for f in result["figures"]}
+        self.assertEqual(found[("series.rolling_volatility_63d", None, None)]["value"], 0.1541)  # the date's point
+        self.assertEqual(found[("series.benchmark_daily_return", None, "SPY-TR")]["detail"],
+                         {"return_basis": "total_return"})
+        rsi = found[("indicator.rsi_14", "265598", None)]
+        self.assertEqual((rsi["display"], rsi["detail"]["signal"]), ("63.25", "neutral"))
+        self.assertEqual(found[("matrix.holdings_correlation", "265598|5212", None)]["detail"], {"observations": 250})
+        self.assertEqual(found[("table.drawdown_episodes", "2026-03-02", None)]["detail"]["rank"], 1)
+        earlier = run_tool(FakeConnection(rows), certified_tools.GET,
+                           {"account_id": "U1", "figures": ["series.rolling_volatility_63d"], "as_of": "2026-10-20"})
+        self.assertEqual([f["value"] for f in earlier["figures"]], [0.1534])
+
+    def test_other_pages_answers_keep_their_shape(self):
+        connection = FakeConnection([_row("overview.nav", 10.0, "money", detail={"fx": "kept out"})])
+        [nav] = run_tool(connection, certified_tools.GET, {"account_id": "U1", "figures": ["overview.nav"]})["figures"]
+        self.assertNotIn("detail", nav)
+
+    def test_pages_not_on_yet_name_the_tools_that_still_answer_them(self):
+        with mock.patch.dict(os.environ, {certified_tools.PAGES_SETTING: "overview=on,attribution=shadow"}):
+            for arguments, words in (({"page": "attribution"}, "get_holdings_changes"),
+                                     ({"figures": ["indicator.rsi_14"]}, "get_nav_history and get_risk_metrics"),
+                                     ({"page": "charts"}, "get_risk_metrics")):
+                with self.assertRaises(ToolError) as caught:
+                    run_tool(FakeConnection(self._attribution()), certified_tools.GET, {"account_id": "U1", **arguments})
+                self.assertEqual(caught.exception.code, "page_not_moved", arguments)
+                self.assertIn(words, caught.exception.message, arguments)
+
+    def test_the_list_serves_the_new_pages_once_on(self):
+        rows = guide_tools.GuideTools().call(certified_tools.LIST, {"page": "attribution"})["data"]["figures"]
+        self.assertEqual({r["figure_id"]: r["kind"] for r in rows if r["kind"] == "per_period_item"},
+                         {"attribution.holding_contribution": "per_period_item",
+                          "attribution.sector_contribution": "per_period_item"})
+        self.assertTrue(all(r["served"] for r in rows))
+        charts = guide_tools.GuideTools().call(certified_tools.LIST, {"page": "charts"})["data"]
+        self.assertEqual(charts["served"], 8)
 
 
 class FigureCitationTest(unittest.TestCase):

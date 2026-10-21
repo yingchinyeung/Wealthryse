@@ -18,7 +18,7 @@ is safe to import everywhere. The stable API for the build, the website readers 
     figure(figure_id) -> Figure             one figure; UnknownFigure (a KeyError) names close ids
     figures() -> dict[str, Figure]          all of them, in register order
     figures_for_page(page_id) -> list       the figures a page shows: its own, then borrowed ones
-    pages() -> dict[str, Page]              the seven pages, in move order
+    pages() -> dict[str, Page]              the nine pages, in move order
     page(page_id) -> Page
     batch_for_page(page_id) -> Batch        (number, date) of the batch the page moves in
     page_modes(text) -> dict[page, mode]    parses CERTIFIED_FIGURES_PAGES ("overview=on,cash=shadow");
@@ -67,7 +67,9 @@ PAGES_SETTING = "CERTIFIED_FIGURES_PAGES"
 AGENT_SETTING = "AGENT_CERTIFIED_FIGURES"
 MODES = ("off", "shadow", "on")
 UNITS = ("ratio", "number", "money", "date", "text")
-KINDS = ("scalar", "per_period", "per_item", "series")
+KINDS = ("scalar", "per_period", "per_item", "series", "per_period_item")
+# Kinds whose rows carry a period (per_period_item also carries an item).
+PERIOD_KINDS = ("per_period", "per_period_item")
 IMPORTED = "imported"
 # The source contracts promise data daily by 10:00 UTC and at most four days behind.
 LATE_AFTER_BUSINESS_DAYS = 4
@@ -306,7 +308,7 @@ def served_figures(modes: Mapping[str, str]) -> list[Figure]:
 
 
 def period_allowed(item: Figure, period: str) -> bool:
-    if item.kind != "per_period":
+    if item.kind not in PERIOD_KINDS:
         return period in ("", None)
     return any(re.fullmatch(_PERIOD_PATTERNS[template], str(period or "")) for template in item.periods)
 

@@ -10,10 +10,15 @@ class MetadataDeploymentTests(unittest.TestCase):
         self.identity={'properties':{'clientId':'00000000-0000-0000-0000-000000000001','principalId':'00000000-0000-0000-0000-000000000002'}}
     def test_exact_metadata_grants(self):
         roles=c.roles(self.identity['properties']['principalId'])
-        self.assertEqual(len(roles),4)
-        self.assertEqual(sum(x['body']['properties']['roleDefinitionId'].endswith(c.READER) for x in roles),3)
+        self.assertEqual(len(roles),3)
+        self.assertEqual(sum(x['body']['properties']['roleDefinitionId'].endswith(c.READER) for x in roles),2)
         self.assertEqual(sum(x['body']['properties']['roleDefinitionId'].endswith(c.PULL) for x in roles),1)
         self.assertTrue(all('/providers/Microsoft.KeyVault/vaults/' in x['scope'] or x['scope']==c.REGISTRY for x in roles))
+        # The two v2 vaults; v1.1's vault was deleted on 21 Oct 2026. The alert expects exactly these.
+        self.assertEqual(c.monitor.VAULTS,('ibkrv2flexauhecwc4ita','ibkrv2stg-auhecwc4itaoo'))
+        q=a.query();count=len(c.monitor.VAULTS)
+        self.assertIn('toint(E.vault_count) != '+str(count)+' or array_length(E.vaults) != '+str(count)+' or',q)
+        self.assertIn('pack_array('+','.join('tostring(E.vaults['+str(i)+'].vault)' for i in range(count))+')',q)
     def test_grants_deterministic(self):self.assertEqual(c.roles('a'),c.roles('a'))
     def test_manual_before_acceptance(self):self.assertEqual(c.body(self.identity)['properties']['configuration']['triggerType'],'Manual')
     def test_schedule(self):self.assertEqual(c.body(self.identity,True)['properties']['configuration']['scheduleTriggerConfig']['cronExpression'],'15 6 * * *')
@@ -27,7 +32,7 @@ class MetadataDeploymentTests(unittest.TestCase):
     def test_wrong_scope_rejected(self):
         wanted=c.roles('a')[0];actual={'properties':{**wanted['body']['properties'],'scope':'/subscriptions/other'}}
         self.assertFalse(c.role_match(actual,wanted))
-    def test_single_existing_owner_route(self):self.assertEqual(a.definition()['properties']['actions']['actionGroups'],[c.BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts'])
+    def test_single_existing_owner_route(self):self.assertEqual(a.definition()['properties']['actions']['actionGroups'],[c.BASE+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts'])
     def test_alert_no_sensitive_projection(self):
         self.assertNotIn('secret_name',a.query());self.assertNotIn('tags',a.query());self.assertIn('FindingCount',a.query())
     def test_fault_cases_complete(self):self.assertEqual(len(list(a.cases())),26)

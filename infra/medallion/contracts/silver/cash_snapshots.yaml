@@ -2,18 +2,24 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.cash_snapshots
 name: cash_snapshots
-version: 1.0.0
+version: 1.0.1
 status: active
 domain: silver
 dataProduct: portfolio-medallion
 description:
-  purpose: Cash balance per account, statement date and currency, from the Flex cash report.
-  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
-    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
-    are not versioned yet (review item 8).
+  purpose: Cash balance per account, statement date and currency, from the Flex cash report, or for a Kiwoom account
+    from Kiwoom's account answers.
+  limitations: 'Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks
+    the account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
+    are not versioned yet (review item 8). Kiwoom accounts (written by ibkr_etl.kiwoom_collector): today''s KRW
+    row has the D+2 deposit (kt00004 d2_entra) as ending cash and the deposit (entr) as settled cash. A past day''s
+    KRW row has the deposit (ka01690 dbst_bal) as both, since it already moves on the trade date. Each US currency
+    row has that currency''s deposit (fx_entr: ust21120 today, ust21132 for a past day) and Kiwoom''s rate to KRW.
+    A Kiwoom row''s row_sha256 is the sha256 of the row as written, not of a Flex row.'
 tags:
 - silver
 - ibkr
+- kiwoom
 schema:
 - name: cash_snapshots
   physicalName: silver.cash_snapshots
@@ -29,7 +35,7 @@ schema:
     primaryKey: true
     primaryKeyPosition: 1
     classification: restricted
-    description: 'IBKR account number. Restricted: never shown or logged in full.'
+    description: 'Broker account number (IBKR or Kiwoom). Restricted: never shown or logged in full.'
   - name: snapshot_date
     physicalType: text
     logicalType: date
@@ -123,7 +129,8 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: internal
-    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows.
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows. For a Kiwoom row,
+      the sha256 of the row as written.
     quality:
     - name: row_sha256_is_sha256
       description: row_sha256 is a lowercase hex sha256 (util.sha256_text of the row).
@@ -168,4 +175,7 @@ customProperties:
 - property: producers
   value:
   - ibkr_etl.loader
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
 contractCreatedTs: '2026-10-18T00:00:00Z'

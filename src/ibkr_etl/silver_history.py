@@ -14,7 +14,9 @@ is true. This module:
 - inserts the versions and turns recording on in one transaction (`apply_backfill`);
 - checks that each table equals its current versions (`check`);
 - for the FX step, fills fx_transactions.event_key and merges FX rows IBKR re-sent with new
-  amounts (`plan_fx_merge`, `apply_fx_merge`), and puts merged rows back (`apply_fx_unmerge`).
+  amounts (`plan_fx_merge`, `apply_fx_merge`), and puts merged rows back (`apply_fx_unmerge`);
+- counts, read-only, the FX events with more than one current row now and after the merge, and
+  the FX amounts the merge changes (`fx_check`), for a restored copy before and after the FX step.
 
 Nothing here runs unless scripts/medallion_silver_history.py is run by hand. Its reports hold
 counts and table names only: no account numbers, amounts or names.
@@ -26,14 +28,16 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .db import DEFAULT_TENANT_ID, connect, initialize, start_run, transaction
-from .loader import fx_event_identity, fx_event_key, fx_transaction_values, load_report
+from .loader import (FX_COLUMNS, FX_EVENT_FIELDS, fx_event_identity, fx_event_key, fx_transaction_values,
+                     load_report)
 from .parser import parse_flex_xml
 from .pilot_snapshot import ACCOUNT_TABLES
-from .util import parse_date_text
+from .util import parse_date_text, pick
 
 # table -> (valid-date column, key columns): as in the held migration.
 TRACKED: dict[str, tuple[str, tuple[str, ...]]] = {
@@ -614,7 +618,12 @@ class FxIndex:
     """From raw statements: each FX record's event key in the latest statement that had it."""
     latest: dict[tuple[str, str], tuple[str, int]] = field(default_factory=dict)
     statements: dict[tuple[str, str], set[int]] = field(default_factory=lambda: defaultdict(set))
+    # (account, row_sha256) -> the parser's key for that raw record: finds a row account-sync
+    # copied from v1.1 under another key (the loader's legacy-key step matches the same way).
+    digests: dict[tuple[str, str], str] = field(default_factory=dict)
     count: int = 0
+    records: int = 0
+    without_report_date: int = 0  # their identity takes the statement's end date instead
 
     def add(self, content: bytes) -> None:
         order = self.count
@@ -623,11 +632,15 @@ class FxIndex:
         for row in parse_flex_xml(content).rows:
             if row.record_type.lower() != "fxtransaction":
                 continue
+            self.records += 1
+            if not pick(row.attributes, "reportDate"):
+                self.without_report_date += 1
             identity = fx_event_identity(fx_transaction_values(row, 0))
             occurrences[(row.account_id, identity)] += 1
             key = (row.account_id, row.source_key)
             self.latest[key] = (fx_event_key(identity, occurrences[(row.account_id, identity)]), order)
             self.statements[key].add(order)
+            self.digests[(row.account_id, row.row_sha256)] = row.source_key
 
 
 @dataclass
@@ -635,34 +648,59 @@ class FxPlan:
     fill: dict[tuple[str, str], str] = field(default_factory=dict)  # (account, source_key) -> event key
     merge: list[tuple[str, str]] = field(default_factory=list)  # (account, source_key) to remove
     counts: Counter = field(default_factory=Counter)
+    # For the read-only check: each event's live rows, oldest report first, and what the merge does with them.
+    groups: dict[tuple[str, str], list[tuple[str, str]]] = field(default_factory=dict)
+    outcome: dict[tuple[str, str], str] = field(default_factory=dict)
+    located: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)  # live key -> index key
 
 
-def plan_fx_merge(rows: Iterable[tuple[str, str, str | None]], index: FxIndex) -> FxPlan:
-    """rows: (account, source_key, current event_key). Same event, never in one statement together: merge."""
+def plan_fx_merge(rows: Iterable[tuple], index: FxIndex) -> FxPlan:
+    """rows: (account, source_key, current event_key[, row_sha256]). Same event, never in one statement together: merge.
+
+    A row whose key no statement has is looked up by its raw record (row_sha256), unless the
+    parser's key for that record is a live row too (the same record twice: left, and counted).
+    """
     plan = FxPlan()
-    rows = list(rows)
-    held = {(account, current): source_key for account, source_key, current in rows if current is not None}
+    rows = [tuple(row) for row in rows]
+    live = {(row[0], row[1]) for row in rows}
+    held = {(row[0], row[2]): row[1] for row in rows if row[2] is not None}
     groups: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
-    for account, source_key, current in rows:
+    for account, source_key, current, *rest in rows:
         plan.counts["rows"] += 1
-        found = index.latest.get((account, source_key))
+        at = (account, source_key)
+        found = index.latest.get(at)
+        if found is None and rest and rest[0]:
+            parser_key = index.digests.get((account, rest[0]))
+            if parser_key is not None:
+                if (account, parser_key) in live:
+                    plan.counts["same_record_under_two_keys"] += 1
+                    continue
+                at = (account, parser_key)
+                found = index.latest[at]
+                plan.counts["found_by_raw_record"] += 1
         if found is None:
             plan.counts["not_in_any_statement"] += 1
             continue
         if current is not None and current != found[0]:
             plan.counts["event_key_differs"] += 1
             continue
+        plan.located[(account, source_key)] = at
         groups[(account, found[0])].append((account, source_key))
-    for (account, event_key), members in groups.items():
-        seen = [index.statements[member] for member in members]
+    for event, members in groups.items():
+        account, event_key = event
+        seen = [index.statements[plan.located[member]] for member in members]
+        members = sorted(members, key=lambda member: index.latest[plan.located[member]][1])
+        plan.groups[event] = members
         if any(seen[i] & seen[j] for i in range(len(seen)) for j in range(i + 1, len(seen))):
             plan.counts["groups_seen_together"] += 1  # an occurrence moved: left as they are
+            plan.outcome[event] = "seen_together"
             continue
-        members = sorted(members, key=lambda member: index.latest[member][1])
         kept = members[-1]  # the latest report stays current
         if held.get((account, event_key), kept[1]) != kept[1]:
             plan.counts["event_key_held_by_another_row"] += 1
+            plan.outcome[event] = "held_by_another_row"
             continue
+        plan.outcome[event] = "merged" if len(members) > 1 else "single"
         if len(members) > 1:
             plan.merge += members[:-1]
             plan.counts["merged"] += len(members) - 1
@@ -670,6 +708,128 @@ def plan_fx_merge(rows: Iterable[tuple[str, str, str | None]], index: FxIndex) -
         plan.fill[kept] = event_key
     plan.counts["events"] = len(plan.fill)
     return plan
+
+
+# The amounts IBKR restates on a re-sent FX row; the rest of an FX row is its identity.
+FX_AMOUNTS = ("proceeds_text", "realized_pnl_text")
+# Identity fields a re-send might still change. Rows alike in everything else, never in one
+# statement together, are counted as re-sends the rule would not recognise (never merged).
+FX_LOOSE_LEFT_OUT = ("report_date", "cost_text")
+
+
+def _amount(value: Any) -> Decimal | None:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return number if number.is_finite() else None
+
+
+def fx_counts(values: Mapping[tuple[str, str], Mapping[str, Any]], plan: FxPlan, index: FxIndex) -> Counter:
+    """Counts for the read-only FX check: no account, key or amount, only how many.
+
+    values: each live row's columns by (account, source_key); plan: plan_fx_merge for those rows.
+    """
+    counts: Counter = Counter(rows=len(values))
+    # Every count is listed, 0 included, so a report reads the same before and after the FX step.
+    for name in ("events_whose_amounts_change", "removed_rows_with_the_same_amounts", "amounts_not_decimal",
+                 "possible_resends_outside_the_rule", "possible_resends_outside_the_rule_unplaced",
+                 *(f"events_where_{name}_changes" for name in FX_AMOUNTS),
+                 *(f"possible_resends_outside_the_rule_differ_in_{name}" for name in FX_LOOSE_LEFT_OUT)):
+        counts[name] = 0
+    counts["event_key_filled"] = sum(1 for row in values.values() if row.get("event_key"))
+    alike = Counter((key[0], fx_event_identity(row)) for key, row in values.items())
+    counts["look_alike_groups"] = sum(1 for n in alike.values() if n > 1)
+    counts["rows_in_look_alike_groups"] = sum(n for n in alike.values() if n > 1)
+    duplicated = {event: members for event, members in plan.groups.items()
+                  if len(members) > 1 and plan.outcome[event] != "seen_together"}
+    counts["events_with_more_than_one_current_row"] = len(duplicated)
+    counts["rows_beyond_one_per_event"] = sum(len(members) - 1 for members in duplicated.values())
+    counts["events_with_more_than_one_current_row_after_merge"] = sum(
+        1 for event in duplicated if plan.outcome[event] != "merged")
+    counts["rows_the_merge_removes"] = len(plan.merge)
+    counts["accounts_the_merge_changes"] = len({key[0] for key in plan.merge})
+    for name in ("groups_seen_together", "not_in_any_statement", "event_key_differs", "event_key_held_by_another_row",
+                 "same_record_under_two_keys", "found_by_raw_record"):
+        counts[name] = plan.counts[name]
+    # The amounts the merge takes out of the current table (the history keeps them).
+    removed = set(plan.merge)
+    for event, members in duplicated.items():
+        if plan.outcome[event] != "merged":
+            continue
+        kept, gone = values[members[-1]], [values[member] for member in members[:-1]]
+        changed = [name for name in FX_AMOUNTS if any(row[name] != kept[name] for row in gone)]
+        for name in changed:
+            counts[f"events_where_{name}_changes"] += 1
+        counts["events_whose_amounts_change"] += bool(changed)
+        counts["removed_rows_with_the_same_amounts"] += sum(
+            1 for row in gone if all(row[name] == kept[name] for name in FX_AMOUNTS))
+    totals: dict[tuple, list[Decimal]] = defaultdict(lambda: [Decimal(0), Decimal(0)])
+    for key, row in values.items():
+        for name in FX_AMOUNTS:
+            amount = _amount(row[name]) if row[name] not in (None, "") else Decimal(0)
+            if amount is None:
+                counts["amounts_not_decimal"] += 1
+                continue
+            total = totals[(key[0], row.get("functional_currency"), name)]
+            total[0] += amount
+            if key not in removed:
+                total[1] += amount
+    counts["account_currency_totals_that_change"] = len(
+        {group[:2] for group, (before, after) in totals.items() if before != after})
+    # Re-sends the rule would miss: alike but for a left-out identity field, never reported together.
+    loose: dict[tuple, list[tuple[str, str]]] = defaultdict(list)
+    for key, row in values.items():
+        if key not in removed and row.get("event_datetime"):
+            loose[(key[0], *(row.get(name) for name in FX_EVENT_FIELDS
+                             if name not in FX_LOOSE_LEFT_OUT and name != "account_id"))].append(key)
+    for members in loose.values():
+        if len({fx_event_identity(values[key]) for key in members}) < 2:
+            continue
+        located = [plan.located.get(key) for key in members]
+        if None in located:
+            counts["possible_resends_outside_the_rule_unplaced"] += 1
+            continue
+        seen = [index.statements[at] for at in located]
+        if any(seen[i] & seen[j] for i in range(len(seen)) for j in range(i + 1, len(seen))):
+            continue
+        counts["possible_resends_outside_the_rule"] += 1
+        for name in FX_LOOSE_LEFT_OUT:
+            if len({values[key].get(name) for key in members}) > 1:
+                counts[f"possible_resends_outside_the_rule_differ_in_{name}"] += 1
+    return counts
+
+
+def fx_check(connection, index: FxIndex, tenants: Iterable[str]) -> dict:
+    """Read-only: FX events with more than one current row, now and after the merge, and the FX amounts
+    the merge changes. Counts only. Works before and after the FX step's migration."""
+    from psycopg import sql
+
+    has_key = "event_key" in table_columns(connection, "fx_transactions")
+    has_history = connection.execute("SELECT to_regclass('silver.fx_transactions_history')").fetchone()[0]
+    names = [name for name in FX_COLUMNS if name != "last_seen_run_id"]
+    query = sql.SQL("SELECT {}, {} FROM silver.fx_transactions WHERE account_id = ANY(%s)").format(
+        sql.SQL(", ").join(sql.Identifier(name) for name in names),
+        sql.Identifier("event_key") if has_key else sql.SQL("NULL::text"))
+    report: dict[str, Any] = {"event_key_column": has_key, "statements_read": index.count,
+                              "fx_records_read": index.records,
+                              "fx_records_without_report_date": index.without_report_date, "tenants": {}}
+    duplicates = 0
+    for label, tenant in tenant_labels(tenants).items():
+        accounts = use_tenant(connection, tenant)
+        values = {}
+        for row in connection.execute(query, (sorted(accounts),)).fetchall():
+            values[(row[0], row[1])] = {**dict(zip(names, row)), "event_key": row[-1]}
+        plan = plan_fx_merge([(*key, row["event_key"], row["row_sha256"]) for key, row in values.items()], index)
+        counts = fx_counts(values, plan, index)
+        if has_history:
+            counts["history_rows_closed_as_merged"] = int(connection.execute(
+                "SELECT count(*) FROM silver.fx_transactions_history WHERE account_id = ANY(%s) "
+                "AND closed_by = 'merged'", (sorted(accounts),)).fetchone()[0])
+        duplicates += counts["events_with_more_than_one_current_row"]
+        report["tenants"][label] = {"accounts": len(accounts), "tables": {"fx_transactions": dict(counts)}}
+    report["ok"] = duplicates == 0
+    return report
 
 
 def _require_fx_step(connection) -> None:
@@ -688,10 +848,10 @@ def apply_fx_merge(connection, index: FxIndex, tenants: Iterable[str], *, dry_ru
     report: dict[str, Any] = {"tenants": {}}
     for label, tenant in tenant_labels(tenants).items():
         accounts = use_tenant(connection, tenant)
-        rows = connection.execute("SELECT account_id, source_key, event_key FROM silver.fx_transactions "
+        rows = connection.execute("SELECT account_id, source_key, event_key, row_sha256 FROM silver.fx_transactions "
                                   "WHERE account_id = ANY(%s)", (sorted(accounts),)).fetchall()
         plan = plan_fx_merge([tuple(row) for row in rows], index)
-        report["tenants"][label] = dict(plan.counts)
+        report["tenants"][label] = {"accounts": len(accounts), "tables": {"fx_transactions": dict(plan.counts)}}
         if dry_run:
             continue
         connection.execute("SELECT set_config('silver_history.reason', 'merged', true), "
@@ -739,7 +899,8 @@ def apply_fx_unmerge(connection, tenants: Iterable[str], *, dry_run: bool = Fals
         ).format(listed=listed, latest=latest)
         count = connection.execute(sql.SQL("SELECT count(*) FROM ({}) m").format(missing),
                                    (sorted(accounts),)).fetchone()[0]
-        report["tenants"][label] = {"rows_to_put_back": int(count)}
+        report["tenants"][label] = {"accounts": len(accounts),
+                                    "tables": {"fx_transactions": {"rows_to_put_back": int(count)}}}
         if dry_run or not count:
             continue
         connection.execute("SELECT set_config('silver_history.note', %s, true)", (NOTE_FX_UNDONE,))

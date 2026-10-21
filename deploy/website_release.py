@@ -817,7 +817,9 @@ PAGES_SETTING = 'CERTIFIED_FIGURES_PAGES'
 PAGES_REGISTER = ROOT / 'infra' / 'medallion' / 'certified-figures.json'
 # A website built from a commit with this file can read the register (the release ships only .py files).
 PAGES_READERS = 'src/ibkr_etl/certified_figures_register_data.py'
-PAGES_STAGES = ('off', 'shadow', 'batch-1', 'batch-2', 'batch-3')
+# ... and with this one it can show the charts on them (batch 5, page key charts).
+CHARTS_READERS = 'src/ibkr_etl/certified_charts.py'
+PAGES_STAGES = ('off', 'shadow', 'batch-1', 'batch-2', 'batch-3', 'batch-4', 'batch-5')
 PAGES_QUIET = ((7, 50), (9, 25))   # UTC: no changes while the daily runs publish
 PAGE_RANK = {'off': 0, 'shadow': 1, 'on': 2}
 
@@ -877,10 +879,21 @@ def pages():
     if switch_is_on(PAGES_SETTING, after):
         tag = container['image'].split(':')[-1] if '@' not in container['image'] else ''
         deployed = tag[len('web-'):] if tag.startswith('web-') else ''
-        if not deployed or subprocess.run(['git', 'cat-file', '-e', deployed + ':' + PAGES_READERS], cwd=ROOT,
-                                          capture_output=True).returncode:
+        needed = [PAGES_READERS] + ([CHARTS_READERS] if page_modes(after).get('charts') == 'on' else [])
+        if not deployed or any(subprocess.run(['git', 'cat-file', '-e', deployed + ':' + path], cwd=ROOT,
+                                              capture_output=True).returncode for path in needed):
             raise SystemExit('The live website (' + container['image'].split('/')[-1] + ') cannot read the certified '
                              'figures yet: run Deploy website from main first. Nothing was changed.')
+        # The pages this run sets come from this commit's register, so the live website must be built from
+        # this branch's history and read the same register; otherwise a page could be named that it lacks.
+        if subprocess.run(['git', 'merge-base', '--is-ancestor', deployed, 'HEAD'], cwd=ROOT,
+                          capture_output=True).returncode:
+            raise SystemExit('The live website commit ' + deployed + ' is not in this branch history. '
+                             'Nothing was changed.')
+        if subprocess.run(['git', 'diff', '--quiet', deployed, 'HEAD', '--', str(PAGES_REGISTER.relative_to(ROOT)),
+                           PAGES_READERS], cwd=ROOT, capture_output=True).returncode:
+            raise SystemExit('The certified figures register changed after the live website (' + deployed[:7] + ') '
+                             'was built: run Deploy website from main first. Nothing was changed.')
         missing = unapplied_migrations([PAGES_SETTING], git('rev-parse', 'HEAD').strip())
         if missing:
             raise SystemExit('Not recorded as applied in deploy/applied-migrations.json: ' + ', '.join(missing)

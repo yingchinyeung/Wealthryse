@@ -91,7 +91,7 @@ from .performance_periods import (
     flow_statement,
     performance_periods as calculate_performance_periods,
 )
-from . import certified_pages, input_readiness, report_design_updates
+from . import certified_charts, certified_pages, input_readiness, report_design_updates
 from .report_design_ui import controls as report_design_controls, SCRIPT as REPORT_DESIGN_SCRIPT
 from .internal_release import InternalReleaseError
 from .risk_snapshots import RISK_ANALYTICS_VERSION, decoded_payload, snapshot_read_status
@@ -1240,10 +1240,12 @@ def _portfolio_access_context(
 def _certified(endpoint: str, account_id: str, requested_as_of: str | None, build) -> dict:
     """The page's answer from build(as_of); with CERTIFIED_FIGURES_PAGES unset, exactly today's.
 
-    Call only after the account check has passed (certified_pages explains the modes).
+    Call only after the account check has passed (certified_pages explains the modes; the
+    charts on the answer follow the page key charts, certified_charts).
     """
-    return certified_pages.serve(endpoint, tenant_id=TENANT_ID, subject_id=account_id,
-                                 requested_as_of=requested_as_of, build=build)
+    payload = certified_pages.serve(endpoint, tenant_id=TENANT_ID, subject_id=account_id,
+                                    requested_as_of=requested_as_of, build=build)
+    return certified_charts.serve(endpoint, payload, tenant_id=TENANT_ID, subject_id=account_id)
 
 
 def _authorized_subject_ids(
@@ -1632,14 +1634,20 @@ def monthly_attribution_view(
     user: dict[str, str] = Depends(_authorized_user),
 ) -> dict:
     """Contribution to return by holding and sector for one calendar month."""
-    from .monthly_reporting_analytics import build_monthly_reporting_analytics
-
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month or ""):
         raise HTTPException(status_code=400, detail="Month must be YYYY-MM")
     if requested_as_of and month > requested_as_of[:7]:
         raise HTTPException(status_code=400, detail="Month is after the as-of date")
+    # The month is worked out to its calendar end whatever the as-of date, as before.
+    return _certified("attribution", account_id, requested_as_of,
+                      lambda day: _monthly_attribution(account_id, access, month))
+
+
+def _monthly_attribution(account_id: str, access: dict, month: str) -> dict:
+    from .monthly_reporting_analytics import build_monthly_reporting_analytics
+
     year, number = int(month[:4]), int(month[5:])
     next_month = date(year + number // 12, number % 12 + 1, 1)
     period_end = (next_month - timedelta(days=1)).isoformat()
@@ -1760,11 +1768,11 @@ def holdings_correlation_view(
         except (TypeError, ValueError):
             continue
         prices.setdefault(str(row["conid"]), {})[str(row["snapshot_date"])] = value
-    return {
+    return certified_charts.serve("holdings-correlation", {
         "account_id": account_id,
         "snapshot_date": snapshot,
         **calculate_holdings_correlation(prices, labels),
-    }
+    }, tenant_id=TENANT_ID, subject_id=account_id)
 
 
 @app.get("/api/portfolio/{account_id}/flows")
@@ -11318,13 +11326,14 @@ document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol
 document.querySelector('#benchmark-legend').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.return_basis==='price_return'?'price return':meta.return_basis==='total_return'?'total return':meta.return_convention}}`;
 document.querySelector('#benchmark-note').textContent=meta.message+`${{meta.return_basis==='price_return'?' The benchmark is a price index: its returns exclude dividends, while portfolio returns include income, so the comparison favours the portfolio by the index dividend yield.':''}} Provider: ${{meta.provider||'—'}} · Convention: ${{meta.return_convention}} · License: ${{meta.license_status}} · Provisional observations: ${{meta.provisional_observations}} · Latest feed observation: ${{meta.latest_provisional_observation||'—'}}`;
 document.querySelector('#benchmark-metrics').innerHTML='';certifiedLine(document.querySelector('#benchmark-metrics'),null);
-draw('#benchmark-chart',[],[],{{emptyMessage:bc.available?'':'No validated comparison is available for this benchmark and date.'}});renderRollingBenchmark(null);
+draw('#benchmark-chart',[],[],{{emptyMessage:bc.available?'':'No validated comparison is available for this benchmark and date.'}});certifiedLine(document.querySelector('#benchmark-chart'),null);renderRollingBenchmark(null);
 if(bc.available){{
 const m=bc.metrics,items=[['Portfolio total return',pct(m.portfolio_total_return)],['Benchmark total return',pct(m.benchmark_total_return),bc.benchmark_return_basis==='price_return'?'Benchmark price return (excludes dividends)':undefined],['Excess total return',pct(m.excess_total_return),bc.benchmark_return_basis==='price_return'?'Excess return vs price index':undefined],['Tracking error',pct(m.tracking_error)],['Information ratio',m.information_ratio==null?'—':fmt(m.information_ratio)],['Beta',m.beta==null?'—':fmt(m.beta)],['Correlation',m.correlation==null?'—':fmt(m.correlation)],['Relative win rate',pct(m.relative_win_rate)]];
 document.querySelector('#benchmark-note').textContent+=` Aligned comparison: ${{m.period_start}} through ${{m.period_end}} · Reporting currency: ${{bc.reporting_currency}} · ${{m.observations}} common-date observations. Rebased to 100 at the first common observation; unmatched market dates are not filled.`;
 document.querySelector('#benchmark-metrics').innerHTML=items.map(metricCard).join('');certifiedLine(document.querySelector('#benchmark-metrics'),bc.certified);
 renderRollingBenchmark(bc);
-draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}})
+draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}});
+certifiedLine(document.querySelector('#benchmark-chart'),chartsFor(bc.certified_charts,['series.portfolio_daily_return','series.benchmark_daily_return'],'Vs benchmark'))
 }}
 }};
 {RISK_DISPLAY_SCRIPT}

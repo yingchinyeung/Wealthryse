@@ -4,6 +4,11 @@ Checked read-only against rg-ibkr-database-v11 on 2026-10-12 (`az containerapp
 job list`, `az containerapp list`, `az containerapp auth show`). Every file in
 `infra/` builds with Bicep 0.48 (CI checks this).
 
+**Update, 21 Oct 2026:** v1.1 was deleted, so its 3 jobs are gone. The v2
+jobs ibkrv2stg-account-sync-daily and ibkrv2stg-institutional-shadow, which
+only served v1.1, were retired with their Bicep files and account-sync's
+failed-execution alert. What this page says about them below no longer applies.
+
 ## Covered by Bicep
 
 - **Web app and sign-in:** `staging-web.bicep` and `staging-web-auth.bicep`

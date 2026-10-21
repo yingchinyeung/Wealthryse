@@ -138,7 +138,7 @@ class Turn:
     usage: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
     # Fields a caller added to the answer schema (extra_fields), already through the figure check.
     extra: dict[str, Any] = field(default_factory=dict)
-    # Certified figures cited [F#] whose number did not match (warn-only until 8 Nov); refs only.
+    # Certified figures cited [F#] whose number did not match (warn mode, the default); refs only.
     figure_warnings: list[str] = field(default_factory=list)
     # The reasoning mode the model last answered in: pro drops to standard if Azure refuses it.
     reasoning_mode: str = "standard"
@@ -241,6 +241,8 @@ class Agent:
                                    "parameters": calculator.SCHEMA, "strict": False})
         allowed_names = {t["name"] for t in function_tools}
         system = instructions or ANALYST.format(account_id=account_id, today=date.today().isoformat())
+        # AGENT_CERTIFIED_FIGURE_CHECK: warn (the default) or enforce, for the whole turn.
+        enforce = certified_tools.figure_check() == "enforce"
         if certified_tools.GET in allowed_names and certified_tools.enabled():
             system += CERTIFIED_NOTE
         conversation: list[dict[str, Any]] = [
@@ -308,7 +310,8 @@ class Agent:
             except (ValueError, KeyError, TypeError, AttributeError) as error:
                 raise AgentError("invalid_model_output", "The model did not return a usable answer.") from error
             checked = "\n".join([answer, *(x for values in extra.values() for x in values)])
-            check = validate_answer(checked, cited, results, question, visuals, figures or None)
+            check = (validate_answer(checked, cited, results, question, visuals, figures or None, figure_check="enforce")
+                     if enforce else validate_answer(checked, cited, results, question, visuals, figures or None))
             if check.ok:
                 turn.answer, turn.visuals, turn.remember, turn.extra = answer, visuals, remember, extra
                 turn.citations = [{"id": c, "tool": results[c]["tool"], "account_id": results[c].get("account_id"),
@@ -318,13 +321,22 @@ class Agent:
                     turn.citations += figure_citations(checked, cited, figures, check.figure_checks)
                     turn.figure_warnings = sorted(ref for ref, state in check.figure_checks.items() if state != "ok")
                     if check.figure_warnings:
-                        # Warn-only until 8 Nov. Refs and figure ids only: never values or text.
+                        # Warn mode (the default). Refs and figure ids only: never values or text.
                         LOGGER.warning("CERTIFIED_FIGURE_CHECK %s", json.dumps({
                             "warnings": len(check.figure_warnings), "refs": turn.figure_warnings,
                             "figure_ids": sorted({figures[r]["figure_id"] for r in turn.figure_warnings if r in figures})}))
                 yield {"type": "answer", "answer": answer, "citations": turn.citations, "visuals": visuals,
                        "turn": turn}
                 return
+            if check.figure_mode == "enforce" and (check.figure_warnings or check.quoted_elsewhere):
+                # Enforce mode: a failed [F#] check is sent back once, then the answer is not shown.
+                # Counts, refs and figure ids only: never values or text.
+                refs = sorted({ref for ref, state in check.figure_checks.items() if state != "ok"}
+                              | set(check.quoted_refs), key=lambda ref: int(ref[1:]))
+                LOGGER.warning("CERTIFIED_FIGURE_CHECK %s", json.dumps({
+                    "mode": "enforce", "outcome": "rejected" if retried else "retry",
+                    "warnings": len(check.figure_warnings), "quoted_elsewhere": len(check.quoted_elsewhere),
+                    "refs": refs, "figure_ids": sorted({figures[r]["figure_id"] for r in refs if r in figures})}))
             if retried:
                 turn.answer, turn.status = UNVERIFIED, "rejected"
                 yield {"type": "rejected", "answer": UNVERIFIED, "reason": check.feedback(), "turn": turn}
@@ -364,6 +376,8 @@ class Agent:
         citation_id = f"T{len(results) + 1}"
         if name == certified_tools.GET and figures is not None:
             result = number_figures(result, figures, citation_id)
+        elif figures is not None and isinstance(result, dict) and isinstance(result.get("certified"), dict):
+            result = number_attached(result, figures, citation_id, name)
         results[citation_id] = result
         return {"citation_id": citation_id, **result}
 
@@ -381,6 +395,21 @@ def number_figures(result: dict[str, Any], figures: dict[str, dict[str, Any]], c
     return {**result, "figures": numbered}
 
 
+def number_attached(result: dict[str, Any], figures: dict[str, dict[str, Any]], citation_id: str,
+                    tool: str) -> dict[str, Any]:
+    """A figure tool's certified block (AGENT_CERTIFIED_FIGURE_TOOLS): its figures get the next F# too."""
+    block = result["certified"]
+    numbered = []
+    for figure in block.get("figures") or []:
+        if not isinstance(figure, dict):
+            continue
+        ref = f"F{len(figures) + 1}"
+        figure = {**figure, "ref": ref}
+        figures[ref] = {**figure, "subject": result.get("account_id"), "tool_call": citation_id, "tool": tool}
+        numbered.append(figure)
+    return {**result, "certified": {**block, "figures": numbered}}
+
+
 def figure_citations(answer: str, cited: list[str], figures: Mapping[str, Mapping[str, Any]],
                      checks: Mapping[str, str]) -> list[dict[str, Any]]:
     """What the message keeps for each F# the answer cites: enough to fetch and trace that exact figure."""
@@ -391,7 +420,7 @@ def figure_citations(answer: str, cited: list[str], figures: Mapping[str, Mappin
         figure = figures[ref]
         lineage, definition = figure.get("lineage") or {}, figure.get("definition") or {}
         entries.append({
-            "id": ref, "tool": certified_tools.GET, "account_id": figure.get("subject"),
+            "id": ref, "tool": figure.get("tool") or certified_tools.GET, "account_id": figure.get("subject"),
             "as_of": figure.get("as_of_date"), "certified": True, "check": checks.get(ref, "not_checked"),
             "figure": {"figure_id": figure.get("figure_id"), "label": figure.get("label"),
                        "subject": figure.get("subject"), "as_of_date": figure.get("as_of_date"),

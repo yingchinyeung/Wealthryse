@@ -771,7 +771,11 @@ def _audit(context: AgentToolContext, tool_name: str, subject_id: str | None, re
     TOOL_AUDIT_LOGGER.info("AGENT_TOOL_AUDIT %s", json.dumps(event, sort_keys=True, separators=(",", ":")))
 
 
-def execute_tool(connection, context: AgentToolContext, tool_name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+def execute_tool(connection, context: AgentToolContext, tool_name: str, arguments: Mapping[str, Any], *,
+                 certified_mode: str | None = None) -> dict[str, Any]:
+    """``certified_mode`` (fallback or on) reads certified figures alongside, as
+    certified_tool_figures says. Only the website analyst passes it: the month-end snapshot
+    builder, the pages and every other caller never do, so their figures cannot change."""
     request_hash = hashlib.sha256(canonical_json(dict(arguments)).encode("utf-8")).hexdigest()
     definition = TOOL_REGISTRY.get(tool_name)
     subject_id = str(arguments.get("subject_id") or "").strip()
@@ -815,6 +819,10 @@ def execute_tool(connection, context: AgentToolContext, tool_name: str, argument
     except (TypeError, ValueError) as error:
         _audit(context, tool_name, subject_id, request_hash, "failed", error_code="invalid_arguments")
         raise AgentToolError(400, "invalid_arguments", "The request contains invalid argument values.") from error
+    if certified_mode in ("fallback", "on"):
+        from .certified_tool_figures import apply_to_result
+
+        result = apply_to_result(result, tenant_id=context.tenant_id, mode_now=certified_mode)
     payload = result.as_dict()
     response_hash = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
     _audit(context, tool_name, subject_id, request_hash, "success", response_hash=response_hash)

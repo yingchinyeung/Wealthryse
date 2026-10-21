@@ -28,11 +28,11 @@ resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' 
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: {
+  tags: union({
     application: 'ibkr-portfolio-platform'
     environment: 'staging'
     purpose: 'verified-account-template-intake'
-  }
+  }, { layer: 'apps', component: 'onboarding', hop: 'conform', owner: 'ying' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

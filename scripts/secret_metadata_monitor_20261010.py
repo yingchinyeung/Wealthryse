@@ -3,7 +3,7 @@ from datetime import datetime,timezone
 import hashlib,json,os,re,sys
 from urllib.parse import parse_qs,urlsplit
 
-VAULTS=('ibkrv11-5rcc62xxqblay','ibkrv2flexauhecwc4ita','ibkrv2stg-auhecwc4itaoo')
+VAULTS=('ibkrv2flexauhecwc4ita','ibkrv2stg-auhecwc4itaoo')
 PREFIX='SECRET_METADATA_MONITOR '
 SCHEMA='wealthryse-secret-metadata-v1'
 VERSION='20261010-v1'

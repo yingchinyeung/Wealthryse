@@ -5,13 +5,14 @@ This is a monitored platform convention, not proof of successful ingestion.
 """
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, timedelta, timezone
 
-_DAILY_V1 = (("ibkr-v11-daily", 480, 60),)
-_DAILY_V2 = (
-    ("ibkrv2stg-account-sync-daily", 490, 30),
+# Daily jobs, all in the v2 workspace: (job, UTC minute of the day, runtime minutes).
+# v1.1's ibkr-v11-daily and account-sync stopped when v2 began its own daily
+# Flex pull on 17 Oct 2026, which moved institutional-daily to 08:20 UTC; v1.1
+# was deleted on 21 Oct 2026.
+DAILY_V2 = (
     ("ibkrv2stg-benchmark-daily", 510, 20),
     ("ibkrv2stg-sector-classification", 525, 30),
     ("ibkrv2stg-derived-daily", 530, 60),
@@ -19,39 +20,9 @@ _DAILY_V2 = (
     ("ibkrv2stg-month-end-factsheet", 540, 60),
     ("ibkrv2stg-analyst-assurance", 550, 10),
     ("ibkrv2stg-burn-in-monitor", 555, 5),
-    ("ibkrv2stg-institutional-daily", 480, 50),
+    ("ibkrv2stg-institutional-daily", 500, 50),
     ("ibkrv2stg-risk-free-daily", 1380, 20),
 )
-# Stopped once v2 makes its own daily Flex pull.
-RETIRED_BY_DIRECT_FLEX = ("ibkr-v11-daily", "ibkrv2stg-account-sync-daily")
-# Moved to 16:20 HKT on that day (the Bicep's scheduleUtc).
-MOVED_BY_DIRECT_FLEX = {"ibkrv2stg-institutional-daily": 500}
-DAILY_FEEDS = ("v11_export", "direct_flex")
-
-
-def daily_schedules(feed: str | None = None) -> tuple[tuple, tuple]:
-    """Expected daily jobs (v1.1 workspace, v2 workspace).
-
-    IBKR_DAILY_FEED=direct_flex leaves out v1.1's pull and account-sync, which
-    stop on the switch day, and expects institutional-daily at 08:20 UTC. The
-    default is today's v1.1-export feed.
-    """
-    chosen = (feed if feed is not None else os.environ.get("IBKR_DAILY_FEED", "v11_export")).strip().lower()
-    if chosen not in DAILY_FEEDS:
-        raise ValueError(f"Unsupported IBKR_DAILY_FEED: {chosen}")
-    if chosen == "v11_export":
-        return _DAILY_V1, _DAILY_V2
-    return tuple(
-        tuple(
-            (name, MOVED_BY_DIRECT_FLEX.get(name, offset), runtime)
-            for name, offset, runtime in specs
-            if name not in RETIRED_BY_DIRECT_FLEX
-        )
-        for specs in (_DAILY_V1, _DAILY_V2)
-    )
-
-
-DAILY_V1, DAILY_V2 = daily_schedules()
 HEARTBEATS = ("ibkrv2stg-autonomous-admin", "ibkrv2stg-flex-discovery")
 GRACE_MINUTES = 15
 TERMINAL_REASONS = ("Completed", "BackoffLimitExceeded", "DeadlineExceeded")

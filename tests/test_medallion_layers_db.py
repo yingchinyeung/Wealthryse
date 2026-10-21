@@ -43,7 +43,7 @@ HELD_BACK = ("054_shadow_workflow_evidence.sql", "055_fx_evidence_versions.sql",
 LAYER_FILES = sorted(path.name for path in MIGRATIONS.glob("*_medallion_*.sql"))
 # Later migrations that create new layer objects and move them into their layer as 068 does,
 # so undoing a layer moves them back to public and running them again moves them in again.
-LAYER_CREATORS = ("073_certified_figures.sql",)
+LAYER_CREATORS = ("073_certified_figures.sql", "082_kiwoom_bronze.sql")
 # Production's ledger has this version, applied outside the repository.
 OUTSIDE = ("067_hong_kong_china_external_market_data_approval.sql",)
 LAYERS = ("bronze", "silver", "gold")

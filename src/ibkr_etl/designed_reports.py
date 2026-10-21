@@ -24,7 +24,7 @@ import json
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 
 from .composite_reports import (
     CHECK_ID, KINDS, STALE_AFTER_DAYS, CompositeReportError, _existing_run, _frozen_payload, _store,
@@ -328,8 +328,9 @@ def _message(evidence: Mapping[str, Any]) -> tuple[str, str]:
 
 def run_designed_report_cases(connection, tenant_id: str, *, container: str, today: date,
                               fetch: Callable[[str, str], bytes], store: Callable[[str, str, bytes, str], None],
-                              render: Callable[..., Mapping[str, Any]] = engine.render) -> list[dict]:
-    """Render and record every eligible case. One case's failure never stops the others."""
+                              render: Callable[..., Mapping[str, Any]] = engine.render,
+                              case_ids: Collection[str] | None = None) -> list[dict]:
+    """Render and record every eligible case (or only ``case_ids``). One case's failure never stops the others."""
 
     # The designer's tables come with migration 067; until then there is no design to render from.
     if connection.execute("SELECT to_regclass('public.factsheet_design_drafts') AS present").fetchone()["present"] is None:
@@ -337,6 +338,8 @@ def run_designed_report_cases(connection, tenant_id: str, *, container: str, tod
     results = []
     for case in eligible_cases(connection, tenant_id):
         case_id = str(case["case_id"])
+        if case_ids is not None and case_id not in case_ids:
+            continue
         recorded = (case["recorded"], case["recorded_message"], _evidence(case))
         try:
             evidence = render_case_reports(connection, tenant_id, case, container=container, today=today,

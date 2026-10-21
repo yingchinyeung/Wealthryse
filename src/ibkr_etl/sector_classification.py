@@ -564,7 +564,8 @@ def refresh_sector_classifications_range(
     """Classify every previously unclassified holding seen in a date range.
 
     A KRW holding (Kiwoom) classified without Yahoo's English name is looked up again: its broker
-    name is Korean, so the factsheet prints Yahoo's.
+    name is Korean, so the factsheet prints Yahoo's. So is a Kiwoom U.S. holding (conid ``US:<ticker>``):
+    Kiwoom names it by its ticker only.
     """
     named = has_long_name(connection)
 
@@ -587,7 +588,8 @@ def refresh_sector_classifications_range(
           AND CAST(COALESCE(NULLIF(p.quantity_text, ''), '0') AS NUMERIC) <> 0
         ORDER BY p.conid
         """.format(relation=relation, subject_column=subject_column, needs_name=(
-            " AND NOT (UPPER(COALESCE(p.currency, i.currency, '')) = 'KRW' AND existing.long_name IS NULL)"
+            " AND NOT ((UPPER(COALESCE(p.currency, i.currency, '')) = 'KRW' OR p.conid LIKE 'US:%%')"
+            " AND existing.long_name IS NULL)"
             if named else "")),
         (YAHOO_PROVIDER, subject_id, start_date, end_date),
     ).fetchall()

@@ -1,0 +1,177 @@
+"""Korea's won risk-free rate: the 91-day CD yield from the Bank of Korea (ECOS).
+
+A Korean-won account's Sharpe and Sortino use this rate, the way USD accounts
+use the 3-month Treasury bill and the HKD portfolios use 1-month HIBOR (owner's
+choice, 21 Oct 2026). The Bank of Korea publishes the 91-day certificate of
+deposit yield each business day in its market interest rates table (817Y002,
+daily), in percent a year.
+
+The table's item for the CD is looked up by name on every run rather than by a
+fixed code, and each returned row must carry that same item, so a renumbered
+table stops the load instead of storing another rate. The ECOS key is read
+from BOK_ECOS_API_KEY and is never written to a log or a raw capture.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import urllib.parse
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Any, Callable
+
+from . import raw_capture
+from .reference_data import _get
+from .util import utc_now_iso
+
+API_BASE = "https://ecos.bok.or.kr/api"
+STAT_CODE = "817Y002"  # market interest rates, daily
+SERIES_ID = "BOK-CD-91D"
+CURRENCY = "KRW"
+TENOR = "91-day"
+PROVIDER = "Bank of Korea ECOS (817Y002 market interest rates, CD 91-day)"
+KEY_ENV = "BOK_ECOS_API_KEY"
+PAGE_SIZE = 1000
+
+
+@dataclass(frozen=True)
+class CdObservation:
+    rate_date: str
+    annual_rate: float
+
+
+def _url(service: str, key: str, *parts: str, first: int = 1, last: int = PAGE_SIZE) -> str:
+    quoted = [urllib.parse.quote(str(part), safe="") for part in (key, "json", "kr", first, last, *parts)]
+    return "/".join((API_BASE, service, *quoted))
+
+
+def _redacted(url: str, key: str) -> str:
+    return url.replace(urllib.parse.quote(key, safe=""), "KEY")
+
+
+def _payload(body: bytes, service: str) -> list[dict[str, Any]]:
+    data = json.loads(body)
+    if service not in data:
+        result = data.get("RESULT") or {}
+        code, message = str(result.get("CODE") or ""), str(result.get("MESSAGE") or "")
+        if code == "INFO-200":  # ECOS: no data for the request
+            return []
+        raise RuntimeError(f"Bank of Korea ECOS answered {code or 'without data'}: {message[:200]}")
+    rows = data[service].get("row") or []
+    if not isinstance(rows, list):
+        raise RuntimeError("Bank of Korea ECOS rows are not a list")
+    return rows
+
+
+def cd_item_code(rows: list[dict[str, Any]]) -> tuple[str, str]:
+    """The daily CD 91-day item in the 817Y002 item list: (code, name)."""
+
+    matches = [
+        (str(row.get("ITEM_CODE") or ""), str(row.get("ITEM_NAME") or ""))
+        for row in rows
+        if str(row.get("CYCLE") or "D") == "D"
+        and "CD" in str(row.get("ITEM_NAME") or "").upper()
+        and "91" in str(row.get("ITEM_NAME") or "")
+    ]
+    matches = list(dict.fromkeys(matches))
+    if len(matches) != 1 or not matches[0][0]:
+        raise RuntimeError(f"Expected one daily CD 91-day item in {STAT_CODE}, found {len(matches)}")
+    return matches[0]
+
+
+def parse_cd_rows(rows: list[dict[str, Any]], item_code: str) -> list[CdObservation]:
+    """Dated CD yields from StatisticSearch rows, validated and in date order."""
+
+    by_date: dict[str, CdObservation] = {}
+    for row in rows:
+        if str(row.get("ITEM_CODE1") or "") != item_code:
+            raise RuntimeError(f"Bank of Korea ECOS returned item {row.get('ITEM_CODE1')!r}, not {item_code}")
+        value = str(row.get("DATA_VALUE") or "").strip()
+        if not value:
+            continue
+        rate_date = datetime.strptime(str(row.get("TIME") or ""), "%Y%m%d").date().isoformat()
+        annual_rate = float(value) / 100.0
+        if not math.isfinite(annual_rate) or not 0.0 <= annual_rate <= 0.30:
+            raise ValueError(f"CD 91-day yield is outside the validation range on {rate_date}")
+        observation = CdObservation(rate_date, annual_rate)
+        if by_date.get(rate_date, observation) != observation:
+            raise ValueError(f"Conflicting CD 91-day yields for {rate_date}")
+        by_date[rate_date] = observation
+    return [by_date[day] for day in sorted(by_date)]
+
+
+def fetch_cd_rates(key: str, start_date: date, end_date: date, *, timeout: int = 45,
+                   get: Callable[..., bytes] = _get) -> tuple[str, list[CdObservation]]:
+    if not key:
+        raise RuntimeError(f"{KEY_ENV} is not set")
+    if end_date < start_date:
+        raise ValueError("Risk-free end date precedes start date")
+    items = _payload(get(_url("StatisticItemList", key, STAT_CODE), timeout=timeout), "StatisticItemList")
+    item_code, _ = cd_item_code(items)
+    observations: list[CdObservation] = []
+    first = 1
+    while True:
+        url = _url("StatisticSearch", key, STAT_CODE, "D", start_date.strftime("%Y%m%d"),
+                   end_date.strftime("%Y%m%d"), item_code, first=first, last=first + PAGE_SIZE - 1)
+        requested_at = raw_capture.utc_now()
+        body = get(url, timeout=timeout)
+        raw_capture.capture_http("bok-cd-91d", PROVIDER, url=_redacted(url, key), body=body,
+                                 key=f"{start_date:%Y%m%d}-{end_date:%Y%m%d}-{first}", extension="json",
+                                 requested_at=requested_at)
+        rows = _payload(body, "StatisticSearch")
+        observations.extend(parse_cd_rows(rows, item_code))
+        if len(rows) < PAGE_SIZE:
+            break
+        first += PAGE_SIZE
+    if not observations:
+        raise RuntimeError("No CD 91-day yields fall within the requested period")
+    dates = [o.rate_date for o in observations]
+    if len(dates) != len(set(dates)):
+        raise ValueError("Bank of Korea ECOS repeated a CD 91-day date across pages")
+    return item_code, sorted(observations, key=lambda o: o.rate_date)
+
+
+def refresh_cd_rates(connection: Any, *, key: str, start_date: date, end_date: date | None = None,
+                     timeout: int = 45, get: Callable[..., bytes] = _get) -> dict[str, Any]:
+    """Idempotently load the validated daily CD 91-day yields into risk_free_rates."""
+
+    end = end_date or date.today()
+    item_code, observations = fetch_cd_rates(key, start_date, end, timeout=timeout, get=get)
+    fetched_at = utc_now_iso()
+    try:
+        for observation in observations:
+            connection.execute(
+                """
+                INSERT INTO risk_free_rates(
+                    rate_date, series_id, currency, tenor, annual_rate,
+                    day_count_convention, provider, fetched_at, quality_status
+                ) VALUES (?, ?, ?, ?, ?, 'annualized-money-market-yield', ?, ?, 'pass')
+                ON CONFLICT(tenant_id, rate_date, series_id) DO UPDATE SET
+                    currency = excluded.currency,
+                    tenor = excluded.tenor,
+                    annual_rate = excluded.annual_rate,
+                    day_count_convention = excluded.day_count_convention,
+                    provider = excluded.provider,
+                    fetched_at = excluded.fetched_at,
+                    quality_status = excluded.quality_status
+                """,
+                (observation.rate_date, SERIES_ID, CURRENCY, TENOR, observation.annual_rate, PROVIDER, fetched_at),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    latest = observations[-1]
+    return {
+        "series_id": SERIES_ID,
+        "currency": CURRENCY,
+        "item_code": item_code,
+        "provider": PROVIDER,
+        "requested_start": start_date.isoformat(),
+        "requested_end": end.isoformat(),
+        "observations_loaded": len(observations),
+        "latest_observation_date": latest.rate_date,
+        "latest_annual_rate": latest.annual_rate,
+        "quality_status": "pass",
+    }

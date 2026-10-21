@@ -19,6 +19,20 @@ var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [
   { name: 'AZURE_CLIENT_ID', value: jobIdentity.properties.clientId }
 ]
 
+// Korea's won risk-free rate (Bank of Korea ECOS, CD 91-day). Empty (the default) keeps the
+// job exactly as it is; set to the Key Vault secret holding the ECOS API key to load it too.
+param bokEcosApiKeySecretName string = ''
+var bokEcosSecrets = empty(bokEcosApiKeySecretName) ? [] : [
+  {
+    name: 'bok-ecos-api-key'
+    keyVaultUrl: '${vault.properties.vaultUri}secrets/${bokEcosApiKeySecretName}'
+    identity: jobIdentity.id
+  }
+]
+var bokEcosEnv = empty(bokEcosApiKeySecretName) ? [] : [
+  { name: 'BOK_ECOS_API_KEY', secretRef: 'bok-ecos-api-key' }
+]
+
 var tags = {
   application: 'ibkr-portfolio-platform'
   environment: 'staging'
@@ -70,13 +84,13 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           identity: jobIdentity.id
         }
       ]
-      secrets: [
+      secrets: concat([
         {
           name: 'database-url'
           keyVaultUrl: '${vault.properties.vaultUri}secrets/database-app-url'
           identity: jobIdentity.id
         }
-      ]
+      ], bokEcosSecrets)
     }
     template: {
       containers: [
@@ -85,7 +99,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           image: '${registry.properties.loginServer}/ibkr-platform@${imageDigest}'
           command: ['python']
           args: ['scripts/refresh_staging_risk_free.py']
-          env: concat([
+          env: concat(concat([
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'RISK_FREE_START_DATE', value: riskFreeStartDate }
@@ -93,7 +107,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             // The app login cannot create tables, so the job must not try migrations
             // (live since 18 Oct 2026, as on the institutional daily job).
             { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
-          ], rawMarketDataEnv)
+          ], rawMarketDataEnv), bokEcosEnv)
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'

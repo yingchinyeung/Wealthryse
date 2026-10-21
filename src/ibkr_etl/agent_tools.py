@@ -458,14 +458,21 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         """,
         (subject_id, mapping["benchmark_id"], CALCULATION_VERSION, effective),
     ).fetchall()
+    from .risk_snapshots import OWN_CURRENCY_RISK_FREE
+    subject = connection.execute(
+        "SELECT COALESCE(reporting_currency, base_currency) AS currency FROM platform_subjects WHERE subject_id = %s",
+        (subject_id,),
+    ).fetchone()
+    # As the risk snapshots: a won account's own rate once loaded, else the U.S. 3-month Treasury.
+    own_rate = OWN_CURRENCY_RISK_FREE.get(str((subject["currency"] if subject else None) or "USD").upper(), "USD")
     rate = connection.execute(
         """
         SELECT rate_date, series_id, currency, tenor, annual_rate, provider, quality_status
         FROM risk_free_rates
-        WHERE currency = 'USD' AND rate_date <= %s AND quality_status IN ('pass', 'warn')
-        ORDER BY rate_date DESC LIMIT 1
+        WHERE currency IN (%s, 'USD') AND rate_date <= %s AND quality_status IN ('pass', 'warn')
+        ORDER BY (currency = %s) DESC, rate_date DESC LIMIT 1
         """,
-        (effective,),
+        (own_rate, effective, own_rate),
     ).fetchone()
     rows = _comparison_rows(records)
     metrics = portfolio_risk_metrics(rows, float(rate["annual_rate"]) if rate else None)
@@ -487,7 +494,7 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         },
         (
             {"table": "performance_comparison_daily", "subject_id": subject_id, "through": effective, "calculation_version": CALCULATION_VERSION},
-            {"table": "risk_free_rates", "currency": "USD", "through": effective},
+            {"table": "risk_free_rates", "currency": rate["currency"] if rate else own_rate, "through": effective},
             {
                 "table": "crisis_replay_daily",
                 "subject_id": subject_id,

@@ -123,5 +123,40 @@ class UsIstrategySecuritiesTests(unittest.TestCase):
             "Consumer Staples", "Telecommunication Services", "Energy", "Utilities", "Materials"})
 
 
+
+class DelistedSectorCheckTests(unittest.TestCase):
+    """The month-end snapshot's sector check sees DFS and FYBR as the factsheet prints them."""
+
+    def test_a_delisted_holding_without_a_yahoo_row_is_classified_for_the_sector_check(self):
+        from ibkr_etl.agent_tools import _with_delisted_classification
+        from ibkr_etl.sector_classification import aggregate_sector_allocation
+
+        rows = [_with_delisted_classification(row) for row in (
+            {"conid": "US:DFS", "symbol": "DFS", "market_value_text": "200", "sector": None, "industry": None,
+             "long_name": None},
+            {"conid": "US:FYBR", "symbol": None, "market_value_text": "300", "sector": None, "industry": None},
+            {"conid": "US:MU", "symbol": "MU", "market_value_text": "100", "sector": "Technology",
+             "industry": "Semiconductors", "long_name": "Micron Technology, Inc."},
+        )]
+        data = aggregate_sector_allocation(rows)
+        self.assertTrue(data["available"])
+        self.assertEqual(data["unclassified_symbols"], [])
+        self.assertEqual(rows[0]["long_name"], "Discover Financial Services")
+        self.assertEqual((rows[0]["sector"], rows[0]["industry"]), ("Financial Services", "Credit Services"))
+        self.assertEqual((rows[1]["sector"], rows[1]["industry"]), ("Communication Services", "Telecom Services"))
+        self.assertEqual(rows[2]["industry"], "Semiconductors")
+
+    def test_only_kiwoom_us_holdings_in_the_delisted_list_are_filled(self):
+        from ibkr_etl.agent_tools import _with_delisted_classification
+        from ibkr_etl.us_istrategy_securities import DELISTED, DELISTED_YAHOO_SECTOR
+
+        self.assertEqual(set(DELISTED), set(DELISTED_YAHOO_SECTOR))
+        for row in ({"conid": "123456", "symbol": "DFS", "sector": None},
+                    {"conid": "US:ZZZZ", "symbol": "ZZZZ", "sector": None}):
+            self.assertIsNone(_with_delisted_classification(dict(row))["sector"])
+        kept = _with_delisted_classification({"conid": "US:DFS", "symbol": "DFS", "sector": "Yahoo's own"})
+        self.assertEqual(kept["sector"], "Yahoo's own")
+
+
 if __name__ == "__main__":
     unittest.main()

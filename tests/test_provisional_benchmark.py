@@ -156,3 +156,46 @@ class ProvisionalBenchmarkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _KrwTicker(_FxTicker):
+    def __init__(self, symbol: str) -> None:
+        if symbol != "KRW=X":
+            raise AssertionError(symbol)
+
+
+class ReportingUsdFxTests(unittest.TestCase):
+    """A won account's own currency against USD, stored for the USD views."""
+
+    def _store(self, reporting, fx_by_currency, ticker):
+        import sqlite3
+        from ibkr_etl.provisional_benchmark import _store_reporting_usd_fx
+
+        connection = sqlite3.connect(":memory:")
+        connection.execute("""CREATE TABLE reference_fx_rates(tenant_id TEXT DEFAULT 't', rate_date TEXT,
+            from_currency TEXT, to_currency TEXT, rate REAL, provider TEXT, observation_status TEXT,
+            fetched_at TEXT, quality_status TEXT,
+            PRIMARY KEY (tenant_id, rate_date, from_currency, to_currency, provider))""")
+        result = _store_reporting_usd_fx(connection, reporting, fx_by_currency, datetime(2025, 1, 20).date(),
+                                         datetime(2025, 1, 21).date(), ticker, "2025-01-22T00:00:00Z")
+        rows = connection.execute("SELECT rate_date, from_currency, to_currency, rate FROM reference_fx_rates "
+                                  "ORDER BY rate_date, from_currency").fetchall()
+        return result, rows
+
+    def test_a_won_account_stores_krw_against_usd_both_ways(self):
+        result, rows = self._store("KRW", {}, _KrwTicker)
+        self.assertEqual(result, {"status": "stored", "symbol": "KRW=X", "observations": 2})
+        self.assertIn(("2025-01-20", "KRW", "USD", 1 / 32.0), rows)
+        self.assertIn(("2025-01-20", "USD", "KRW", 32.0), rows)
+
+    def test_other_currencies_and_a_usd_benchmark_store_nothing_extra(self):
+        for reporting, fx in (("USD", {}), ("HKD", {}), ("KRW", {"USD": [("2025-01-20", 32.0)]})):
+            with self.subTest(reporting=reporting):
+                self.assertEqual(self._store(reporting, fx, _KrwTicker), (None, []))
+
+    def test_a_missing_quote_is_reported_not_raised(self):
+        def broken(symbol):
+            raise RuntimeError("Yahoo is down")
+
+        result, rows = self._store("KRW", {}, broken)
+        self.assertEqual((result["status"], rows), ("unavailable", []))

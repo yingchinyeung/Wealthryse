@@ -788,16 +788,24 @@ def _history_record(connection, tenant_id: str, target: Target, build: Callable[
 
 
 def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClient], today: date,
-        now: datetime, include_us: bool = True) -> list[dict[str, Any]]:
-    """Collect every Kiwoom account. One account's failure never stops the others."""
+        now: datetime, include_us: bool = True, bronze: Any = None) -> list[dict[str, Any]]:
+    """Collect every Kiwoom account. One account's failure never stops the others.
+
+    ``bronze`` (kiwoom_bronze.KiwoomBronze, only when KIWOOM_BRONZE=true) stores every inquiry page as received.
+    """
 
     results = []
     for target in targets(connection, tenant_id):
         result: dict[str, Any] = {"connection_id": target.connection_id, "account": target.broker_account_id,
                                   "case_id": target.case_id}
         client = None
+        capture = None
+        before = len(results)
         try:
             client = client_for(target)
+            capture = bronze.for_target(target) if bronze is not None else None
+            if capture is not None:
+                client.set_capture(capture)
             if target.case_id is None or target.stage not in LOADING_STAGES or target.history_start is None:
                 # Not being onboarded: a connection check only, so the account is never copied in unasked.
                 valuation = client.valuation()
@@ -850,4 +858,7 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
                     client.revoke()
                 except KiwoomError:
                     pass
+            if capture is not None:
+                # This account's own result: none when the run was cut short (a BaseException).
+                capture.finish(len(results) > before and results[-1].get("status") != "failed")
     return results

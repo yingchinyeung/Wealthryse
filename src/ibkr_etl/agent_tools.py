@@ -667,7 +667,8 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
         """.format(long_name=", c.long_name" if has_long_name(connection) else ""),
         (YAHOO_PROVIDER, subject_id, position_date),
     ).fetchall()
-    data = aggregate_sector_allocation([dict(row) for row in records])
+    records = [_with_delisted_classification(dict(row)) for row in records]
+    data = aggregate_sector_allocation(records)
     fx_citations = ()
     if records:
         from .db import PostgresConnection
@@ -711,6 +712,22 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
         ) + fx_citations,
         utc_now_iso(),
     )
+
+
+def _with_delisted_classification(row: dict[str, Any]) -> dict[str, Any]:
+    """A Kiwoom U.S. holding Yahoo stopped quoting after a takeover keeps the name and industry it had while
+    listed (us_istrategy_securities.DELISTED), as its factsheet prints them. Only where Yahoo has no sector."""
+    if str(row.get("sector") or "").strip():
+        return row
+    from .us_istrategy_securities import delisted_classification
+
+    fallback = delisted_classification(row.get("conid"), row.get("symbol"))
+    if fallback is None:
+        return row
+    row = {**row, "sector": fallback["sector"], "industry": fallback["industry"]}
+    if "long_name" in row and not row.get("long_name"):
+        row["long_name"] = fallback["long_name"]
+    return row
 
 
 TOOL_DEFINITIONS: tuple[AgentToolDefinition, ...] = (

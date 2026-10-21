@@ -800,6 +800,7 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
                                   "case_id": target.case_id}
         client = None
         capture = None
+        before = len(results)
         try:
             client = client_for(target)
             capture = bronze.for_target(target) if bronze is not None else None
@@ -858,5 +859,6 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
                 except KiwoomError:
                     pass
             if capture is not None:
-                capture.finish(bool(results) and results[-1].get("status") != "failed")
+                # This account's own result: none when the run was cut short (a BaseException).
+                capture.finish(len(results) > before and results[-1].get("status") != "failed")
     return results

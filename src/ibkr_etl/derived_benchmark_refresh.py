@@ -33,7 +33,8 @@ def refresh_governed_derived_benchmarks(connection, *, tenant_id, subject_id, as
     # The qualified benchmark module independently checks each contract,
     # currency and primary/secondary mapping and keeps the pair atomic.
     result=refresh_and_materialize(connection,account_id=subject_id,start_date=start,end_date=end)
-    comparisons=result.get('benchmarks') or []
+    # Website-only catalog comparisons (WEBSITE_ALL_BENCHMARKS) are best effort, not the pair.
+    comparisons=[item for item in result.get('benchmarks') or [] if item.get('mapping_type')!='comparison']
     if result.get('reporting_currency')!='HKD' or len(comparisons)!=2 or any(not item.get('available') or item.get('quality_status')=='fail' for item in comparisons):
         raise ValueError('Both existing approved HKD comparisons must pass')
     return {'available':True,'refreshed_after_validated_nav':True,'as_of':as_of,'result':result}

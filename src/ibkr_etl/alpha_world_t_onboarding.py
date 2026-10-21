@@ -15,7 +15,8 @@ from .website_benchmarks import T_HKD_COMPARISON_VERSION
 
 
 def validate_benchmark_result(result):
-    rows = result.get('benchmarks', [])
+    # Website-only catalog comparisons (WEBSITE_ALL_BENCHMARKS) are best effort, not the pair.
+    rows = [r for r in result.get('benchmarks', []) if r.get('mapping_type') != 'comparison']
     expected = {'HSI': ('primary', 'HKD'), 'GSPC': ('secondary', 'USD')}
     if (result.get('account_id') != 'alpha-world-t'
             or result.get('reporting_currency') != 'HKD'

@@ -361,6 +361,31 @@ class CrisisWhatIfTests(unittest.TestCase):
         self.assertEqual(results[0]["defaults"], ["NEWCO", "ZZZ"])
         self.assertAlmostEqual(results[0]["current"]["period_return"], 0.5 * -0.15)
 
+    def test_a_won_account_replays_every_path_in_won(self) -> None:
+        calls = []
+
+        class _WonPrices(_CrisisPrices):
+            def in_currency(self, symbol, native, reporting, start, end):
+                calls.append((symbol, native, reporting))
+                series = self.history(symbol, start, end)
+                # USD rising against the won lifts every dollar path by 10% over the window.
+                if native == "USD" and reporting == "KRW":
+                    return {d: v * (1 + 0.1 * i / 3) for i, (d, v) in enumerate(sorted(series.items()))}
+                return series
+
+        stored = {**self.stored, "reporting_currency": "KRW"}
+        stored["scenarios"][0]["components"].append(
+            {"conid": "5", "symbol": "005930", "method": "market_proxy", "source_symbol": "^KS11", "beta": 1.0})
+        prices = _WonPrices(self.calendar)
+        prices.series["^KS11"] = [100, 95, 90, 90]
+        holdings = {**self.holdings, "5": {"symbol": "005930", "currency": "KRW"}}
+        results = crisis_what_if(stored, {"5": 0.5, "4": 0.25}, {"5": 0.5, "new:005935.KS": 0.25}, holdings, prices)
+        self.assertIn(("^KS11", "KRW", "KRW"), calls)
+        self.assertIn(("SPY", "USD", "KRW"), calls)               # NEWCO's default stand-in, in won
+        self.assertIn(("005935.KS", "KRW", "KRW"), calls)         # an added KRX ticker is priced in won
+        # KOSPI ends 10% down; SPY ends 15% down in dollars, 0.85 x 1.1 in won.
+        self.assertAlmostEqual(results[0]["current"]["period_return"], 0.5 * -0.1 + 0.25 * (0.85 * 1.1 - 1))
+
 
 class _Result:
     def __init__(self, rows):

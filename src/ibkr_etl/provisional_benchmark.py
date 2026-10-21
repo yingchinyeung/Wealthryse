@@ -47,8 +47,15 @@ BENCHMARKS = (
 FX_TICKERS = {
     "CNY": "CNY=X",  # quoted as CNY per USD
     "HKD": "HKD=X",  # quoted as HKD per USD
+    "KRW": "KRW=X",  # quoted as KRW per USD
     "TWD": "TWD=X",  # quoted as TWD per USD
 }
+# Reporting currencies a USD benchmark may be converted into with the direct Yahoo quote.
+DIRECT_FROM_USD = {"HKD", "KRW"}
+
+
+class NoBenchmarkContract(RuntimeError):
+    """The subject has no active benchmark mapping, so there is nothing to compare it with."""
 
 
 def mapped_benchmarks(connection: Any, account_id: str) -> tuple[BenchmarkSpec, ...]:
@@ -69,7 +76,7 @@ def mapped_benchmarks(connection: Any, account_id: str) -> tuple[BenchmarkSpec, 
         (account_id,),
     ).fetchall()
     if not rows:
-        raise RuntimeError(f"No active benchmark contract is configured for {account_id}")
+        raise NoBenchmarkContract(f"No active benchmark contract is configured for {account_id}")
     specs = tuple(
         BenchmarkSpec(
             benchmark_id=str(row["benchmark_id"]),
@@ -236,21 +243,22 @@ def fetch_fx_to_reporting_yfinance(
 ) -> tuple[list[tuple[str, float]], str]:
     """Fetch native-currency-to-reporting-currency closes from Yahoo Finance.
 
-    Yahoo's ``TWD=X``/``CNY=X``/``HKD=X`` series are quoted as local
+    Yahoo's ``TWD=X``/``CNY=X``/``HKD=X``/``KRW=X`` series are quoted as local
     currency units per USD. Use the reciprocal for local -> USD, but use the
-    direct HKD=X quote for USD -> HKD. No additional cross pairs are approved.
+    direct HKD=X or KRW=X quote for USD -> HKD or USD -> KRW. No additional
+    cross pairs are approved.
     """
 
     native = from_currency.upper()
     reporting = reporting_currency.upper()
     if native == reporting:
         raise ValueError("FX retrieval is unnecessary for identical currencies")
-    direct_quote = native == "USD" and reporting == "HKD"
+    direct_quote = native == "USD" and reporting in DIRECT_FROM_USD
     if not direct_quote and (reporting != "USD" or native not in FX_TICKERS):
         raise RuntimeError(
             f"No approved provisional FX ticker maps {native} to {reporting}"
         )
-    symbol = FX_TICKERS["HKD"] if direct_quote else FX_TICKERS[native]
+    symbol = FX_TICKERS[reporting] if direct_quote else FX_TICKERS[native]
     quote_currency = reporting if direct_quote else native
     direct = fetch_benchmark_yfinance(
         BenchmarkSpec(
@@ -324,6 +332,29 @@ def _store_reference_fx_rates(
                 fetched_at,
             ),
         )
+
+
+# Accounts reporting in these currencies keep no FX of their own (a Kiwoom won account
+# holds only won), so the benchmark run also stores their currency against USD for the
+# USD views, such as Combined holdings. HKD subjects already have theirs.
+REPORTING_USD_FX = {"KRW"}
+
+
+def _store_reporting_usd_fx(connection: Any, reporting_currency: str, fx_by_currency: dict,
+                            start_date: date, end_date: date, ticker_factory: Callable[[str], Any] | None,
+                            fetched_at: str) -> dict[str, Any] | None:
+    """Best effort: a missing quote is reported and never holds back the comparison."""
+
+    if reporting_currency not in REPORTING_USD_FX or "USD" in fx_by_currency:
+        return None
+    try:
+        rates, symbol = fetch_fx_to_reporting_yfinance(
+            "USD", reporting_currency, start_date - timedelta(days=7), end_date, ticker_factory)
+    except Exception as error:  # noqa: BLE001 - reported in the run result
+        return {"status": "unavailable", "error": " ".join(str(error).split())[:300]}
+    _store_reference_fx_rates(connection, from_currency="USD", reporting_currency=reporting_currency,
+                              rates=rates, fetched_at=fetched_at)
+    return {"status": "stored", "symbol": symbol, "observations": len(rates)}
 
 
 def _account_contract(connection: Any, account_id: str) -> tuple[str, str, date]:
@@ -451,6 +482,35 @@ def _external_flows(
         amount = _convert(values.get("amount"), rate)
         if amount is not None:
             flows[flow_date] += amount
+    if str(bases[account_id] or "").upper() in KIWOOM_FLOW_CURRENCIES and connection.execute(
+        "SELECT 1 FROM flex_rows WHERE account_id = ? LIMIT 1", (account_id,)
+    ).fetchone() is None:
+        for flow_date, amount in _kiwoom_flows(connection, account_id, converter).items():
+            flows[flow_date] += amount
+    return dict(flows)
+
+
+# A Kiwoom account has no Flex file: its deposits and withdrawals are the platform's own cash rows
+# (kiwoom_us_account.balance_gaps for a USD account). Korea's KRW account is left out until its own factsheet
+# check takes them in, so its figures do not move here.
+KIWOOM_FLOW_CURRENCIES = frozenset({"USD"})
+KIWOOM_FLOW_TYPES = ("DEPOSIT", "WITHDRAWAL")
+
+
+def _kiwoom_flows(connection: Any, account_id: str, converter: FxConverter) -> dict[str, float]:
+    flows: dict[str, float] = defaultdict(float)
+    for row in connection.execute(
+        "SELECT effective_date, amount_text, currency FROM cash_transactions "
+        "WHERE account_id = ? AND transaction_type IN (?, ?) ORDER BY effective_date",
+        (account_id, *KIWOOM_FLOW_TYPES),
+    ):
+        flow_date = str(row["effective_date"] or "")[:10]
+        if not flow_date:
+            continue
+        rate = converter.rate(account_id, row["currency"], flow_date)
+        amount = _convert(row["amount_text"], rate)
+        if amount is not None:
+            flows[flow_date] += amount
     return dict(flows)
 
 
@@ -563,6 +623,8 @@ def _refresh_and_materialize(
             rates=rates,
             fetched_at=fetched_at,
         )
+    usd_fx = _store_reporting_usd_fx(
+        connection, reporting_currency, fx_by_currency, start_date, end_date, ticker_factory, fetched_at)
     summaries: list[dict[str, Any]] = []
     for spec in specs:
         if spec.benchmark_id in unavailable_by_id:
@@ -809,4 +871,5 @@ def _refresh_and_materialize(
             else "fail"
         ),
         "benchmarks": summaries,
+        **({"reporting_usd_fx": usd_fx} if usd_fx else {}),
     }

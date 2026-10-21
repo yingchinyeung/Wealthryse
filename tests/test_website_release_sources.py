@@ -167,6 +167,57 @@ class AlreadyLiveFilesTest(unittest.TestCase):
             self.assertEqual((pkg / "risk_display.py").read_text(), "risk\n")
 
 
+
+class DesignsTest(unittest.TestCase):
+    """The designer reads factsheet_spec/designs/*.json (built-in designs); the website gets them whole."""
+    KOREA = "factsheet_spec/designs/korea-istrategy.json"
+
+    def test_design_files_are_the_json_files_directly_in_the_designs_folder(self):
+        trees = {HEAD: {"src/ibkr_etl/factsheet_spec/designs/korea-istrategy.json": b"{}",
+                        "src/ibkr_etl/factsheet_spec/designs/notes.txt": b"x",
+                        "src/ibkr_etl/factsheet_spec/designs/old/a.json": b"{}",
+                        "src/ibkr_etl/factsheet_spec/spec.py": b""}}
+
+        def git(*args, binary=False):
+            if args[0] == "ls-tree":
+                return "\n".join(p for p in trees[args[3]] if p.startswith(args[4]))
+            commit, path = args[1].split(":", 1)
+            return trees[commit][path]
+
+        with mock.patch.object(release, "git", side_effect=git):
+            self.assertEqual(release.design_files(HEAD), {self.KOREA: b"{}"})
+
+    def test_the_build_sends_every_design_with_its_hash(self):
+        sent = {}
+
+        def capture(config):
+            sent.update(config)
+            raise RuntimeError("stop before Azure")
+
+        with mock.patch.object(release, "change_set", return_value=(b"", {}, {})), \
+                mock.patch.object(release, "sides", return_value=({}, {})), \
+                mock.patch.object(release, "design_files", return_value={self.KOREA: b"{}"}), \
+                mock.patch.object(release, "remote_script", side_effect=capture), \
+                self.assertRaises(RuntimeError):
+            release.overlay_build({"head": HEAD, "live_image": "live", "target_image": "target"})
+        self.assertEqual(sent["design_hashes"], {self.KOREA: sha(b"{}")})
+        self.assertEqual(remote.gzip.decompress(remote.base64.b64decode(sent["designs"][self.KOREA])), b"{}")
+
+    def test_the_build_writes_them_after_the_patch_checks_and_the_image_loads_them(self):
+        code = (ROOT / "deploy" / "website_overlay_build_remote.py").read_text()
+        self.assertIn("!= design_hashes.get(name)", code)
+        self.assertLess(code.index("The change altered files it should not have"), code.index("result['designs_written']"))
+        self.assertLess(code.index("result['designs_written']"), code.index("'import ibkr_etl.web'"))
+        self.assertIn("DESIGN_CHECK.replace('IDS', repr(ids))", code)
+
+    def test_the_image_check_passes_for_the_repo_designs_and_fails_for_a_missing_one(self):
+        ids = sorted(p.stem for p in (ROOT / "src" / "ibkr_etl" / "factsheet_spec" / "designs").glob("*.json"))
+        self.assertIn("korea-istrategy", ids)
+        exec(remote.DESIGN_CHECK.replace("IDS", repr(ids)), {})
+        with self.assertRaises(AssertionError):
+            exec(remote.DESIGN_CHECK.replace("IDS", repr(ids + ["missing-design"])), {})
+
+
 class PrepareTest(unittest.TestCase):
     def run_prepare(self, changed, env=(), applied=None, migrations=None, pyproject=None, files=None):
         app = {"properties": {"template": {"containers": [{"image": "reg/ibkr-platform:web-" + DEPLOYED, "env": list(env)}]},
@@ -203,6 +254,10 @@ class PrepareTest(unittest.TestCase):
         state = self.run_prepare(["migrations/postgres/064_onboarding.sql", "src/ibkr_etl/web.py"])
         self.assertEqual(state["changed_files"], ["src/ibkr_etl/web.py"])
         self.assertEqual(state["migrations_not_shipped"], ["migrations/postgres/064_onboarding.sql"])
+
+    def test_a_built_in_design_change_is_shipped(self):
+        state = self.run_prepare(["src/ibkr_etl/factsheet_spec/designs/korea-istrategy.json", "src/ibkr_etl/web.py"])
+        self.assertEqual(state["changed_files"], ["src/ibkr_etl/factsheet_spec/designs/korea-istrategy.json", "src/ibkr_etl/web.py"])
 
     def test_the_license_file_does_not_stop_the_release(self):
         state = self.run_prepare(["LICENSE", "src/ibkr_etl/web.py"])

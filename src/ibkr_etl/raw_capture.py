@@ -65,6 +65,8 @@ FEEDS = frozenset({
     "treasury-par-yield",  # U.S. Treasury daily par yield curve (HTTP XML)
     "hkma-hibor",  # HKMA HIBOR fixing pages (HTTP JSON)
     "hkab-hibor",  # HKAB dated HIBOR fallback (HTTP JSON)
+    "bok-cd-91d",  # Bank of Korea ECOS CD 91-day yield (HTTP JSON)
+    "oecd-kr-cd-3m",  # OECD Korea 3-month CD rate, monthly, via FRED (HTTP CSV)
     "kenneth-french",  # Kenneth French daily factor files behind factor_returns (HTTP zip)
     "fred-series",  # FRED keyless CSV downloads of public-domain macro series (macro_series.py)
     "sec-13f",  # SEC EDGAR 13F-HR filings: submissions, filing index, cover page, information table

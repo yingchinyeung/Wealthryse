@@ -159,7 +159,7 @@ _DEFINITIONS = (
     MetricDefinition(
         "Risk-free rate",
         "Annual reference yield used in the Sharpe calculation, matched to the portfolio's reporting currency.",
-        "USD portfolios: latest validated U.S. Treasury Daily Treasury Par Yield Curve 3-month observation on or before As of. HKD composites: arithmetic mean of the published HKAB 1-month HIBOR fixings from inception to the valuation date. Stored as a decimal annual rate.",
+        "USD portfolios: latest validated U.S. Treasury Daily Treasury Par Yield Curve 3-month observation on or before As of. KRW accounts: latest validated Bank of Korea 91-day CD yield on or before As of (the U.S. Treasury 3-month rate until that series is loaded). HKD composites: arithmetic mean of the published HKAB 1-month HIBOR fixings from inception to the valuation date. Stored as a decimal annual rate.",
         "It is not the interest earned by the account. It can legitimately lag on weekends and public holidays; the Risk note names the source and observation date.",
     ),
     MetricDefinition(
@@ -1140,7 +1140,7 @@ CLIENT_CALCULATIONS = {
     "Total return": "Link all validated daily portfolio returns together, allowing each day's gain or loss to build on the previous day's value.",
     "Annualized return": "Convert the portfolio's total growth over the measured period into an equivalent yearly growth rate.",
     "Annualized volatility": "Measure the typical variation in daily returns and scale it to a 252-trading-day year.",
-    "Risk-free rate": "Use the latest validated 3-month U.S. Treasury yield for USD portfolios, or the average published 1-month HIBOR fixing for HKD composites.",
+    "Risk-free rate": "Use the latest validated 3-month U.S. Treasury yield for USD portfolios, the latest Bank of Korea 91-day CD yield for Korean-won accounts, or the average published 1-month HIBOR fixing for HKD composites.",
     "Sharpe ratio": "Subtract the daily equivalent of the risk-free rate from average daily portfolio return, then divide by daily volatility and annualize.",
     "Expected maximum drawdown (1 year)": "Create 5,000 realistic one-year return paths from the available history and average the worst fall in each path.",
     "Actual maximum drawdown (1 year)": "Look across the latest year of validated returns and find the largest fall from a previous high to a later low.",

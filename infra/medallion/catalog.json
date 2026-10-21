@@ -1073,6 +1073,12 @@
    "target_schema": "agent",
    "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
   },
+  "agent.cash_transactions": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read (Kiwoom deposits and withdrawals only, amount as text)."
+  },
   "agent.certified_builds": {
    "kind": "view",
    "layer": "consumer",

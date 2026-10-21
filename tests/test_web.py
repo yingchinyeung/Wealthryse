@@ -366,12 +366,13 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("account_onboarding_approvals", source)
         self.assertIn('"transmission_started": False', source)
 
-    def test_risk_attribution_converts_validated_native_currency_positions_to_usd(self) -> None:
+    def test_risk_attribution_converts_validated_native_currency_positions_to_reporting_currency(self) -> None:
         source = Path("src/ibkr_etl/risk_snapshots.py").read_text(encoding="utf-8")
         self.assertIn("LEFT JOIN LATERAL", source)
         self.assertIn("FROM reference_fx_rates AS r", source)
         self.assertIn("p.snapshot_date::date - INTERVAL '4 days'", source)
-        self.assertIn("WHEN fx.rate IS NOT NULL THEN 'USD'", source)
+        self.assertIn("WHEN fx.rate IS NOT NULL THEN ?", source)
+        self.assertIn("AND r.to_currency = ?", source)
         self.assertIn("NOT LIKE '%%.REC'", source)
         self.assertIn("p.snapshot_date = ANY(?::text[])", source)
 
@@ -602,6 +603,14 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertEqual(SECURITY_HEADERS["Cache-Control"], "no-store")
         self.assertEqual(SECURITY_HEADERS["X-Content-Type-Options"], "nosniff")
         self.assertEqual(SECURITY_HEADERS["Referrer-Policy"], "same-origin")
+        self.assertIn("frame-ancestors 'none'", SECURITY_HEADERS["Content-Security-Policy"])
+
+    def test_only_pdfs_may_be_framed_and_only_by_the_portal(self) -> None:
+        pdf = web.security_headers_for("application/pdf")["Content-Security-Policy"]
+        self.assertIn("frame-ancestors 'self'", pdf)
+        self.assertNotIn("frame-ancestors 'none'", pdf)
+        for kind in ("text/html; charset=utf-8", "application/json", None):
+            self.assertIn("frame-ancestors 'none'", web.security_headers_for(kind)["Content-Security-Policy"])
         self.assertIn("frame-ancestors 'none'", SECURITY_HEADERS["Content-Security-Policy"])
 
     def test_authorized_user_requires_every_configured_identity_claim(self) -> None:

@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.instrument_classifications
 name: instrument_classifications
-version: 1.0.0
+version: 1.1.0
 status: active
 domain: silver
 dataProduct: portfolio-medallion
@@ -191,6 +191,16 @@ schema:
     primaryKeyPosition: -1
     classification: internal
     description: UTC time (ISO 8601) of the lookup.
+  - name: long_name
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Yahoo's English company name from the same lookup; the factsheet name of a KRX holding,
+      whose broker name is Korean. Null for rows not looked up since migration 080.
   quality:
   - name: classified_has_sector
     description: A classified row has a sector.

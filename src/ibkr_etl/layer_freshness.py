@@ -80,12 +80,14 @@ RULES: tuple[Rule, ...] = (
     # once under history/, so no new file is expected each day.
     _feed("yahoo-benchmark-history", time(9, 30)),
     _feed("treasury-par-yield", time(23, 30)),
-    # Fetched only when a subject needs them (FX, new holdings, licensed HIBOR, derived-daily).
+    # Fetched only when a subject needs them (FX, new holdings, licensed HIBOR, KRW CD, derived-daily).
     _feed("yahoo-fx-history", time(9, 30), required=False),
     _feed("yahoo-sector-search", time(9, 30), required=False),
     _feed("yahoo-sector-profile", time(9, 30), required=False),
     _feed("hkma-hibor", time(23, 30), required=False),
     _feed("hkab-hibor", time(23, 30), required=False),
+    _feed("bok-cd-91d", time(23, 30), required=False),  # only once BOK_ECOS_API_KEY is set
+    _feed("oecd-kr-cd-3m", time(23, 30), required=False),
     _feed("yahoo-chart", time(9, 30), required=False),
     # The macro-series job (22:30, off unless MACRO_SERIES_LOAD=on; docs/PHASE3_DATA_MACRO_13F.md).
     # sec-13f has no daily rule: 13F filings come quarterly and each is filed once under history/.

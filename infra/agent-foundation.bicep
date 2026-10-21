@@ -35,9 +35,10 @@ param modelVersion string = '2026-09-03'
 param modelDeploymentName string = 'wr-analyst-astra'
 @allowed(['DataZoneStandard', 'GlobalStandard'])
 param modelSku string = 'GlobalStandard'
+@description('Thousands of tokens per minute. Chat in pro mode uses many more reasoning tokens per call.')
 @minValue(1)
 @maxValue(200)
-param modelCapacity int = 20
+param modelCapacity int = 100
 
 @description('Optional small model used to screen out-of-scope questions. Leave empty to skip.')
 param routerModelName string = ''

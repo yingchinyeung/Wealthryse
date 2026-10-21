@@ -43,7 +43,7 @@ from .broker_connections import (
 from .composition_tree import composite_tree, filtered_tree, tree_for_definition, tree_svg
 from .flex_recipe import RECIPE_STEPS
 from .market_data import ALPHA_WORLD_MARKET_INSTRUMENTS
-from . import onboarding_agents
+from . import onboarding_agents, yahoo_disclosure
 from .monthly_reports import REPORT_TYPES, MonthlyReportError, validate_period_end, validate_review_artifact
 from .onboarding import FEATURE_KEYS
 from .onboarding_cases import (
@@ -503,6 +503,24 @@ def record_platform_check(connection, tenant_id: str, case_id: str, check_id: st
     return {"case_id": case_id, "stage": case.stage, "status": case_status(case)}
 
 
+def record_first_month_end(connection, tenant_id: str, subject_id: str, period_end: str) -> dict | None:
+    """The owner released a subject's month-end factsheet: a live case waiting on its first month-end closes.
+
+    Called by the website's month-end release, in its transaction. Does nothing for a subject with no case in
+    the First month-end stage, so later months and older onboardings are unaffected.
+    """
+
+    row = connection.execute(
+        "SELECT case_id FROM broker_onboarding_cases WHERE tenant_id = ? AND target_subject_id = ? "
+        "AND stage = 'first_month_end' AND status <> 'cancelled'",
+        (tenant_id, subject_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return record_platform_check(connection, tenant_id, str(row["case_id"]), "first_month_end_released", "pass",
+                                 f"The {period_end} month-end factsheet was released.", {"period_end": period_end})
+
+
 def _evidence(check: Mapping[str, Any]) -> dict:
     value = check.get("evidence_json") or {}
     return json.loads(value) if isinstance(value, str) else dict(value)
@@ -846,9 +864,78 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
     # Last, as it reads another feature's table: a failed read leaves only this part unavailable.
     design = _factsheet_design(connection, tenant_id, row, case)
     detail["factsheet_design"] = design
+    detail["external_data"] = external = _external_data(connection, tenant_id, row, case)
+    if external and external["open"] and not external["approved"] and detail["next_owner_action"] is None:
+        detail["next_owner_action"] = "Approve sending this account's ticker symbols to Yahoo, below."
     if design and design.get("owner_action") and detail["next_owner_action"] is None:
         detail["next_owner_action"] = design["owner_action"]
     return detail
+
+
+EXTERNAL_DATA_MESSAGE = (
+    "Only this account's current and historical ticker symbols are sent to Yahoo Finance via yfinance, to "
+    "look up each company's English name, sector and industry for the factsheets and to read crisis-period "
+    "prices. Raw broker files, account numbers, keys, database credentials and personal information are "
+    "never sent."
+)
+
+
+def _external_data_approval(connection, tenant_id: str, subject_id: str):
+    return connection.execute(
+        "SELECT approval_id, approved_at FROM account_onboarding_approvals "
+        "WHERE tenant_id = %s AND subject_id = %s AND approval_type = 'external_market_data' "
+        "AND approval_status = 'approved' AND revoked_at IS NULL AND disclosure_version = %s LIMIT 1",
+        (tenant_id, subject_id, yahoo_disclosure.VERSION),
+    ).fetchone()
+
+
+def _external_data(connection, tenant_id: str, row: Mapping[str, Any], case: OnboardingCase) -> dict | None:
+    """The owner's Yahoo consent for a broker account, once approval 1 has registered it."""
+
+    if case.source_kind != "broker_account" or not row.get("subject_id"):
+        return None
+    approval = _external_data_approval(connection, tenant_id, str(row["subject_id"]))
+    return {
+        "approved": approval is not None,
+        "approved_at": str(approval["approved_at"]) if approval else None,
+        "message": EXTERNAL_DATA_MESSAGE,
+        "disclosure_version": yahoo_disclosure.VERSION,
+        "scope_sha256": yahoo_disclosure.SCOPE_SHA256,
+        "open": not case.cancelled and case.stage in PRE_LIVE_STAGES,
+    }
+
+
+def approve_external_data(connection, tenant_id: str, case_id: str, *, disclosure_version: str,
+                          scope_sha256: str, actor: str) -> dict:
+    """Record the owner's consent to send this account's ticker symbols to Yahoo; nothing is sent here.
+
+    Stored where the sector job and the other Yahoo readers look for it. A new-onboarding case has no
+    wizard case, so case_id stays empty (as for accounts onboarded before the wizard) and the metadata
+    names this case.
+    """
+
+    row, _checks, _approvals, case = _load_case(connection, tenant_id, case_id, lock=True)
+    if case.source_kind != "broker_account" or not row.get("subject_id"):
+        raise OnboardingError("Yahoo consent opens once you approve the account terms")
+    if case.cancelled or case.stage not in PRE_LIVE_STAGES:
+        raise OnboardingError("Yahoo consent is recorded before go-live; this case is past that")
+    if disclosure_version != yahoo_disclosure.VERSION or scope_sha256 != yahoo_disclosure.SCOPE_SHA256:
+        raise OnboardingError("What you reviewed changed after this page loaded; reload and review it again")
+    subject_id = str(row["subject_id"])
+    existing = _external_data_approval(connection, tenant_id, subject_id)
+    if existing is not None:
+        return {"status": "already_approved", "approval_id": str(existing["approval_id"]), "transmission_started": False}
+    approval_id = uuid.uuid4()
+    connection.execute(
+        "INSERT INTO account_onboarding_approvals (approval_id, tenant_id, case_id, subject_id, approval_type, "
+        "approval_status, disclosure_version, destination, scope_json, scope_sha256, approved_by_identity_sha256, "
+        "approved_at, metadata_json) VALUES (%s, %s, NULL, %s, 'external_market_data', 'approved', %s, %s, "
+        "%s::jsonb, %s, %s, now(), %s::jsonb)",
+        (approval_id, tenant_id, subject_id, yahoo_disclosure.VERSION, yahoo_disclosure.DESTINATION,
+         _json(yahoo_disclosure.SCOPE), yahoo_disclosure.SCOPE_SHA256, actor,
+         _json({"channel": "broker_onboarding_v2", "broker_case_id": case_id})),
+    )
+    return {"status": "approved", "approval_id": str(approval_id), "transmission_started": False}
 
 
 def factsheet_design_enabled() -> bool:
@@ -1359,6 +1446,14 @@ class ApproveCaseRequest(BaseModel):
     confirmation: str | None = Field(default=None, max_length=120)
 
 
+class ExternalDataRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    disclosure_version: Literal["yahoo-ticker-disclosure-v1"]
+    scope_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    approved: Literal[True]
+
+
 class CancelCaseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1554,6 +1649,13 @@ def install(
             display_name=body.display_name, reporting_currency=body.reporting_currency,
             history_start_date=body.history_start_date, actor=actor(user), today=today()))
 
+    @app.post("/api/onboarding-v2/cases/{case_id}/external-market-data")
+    def external_data_route(case_id: uuid.UUID, body: ExternalDataRequest,
+                            user: dict[str, Any] = Depends(v2_owner)) -> dict:
+        return run(write_database, lambda c: approve_external_data(
+            c, tenant_id, str(case_id), disclosure_version=body.disclosure_version,
+            scope_sha256=body.scope_sha256, actor=actor(user) or ""))
+
     @app.post("/api/onboarding-v2/cases/{case_id}/approvals/{approval}")
     def approve_route(case_id: uuid.UUID, approval: str, body: ApproveCaseRequest,
                       user: dict[str, Any] = Depends(v2_owner)) -> dict:
@@ -1724,6 +1826,7 @@ CASE_CONTENT = """<div class="page-view active" data-section="account-onboarding
 <div class="card wide"><div class="label" id="case-kicker">Loading…</div><h2 id="case-title"></h2><div id="case-next" class="muted"></div><div id="case-progress" class="status-row"></div></div>
 <div class="card wide" id="case-portfolio" hidden><div class="label">The portfolio</div><p id="case-description"></p><p class="muted" id="case-report-style" hidden></p><div id="case-tree" style="max-width:760px;margin-top:14px;overflow-x:auto"></div></div>
 <div class="card wide"><div class="label">Checks for this stage</div><div id="case-checks" class="onboarding-checks"></div></div>
+<div class="card wide" id="case-external" hidden><div class="label">Yahoo Finance</div><div id="case-external-body"></div><div id="case-external-result" class="muted" role="status" aria-live="polite"></div></div>
 <div class="card wide" id="case-design" hidden><div class="label">Factsheet design</div><p class="muted">The monthly factsheets use the design you make from your template in the factsheet designer. Upload the template and, if you have one, a completed example. The design agents draft it, you review it and ask for changes in plain words, then submit it. The historical factsheets are rendered from the submitted design for approval 2.</p><div id="case-design-body"></div></div>
 <div class="card wide" id="case-proposals" hidden><div class="label">Proposed security master entries</div><p class="muted">Securities in this account that the security master does not have yet, as the agent proposes them. Nothing is added until you approve the account terms.</p><div id="case-proposal-list"></div></div>
 <div class="card wide" id="case-documents" hidden><div class="label">Client documents</div><p class="muted">The mandate, fee terms and side letters. The agent drafts the account terms from them, quoting each clause, for you to compare before approval 1.</p><div id="case-document-list"></div><form id="case-document-form" hidden><div class="actions"><input type="file" name="document" accept=".pdf,.docx,.txt,.md" required aria-label="Client document"><button class="button" type="submit">Add document</button></div><div class="muted" role="status"></div></form></div>
@@ -1796,6 +1899,13 @@ const renderDesign=d=>{const card=document.querySelector('#case-design');card.hi
   else body.innerHTML=(d.designs.length?d.designs.map(x=>{const [text,cls]=designState[x.status]||[x.status,''];return row(x.title,`version ${x.version} · ${x.updated_at}`,pill(text,cls))}).join(''):'<p class="muted">No design yet.</p>')
     +(d.submitted?`<p class="muted">The historical factsheets are rendered from ${esc(d.submitted.title)}. Until you approve them, submitting a newer design renders them again.</p>`:'');
   body.innerHTML+=`<div class="actions"><a class="button" href="${esc(d.designer_page)}">${d.designs.length?'Open the factsheet designer':'Design the factsheet'}</a></div>`};
+const renderExternal=(c,x)=>{const card=document.querySelector('#case-external'),body=document.querySelector('#case-external-body');card.hidden=!x;if(!x)return;
+  if(x.approved){body.innerHTML=`<div class="onboarding-check pass"><strong>You approved sending this account's ticker symbols to Yahoo</strong><span>Approved ${esc(x.approved_at)}. The sector job looks up names and sectors on its next run.</span></div>`;return}
+  const can=c.may_approve&&x.open;
+  body.innerHTML=`<div class="onboarding-check pending"><strong>Approve sending ticker symbols to Yahoo</strong><span>${esc(x.message)} The factsheets need these names and sectors.</span>${can?`<label style="display:flex;gap:10px;align-items:flex-start;margin-top:12px"><input id="external-consent" type="checkbox"> <span>I approve sending this account's ticker symbols to Yahoo Finance as described.</span></label><div class="actions"><button id="external-approve" class="button" type="button" disabled>Approve</button></div>`:`<span class="muted">${x.open?'Only the owner can approve this.':'This case is past go-live.'}</span>`}</div>`;
+  if(!can)return;const box=body.querySelector('#external-consent'),button=body.querySelector('#external-approve'),note=document.querySelector('#case-external-result');
+  box.addEventListener('change',()=>button.disabled=!box.checked);
+  button.addEventListener('click',async()=>{button.disabled=true;note.textContent='Recording your approval…';try{await post(`/api/onboarding-v2/cases/${caseId}/external-market-data`,{disclosure_version:x.disclosure_version,scope_sha256:x.scope_sha256,approved:true});note.textContent='Approved. No ticker was sent by this button.';load()}catch(error){note.textContent=`Not approved: ${error.message}`;button.disabled=false}})};
 const termState={matches:['Matches','active'],differs:['Differs','blocked'],not_in_documents:['Not in the documents',''],no_draft:['No draft yet','']};
 const renderReadiness=r=>{const box=document.querySelector('#case-readiness');box.hidden=!r;if(!r){box.innerHTML='';return}
   if(r.unavailable){box.innerHTML='<div class="warning" style="margin-top:14px">The readiness summary could not be built. The checks and approvals above are still current.</div>';return}
@@ -1833,6 +1943,7 @@ const render=c=>{
   const agent=c.agents||{checks:{}};
   document.querySelector('#case-checks').innerHTML=c.checks.map(k=>{const ev=agent.checks[k.check_id];return `<div class="onboarding-check ${esc(k.status==='pending'?'':k.status)}"><strong>${esc(k.label)}${ev?' '+pill('Checked by agent',''):''}</strong><span>${esc(k.message)}${k.status==='warn'&&k.acknowledged?' Acknowledged.':''}</span>${ev?evidenceDrawer(ev):''}</div>`}).join('')||'<div class="muted">No checks in this stage.</div>';
   renderProposals(agent.security_proposals||[]);
+  renderExternal(c,c.external_data);
   renderDesign(c.factsheet_design);
   renderDraft(c,agent.term_draft);
   renderDocuments(c);

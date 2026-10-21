@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping
 
 from .benchmark_analytics import ComparisonRow, comparison_metrics, portfolio_risk_metrics
 from .crisis_replay import load_crisis_replay
-from .sector_classification import YAHOO_PROVIDER, aggregate_sector_allocation
+from .sector_classification import YAHOO_PROVIDER, aggregate_sector_allocation, has_long_name
 from .util import canonical_json, utc_now_iso
 from .subject_read_contract import ACTIVE_NAV_CURRENCY_SQL, require_ms_hkd_contract, synthetic_exposure
 
@@ -458,14 +458,22 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         """,
         (subject_id, mapping["benchmark_id"], CALCULATION_VERSION, effective),
     ).fetchall()
+    from .risk_snapshots import OWN_CURRENCY_RISK_FREE, own_rate_cutoff
+    subject = connection.execute(
+        "SELECT COALESCE(reporting_currency, base_currency) AS currency FROM platform_subjects WHERE subject_id = %s",
+        (subject_id,),
+    ).fetchone()
+    # As the risk snapshots: a won account's own rate once loaded, else the U.S. 3-month Treasury.
+    own_rate = OWN_CURRENCY_RISK_FREE.get(str((subject["currency"] if subject else None) or "USD").upper(), "USD")
     rate = connection.execute(
         """
         SELECT rate_date, series_id, currency, tenor, annual_rate, provider, quality_status
         FROM risk_free_rates
-        WHERE currency = 'USD' AND rate_date <= %s AND quality_status IN ('pass', 'warn')
-        ORDER BY rate_date DESC LIMIT 1
+        WHERE currency IN (%s, 'USD') AND rate_date <= %s AND (currency = 'USD' OR rate_date >= %s)
+          AND quality_status IN ('pass', 'warn')
+        ORDER BY (currency = %s) DESC, rate_date DESC LIMIT 1
         """,
-        (effective,),
+        (own_rate, effective, own_rate_cutoff(str(effective)), own_rate),
     ).fetchone()
     rows = _comparison_rows(records)
     metrics = portfolio_risk_metrics(rows, float(rate["annual_rate"]) if rate else None)
@@ -487,7 +495,7 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         },
         (
             {"table": "performance_comparison_daily", "subject_id": subject_id, "through": effective, "calculation_version": CALCULATION_VERSION},
-            {"table": "risk_free_rates", "currency": "USD", "through": effective},
+            {"table": "risk_free_rates", "currency": rate["currency"] if rate else own_rate, "through": effective},
             {
                 "table": "crisis_replay_daily",
                 "subject_id": subject_id,
@@ -648,7 +656,7 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
         """
         SELECT p.conid, i.symbol, p.market_value_text, p.currency, p.snapshot_date,
                i.listing_exchange, c.sector, c.industry, c.exchange,
-               c.checked_at, c.quality_status, c.license_status
+               c.checked_at, c.quality_status, c.license_status{long_name}
         FROM subject_position_series p
         LEFT JOIN instruments i ON i.conid = p.conid
         LEFT JOIN instrument_classifications c
@@ -656,10 +664,11 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
         WHERE p.subject_id = %s AND p.snapshot_date = %s
           AND COALESCE(NULLIF(p.quantity_text, ''), '0')::numeric <> 0
         ORDER BY ABS(COALESCE(NULLIF(p.market_value_text, ''), '0')::numeric) DESC
-        """,
+        """.format(long_name=", c.long_name" if has_long_name(connection) else ""),
         (YAHOO_PROVIDER, subject_id, position_date),
     ).fetchall()
-    data = aggregate_sector_allocation([dict(row) for row in records])
+    records = [_with_delisted_classification(dict(row)) for row in records]
+    data = aggregate_sector_allocation(records)
     fx_citations = ()
     if records:
         from .db import PostgresConnection
@@ -703,6 +712,22 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
         ) + fx_citations,
         utc_now_iso(),
     )
+
+
+def _with_delisted_classification(row: dict[str, Any]) -> dict[str, Any]:
+    """A Kiwoom U.S. holding Yahoo stopped quoting after a takeover keeps the name and industry it had while
+    listed (us_istrategy_securities.DELISTED), as its factsheet prints them. Only where Yahoo has no sector."""
+    if str(row.get("sector") or "").strip():
+        return row
+    from .us_istrategy_securities import delisted_classification
+
+    fallback = delisted_classification(row.get("conid"), row.get("symbol"))
+    if fallback is None:
+        return row
+    row = {**row, "sector": fallback["sector"], "industry": fallback["industry"]}
+    if "long_name" in row and not row.get("long_name"):
+        row["long_name"] = fallback["long_name"]
+    return row
 
 
 TOOL_DEFINITIONS: tuple[AgentToolDefinition, ...] = (

@@ -261,7 +261,7 @@ def draft_spec(found: Mapping[str, Any], *, design_id: str, title: str, currency
                         if item.text:
                             remove.append(item.box)
         for chart in [c for c in found["charts"] if c["page"] == number]:
-            if inputs == "account":
+            if inputs in ("account", "us_istrategy"):
                 ops.append({"id": _slug("nav_chart", used_ids, f"p{number + 1}"), "op": "component",
                             "role": "chart", "name": "account.nav_line_chart", "box": chart["box"]})
             else:

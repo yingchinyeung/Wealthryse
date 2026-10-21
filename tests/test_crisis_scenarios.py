@@ -202,6 +202,82 @@ class CompositeAndStorageTests(unittest.TestCase):
         self.assertIsNotNone(cs.load(connection, "demo-composite"))
 
 
+KRW_SERIES = {
+    "005930.KS": make_levels(1.0, ORIGIN),           # listed throughout: its own won prices
+    "123456.KS": make_levels(2.0, date(2024, 1, 2)),  # listed recently, twice as sensitive as KOSPI
+    "^KS11": make_levels(1.0, ORIGIN),
+}
+
+
+class WonPrices(FakePrices):
+    """KRX closes in won; USD to KRW at 1,400, and KRW to HKD drifting so a path shows the FX."""
+
+    def history(self, symbol, start, end):
+        if symbol in KRW_SERIES:
+            return {d: v for d, v in KRW_SERIES[symbol].items() if start.isoformat() <= d <= end.isoformat()}
+        return super().history(symbol, start, end)
+
+    def fx(self, native, reporting, start, end):
+        if (native, reporting) == ("USD", "KRW"):
+            return [(d.isoformat(), 1400.0) for d in weekdays(start, end)]
+        if (native, reporting) == ("KRW", "HKD"):
+            return [(d.isoformat(), 0.0056 * (1 - 0.001 * i)) for i, d in enumerate(weekdays(start, end))]
+        return super().fx(native, reporting, start, end)
+
+
+def won_database() -> sqlite3.Connection:
+    connection = database()
+    connection.executescript("""
+        INSERT INTO platform_subjects VALUES ('KIWOOM-0001', 'physical_account', 'KRW');
+        INSERT INTO instruments VALUES ('k1', '005930', 'KRX'), ('k2', '123456', 'KRX');
+        INSERT INTO nav_snapshots VALUES ('KIWOOM-0001', '2026-09-30', 'TOTAL', '1000000');
+        INSERT INTO position_snapshots VALUES
+            ('KIWOOM-0001', '2026-09-30', 'k1', 'KRW', '400000'),
+            ('KIWOOM-0001', '2026-09-30', 'k2', 'KRW', '200000'),
+            ('KIWOOM-0001', '2026-09-30', '1', 'USD', '100');
+        INSERT INTO reference_fx_rates VALUES ('USD', 'KRW', '2026-09-30', 1400, 'pass');
+    """)
+    return connection
+
+
+class WonAccountTests(unittest.TestCase):
+    def test_a_won_account_is_replayed_in_won_on_kospi_stand_ins(self):
+        result = cs.account_scenarios(won_database(), "KIWOOM-0001", WonPrices())
+        self.assertEqual(result["reporting_currency"], "KRW")
+        for item in result["scenarios"]:
+            self.assertTrue(item["available"], item)
+            self.assertEqual(item["reporting_currency"], "KRW")
+            by_symbol = {c["symbol"]: c for c in item["components"]}
+            # Weights are shares of the won NAV: 40% and 20% in won, and $100 at 1,400 = 14%.
+            self.assertAlmostEqual(by_symbol["005930"]["weight"], 0.4)
+            self.assertAlmostEqual(by_symbol["123456"]["weight"], 0.2)
+            self.assertAlmostEqual(by_symbol["OLD"]["weight"], 0.14)
+            self.assertAlmostEqual(item["cash_weight"], 0.26)
+            self.assertEqual((by_symbol["005930"]["method"], by_symbol["005930"]["source_symbol"]),
+                             ("direct", "005930.KS"))
+            self.assertEqual((by_symbol["123456"]["method"], by_symbol["123456"]["source_symbol"]),
+                             ("market_proxy", "^KS11"))
+            self.assertAlmostEqual(by_symbol["123456"]["beta"], 2.0, delta=0.1)
+            self.assertLess(item["maximum_drawdown"], -0.01)
+
+    def test_usd_accounts_are_unchanged(self):
+        result = cs.account_scenarios(database(), "U0000001", WonPrices())
+        self.assertEqual(result["reporting_currency"], "USD")
+        stand_in = next(c for c in result["scenarios"][0]["components"] if c["method"] == "market_proxy")
+        self.assertEqual(stand_in["source_symbol"], "SPY")
+
+    def test_a_composite_converts_a_won_sleeve_at_its_own_fx(self):
+        connection, prices = database(), WonPrices()
+        sleeve = cs.account_scenarios(won_database(), "KIWOOM-0001", prices)
+        result = cs.composite_scenarios(connection, "demo-composite", prices, lambda key, _: sleeve)
+        for scenario, own, item in zip(cs.SCENARIOS, sleeve["scenarios"], result["scenarios"]):
+            self.assertTrue(item["available"], item)
+            fx = cs._fx_path(prices, "KRW", "HKD", scenario, [r["date"] for r in own["daily"]])
+            hedge = spy_end(scenario) - 1
+            expected = 1 + 0.6 * (own["daily"][-1]["value"] * fx[-1] - 1) - 0.2 * hedge
+            self.assertAlmostEqual(item["daily"][-1]["value"], expected)
+
+
 class WebsiteSwitchTests(unittest.TestCase):
     def test_switch_is_off_unless_true(self):
         self.assertFalse(cs.website_enabled({}))

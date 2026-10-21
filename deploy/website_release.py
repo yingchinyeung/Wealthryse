@@ -24,6 +24,10 @@ REG = 'ibkrv2stgauhecwc4itaoo.azurecr.io'
 # the live files and refuses if any hunk does not apply exactly.
 BASELINE_COMMIT = '59dbd295c32b8503aa9f66be5b9cf0e5b70562b2'
 PACKAGE = 'src/ibkr_etl'
+# Built-in factsheet designs: data files the website's designer reads
+# (factsheet_spec.spec.built_in_designs). The release writes them whole, as the reviewed
+# commit has them, so the website has the same designs as the platform image.
+DESIGNS = 'factsheet_spec/designs/'
 # Paths that are not part of the website image.
 IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azuredevops/',
                     # CI-only helper; the website never runs it.
@@ -76,6 +80,14 @@ def git(*args, binary=False):
 def package_files(commit):
     files = [f for f in git('ls-tree', '-r', '--name-only', commit, PACKAGE).split() if f.endswith('.py')]
     return {f[len(PACKAGE) + 1:]: git('show', commit + ':' + f, binary=True) for f in files}
+
+
+def design_files(commit):
+    """The built-in factsheet designs (src/ibkr_etl/factsheet_spec/designs/*.json) at commit, by package path."""
+    prefix = PACKAGE + '/' + DESIGNS
+    return {f[len(PACKAGE) + 1:]: git('show', commit + ':' + f, binary=True)
+            for f in git('ls-tree', '-r', '--name-only', commit, prefix).split()
+            if f.endswith('.json') and '/' not in f[len(prefix):]}
 
 
 def sides(state):
@@ -277,7 +289,10 @@ def prepare():
     unsupported = [p for p in image_changes if not p.startswith(PACKAGE + '/')]
     if unsupported:
         raise SystemExit('This release path only ships src/ibkr_etl. Other image files changed:\n  ' + '\n  '.join(unsupported))
-    data = [p for p in image_changes if p.startswith(PACKAGE + '/') and not p.endswith('.py')]
+    designs = [p for p in image_changes if p.startswith(PACKAGE + '/' + DESIGNS) and p.endswith('.json')]
+    if designs:
+        print('Shipped whole (built-in factsheet designs the designer reads):\n  ' + '\n  '.join(designs))
+    data = [p for p in image_changes if p.startswith(PACKAGE + '/') and not p.endswith('.py') and p not in designs]
     if data:
         print('Not part of the website release (package data; this path ships the .py files of src/ibkr_etl, '
               'so the website must not need these):\n  ' + '\n  '.join(data))
@@ -364,6 +379,7 @@ def overlay_build(state, merged=None):
     """Build on the build VM. Returns the files the change did not apply to, for one merge retry."""
     patch, live_hashes, new_hashes = change_set(state, merged)
     before, after = sides(state)
+    designs = design_files(state['head'])
     for name, (copy, result) in (merged or {}).items():
         before[name], after[name] = copy, result
     config = {
@@ -372,6 +388,9 @@ def overlay_build(state, merged=None):
         'live_hashes': live_hashes, 'new_hashes': new_hashes,
         'patch': base64.b64encode(gzip.compress(patch, 9)).decode(),
         'website_modules': sorted(website_modules(after)),
+        # Every built-in design at HEAD, written whole and checked against these hashes.
+        'designs': {n: base64.b64encode(gzip.compress(d, 9)).decode() for n, d in designs.items()},
+        'design_hashes': {n: hashlib.sha256(d).hexdigest() for n, d in designs.items()},
     }
     command = remote_script(config)
     vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
@@ -421,11 +440,13 @@ def acr_context(state, folder):
     changed = sorted(n for n in set(before) | set(after) if before.get(n) != after.get(n))
     digest = lambda data: None if data is None else hashlib.sha256(data).hexdigest()
     imported = first_imported(before, after)
+    designs = design_files(state['head'])
+    after = {**designs, **after}
     release = {'runtime_user': RUNTIME_USER,
                'touched': {n: {'live': digest(before.get(n)), 'new': digest(after.get(n))} for n in changed},
-               'imported': {n: digest(after[n]) for n in imported}}
+               'imported': {n: digest(after[n]) for n in imported + sorted(designs)}}
     stage = folder / 'release'
-    for name in changed + imported:
+    for name in changed + imported + sorted(designs):
         if name in after:
             (stage / 'files' / name).parent.mkdir(parents=True, exist_ok=True)
             (stage / 'files' / name).write_bytes(after[name])

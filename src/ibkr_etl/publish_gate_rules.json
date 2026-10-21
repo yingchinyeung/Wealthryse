@@ -267,7 +267,7 @@
      "severity": "error"
     }
    ],
-   "version": "1.1.0"
+   "version": "1.2.0"
   },
   "gold.reporting_snapshots": {
    "calculation_version_column": "formula_version",

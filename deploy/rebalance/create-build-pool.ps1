@@ -66,6 +66,9 @@ $existing = AzRun acr agentpool list -r $Registry --query "[?name=='$PoolName'].
 if (-not $existing) {
     AzRun acr agentpool create -r $Registry -n $PoolName --tier $Tier --subnet-id $subnetId | Out-Null
 }
+$poolId = AzRun acr agentpool show -r $Registry -n $PoolName --query id -o tsv
+# Same labels as the registry it belongs to, so it shows up with the rest of the foundation.
+AzRun resource tag --ids $poolId --tags layer=foundation component=registry owner=ying -i | Out-Null
 $state = AzRun acr agentpool show -r $Registry -n $PoolName --query provisioningState -o tsv
 $count = AzRun acr agentpool show -r $Registry -n $PoolName --query count -o tsv
 Write-Host ''

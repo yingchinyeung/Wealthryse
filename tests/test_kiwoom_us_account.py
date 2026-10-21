@@ -67,6 +67,9 @@ class ChoiceTests(unittest.TestCase):
         self.assertEqual(us_snapshot_day(datetime(2026, 10, 20, 8, 20, tzinfo=timezone.utc)), date(2026, 10, 19))
         self.assertEqual(us_snapshot_day(datetime(2026, 9, 8, 8, 20, tzinfo=timezone.utc)), date(2026, 9, 4))
         self.assertEqual(us_snapshot_day(datetime(2026, 10, 20, 21, 30, tzinfo=timezone.utc)), date(2026, 10, 20))
+        # New York time decides, so the switch moves with daylight saving: 16:30 EST on 2 Nov is before it.
+        self.assertEqual(us_snapshot_day(datetime(2026, 11, 2, 21, 30, tzinfo=timezone.utc)), date(2026, 10, 30))
+        self.assertEqual(us_snapshot_day(datetime(2026, 11, 2, 22, 5, tzinfo=timezone.utc)), date(2026, 11, 2))
 
     def test_history_asks_for_nyse_sessions_only(self):
         days = us_trading_days(date(2025, 4, 16), date(2025, 4, 22))

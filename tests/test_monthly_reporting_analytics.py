@@ -48,7 +48,7 @@ class MonthlyReportingAnalyticsTests(unittest.TestCase):
                 conid TEXT,
                 source_key TEXT
             );
-            CREATE TABLE accounts (account_id TEXT, base_currency TEXT);
+            CREATE TABLE accounts (account_id TEXT, base_currency TEXT, account_type TEXT);
             CREATE TABLE flex_rows (account_id TEXT, section TEXT, data_json TEXT);
             CREATE TABLE fx_rates (
                 account_id TEXT,
@@ -67,7 +67,7 @@ class MonthlyReportingAnalyticsTests(unittest.TestCase):
             "INSERT INTO instrument_classifications VALUES (?, ?, ?)",
             ("1", "Yahoo Finance search profile", "Technology"),
         )
-        self.connection.execute("INSERT INTO accounts VALUES ('U16088571', 'USD')")
+        self.connection.execute("INSERT INTO accounts VALUES ('U16088571', 'USD', 'Individual')")
         for day, nav, price in (
             ("2026-07-31", "100", "5.00"),
             ("2026-08-03", "102", "5.10"),

@@ -492,7 +492,7 @@ def _bronze_external_flows(
                                 _number(values.get("amount")), amount))
     if str(bases[account_id] or "").upper() in KIWOOM_FLOW_CURRENCIES and connection.execute(
         "SELECT 1 FROM flex_rows WHERE account_id = ? LIMIT 1", (account_id,)
-    ).fetchone() is None:
+    ).fetchone() is None and _is_kiwoom(connection, account_id):
         for flow_date, amount in _kiwoom_flows(connection, account_id, converter, records=records).items():
             flows[flow_date] += amount
     return dict(flows)
@@ -503,6 +503,16 @@ def _bronze_external_flows(
 # check takes them in, so its figures do not move here.
 KIWOOM_FLOW_CURRENCIES = frozenset({"USD"})
 KIWOOM_FLOW_TYPES = ("DEPOSIT", "WITHDRAWAL")
+
+
+def _is_kiwoom(connection: Any, account_id: str) -> bool:
+    """Only a Kiwoom account reads silver cash rows, as flows_source.silver_external_flows does.
+
+    An IBKR account's flows come from its Flex file alone, wherever it is read from: the agents'
+    scoped views have flex_rows but no cash_transactions.
+    """
+    row = connection.execute("SELECT account_type FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
+    return row is not None and str(row["account_type"] or "") == "kiwoom"
 
 
 def _kiwoom_flows(connection: Any, account_id: str, converter: FxConverter, *,

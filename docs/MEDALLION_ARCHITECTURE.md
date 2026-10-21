@@ -5,8 +5,10 @@ The platform's data is organised in three layers, with a control plane beside th
 blob container and job. `tests/test_medallion_catalog.py` fails when a migration adds a
 table or view, or Bicep adds a container, without a catalog entry.
 
-Status: the catalog is in place. Nothing has moved yet, and every table is still in
-`public`. The moves happen in stages, each approved separately (see "Stages" below).
+Status: the tables are in their layer schemas. Migrations 068, 069 and 070 (S3) moved
+them into `gold`, `bronze` and `silver`, each leaving a `security_invoker` view of the same
+name in `public`. 082 adds Kiwoom's stored answers (`bronze.kiwoom_responses`) when it is
+applied. Each stage is approved separately (see "Stages" below).
 
 ## Layers
 

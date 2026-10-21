@@ -108,6 +108,28 @@ DELISTED: dict[str, tuple[str, str]] = {
 }
 
 
+# Yahoo's sector for each DELISTED holding while it was listed (Yahoo's own label, as the sector job stores it).
+DELISTED_YAHOO_SECTOR: dict[str, str] = {
+    "DFS": "Financial Services",
+    "FYBR": "Communication Services",
+}
+
+
+def delisted_classification(conid: object, symbol: object) -> dict[str, str] | None:
+    """The stored-classification fields for a Kiwoom U.S. holding Yahoo stopped quoting after a takeover.
+
+    Only for a ``US:<ticker>`` holding in DELISTED. The sector tool uses it where Yahoo has no row, so the
+    month-end snapshot's sector check sees the same name and industry the factsheet prints.
+    """
+    if not str(conid or "").startswith("US:"):
+        return None
+    ticker = str(symbol or str(conid)[3:]).strip().upper()
+    if ticker not in DELISTED:
+        return None
+    name, industry = DELISTED[ticker]
+    return {"sector": DELISTED_YAHOO_SECTOR[ticker], "industry": industry, "long_name": name}
+
+
 class UsIstrategySecurityError(ValueError):
     pass
 

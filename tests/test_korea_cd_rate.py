@@ -99,6 +99,48 @@ class RiskSnapshotRateTests(unittest.TestCase):
         self.assertEqual(pick("USD"), "USD")
         self.assertEqual(pick("HKD"), "USD")      # the HKD composites use HIBOR on their own path
 
+    def test_a_won_rate_more_than_100_days_old_is_not_used(self):
+        from ibkr_etl.risk_snapshots import risk_free_rate
+
+        connection = database()
+        connection.execute("INSERT INTO risk_free_rates VALUES ('t', '2026-10-20', 'UST-PAR-3M', 'USD', '3-month', "
+                           "0.04, 'x', 'p', 'f', 'pass')")
+        connection.execute("INSERT INTO risk_free_rates VALUES ('t', '2026-06-30', 'OECD-KR-CD-3M', 'KRW', "
+                           "'3-month', 0.026, 'x', 'p', 'f', 'pass')")
+        rate = lambda as_of: dict(risk_free_rate(connection, tenant_id="t", reporting_currency="KRW",  # noqa: E731
+                                                 as_of=as_of))["currency"]
+        self.assertEqual(rate("2026-09-30"), "KRW")
+        self.assertEqual(rate("2026-10-21"), "USD")
+
+
+FRED_CSV = b"observation_date,IR3TCD01KRM156N\n2026-06-01,2.61\n2026-07-01,.\n2026-08-01,2.55\n2026-12-01,2.50\n"
+
+
+class MonthlyCdRateTests(unittest.TestCase):
+    def test_each_month_is_stored_on_its_last_day_and_gaps_are_skipped(self):
+        urls = []
+
+        def get(url, timeout=30):
+            urls.append(url)
+            return FRED_CSV
+
+        connection = database()
+        result = cd.refresh_monthly_cd_rates(connection, start_date=date(2026, 1, 1), end_date=date(2026, 10, 21),
+                                             get=get)
+        self.assertEqual(result["observations_loaded"], 2)   # December is after the end date
+        rows = [tuple(r) for r in connection.execute(
+            "SELECT rate_date, series_id, currency, annual_rate FROM risk_free_rates ORDER BY rate_date")]
+        self.assertEqual(rows, [("2026-06-30", "OECD-KR-CD-3M", "KRW", 0.0261),
+                                ("2026-08-31", "OECD-KR-CD-3M", "KRW", 0.0255)])
+        self.assertEqual(cd.parse_monthly_csv(FRED_CSV)[-1].rate_date, "2026-12-31")
+        self.assertIn(cd.FRED_SERIES, urls[0])
+
+    def test_another_series_or_a_bad_value_stops_the_load(self):
+        with self.assertRaisesRegex(RuntimeError, "not IR3TCD01KRM156N"):
+            cd.parse_monthly_csv(b"DATE,IR3TCD01USM156N\n2026-06-01,5.1\n")
+        with self.assertRaisesRegex(ValueError, "validation range"):
+            cd.parse_monthly_csv(b"DATE,IR3TCD01KRM156N\n2026-06-01,61\n")
+
 
 if __name__ == "__main__":
     unittest.main()

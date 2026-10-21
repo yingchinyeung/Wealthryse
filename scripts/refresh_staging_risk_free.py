@@ -45,6 +45,15 @@ def main() -> int:
             result['hkd_hibor']=refresh(connection,start,date.fromisoformat(policy['expected_date']),license_scope_confirmed=True)
             result['hkd_hibor']['publication_policy']=policy
         krw_error = None
+        if os.environ.get("KOREA_CD_MONTHLY", "").lower() == "true":
+            # Korea's won rate without a Bank of Korea key: the OECD monthly CD rate via FRED.
+            from ibkr_etl.korea_cd_rate import refresh_monthly_cd_rates
+            try:
+                result["krw_cd_monthly"] = refresh_monthly_cd_rates(connection, start_date=start)
+            except Exception as error:  # noqa: BLE001 - reported below and in the run record
+                connection.rollback()
+                krw_error = f"{type(error).__name__}: {' '.join(str(error).split())[:300]}"
+                result["krw_cd_monthly"] = {"status": "failed", "error": krw_error}
         if os.environ.get("BOK_ECOS_API_KEY", "").strip():
             # Korea's won rate (Bank of Korea CD 91-day). The USD rows above are already committed,
             # so a Bank of Korea outage is reported and fails the run without undoing them.
@@ -66,7 +75,8 @@ def main() -> int:
             row_count=int(result["observations_loaded"]),
             reconciliation_json=payload,
         )
-        loaded = int(result["observations_loaded"]) + int((result.get("krw_cd_91d") or {}).get("observations_loaded") or 0)
+        loaded = int(result["observations_loaded"]) + sum(
+            int((result.get(name) or {}).get("observations_loaded") or 0) for name in ("krw_cd_91d", "krw_cd_monthly"))
         lineage.current().output("silver.risk_free_rates", rows=loaded)
         print(json.dumps(result, sort_keys=True))
         return 1 if krw_error else 0

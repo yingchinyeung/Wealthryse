@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 from dataclasses import asdict
 from typing import Any, Mapping
 
@@ -25,13 +25,20 @@ LOGGER = logging.getLogger(__name__)
 RISK_ANALYTICS_VERSION = "risk-analytics-v2"
 # Reporting currencies with their own risk-free series in risk_free_rates (see korea_cd_rate).
 OWN_CURRENCY_RISK_FREE = {"KRW": "KRW"}
+# A won rate older than this is not used: the monthly OECD series runs one to two months
+# behind, so a quarter without a new month means the feed has stopped.
+OWN_RATE_MAX_AGE_DAYS = 100
+
+
+def own_rate_cutoff(as_of: str) -> str:
+    return (date.fromisoformat(str(as_of)[:10]) - timedelta(days=OWN_RATE_MAX_AGE_DAYS)).isoformat()
 
 
 def risk_free_rate(connection, *, tenant_id: str, reporting_currency: str, as_of: str):
     """The latest validated risk-free observation for a subject reporting in this currency.
 
-    A won account takes the won rate (Bank of Korea CD 91-day) once it is loaded; until
-    then, and for every other currency here, the U.S. 3-month Treasury rate as before.
+    A won account takes the won CD rate once it is loaded and recent; until then, and for
+    every other currency here, the U.S. 3-month Treasury rate as before.
     """
     own_rate = OWN_CURRENCY_RISK_FREE.get(str(reporting_currency or "USD").upper(), "USD")
     return connection.execute(
@@ -40,10 +47,11 @@ def risk_free_rate(connection, *, tenant_id: str, reporting_currency: str, as_of
                quality_status
         FROM risk_free_rates
         WHERE tenant_id = ? AND currency IN (?, 'USD') AND rate_date <= ?
+          AND (currency = 'USD' OR rate_date >= ?)
           AND quality_status IN ('pass', 'warn')
         ORDER BY (currency = ?) DESC, rate_date DESC LIMIT 1
         """,
-        (tenant_id, own_rate, as_of, own_rate),
+        (tenant_id, own_rate, as_of, own_rate_cutoff(as_of), own_rate),
     ).fetchone()
 
 

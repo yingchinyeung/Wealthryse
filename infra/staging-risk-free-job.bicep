@@ -32,6 +32,9 @@ var bokEcosSecrets = empty(bokEcosApiKeySecretName) ? [] : [
 var bokEcosEnv = empty(bokEcosApiKeySecretName) ? [] : [
   { name: 'BOK_ECOS_API_KEY', secretRef: 'bok-ecos-api-key' }
 ]
+// Without an ECOS key: load the OECD's monthly Korea CD rate from FRED (no key needed).
+param koreaCdMonthly bool = false
+var koreaCdEnv = concat(bokEcosEnv, koreaCdMonthly ? [ { name: 'KOREA_CD_MONTHLY', value: 'true' } ] : [])
 
 var tags = {
   application: 'ibkr-portfolio-platform'
@@ -107,7 +110,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             // The app login cannot create tables, so the job must not try migrations
             // (live since 18 Oct 2026, as on the institutional daily job).
             { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
-          ], rawMarketDataEnv), bokEcosEnv)
+          ], rawMarketDataEnv), koreaCdEnv)
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'

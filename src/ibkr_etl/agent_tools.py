@@ -458,7 +458,7 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         """,
         (subject_id, mapping["benchmark_id"], CALCULATION_VERSION, effective),
     ).fetchall()
-    from .risk_snapshots import OWN_CURRENCY_RISK_FREE
+    from .risk_snapshots import OWN_CURRENCY_RISK_FREE, own_rate_cutoff
     subject = connection.execute(
         "SELECT COALESCE(reporting_currency, base_currency) AS currency FROM platform_subjects WHERE subject_id = %s",
         (subject_id,),
@@ -469,10 +469,11 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         """
         SELECT rate_date, series_id, currency, tenor, annual_rate, provider, quality_status
         FROM risk_free_rates
-        WHERE currency IN (%s, 'USD') AND rate_date <= %s AND quality_status IN ('pass', 'warn')
+        WHERE currency IN (%s, 'USD') AND rate_date <= %s AND (currency = 'USD' OR rate_date >= %s)
+          AND quality_status IN ('pass', 'warn')
         ORDER BY (currency = %s) DESC, rate_date DESC LIMIT 1
         """,
-        (own_rate, effective, own_rate),
+        (own_rate, effective, own_rate_cutoff(str(effective)), own_rate),
     ).fetchone()
     rows = _comparison_rows(records)
     metrics = portfolio_risk_metrics(rows, float(rate["annual_rate"]) if rate else None)

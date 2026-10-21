@@ -175,3 +175,94 @@ def refresh_cd_rates(connection: Any, *, key: str, start_date: date, end_date: d
         "latest_annual_rate": latest.annual_rate,
         "quality_status": "pass",
     }
+
+
+# No-key source: the OECD's monthly Korea 3-month CD rate, as republished by FRED. It is the
+# month's average, so each month is stored on its last day: a figure is never used before the
+# month it averages is over. It runs one to two months behind; risk_snapshots stops using a
+# won rate that is more than OWN_RATE_MAX_AGE_DAYS old.
+FRED_SERIES = "IR3TCD01KRM156N"
+FRED_URL = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={FRED_SERIES}"
+MONTHLY_SERIES_ID = "OECD-KR-CD-3M"
+MONTHLY_TENOR = "3-month"
+MONTHLY_PROVIDER = f"OECD Main Economic Indicators via FRED ({FRED_SERIES}, Korea 3-month CD, monthly average)"
+
+
+def parse_monthly_csv(body: bytes) -> list[CdObservation]:
+    """Month-end dated won CD rates from FRED's CSV, validated and in date order."""
+
+    lines = [line.strip() for line in body.decode("utf-8-sig").splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError("FRED returned an empty file")
+    header = [part.strip() for part in lines[0].split(",")]
+    if len(header) != 2 or header[0].lower() not in {"date", "observation_date"} or header[1] != FRED_SERIES:
+        raise RuntimeError(f"FRED file is not {FRED_SERIES}: header {lines[0][:80]!r}")
+    observations: dict[str, CdObservation] = {}
+    for line in lines[1:]:
+        day_text, value = (part.strip() for part in line.split(",", 1))
+        if value in {"", "."}:
+            continue
+        month = date.fromisoformat(day_text)
+        if month.day != 1:
+            raise RuntimeError(f"FRED monthly observation not dated on the 1st: {day_text}")
+        following = date(month.year + (month.month == 12), month.month % 12 + 1, 1)
+        rate_date = date.fromordinal(following.toordinal() - 1).isoformat()
+        annual_rate = round(float(value) / 100.0, 8)
+        if not math.isfinite(annual_rate) or not 0.0 <= annual_rate <= 0.30:
+            raise ValueError(f"Korea CD rate is outside the validation range for {day_text}")
+        observations[rate_date] = CdObservation(rate_date, annual_rate)
+    if not observations:
+        raise RuntimeError(f"FRED {FRED_SERIES} has no observations")
+    return [observations[day] for day in sorted(observations)]
+
+
+def refresh_monthly_cd_rates(connection: Any, *, start_date: date, end_date: date | None = None,
+                             timeout: int = 45, get: Callable[..., bytes] = _get) -> dict[str, Any]:
+    """Idempotently load month-end won CD rates (OECD via FRED) into risk_free_rates."""
+
+    end = end_date or date.today()
+    requested_at = raw_capture.utc_now()
+    body = get(FRED_URL, timeout=timeout)
+    raw_capture.capture_http("oecd-kr-cd-3m", MONTHLY_PROVIDER, url=FRED_URL, body=body,
+                             key=end.strftime("%Y%m%d"), extension="csv", requested_at=requested_at)
+    observations = [o for o in parse_monthly_csv(body)
+                    if start_date.isoformat() <= o.rate_date <= end.isoformat()]
+    if not observations:
+        raise RuntimeError("No Korea CD monthly rates fall within the requested period")
+    fetched_at = utc_now_iso()
+    try:
+        for observation in observations:
+            connection.execute(
+                """
+                INSERT INTO risk_free_rates(
+                    rate_date, series_id, currency, tenor, annual_rate,
+                    day_count_convention, provider, fetched_at, quality_status
+                ) VALUES (?, ?, ?, ?, ?, 'monthly-average-annual-yield', ?, ?, 'pass')
+                ON CONFLICT(tenant_id, rate_date, series_id) DO UPDATE SET
+                    currency = excluded.currency,
+                    tenor = excluded.tenor,
+                    annual_rate = excluded.annual_rate,
+                    day_count_convention = excluded.day_count_convention,
+                    provider = excluded.provider,
+                    fetched_at = excluded.fetched_at,
+                    quality_status = excluded.quality_status
+                """,
+                (observation.rate_date, MONTHLY_SERIES_ID, CURRENCY, MONTHLY_TENOR, observation.annual_rate,
+                 MONTHLY_PROVIDER, fetched_at),
+            )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    latest = observations[-1]
+    return {
+        "series_id": MONTHLY_SERIES_ID,
+        "currency": CURRENCY,
+        "provider": MONTHLY_PROVIDER,
+        "requested_start": start_date.isoformat(),
+        "requested_end": end.isoformat(),
+        "observations_loaded": len(observations),
+        "latest_observation_date": latest.rate_date,
+        "latest_annual_rate": latest.annual_rate,
+        "quality_status": "pass",
+    }

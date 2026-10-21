@@ -163,12 +163,14 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
             "holdings_and_cash_loaded": "pass", "transactions_loaded": "pass", "securities_mapped": "pass",
             "nav_reconciled": "pass"})
         account = "KIWOOM-1234567890"
-        self.assertEqual(self._today("position_snapshots", account), 1)
         self.assertEqual(self._count("trades", account), 1)
         self.assertEqual(self._count("cash_transactions", account), 1)
-        nav = self.db.execute("SELECT total_text FROM nav_snapshots WHERE account_id = ? AND snapshot_date = ?",
-                              (account, TODAY.isoformat())).fetchone()
-        self.assertEqual(nav["total_text"], "8000000")
+        # Today's holdings and total are Kiwoom's live prices: checked, but left for the
+        # next day's history pass to store at the official close.
+        for table in ("position_snapshots", "cash_snapshots", "nav_snapshots"):
+            self.assertEqual(self._today(table, account), 0, table)
+        self.assertEqual(self.db.execute("SELECT count(*) AS n FROM fx_rates WHERE account_id = ? AND rate_date = ?",
+                                         (account, TODAY.isoformat())).fetchone()["n"], 0)
         self.assertEqual(self.db.execute(
             "SELECT security_key FROM security_identifiers WHERE scheme = 'krx_code' AND identifier = '005930'"
         ).fetchone()["security_key"], "KRX:005930")
@@ -178,7 +180,7 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
 
         # The same day again replaces rather than adds.
         self._run({"1234567890": FakeKiwoom()})
-        self.assertEqual(self._today("position_snapshots", account), 1)
+        self.assertEqual(self._today("position_snapshots", account), 0)
         self.assertEqual(self._count("trades", account), 1)
 
     def test_history_fills_before_approval_and_is_recorded_after(self):
@@ -208,7 +210,7 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self.assertEqual(check["status"], "pass", check["message"])
         days = self.db.execute("SELECT count(DISTINCT snapshot_date) AS n FROM nav_snapshots WHERE account_id = ?",
                                (account,)).fetchone()["n"]
-        self.assertEqual(days, len(weekdays))  # every weekday but the closed one, plus today
+        self.assertEqual(days, len(weekdays) - 1)  # every weekday but the closed one; today waits for its close
         self.assertEqual(self.db.execute("SELECT total_text FROM nav_snapshots WHERE account_id = ? AND "
                                          "snapshot_date = '2025-06-02'", (account,)).fetchone()["total_text"],
                          "7988450")
@@ -349,7 +351,7 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         result = self._run({"7234567890": FakeKiwoom(refuse_history=True)})[0]
         self.assertEqual((result["status"], result["history"]["check"]), ("loaded", "fail"))
         self.assertIn("no data before the account opened", self._history_check(case_id)["message"])
-        self.assertEqual(self._today("position_snapshots", "KIWOOM-7234567890"), 1)
+        self.assertEqual(self._count("trades", "KIWOOM-7234567890"), 1)
 
     def test_a_refusal_marks_the_connection_and_writes_nothing(self):
         connection_id, case_id = self._kiwoom_account("2234567890")

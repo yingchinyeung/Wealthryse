@@ -432,11 +432,20 @@ def _clear_day(connection, account_id: str, day: date, fx_rates: Sequence[Mappin
                            (account_id, day.isoformat()))
 
 
+# What the daily run writes. Its holdings and totals are Kiwoom's live prices (kt00018, kt00004),
+# so the day's snapshot is left to the next day's history pass, which writes it at the official close.
+DAILY_TABLES = ("trades", "cash_transactions")
+
+
 def store(connection, collected: Collected, *, display_name: str, now: datetime) -> dict[str, int]:
-    """Write one collection in the caller's transaction. Re-running a day replaces that day's rows."""
+    """Write one collection's instruments and movements in the caller's transaction.
+
+    The day's holdings, cash and total are checked (stage_two_checks) but not stored:
+    they carry live prices, and the history pass stores each day at the close.
+    """
 
     stamp = now.astimezone(timezone.utc).isoformat()
-    payload = {table: rows for table, rows in collected.rows.items()}
+    payload = {table: collected.rows[table] for table in ("instruments", *DAILY_TABLES)}
     run_id = connection.execute(
         "INSERT INTO ingestion_runs (run_type, requested_from, requested_to, started_at, completed_at, status, "
         "raw_sha256, row_count) VALUES (?, ?, ?, ?, ?, 'success', ?, ?) RETURNING run_id",
@@ -451,11 +460,10 @@ def store(connection, collected: Collected, *, display_name: str, now: datetime)
          json.dumps({"source": SOURCE, "account_name": collected.valuation.account_name}, ensure_ascii=False)),
     )
     _register(connection, collected.new_securities, collected.rows["instruments"], stamp)
-    _clear_day(connection, collected.account_id, collected.day, collected.rows["fx_rates"])
     counts: dict[str, int] = {}
-    for table, keys in _KEYS.items():
+    for table in DAILY_TABLES:
         rows = [{**row, "row_sha256": _sha(row), "last_seen_run_id": run_id} for row in collected.rows[table]]
-        counts[table] = _upsert(connection, table, rows, keys)
+        counts[table] = _upsert(connection, table, rows, _KEYS[table])
     return counts
 
 
@@ -481,8 +489,8 @@ def days_with_snapshots(connection, account_id: str, start: date, end: date) -> 
     leaving it out here has the history fill it again.
     """
 
-    # Only a day written by the history pass counts: the daily run's row for a day can carry
-    # after-market prices, so the history pass collects that day again at the official close.
+    # Only a day written by the history pass counts: a day the daily run wrote before it stopped
+    # storing snapshots carries live prices, so the history pass collects it again at the close.
     rows = connection.execute(
         "SELECT n.snapshot_date, n.total_text, n.cash_text, n.stock_text, n.accruals_text, "
         "c.ending_cash_text, c.settled_cash_text FROM nav_snapshots n LEFT JOIN cash_snapshots c "

@@ -38,7 +38,7 @@ _RULES = {
         r"how long (could|would|will|can) (the|my|our) (money|savings|account|portfolio) last|"
         r"where could (this|the|my|our) (account|portfolio) be|"
         r"if (i|we) (add|withdraw|invest|contribute|put in|take out)\w*|"
-        r"if (the )?[\w&.-]+( [\w&.-]+)? (fell|falls|drops?|dropped|"
+        r"if (the )?[\w&.-]+( [\w&.-]+)? (fell|falls?|drops?|dropped|"
         r"rises?|rose|crash\w*|doubles?|halves?))\b", re.I),
     "metrics_guide": re.compile(
         r"(\bwhat( is|'s| are| does) (a |an |the )?(sharpe|sortino|calmar|twr|mwr|irr|time[- ]weighted|"

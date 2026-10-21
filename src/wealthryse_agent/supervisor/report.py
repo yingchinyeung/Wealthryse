@@ -25,6 +25,9 @@ from datetime import date
 from typing import Any, Iterable
 
 AGREEMENTS = ("agree", "over", "under", "partial", "differ", "undecided", "no_tools")
+# A Kiwoom account's subject id (ibkr_etl.kiwoom_collector.platform_account_id): its chat is counted apart,
+# account by account, since Korea iStrategy is in won and U.S. iStrategy in dollars.
+KIWOOM_PREFIX = "KIWOOM-"
 
 
 def _percentile(values: list[int], share: float) -> int | None:
@@ -37,10 +40,31 @@ def _percentile(values: list[int], share: float) -> int | None:
 def summarise(roots: Iterable[dict[str, Any]]) -> dict[str, Any]:
     roots = list(roots)
     chat = [r for r in roots if r.get("source", "chat") != "event"]
-    summary = _watched([r for r in chat if r.get("mode", "watch") == "watch"])
+    watched = [r for r in chat if r.get("mode", "watch") == "watch"]
+    summary = _watched(watched)
+    summary["kiwoom"] = _kiwoom(watched)
     summary["live"] = _live([r for r in chat if r.get("mode") == "live"])
     summary["events"] = _events([r for r in roots if r.get("source") == "event"])
     return summary
+
+
+def _kiwoom(roots: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    """Each Kiwoom account's watched answers: how many, how many no rule placed (a question in Korean
+    lands there), how many the rules matched exactly, and the figure check's warnings."""
+    by_account: dict[str, dict[str, int]] = {}
+    for root in roots:
+        subject = str(root.get("subject_id") or "")
+        if not subject.startswith(KIWOOM_PREFIX):
+            continue
+        detail = root.get("detail") or {}
+        counts = by_account.setdefault(subject, {"requests": 0, "no_rule_matched": 0, "agree": 0,
+                                                 "figure_check_warnings": 0, "rejected": 0})
+        counts["requests"] += 1
+        counts["no_rule_matched"] += (detail.get("route") or {}).get("lead", "router") == "router"
+        counts["agree"] += detail.get("agreement") == "agree"
+        counts["figure_check_warnings"] += int(detail.get("figure_warnings") or 0)
+        counts["rejected"] += root.get("status") == "rejected"
+    return dict(sorted(by_account.items()))
 
 
 def _events(roots: list[dict[str, Any]]) -> dict[str, Any]:
@@ -150,6 +174,11 @@ def render(summary: dict[str, Any], since: str, until: str) -> str:
              "route (finished answers only): " + (", ".join(f"{k} {v}" for k, v in sorted(summary["cost"]["mean_tokens_by_lead"].items()))
                           or "none") + ".",
              f"Time to answer: median {summary['elapsed_ms']['p50']} ms, 90th percentile {summary['elapsed_ms']['p90']} ms."]
+    for subject, counts in (summary.get("kiwoom") or {}).items():
+        k = counts["requests"]
+        lines.append(f"Kiwoom account ending {subject[-4:]}: {k} answers, no rule matched {_share(counts['no_rule_matched'], k)}, "
+                     f"agree {_share(counts['agree'], k)}, rejected {counts['rejected']}, "
+                     f"figure-check warnings {counts['figure_check_warnings']}.")
     events = summary.get("events") or {}
     if events.get("events"):
         lines += ["",

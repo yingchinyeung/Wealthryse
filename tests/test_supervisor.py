@@ -615,6 +615,27 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Checker objected to 1 (50%), rewritten 1", text)
         self.assertNotIn("Live answers", report.render(report.summarise([watched]), "2026-10-29", "2026-10-30"))
 
+    def test_each_kiwoom_account_is_counted_apart(self):
+        def root(subject, lead, agreement_kind, status="done", **detail):
+            return {"mode": "watch", "status": status, "subject_id": subject, "usage": {},
+                    "detail": {"route": {"lead": lead}, "agreement": agreement_kind, **detail}}
+
+        roots = [root("KIWOOM-0000001111", "router", "undecided"),
+                 root("KIWOOM-0000001111", "fast_path", "agree", figure_warnings=2),
+                 root("KIWOOM-0000002222", "planner", "over", status="rejected"),
+                 root("U1234567", "fast_path", "agree")]
+        summary = report.summarise(roots)
+        self.assertEqual(summary["requests"], 4)
+        self.assertEqual(summary["kiwoom"], {
+            "KIWOOM-0000002222": {"requests": 1, "no_rule_matched": 0, "agree": 0, "figure_check_warnings": 0,
+                                  "rejected": 1},
+            "KIWOOM-0000001111": {"requests": 2, "no_rule_matched": 1, "agree": 1, "figure_check_warnings": 2,
+                                  "rejected": 0}})
+        text = report.render(summary, "2026-10-29", "2026-11-09")
+        self.assertIn("Kiwoom account ending 1111: 2 answers, no rule matched 1 (50%), agree 1 (50%)", text)
+        self.assertNotIn("0000001111", text, "the report shows only the last four digits")
+        self.assertNotIn("Kiwoom", report.render(report.summarise(roots[3:]), "2026-10-29", "2026-11-09"))
+
     def test_an_empty_period(self):
         summary = report.summarise([])
         self.assertEqual(summary["requests"], 0)

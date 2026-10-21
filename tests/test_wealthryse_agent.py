@@ -53,6 +53,13 @@ class ValidatorTests(unittest.TestCase):
     def test_figures_need_a_citation(self):
         self.assertFalse(validate_answer("Returns were 5%.", [], RESULTS).ok)
 
+    def test_won_amounts_are_checked_with_their_korean_units(self):
+        results = {"T1": {"data": {"nav": 1234567890.0, "currency": "KRW"}}}
+        for answer, ok in (("It is worth \u20a91,234,567,890 [T1].", True), ("It is worth 12\uc5b5 \uc6d0 [T1].", True),
+                           ("It is worth 123,457\ub9cc \uc6d0 [T1].", True), ("It is worth 5\uc5b5\uc6d0 [T1].", False),
+                           ("It is worth \u20a95 [T1].", False), ("It is worth 0.001\uc870 [T1].", True)):
+            self.assertEqual(validate_answer(answer, ["T1"], results).ok, ok, answer)
+
     def test_counts_dates_and_question_numbers_are_allowed(self):
         answer = "As of 2026-03-31 your top 3 holdings drove 2026's gains [T1]; you asked about 42."
         self.assertTrue(validate_answer(answer, ["T1"], RESULTS, question="What about 42?").ok)
@@ -514,6 +521,20 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(evaluate.assign_cases(cases, ["U1", "U2"]),
                          [(cases[0], "U1", "q"), (cases[1], "U2", "Show U1"), (cases[2], "U9", "q")])
         self.assertEqual([c.case_id for c, _, _ in evaluate.assign_cases(cases, ["U1"])], ["a", "c"])
+
+    def test_won_cases_go_to_won_accounts_and_dollar_amounts_skip_them(self):
+        cases = [evaluate.Case("a", "q", amounts=True), evaluate.Case("b", "q", amounts=True),
+                 evaluate.Case("c", "q", currency="KRW"), evaluate.Case("d", "q"), evaluate.Case("e", "q", currency="JPY")]
+        currencies = {"U1": "USD", "KIWOOM-1": "KRW", "U2": "hkd"}
+        planned = evaluate.assign_cases(cases, ["U1", "KIWOOM-1", "U2"], currencies)
+        self.assertEqual([(c.case_id, subject) for c, subject, _ in planned],
+                         [("a", "U1"), ("b", "U2"), ("c", "KIWOOM-1"), ("d", "U1")])
+        # Without currencies every account is used, as before; a currency case finds no account.
+        self.assertEqual([(c.case_id, subject) for c, subject, _ in evaluate.assign_cases(cases, ["U1", "U2"])],
+                         [("a", "U1"), ("b", "U2"), ("d", "U2")])
+        won = [c for c in evaluate.DEFAULT_CASES if c.currency == "KRW"]
+        self.assertTrue(won and all(c.expected_tools for c in won))
+        self.assertTrue(all(c.amounts for c in evaluate.DEFAULT_CASES if c.case_id in ("model-01", "model-02", "model-03")))
 
     def test_default_set_and_readiness(self):
         ids = [c.case_id for c in evaluate.DEFAULT_CASES]

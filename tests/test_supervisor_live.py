@@ -581,6 +581,15 @@ class PromptTests(unittest.TestCase):
                 self.assertNotIn(tool, text, f"{name} is told about {tool}")
             self.assertIn("U1", text)
 
+    def test_won_amounts_and_the_factor_fit_for_won_accounts(self):
+        for name in registry.CLIENT_SPECIALISTS:
+            text = prompts.specialist(name, account_id="KIWOOM-1", today="2026-10-29", writes_answer=False)
+            self.assertIn("never in \ub9cc, \uc5b5 or \uc870", text)
+        self.assertIn("never in \ub9cc, \uc5b5 or \uc870", prompts.writer(account_id="U1", today="2026-10-29", findings={}, failed=[]))
+        for name in ("risk", "modelling"):
+            self.assertIn("no Korea set", prompts.AREAS[name])
+        self.assertIn("matched nothing", prompts.AREAS["modelling"])
+
     def test_the_writer_keeps_braces_in_findings(self):
         text = prompts.writer(account_id="U1", today="2026-10-29", findings={"risk": "a {weird} finding"}, failed=[])
         self.assertIn("a {weird} finding", text)

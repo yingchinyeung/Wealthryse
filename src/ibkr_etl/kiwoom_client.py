@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Callable, Mapping
 
@@ -80,12 +80,24 @@ class KiwoomUnknownStock(KiwoomError):
 USER_AGENT = "IBKR-Portfolio-Analytics/2.1"
 
 
+class RawAnswer(dict):
+    """A parsed Kiwoom answer that keeps the body exactly as received, in ``raw``, for bronze."""
+
+    def __init__(self, payload: Mapping[str, object], raw: bytes) -> None:
+        super().__init__(payload)
+        self.raw = raw
+
+
 def _urllib_transport(url: str, headers: Mapping[str, str], body: bytes):
     request = urllib.request.Request(url, data=body, method="POST",
                                      headers={"User-Agent": USER_AGENT, "Accept": "application/json", **headers})
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return response.status, {k.lower(): v for k, v in response.headers.items()}, json.load(response)
+            raw = response.read()
+            payload = json.loads(raw)
+            if isinstance(payload, Mapping):
+                payload = RawAnswer(payload, raw)
+            return response.status, {k.lower(): v for k, v in response.headers.items()}, payload
     except urllib.error.HTTPError as error:
         try:
             raw = error.read()
@@ -96,7 +108,32 @@ def _urllib_transport(url: str, headers: Mapping[str, str], body: bytes):
         except ValueError:
             text = " ".join(raw.decode("utf-8", "replace").split())[:150]
             payload = {"return_msg": f"non-JSON answer: {text}" if text else ""}
+        if isinstance(payload, Mapping):
+            payload = RawAnswer(payload, raw)
         return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, payload
+
+
+@dataclass(frozen=True)
+class Answer:
+    """One page of one inquiry as Kiwoom sent it, handed to the bronze capture (kiwoom_bronze).
+
+    ``body`` is the response body as received; a test transport that returns a parsed answer is
+    stored as its compact JSON. Only the two paging headers are kept. Token calls never get here.
+    """
+
+    api_id: str
+    request: Mapping[str, object]
+    page_no: int
+    cont_yn: str | None
+    next_key: str | None
+    requested_at: datetime
+    received_at: datetime
+    http_status: int
+    return_code: int | None
+    body: bytes
+
+
+Capture = Callable[[Answer], None]
 
 
 def kiwoom_number(value: object, *, unsigned: bool = False) -> Decimal:
@@ -318,11 +355,18 @@ class KiwoomClient:
         self._token: str | None = None
         self._token_expires: datetime | None = None
         self._closes: dict[str, dict[str, Decimal]] = {}
+        self._capture: Capture | None = None
 
     def __repr__(self) -> str:
         return f"KiwoomClient(environment={self.environment!r})"
 
-    def _post(self, path: str, headers: Mapping[str, str], body: Mapping[str, object]):
+    def set_capture(self, capture: Capture | None) -> None:
+        """Hand every inquiry page, refusals included, to ``capture`` (the bronze writer). Never token calls."""
+
+        self._capture = capture
+
+    def _post(self, path: str, headers: Mapping[str, str], body: Mapping[str, object], *,
+              page_no: int = 1):
         if path not in {TOKEN_PATH, REVOKE_PATH, *INQUIRY_APIS.values()}:
             raise KiwoomError("Only Kiwoom inquiry calls are allowed")
         if self._last_call is not None and self._min_interval:
@@ -332,6 +376,7 @@ class KiwoomClient:
         self._last_call = self._clock()
         encoded = json.dumps(body, separators=(",", ":")).encode("utf-8")
         call = headers.get("api-id") or path
+        requested_at = datetime.now(timezone.utc)
         for attempt in range(TRANSPORT_TRIES):
             try:
                 status, response_headers, payload = self._transport(
@@ -346,6 +391,8 @@ class KiwoomClient:
                                       f"{type(error).__name__}: {str(error)[:120]}") from error
                 self._sleep(TRANSPORT_RETRY_SECONDS * (attempt + 1))
                 self._last_call = self._clock()
+        if path in INQUIRY_APIS.values() and self._capture is not None:
+            self._hand_over(call, body, page_no, requested_at, status, response_headers, payload)
         if not isinstance(payload, Mapping):
             raise KiwoomError(f"Kiwoom returned a non-JSON answer (HTTP {status})")
         code = payload.get("return_code", 0)
@@ -356,6 +403,30 @@ class KiwoomClient:
             refusal = KiwoomUnknownStock if "[1903:" in message else KiwoomError
             raise refusal(f"Kiwoom refused the call {call} (HTTP {status}, code {code}): {message}")
         return response_headers, payload
+
+    def _hand_over(self, api_id: str, body: Mapping[str, object], page_no: int, requested_at: datetime,
+                   status: int, headers: Mapping[str, str], payload: object) -> None:
+        # Bronze is best effort: nothing here may stop or change the inquiry.
+        try:
+            raw = getattr(payload, "raw", None)
+            if not isinstance(raw, (bytes, bytearray)):
+                raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            code = payload.get("return_code") if isinstance(payload, Mapping) else None
+            try:
+                return_code = int(str(code).strip()) if code is not None and str(code).strip() else None
+            except ValueError:
+                return_code = None
+            lowered = {str(k).lower(): v for k, v in (headers or {}).items()}
+            cont = str(lowered.get("cont-yn") or "").strip().upper() or None
+            self._capture(Answer(
+                api_id=api_id, request=dict(body), page_no=page_no,
+                cont_yn=cont if cont in ("Y", "N") else None,
+                next_key=(str(lowered.get("next-key") or "").strip() or None),
+                requested_at=requested_at, received_at=max(requested_at, datetime.now(timezone.utc)),
+                http_status=int(status), return_code=return_code, body=bytes(raw),
+            ))
+        except Exception:  # noqa: BLE001 - a capture fault never fails the call
+            pass
 
     def _bearer(self) -> str:
         now = self._clock()
@@ -400,7 +471,7 @@ class KiwoomClient:
             if max_pages is not None and len(pages) >= max_pages:
                 return pages
             headers = {"authorization": f"Bearer {self._bearer()}", "api-id": api_id, **continuation}
-            response_headers, payload = self._post(INQUIRY_APIS[api_id], headers, body)
+            response_headers, payload = self._post(INQUIRY_APIS[api_id], headers, body, page_no=len(pages) + 1)
             pages.append(payload)
             if str(response_headers.get("cont-yn", "N")).upper() != "Y":
                 return pages

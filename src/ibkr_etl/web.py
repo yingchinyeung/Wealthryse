@@ -1856,6 +1856,50 @@ def _holdings_fx_account(connection, subject_id: str, subject_type: str) -> str 
     return str(definition["source_account_id"]) if definition and definition["source_account_id"] else None
 
 
+# A market reference rate stands in only within this many days before the snapshot.
+REFERENCE_FX_MAX_AGE_DAYS = 4
+
+
+def _reference_fx_fallback(connection, rows: list[dict], fx_rows, *, reporting_currency: str,
+                           snapshot_date: str) -> dict:
+    """Market reference FX for currency pairs the account's own FX history lacks.
+
+    An account converts with its own dated FX history. A Kiwoom won account keeps no FX
+    (it holds only won), so to show it in another currency, such as USD in Combined
+    holdings, the validated reference rate (Yahoo close in reference_fx_rates) is used
+    instead, dated within REFERENCE_FX_MAX_AGE_DAYS of the snapshot. Pairs the account
+    has any history for are never replaced.
+    """
+    target = str(reporting_currency or "").upper()
+    own = {(str(r["from_currency"]).upper(), str(r["to_currency"]).upper()) for r in fx_rows}
+    natives = sorted({str(r.get("currency") or "").upper() for r in rows} - {target, ""})
+    missing = [n for n in natives if (n, target) not in own and (target, n) not in own]
+    if not missing or len(target) != 3:
+        return {"rows": [], "pairs": []}
+    earliest = (date.fromisoformat(snapshot_date[:10])
+                - timedelta(days=REFERENCE_FX_MAX_AGE_DAYS)).isoformat()
+    found: dict[tuple[str, str, str], dict] = {}
+    pairs: set[str] = set()
+    for native in missing:
+        for row in connection.execute(
+            """
+            SELECT rate_date, from_currency, to_currency, rate, provider
+            FROM reference_fx_rates
+            WHERE tenant_id = %s AND from_currency = %s AND to_currency = %s
+              AND rate_date >= %s AND rate_date <= %s
+              AND quality_status IN ('pass', 'warn')
+            ORDER BY rate_date, provider
+            """,
+            (TENANT_ID, native, target, earliest, snapshot_date[:10]),
+        ).fetchall():
+            key = (native, target, str(row["rate_date"])[:10])
+            # One observation a day (the first provider), so the dated lookup is never ambiguous.
+            found.setdefault(key, {"rate_date": key[2], "from_currency": native, "to_currency": target,
+                                   "rate_text": str(row["rate"])})
+            pairs.add(f"{native}/{target}")
+    return {"rows": [found[key] for key in sorted(found)], "pairs": sorted(pairs)}
+
+
 def _enrich_subject_holdings(
     connection,
     subject_id: str,
@@ -1885,6 +1929,9 @@ def _enrich_subject_holdings(
             """,
             (fx_account, snapshot_date),
         ).fetchall()
+    reference_pairs = _reference_fx_fallback(
+        connection, rows, fx_rows, reporting_currency=reporting_currency, snapshot_date=snapshot_date)
+    fx_rows = [*fx_rows, *reference_pairs["rows"]]
     nav_total = None
     if nav_currency is not None:
         nav = connection.execute(
@@ -1904,6 +1951,7 @@ def _enrich_subject_holdings(
         fx_unavailable_reason=None if fx_account is not None else "fx_source_unavailable",
     )
     view["fx_account_id"] = fx_account
+    view["fx_reference_pairs"] = reference_pairs["pairs"]
     return view
 
 
@@ -5244,7 +5292,7 @@ const loadCombined=()=>{
     document.querySelector('#combined-accounts').innerHTML=data.accounts.map(item=>`<div class="status-item"><span class="label">${esc(item.display_name)}</span><strong>${esc(item.snapshot_date||'No snapshot')}</strong><span class="muted">${esc(item.holdings_count)} holdings${item.fx_missing_conids.length?` · ${esc(item.fx_missing_conids.length)} without FX`:''}</span></div>`).join('');
     document.querySelector('#combined-holdings').innerHTML=data.holdings.map(x=>`<tr><td>${esc(x.symbol||x.conid)}</td><td>${esc(x.description||'')}</td><td>${esc(x.sector||'')}</td><td><details><summary>${esc(x.account_count)}</summary>${x.accounts.map(a=>`<div class="muted">${esc(a.display_name)}: ${fmt(a.quantity_text)} · ${a.fx_missing?'FX unavailable':esc(fmt(a.reporting_market_value_text))}</div>`).join('')}</details></td><td>${fmt(x.quantity_text)}</td><td>${money(x.reporting_market_value_text)}${x.incomplete?' <span class="muted" title="At least one account has no usable FX rate for this holding">(partial)</span>':''}</td><td>${money(x.reporting_cost_basis_text)}</td><td>${toned(money(x.reporting_unrealized_pnl_text),x.reporting_unrealized_pnl_text)}</td><td>${toned(pct(x.unrealized_pnl_pct),x.unrealized_pnl_pct)}</td><td data-sort="${x.weight??''}">${pct(x.weight)}</td></tr>`).join('')||'<tr><td colspan="10">No holdings are available for your accounts on or before this date.</td></tr>';
     certifiedLine(document.querySelector('#combined-holdings'),data.certified);
-    document.querySelector('#combined-note').textContent=`${data.accounts.length} physical account(s) combined in ${data.currency}. Filtered and composite portfolios are excluded because they are built from these accounts. Each account uses its own latest snapshot and dated FX history. Weights are shares of gross combined holdings value (cash excluded).${data.incomplete?' Some holdings have no usable FX rate; their values are partial.':''}${data.skipped_accounts.length?` ${data.skipped_accounts.length} account(s) could not be included.`:''}`;
+    document.querySelector('#combined-note').textContent=`${data.accounts.length} physical account(s) combined in ${data.currency}. Filtered and composite portfolios are excluded because they are built from these accounts. Each account uses its own latest snapshot and dated FX history, or a market reference rate where it keeps none. Weights are shares of gross combined holdings value (cash excluded).${data.incomplete?' Some holdings have no usable FX rate; their values are partial.':''}${data.skipped_accounts.length?` ${data.skipped_accounts.length} account(s) could not be included.`:''}`;
   }).catch(error=>{document.querySelector('#combined-note').textContent=`Combined holdings are unavailable: ${error.message}`;document.querySelector('#combined-holdings').innerHTML=''});
 };
 combinedForm.addEventListener('submit',event=>{event.preventDefault();loadCombined()});

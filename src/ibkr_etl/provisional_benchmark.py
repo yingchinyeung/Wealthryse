@@ -334,6 +334,29 @@ def _store_reference_fx_rates(
         )
 
 
+# Accounts reporting in these currencies keep no FX of their own (a Kiwoom won account
+# holds only won), so the benchmark run also stores their currency against USD for the
+# USD views, such as Combined holdings. HKD subjects already have theirs.
+REPORTING_USD_FX = {"KRW"}
+
+
+def _store_reporting_usd_fx(connection: Any, reporting_currency: str, fx_by_currency: dict,
+                            start_date: date, end_date: date, ticker_factory: Callable[[str], Any] | None,
+                            fetched_at: str) -> dict[str, Any] | None:
+    """Best effort: a missing quote is reported and never holds back the comparison."""
+
+    if reporting_currency not in REPORTING_USD_FX or "USD" in fx_by_currency:
+        return None
+    try:
+        rates, symbol = fetch_fx_to_reporting_yfinance(
+            "USD", reporting_currency, start_date - timedelta(days=7), end_date, ticker_factory)
+    except Exception as error:  # noqa: BLE001 - reported in the run result
+        return {"status": "unavailable", "error": " ".join(str(error).split())[:300]}
+    _store_reference_fx_rates(connection, from_currency="USD", reporting_currency=reporting_currency,
+                              rates=rates, fetched_at=fetched_at)
+    return {"status": "stored", "symbol": symbol, "observations": len(rates)}
+
+
 def _account_contract(connection: Any, account_id: str) -> tuple[str, str, date]:
     row = connection.execute(
         """
@@ -600,6 +623,8 @@ def _refresh_and_materialize(
             rates=rates,
             fetched_at=fetched_at,
         )
+    usd_fx = _store_reporting_usd_fx(
+        connection, reporting_currency, fx_by_currency, start_date, end_date, ticker_factory, fetched_at)
     summaries: list[dict[str, Any]] = []
     for spec in specs:
         if spec.benchmark_id in unavailable_by_id:
@@ -846,4 +871,5 @@ def _refresh_and_materialize(
             else "fail"
         ),
         "benchmarks": summaries,
+        **({"reporting_usd_fx": usd_fx} if usd_fx else {}),
     }

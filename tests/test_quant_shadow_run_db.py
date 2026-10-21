@@ -166,8 +166,10 @@ class ShadowRunTests(unittest.TestCase):
                                                    "live_tables": True})
         self.assertEqual(report["subjects"]["eligible"], 2)
         self.assertEqual(report["subjects"]["latest_nav"],
-                         [{"subject": "u01", "subject_type": "physical_account", "latest_nav_date": AS_OF},
-                          {"subject": "u02", "subject_type": "physical_account", "latest_nav_date": AS_OF}])
+                         [{"subject": "u01", "subject_type": "physical_account", "broker": "ibkr",
+                           "latest_nav_date": AS_OF},
+                          {"subject": "u02", "subject_type": "physical_account", "broker": "ibkr",
+                           "latest_nav_date": AS_OF}])
         self.assertEqual(report["subjects"]["by_type"],
                          [{"subject_type": "physical_account", "lifecycle_status": "active", "subjects": 2}])
         for name, value in report["inputs"].items():
@@ -277,6 +279,10 @@ class ShadowRunTests(unittest.TestCase):
         self.assertEqual((rows["subject_dates_complete"], rows["first_date"], rows["last_date"]),
                          (pairs, "2026-10-12", AS_OF))
         self.assertEqual([item["subject"] for item in rows["subjects"]], ["u01", "u02"])
+        # Both made-up accounts are IBKR's, so one broker group with every row.
+        self.assertEqual(list(rows["by_broker"]), ["ibkr"])
+        self.assertEqual(sum(entry["rows"] for entry in rows["by_broker"]["ibkr"].values()), 9 * pairs)
+        self.assertIn("### Rows by broker (unavailable in brackets)", markdown)
         self.assertEqual(review["history"], {"history_days": 6, "subject_dates": pairs, "complete": pairs, "left": 0})
         # The timing maths on the known timings.
         latest = review["timing"]["latest_pass"]

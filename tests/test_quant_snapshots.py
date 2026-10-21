@@ -48,7 +48,7 @@ def synthetic_data(*, holdings: int = 8, days: int = 320, seed: int = 7, as_of: 
     cash, level = 20000.0, 100.0
     data = {"subject_id": ACCOUNT, "as_of": as_of, "subject_type": subject_type, "reporting_currency": "USD",
             "benchmark_id": "synthetic-benchmark", "comparison": [], "positions": [], "trades": [], "nav": [],
-            "flows": [], "fx": [], "risk_free": {"rate_date": as_of, "annual_rate": 0.04},
+            "flows": [], "fx": [], "risk_free": {"rate_date": as_of, "annual_rate": 0.04, "currency": "USD", "series_id": "SYN"},
             "classifications": {conid: ("Technology", "Financials", "Energy")[i % 3]
                                 for i, conid in enumerate(conids[:-1])}}
     previous_nav = None

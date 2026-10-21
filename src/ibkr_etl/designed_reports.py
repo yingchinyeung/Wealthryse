@@ -175,15 +175,26 @@ HISTORY_RUN_TYPES = {"kiwoom_rest": ("kiwoom_rest_history", "kiwoom_rest_us_hist
 
 def _close_is_final(connection, subject_id: str, period_end: str, day: str) -> bool:
     """The month's last NAV row was rewritten by a history run at the official close,
-    and a later trading day's row is in (the nav_snapshots contract's rule)."""
+    and a later trading day's row is in (the nav_snapshots contract's rule).
+
+    A Kiwoom U.S. day also has to add up: for its latest sessions Kiwoom's daily total is a
+    provisional figure that the history pass stores and asks for again on each run
+    (kiwoom_us_account.US_SETTLING_SESSIONS), so the month waits until the day's positions
+    at their closes add up to Kiwoom's securities value."""
 
     final = connection.execute(
-        "SELECT 1 AS final FROM nav_snapshots n JOIN ingestion_runs r ON r.run_id = n.last_seen_run_id "
+        "SELECT r.run_type FROM nav_snapshots n JOIN ingestion_runs r ON r.run_id = n.last_seen_run_id "
         "WHERE n.account_id = ? AND n.snapshot_date = ? AND n.asset_class = 'TOTAL' AND r.run_type IN (?, ?)",
         (subject_id, day, *HISTORY_RUN_TYPES["kiwoom_rest"]),
     ).fetchone()
     if not final:
         return False
+    from .kiwoom_us_account import US_HISTORY_RUN, us_days_stored
+
+    if str(final["run_type"]) == US_HISTORY_RUN:
+        settled = date.fromisoformat(str(day)[:10])
+        if settled not in us_days_stored(connection, subject_id, settled, settled):
+            return False
     later = connection.execute(
         "SELECT MIN(n.snapshot_date) AS day FROM nav_snapshots n "
         "WHERE n.account_id = ? AND n.snapshot_date > ? AND n.asset_class = 'TOTAL'",

@@ -91,6 +91,21 @@ class UsIstrategySecuritiesTests(unittest.TestCase):
         with self.assertRaisesRegex(legacy.MonthlyArtifactError, "IONQ"):
             _inputs(snapshot)
 
+    def test_a_holding_yahoo_stopped_quoting_after_a_takeover_keeps_its_listed_name(self):
+        snapshot = _us_snapshot({"FYBR": (300.0, "", ""), "DFS": (200.0, "", "")})
+        for row in snapshot["sector_allocation"]["classifications"]:
+            row.pop("long_name"), row.pop("sub_sector")
+        inputs = _inputs(snapshot)
+        self.assertEqual([h["company_name"] for h in inputs.top_holdings], [
+            "Frontier Communications Parent, Inc.", "Discover Financial Services"])
+        self.assertEqual([(row["sector"], row["sub_sector"]) for row in inputs.sectors], [
+            ("Telecommunication Services", "Telecommunication Services"), ("Financials", "Diversified Financials")])
+
+    def test_a_delisted_holding_with_no_classification_row_still_renders(self):
+        snapshot = _us_snapshot({"DFS": (200.0, "", ""), "MU": (100.0, "Micron Technology, Inc.", "Semiconductors")})
+        snapshot["sector_allocation"]["classifications"].pop(0)
+        self.assertEqual(_inputs(snapshot).top_holdings[0]["company_name"], "Discover Financial Services")
+
     def test_designer_previews_keep_their_made_up_holdings(self):
         snapshot = stress.snapshot(currency="USD")
         inputs = _inputs(snapshot)

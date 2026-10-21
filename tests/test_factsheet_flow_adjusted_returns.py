@@ -153,6 +153,52 @@ class ExternalFlowSourceTests(unittest.TestCase):
         self.assertEqual(self.flows(), {"2026-05-26": 25000.0})
 
 
+class KiwoomExternalFlowTests(unittest.TestCase):
+    """A Kiwoom account has no Flex file: its DEPOSIT and WITHDRAWAL cash rows are its flows (USD only)."""
+
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.connection.executescript(
+            """
+            CREATE TABLE accounts (account_id TEXT, base_currency TEXT);
+            CREATE TABLE fx_rates (account_id TEXT, rate_date TEXT, from_currency TEXT,
+                                   to_currency TEXT, rate_text TEXT);
+            CREATE TABLE flex_rows (account_id TEXT, section TEXT, data_json TEXT);
+            CREATE TABLE cash_transactions (account_id TEXT, effective_date TEXT, transaction_type TEXT,
+                                            amount_text TEXT, currency TEXT);
+            INSERT INTO accounts VALUES ('KIWOOM-US', 'USD'), ('KIWOOM-KR', 'KRW'), ('U1', 'USD');
+            """
+        )
+
+    def cash(self, account, day, kind, amount, currency):
+        self.connection.execute("INSERT INTO cash_transactions VALUES (?, ?, ?, ?, ?)",
+                                (account, day, kind, amount, currency))
+
+    def flows(self, account):
+        return _external_flows(self.connection, account, subject_type="physical_account")
+
+    def test_usd_kiwoom_deposits_and_withdrawals_are_flows_and_income_is_not(self):
+        self.cash("KIWOOM-US", "2025-11-26", "DEPOSIT", "377.2", "USD")
+        self.cash("KIWOOM-US", "2026-01-08", "DEPOSIT", "167.19", "USD")
+        self.cash("KIWOOM-US", "2026-01-08", "WITHDRAWAL", "-20", "USD")
+        self.cash("KIWOOM-US", "2025-11-26", "DIVIDEND", "1.96", "USD")
+        self.cash("KIWOOM-US", "2026-01-22", "CORPORATE_ACTION_CASH", "770", "USD")
+        flows = self.flows("KIWOOM-US")
+        self.assertEqual(set(flows), {"2025-11-26", "2026-01-08"})
+        self.assertAlmostEqual(flows["2025-11-26"], 377.2)
+        self.assertAlmostEqual(flows["2026-01-08"], 147.19)
+
+    def test_korea_kiwoom_account_is_unchanged(self):
+        self.cash("KIWOOM-KR", "2025-11-26", "DEPOSIT", "500000", "KRW")
+        self.assertEqual(self.flows("KIWOOM-KR"), {})
+
+    def test_an_account_with_a_flex_file_reads_only_the_flex_file(self):
+        self.connection.execute("INSERT INTO flex_rows VALUES ('U1', 'Trades', '{}')")
+        self.cash("U1", "2026-01-08", "DEPOSIT", "100", "USD")
+        self.assertEqual(self.flows("U1"), {})
+
+
 class AttributionCashClassifierTests(unittest.TestCase):
     def test_swire_dividend_is_not_an_external_wire(self):
         self.assertFalse(_external_cash_flow("Dividends", "SWIRE PACIFIC LTD-CL A CASH DIVIDEND"))

@@ -359,6 +359,60 @@ class DifferenceTests(FlowsSourceTestCase):
         self.assertEqual(self.lines, [])
 
 
+class KiwoomFlowsTests(FlowsSourceTestCase):
+    """A Kiwoom U.S. account has no Flex file: both readers take its DEPOSIT and WITHDRAWAL cash rows."""
+
+    US = "KIWOOM-T9300003"
+    KR = "KIWOOM-T9300004"
+
+    def setUp(self):
+        super().setUp()
+        self.db.load(daily_statements(ACCOUNT, cash=standard_cash(), days=1))
+        connection = self.db.connection
+        for account, currency in ((self.US, "USD"), (self.KR, "KRW")):
+            connection.execute(
+                "INSERT INTO accounts (account_id, alias, base_currency, account_type, ib_entity, first_seen_at, "
+                "last_seen_at, source_json) VALUES (?, 'Synthetic', ?, 'kiwoom', NULL, '2026-09-01', '2026-09-01', "
+                "'{}')", (account, currency))
+            for key, (day, kind, amount) in enumerate((("2026-09-02", "DEPOSIT", "5000"),
+                                                       ("2026-09-09", "WITHDRAWAL", "-1200.25"),
+                                                       ("2026-09-09", "DEPOSIT", "300"),
+                                                       ("2026-09-10", "DIVIDEND", "8.40"))):
+                connection.execute(
+                    "INSERT INTO cash_transactions (account_id, source_key, transaction_id, event_datetime, "
+                    "model_code, effective_date, settle_date, transaction_type, description, amount_text, currency, "
+                    "conid, row_sha256, last_seen_run_id) "
+                    "VALUES (?, ?, ?, ?, '', ?, NULL, ?, ?, ?, ?, NULL, '0', 1)",
+                    (account, f"{account}-{key}", f"{account}-{key}", day, day, kind, kind, amount, currency))
+        connection.commit()
+
+    def test_both_readers_take_a_us_accounts_deposits_and_withdrawals(self):
+        expected = {"2026-09-02": 5000.0, "2026-09-09": -900.25}
+        self.assertEqual(self.bronze(self.US), expected)
+        self.assertEqual(flows_source.silver_external_flows(self.db.connection, self.US), expected)
+        for mode in ("off", "fallback", "on"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.flows(mode, account=self.US), expected)
+        self.assertEqual(self.lines, [])
+
+    def test_records_compare_equal(self):
+        bronze_records: list = []
+        silver_records: list = []
+        bronze = _bronze_external_flows(self.db.connection, self.US, subject_type="physical_account",
+                                        records=bronze_records)
+        silver = flows_source.silver_external_flows(self.db.connection, self.US, records=silver_records)
+        self.assertEqual({source for source, *_ in bronze_records}, {"kiwoom"})
+        self.assertTrue(flows_source.compare(bronze, bronze_records, silver, silver_records).equal)
+
+    def test_a_won_account_is_left_out_by_both(self):
+        self.assertEqual(self.bronze(self.KR), {})
+        self.assertEqual(flows_source.silver_external_flows(self.db.connection, self.KR), {})
+
+    def test_an_ibkr_account_is_unchanged(self):
+        self.assertEqual(self.flows("fallback"), self.bronze())
+        self.assertEqual(self.lines, [])
+
+
 class PortfolioTests(FlowsSourceTestCase):
     def test_portfolios_read_their_ledger_in_every_mode(self):
         connection = sqlite3.connect(":memory:")

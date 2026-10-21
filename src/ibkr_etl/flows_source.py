@@ -133,13 +133,14 @@ def silver_external_flows(connection: Any, account_id: str, *,
     The same rule as bronze: IBKR's type "Deposits/Withdrawals", or for older records
     without a type, a bank-transfer description; the report date (silver's effective_date),
     else the settle date, else the day of dateTime; converted to the base currency with the
-    account's IBKR FX rates. Transfers have no silver table, so they are not here.
+    account's IBKR FX rates. Transfers have no silver table, so they are not here. A Kiwoom
+    U.S. account's DEPOSIT and WITHDRAWAL rows are added as the bronze reader adds them.
     """
-    from .provisional_benchmark import _is_external_cash_transaction
+    from .provisional_benchmark import KIWOOM_FLOW_CURRENCIES, _is_external_cash_transaction, _kiwoom_flows
     from .report import FxConverter, _convert, _flex_date, _number
 
     account = connection.execute(
-        "SELECT base_currency FROM accounts WHERE account_id = ?", (account_id,)
+        "SELECT base_currency, account_type FROM accounts WHERE account_id = ?", (account_id,)
     ).fetchone()
     if account is None:
         raise RuntimeError(f"Unknown account: {account_id}")
@@ -167,6 +168,11 @@ def silver_external_flows(connection: Any, account_id: str, *,
             flows[flow_date] += amount
             if records is not None:
                 records.append(("cash", flow_date, str(row["currency"] or ""), _number(row["amount_text"]), amount))
+    # A Kiwoom account's deposits and withdrawals, read as the bronze reader reads them (silver rows in both).
+    if str(account["account_type"] or "") == "kiwoom" and \
+            str(account["base_currency"] or "").upper() in KIWOOM_FLOW_CURRENCIES:
+        for flow_date, amount in _kiwoom_flows(connection, account_id, converter, records=records).items():
+            flows[flow_date] += amount
     return dict(flows)
 
 

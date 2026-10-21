@@ -428,7 +428,8 @@ class KiwoomUsTests(unittest.TestCase):
     def test_us_transactions_keep_both_currencies(self) -> None:
         page = {"return_code": 0, "result_list": [
             {"deal_dt": "20260105", "deal_kind_nm": "Buy", "rmrk_nm": "Buy", "stk_cd": "AMGN",
-             "deal_qty": "10", "crnc_code": "USD", "fc_exct_amt": "-2501.00", "exct_amt": "-000003501400"},
+             "deal_qty": "10", "crnc_code": "USD", "fc_exct_amt": "-2501.00", "exct_amt": "-000003501400",
+             "fc_entra": "-14.32", "proc_time": "08:11:40", "deal_no": "000000003"},
             {"deal_dt": "20260102", "deal_kind_nm": "Deposit", "rmrk_nm": "KRW deposit", "stk_cd": "",
              "deal_qty": "", "crnc_code": "", "fc_exct_amt": "0", "exct_amt": "000005000000"},
         ]}
@@ -439,6 +440,9 @@ class KiwoomUsTests(unittest.TestCase):
                          (SecurityIdentifier("us_ticker", "AMGN"), Decimal("-2501.00"), "USD", Decimal("-3501400")))
         self.assertEqual((deposit.security, deposit.amount, deposit.currency, deposit.amount_krw),
                          (None, Decimal("5000000"), "KRW", None))
+        # Kiwoom's cash after a foreign-currency row, and the row's place in its posting date.
+        self.assertEqual((buy.balance, buy.order), (Decimal("-14.32"), "08:11:40|000000003"))
+        self.assertIsNone(deposit.balance)
         self.assertEqual(fake.requests[-1][2]["tp"], "0")
         missing = {"return_code": 0, "result_list": [{"deal_dt": "20260105", "crnc_code": "USD", "exct_amt": "1"}]}
         with self.assertRaisesRegex(KiwoomError, "missing fc_exct_amt"):

@@ -490,6 +490,43 @@ def _bronze_external_flows(
             if records is not None:
                 records.append(("cash", flow_date, str(values.get("currency") or ""),
                                 _number(values.get("amount")), amount))
+    if str(bases[account_id] or "").upper() in KIWOOM_FLOW_CURRENCIES and connection.execute(
+        "SELECT 1 FROM flex_rows WHERE account_id = ? LIMIT 1", (account_id,)
+    ).fetchone() is None:
+        for flow_date, amount in _kiwoom_flows(connection, account_id, converter, records=records).items():
+            flows[flow_date] += amount
+    return dict(flows)
+
+
+# A Kiwoom account has no Flex file: its deposits and withdrawals are the platform's own cash rows
+# (kiwoom_us_account.balance_gaps for a USD account). Korea's KRW account is left out until its own factsheet
+# check takes them in, so its figures do not move here.
+KIWOOM_FLOW_CURRENCIES = frozenset({"USD"})
+KIWOOM_FLOW_TYPES = ("DEPOSIT", "WITHDRAWAL")
+
+
+def _kiwoom_flows(connection: Any, account_id: str, converter: FxConverter, *,
+                  records: list[tuple[str, str, str, float, float]] | None = None) -> dict[str, float]:
+    """The account's DEPOSIT and WITHDRAWAL rows in silver cash_transactions, in the base currency.
+
+    Both flow readers call this (flows_source.silver_external_flows too), so FLOWS_SOURCE compares like
+    with like; records, when given, receives ("kiwoom", date, currency, amount, base amount) for each row.
+    """
+    flows: dict[str, float] = defaultdict(float)
+    for row in connection.execute(
+        "SELECT effective_date, amount_text, currency FROM cash_transactions "
+        "WHERE account_id = ? AND transaction_type IN (?, ?) ORDER BY effective_date",
+        (account_id, *KIWOOM_FLOW_TYPES),
+    ):
+        flow_date = str(row["effective_date"] or "")[:10]
+        if not flow_date:
+            continue
+        rate = converter.rate(account_id, row["currency"], flow_date)
+        amount = _convert(row["amount_text"], rate)
+        if amount is not None:
+            flows[flow_date] += amount
+            if records is not None:
+                records.append(("kiwoom", flow_date, str(row["currency"] or ""), _number(row["amount_text"]), amount))
     return dict(flows)
 
 

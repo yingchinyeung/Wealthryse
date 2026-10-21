@@ -1288,7 +1288,7 @@
    "kind": "table",
    "layer": "bronze",
    "target_schema": "bronze",
-   "note": "Kiwoom REST inquiry answers exactly as received, one row per page, with the request's account number and query fields. Append-only and restricted. Silver's Kiwoom rows are rebuilt from it by ibkr_etl.kiwoom_conform. Never token calls, keys, secrets or tokens."
+   "note": "Kiwoom REST inquiry answers exactly as received, one row per page, with the request's account number and query fields. Append-only and restricted. ibkr_etl.kiwoom_conform rebuilds silver's Kiwoom rows from it and compares them with silver (read-only until its write mode). Never token calls, keys, secrets or tokens."
   }
  },
  "blob_containers": {

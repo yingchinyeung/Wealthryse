@@ -15,9 +15,8 @@ import os
 import sys
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -28,22 +27,9 @@ from ibkr_etl import lineage  # noqa: E402
 from ibkr_etl.db import DEFAULT_TENANT_ID, connect  # noqa: E402
 from ibkr_etl.kiwoom_bronze import KiwoomBronze  # noqa: E402
 from ibkr_etl.kiwoom_client import KiwoomClient  # noqa: E402
-from ibkr_etl.kiwoom_collector import SECRET_PREFIX, Target, collector_enabled, run  # noqa: E402
+from ibkr_etl.kiwoom_collector import SECRET_PREFIX, Target, collector_enabled, run, snapshot_day  # noqa: E402
 
 VAULT_SCOPE = "https://vault.azure.net/.default"
-SEOUL = ZoneInfo("Asia/Seoul")
-# KRX closes at 15:30; Kiwoom's prices are final a few minutes later.
-CLOSE_SETTLED = time(15, 40)
-
-
-def snapshot_day(now: datetime) -> date:
-    """The KRX trading day whose close Kiwoom's prices show at this moment."""
-
-    local = now.astimezone(SEOUL)
-    day = local.date() if local.time() >= CLOSE_SETTLED else local.date() - timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= timedelta(days=1)
-    return day
 
 
 def _required(name: str) -> str:

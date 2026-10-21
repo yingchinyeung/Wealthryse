@@ -52,6 +52,10 @@
   "080_instrument_long_name.sql": {
    "sha256": "2c625b3df76bd5250715159cbd63dfe2305979a197e3004b91c7fbef208001ad",
    "evidence": "ibkrv2stg-bootstrap-gdcjmun on ibkr-platform main-92e9cdd (sha256:d1ef4cd91121210164c244802174ab1bde830e15ed2f016ae18b7fa702afe0f1), 080 only with bootstrap_postgres.py --only-migration (054, 055, 059, 060, 061 and 079 left pending), English names for the Kiwoom Korea factsheets, status pass with 0 failed checks, 2026-10-20 about 04:32 UTC"
+  },
+  "081_kospi200_via_kodex200.sql": {
+   "sha256": "3189bb5017ecb8f73642129ace065bce1dd277ea012611e0268ad980c0272e23",
+   "evidence": "ibkrv2stg-bootstrap-p5zc7wk on ibkr-platform main-5f452a0 (sha256:67cfa63fced1653234c9e67372acf7d2f9b9f496beb29899fa8796b834ade726) with main's 081 put beside the image's migrations for that one run (job definition unchanged), 081 only with bootstrap_postgres.py --only-migration (054, 055, 059, 060 and 061 left pending), KS200 becomes the KODEX 200 ETF (069500.KS) for Korea iStrategy, execution Succeeded, 2026-10-21T04:44:12Z"
   }
  }
 }

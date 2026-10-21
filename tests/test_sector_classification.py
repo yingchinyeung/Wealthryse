@@ -302,6 +302,30 @@ class SectorClassificationTests(unittest.TestCase):
         self.assertEqual(names, {"KRX:000660": "SK hynix Inc.", "1": "APPLE INC"})
         self.assertEqual(again, [])  # named now, so not looked up again
 
+    def test_a_kiwoom_us_holding_without_its_english_name_is_looked_up_again(self) -> None:
+        connection = self._krw_database(with_name_column=True)
+        connection.executescript(
+            """
+            INSERT INTO instruments VALUES ('US:ACHR', 'ACHR', 'ACHR', 'US', 'USD');
+            INSERT INTO position_snapshots VALUES ('K1', '2026-08-31', 'US:ACHR', 'USD', '96');
+            INSERT INTO instrument_classifications (tenant_id, conid, provider, symbol, lookup_symbol, sector,
+                industry, exchange, status, quality_status, license_status, source_url, response_sha256,
+                error_code, checked_at) VALUES ('tenant-1', 'US:ACHR', 'Yahoo Finance search profile', 'ACHR',
+                'ACHR', 'Industrials', 'Aerospace & Defense', 'NYQ', 'classified', 'warn', 'restricted', 'test',
+                'd', NULL, '2026-10-01');
+            UPDATE instrument_classifications SET long_name = 'SK hynix Inc.' WHERE conid = 'KRX:000660';
+            """)
+        transmitted: list[str] = []
+        try:
+            refresh_sector_classifications_range(
+                connection, subject_id="K1", start_date="2026-08-01", end_date="2026-08-31", workers=1,
+                fetcher=self._fetcher(transmitted))
+        finally:
+            connection.close()
+        # Kiwoom names a U.S. stock by its ticker only; an IBKR holding with a sector is left alone.
+        self.assertEqual([symbol for symbol in transmitted if "ACHR" in symbol], transmitted)
+        self.assertTrue(transmitted)
+
     def test_before_migration_080_nothing_changes(self) -> None:
         connection = self._krw_database(with_name_column=False)
         transmitted: list[str] = []

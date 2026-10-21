@@ -318,3 +318,37 @@ class KiwoomMonthReadyTests(_DesignedCase):
         self.assertTrue(ready())
         self.assertTrue(ready("ibkr_flex"))
         db.rollback()
+
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class BuiltInDesignSubmissionTests(_DesignedCase):
+    """The backend submits a built-in design measured from the owner's exact template, as the designer would."""
+
+    def test_the_built_in_design_is_submitted_once_and_the_case_renders_from_it(self):
+        from ibkr_etl import designed_reports as dr
+        from ibkr_etl.builtin_design_submission import BuiltInDesignError, bundled_template, submit_built_in_design
+        from ibkr_etl.factsheet_spec.spec import load_design
+
+        db = self._connection()
+        case_id = self._case_with_history(db)
+        with self.assertRaisesRegex(BuiltInDesignError, "does not match"):
+            submit_built_in_design(db, TENANT, case_id, design_id="us-istrategy", template=b"%PDF another template")
+        done = submit_built_in_design(db, TENANT, case_id, design_id="us-istrategy")
+        db.commit()
+        self.assertEqual(done["status"], "submitted")
+        design = dr.submitted_design(db, TENANT, "synthetic-own-design")
+        self.assertEqual(design["draft_id"], done["draft_id"])
+        self.assertEqual(design["spec"]["inputs"], load_design("us-istrategy")["inputs"])
+        self.assertEqual(design["template_sha256"], load_design("us-istrategy")["template_sha256"])
+        self.assertEqual(dr.design_file(db, TENANT, design["template_sha256"]), bundled_template("us-istrategy"))
+        # The same design again changes nothing.
+        again = submit_built_in_design(db, TENANT, case_id, design_id="us-istrategy")
+        self.assertEqual((again["status"], again["draft_id"]), ("unchanged", done["draft_id"]))
+        count = db.execute("SELECT count(*) AS n FROM factsheet_design_drafts WHERE subject_id = 'synthetic-own-design'"
+                           ).fetchone()["n"]
+        self.assertEqual(count, 1)
+        # A case that is not waiting for a design is refused.
+        db.execute("UPDATE broker_onboarding_cases SET stage = 'load_and_reconcile' WHERE case_id = ?", (case_id,))
+        with self.assertRaisesRegex(BuiltInDesignError, "not waiting"):
+            submit_built_in_design(db, TENANT, case_id, design_id="us-istrategy")
+        db.rollback()

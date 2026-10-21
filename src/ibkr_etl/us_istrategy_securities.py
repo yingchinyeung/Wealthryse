@@ -11,7 +11,8 @@ current label for QXO (Industrial Distribution, so Capital Goods) over the
 Software & Services row the 31 Aug factsheet printed. Every holding prints
 "United States" as its region. A holding with no Yahoo name, or an industry the
 map does not know, stops the render and names the ticker, so a guessed name or
-sector never reaches a factsheet.
+sector never reaches a factsheet. A holding Yahoo stopped quoting after a takeover
+uses the name and industry it had while listed (DELISTED).
 """
 from __future__ import annotations
 
@@ -98,6 +99,15 @@ INDUSTRIES: dict[str, tuple[str, str]] = {
     "Other Industrial Metals & Mining": (MAT, "Metals & Mining"),
 }
 
+# Holdings Yahoo no longer quotes because the company was taken over: Yahoo answers 404 for the
+# ticker, so the sector job can store no name or industry. Each keeps the English name and the
+# Yahoo industry it had while listed. Used only when Yahoo has no name stored for the ticker.
+DELISTED: dict[str, tuple[str, str]] = {
+    "DFS": ("Discover Financial Services", "Credit Services"),  # acquired by Capital One, May 2025
+    "FYBR": ("Frontier Communications Parent, Inc.", "Telecom Services"),  # acquired by Verizon
+}
+
+
 class UsIstrategySecurityError(ValueError):
     pass
 
@@ -107,6 +117,9 @@ def lookup(holding: Mapping[str, Any], classification: Mapping[str, Any] | None)
     symbol = str(holding.get("symbol") or "").strip().upper()
     classification = classification or {}
     name = " ".join(str(classification.get("long_name") or "").split())
+    if not name and symbol in DELISTED:
+        name, industry = DELISTED[symbol]
+        classification = {**classification, "sub_sector": classification.get("sub_sector") or industry}
     if not name or not name.isascii():
         raise UsIstrategySecurityError(
             f"Yahoo has no English name stored for {symbol}; run the sector job for the account")

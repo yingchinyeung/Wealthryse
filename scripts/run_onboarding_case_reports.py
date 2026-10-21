@@ -46,6 +46,24 @@ def _required(name: str) -> str:
     return value
 
 
+def us_security_problems(connection, subject_id: str, start: str, end: str, provider: str) -> list[str]:
+    from ibkr_etl.us_istrategy_securities import UsIstrategySecurityError, lookup
+
+    rows = connection.execute(
+        "SELECT DISTINCT p.conid, COALESCE(i.symbol, p.conid) AS symbol, c.long_name, c.sub_sector "
+        "FROM subject_position_series p LEFT JOIN instruments i ON i.conid = p.conid "
+        "LEFT JOIN instrument_classifications c ON c.conid = p.conid AND c.provider = ? "
+        "WHERE p.subject_id = ? AND p.snapshot_date BETWEEN ? AND ? AND p.conid LIKE 'US:%%' "
+        "ORDER BY p.conid", (provider, subject_id, start, end)).fetchall()
+    problems = []
+    for row in rows:
+        try:
+            lookup({"symbol": row["symbol"]}, dict(row) if row["long_name"] or row["sub_sector"] else None)
+        except UsIstrategySecurityError as error:
+            problems.append(str(error))
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--case-id", required=True)
@@ -58,7 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     from ibkr_etl.cloud_storage import download_blob_bytes, upload_bytes
     from ibkr_etl.composite_reports import HONG_KONG
     from ibkr_etl.designed_reports import run_designed_report_cases
-    from ibkr_etl.sector_classification import refresh_sector_classifications_range
+    from ibkr_etl.sector_classification import YAHOO_PROVIDER, refresh_sector_classifications_range
 
     database_url = _required("DATABASE_URL")
     storage_url = _required("AZURE_STORAGE_ACCOUNT_URL")
@@ -97,6 +115,11 @@ def main(argv: list[str] | None = None) -> int:
         summary["classification"] = {key: classified.get(key) for key in (
             "historical_unique_holdings", "previously_classified", "classified", "unclassified",
             "unclassified_symbols")}
+        if args.design == "us-istrategy":
+            # Every U.S. holding's name and sector at once, so one run lists all of them rather
+            # than stopping at the first month that has one.
+            summary["us_securities_problems"] = us_security_problems(
+                connection, subject_id, str(case["history_start_date"])[:10], today.isoformat(), YAHOO_PROVIDER)
         summary["reports"] = run_designed_report_cases(connection, tenant_id, container=container, today=today,
                                                        fetch=fetch, store=store, case_ids={args.case_id})
         check = connection.execute(

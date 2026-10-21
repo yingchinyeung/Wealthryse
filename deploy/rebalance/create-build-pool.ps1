@@ -9,6 +9,11 @@
 # jobs is changed. Before changing anything it checks that the range is free
 # and that the private-endpoint subnet's rules let HTTPS in from the new
 # subnet; if either check fails it stops with nothing changed. Safe to re-run.
+#
+# With -AllowRegistryAccess, if the private-endpoint subnet's rules block the
+# new subnet, it adds one inbound rule "allow-acr-build-registry" to
+# ibkr-upgrade-pe-main-nsg: TCP 443 from 10.50.14.0/27 to the registry's own
+# private addresses only, just ahead of the blocking rule. No other rule changes.
 
 param(
     [string]$ResourceGroup = 'rg-ibkr-database-v11',
@@ -20,7 +25,8 @@ param(
     [string]$EndpointNsg = 'ibkr-upgrade-pe-main-nsg',
     [string]$Registry = 'ibkrv2stgauhecwc4itaoo',
     [string]$PoolName = 'rebalance',
-    [string]$Tier = 'S1'
+    [string]$Tier = 'S1',
+    [switch]$AllowRegistryAccess
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,10 +70,23 @@ foreach ($row in $rows) {
     $ports = @($f[5]) + ($f[6] -split ',') | Where-Object { $_ -and $_ -ne 'None' }
     if (($sources | Where-Object { Covers $_ }) -and ($ports | Where-Object { Has443 $_ })) { $firstMatch = $f; break }
 }
-if ($firstMatch -and $firstMatch[1] -eq 'Deny') {
+$blocked = $firstMatch -and $firstMatch[1] -eq 'Deny'
+if ($blocked -and -not $AllowRegistryAccess) {
     throw "STOPPED, nothing changed: rule '$($firstMatch[7])' (priority $($firstMatch[0])) on $EndpointNsg would block HTTPS from $Prefix to the registry. Paste this line to Claude."
 }
-Write-Host "   allowed ($(if ($firstMatch) { "rule '$($firstMatch[7])'" } else { 'network default' }))"
+if (-not $blocked) { Write-Host "   allowed ($(if ($firstMatch) { "rule '$($firstMatch[7])'" } else { 'network default' }))" }
+if ($blocked) {
+    # The registry's own private addresses, from its private endpoint in this network.
+    [string[]]$peIds = (AzRun acr show -n $Registry --query 'privateEndpointConnections[].privateEndpoint.id' -o tsv) -split "`r?`n" | Where-Object { $_ }
+    [string[]]$regIps = $peIds | ForEach-Object { (AzRun network private-endpoint show --ids $_ --query 'customDnsConfigs[].ipAddresses[]' -o tsv) -split "`r?`n" } |
+        Where-Object { $_ -match '^10\.50\.10\.\d+$' } | Sort-Object -Unique
+    # Needs both the login and the data address, or pushes fail after login.
+    if (@($regIps).Count -lt 2) { throw "STOPPED, nothing changed: found $(@($regIps).Count) of the registry's 2 private addresses in 10.50.10.0/24." }
+    [int[]]$taken = $rows | ForEach-Object { [int](($_ -split "`t")[0]) }
+    $priority = ([int]$firstMatch[0]) - 1
+    while ($priority -ge 100 -and $taken -contains $priority) { $priority-- }
+    if ($priority -lt 100) { throw "STOPPED, nothing changed: no free rule slot ahead of priority $($firstMatch[0]) on $EndpointNsg." }
+}
 
 Write-Host "== Checking $Prefix is free in $Vnet"
 $subnetId = AzRun network vnet subnet list -g $ResourceGroup --vnet-name $Vnet --query "[?name=='$SubnetName'].id | [0]" -o tsv
@@ -79,12 +98,21 @@ if (-not $subnetId) {
     $inside = $spaces | Where-Object { $r = Range $_; $want[0] -ge $r[0] -and $want[1] -le $r[1] }
     if (-not $inside) { throw "STOPPED, nothing changed: $Prefix is outside $Vnet's address space." }
     foreach ($u in $used) { $r = Range $u; if (-not ($want[1] -lt $r[0] -or $want[0] -gt $r[1])) { throw "STOPPED, nothing changed: $Prefix overlaps existing subnet $u." } }
+    if ($blocked) {
+        Write-Host "== Allowing HTTPS from $Prefix to the registry ($($regIps -join ', ')) on $EndpointNsg, priority $priority"
+        AzRun network nsg rule create -g $ResourceGroup --nsg-name $EndpointNsg -n allow-acr-build-registry --priority $priority --direction Inbound --access Allow --protocol Tcp --source-address-prefixes $Prefix --destination-address-prefixes @regIps --destination-port-ranges 443 --description 'Rebalancing site build pool to the private registry' | Out-Null
+        $blocked = $false
+    }
     Write-Host "== Creating subnet $SubnetName ($Prefix)"
     # Builds need to download base images and packages, so the subnet keeps
     # ordinary outbound internet access; nothing can reach into it.
     $subnetId = AzRun network vnet subnet create -g $ResourceGroup --vnet-name $Vnet -n $SubnetName --address-prefixes $Prefix --default-outbound-access true --query id -o tsv
 }
 
+if ($blocked) {
+    Write-Host "== Allowing HTTPS from $Prefix to the registry ($($regIps -join ', ')) on $EndpointNsg, priority $priority"
+    AzRun network nsg rule create -g $ResourceGroup --nsg-name $EndpointNsg -n allow-acr-build-registry --priority $priority --direction Inbound --access Allow --protocol Tcp --source-address-prefixes $Prefix --destination-address-prefixes @regIps --destination-port-ranges 443 --description 'Rebalancing site build pool to the private registry' | Out-Null
+}
 Write-Host "== Creating build pool $PoolName (takes a few minutes)"
 $existing = AzRun acr agentpool list -r $Registry --query "[?name=='$PoolName'].name | [0]" -o tsv
 if (-not $existing) {

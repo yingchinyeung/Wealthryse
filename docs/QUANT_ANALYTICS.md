@@ -60,7 +60,7 @@ daily marks.
 
 | Section | Page, card (model_id) | Engine calls (`results` keys) | Inputs |
 |---|---|---|---|
-| `skill` | Performance, skill-statistics | `skill_summary`: daily portfolio against the primary benchmark, the risk-free rate as a daily rate, one trial, level 0.90, 2000 bootstrap samples (seeded, so a rerun gives the same answer) | `performance_comparison_daily` on the primary benchmark (`benchmark-comparison-v1`, pass or warn), the latest USD `risk_free_rates` |
+| `skill` | Performance, skill-statistics | `skill_summary`: daily portfolio against the primary benchmark, the risk-free rate as a daily rate, one trial, level 0.90, 2000 bootstrap samples (seeded, so a rerun gives the same answer) | `performance_comparison_daily` on the primary benchmark (`benchmark-comparison-v1`, pass or warn), the Risk page's risk-free rate (`risk_snapshots.risk_free_rate`: the Korea CD rate for a won account once loaded and recent, otherwise the U.S. 3-month Treasury) |
 | `decisions` | Performance, decision-attribution | `trade_value_added` (5, 21 and 63 sessions), `skill_profile` (21 sessions), `timing_cost` (decision price = the prior close), `counterfactual_portfolios` (no trades since 1 Jan, and the benchmark) | The last year of `trades` (physical accounts), the daily marks and holdings from `subject_position_series`, `subject_nav_series`, external flows |
 | `currency` | Performance, attribution | `currency_attribution` for month to date and year to date (`mtd`, `ytd`), opening holdings grouped by currency, cash and the benchmark as their own segments | Holdings at the period start, marks and FX to the date, NAV, the benchmark levels |
 | `tail` | Risk, tail-risk | `evt_var_es` (0.99, 0.995), `tail_backtest_report` (0.975, 0.99), and `forecasts`: today's one-day VaR and ES, stored so later calibration can read the history | The daily portfolio returns (EVT needs about 300, the backtest 500) |
@@ -74,7 +74,8 @@ Who is covered: physical accounts and derived (non-profiled) subjects. The Alpha
 and profiled composites report through their own HKD pipelines, so their nine sections are stored
 as unavailable with that reason. Trades are stored for physical accounts only, so a derived
 subject's `decisions` and `execution` are unavailable, with that reason. A subject with no primary
-benchmark comparison has `skill`, `tail` and `regime` unavailable.
+benchmark comparison has `skill`, `tail` and `regime` unavailable. The two Kiwoom accounts are
+physical accounts and are covered, with the differences under "Kiwoom accounts" below.
 
 ## The job
 
@@ -396,9 +397,9 @@ the table changes when they come on.
 | Section | Page › card (model_id) | Engine calls (`results` keys) | Silver inputs (`ibkr_etl.market_inputs`) |
 |---|---|---|---|
 | `liquidity` | Risk › Liquidity (liquidity) | `average_daily_volume` per holding (its last 20 sessions with a volume above zero, from the 45 days to the holdings date); `days_to_liquidate` at 20% of daily volume, with the share sellable in 1, 5 and 20 days; `liquidity_adjusted_var` (Bangia et al.) on the one-day 99% VaR, from `evt_var_es` on the same daily returns as `tail`: the conditional (GARCH) forecast when that fit works, else the unconditional one, as the tail card shows; `inputs.var_basis` says which | `daily_volumes`, each holding's rows by its IBKR conid (the `instrument_id` the holdings' fetch, `daily_volumes.fetch_and_load`, stores them under; the benchmarks' rows, under `market_data_prices` ids, are never read for a holding). Holdings, quantities and returns are `holdings_risk`'s and `tail`'s |
-| `factor_attribution` | Performance › Factor attribution (attribution) | `factor_attribution` for `ytd` (from 1 January) and `past_year` (the 365 days to the date): the daily portfolio return less the file's RF on Mkt-RF, SMB, HML, RMW, CMA and MOM (those stored), OLS with Carino linking | `factor_returns` for region `developed`, the Modelling page's default factor model (`fama_french.DEFAULT_REGION`); Kenneth French rows only (`source = 'kenneth-french'`: the ETF stand-ins are left out), the latest vintage of each factor and date; the primary benchmark comparison's daily returns |
+| `factor_attribution` | Performance › Factor attribution (attribution) | `factor_attribution` for `ytd` (from 1 January) and `past_year` (the 365 days to the date): the daily portfolio return less the file's RF on Mkt-RF, SMB, HML, RMW, CMA and MOM (those stored), OLS with Carino linking; for holdings mostly in won, Korea's market model instead ("Kiwoom accounts" below) | `factor_returns` for the holdings' region (`factor_model_for`: `us` when at least 90% of the holdings' value is in U.S. dollars, otherwise `developed`, the Modelling page's default factor model, `fama_french.DEFAULT_REGION`); Kenneth French rows only (`source = 'kenneth-french'`: the ETF stand-ins are left out), the latest vintage of each factor and date; the primary benchmark comparison's daily returns |
 | `macro` | Risk › Macro exposures (macro-factors) | `macro_exposures` on weekly observations over up to three years (the last day of each week on which the portfolio and every series have a value; the daily returns in between compounded): the US 10-year yield (DGS10) and the curve (DGS10 − DGS2) as basis-point changes, the broad dollar (DTWEXBGS), Brent (DCOILBRENTEU), the VIX (VIXCLS, once licensed) and USD/CNH as log returns; Newey-West with 5 lags; at least 60 weeks. A series not in silver is left out, named with its reason in `inputs.factors_missing_reasons`. `macro_sensitivity` for each shock below | `macro_series`, the latest vintage of each series and date |
-| `crowding` | Risk › Crowding (crowding) | `ownership_overlap` (stakes by value) of the holdings that are shares with a US ISIN (CUSIP = ISIN characters 3 to 11) against each 13F filer's latest filing known on the date, and the most similar funds; the others are listed under `inputs.not_covered` with the reason. The CUSIP is `ibkr_etl.sec_13f.cusip_from_isin`, the loader's own rule | `institutional_holdings`: per filer, the latest quarter (`period` on or before the date) filed on or before the date, and that quarter's latest accession filed by then (the newest `filed_at`, then the highest accession, as `sec_13f.LATEST_SQL`); shares held outright only (`shares_type` SH, no PUT or CALL, value above zero); `instruments.isin` |
+| `crowding` | Risk › Crowding (crowding) | `ownership_overlap` (stakes by value) of the holdings that are shares with a US ISIN (CUSIP = ISIN characters 3 to 11), or ticker-only U.S. shares with a CUSIP in the reviewed ticker list ("Kiwoom accounts" below), against each 13F filer's latest filing known on the date, and the most similar funds; the others are listed under `inputs.not_covered` with the reason. The CUSIP is `ibkr_etl.sec_13f.cusip_from_isin`, the loader's own rule | `institutional_holdings`: per filer, the latest quarter (`period` on or before the date) filed on or before the date, and that quarter's latest accession filed by then (the newest `filed_at`, then the highest accession, as `sec_13f.LATEST_SQL`); shares held outright only (`shares_type` SH, no PUT or CALL, value above zero); `instruments.isin` |
 
 The standard macro shocks (`quant_snapshots.MACRO_SHOCKS`; basis points for the yield and the curve,
 a share of the level otherwise):
@@ -530,6 +531,46 @@ To take a section off, set it to `off` (or leave it out) on both: the job stops 
 the card, route and guide entries go; its rows stay and are not shown. If its table is dropped,
 the section is skipped from then on.
 
+## Kiwoom accounts
+
+Korea iStrategy (won, Korean shares, KOSPI 200 benchmark through KODEX 200) and U.S. iStrategy
+(dollars, U.S. shares bought with won top-ups) are physical accounts with `accounts.account_type =
+'kiwoom'`, so the job builds them like any other. Kiwoom has no Flex file and no live feed, which
+makes six differences. Each is in the code already and changes nothing while the build is off
+(`frontier-analytics/kiwoom-review.md` has the review).
+
+| What | Kiwoom accounts | Code |
+|---|---|---|
+| Risk-free rate (skill) | The Risk page's rule: Korea iStrategy takes the Korea CD rate once loaded and no more than 100 days old, the U.S. 3-month Treasury until then; U.S. iStrategy the Treasury. The section's summary names the rate's currency and series | `risk_snapshots.risk_free_rate`, `load_inputs` |
+| Flows | U.S. iStrategy's `DEPOSIT` and `WITHDRAWAL` cash rows (its won-to-dollar top-ups) are money from outside, as the benchmark job reads them (#186); Korea iStrategy's are left as the benchmark job has them, and IBKR accounts keep reading their own labels | `_kiwoom_cash_flows`, `_external_flows`, `provisional_benchmark.KIWOOM_FLOW_CURRENCIES` |
+| Decisions and execution | Not built from Kiwoom trades yet: the stored price is the net settlement amount over the quantity, so fees and Korea's 0.20% sell tax would read as slippage, there is no commission, and the U.S. account's trade date is Kiwoom's Korean posting date. Both sections say so (`TRADE_DETAIL_MISSING`) until the Kiwoom loader stores the gross price, fee, tax and U.S. trade date; the counterfactual "no trades" portfolio waits with them | `TRADE_DETAIL_MISSING`, `prepare_inputs` |
+| Factor attribution | By `factor_model_for`, from the holdings' value in the reporting currency: at least half in won takes **Korea's market model**; at least 90% in dollars takes the U.S. French factors; anything else Developed markets. Korea's market model regresses the daily return less the account's own risk-free rate on the primary benchmark's return less the same rate (`KR-Mkt-RF`) and on the won/dollar move of the previous U.S. day (`USDKRW`, the log change between the two reference closes before each Korean day, none older than 5 days). It reads no factor file: no daily French region covers Korea (his emerging-markets set is monthly only) | `factor_model_for`, `_korea_market_model_inputs`, `build_factor_attribution` |
+| Macro | Holdings mostly in won take won per dollar (FRED `DEXKOUS`, H.10) in place of USD/CNH, and every series at its previous U.S. day's level: Korea closes at 06:30 UTC, before New York opens, so a week of Korean returns is set against the U.S. moves Korean prices had already seen. Its shocks are below | `MACRO_FACTORS_KOREA`, `MACRO_SHOCKS_KOREA`, `_previous_day_levels` |
+| Crowding | Kiwoom gives tickers, not ISINs, so U.S. iStrategy's shares (instrument keys `US:<ticker>`) are matched by the reviewed ticker list `src/ibkr_etl/data/us_ticker_cusips.json` (`sec_13f.reviewed_ticker_cusips`): empty and not reviewed until someone fills it from the SEC's Official List of Section 13(f) Securities; a bad check digit refuses the whole list. Until then those shares are listed as "No reviewed CUSIP for this U.S. ticker yet". Korean shares are listed as "13F covers U.S.-listed shares only" | `_not_in_13f`, `_holding_cusip`, `load_phase3_inputs` |
+
+Korea's macro shocks (`MACRO_SHOCKS_KOREA`): the standard ones without `yuan_down_5pct`, plus
+`won_down_5pct` (DEXKOUS +5%, the won 5% weaker), and `risk_off` with won per dollar +3% in place of
+USD/CNH +3%.
+
+Also:
+
+- An account whose holdings all trade in its reporting currency (Korea iStrategy) gets "All holdings
+  are in KRW, so there is no currency effect" on the currency card instead of a table of zeros
+  (`inputs.single_currency`).
+- **The 90% rule moves some IBKR accounts too.** An IBKR account with at least 90% of its holdings
+  in U.S. dollars (likely U16088571, whose benchmark is the S&P 500) gets the U.S. factors instead
+  of Developed markets. The Modelling page is unchanged. Compare the two in shadow before
+  `factor_attribution` comes on.
+- Liquidity, holdings, sectors, correlation and concentration need nothing new: the daily volumes
+  fetch maps `KRX:` codes to Yahoo `.KS`/`.KQ` and U.S. tickers as they are.
+- The Desk stays IBKR only: it is offered where the live view is, and Kiwoom has no live feed.
+- **Shadow run.** The masking takes each Kiwoom subject's bare account number
+  (`platform_subjects.source_account_id`) as an alias of its subject, so both read as the same `u..`
+  label, and masks any other `KIWOOM-...` id as `u??`. The review groups rows by broker (`kiwoom`,
+  `ibkr`, `derived`), so the Kiwoom accounts' coverage reads on its own.
+- Both accounts start in March 2025, so several figures say "not enough history yet" for a while.
+  That is the expected answer.
+
 ## Undoing
 
 - Lighter: redeploy with `quantAnalyticsBuild=off`. The rows stay; the website's cards are turned
@@ -569,6 +610,14 @@ pipelines), and the trade sections for derived subjects (no trades are stored fo
   nothing and a one-input change rebuilding only its sections; a failing day held back whole by
   the publish gate; the reader's fallback; the time budget and the lock; lineage; and both undos in
   either order leaving no trace.
+- `tests/test_quant_kiwoom.py`, no database: the factor model each account gets; the previous
+  U.S. day's won move and levels; Korea's market model recovering known betas (and missing the won
+  exposure on same-day moves); Korea's macro set recovering known sensitivities and the won shock
+  (and coming out too small on same-day levels); the U.S. account's top-ups as flows; Kiwoom trades
+  held back; the one-currency note; crowding's reasons and the reviewed ticker list; the shadow
+  run's aliases and broker groups; and the Korea cards rendered in Node.
+- `tests/test_quant_kiwoom_db.py`, PostgreSQL: both Kiwoom accounts and an IBKR account through
+  `load_inputs` (risk-free rate, flows, trades held back, factor model, the one-currency note).
 - `tests/test_quant_shadow_run.py`, no database, covers the shadow-run tool:
   - the guard refuses, before anything connects, the live server, its alias, the hosts in
     `LIVE_DATABASE_HOSTS`, a name that is not a copy's, a host other than `--copy-host`, a host

@@ -147,7 +147,7 @@ class FredCsvTests(unittest.TestCase):
 
     def test_the_registry_is_the_design_list_with_hibor_left_in_risk_free_rates(self):
         self.assertEqual([s.series_id for s in ms.SERIES],
-                         ["DGS10", "DGS2", "DTWEXBGS", "DCOILBRENTEU", "VIXCLS", "USDCNH"])
+                         ["DGS10", "DGS2", "DTWEXBGS", "DCOILBRENTEU", "VIXCLS", "DEXKOUS", "USDCNH"])
         self.assertFalse(any("HIBOR" in s.series_id for s in ms.SERIES))
         for series in ms.SERIES:
             self.assertIn(series.units, ms.UNITS)
@@ -293,19 +293,19 @@ class MacroLoadTests(_NoNetwork):
                          getter=lambda url: (_ for _ in ()).throw(RuntimeError("FRED down")),
                          cnh_fetch=lambda instrument, start, end: (_ for _ in ()).throw(RuntimeError("Yahoo down")))
         self.assertEqual(sorted(f["series_id"] for f in result["failed"]),
-                         ["DCOILBRENTEU", "DGS10", "DGS2", "DTWEXBGS", "USDCNH"])
+                         ["DCOILBRENTEU", "DEXKOUS", "DGS10", "DGS2", "DTWEXBGS", "USDCNH"])
         self.assertEqual((result["series"], result["rows_stored"]), ([], 0))
         self.assertEqual([item["series_id"] for item in result["not_loaded_for_licence"]], ["VIXCLS"])
-        self.assertEqual(connection.rollbacks, 5)
+        self.assertEqual(connection.rollbacks, 6)
         self.assertEqual(result["vintage"], "2026-10-19")
 
     def test_an_empty_response_is_a_failure_and_the_window_stops_the_rest(self):
-        calls = iter([False, True, True, True, True])
+        calls = iter([False, True, True, True, True, True])
         result = ms.load(_FakeConnection(), today=date(2026, 10, 19), environ={},
                          getter=lambda url: b"DATE,DGS10\n2026-10-16,.\n", stop=lambda: next(calls))
         self.assertEqual([f["series_id"] for f in result["failed"]], ["DGS10"])
         self.assertIn("no observations", result["failed"][0]["error"])
-        self.assertEqual(len(result["not_started"]), 4)
+        self.assertEqual(len(result["not_started"]), 5)
 
     def test_cnh_asks_for_completed_days_only(self):
         seen = []

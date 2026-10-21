@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS public.macro_series (
     observation_date TEXT NOT NULL CHECK (observation_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
     -- Finite only: PostgreSQL orders NaN above Infinity, so this keeps out NaN as well.
     value DOUBLE PRECISION NOT NULL CHECK (value > '-Infinity'::float8 AND value < 'Infinity'::float8),
-    units TEXT NOT NULL CHECK (units IN ('percent', 'index', 'usd_per_barrel', 'cnh_per_usd')),
+    units TEXT NOT NULL CHECK (units IN ('percent', 'index', 'usd_per_barrel', 'cnh_per_usd', 'krw_per_usd')),
     source TEXT NOT NULL CHECK (source IN ('fred', 'yahoo-chart')),
     vintage TEXT NOT NULL CHECK (vintage ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
     fetched_at TEXT NOT NULL CHECK (fetched_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}'),
@@ -37,12 +37,12 @@ COMMENT ON TABLE public.macro_series IS
     'date. Written by the macro-series job (docs/PHASE3_DATA_MACRO_13F.md).';
 COMMENT ON COLUMN public.macro_series.tenant_id IS 'Tenant that owns the row; row-level security filters on it.';
 COMMENT ON COLUMN public.macro_series.series_id IS
-    'FRED id as FRED names it (DGS10, DGS2, DTWEXBGS, DCOILBRENTEU, VIXCLS once licensed) or USDCNH (Yahoo CNH=X).';
+    'FRED id as FRED names it (DGS10, DGS2, DTWEXBGS, DCOILBRENTEU, DEXKOUS, VIXCLS once licensed) or USDCNH (Yahoo CNH=X).';
 COMMENT ON COLUMN public.macro_series.observation_date IS 'Date of the observation (yyyy-MM-dd), as the source dates it.';
 COMMENT ON COLUMN public.macro_series.value IS
     'The observation in units: yields in percent as published (4.25 is 4.25%), index levels, US dollars per '
-    'barrel, offshore renminbi per US dollar.';
-COMMENT ON COLUMN public.macro_series.units IS 'percent, index, usd_per_barrel or cnh_per_usd.';
+    'barrel, offshore renminbi or South Korean won per US dollar.';
+COMMENT ON COLUMN public.macro_series.units IS 'percent, index, usd_per_barrel, cnh_per_usd or krw_per_usd.';
 COMMENT ON COLUMN public.macro_series.source IS 'fred (keyless CSV download) or yahoo-chart.';
 COMMENT ON COLUMN public.macro_series.vintage IS
     'UTC date (yyyy-MM-dd) the value was fetched. A revised value gets a new vintage; an unchanged one is not '

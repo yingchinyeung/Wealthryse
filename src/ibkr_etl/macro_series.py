@@ -15,7 +15,7 @@ yahoo-chart/ for USD/CNH, through raw_capture), then parsed and stored in silver
 
 Licences (Medallion condition 5: checked before anything is kept). From each series' FRED notes, as
 quoted in SERIES below:
-- DGS10, DGS2 (H.15) and DTWEXBGS (H.10) come from the Federal Reserve Board, and DCOILBRENTEU from
+- DGS10, DGS2 (H.15), DTWEXBGS and DEXKOUS (H.10) come from the Federal Reserve Board, and DCOILBRENTEU from
   the U.S. Energy Information Administration. Their notes carry no copyright notice: US government
   data, public domain, citation requested. Each capture says so in its metadata.
 - VIXCLS comes from Cboe, and its FRED notes say "Copyright, 2016, Chicago Board Options Exchange,
@@ -69,10 +69,10 @@ CBOE_COPYRIGHT = "cboe-copyright-reprinted-with-permission"
 YAHOO_INTERNAL = "yfinance-internal-only"
 # ICE BofA indices on FRED (BAMLH0A0HYM2 and the like): copyrighted, left out (design, "Licences").
 EXCLUDED_PREFIXES = ("BAML",)
-UNITS = ("percent", "index", "usd_per_barrel", "cnh_per_usd")
+UNITS = ("percent", "index", "usd_per_barrel", "cnh_per_usd", "krw_per_usd")
 # Plausible levels in each unit; a value outside means the response is not what we think it is.
 RANGES = {"percent": (-5.0, 30.0), "index": (0.0, 1000.0), "usd_per_barrel": (0.0, 1000.0),
-          "cnh_per_usd": (1.0, 20.0)}
+          "cnh_per_usd": (1.0, 20.0), "krw_per_usd": (500.0, 3000.0)}
 _ISO_DATE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
@@ -113,6 +113,12 @@ SERIES: tuple[Series, ...] = (
            "Chicago Board Options Exchange (Cboe), via FRED; copyright Cboe, reprinted with permission",
            "FRED: source Chicago Board Options Exchange; notes: 'Copyright, 2016, Chicago Board Options "
            "Exchange, Inc. Reprinted with permission.' Not public domain: kept only once licensed."),
+    Series("DEXKOUS", "South Korean won to one US dollar (noon buying rate in New York)", "krw_per_usd", "fred",
+           PUBLIC_DOMAIN, True,
+           "Board of Governors of the Federal Reserve System (US), H.10 Foreign Exchange Rates, via FRED",
+           "FRED: source Board of Governors of the Federal Reserve System (US), release H.10 (as DTWEXBGS); "
+           "units South Korean won to one U.S. dollar, daily. For accounts holding mostly won (Korea's macro "
+           "set). Re-read its FRED notes for a copyright notice before switch-on, as for the others."),
     Series("USDCNH", "US dollar in offshore renminbi (Yahoo CNH=X)", "cnh_per_usd", "yahoo-chart",
            YAHOO_INTERNAL, True, "Yahoo Finance chart API, internal use only",
            "Yahoo chart closes of CNH=X, under the existing internal-only rule (yfinance-internal-only)."),

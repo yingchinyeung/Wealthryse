@@ -40,7 +40,7 @@ SECTION_TABLES = {
     "crowding": "institutional_holdings",
 }
 PHASE3_SECTIONS = tuple(SECTION_TABLES)
-MACRO_SERIES = ("DGS10", "DGS2", "DTWEXBGS", "DCOILBRENTEU", "VIXCLS", "USDCNH")
+MACRO_SERIES = ("DGS10", "DGS2", "DTWEXBGS", "DCOILBRENTEU", "VIXCLS", "USDCNH", "DEXKOUS")
 
 
 # --- The setting -------------------------------------------------------------------------

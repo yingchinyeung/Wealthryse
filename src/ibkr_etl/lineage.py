@@ -528,7 +528,7 @@ JOB_INPUTS: dict[str, tuple[str, ...]] = {
         "gold.performance_comparison_daily", "silver.risk_free_rates", "silver.position_snapshots",
         "silver.derived_portfolio_positions", "silver.instruments", "silver.instrument_classifications",
         "silver.trades", "silver.reference_fx_rates", "silver.nav_snapshots", "silver.derived_portfolio_nav",
-        "silver.cash_transactions", "silver.derived_portfolio_cash_ledger"),
+        "silver.cash_transactions", "silver.derived_portfolio_cash_ledger", "silver.accounts"),
 }
 
 

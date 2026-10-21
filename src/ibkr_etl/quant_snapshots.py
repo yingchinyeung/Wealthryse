@@ -113,11 +113,33 @@ LIQUIDITY_VAR_LEVEL = 0.99       # the tail section's one-day 99% VaR
 ADV_SESSIONS = 20                # average daily volume over the last 20 sessions with volume
 VOLUME_WINDOW_DAYS = 45          # calendar days of volumes read for those 20 sessions
 FACTOR_REGION = DEFAULT_FACTOR_REGION   # the Modelling page's factor model default (Developed markets)
+# Factor attribution's model follows the holdings (factor_model_for): mostly won holdings take Korea's
+# market model, since no daily Kenneth French region covers Korea (it is in his emerging-markets set,
+# monthly only); nearly all dollar holdings take the U.S. factors; anything else Developed markets.
+KOREA_MARKET_MODEL = "korea_market"
+# Brokers whose stored trades are not yet fit for decision and execution analysis, and why. Kiwoom
+# gives no commission; the stored price is the net settlement amount over the shares, so its fee and
+# Korea's sell tax would read as slippage; and a U.S. trade carries Kiwoom's Korean posting date, one
+# or two U.S. trading days late. Removed once the Kiwoom loader stores the gross price, fees, tax and
+# trade date (docs/QUANT_ANALYTICS.md, "Kiwoom accounts").
+TRADE_DETAIL_MISSING = {
+    "kiwoom": "Kiwoom's trade records don't yet give each fill's own price, fees and tax (or, for U.S. shares, "
+              "the trade date), so trade-by-trade analysis is not yet available for this account.",
+}
+KOREA_MARKET_FACTOR = "KR-Mkt-RF"       # the primary benchmark's daily return less the daily risk-free rate
+KOREA_FX_FACTOR = "USDKRW"              # log change in won per dollar over the previous U.S.-time day
+KOREA_MODEL_SHARE = 0.5                 # won share of the holdings' value that takes Korea's market model
+US_FACTORS_SHARE = 0.9                  # dollar share of the holdings' value that takes the U.S. factors
+NEXT_DAY_FX_DAYS = 5                    # an FX close older than this before a won day is not used
 MACRO_YEARS = 3
 MACRO_CURVE = "DGS10-DGS2"
 MACRO_FACTORS = ("DGS10", MACRO_CURVE, "DTWEXBGS", "DCOILBRENTEU", "VIXCLS", "USDCNH")
 MACRO_TRANSFORMS = {"DGS10": "diff_bp", MACRO_CURVE: "diff_bp", "DTWEXBGS": "log_return",
-                    "DCOILBRENTEU": "log_return", "VIXCLS": "log_return", "USDCNH": "log_return"}
+                    "DCOILBRENTEU": "log_return", "VIXCLS": "log_return", "USDCNH": "log_return",
+                    "DEXKOUS": "log_return"}
+# Holdings mostly in won (factor_model_for): won per dollar (FRED DEXKOUS, H.10) in place of USD/CNH,
+# and each series read at the previous U.S. day (Korea closes at 06:30 UTC, before New York opens).
+MACRO_FACTORS_KOREA = ("DGS10", MACRO_CURVE, "DTWEXBGS", "DCOILBRENTEU", "VIXCLS", "DEXKOUS")
 # Standard shocks (basis points for the yield and the curve, a fraction of the level otherwise).
 MACRO_SHOCKS = {
     "rates_up_100bp": {"DGS10": 100.0},
@@ -127,6 +149,11 @@ MACRO_SHOCKS = {
     "volatility_up_50pct": {"VIXCLS": 0.50},
     "yuan_down_5pct": {"USDCNH": 0.05},
     "risk_off": {"DGS10": -50.0, "DTWEXBGS": 0.05, "DCOILBRENTEU": -0.20, "VIXCLS": 0.50, "USDCNH": 0.03},
+}
+MACRO_SHOCKS_KOREA = {
+    **{name: shocks for name, shocks in MACRO_SHOCKS.items() if name not in ("yuan_down_5pct", "risk_off")},
+    "won_down_5pct": {"DEXKOUS": 0.05},
+    "risk_off": {"DGS10": -50.0, "DTWEXBGS": 0.05, "DCOILBRENTEU": -0.20, "VIXCLS": 0.50, "DEXKOUS": 0.03},
 }
 # Series the macro loader keeps only once their licence is confirmed (ibkr_etl.macro_series): until
 # then the series is left out of the model, with this said, and so are the shocks to it alone.
@@ -300,7 +327,9 @@ def build_skill(inputs: Mapping[str, Any]) -> dict[str, Any]:
     days = sorted(portfolio)
     summary = {"observations": len(days), "window": [days[0], days[-1]] if days else None,
                "benchmark_id": inputs.get("benchmark_id"), "benchmark_observations": len(benchmark),
-               "risk_free_annual_rate": inputs.get("risk_free_annual_rate"), "trials": 1,
+               "risk_free_annual_rate": inputs.get("risk_free_annual_rate"),
+               "risk_free_currency": inputs.get("risk_free_currency"), "risk_free_series": inputs.get("risk_free_series"),
+               "trials": 1,
                "level": SKILL_LEVEL, "samples": SKILL_SAMPLES}
     results: dict[str, Any] = {}
     _call(results, "skill_summary", skill_summary, portfolio, benchmark or None,
@@ -402,6 +431,12 @@ def build_currency(inputs: Mapping[str, Any]) -> dict[str, Any]:
                **{name: {key: (periods.get(name) or {}).get(key) for key in ("start_date", "end_date")}
                   | {"holdings": len((periods.get(name) or {}).get("holdings") or [])}
                   for name in ("mtd", "ytd")}}
+    held = [str(holding.get("currency") or "").upper() for name in ("mtd", "ytd")
+            for holding in (periods.get(name) or {}).get("holdings") or []]
+    if held and set(held) == {base}:
+        # Every holding trades in the reporting currency (Korea iStrategy in won), so there is no
+        # currency effect to show; the card says so instead of a table of zeros.
+        summary["single_currency"] = True
     return _payload("currency", inputs, summary=summary, results=results)
 
 
@@ -736,9 +771,11 @@ def _attribution_days(inputs: Mapping[str, Any], start: str, names: Sequence[str
 
 
 def build_factor_attribution(inputs: Mapping[str, Any]) -> dict[str, Any]:
-    """factor_attribution of the daily portfolio returns, less the factor file's RF, on the French
-    factors of the Modelling page's default region (Developed markets): year to date (ytd, from 1
-    January) and the past year (past_year, the 365 days to as_of)."""
+    """factor_attribution of the daily portfolio returns, less the daily risk-free rate, on the
+    factors of the holdings' model (factor_model_for): the French factors of the U.S. or Developed
+    markets (less the factor file's RF), or Korea's market model (the primary benchmark and the
+    previous U.S.-time day's won/dollar move, less the subject's own risk-free rate): year to date
+    (ytd, from 1 January) and the past year (past_year, the 365 days to as_of)."""
     from .modelling import FACTOR_NAMES
     from .quant.attribution import factor_attribution
 
@@ -746,7 +783,9 @@ def build_factor_attribution(inputs: Mapping[str, Any]) -> dict[str, Any]:
     if stopped:
         return stopped
     factors = dict(inputs.get("factors") or {})
-    names = [name for name in FACTOR_NAMES if any(name in row for row in factors.values())]
+    korea = inputs.get("model") == KOREA_MARKET_MODEL
+    names = (list(inputs.get("factor_names") or ()) if korea else
+             [name for name in FACTOR_NAMES if any(name in row for row in factors.values())])
     as_of = str(inputs["as_of"])
     starts = {"ytd": date.fromisoformat(as_of).replace(month=1, day=1).isoformat(),
               "past_year": _shift(as_of, -365)}
@@ -755,7 +794,15 @@ def build_factor_attribution(inputs: Mapping[str, Any]) -> dict[str, Any]:
         "factor_sources": inputs.get("sources"), "factor_vintages": inputs.get("vintages"),
         "factor_data_through": max(factors) if factors else None, "returns": "daily, less the daily RF",
     }
-    if "Mkt-RF" not in names:
+    if korea:
+        summary.update(model=KOREA_MARKET_MODEL, benchmark_id=inputs.get("benchmark_id"),
+                       alignment=inputs.get("alignment"), risk_free_currency=inputs.get("risk_free_currency"),
+                       risk_free_series=inputs.get("risk_free_series"))
+        if not factors:
+            return _payload("factor_attribution", inputs, summary=summary,
+                            reason=f"The primary benchmark's daily returns and the won/dollar reference rate have "
+                                   f"no day in common with the portfolio's returns in the year to {as_of}.")
+    elif "Mkt-RF" not in names:
         return _payload("factor_attribution", inputs, summary=summary,
                         reason=f"There are no {inputs.get('region_label') or 'region'} market factor returns in "
                                f"silver (factor_returns) for the year to {as_of}.")
@@ -790,7 +837,9 @@ def _macro_missing_reason(name: str, levels: Mapping[str, Any]) -> str:
 def build_macro(inputs: Mapping[str, Any]) -> dict[str, Any]:
     """macro_exposures of weekly portfolio returns on the US 10-year yield (DGS10), the 10y-2y curve,
     the broad dollar (DTWEXBGS), Brent (DCOILBRENTEU), the VIX (VIXCLS) and USD/CNH, over up to
-    three years, and macro_sensitivity for each of MACRO_SHOCKS.
+    three years, and macro_sensitivity for each of MACRO_SHOCKS. Holdings mostly in won (Korea's
+    market model) take won per dollar (DEXKOUS) in place of USD/CNH, MACRO_SHOCKS_KOREA, and every
+    series at its previous U.S. day's level (prepare_phase3_inputs re-dates them).
 
     A series with no levels (the VIX until its licence is confirmed, MACRO_LICENSED) is left out of
     the model and named with its reason in inputs.factors_missing_reasons; a shock to such series
@@ -801,12 +850,14 @@ def build_macro(inputs: Mapping[str, Any]) -> dict[str, Any]:
     stopped = _not_covered("macro", inputs)
     if stopped:
         return stopped
+    korea = inputs.get("model") == KOREA_MARKET_MODEL
+    factor_set, shock_set = (MACRO_FACTORS_KOREA, MACRO_SHOCKS_KOREA) if korea else (MACRO_FACTORS, MACRO_SHOCKS)
     levels = {name: dict(values) for name, values in (inputs.get("levels") or {}).items()}
     if levels.get("DGS10") and levels.get("DGS2"):
         levels[MACRO_CURVE] = {day: levels["DGS10"][day] - levels["DGS2"][day]
                                for day in levels["DGS10"] if day in levels["DGS2"]}
-    factors = {name: levels[name] for name in MACRO_FACTORS if levels.get(name)}
-    missing = [name for name in MACRO_FACTORS if name not in factors]
+    factors = {name: levels[name] for name in factor_set if levels.get(name)}
+    missing = [name for name in factor_set if name not in factors]
     returns = {str(day): float(value) for day, value in (inputs.get("returns") or {}).items()}
     summary: dict[str, Any] = {
         "frequency": "weekly: the last day in each week with a portfolio return and every series",
@@ -814,9 +865,11 @@ def build_macro(inputs: Mapping[str, Any]) -> dict[str, Any]:
         "factors_missing_reasons": {name: _macro_missing_reason(name, levels) for name in missing},
         "transforms": {name: MACRO_TRANSFORMS[name] for name in factors},
         "units": inputs.get("units"), "sources": inputs.get("sources"),
-        "shocks": {name: dict(shocks) for name, shocks in MACRO_SHOCKS.items()},
+        "shocks": {name: dict(shocks) for name, shocks in shock_set.items()},
         "shocks_left_out": {},
     }
+    if korea:
+        summary.update(model=KOREA_MARKET_MODEL, alignment=inputs.get("alignment"))
     if not factors:
         return _payload("macro", inputs, summary=summary,
                         reason="None of the macro series is in silver (macro_series) for the window.")
@@ -846,7 +899,7 @@ def build_macro(inputs: Mapping[str, Any]) -> dict[str, Any]:
     else:
         in_model = {row["factor"] for row in fitted.get("exposures") or []}
         scenarios: dict[str, Any] = {}
-        for name, shocks in MACRO_SHOCKS.items():
+        for name, shocks in shock_set.items():
             if not in_model.intersection(shocks):
                 why = " ".join(summary["factors_missing_reasons"].get(factor, "") for factor in shocks)
                 summary["shocks_left_out"][name] = " ".join([
@@ -1177,21 +1230,24 @@ def prepare_inputs(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     no_comparison = (None if portfolio else
                      f"No primary benchmark comparison with daily returns is stored on or before {as_of}.")
     returns = [[day, portfolio[day]] for day in sorted(portfolio)]
-    rate = _number((data.get("risk_free") or {}).get("annual_rate"))
+    risk_free = data.get("risk_free") or {}
+    rate = _number(risk_free.get("annual_rate"))
     skill = {"as_of": as_of, "benchmark_id": data.get("benchmark_id"),
              "portfolio": dict(sorted(portfolio.items())),
              "benchmark": {d: v for d, v in sorted((_day(r["date"]), _number(r.get("benchmark_return")))
                                                      for r in comparison) if v is not None},
-             "risk_free_annual_rate": rate,
+             "risk_free_annual_rate": rate, "risk_free_currency": risk_free.get("currency"),
+             "risk_free_series": risk_free.get("series_id"),
              "risk_free_daily": (1.0 + rate) ** (1.0 / 252.0) - 1.0 if rate is not None and rate > -1 else 0.0}
     series = {"as_of": as_of, "returns": returns}
 
     holdings = _holdings_inputs(data, positions, nav, classifications)
     window_start = _shift(as_of, -TRADE_WINDOW_DAYS)
     physical = str(data.get("subject_type") or "physical_account") == "physical_account"
-    trades, left_out = _trades(data, fx, base, positions["labels"]) if physical else ([], 0)
+    trade_detail = data.get("trade_detail_missing")
+    trades, left_out = _trades(data, fx, base, positions["labels"]) if physical and not trade_detail else ([], 0)
     trades = [trade for trade in trades if window_start < trade["trade_date"] <= as_of]
-    no_trades = (None if trades else
+    no_trades = (str(trade_detail) if trade_detail else None if trades else
                  "Trades are stored for physical accounts only." if not physical else
                  f"There are no trades in the year to {as_of}.")
     closes = {conid: dict(sorted(series_.items())) for conid, series_ in sorted(positions["reporting"].items())}
@@ -1215,6 +1271,103 @@ def prepare_inputs(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return {name: finite_copy(value)[0] for name, value in prepared.items()}
 
 
+def factor_model_for(data: Mapping[str, Any], day: str | None) -> str:
+    """The factor model for the holdings on `day`, by the share of their value (in the reporting
+    currency) in each trading currency: KOREA_MARKET_MODEL when won holdings are at least
+    KOREA_MODEL_SHARE, "us" when dollar holdings are at least US_FACTORS_SHARE, otherwise the
+    Modelling page's default region (Developed markets). Pure."""
+    base = str(data.get("reporting_currency") or "USD").upper()
+    fx = FxRates(data.get("fx") or [])
+    values: dict[str, float] = defaultdict(float)
+    for row in data.get("positions") or []:
+        if not day or _day(row.get("date")) != day:
+            continue
+        currency = str(row.get("currency") or "").upper()
+        value, rate = _number(row.get("market_value")), fx.rate(currency, base, day)
+        if currency and value is not None and rate is not None:
+            values[currency] += abs(value) * rate
+    total = math.fsum(values.values())
+    if total <= 0:
+        return KOREA_MARKET_MODEL if base == "KRW" else FACTOR_REGION
+    if values.get("KRW", 0.0) / total >= KOREA_MODEL_SHARE:
+        return KOREA_MARKET_MODEL
+    if values.get("USD", 0.0) / total >= US_FACTORS_SHARE:
+        return "us"
+    return FACTOR_REGION
+
+
+def _won_per_dollar(data: Mapping[str, Any]) -> tuple[list[str], list[float]]:
+    """Reference closes of won per U.S. dollar (USD to KRW, or KRW to USD inverted), by date."""
+    found: dict[str, float] = {}
+    for row in data.get("fx") or []:
+        day, rate = _day(row.get("date")), _number(row.get("rate"))
+        pair = (str(row.get("from") or "").upper(), str(row.get("to") or "").upper())
+        if not day or not rate or rate <= 0 or day in found:
+            continue
+        if pair == ("USD", "KRW"):
+            found[day] = rate
+        elif pair == ("KRW", "USD"):
+            found[day] = 1.0 / rate
+    dates = sorted(found)
+    return dates, [found[day] for day in dates]
+
+
+def _previous_day_fx_moves(data: Mapping[str, Any], days: Iterable[str]) -> dict[str, float]:
+    """For each won trading day, the log change in won per dollar between the two FX closes before
+    it. Korea's market closes at 06:30 UTC, before New York opens, so a day's FX close comes after
+    the Korean close and moves Korean prices the next Korean day."""
+    dates, rates = _won_per_dollar(data)
+    moves: dict[str, float] = {}
+    for day in days:
+        index = bisect.bisect_left(dates, day) - 1
+        if index < 1 or dates[index] < _shift(day, -NEXT_DAY_FX_DAYS):
+            continue
+        moves[day] = math.log(rates[index] / rates[index - 1])
+    return moves
+
+
+def _korea_market_model_inputs(data: Mapping[str, Any], returns: Mapping[str, float], start: str,
+                               as_of: str) -> dict[str, Any]:
+    """Korea's market model: the portfolio's daily return less the daily risk-free rate on the
+    primary benchmark's (KOSPI 200 for Korea iStrategy) less the same rate, and on the previous
+    U.S.-time day's won/dollar move. Pure."""
+    rate = _number((data.get("risk_free") or {}).get("annual_rate"))
+    daily_rf = (1.0 + rate) ** (1.0 / 252.0) - 1.0 if rate is not None and rate > -1 else 0.0
+    benchmark = {}
+    for row in data.get("comparison") or []:
+        day, value = _day(row.get("date")), _number(row.get("benchmark_return"))
+        if day and value is not None and start <= day <= as_of:
+            benchmark[day] = value
+    window = {day: value for day, value in returns.items() if start <= day <= as_of}
+    moves = _previous_day_fx_moves(data, sorted(window))
+    factors = {day: {KOREA_MARKET_FACTOR: benchmark[day] - daily_rf, KOREA_FX_FACTOR: moves[day], "RF": daily_rf}
+               for day in sorted(window) if day in benchmark and day in moves}
+    risk_free = data.get("risk_free") or {}
+    return {"as_of": as_of, "model": KOREA_MARKET_MODEL, "region": "korea",
+            "region_label": "Korea market model", "factor_names": [KOREA_MARKET_FACTOR, KOREA_FX_FACTOR],
+            "market_factor": KOREA_MARKET_FACTOR, "benchmark_id": data.get("benchmark_id"),
+            "risk_free_currency": risk_free.get("currency"), "risk_free_series": risk_free.get("series_id"),
+            "alignment": "won/dollar move of the previous U.S.-time day (the two FX closes before each Korean "
+                         "trading day)",
+            "returns": window, "factors": factors,
+            "sources": {"korea-market-model": "the primary benchmark's daily returns and the reference "
+                                              "won/dollar closes (reference_fx_rates)"},
+            "vintages": None}
+
+
+def _previous_day_levels(series: Mapping[str, float], days: Iterable[str]) -> dict[str, float]:
+    """A U.S.-time series re-dated to Korean trading days: each day takes the series' last level
+    before it (no older than NEXT_DAY_FX_DAYS), so a week of Korean returns lines up with the U.S.
+    moves Korean prices had already seen."""
+    dates = sorted(series)
+    found: dict[str, float] = {}
+    for day in sorted(days):
+        index = bisect.bisect_left(dates, day) - 1
+        if index >= 0 and dates[index] >= _shift(day, -NEXT_DAY_FX_DAYS):
+            found[day] = series[dates[index]]
+    return found
+
+
 def _held_quantities(data: Mapping[str, Any], day: str | None) -> dict[str, float]:
     found: dict[str, float] = defaultdict(float)
     for row in data.get("positions") or []:
@@ -1224,17 +1377,31 @@ def _held_quantities(data: Mapping[str, Any], day: str | None) -> dict[str, floa
 
 
 def _not_in_13f(info: Mapping[str, Any]) -> str | None:
-    """Why a holding cannot be matched to 13F filings, or None when it can (a share with a US ISIN)."""
+    """Why a holding cannot be matched to 13F filings, or None when it can: a share with a US ISIN,
+    or a ticker-only U.S. share (Kiwoom's US:<ticker>) with a reviewed CUSIP (cusip_from_ticker)."""
     from .sec_13f import cusip_from_isin  # the 13F loader's own rule
 
     category = str(info.get("asset_category") or "").strip().upper()
     if category and category != "STK":
         return "Only shares are in 13F filings."
+    if str(info.get("cusip_from_ticker") or "").strip():
+        return None
     if not str(info.get("isin") or "").strip():
+        if str(info.get("conid") or "").strip().upper().startswith("US:"):
+            return "No reviewed CUSIP for this U.S. ticker yet: its broker gives tickers, not ISINs."
+        if str(info.get("currency") or "").strip().upper() not in ("", "USD"):
+            return "13F covers U.S.-listed shares only."
         return "No ISIN in silver instruments."
     if cusip_from_isin(info.get("isin")) is None:
         return "Not a US ISIN, so not in 13F filings."
     return None
+
+
+def _holding_cusip(info: Mapping[str, Any]) -> str | None:
+    """The CUSIP a holding is matched to 13F filings by: from its US ISIN, else the reviewed ticker list's."""
+    from .sec_13f import cusip_from_isin
+
+    return cusip_from_isin(info.get("isin")) or (str(info.get("cusip_from_ticker") or "").strip() or None)
 
 
 def prepare_phase3_inputs(data: Mapping[str, Any], prepared: Mapping[str, Mapping[str, Any]],
@@ -1280,25 +1447,35 @@ def prepare_phase3_inputs(data: Mapping[str, Any], prepared: Mapping[str, Mappin
     if "factor_attribution" in names:
         stored = dict(market["factor_attribution"] or {})
         start = min(date.fromisoformat(as_of).replace(month=1, day=1).isoformat(), _shift(as_of, -365))
-        found["factor_attribution"] = (
-            {"as_of": as_of, "unavailable": no_returns} if no_returns else
-            {"as_of": as_of, "region": FACTOR_REGION, "region_label": FACTOR_REGIONS[FACTOR_REGION][0],
-             "returns": {d: r for d, r in returns.items() if d >= start},
-             "factors": {d: dict(row) for d, row in sorted((stored.get("factors") or {}).items())
-                         if start <= d <= as_of},
-             "sources": stored.get("sources"), "vintages": stored.get("vintages")})
+        region = str(stored.get("region") or FACTOR_REGION)
+        if no_returns:
+            found["factor_attribution"] = {"as_of": as_of, "unavailable": no_returns}
+        elif stored.get("model") == KOREA_MARKET_MODEL:
+            found["factor_attribution"] = _korea_market_model_inputs(data, returns, start, as_of)
+        else:
+            found["factor_attribution"] = {
+                "as_of": as_of, "region": region, "region_label": FACTOR_REGIONS[region][0],
+                "returns": {d: r for d, r in returns.items() if d >= start},
+                "factors": {d: dict(row) for d, row in sorted((stored.get("factors") or {}).items())
+                            if start <= d <= as_of},
+                "sources": stored.get("sources"), "vintages": stored.get("vintages")}
     if "macro" in names:
         stored = dict(market["macro"] or {})
         start = _shift(as_of, -365 * MACRO_YEARS - 7)
+        window = {d: r for d, r in returns.items() if d >= start}
+        levels = {name: {d: v for d, v in sorted(series.items()) if start <= d <= as_of}
+                  for name, series in sorted((stored.get("series") or {}).items())}
+        korea = factor_model_for(data, day) == KOREA_MARKET_MODEL
         found["macro"] = (
             {"as_of": as_of, "unavailable": no_returns} if no_returns else
-            {"as_of": as_of, "returns": {d: r for d, r in returns.items() if d >= start},
-             "levels": {name: {d: v for d, v in sorted(series.items()) if start <= d <= as_of}
-                        for name, series in sorted((stored.get("series") or {}).items())},
-             "units": stored.get("units"), "sources": stored.get("sources")})
+            {"as_of": as_of, "returns": window,
+             "levels": {name: _previous_day_levels(series, window) for name, series in levels.items()}
+             if korea else levels,
+             "units": stored.get("units"), "sources": stored.get("sources"),
+             **({"model": KOREA_MARKET_MODEL,
+                 "alignment": "each series' level of the previous U.S. day (the last level before each "
+                              "Korean trading day)"} if korea else {})})
     if "crowding" in names:
-        from .sec_13f import cusip_from_isin
-
         stored = dict(market["crowding"] or {})
         instruments = dict(stored.get("instruments") or {})
         filings = dict(stored.get("filings") or {})
@@ -1310,7 +1487,7 @@ def prepare_phase3_inputs(data: Mapping[str, Any], prepared: Mapping[str, Mappin
             if reason:
                 not_covered.append({**row, "reason": reason})
             else:
-                covered.append({**row, "cusip": cusip_from_isin(info.get("isin"))})
+                covered.append({**row, "cusip": _holding_cusip(info)})
         found["crowding"] = {"as_of": as_of, "holdings_date": day, "no_holdings": holdings.get("no_holdings"),
                              "covered": covered, "not_covered": not_covered,
                              "filers": list(filings.get("filers") or []), "stakes": list(filings.get("stakes") or [])}
@@ -1350,6 +1527,12 @@ def load_inputs(connection, *, tenant_id: str, subject_id: str, as_of: str) -> d
     reason = _own_pipeline_reason(connection, tenant_id=tenant_id, subject_id=subject_id, subject_type=subject_type)
     if reason:
         return {**data, "unavailable": reason}
+    if subject_type == "physical_account":
+        broker = connection.execute(
+            "SELECT account_type FROM accounts WHERE tenant_id = ? AND account_id = ?",
+            (tenant_id, subject_id)).fetchone()
+        if broker is not None and str(broker["account_type"] or "").lower() in TRADE_DETAIL_MISSING:
+            data["trade_detail_missing"] = TRADE_DETAIL_MISSING[str(broker["account_type"]).lower()]
 
     benchmark = connection.execute(
         """
@@ -1371,13 +1554,15 @@ def load_inputs(connection, *, tenant_id: str, subject_id: str, as_of: str) -> d
               AND quality_status IN ('pass', 'warn') AND observation_date <= ?
             ORDER BY observation_date
             """, (tenant_id, subject_id, benchmark["benchmark_id"], CALCULATION_VERSION, as_of)).fetchall()]
-    risk_free = connection.execute(
-        """
-        SELECT rate_date, annual_rate FROM risk_free_rates
-        WHERE tenant_id = ? AND currency = 'USD' AND rate_date <= ? AND quality_status IN ('pass', 'warn')
-        ORDER BY rate_date DESC LIMIT 1
-        """, (tenant_id, as_of)).fetchone()
-    data["risk_free"] = ({"rate_date": str(risk_free["rate_date"])[:10], "annual_rate": risk_free["annual_rate"]}
+    # The Risk page's rule: a won account takes the Korea CD rate once loaded and recent, every
+    # other subject (and Korea until then) the U.S. 3-month Treasury rate.
+    from .risk_snapshots import risk_free_rate
+
+    risk_free = risk_free_rate(connection, tenant_id=tenant_id, reporting_currency=data["reporting_currency"],
+                               as_of=as_of)
+    data["risk_free"] = ({"rate_date": str(risk_free["rate_date"])[:10], "annual_rate": risk_free["annual_rate"],
+                          "currency": str(risk_free["currency"] or "").upper() or None,
+                          "series_id": risk_free["series_id"]}
                          if risk_free else None)
 
     year_start = date.fromisoformat(as_of).replace(month=1, day=1).isoformat()
@@ -1430,7 +1615,9 @@ def load_inputs(connection, *, tenant_id: str, subject_id: str, as_of: str) -> d
             "SELECT snapshot_date, total_text FROM subject_nav_series "
             "WHERE tenant_id = ? AND subject_id = ? AND snapshot_date BETWEEN ? AND ? AND currency = "
             + ACTIVE_NAV_CURRENCY_SQL + " ORDER BY snapshot_date", (tenant_id, subject_id, start, as_of)).fetchall()]
-    data["flows"] = _external_flows(connection, tenant_id=tenant_id, subject_id=subject_id, start=start, end=as_of)
+    data["flows"] = _external_flows(connection, tenant_id=tenant_id, subject_id=subject_id, start=start, end=as_of,
+                                    kiwoom_cash_flows=_kiwoom_cash_flows(connection, tenant_id=tenant_id,
+                                                                         account_id=subject_id))
     currencies = sorted({str(value).upper() for value in (
         [row["currency"] for row in data["positions"]] + [row["currency"] for row in data["trades"]]
         + [row["commission_currency"] for row in data["trades"]] + [row["currency"] for row in data["flows"]]
@@ -1448,10 +1635,25 @@ def load_inputs(connection, *, tenant_id: str, subject_id: str, as_of: str) -> d
     return data
 
 
-def _external_flows(connection, *, tenant_id: str, subject_id: str, start: str, end: str) -> list[dict[str, Any]]:
+def _kiwoom_cash_flows(connection, *, tenant_id: str, account_id: str) -> bool:
+    """Whether this account's DEPOSIT and WITHDRAWAL cash rows are money from outside: a Kiwoom
+    account in the currencies the provisional benchmark reads them for (provisional_benchmark
+    KIWOOM_FLOW_CURRENCIES: the U.S. account's won-to-dollar top-ups; Korea's won account is left
+    as the benchmark job has it). An IBKR account's flows are read from its own labels."""
+    from .provisional_benchmark import KIWOOM_FLOW_CURRENCIES
+
+    row = connection.execute(
+        "SELECT base_currency FROM accounts WHERE tenant_id = ? AND account_id = ? AND account_type = 'kiwoom'",
+        (tenant_id, account_id)).fetchone()
+    return row is not None and str(row["base_currency"] or "").upper() in KIWOOM_FLOW_CURRENCIES
+
+
+def _external_flows(connection, *, tenant_id: str, subject_id: str, start: str, end: str,
+                    kiwoom_cash_flows: bool = False) -> list[dict[str, Any]]:
     """Deposits and withdrawals: a derived subject's external ledger rows, or an account's cash
-    transactions of that type (as the provisional benchmark reads them)."""
-    from .provisional_benchmark import _is_external_cash_transaction
+    transactions of that type (as the provisional benchmark reads them, a Kiwoom dollar account's
+    DEPOSIT and WITHDRAWAL rows included)."""
+    from .provisional_benchmark import KIWOOM_FLOW_TYPES, _is_external_cash_transaction
 
     found = []
     for row in connection.execute(
@@ -1464,6 +1666,8 @@ def _external_flows(connection, *, tenant_id: str, subject_id: str, start: str, 
             """, (tenant_id, subject_id, start, end)).fetchall():
         if row["source_kind"] == "derived_portfolio":
             external = bool(row["included"]) and bool(row["external_flow"])
+        elif kiwoom_cash_flows and str(row["transaction_type"] or "").upper() in KIWOOM_FLOW_TYPES:
+            external = True
         else:
             external = _is_external_cash_transaction({"type": row["transaction_type"],
                                                       "description": row["description"]})
@@ -1517,28 +1721,40 @@ def load_phase3_inputs(connection, *, tenant_id: str, subject_id: str, as_of: st
                 if series}}
         elif name == "factor_attribution":
             start = min(date.fromisoformat(as_of).replace(month=1, day=1).isoformat(), _shift(as_of, -365))
-            found[name] = market_inputs.read_factor_returns(connection, tenant_id=tenant_id, region=FACTOR_REGION,
-                                                            start=start, end=as_of)
+            model = factor_model_for(data, day)
+            if model == KOREA_MARKET_MODEL:
+                # The benchmark's returns and the won/dollar rate are already in `data`.
+                found[name] = {"model": KOREA_MARKET_MODEL}
+            else:
+                stored = market_inputs.read_factor_returns(connection, tenant_id=tenant_id, region=model,
+                                                           start=start, end=as_of)
+                found[name] = None if stored is None else {**stored, "region": model}
         elif name == "macro":
             found[name] = market_inputs.read_macro_series(connection, tenant_id=tenant_id,
                                                           start=_shift(as_of, -365 * MACRO_YEARS - 7), end=as_of)
         elif name == "crowding":
-            from .sec_13f import cusip_from_isin  # the 13F loader's own rule
+            from .sec_13f import reviewed_ticker_cusips
 
-            cusips = {cusip_from_isin(info.get("isin")) for info in instruments.values()}
+            tickers = reviewed_ticker_cusips()
+            described = {}
+            for conid in held:
+                info = instruments.get(conid) or {}
+                ticker = conid[3:].strip().upper() if conid.upper().startswith("US:") else ""
+                described[conid] = {"conid": conid, "isin": info.get("isin"), "currency": info.get("currency"),
+                                    "asset_category": info.get("asset_category"),
+                                    **({"cusip_from_ticker": tickers[ticker]}
+                                       if ticker in tickers and not str(info.get("isin") or "").strip() else {})}
+            cusips = {_holding_cusip(info) for info in described.values()}
             filings = market_inputs.read_institutional_holdings(connection, tenant_id=tenant_id, as_of=as_of,
                                                                 cusips=sorted(c for c in cusips if c))
-            found[name] = None if filings is None else {
-                "instruments": {conid: {"isin": (instruments.get(conid) or {}).get("isin"),
-                                        "asset_category": (instruments.get(conid) or {}).get("asset_category")}
-                                for conid in held},
-                "filings": filings}
+            found[name] = None if filings is None else {"instruments": described, "filings": filings}
     # Each phase 3 table read is one more input of the job's lineage run (a no-op unless recording;
     # lineage.JOB_INPUTS lists the v1 inputs only, so nothing changes while the setting is off).
     from . import lineage
 
     for name in present:
-        if found.get(name) is not None:
+        # Korea's market model reads no factor file (its inputs are the v1 reads), so none is recorded.
+        if found.get(name) is not None and found[name].get("model") != KOREA_MARKET_MODEL:
             lineage.current().input(f"silver.{market_inputs.SECTION_TABLES[name]}")
     return found
 

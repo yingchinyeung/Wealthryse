@@ -62,7 +62,7 @@
     "ibkr_etl.quant.tail_risk:evt_var_es": "c74b377c43425b9e9aa8becd191b54b537b573df8efd626a770daee72a58e728",
     "ibkr_etl.quant.tail_risk:tail_backtest_report": "23b63c32227762716e8a0c01b92442271261bfe5294d5e9df7ed19ae9374da60",
     "ibkr_etl.quant_snapshots:build_liquidity": "bbc476b514e7dd0f1aa097121af8ded3c47d92861b355b2574ba619bd1560c7a",
-    "ibkr_etl.quant_snapshots:build_macro": "e1e59597d8ea187b677de8abdba5d9f6cba4139680ed82453451a3555dbf7afe",
+    "ibkr_etl.quant_snapshots:build_macro": "13b612f4c26b9ee83aeea5c72cb3555d1c581d87251fe0d659d90d5f66f9ebbd",
     "ibkr_etl.risk_forecasting:choose_regimes": "a4681f28e1b496cd99ee1d59be8a744a550a850c34057fee4527787f5b2e9db4",
     "ibkr_etl.risk_forecasting:drawdown_odds": "a63f94f8215ca092bccb90fc453352574a588d4bb0a27a5ad31674b4e453e3c9",
     "ibkr_etl.risk_forecasting:factor_stress": "17e8d4bbb249701951591e263e3eeede2849579cb135b4a6e874a5e282045263",

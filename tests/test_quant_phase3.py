@@ -863,9 +863,11 @@ class GatingTests(unittest.TestCase):
             found = qs.load_phase3_inputs(connection, tenant_id="t", subject_id=ACCOUNT, as_of=AS_OF, data=self.data,
                                           sections=qs.PHASE3_NAMES)
         self.assertEqual(found["liquidity"], {"volumes": {}})
-        self.assertEqual(found["factor_attribution"], {"factors": {}})
+        # The holdings are mixed (factor_model_for), so the Modelling page's default region.
+        self.assertEqual(found["factor_attribution"], {"factors": {}, "region": "developed"})
         self.assertEqual(found["crowding"]["filings"], {"filers": [], "stakes": []})
-        self.assertEqual(found["crowding"]["instruments"]["9001"], {"isin": "US0378331005", "asset_category": "STK"})
+        self.assertEqual(found["crowding"]["instruments"]["9001"],
+                         {"conid": "9001", "isin": "US0378331005", "currency": "USD", "asset_category": "STK"})
         self.assertEqual(read_instruments.call_args.args[1], sorted(instruments))
         self.assertEqual(volumes.call_args.kwargs["instrument_ids"], sorted(instruments))  # the held conids
         self.assertEqual((volumes.call_args.kwargs["start"], volumes.call_args.kwargs["end"]),

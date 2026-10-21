@@ -343,7 +343,9 @@ def market_from_raw(raw: dict, data: dict, *, as_of: str | None = None) -> dict:
         "liquidity": {"volumes": volumes},
         "factor_attribution": factor_returns,
         "macro": macro,
-        "crowding": {"instruments": {conid: {"isin": instruments[conid]["isin"],
+        # No reviewed ticker list in the test data, so no holding gets a CUSIP from its ticker.
+        "crowding": {"instruments": {conid: {"conid": conid, "isin": instruments[conid]["isin"],
+                                             "currency": instruments[conid]["currency"],
                                              "asset_category": instruments[conid]["asset_category"]}
                                      for conid in held},
                      "filings": {"filers": filers, "stakes": stakes}},

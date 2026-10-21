@@ -71,6 +71,9 @@ FEED = "sec-13f"
 PROVIDER = "SEC EDGAR"
 LICENCE = "sec-edgar-public-filing; U.S. Securities and Exchange Commission, EDGAR"
 FILERS_FILE = Path(__file__).resolve().parent / "data" / "sec_13f_filers.json"
+# CUSIPs for U.S. shares held through a broker that gives tickers but no ISIN (Kiwoom's U.S.
+# account keys them US:<ticker>), reviewed by hand like the filer list.
+TICKER_CUSIPS_FILE = Path(__file__).resolve().parent / "data" / "us_ticker_cusips.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/{name}"
 ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{folder}/{name}"
 FORMS = ("13F-HR", "13F-HR/A")
@@ -164,6 +167,27 @@ def load_filers(path: Path = FILERS_FILE, *, require_reviewed: bool = True) -> l
     if not filers:
         raise ValueError(f"{Path(path).name} lists no filers")
     return filers
+
+
+def reviewed_ticker_cusips(path: Path = TICKER_CUSIPS_FILE) -> dict[str, str]:
+    """``{ticker: cusip}`` from the reviewed ticker list; empty while it is not marked reviewed, so a
+    ticker-only U.S. share stays "not covered" until someone has checked its CUSIP. A malformed
+    entry (bad CUSIP or check digit, repeated ticker) refuses the whole list."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if data.get("reviewed") is not True:
+        return {}
+    found: dict[str, str] = {}
+    for ticker, entry in (data.get("tickers") or {}).items():
+        key = str(ticker or "").strip().upper()
+        cusip = str((entry or {}).get("cusip") if isinstance(entry, dict) else entry or "").strip().upper()
+        valid = bool(_CUSIP.match(cusip)) and cusip[8].isdigit() and cusip_check_digit(cusip[:8]) == int(cusip[8])
+        if not key or key in found or not valid:
+            raise ValueError(f"{Path(path).name}: bad or repeated ticker entry {ticker!r}")
+        found[key] = cusip
+    return found
 
 
 # ---------------------------------------------------------------- CUSIPs

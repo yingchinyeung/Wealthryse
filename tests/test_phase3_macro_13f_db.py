@@ -138,6 +138,8 @@ FRED_HISTORY = {
     "DCOILBRENTEU": {"2026-11-20": "74.2", "2026-11-23": "75.0", "2026-11-24": "75.4", "2026-11-25": "76.1",
                      "2026-11-26": "."},
     "VIXCLS": {"2026-11-25": "15.2"},
+    "DEXKOUS": {"2026-11-20": "1384.20", "2026-11-23": "1386.55", "2026-11-24": "1381.10",
+                "2026-11-25": "1379.80", "2026-11-26": "."},
 }
 CNH_HISTORY = [("2026-11-20", 7.12), ("2026-11-23", 7.13), ("2026-11-24", 7.11)]
 
@@ -350,16 +352,17 @@ class MacroAndHoldingsTests(unittest.TestCase):
 
         first = run(date(2026, 11, 26))
         self.assertEqual(first["failed"], [])
-        self.assertEqual(first["rows_stored"], 4 * 4 + 3)
+        self.assertEqual(first["rows_stored"], 5 * 4 + 3)
         self.assertEqual({s["series_id"]: s["skipped_missing"] for s in first["series"]},
-                         {"DGS10": 1, "DGS2": 1, "DTWEXBGS": 1, "DCOILBRENTEU": 1, "USDCNH": 0})
+                         {"DGS10": 1, "DGS2": 1, "DTWEXBGS": 1, "DCOILBRENTEU": 1, "DEXKOUS": 1, "USDCNH": 0})
         stored = rows()
-        self.assertEqual(len(stored), 19)
+        self.assertEqual(len(stored), 23)
         self.assertEqual({row[5] for row in stored}, {"2026-11-26"})
         self.assertNotIn("VIXCLS", {row[0] for row in stored})
-        self.assertEqual({(row[0], row[3], row[4]) for row in stored if row[0] in ("DGS10", "USDCNH")},
-                         {("DGS10", "percent", "fred"), ("USDCNH", "cnh_per_usd", "yahoo-chart")})
-        self.assertEqual([c["feed"] for c in self.capture.calls], ["fred-series"] * 4)
+        self.assertEqual({(row[0], row[3], row[4]) for row in stored if row[0] in ("DGS10", "DEXKOUS", "USDCNH")},
+                         {("DGS10", "percent", "fred"), ("DEXKOUS", "krw_per_usd", "fred"),
+                          ("USDCNH", "cnh_per_usd", "yahoo-chart")})
+        self.assertEqual([c["feed"] for c in self.capture.calls], ["fred-series"] * 5)
 
         # The same day again: nothing new to store, nothing changes.
         again = run(date(2026, 11, 26))
@@ -374,7 +377,7 @@ class MacroAndHoldingsTests(unittest.TestCase):
         self.assertEqual(counts["DGS10"], (1, 1, 3))
         self.assertEqual(counts["USDCNH"], (1, 0, 3))
         self.assertEqual(counts["DGS2"], (0, 0, 4))
-        self.assertEqual(len(rows()), 22)
+        self.assertEqual(len(rows()), 26)
         self.assertEqual(latest("DGS10")["2026-11-25"], 4.16)
         with layers._connect(self.database) as owner:
             history = owner.execute("SELECT vintage, value FROM macro_series WHERE series_id = 'DGS10' AND "
@@ -384,7 +387,7 @@ class MacroAndHoldingsTests(unittest.TestCase):
         # Revised again the same day: the day's vintage is updated in place (an upsert), not added.
         fred.history["DGS10"]["2026-11-25"] = "4.17"
         run(date(2026, 11, 27))
-        self.assertEqual(len(rows()), 22)
+        self.assertEqual(len(rows()), 26)
         self.assertEqual(latest("DGS10")["2026-11-25"], 4.17)
 
         # A licensed VIX is kept once confirmed.
@@ -402,7 +405,7 @@ class MacroAndHoldingsTests(unittest.TestCase):
                               "source, vintage, fetched_at) VALUES (%s, 'DGS10', '2026-11-20', 1, 'percent', "
                               "'fred', '2026-11-27', '2026-11-27T22:30:00+00:00')", (TENANT,))
         with layers._connect(self.database, WEB) as web:
-            self.assertEqual(web.execute("SELECT count(*) FROM macro_series").fetchone()[0], 23)
+            self.assertEqual(web.execute("SELECT count(*) FROM macro_series").fetchone()[0], 27)
             # The website login is read-only twice over: its sessions, and its grants (checked above).
             with self.assertRaises((psycopg.errors.InsufficientPrivilege, psycopg.errors.ReadOnlySqlTransaction)):
                 web.execute("DELETE FROM macro_series")

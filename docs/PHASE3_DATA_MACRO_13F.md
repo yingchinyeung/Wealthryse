@@ -56,6 +56,7 @@ read no network.
 |---|---|---|---|
 | DGS10, DGS2 | Board of Governors of the Federal Reserve System, H.15 | US government data, no copyright notice: public domain, citation requested | Yes |
 | DTWEXBGS | Board of Governors of the Federal Reserve System, H.10 | As above | Yes |
+| DEXKOUS (won per dollar, added 21 Oct for the Korea account) | Board of Governors of the Federal Reserve System, H.10 | As DTWEXBGS, same release: **re-read its FRED notes before switch-on** | Yes (confirm) |
 | DCOILBRENTEU | U.S. Energy Information Administration, Spot Prices | US government data, no copyright notice. EIA republishes these spot prices from a commercial source: **confirm before switch-on** | Yes (confirm) |
 | VIXCLS | Chicago Board Options Exchange | Its notes say "Copyright, 2016, Chicago Board Options Exchange, Inc. Reprinted with permission." **Not public domain** | **No**, until the owner confirms a licence and sets `MACRO_SERIES_LICENSE_CONFIRMED=VIXCLS` |
 | ICE BofA (`BAML*`) | ICE Data Indices | Copyrighted | Never: `fred_url` refuses any id that starts with BAML |
@@ -84,7 +85,7 @@ No columns were added beyond the fixed schemas.
 
 **`silver.macro_series`**
 - Columns: `series_id`, `observation_date`, `value`, `units` (`percent`, `index`,
-  `usd_per_barrel`, `cnh_per_usd`), `source` (`fred`, `yahoo-chart`), `vintage`, `fetched_at`.
+  `usd_per_barrel`, `cnh_per_usd`, `krw_per_usd`), `source` (`fred`, `yahoo-chart`), `vintage`, `fetched_at`.
 - Key: (tenant_id, series_id, observation_date, vintage).
 - Yields are in percent as FRED publishes them (4.25 means 4.25%).
 - **Vintages.** The vintage is the UTC date of the fetch. A value is stored under a new vintage
@@ -218,8 +219,9 @@ Each table is its own held migration. The design gives each switch-on **one free
 
 So `macro_series.sql` runs on its own day, and `institutional_holdings.sql` on a later one.
 
-- At merge each draft takes the next free number in `migrations/postgres`. 074 to 077 are taken
-  by the drafts already held, and part A's two tables take numbers too.
+- At merge each draft takes the next free number in `migrations/postgres`. 074 to 078 are taken
+  by the drafts already held (daily volumes 078), `main` has used 079 to 081 and Medallion's Kiwoom
+  bronze table takes 082, so factor returns, macro series and 13F take 083 onwards, in that order.
 - On its day, and not before, the draft moves to
   `migrations/postgres/<number>_macro_series.sql` (or `_institutional_holdings.sql`), and in the
   same change `"held"` is dropped from its catalog entry. The undo stays in drafts.

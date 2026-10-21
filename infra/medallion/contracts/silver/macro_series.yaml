@@ -39,14 +39,14 @@ schema:
     primaryKey: true
     primaryKeyPosition: 2
     classification: internal
-    description: FRED id as FRED names it (DGS10, DGS2, DTWEXBGS, DCOILBRENTEU, VIXCLS once licensed) or USDCNH
-      (Yahoo CNH=X).
+    description: FRED id as FRED names it (DGS10, DGS2, DTWEXBGS, DCOILBRENTEU, DEXKOUS, VIXCLS once licensed) or
+      USDCNH (Yahoo CNH=X).
     quality:
     - name: series_id_is_reviewed
       description: series_id is one of the reviewed series; ICE BofA (BAML) series are never kept.
       type: sql
       query: SELECT COUNT(*) FROM silver.macro_series WHERE series_id NOT IN ('DGS10', 'DGS2', 'DTWEXBGS', 'DCOILBRENTEU',
-        'VIXCLS', 'USDCNH')
+        'VIXCLS', 'USDCNH', 'DEXKOUS')
       mustBe: 0
       severity: error
       dimension: conformity
@@ -78,16 +78,16 @@ schema:
     primaryKeyPosition: -1
     classification: internal
     description: 'The observation in units: yields in percent as published (4.25 is 4.25%), index levels, US dollars
-      per barrel, offshore renminbi per US dollar.'
+      per barrel, offshore renminbi or South Korean won per US dollar.'
     quality:
     - name: value_in_unit_range
       description: 'value is in its unit''s plausible range, as the loader checks before it writes: percent above
         -5 and at most 30, index and US dollars per barrel above 0 and at most 1000, renminbi per US dollar above
-        1 and at most 20.'
+        1 and at most 20, won per US dollar above 500 and at most 3000.'
       type: sql
       query: SELECT COUNT(*) FROM silver.macro_series WHERE (units = 'percent' AND (value <= -5 OR value > 30))
         OR (units IN ('index', 'usd_per_barrel') AND (value <= 0 OR value > 1000)) OR (units = 'cnh_per_usd' AND
-        (value <= 1 OR value > 20))
+        (value <= 1 OR value > 20)) OR (units = 'krw_per_usd' AND (value <= 500 OR value > 3000))
       mustBe: 0
       severity: error
       dimension: conformity
@@ -99,13 +99,13 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: internal
-    description: percent, index, usd_per_barrel or cnh_per_usd.
+    description: percent, index, usd_per_barrel, cnh_per_usd or krw_per_usd.
     quality:
     - name: units_allowed_values
-      description: units is one of percent, index, usd_per_barrel, cnh_per_usd (a CHECK constraint).
+      description: units is one of percent, index, usd_per_barrel, cnh_per_usd, krw_per_usd (a CHECK constraint).
       type: sql
       query: SELECT COUNT(*) FROM silver.macro_series WHERE units NOT IN ('percent', 'index', 'usd_per_barrel',
-        'cnh_per_usd')
+        'cnh_per_usd', 'krw_per_usd')
       mustBe: 0
       severity: error
       dimension: conformity
@@ -166,11 +166,12 @@ schema:
   quality:
   - name: series_units_and_source_match
     description: 'Each series has its own unit and source: the Treasury yields in percent, the dollar index and
-      VIX as index, Brent in US dollars per barrel, all from FRED, and USDCNH in renminbi per US dollar from yahoo-chart.'
+      VIX as index, Brent in US dollars per barrel, won per US dollar (DEXKOUS), all from FRED, and USDCNH in renminbi
+      per US dollar from yahoo-chart.'
     type: sql
     query: SELECT COUNT(*) FROM silver.macro_series WHERE (series_id IN ('DGS10', 'DGS2') AND units <> 'percent')
       OR (series_id IN ('DTWEXBGS', 'VIXCLS') AND units <> 'index') OR (series_id = 'DCOILBRENTEU' AND units <>
-      'usd_per_barrel') OR (series_id = 'USDCNH' AND (units <> 'cnh_per_usd' OR source <> 'yahoo-chart')) OR (series_id
+      'usd_per_barrel') OR (series_id = 'DEXKOUS' AND units <> 'krw_per_usd') OR (series_id = 'USDCNH' AND (units <> 'cnh_per_usd' OR source <> 'yahoo-chart')) OR (series_id
       <> 'USDCNH' AND source <> 'fred')
     mustBe: 0
     severity: error

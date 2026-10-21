@@ -1067,7 +1067,7 @@ const quantRenderDecisions=r=>{const tva=r.trade_value_added||{},totals=tva.tota
   const byHolding=(tva.by_holding||[]).slice().sort((a,b)=>Math.abs(holdingAdded(b))-Math.abs(holdingAdded(a))).slice(0,5);
   const holdTable=byHolding.length?quantSub('Largest value added by holding (21 sessions)')+quantTable(['Holding','Trades','Value added'],byHolding.map(x=>quantRow(x.symbol||x.conid,[esc(x.trades),quantSignedMoney(holdingAdded(x))]))):'';
   return [tiles+cfTable+holdTable,quantText([tva.method,prof.method,(r.timing_cost||{}).method,cf.method,tva.disclaimer])]};
-const quantRenderCurrency=r=>{const ca=r.currency_attribution||r,mtd=ca.mtd||{},ytd=ca.ytd||{};
+const quantRenderCurrency=(r,p)=>{const ca=r.currency_attribution||r,mtd=ca.mtd||{},ytd=ca.ytd||{},inputs=(p||{}).inputs||{};
   const effect=x=>x&&x.totals&&quantNum(x.totals.currency_allocation)?Number(x.totals.currency_allocation)+(Number(x.totals.currency_compounding)||0):null;
   const signed=n=>quantNum(n)?toned(signedPct(n),n):'—';const t=ytd.totals||{};
   const tiles=quantTiles([
@@ -1077,7 +1077,7 @@ const quantRenderCurrency=r=>{const ca=r.currency_attribution||r,mtd=ca.mtd||{},
     quantTile('Local market effect (year to date)',signed(['allocation','selection','interaction'].every(k=>quantNum(t[k]))?Number(t.allocation)+Number(t.selection)+Number(t.interaction):null),'How the holdings did in their own currencies against the benchmark'),
   ]);
   const rows=(ytd.currencies||[]).map(x=>quantRow(x.currency,[weightPct(x.portfolio_weight),weightPct(x.benchmark_weight),signedPct(x.currency_return),signed(x.currency_allocation)]));
-  return [tiles+(rows.length?quantSub('By currency, year to date'):'')+quantTable(['Currency','Portfolio weight','Benchmark weight','Currency move','Currency allocation'],rows),quantText([ytd.method||mtd.method,...(ytd.notes||[])])]};
+  return [tiles+(rows.length?quantSub('By currency, year to date'):'')+quantTable(['Currency','Portfolio weight','Benchmark weight','Currency move','Currency allocation'],rows),quantText([inputs.single_currency?`All holdings are in ${esc(inputs.base_currency||'the reporting currency')}, so there is no currency effect.`:'',ytd.method||mtd.method,...(ytd.notes||[])])]};
 const quantRenderHoldingsRisk=r=>{const lw=r.ledoit_wolf_covariance||{},ex=r.ex_ante_risk||{},pc=r.statistical_factors||{};
   const holdings=(ex.holdings||[]).slice().sort((a,b)=>(Number(b.contribution)||0)-(Number(a.contribution)||0));const top=holdings[0];const first=(pc.factors||[])[0];
   const tiles=quantTiles([
@@ -1231,8 +1231,8 @@ PHASE3_SCRIPT = r"""
 const quantCount=n=>quantNum(n)?minus(new Intl.NumberFormat('en-US',{maximumFractionDigits:0}).format(Number(n))):'—';
 const quantDays=n=>quantNum(n)?`${quantFixed(n,Number(n)<10?1:0)} ${Number(n)===1?'day':'days'}`:'—';
 const quantSigned=n=>quantNum(n)?toned(signedPct(n),n):'—';
-const quantFactorNames={'Mkt-RF':'Market','SMB':'Size','HML':'Value','RMW':'Profitability','CMA':'Investment','MOM':'Momentum'};
-const quantMacroNames={'DGS10':'US 10-year yield','DGS10-DGS2':'Yield curve (10-year minus 2-year)','DTWEXBGS':'Broad dollar index','DCOILBRENTEU':'Brent oil','VIXCLS':'VIX','USDCNH':'USD/CNH'};
+const quantFactorNames={'Mkt-RF':'Market','SMB':'Size','HML':'Value','RMW':'Profitability','CMA':'Investment','MOM':'Momentum','KR-Mkt-RF':'Korean market (the benchmark)','USDKRW':'Won per dollar (previous U.S. day)'};
+const quantMacroNames={'DGS10':'US 10-year yield','DGS10-DGS2':'Yield curve (10-year minus 2-year)','DTWEXBGS':'Broad dollar index','DCOILBRENTEU':'Brent oil','VIXCLS':'VIX','USDCNH':'USD/CNH','DEXKOUS':'Won per dollar'};
 const quantRenderFactorAttribution=(r,p)=>{const y=r.past_year||{},t=r.ytd||{},inputs=(p||{}).inputs||{};
   const ok=x=>x&&x.available!==false&&quantNum(x.cumulative_excess_return);const alpha=x=>(x.alpha||{}),rest=x=>(x.residual||{});
   const tiles=quantTiles([
@@ -1249,7 +1249,10 @@ const quantRenderFactorAttribution=(r,p)=>{const y=r.past_year||{},t=r.ytd||{},i
   const head=['Factor',`Beta (${label})`,'t-statistic',`Contribution (${label})`].concat(ok(y)&&ok(t)?['Contribution (year to date)']:[]);
   const rows=(main.exposures||[]).map(x=>quantRow(quantFactorNames[x.factor]||x.factor,[ratio(x.beta),quantFixed(x.t_statistic,2),quantSigned(x.cumulative_contribution)].concat(ok(y)&&ok(t)?[other[x.factor]?quantSigned(other[x.factor].cumulative_contribution):'—']:[])));
   const sources=Object.keys(inputs.factor_sources||{}).map(s=>s==='etf-proxy'?'fund stand-ins':'the Kenneth French data library').join(' and ');
-  return [tiles+(rows.length?quantSub('By factor'):'')+quantTable(head,rows),quantText([inputs.region_label?`${inputs.region_label} factors${sources?` from ${sources}`:''}, through ${analyticsDate(inputs.factor_data_through)}; daily portfolio returns less the daily risk-free rate.`:'',main.method,main.disclaimer])]};
+  const korea=inputs.model==='korea_market';
+  const note=korea?`Korea market model: the account's benchmark${inputs.benchmark_id?` (${esc(inputs.benchmark_id)})`:''} and the won/dollar move of the previous U.S. trading day, through ${analyticsDate(inputs.factor_data_through)}; daily returns less the daily risk-free rate. No daily style factors cover Korean stocks.`:
+    inputs.region_label?`${inputs.region_label} factors${sources?` from ${sources}`:''}, through ${analyticsDate(inputs.factor_data_through)}; daily portfolio returns less the daily risk-free rate.`:'';
+  return [tiles+(rows.length?quantSub('By factor'):'')+quantTable(head,rows),quantText([note,main.method,main.disclaimer])]};
 const quantRenderLiquidity=(r,p)=>{const d=r.days_to_liquidate||{},lv=r.liquidity_adjusted_var||{},inputs=(p||{}).inputs||{},s=d.sellable_within||{};const lvar=lv.available!==false&&quantNum(lv.liquidity_adjusted_var),dl=d.available!==false&&quantNum(s['1']);
   const total=Number(inputs.holdings)||0,without=(inputs.not_covered||[]).length;
   const tiles=quantTiles([
@@ -1266,12 +1269,12 @@ const quantRenderLiquidity=(r,p)=>{const d=r.days_to_liquidate||{},lv=r.liquidit
   const rows=(d.holdings||[]).slice(0,10).map(x=>quantRow(x.key,[quantCount(x.quantity),quantCount(x.average_daily_volume),quantDays(x.days),weightPct(x.share_of_portfolio)]));
   const missing=d.no_volume_data||[];
   return [tiles+(rows.length?quantSub('Slowest holdings to sell'):'')+quantTable(['Holding','Quantity','Average daily volume','Days to sell','Share of holdings'],rows),quantText([missing.length?`No volume data: ${missing.join(', ')}.`:'',inputs.holdings_date?`Holdings on ${analyticsDate(inputs.holdings_date)}; average daily volume over the last ${inputs.volume_window_sessions||20} sessions with volume.`:'',d.method,lvar?lv.method:'',lvar?inputs.spreads:'',d.disclaimer])]};
-const quantShockNames={'rates_up_100bp':'US 10-year yield +100bp','curve_steeper_50bp':'Yield curve 50bp steeper','dollar_up_5pct':'Dollar index +5%','oil_down_20pct':'Brent oil −20%','volatility_up_50pct':'VIX +50%','yuan_down_5pct':'Yuan 5% weaker','risk_off':'Risk-off week'};
-const quantRiskOffParts={'DGS10':'yield −50bp','DTWEXBGS':'dollar +5%','DCOILBRENTEU':'Brent −20%','VIXCLS':'VIX +50%','USDCNH':'USD/CNH +3%'};
+const quantShockNames={'rates_up_100bp':'US 10-year yield +100bp','curve_steeper_50bp':'Yield curve 50bp steeper','dollar_up_5pct':'Dollar index +5%','oil_down_20pct':'Brent oil −20%','volatility_up_50pct':'VIX +50%','yuan_down_5pct':'Yuan 5% weaker','won_down_5pct':'Won 5% weaker','risk_off':'Risk-off week'};
+const quantRiskOffParts={'DGS10':'yield −50bp','DTWEXBGS':'dollar +5%','DCOILBRENTEU':'Brent −20%','VIXCLS':'VIX +50%','USDCNH':'USD/CNH +3%','DEXKOUS':'won per dollar +3%'};
 const quantRenderMacro=(r,p)=>{const m=r.macro_exposures||{},sens=r.macro_sensitivity||{},inputs=(p||{}).inputs||{};
   const has=k=>sens[k]&&quantNum(sens[k].impact);const shock=k=>quantSigned(sens[k].impact);
   const range=k=>Array.isArray(sens[k].range_95)?`95% range ${signedPct(sens[k].range_95[0])} to ${signedPct(sens[k].range_95[1])}`:'';
-  const offOut=new Set((sens.risk_off||{}).factors_not_in_model||[]),offIn=Object.keys(quantRiskOffParts).filter(k=>!offOut.has(k)).map(k=>quantRiskOffParts[k]).join(', ');
+  const offOut=new Set((sens.risk_off||{}).factors_not_in_model||[]),offIn=Object.keys(((inputs.shocks||{}).risk_off)||quantRiskOffParts).filter(k=>!offOut.has(k)&&quantRiskOffParts[k]).map(k=>quantRiskOffParts[k]).join(', ');
   const offHint=offIn?`${offIn.charAt(0).toUpperCase()}${offIn.slice(1)} together${offOut.size?`; ${[...offOut].map(k=>quantMacroNames[k]||k).join(', ')} left out`:''}`:'';
   const tiles=quantTiles([
     has('rates_up_100bp')?quantTile('US 10-year yield +100bp',shock('rates_up_100bp'),range('rates_up_100bp')):'',
@@ -1280,6 +1283,7 @@ const quantRenderMacro=(r,p)=>{const m=r.macro_exposures||{},sens=r.macro_sensit
     has('oil_down_20pct')?quantTile('Brent oil −20%',shock('oil_down_20pct'),range('oil_down_20pct')):'',
     has('volatility_up_50pct')?quantTile('VIX +50%',shock('volatility_up_50pct'),range('volatility_up_50pct')):'',
     has('yuan_down_5pct')?quantTile('Yuan 5% weaker',shock('yuan_down_5pct'),range('yuan_down_5pct')):'',
+    has('won_down_5pct')?quantTile('Won 5% weaker',shock('won_down_5pct'),range('won_down_5pct')):'',
     has('risk_off')?quantTile('Risk-off week',shock('risk_off'),offHint):'',
     quantTile('Macro R²',pct(m.r_squared),'Share of the weekly moves the series explain together'),
     quantTile('Weeks in the macro model',quantCount((m.window||{}).observations),(m.window||{}).start?`${analyticsDate(m.window.start)} to ${analyticsDate(m.window.end)}`:''),
@@ -1289,13 +1293,13 @@ const quantRenderMacro=(r,p)=>{const m=r.macro_exposures||{},sens=r.macro_sensit
   const why=inputs.factors_missing_reasons||{},plain=t=>String(t||'').replace(/\.$/,'');
   const missing=(inputs.factors_missing||[]).map(x=>`${quantMacroNames[x]||x}${why[x]?` (${plain(why[x]).charAt(0).toLowerCase()}${plain(why[x]).slice(1)})`:''}`);
   const skipped=Object.keys(inputs.shocks_left_out||{}).map(k=>quantShockNames[k]||k);
-  return [tiles+(rows.length?quantSub('Sensitivity to each series, the others held still'):'')+quantTable(['Series','Portfolio move','t-statistic (Newey-West)','Significant'],rows),quantText([missing.length?`Left out of the model: ${missing.join('; ')}.`:'',skipped.length?`Shocks left out, as their series are not in the model: ${skipped.join(', ')}.`:'',m.method,(Object.values(sens).find(x=>x&&x.method)||{}).method,m.disclaimer])]};
+  return [tiles+(rows.length?quantSub('Sensitivity to each series, the others held still'):'')+quantTable(['Series','Portfolio move','t-statistic (Newey-West)','Significant'],rows),quantText([inputs.model==='korea_market'?'Korean returns are compared with each series at the previous U.S. day, since Korea closes before New York opens; won per dollar takes the place of USD/CNH.':'',missing.length?`Left out of the model: ${missing.join('; ')}.`:'',skipped.length?`Shocks left out, as their series are not in the model: ${skipped.join(', ')}.`:'',m.method,(Object.values(sens).find(x=>x&&x.method)||{}).method,m.disclaimer])]};
 const quantRenderCrowding=(r,p)=>{const o=r.ownership_overlap||{},inputs=(p||{}).inputs||{},names=inputs.securities||{},funds=o.most_similar_funds||[],top=funds[0];
   const held=(o.holdings||[]).slice().sort((a,b)=>(Number(b.funds_holding)||0)-(Number(a.funds_holding)||0)||Math.abs(Number(b.weight)||0)-Math.abs(Number(a.weight)||0));const wide=held[0];
   const periods=(inputs.periods||[]).map(analyticsDate).join(', ');
   const tiles=quantTiles([
     quantTile('Funds compared',quantCount(o.funds),periods?`13F filings for the quarter to ${periods}`:''),
-    quantTile('Covered by 13F filings',weightPct(inputs.covered_weight),'Share of NAV in shares with a US ISIN'),
+    quantTile('Covered by 13F filings',weightPct(inputs.covered_weight),'Share of NAV in U.S. shares with a CUSIP (from a US ISIN, or the reviewed ticker list)'),
     quantTile('In names the funds hold',pct(o.share_in_names_funds_hold),'Share of the covered weight'),
     top&&quantNum(top.similarity)?quantTile('Most similar fund',`${esc(top.fund)} · ${ratio(top.similarity)}`,'Cosine similarity: 1 is the same mix, 0 nothing in common'):'',
     wide?quantTile('Most widely held',`${esc(names[wide.security]||wide.security)} · ${quantCount(wide.funds_holding)} ${Number(wide.funds_holding)===1?'fund':'funds'}`):'',
@@ -1303,6 +1307,6 @@ const quantRenderCrowding=(r,p)=>{const o=r.ownership_overlap||{},inputs=(p||{})
   const fundRows=funds.map(f=>quantRow(f.fund,[ratio(f.similarity),quantCount(f.shared_holdings),weightPct(f.portfolio_weight_in_fund_names),weightPct(f.fund_weight_in_portfolio_names),`${money(f.reported_value)} USD`]));
   const holdingRows=held.slice(0,10).map(x=>quantRow(names[x.security]||x.security,[weightPct(x.weight),quantCount(x.funds_holding)]));
   const out=inputs.not_covered||[];
-  return [tiles+(fundRows.length?quantSub('Most similar funds'):'')+quantTable(['Fund','Similarity','Shared holdings','Our weight in its names','Its weight in our names','Reported value'],fundRows)+(holdingRows.length?quantSub('Covered holdings by number of funds'):'')+quantTable(['Holding','Weight','Funds holding'],holdingRows),quantText([out.length?`Not covered (${weightPct(inputs.not_covered_weight)} of NAV): ${out.map(x=>`${x.name} (${String(x.reason||'').replace(/\.$/,'').toLowerCase()})`).join(', ')}.`:'',inputs.shares_outstanding,o.method])]};
+  return [tiles+(fundRows.length?quantSub('Most similar funds'):'')+quantTable(['Fund','Similarity','Shared holdings','Our weight in its names','Its weight in our names','Reported value'],fundRows)+(holdingRows.length?quantSub('Covered holdings by number of funds'):'')+quantTable(['Holding','Weight','Funds holding'],holdingRows),quantText([out.length?`Not covered (${weightPct(inputs.not_covered_weight)} of NAV): ${out.map(x=>{const why=String(x.reason||'').replace(/\.$/,'');return `${x.name} (${why.charAt(0).toLowerCase()}${why.slice(1)})`}).join(', ')}.`:'',inputs.shares_outstanding,o.method])]};
 quantSections.push(['factor_attribution','quant-factor-attribution',quantRenderFactorAttribution],['liquidity','quant-liquidity',quantRenderLiquidity],['macro','quant-macro',quantRenderMacro],['crowding','quant-crowding',quantRenderCrowding]);
 """

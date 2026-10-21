@@ -278,7 +278,9 @@ the terms, then change `raw_capture.FEED_LICENSES`, the tag and the contract.
 ### Switching on, in order
 
 **The day.** A free day after Wed 25 Nov, with the migration run alone. Its number is the next free
-number on that day (079 if daily volumes took 078). Run steps 3, 5 and 6 outside 07:50 to 09:25 UTC.
+number on that day: `main` has used 079 to 081 and Medallion's Kiwoom bronze table takes 082, so
+083 if nothing else comes first (the steps below say 079; use the day's number). Run steps 3, 5 and
+6 outside 07:50 to 09:25 UTC.
 
 | # | Where | PowerShell line | What it does |
 |---|---|---|---|

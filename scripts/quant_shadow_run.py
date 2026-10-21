@@ -247,7 +247,8 @@ def _open(target: Target, tenant_id: str):
 # ---------------------------------------------------------------- masking
 
 
-ACCOUNT_ID = re.compile(r"[A-Z]{1,2}\d{5,}")
+# IBKR account numbers (U1234567), and Kiwoom's platform ids (KIWOOM-<account number>).
+ACCOUNT_ID = re.compile(r"[A-Z]{1,2}\d{5,}|KIWOOM-[0-9A-Za-z]+")
 DATE_IN_TEXT = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
 NUMBER_IN_TEXT = re.compile(r"\d+(?:[.,]\d+)*(?:[eE][-+]?\d+)?")
 
@@ -256,10 +257,15 @@ class Masker:
     """u01, u02, ... for the subject ids given, in sorted order, so the labels hold within one
     review and on one copy. Any other account-like id in a text becomes u??."""
 
-    def __init__(self, subject_ids: Iterable[Any] = ()):
+    def __init__(self, subject_ids: Iterable[Any] = (), aliases: Mapping[str, Any] | None = None):
         ordered = sorted({str(value) for value in subject_ids if value is not None and str(value)})
         width = max(2, len(str(len(ordered))))
         self.labels = {subject: f"u{index:0{width}d}" for index, subject in enumerate(ordered, 1)}
+        # Another id of a subject (a Kiwoom account's bare account number) takes the subject's label.
+        for alias, subject in (aliases or {}).items():
+            alias, subject = str(alias or "").strip(), str(subject)
+            if alias and alias not in self.labels and subject in self.labels:
+                self.labels[alias] = self.labels[subject]
         known = [rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])"
                  for name in sorted(self.labels, key=len, reverse=True)]
         self._ids = re.compile("(" + "|".join([*known, ACCOUNT_ID.pattern]) + ")")
@@ -301,9 +307,20 @@ def _subjects_masker(connection, tenant_id: str) -> Masker:
     if _exists(connection, f"{SCHEMA}.builds"):
         found |= {str(row[0]) for row in connection.execute(f"SELECT DISTINCT subject_id FROM {SCHEMA}.builds"
                                                              ).fetchall()}
+    aliases = {str(row[1]): str(row[0]) for row in connection.execute(
+        "SELECT subject_id, source_account_id FROM platform_subjects WHERE source_account_id IS NOT NULL"
+    ).fetchall() if str(row[1] or "").strip()}
     connection.rollback()
-    _MASK[0] = Masker(found)
+    _MASK[0] = Masker(found, aliases)
     return _MASK[0]
+
+
+def _brokers(connection, tenant_id: str) -> dict[str, str]:
+    """Each physical account's broker as accounts.account_type has it (kiwoom for Kiwoom)."""
+    found = {str(row[0]): str(row[1] or "ibkr").lower() for row in connection.execute(
+        "SELECT account_id, account_type FROM accounts WHERE tenant_id = ?", (tenant_id,)).fetchall()}
+    connection.rollback()
+    return found
 
 
 # ---------------------------------------------------------------- timing maths (pure)
@@ -493,10 +510,12 @@ def copy_report(connection, tenant_id: str, masker: Masker) -> dict[str, Any]:
         "SELECT subject_id, subject_type FROM platform_subjects WHERE tenant_id = ?", (tenant_id,)).fetchall()}
     own = sum(1 for subject in eligible if subject in qs.OWN_PIPELINES or (
         types.get(subject) == "composite_portfolio" and is_profiled(connection, subject, tenant_id=tenant_id)))
+    brokers = _brokers(connection, tenant_id)
     latest = []
     for subject in eligible:
         value = connection.execute(job.LATEST_NAV_SQL, (tenant_id, subject)).fetchone()["latest"]
         latest.append({"subject": masker.label(subject), "subject_type": types.get(subject, ""),
+                       "broker": _broker_group(brokers.get(subject), types.get(subject, "")),
                        "latest_nav_date": str(value)[:10] if value else None})
     connection.rollback()
     inputs = {}
@@ -791,6 +810,36 @@ def run(connection, target: Target, args, environ) -> int:
 # ---------------------------------------------------------------- the review
 
 
+def _broker_group(account_type: str | None, subject_type: str) -> str:
+    """kiwoom, ibkr, or derived (a portfolio or composite built from accounts)."""
+    if subject_type and subject_type != "physical_account":
+        return "derived"
+    return "kiwoom" if str(account_type or "").lower() == "kiwoom" else "ibkr"
+
+
+def _rows_by_broker(connection, tenant_id: str) -> dict[str, dict[str, dict[str, int]]]:
+    """Rows and unavailable rows per section for each broker group, so the Kiwoom accounts' coverage
+    reads on its own (docs/QUANT_ANALYTICS.md, Kiwoom accounts)."""
+    brokers = _brokers(connection, tenant_id)
+    types = {str(row[0]): str(row[1]) for row in connection.execute(
+        "SELECT subject_id, subject_type FROM platform_subjects WHERE tenant_id = ?", (tenant_id,)).fetchall()}
+    rows = connection.execute(
+        """
+        SELECT subject_id, section, (payload_json->>'available') = 'true' AS available, count(*)
+        FROM quant_analytics_snapshots WHERE tenant_id = ? AND analytics_version = ?
+        GROUP BY 1, 2, 3
+        """, (tenant_id, qs.QUANT_ANALYTICS_VERSION)).fetchall()
+    connection.rollback()
+    found: dict[str, dict[str, dict[str, int]]] = {}
+    for subject, section, available, count in _tuples(rows):
+        group = _broker_group(brokers.get(str(subject)), types.get(str(subject), "physical_account"))
+        entry = found.setdefault(group, {}).setdefault(str(section), {"rows": 0, "unavailable": 0})
+        entry["rows"] += int(count)
+        if not available:
+            entry["unavailable"] += int(count)
+    return {group: dict(sorted(sections.items())) for group, sections in sorted(found.items())}
+
+
 def _rows_by_section(connection, tenant_id: str) -> dict[str, Any]:
     rows = connection.execute(
         """
@@ -927,6 +976,7 @@ def build_review(connection, target: Target, tenant_id: str, *, history_days: in
     complete = _complete(connection, tenant_id) if table else set()
     if table:
         review["rows"] = _rows_by_section(connection, tenant_id)
+        review["rows"]["by_broker"] = _rows_by_broker(connection, tenant_id)
         dates = sorted({pair[1] for pair in complete})
         review["rows"]["subject_dates_complete"] = len(complete)
         review["rows"]["subjects"] = _coverage(connection, tenant_id, masker, complete)
@@ -1037,8 +1087,8 @@ def render_markdown(review: Mapping[str, Any]) -> str:
     out += ["", f"Built by the daily job: {subjects['eligible']} subjects ({subjects['own_pipeline']} with their own "
             "HKD pipeline, stored as unavailable).", ""]
     coverage = {item["subject"]: item for item in (rows or {}).get("subjects") or []}
-    out += _table(("Subject", "Type", "Latest NAV date", "Dates built", "Complete", "First", "Last"),
-                  ((item["subject"], item["subject_type"], item["latest_nav_date"],
+    out += _table(("Subject", "Type", "Broker", "Latest NAV date", "Dates built", "Complete", "First", "Last"),
+                  ((item["subject"], item["subject_type"], item.get("broker", ""), item["latest_nav_date"],
                     coverage.get(item["subject"], {}).get("dates", 0),
                     coverage.get(item["subject"], {}).get("complete_dates", 0),
                     coverage.get(item["subject"], {}).get("first"), coverage.get(item["subject"], {}).get("last"))
@@ -1053,6 +1103,13 @@ def render_markdown(review: Mapping[str, Any]) -> str:
                        for name, entry in rows["by_section"].items()))
         out += ["", f"Subject-dates with every section: {rows['subject_dates_complete']}, "
                 f"from {_cell(rows['first_date'])} to {_cell(rows['last_date'])}."]
+        groups = rows.get("by_broker") or {}
+        if groups:
+            out += ["", "### Rows by broker (unavailable in brackets)", ""]
+            names = sorted({section for sections in groups.values() for section in sections})
+            out += _table(("Section", *groups), ((section, *(
+                f"{groups[group][section]['rows']} ({groups[group][section]['unavailable']})"
+                if section in groups[group] else "0" for group in groups)) for section in names))
     else:
         out.append("The quant table is not on the copy.")
     out += ["", "## Why sections are unavailable", "",

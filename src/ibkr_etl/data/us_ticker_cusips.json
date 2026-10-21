@@ -1,0 +1,9 @@
+{
+ "status": "EMPTY, NOT REVIEWED. Until \"reviewed\" is true the crowding card lists every ticker-only U.S. share as not covered.",
+ "purpose": "CUSIPs for U.S. shares held through a broker that gives tickers but no ISIN: Kiwoom's U.S. iStrategy account (instrument keys US:<ticker>). The crowding section matches them to 13F filings by these CUSIPs (src/ibkr_etl/sec_13f.py reviewed_ticker_cusips, docs/QUANT_ANALYTICS.md).",
+ "how_to_fill": "Take the tickers the crowding card (or the shadow-run review) lists as 'No reviewed CUSIP for this U.S. ticker yet'. For each, find the CUSIP in the SEC's Official List of Section 13(f) Securities for the latest quarter, check the issuer name and share class against the holding, and add \"TICKER\": {\"cusip\": \"#########\", \"issuer\": \"...\"}. Then set reviewed, reviewed_by and reviewed_on. A bad check digit refuses the whole list.",
+ "reviewed": false,
+ "reviewed_by": null,
+ "reviewed_on": null,
+ "tickers": {}
+}

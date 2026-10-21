@@ -79,12 +79,13 @@ RULES: tuple[Rule, ...] = (
     # once under history/, so no new file is expected each day.
     _feed("yahoo-benchmark-history", time(9, 30)),
     _feed("treasury-par-yield", time(23, 30)),
-    # Fetched only when a subject needs them (FX, new holdings, licensed HIBOR, derived-daily).
+    # Fetched only when a subject needs them (FX, new holdings, licensed HIBOR, KRW CD, derived-daily).
     _feed("yahoo-fx-history", time(9, 30), required=False),
     _feed("yahoo-sector-search", time(9, 30), required=False),
     _feed("yahoo-sector-profile", time(9, 30), required=False),
     _feed("hkma-hibor", time(23, 30), required=False),
     _feed("hkab-hibor", time(23, 30), required=False),
+    _feed("bok-cd-91d", time(23, 30), required=False),  # only once BOK_ECOS_API_KEY is set
     _feed("yahoo-chart", time(9, 30), required=False),
     # Silver.
     Rule("silver.nav_snapshots", "silver", "public.nav_snapshots", AS_OF, time(9, 30),

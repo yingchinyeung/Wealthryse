@@ -310,6 +310,11 @@ def collect_past_day(client: KiwoomClient, day: date) -> UsDay:
 US_HISTORY_RUN = "kiwoom_rest_us_history"
 # Past days filled per run (one ust21132 call each), so a run stays inside the daily job's time limit.
 US_HISTORY_DAYS_PER_RUN = 250
+# Kiwoom's daily total (ust21132) for the latest sessions is a provisional figure taken before the close
+# settles (20 Oct 2026 read 43,235.18 the next morning; the closes add up to 43,743.75). It is replaced
+# later: every older day matches the closes to the cent. A gap on one of these days does not hold the
+# history check; the day is asked for again on each run until it adds up.
+US_SETTLING_SESSIONS = 2
 
 
 def us_trading_days(start: date, end: date) -> list[date]:
@@ -570,7 +575,8 @@ def build_us_history(connection, client: KiwoomClient, *, account_id: str, displ
     ``positions_on(day, figures)`` gives a past day's holdings at that day's close
     (UsHistoryPositions), or None when a stock's close is missing. A day is stored either way
     (its total and cash are Kiwoom's), but only counts as done once its positions
-    add up to Kiwoom's securities value; until then the check stays pending.
+    add up to Kiwoom's securities value; until then it is asked for again on each run and the check
+    stays pending, except on the latest sessions, where Kiwoom's figure is still provisional.
     """
 
     from .kiwoom_collector import Securities, known_identifiers
@@ -614,15 +620,26 @@ def build_us_history(connection, client: KiwoomClient, *, account_id: str, displ
                                       "tickers": sorted({item["ticker"] for item in derived}),
                                       "basis": "Kiwoom's securities value less every listed stock at its close, "
                                                "for stocks Kiwoom no longer lists"}
+    settling_days = {day.isoformat() for day in us_trading_days(history_start, end)[-US_SETTLING_SESSIONS:]}
+    settling = [gap for gap in gaps if gap["date"] in settling_days]
+    gaps = [gap for gap in gaps if gap["date"] not in settling_days]
+    evidence["gaps"] = gaps[:20]
+    if settling:
+        evidence["settling"] = {"days": settling,
+                                "basis": "Kiwoom's figure for its latest sessions is provisional and is "
+                                         "asked for again on each run until the closes add up to it"}
     if remaining or without_positions or gaps:
         reason = (f"{len(remaining)} more days are filled on the next runs" if remaining else
                   f"{len(gaps)} days' positions do not add up to Kiwoom's securities value" if gaps else
                   "some days have a stock without Kiwoom's close for the day")
         return {"status": "pending", "evidence": evidence,
                 "message": f"{done} past days complete; {reason}."}
-    return {"status": "pass", "evidence": evidence,
-            "message": f"Daily history from {history_start.isoformat()} is complete: {done} U.S. trading days, "
-                       "each adding up to Kiwoom's own daily total."}
+    message = (f"Daily history from {history_start.isoformat()} is complete: {done} U.S. trading days, "
+               "each adding up to Kiwoom's own daily total.")
+    if settling:
+        message += (f" Kiwoom's figure for {', '.join(gap['date'] for gap in settling)} is still provisional; "
+                    "it is asked for again on each run.")
+    return {"status": "pass", "evidence": evidence, "message": message}
 
 
 def run_target(connection, tenant_id: str, client: KiwoomClient, target, *, now: datetime) -> dict[str, Any]:

@@ -427,8 +427,9 @@ US_NOW = datetime(2026, 10, 20, 8, 30, tzinfo=timezone.utc)  # shows Monday 19 O
 class FakeUsKiwoom:
     """A U.S.-only account: one stock bought on the first day, USD cash, Kiwoom's daily totals."""
 
-    def __init__(self, *, extra_shares="0", listed=True):
+    def __init__(self, *, extra_shares="0", listed=True, provisional=None):
         self.revoked, self.asked, self.extra, self.listed = False, [], Decimal(extra_shares), listed
+        self.provisional = provisional or {}  # day -> Kiwoom's securities value before the close settles
 
     def valuation(self):
         raise AssertionError("A USD account is never read through the domestic calls")
@@ -451,7 +452,7 @@ class FakeUsKiwoom:
         from ibkr_etl.kiwoom_client import CurrencyBalance
 
         self.asked.append(day)
-        return (CurrencyBalance("USD", Decimal("100"), Decimal("800"), Decimal("1400")),)
+        return (CurrencyBalance("USD", Decimal("100"), Decimal(self.provisional.get(day, "800")), Decimal("1400")),)
 
     def us_daily_closes(self, ticker, exchange, since, through):
         from ibkr_etl.kiwoom_client import KiwoomUnknownStock
@@ -536,6 +537,32 @@ class KiwoomUsAccountDatabaseTests(KiwoomCollectorDatabaseTests):
                                 "WHERE account_id = ? AND snapshot_date = '2026-09-01'", (account,)).fetchone()
         self.assertEqual((first["quantity_text"], first["mark_price_text"], first["market_value_text"]),
                          ("2", "400", "800"))
+
+    def test_us_a_provisional_latest_day_is_asked_again_until_it_adds_up(self):
+        _, case_id = self._kiwoom_account("9900000006", start=date(2026, 9, 1), currency="USD")
+        self.addCleanup(self._cancel, case_id)
+        account = "KIWOOM-9900000006"
+        client = FakeUsKiwoom(provisional={date(2026, 10, 19): "790"})
+        result = self._run({"9900000006": client}, now=US_NOW)[0]
+        # The latest session's figure is provisional: it does not hold the check, and the day keeps it.
+        self.assertEqual(result["history"]["check"], "pass")
+        nav = self.db.execute("SELECT stock_text FROM nav_snapshots WHERE account_id = ? "
+                              "AND snapshot_date = '2026-10-19'", (account,)).fetchone()
+        self.assertEqual(nav["stock_text"], "790")
+        # The next run asks for that day only, and stores Kiwoom's final figure once it is there.
+        later = FakeUsKiwoom()
+        self._run({"9900000006": later}, now=US_NOW + timedelta(hours=1))
+        self.assertEqual(later.asked, [date(2026, 10, 19)])
+        nav = self.db.execute("SELECT stock_text FROM nav_snapshots WHERE account_id = ? "
+                              "AND snapshot_date = '2026-10-19'", (account,)).fetchone()
+        self.assertEqual(nav["stock_text"], "800")
+
+    def test_us_an_older_day_that_does_not_add_up_holds_the_check(self):
+        _, case_id = self._kiwoom_account("9900000007", start=date(2026, 9, 1), currency="USD")
+        self.addCleanup(self._cancel, case_id)
+        client = FakeUsKiwoom(provisional={date(2026, 10, 1): "790"})
+        result = self._run({"9900000007": client}, now=US_NOW)[0]
+        self.assertEqual(result["history"]["check"], "pending")
 
     def test_us_a_stock_kiwoom_does_not_list_takes_the_rest_of_its_total(self):
         _, case_id = self._kiwoom_account("9900000005", start=date(2026, 9, 1), currency="USD")

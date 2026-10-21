@@ -249,6 +249,10 @@ class CashMovement:
     currency: str
     # Kiwoom's KRW settlement for a movement in another currency.
     amount_krw: Decimal | None = None
+    # U.S. list (ust21100) only: Kiwoom's cash in the movement's currency after it (fc_entra), and the
+    # movement's place within its Korean posting date (processing time, then deal number).
+    balance: Decimal | None = None
+    order: str = ""
 
 
 def _field(row: Mapping[str, object], name: str) -> object:
@@ -633,6 +637,9 @@ class KiwoomClient:
                     amount=kiwoom_number(_field(row, "fc_exct_amt" if foreign else "exct_amt")),
                     currency=currency,
                     amount_krw=kiwoom_number(_field(row, "exct_amt")) if foreign else None,
+                    balance=(kiwoom_number(row["fc_entra"]) if foreign and str(row.get("fc_entra") or "").strip()
+                             else None),
+                    order=f"{str(row.get('proc_time') or '').strip()}|{str(row.get('deal_no') or '').strip()}",
                 ))
         return movements
 

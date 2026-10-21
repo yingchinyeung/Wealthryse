@@ -17,6 +17,9 @@ is loaded here instead, in USD, from the U.S. account calls:
   - every movement since the history start (ust21100), with the U.S. labels in
     ``US_KINDS``. Anything else fails the transactions check with the label
     shown.
+    Kiwoom does not list money paid in or out of the account there; it is read
+    from jumps in Kiwoom's own USD cash after each movement (``balance_gaps``)
+    and stored as DEPOSIT or WITHDRAWAL, which returns leave out.
 
 The Korea path is untouched: ``is_usd_account`` decides per account, and an
 account in KRW never reaches this module.
@@ -62,6 +65,50 @@ US_KINDS: tuple[tuple[str, str, int], ...] = (
 )
 # Movements that change a share count. A corporate action moves shares without cash.
 SHARE_KINDS = {"BUY": 1, "SELL": -1, "CORPORATE_ACTION_IN": 1, "CORPORATE_ACTION_OUT": -1}
+
+# Kiwoom leaves money paid into or out of the U.S. account out of its U.S. movement list (ust21100), but every
+# row carries Kiwoom's USD cash after it (fc_entra). When that cash moves by more than the row's own amount, the
+# difference came from outside the account's trades, dividends and corporate actions: a deposit or withdrawal.
+# Below this size a jump is left alone (Kiwoom's dividend tax adjustments are a few dollars) rather than guessed.
+BALANCE_GAP_MINIMUM = Decimal("10")
+BALANCE_GAP_LABEL = ("USD added to or taken from the account outside Kiwoom's U.S. movement list "
+                     "(for example won converted to dollars for a won order)")
+
+
+def balance_gaps(movements: Iterable[CashMovement]) -> list[CashMovement]:
+    """Deposits and withdrawals read from jumps in Kiwoom's own USD cash after each listed movement.
+
+    Rows are replayed in Kiwoom's order (posting date, processing time, deal number). A row that only moves
+    shares (a corporate action out or in) shows a cash of zero and is skipped; every other row should leave the
+    cash at the previous cash plus its own signed amount; the difference is dated with that row, or with the row
+    before it when that one left the cash below zero. The first row with a cash only starts the chain, so a
+    deposit before it is the account's opening money, not a flow. A label the platform does not read breaks the
+    chain (the transactions check fails on it anyway).
+    """
+
+    rows = sorted((m for m in movements if m.balance is not None and m.currency == BASE_CURRENCY),
+                  key=lambda m: (m.trade_date.replace("-", ""), m.order))
+    gaps: list[CashMovement] = []
+    previous: Decimal | None = None
+    previous_day, previous_order = "", ""
+    for movement in rows:
+        found = us_classify(movement)
+        if found is None:
+            previous = None
+            continue
+        _, direction = found
+        if not direction:
+            continue
+        if previous is not None:
+            gap = movement.balance - (previous + abs(movement.amount) * direction)
+            if abs(gap) >= BALANCE_GAP_MINIMUM:
+                # Kiwoom covers a negative USD cash with won on the day it settles (its daily cash is back to
+                # zero the next day), so that money is dated with the row that overdrew, not the next row.
+                day, order = (previous_day, previous_order) if previous < 0 else (movement.trade_date, movement.order)
+                gaps.append(CashMovement(day, BALANCE_GAP_LABEL, "DEPOSIT" if gap > 0 else "WITHDRAWAL", None,
+                                         Decimal("0"), gap, BASE_CURRENCY, order=order))
+        previous, previous_day, previous_order = movement.balance, movement.trade_date, movement.order
+    return gaps
 
 
 def is_usd_account(reporting_currency: str | None) -> bool:
@@ -226,6 +273,14 @@ def us_movement_rows(account_id: str, movements: Iterable[CashMovement],
                 "settle_date": None, "transaction_type": kind, "description": movement.description[:500] or kind,
                 "amount_text": _text(amount), "currency": movement.currency, "conid": key,
             })
+    for gap in balance_gaps(movements):
+        source_key = _sha([account_id, "balance_gap", gap.trade_date, gap.order, str(gap.amount)])[:40]
+        cash.append({
+            "account_id": account_id, "source_key": source_key, "transaction_id": source_key,
+            "event_datetime": gap.trade_date, "model_code": "", "effective_date": gap.trade_date,
+            "settle_date": None, "transaction_type": gap.kind, "description": gap.description,
+            "amount_text": _text(gap.amount), "currency": gap.currency, "conid": None,
+        })
     return {"trades": trades, "cash_transactions": cash}, unknown
 
 

@@ -459,6 +459,35 @@ def _external_flows(
         amount = _convert(values.get("amount"), rate)
         if amount is not None:
             flows[flow_date] += amount
+    if str(bases[account_id] or "").upper() in KIWOOM_FLOW_CURRENCIES and connection.execute(
+        "SELECT 1 FROM flex_rows WHERE account_id = ? LIMIT 1", (account_id,)
+    ).fetchone() is None:
+        for flow_date, amount in _kiwoom_flows(connection, account_id, converter).items():
+            flows[flow_date] += amount
+    return dict(flows)
+
+
+# A Kiwoom account has no Flex file: its deposits and withdrawals are the platform's own cash rows
+# (kiwoom_us_account.balance_gaps for a USD account). Korea's KRW account is left out until its own factsheet
+# check takes them in, so its figures do not move here.
+KIWOOM_FLOW_CURRENCIES = frozenset({"USD"})
+KIWOOM_FLOW_TYPES = ("DEPOSIT", "WITHDRAWAL")
+
+
+def _kiwoom_flows(connection: Any, account_id: str, converter: FxConverter) -> dict[str, float]:
+    flows: dict[str, float] = defaultdict(float)
+    for row in connection.execute(
+        "SELECT effective_date, amount_text, currency FROM cash_transactions "
+        "WHERE account_id = ? AND transaction_type IN (?, ?) ORDER BY effective_date",
+        (account_id, *KIWOOM_FLOW_TYPES),
+    ):
+        flow_date = str(row["effective_date"] or "")[:10]
+        if not flow_date:
+            continue
+        rate = converter.rate(account_id, row["currency"], flow_date)
+        amount = _convert(row["amount_text"], rate)
+        if amount is not None:
+            flows[flow_date] += amount
     return dict(flows)
 
 

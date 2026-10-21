@@ -10,6 +10,7 @@ from ibkr_etl.kiwoom_collector import Securities
 from ibkr_etl.kiwoom_us_account import (
     UsDay,
     UsHistoryPositions,
+    balance_gaps,
     day_from_balances,
     is_usd_account,
     position_gap,
@@ -233,6 +234,78 @@ class HistoryPositionTests(unittest.TestCase):
         self._on("2026-03-03", "1050")
         self.assertEqual(len(self.kiwoom.calls), asked)
         self.assertIn(("usa06012", "AMGN", "NY"), self.kiwoom.calls)
+
+
+def _row(day, order, label, kind, security, quantity, amount, balance):
+    return CashMovement(day, label, kind, security, Decimal(quantity), Decimal(amount), "USD",
+                        balance=Decimal(balance), order=order)
+
+
+TGT = SecurityIdentifier("us_ticker", "TGT")
+# Kiwoom's own rows around 26 Nov 2025 on the live account (amounts and cash after each row, ust21100):
+# deal 1 of 26 Nov is missing from the list, and the cash after the VRSN dividend is 377.20 above the cash
+# before it plus the dividend. A split's shares-out row shows a cash of zero; the TGT sale's first fill
+# carries no cash and the second carries both.
+LIVE = [
+    _row("2025-11-21", "11:00:00|000000001", "배당금(외화)입금", "입출금", AMGN, "0", "2.00", "778.44"),
+    _row("2025-11-26", "11:38:11|000000002", "배당금(외화)입금", "입출금", AMGN, "0", "1.96", "1157.60"),
+    _row("2025-11-27", "08:09:58|000000001", "매도", "매매", DFS, "4", "993.03", "2150.63"),
+    _row("2025-11-27", "08:09:58|000000002", "매수", "매매", COF, "16", "1534.78", "615.85"),
+    _row("2025-12-01", "08:09:08|000000001", "매도", "매매", TGT, "3", "0.00", "615.85"),
+    _row("2025-12-01", "08:09:08|000000002", "매도", "매매", TGT, "3", "517.92", "1133.77"),
+    _row("2025-12-01", "09:00:00|000000003", "액면분할병합출고", "입출고", AMGN, "2", "0.00", "0.00"),
+    _row("2025-12-01", "09:00:00|000000004", "액면분할병합입고", "입출고", AMGN, "4", "0.00", "0.00"),
+    _row("2025-12-02", "10:35:38|000000001", "배당금(외화)입금", "입출금", COF, "0", "4.25", "1139.84"),
+    _row("2026-01-08", "08:10:16|000000003", "매수", "매매", AMGN, "1", "898.16", "241.68"),
+    _row("2026-01-08", "10:15:40|000000005", "배당금(외화)입금", "입출금", AMGN, "0", "2.55", "411.42"),
+]
+
+
+class BalanceGapTests(unittest.TestCase):
+    def test_kiwooms_cash_jumps_are_read_as_deposits(self):
+        gaps = balance_gaps(LIVE)
+        self.assertEqual([(g.trade_date, g.kind, g.amount) for g in gaps],
+                         [("2025-11-26", "DEPOSIT", Decimal("377.20")), ("2026-01-08", "DEPOSIT", Decimal("167.19"))])
+
+    def test_won_covering_an_overdraft_is_dated_with_the_row_that_overdrew(self):
+        # 28 Mar 2025: the opening buys left the cash at -14.32; Kiwoom's daily cash is 0.00 the next day,
+        # and the next listed row is a dividend on 18 Apr.
+        rows = [_row("2025-03-28", "08:11:41|000000049", "매수", "매매", AMGN, "1", "671.85", "697.28"),
+                _row("2025-03-28", "08:11:41|000000050", "매수", "매매", COF, "1", "711.60", "-14.32"),
+                _row("2025-04-18", "11:09:00|000000001", "배당금(외화)입금", "입출금", AMGN, "0", "0.89", "0.89")]
+        self.assertEqual([(g.trade_date, g.kind, g.amount) for g in balance_gaps(rows)],
+                         [("2025-03-28", "DEPOSIT", Decimal("14.32"))])
+
+    def test_rows_are_replayed_in_kiwooms_order_whatever_order_they_arrive_in(self):
+        self.assertEqual(balance_gaps(list(reversed(LIVE))), balance_gaps(LIVE))
+
+    def test_a_withdrawal_and_small_adjustments(self):
+        rows = [_row("2026-04-01", "10:00:00|000000001", "배당금(외화)입금", "입출금", AMGN, "0", "4.25", "2159.39"),
+                _row("2026-04-14", "16:48:23|000000001", "배당금(외화)입금", "입출금", AMGN, "0", "4.25", "2165.46"),
+                _row("2026-04-20", "10:00:00|000000001", "배당금(외화)입금", "입출금", AMGN, "0", "1.00", "1166.46")]
+        # The 1.82 USD dividend adjustment stays income; the 1,000 USD drop is a withdrawal.
+        self.assertEqual([(g.kind, g.amount) for g in balance_gaps(rows)], [("WITHDRAWAL", Decimal("-1000.00"))])
+
+    def test_the_first_cash_only_starts_the_chain(self):
+        self.assertEqual(balance_gaps(LIVE[1:2]), [])
+
+    def test_an_unread_label_breaks_the_chain_rather_than_guessing(self):
+        rows = [LIVE[0], _row("2025-11-24", "09:00:00|000000001", "환전", "환전", None, "0", "50", "828.44"), LIVE[1]]
+        self.assertEqual(balance_gaps(rows), [])
+
+    def test_deposits_are_stored_as_cash_rows_and_listed_movements_are_unchanged(self):
+        moved, unknown = us_movement_rows(ACCOUNT, LIVE, Securities(known={}))
+        self.assertEqual(unknown, [])
+        deposits = [(row["effective_date"], row["transaction_type"], row["amount_text"], row["currency"])
+                    for row in moved["cash_transactions"] if row["transaction_type"] in ("DEPOSIT", "WITHDRAWAL")]
+        self.assertEqual(deposits, [("2025-11-26", "DEPOSIT", "377.20", "USD"), ("2026-01-08", "DEPOSIT", "167.19", "USD")])
+        again, _ = us_movement_rows(ACCOUNT, LIVE, Securities(known={}))
+        self.assertEqual([r["source_key"] for r in again["cash_transactions"]],
+                         [r["source_key"] for r in moved["cash_transactions"]])
+        # Movements without Kiwoom's cash (the Korea list, older fixtures) give no deposits.
+        plain, _ = us_movement_rows(ACCOUNT, MOVES, Securities(known={}))
+        self.assertNotIn("DEPOSIT", {row["transaction_type"] for row in plain["cash_transactions"]})
+
 
 if __name__ == "__main__":
     unittest.main()

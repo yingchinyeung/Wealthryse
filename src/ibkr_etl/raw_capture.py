@@ -65,6 +65,8 @@ FEEDS = frozenset({
     "treasury-par-yield",  # U.S. Treasury daily par yield curve (HTTP XML)
     "hkma-hibor",  # HKMA HIBOR fixing pages (HTTP JSON)
     "hkab-hibor",  # HKAB dated HIBOR fallback (HTTP JSON)
+    "bok-cd-91d",  # Bank of Korea ECOS CD 91-day yield (HTTP JSON)
+    "oecd-kr-cd-3m",  # OECD Korea 3-month CD rate, monthly, via FRED (HTTP CSV)
 })
 
 _SECRET_QUERY_KEYS = re.compile(r"(key|token|sig|secret|password|credential|auth|code)", re.I)

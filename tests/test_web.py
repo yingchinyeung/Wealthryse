@@ -366,12 +366,13 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("account_onboarding_approvals", source)
         self.assertIn('"transmission_started": False', source)
 
-    def test_risk_attribution_converts_validated_native_currency_positions_to_usd(self) -> None:
+    def test_risk_attribution_converts_validated_native_currency_positions_to_reporting_currency(self) -> None:
         source = Path("src/ibkr_etl/risk_snapshots.py").read_text(encoding="utf-8")
         self.assertIn("LEFT JOIN LATERAL", source)
         self.assertIn("FROM reference_fx_rates AS r", source)
         self.assertIn("p.snapshot_date::date - INTERVAL '4 days'", source)
-        self.assertIn("WHEN fx.rate IS NOT NULL THEN 'USD'", source)
+        self.assertIn("WHEN fx.rate IS NOT NULL THEN ?", source)
+        self.assertIn("AND r.to_currency = ?", source)
         self.assertIn("NOT LIKE '%%.REC'", source)
         self.assertIn("p.snapshot_date = ANY(?::text[])", source)
 

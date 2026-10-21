@@ -150,8 +150,17 @@ def _crisis_market() -> crisis_scenarios.Prices:
         return _crisis_market_prices
 
 
+# Yahoo suffixes of tickers someone may add in the what-if, and their trading currency; any other
+# ticker is taken to be a U.S. listing in USD.
+_SUFFIX_CURRENCY = {".KS": "KRW", ".KQ": "KRW", ".HK": "HKD", ".TW": "TWD"}
+
+
+def _ticker_currency(symbol: str) -> str:
+    return next((currency for suffix, currency in _SUFFIX_CURRENCY.items() if symbol.upper().endswith(suffix)), "USD")
+
+
 def _crisis_path(prices: Any, key: str, holding: Mapping[str, Any], component: Mapping[str, Any] | None,
-                 calendar: list[str], start: date, end: date) -> tuple[list[float], str]:
+                 calendar: list[str], start: date, end: date, reporting: str = "USD") -> tuple[list[float], str]:
     """One holding's value path through a stored crisis window and how it was built.
 
     Stored scenarios record, for each holding, whether it was replayed on its
@@ -160,31 +169,37 @@ def _crisis_path(prices: Any, key: str, holding: Mapping[str, Any], component: M
     is replayed on exactly the same paths. A ticker added in the what-if uses
     its own prices when it traded through the window, otherwise the S&P 500
     fund at a beta of one, as does a holding the stored run did not cover.
+    Every path is in the stored scenarios' reporting currency (won for a Korean-won account).
     """
+
+    def in_reporting(symbol: str, native: str) -> dict[str, float]:
+        return prices.in_currency(symbol, native, reporting, start, end)
 
     symbol = str(holding.get("symbol") or "").upper()
     if symbol.endswith(".REC"):
         return [1.0] * len(calendar), "cash"
     try:
         if key.startswith("new:"):
-            own = prices.history(key[4:], start, end)
+            own = in_reporting(key[4:], _ticker_currency(key[4:]))
             if crisis_scenarios.has_own_history(own, calendar):
                 aligned = crisis_scenarios.align(own, calendar)
                 if aligned is not None:
                     return crisis_scenarios.scaled_path(aligned, calendar, 1.0), "direct"
         elif component and component.get("method") == "direct" and component.get("source_symbol"):
             native = str(holding.get("currency") or "USD").upper()
-            own = prices.in_currency(str(component["source_symbol"]), native, "USD", start, end)
+            own = in_reporting(str(component["source_symbol"]), native)
             aligned = crisis_scenarios.align(own, calendar) if own else None
             if aligned is not None:
                 return crisis_scenarios.scaled_path(aligned, calendar, 1.0), "direct"
         elif component and component.get("method") == "market_proxy" and component.get("source_symbol"):
-            proxy = crisis_scenarios.align(prices.history(str(component["source_symbol"]), start, end), calendar)
+            source = str(component["source_symbol"])
+            proxy = crisis_scenarios.align(
+                in_reporting(source, crisis_scenarios.STAND_IN_CURRENCY.get(source, "USD")), calendar)
             if proxy is not None:
                 return crisis_scenarios.scaled_path(proxy, calendar, float(component.get("beta") or 1.0)), "stand_in"
     except (RuntimeError, ValueError, KeyError, ZeroDivisionError):
         pass
-    market = crisis_scenarios.align(prices.history(CRISIS_STAND_IN, start, end), calendar)
+    market = crisis_scenarios.align(in_reporting(CRISIS_STAND_IN, "USD"), calendar)
     if market is None:
         raise RuntimeError(f"{CRISIS_STAND_IN} has no prices for this window")
     return crisis_scenarios.scaled_path(market, calendar, 1.0), "default"
@@ -199,6 +214,7 @@ def crisis_what_if(stored: Mapping[str, Any], current: Mapping[str, float], prop
     rest is cash held flat, as in the stored scenarios.
     """
 
+    reporting = str(stored.get("reporting_currency") or "USD").upper()
     keys = sorted(key for key in set(current) | set(proposed)
                   if (current.get(key) or 0) > 0 or (proposed.get(key) or 0) > 0)
     jobs = []
@@ -215,7 +231,8 @@ def crisis_what_if(stored: Mapping[str, Any], current: Mapping[str, float], prop
     def build(job):
         scenario_id, key, component, calendar, start, end = job
         try:
-            return scenario_id, key, _crisis_path(prices, key, holdings.get(key) or {}, component, calendar, start, end)
+            return scenario_id, key, _crisis_path(prices, key, holdings.get(key) or {}, component, calendar, start, end,
+                                                  reporting)
         except RuntimeError as error:
             return scenario_id, key, error
 
@@ -539,9 +556,10 @@ def install(
             "account_id": account_id,
             "holdings_as_of": str(rows[0]["snapshot_date"])[:10],
             "scenarios_holdings_as_of": stored.get("holdings_as_of"),
-            "currency": "USD",
+            "currency": str(stored.get("reporting_currency") or "USD"),
             "limitations": (
-                "Both mixes are replayed as fixed units through each historical window in US dollars, on the same "
+                "Both mixes are replayed as fixed units through each historical window in "
+                f"{stored.get('reporting_currency') or 'USD'}, on the same "
                 "price paths as the stored crisis scenarios: a holding's own prices where it traded through the "
                 "window, otherwise its stand-in fund scaled by beta. Cash is held flat; no rebalancing or costs."
             ),

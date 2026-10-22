@@ -50,12 +50,12 @@ param retentionDays int = 90
 param supervisorMode string = 'off'
 @description('With supervisorMode live: the Entra object ids, comma-separated, whose chat the client analysis team answers; * for everyone. Empty: nobody.')
 param supervisorUsers string = ''
-@description('The event dispatcher\'s job (ibkrv2stg-agent-dispatcher, docs/AGENTS.md): every 5 minutes it checks what the holdings explainer, risk watch and weekly brief are waiting for. Off until approved; needs migrations/agent/018 installed.')
+@description('The event dispatcher\'s job (ibkrv2stg-agent-dispatcher, docs/AGENTS.md): every 5 minutes it checks what the holdings explainer, risk watch, weekly brief, month-end commentary and export packs are waiting for. Off until approved; needs migrations/agent/018 installed.')
 param deployDispatcher bool = false
 @description('watch records in agent.tasks which job each new data date would have started; live also runs the jobs in dispatcherJobs. The scheduled jobs stay as a backup either way.')
 @allowed(['off', 'watch', 'live'])
 param dispatcherMode string = 'watch'
-@description('With dispatcherMode live: the jobs it may run, comma-separated (holdings_explainer, risk_watch, weekly_brief). Empty: none.')
+@description('With dispatcherMode live: the jobs it may run, comma-separated (holdings_explainer, risk_watch, weekly_brief, month_end_drafter, export_packs). Empty: none.')
 param dispatcherJobs string = ''
 
 param agentAppName string = 'ibkrv2stg-agent'
@@ -70,6 +70,9 @@ param reportStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
 param reportContainerName string = 'internal-reports'
 @description('On only together with the month-end package job\'s team-commentary setting: the team\'s agreed commentary then goes into the decks, never the factsheets.')
 param monthTeamLive bool = false
+@description('on: the supervisor records each month-end team run in agent.tasks (docs/AGENTS.md, "Month-end team in the task record"). The team itself is unchanged either way.')
+@allowed(['off', 'on'])
+param monthTeamRecord string = 'off'
 @description('Tokens per calendar month for the month-end team, separate from the daily chat budget.')
 param monthTeamTokenBudget int = 40000000
 @description('The onboarding agents\' job (ibkrv2stg-agent-onboarding): drafts a new case\'s account terms from its documents before approval 1, and reviews a new composite\'s historical reports before approval 2. Off until approved; needs the month-end team\'s report reader and the APAC report deployment.')
@@ -254,7 +257,8 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
 var jobs = [
   // 08:30 HKT, after the morning account sync.
   { name: 'ibkrv2stg-agent-holdings', job: 'holdings_explainer', cron: '30 0 * * *' }
-  // 10:00 HKT on the 2nd to 7th; skips accounts that already have this month's draft.
+  // 10:00 HKT on the 2nd to 7th; skips accounts that already have this month's draft, and waits for an
+  // account whose month is not final yet (a Kiwoom month's last sessions) until the 7th.
   { name: 'ibkrv2stg-agent-month-end', job: 'month_end_drafter', cron: '0 2 2-7 * *' }
   // 09:00 HKT; also deletes chats older than the retention period.
   { name: 'ibkrv2stg-agent-data-quality', job: 'data_quality', cron: '0 1 * * *' }
@@ -397,6 +401,7 @@ resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
             { name: 'AGENT_TOOL_SERVER_AUDIENCE', value: toolsAudience }
             { name: 'AGENT_MONTH_TEAM_TOKEN_BUDGET', value: string(monthTeamTokenBudget) }
             { name: 'AGENT_MONTH_TEAM_LIVE', value: monthTeamLive ? 'true' : 'false' }
+            { name: 'AGENT_MONTH_TEAM_RECORD', value: monthTeamRecord }
             { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${reportStorageAccountName}.blob.${environment().suffixes.storage}' }
             { name: 'INTERNAL_REPORT_CONTAINER', value: reportContainerName }
             { name: 'AZURE_CLIENT_ID', value: jobsIdentity.properties.clientId }
@@ -409,9 +414,9 @@ resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
   }
 }
 
-// The onboarding agents: hourly, they draft the account terms of any case
+// The onboarding agents: every 10 minutes, they draft the account terms of any case
 // waiting for approval 1 from its documents, and review the historical reports
-// of any composite case waiting in stage 3. Same jobs identity and report reader
+// of any composite case waiting in stage 3. A run still going skips the next start. Same jobs identity and report reader
 // as the month-end team, plus read access to the intake container; it writes
 // only agent.onboarding_term_drafts and agent.onboarding_reviews.
 resource onboardingJob 'Microsoft.App/jobs@2024-03-01' = if (deployOnboarding && deployMonthTeam) {
@@ -430,7 +435,7 @@ resource onboardingJob 'Microsoft.App/jobs@2024-03-01' = if (deployOnboarding &&
       replicaTimeout: 3600
       replicaRetryLimit: 0
       scheduleTriggerConfig: {
-        cronExpression: '20 * * * *'
+        cronExpression: '*/10 * * * *'
         parallelism: 1
         replicaCompletionCount: 1
       }
@@ -554,7 +559,8 @@ resource operationsJob 'Microsoft.App/jobs@2024-03-01' = if (deployOperations) {
 }
 
 // The event dispatcher: every 5 minutes it asks the tool server, as each scheduled job, whether
-// that job's data is in (a new holdings or valuation date, a finished week). In watch mode it only
+// that job's data is in and final (a new settled holdings or valuation date, a finished week, a
+// final month), and once Medallion's certified view exists, whether the certified build covers it. In watch mode it only
 // records what it would start; in live mode it also runs the named jobs for that account, with
 // the jobs identity and each job's own access, as the job's scheduled run would.
 resource dispatcherJob 'Microsoft.App/jobs@2024-03-01' = if (deployDispatcher) {

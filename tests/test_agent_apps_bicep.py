@@ -68,6 +68,10 @@ class AgentAppsBicepTest(unittest.TestCase):
         self.assertIn("{ name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }", job)
         self.assertIn("value: reportModelDeployment", job)
         self.assertIn("args: ['onboarding']", job)
+        # Every 10 minutes; a run still going skips the next start, for as long as a run may last.
+        self.assertIn("cronExpression: '*/10 * * * *'", job)
+        timeout = int(re.search(r"replicaTimeout: (\d+)", job).group(1))
+        self.assertIn("ONBOARDING_RUN_MINUTES = %d" % (timeout // 60), (BICEP.parents[1] / "src" / "wealthryse_agent" / "jobs.py").read_text())
         # The intake agent reads the case documents: read-only, on the intake container only, and only with the job.
         reader = apps[apps.index("resource onboardingIntakeReader"):apps.index("resource monthTeamJob")]
         self.assertIn("= if (deployOnboarding && deployMonthTeam)", reader.splitlines()[0])

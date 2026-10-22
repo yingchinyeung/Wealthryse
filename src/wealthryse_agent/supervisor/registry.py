@@ -36,6 +36,8 @@ TOOL_LAYERS = {
     "get_sector_allocation": "silver",
     "get_cash_flows": "silver",
     "get_data_freshness": "silver",
+    # Silver dates, and the newest published certified build's as-of date once Medallion's view exists.
+    "get_settled_dates": "silver",
     "get_nav_history": "silver",
     "get_risk_metrics": "silver",
     "get_month_end_package": "gold",

@@ -77,6 +77,7 @@ class TransformTest(unittest.TestCase):
         self.assertIn('<style id="nx-css">', out)
         self.assertIn('type="speculationrules"', out)
         self.assertIn("window.WR_NEXT=", out)
+        self.assertIn("data-nx-pin", out)  # the rail collapses to icons and can be pinned open
         self.assertNotIn(HOME_SCRIPT, out)
         self.assertIn("@media screen {", out)  # the classic light and dark themes stay
         self.assertNotIn("metric-beta</script>", out)  # config can't close the script early

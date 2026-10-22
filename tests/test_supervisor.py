@@ -82,8 +82,12 @@ class RegistryTests(unittest.TestCase):
         owners: dict[str, list[str]] = {}
         for name in registry.CLIENT_SPECIALISTS:
             for tool in registry.BY_NAME[name].tools:
-                if tool not in registry.SHARED_CLIENT_TOOLS:
+                if tool not in registry.SHARED_CLIENT_TOOLS and tool not in registry.BORROWED.get(name, ()):
                     owners.setdefault(tool, []).append(name)
+        for name, borrowed in registry.BORROWED.items():
+            for tool in borrowed:
+                self.assertIn(tool, registry.BY_NAME[name].tools)
+                self.assertNotIn(registry.owner(tool), (None, name), f"{name} borrows {tool} from nobody")
         for tool in _chat_tools():
             if tool in registry.SHARED_CLIENT_TOOLS or tool in registry.SERVER_TOOLS:
                 self.assertIsNone(registry.owner(tool))
@@ -118,6 +122,12 @@ class RoutingTests(unittest.TestCase):
         "Project my portfolio value in 10 years": ("modelling",),
         "How did I do this year, and what drove the risk?": ("holdings_performance", "risk"),
         "How is my Sharpe ratio calculated?": ("risk", "metrics_guide"),
+        # Risk as what a model reports goes to modelling alone; a separate ask about risk keeps the risk specialist.
+        "Which holdings carry the most risk compared with their weight?": ("modelling",),
+        "What would the risk look like if my largest holding were half its weight?": ("modelling",),
+        "If my largest holding fell 30%, what happens?": ("modelling",),
+        "What is my risk, and what if tech falls 20%?": ("risk", "modelling"),
+        "What would my value at risk be if I halved Apple?": ("risk", "modelling"),
     }
 
     def test_rules_place_typical_questions(self):

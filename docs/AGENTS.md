@@ -786,7 +786,9 @@ off until its own release.
   with its team, level, autonomy (answer, draft or propose; no agent can act),
   model deployment and tools, and the Medallion layer each tool reads. Today's
   agents keep their own tool lists for now; the new client analysis specialists
-  (holdings and performance, risk, modelling, Metrics guide) get explicit ones.
+  (holdings and performance, risk, modelling, Metrics guide) get explicit ones. Each tool
+  has one owner; modelling also borrows `get_holdings` (`BORROWED`), because `run_what_if`
+  and `run_stress_test` take holdings by symbol.
   Tests fail if a job or tool has no place in it (`tests/test_supervisor.py`).
 - **Routing** (`supervisor/routing.py`). Rules place a chat question with one
   specialist (the fast path, at today's cost) or several (the planner, plus an
@@ -853,12 +855,14 @@ own changes nothing anyone sees.
   evaluation questions through the team and says which lead and specialists
   answered each one; compare it with the same run without `--supervisor`.
 
-**Turning it on.** Not before the 1 to 7 Nov freeze ends. Planned: owners only from
-Mon 16 Nov (`supervisorMode=live`, `supervisorUsers=<owner object ids>`), then
-everyone from Mon 23 Nov (`supervisorUsers=*`) if the evaluation run and a week of
-the report hold up. Each step is a redeploy of `infra/agent-apps.bicep` with Ying's
-approval. **The undo is `supervisorMode=watch`** (or `off`): chat goes straight back
-to today's analyst.
+**Turning it on.** On for Ying's own chat since 22 Oct: `AGENT_SUPERVISOR=live` and
+`AGENT_SUPERVISOR_USERS=<Ying's object id>`, set on the app after the evaluation run through
+the team passed 67 of 70 (the three misses were modelling questions, fixed in routing and the
+modelling instructions since). **Every later deploy of `infra/agent-apps.bicep` must pass
+`supervisorMode=live` and `supervisorUsers=<the same id>`, or that deploy turns it off.**
+Everyone from Mon 23 Nov (`supervisorUsers=*`) if the evaluation run and the 9 Nov report
+hold up, with Ying's approval. **The undo is `AGENT_SUPERVISOR=watch`** (or `off`): chat goes
+straight back to today's analyst.
 
 ### Event dispatcher: jobs wake when their data is in (off)
 

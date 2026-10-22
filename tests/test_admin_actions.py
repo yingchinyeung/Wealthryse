@@ -5,13 +5,18 @@ import unittest
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
+import urllib.error
+
 from ibkr_etl.admin_actions import (
     ACTION_REGISTRY,
     AdminActionConfig,
     AdminActionError,
     claim_action_for_execution,
+    configured_env,
     create_action_preview,
     execute_claimed_action,
+    execution_template,
+    start_job_with_env,
 )
 
 
@@ -238,6 +243,141 @@ class AdminActionTests(unittest.TestCase):
         self.assertEqual(starts, ["ibkrv2stg-risk-free-daily"])
         self.assertEqual(result["status"], "executed")
         self.assertEqual(connection.rows[preview["approval_id"]]["status"], "executed")
+
+
+def _job(**container) -> dict:
+    """A synthetic job as Azure's GET returns it."""
+    main = {
+        "name": "derived",
+        "image": "example.azurecr.io/ibkr:synthetic",
+        "command": ["python"],
+        "args": ["scripts/run_derived.py"],
+        "env": [{"name": "INPUT_READINESS_MODE", "value": "enforce"},
+                {"name": "DB_PASSWORD", "secretRef": "db-password"}],
+        "resources": {"cpu": 0.5, "memory": "1Gi", "ephemeralStorage": "2Gi"},
+    }
+    main.update(container)
+    return {"name": "ibkrv2stg-derived-daily",
+            "properties": {"template": {"containers": [main], "initContainers": None, "volumes": []}}}
+
+
+class _Response:
+    def __init__(self, body: bytes, headers: dict | None = None) -> None:
+        self._body = body
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class _Azure:
+    """Answers the GET and start calls in order; an int answer raises that HTTP error."""
+
+    def __init__(self, *answers) -> None:
+        self.answers = list(answers)
+        self.requests: list[tuple[str, str, object]] = []
+
+    def __call__(self, request, timeout=None):
+        body = json.loads(request.data) if request.data else None
+        self.requests.append((request.get_method(), request.full_url, body))
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        if isinstance(answer, int):
+            raise urllib.error.HTTPError(request.full_url, answer, "synthetic", {}, None)
+        return _Response(json.dumps(answer).encode("utf-8"))
+
+
+class StartJobWithEnvTests(unittest.TestCase):
+    SHADOW = {"INPUT_READINESS_MODE": "shadow"}
+
+    def setUp(self) -> None:
+        self.config = AdminActionConfig(True, "staging", "subscription-id", "rg-synthetic", "identity-id")
+
+    def _start(self, azure: _Azure, **options) -> str:
+        return start_job_with_env(self.config, "ibkrv2stg-derived-daily", self.SHADOW,
+                                  token=lambda: "synthetic-token", urlopen=azure, **options)
+
+    def test_template_is_copied_with_the_env_set_for_that_execution(self) -> None:
+        template = execution_template(_job(), self.SHADOW)
+        container = template["containers"][0]
+        self.assertEqual(container["env"], [{"name": "DB_PASSWORD", "secretRef": "db-password"},
+                                            {"name": "INPUT_READINESS_MODE", "value": "shadow"}])
+        self.assertEqual(container["resources"], {"cpu": 0.5, "memory": "1Gi"})
+        self.assertEqual((container["image"], container["args"]),
+                         ("example.azurecr.io/ibkr:synthetic", ["scripts/run_derived.py"]))
+        self.assertEqual(set(template), {"containers"})
+
+    def test_templates_it_cannot_copy_exactly_are_refused(self) -> None:
+        self.assertIsNone(execution_template(_job(volumeMounts=[{"volumeName": "data"}]), self.SHADOW))
+        self.assertIsNone(execution_template(_job(probes=[{"type": "Liveness"}]), self.SHADOW))
+        with_volume = _job()
+        with_volume["properties"]["template"]["volumes"] = [{"name": "data"}]
+        self.assertIsNone(execution_template(with_volume, self.SHADOW))
+        self.assertIsNone(execution_template({}, self.SHADOW))
+
+    def test_start_posts_the_template_with_the_env(self) -> None:
+        azure = _Azure(_job(), {"id": "execution-1"})
+        self.assertEqual(self._start(azure), "execution-1")
+        (get, get_url, _), (post, post_url, body) = azure.requests
+        self.assertEqual((get, post), ("GET", "POST"))
+        self.assertTrue(get_url.endswith("/jobs/ibkrv2stg-derived-daily?api-version=2024-03-01"))
+        self.assertTrue(post_url.endswith("/jobs/ibkrv2stg-derived-daily/start?api-version=2024-03-01"))
+        self.assertIn({"name": "INPUT_READINESS_MODE", "value": "shadow"}, body["containers"][0]["env"])
+
+    def test_when_not_needed_the_job_starts_exactly_as_configured(self) -> None:
+        self.assertEqual(configured_env(_job()), [{"INPUT_READINESS_MODE": "enforce", "DB_PASSWORD": None}])
+        seen = []
+
+        def needed(own):
+            seen.append(dict(own))
+            return own.get("INPUT_READINESS_MODE") == "enforce"
+
+        azure = _Azure(_job(env=[{"name": "INPUT_READINESS_MODE", "value": "off"}]), {"id": "execution-4"})
+        self.assertEqual(self._start(azure, needed=needed), "execution-4")
+        self.assertEqual([(method, body) for method, _, body in azure.requests], [("GET", None), ("POST", {})])
+        self.assertEqual(seen, [{"INPUT_READINESS_MODE": "off"}])
+        azure = _Azure(_job(), {"id": "execution-5"})
+        self.assertEqual(self._start(azure, needed=needed), "execution-5")
+        self.assertIn({"name": "INPUT_READINESS_MODE", "value": "shadow"}, azure.requests[1][2]["containers"][0]["env"])
+
+    def test_it_starts_the_job_as_configured_when_the_template_is_unusable(self) -> None:
+        for first in (403, urllib.error.URLError("synthetic"), _job(volumeMounts=[{"volumeName": "data"}])):
+            with self.subTest(first=first):
+                azure = _Azure(first, {"name": "execution-2"})
+                with self.assertLogs("uvicorn.error.ibkr_admin_action", "WARNING"):
+                    self.assertEqual(self._start(azure), "execution-2")
+                self.assertEqual([(method, body) for method, _, body in azure.requests][1:], [("POST", {})])
+
+    def test_a_refused_template_falls_back_to_a_plain_start(self) -> None:
+        azure = _Azure(_job(), 400, {"id": "execution-3"})
+        with self.assertLogs("uvicorn.error.ibkr_admin_action", "WARNING"):
+            self.assertEqual(self._start(azure), "execution-3")
+        self.assertEqual([body for _, _, body in azure.requests][2], {})
+
+    def test_server_errors_and_timeouts_are_reported_not_retried(self) -> None:
+        cases = ((_job(), 503), (_job(), TimeoutError()), (403, 500))
+        codes = ("azure_job_start_failed", "azure_job_start_unavailable", "azure_job_start_failed")
+        for answers, code in zip(cases, codes):
+            with self.subTest(code=code):
+                azure = _Azure(*answers)
+                with self.assertLogs("uvicorn.error.ibkr_admin_action", "WARNING") if answers[0] == 403 \
+                        else _quiet():
+                    with self.assertRaises(AdminActionError) as raised:
+                        self._start(azure)
+                self.assertEqual((raised.exception.status_code, raised.exception.code), (502, code))
+                self.assertEqual(len(azure.requests), 2)
+
+
+@contextmanager
+def _quiet():
+    yield
 
 
 if __name__ == "__main__":

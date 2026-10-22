@@ -20,6 +20,11 @@ COLUMNS={
     'derived_portfolio_nav':'tenant_id portfolio_id snapshot_date currency total_nav',
     'subject_nav_series':'tenant_id subject_id source_kind snapshot_date currency total_text',
 }
+# Migrations 068 to 070 moved some registry tables into the layer schemas and left a view of the same
+# name in public. A view checks every column it reads against the table behind it, so a reader with
+# column grants is refused through it: the reader names its tables unqualified and finds the layer
+# table first. A schema that does not exist yet, or that the role cannot use, is skipped.
+SEARCH_PATH='bronze, silver, gold, public'
 DENIED_COLUMNS=(('raw_reports','file_path'),('ibkr_flex_credentials','key_vault_secret_name'),
     ('nav_snapshots','cash_text'),('specialist_observation_grants','enabled'))
 
@@ -29,6 +34,25 @@ def grant_statements(role):
     return ['GRANT USAGE ON SCHEMA public TO '+role]+[
         f"GRANT SELECT ({', '.join(columns.split())}) ON public.{table} TO {role}"
         for table,columns in sorted(COLUMNS.items())]
+
+
+def _layers(c):
+    """table -> schema for the registry tables that migrations 068-070 moved out of public.
+
+    public then holds a security_invoker view of the same name, which needs the same
+    column grants on the table behind it."""
+    rows=c.execute('''SELECT t.relname AS table,n.nspname AS schema FROM pg_class t
+        JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname IN ('bronze','silver','gold')
+        AND t.relname=ANY(%s)''',(sorted(COLUMNS),)).fetchall()
+    return {r['table']:r['schema'] for r in rows}
+
+
+def layer_grant_statements(c,role):
+    if role not in (ROLE,TRIAL_ROLE): raise ValueError('Unregistered observation role')
+    moved=_layers(c)
+    return [f'GRANT USAGE ON SCHEMA {schema} TO {role}' for schema in sorted(set(moved.values()))]+[
+        f"GRANT SELECT ({', '.join(COLUMNS[table].split())}) ON {schema}.{table} TO {role}"
+        for table,schema in sorted(moved.items())]
 
 
 def verify_permissions(c,role):
@@ -47,7 +71,9 @@ def verify_permissions(c,role):
         WHERE t.relkind IN ('r','p','v','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema')
           AND n.nspname NOT LIKE 'pg_toast%%' ''',(role,role)).fetchall()
     actual={(r['schema'],r['table'],r['column']) for r in rows if r['readable']}
-    expected={('public',table,col) for table,cols in COLUMNS.items() for col in cols.split()}
+    moved={r['table']:r['schema'] for r in rows if r['schema'] in ('bronze','silver','gold') and r['table'] in COLUMNS}
+    expected={(schema,table,col) for table,cols in COLUMNS.items() for col in cols.split()
+        for schema in ('public',moved.get(table,'public'))}
     if actual!=expected or any(r['writable'] for r in rows):
         raise ValueError('Observation column permissions differ from exact registry')
     broad=c.execute('''SELECT count(*) AS n FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
@@ -66,12 +92,13 @@ def verify_permissions(c,role):
         raise ValueError('Observation capability can create schemas')
     tables=sorted(set(COLUMNS)-{'subject_nav_series'})
     isolation=c.execute('''SELECT relname,relrowsecurity,relforcerowsecurity FROM pg_class t
-        JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname='public' AND t.relname=ANY(%s)
-        ORDER BY relname''',(tables,)).fetchall()
+        JOIN pg_namespace n ON n.oid=t.relnamespace WHERE n.nspname IN ('public','bronze','silver','gold')
+        AND t.relkind IN ('r','p') AND t.relname=ANY(%s) ORDER BY relname''',(tables,)).fetchall()
     if isolation!=[dict(relname=n,relrowsecurity=True,relforcerowsecurity=True) for n in tables]:
         raise ValueError('Observation forced tenant isolation missing')
     policies=c.execute('''SELECT tablename,policyname,permissive,roles,cmd,qual,with_check
-        FROM pg_policies WHERE schemaname='public' AND tablename=ANY(%s) ORDER BY tablename''',(tables,)).fetchall()
+        FROM pg_policies WHERE schemaname IN ('public','bronze','silver','gold') AND tablename=ANY(%s)
+        ORDER BY tablename''',(tables,)).fetchall()
     expected=[]
     for table in tables:
         expression='account_belongs_to_current_tenant(account_id)' if table=='nav_snapshots' else '(tenant_id = app_tenant_id())'
@@ -83,6 +110,17 @@ def verify_permissions(c,role):
     view=c.execute("SELECT reloptions,pg_get_viewdef(oid,true) AS definition FROM pg_class WHERE oid='public.subject_nav_series'::regclass").fetchone()
     if not view or 'security_invoker=true' not in (view['reloptions'] or []):
         raise ValueError('Observation NAV view must use caller privileges')
+    schema=moved.get('subject_nav_series')
+    if schema:
+        # After migration 070 public holds a view over silver.subject_nav_series. Hash the
+        # moved view's definition, printed as before the move (with its schema on the path).
+        path=c.execute("SELECT current_setting('search_path') AS p").fetchone()['p']
+        c.execute("SELECT set_config('search_path',%s,true)",(schema+', public',))
+        view=c.execute('''SELECT reloptions,pg_get_viewdef(oid,true) AS definition FROM pg_class
+            WHERE oid=%s::regclass''',(schema+'.subject_nav_series',)).fetchone()
+        c.execute("SELECT set_config('search_path',%s,true)",(path,))
+        if 'security_invoker=true' not in (view['reloptions'] or []):
+            raise ValueError('Observation NAV view must use caller privileges')
     return dict(column_permissions_verified=len(expected_columns()),write_privileges=0,
         raw_statement_access=False,credential_access=False,forced_rls_tables=len(tables),
         nav_view_sha256=hashlib.sha256(view['definition'].encode()).hexdigest())

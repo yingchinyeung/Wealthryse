@@ -6,6 +6,7 @@ import re
 import sqlite3
 import unittest
 from contextlib import contextmanager
+from datetime import date, timedelta
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -193,6 +194,8 @@ class _Fixture:
             CREATE TABLE instrument_classifications(tenant_id, conid, provider, sector);
             CREATE TABLE fx_rates(account_id, rate_date, from_currency, to_currency, rate_text);
             CREATE TABLE subject_nav_series(tenant_id, subject_id, snapshot_date, currency, total_text);
+            CREATE TABLE reference_fx_rates(tenant_id, rate_date, from_currency, to_currency, rate, provider,
+                quality_status);
         """)
         subjects = [
             ("U1", "Visible USD", "USD", "physical_account", None),
@@ -281,6 +284,22 @@ class HoldingsEndpointTests(unittest.TestCase):
         self.assertAlmostEqual(rows["700"]["weight"], 0.25)
         self.assertAlmostEqual(rows["700"]["unrealized_pnl_pct"], -780 / 8580)
 
+    def test_account_holdings_carry_rsi_from_stored_daily_marks(self):
+        self.db.raw.execute("DELETE FROM subject_position_series WHERE subject_id = 'U1' "
+                            "AND conid = '265598' AND snapshot_date = '2025-01-20'")
+        day, marks = date(2025, 1, 20), []
+        while len(marks) < 18:
+            if day.weekday() < 5:
+                marks.append(("U1", day.isoformat(), "265598", "USD", "10", "1500",
+                              str(199 - len(marks)), "1990", "0"))
+            day -= timedelta(days=1)
+        self.db.raw.executemany("INSERT INTO subject_position_series VALUES ('tenant',?,?,?,?,?,?,?,?,?)", marks)
+        rows = {row["conid"]: row for row in web.holdings("U1", user=VIEWER)["holdings"]}
+        self.assertEqual(rows["265598"]["rsi"], 100.0)
+        self.assertEqual(rows["265598"]["rsi_signal"], "overbought")
+        self.assertIsNone(rows["700"]["rsi"])
+        self.assertEqual(rows["700"]["rsi_reason"], "insufficient_history")
+
     def test_filtered_portfolio_uses_source_account_fx_and_gross_fallback(self):
         result = web.holdings("F1", user=VIEWER)
         self.assertEqual(result["fx_account_id"], "U1")
@@ -330,6 +349,44 @@ class HoldingsEndpointTests(unittest.TestCase):
         self.assertEqual(float(by_account["U1"]["reporting_fx"]["rate"]), 7.8)
         self.assertEqual(float(by_account["U2"]["reporting_fx"]["rate"]), 8.0)
         self.assertAlmostEqual(float(apple["reporting_market_value_text"]), 2000 * 7.8 + 1000 * 8)
+
+    def _won_account(self):
+        self.db.raw.execute("INSERT INTO platform_subjects VALUES "
+                            "('tenant','KIWOOM-K1','Korea','KRW','KRW','physical_account','2025-01-20','active',NULL)")
+        for feature in ("viewer_access", "website_analytics"):
+            self.db.raw.execute("INSERT INTO subject_feature_states VALUES ('tenant','KIWOOM-K1',?,'active')",
+                                (feature,))
+        self.db.raw.execute("INSERT INTO user_account_access VALUES ('tenant','KIWOOM-K1','viewer-1','read')")
+        self.db.raw.execute("INSERT INTO instruments VALUES ('005930','005930','Samsung Electronics')")
+        self.db.raw.execute("INSERT INTO subject_position_series VALUES "
+                            "('tenant','KIWOOM-K1','2025-01-21','005930','KRW','10','600000','70000','700000','100000')")
+
+    def test_a_won_account_without_fx_of_its_own_joins_usd_on_the_reference_rate(self):
+        self._won_account()
+        self.db.raw.executemany("INSERT INTO reference_fx_rates VALUES ('tenant',?,?,?,?,?,'warn')", [
+            ("2025-01-10", "KRW", "USD", 0.0005, "Yahoo"),      # too old to stand in
+            ("2025-01-20", "KRW", "USD", 0.0007, "Yahoo"),
+            ("2025-01-20", "KRW", "USD", 0.0009, "Zeta"),       # one rate a day: the first provider
+            ("2025-01-20", "USD", "KRW", 1428.57, "Yahoo"),
+        ])
+        result = web.combined_holdings(currency="USD", user=VIEWER)
+        korea = {a["account_id"]: a for a in result["accounts"]}["KIWOOM-K1"]
+        self.assertEqual(korea["fx_missing_conids"], [])
+        samsung = {row["conid"]: row for row in result["holdings"]}["005930"]
+        self.assertAlmostEqual(float(samsung["reporting_market_value_text"]), 700000 * 0.0007)
+        own = web.holdings("KIWOOM-K1", user=VIEWER)          # its own page stays in won
+        self.assertEqual(own["holdings"][0]["reporting_fx"]["direction"], "identity")
+
+    def test_a_reference_rate_never_replaces_the_accounts_own_fx_or_a_stale_gap(self):
+        self._won_account()
+        self.db.raw.execute("INSERT INTO reference_fx_rates VALUES ('tenant','2025-01-21','USD','HKD',9.9,'Yahoo','warn')")
+        self.db.raw.execute("INSERT INTO reference_fx_rates VALUES ('tenant','2025-01-16','KRW','USD',0.0007,'Yahoo','warn')")
+        result = web.combined_holdings(currency="HKD", user=VIEWER)
+        apple = {row["conid"]: row for row in result["holdings"]}["265598"]
+        by_account = {a["account_id"]: a for a in apple["accounts"]}
+        self.assertEqual(float(by_account["U1"]["reporting_fx"]["rate"]), 7.8)
+        usd = web.combined_holdings(currency="USD", user=VIEWER)
+        self.assertEqual({a["account_id"]: a for a in usd["accounts"]}["KIWOOM-K1"]["fx_missing_conids"], ["005930"])
 
     def test_combined_view_for_unentitled_viewer_is_empty(self):
         stranger = {**VIEWER, "object_id": "someone-else"}

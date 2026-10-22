@@ -1,0 +1,918 @@
+"""Routes, markup and browser script for the account Modelling tab.
+
+Four read-only models over data the platform already stores (see
+:mod:`ibkr_etl.modelling` for the maths): a Monte Carlo wealth projection, a
+what-if rebalancing comparison, portfolio optimisation with a risk budget, and
+a Fama-French factor model. Nothing is written to the database.
+
+MODELLING_SCRIPT runs inside the account page script after ANALYTICS_SCRIPT and
+relies on its helpers (account, esc, json, draw, pct2, signedPct, weightPct,
+money, ratio, toned, analyticsDate, chartColors, reportingCurrency).
+"""
+from __future__ import annotations
+
+import math
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Mapping
+from zoneinfo import ZoneInfo
+
+from fastapi import Depends, FastAPI, HTTPException
+
+from . import crisis_scenarios, fama_french, risk_forecasting
+from .modelling import (
+    ModellingInputError,
+    factor_model,
+    holding_return_matrix,
+    optimise,
+    project_wealth,
+    what_if,
+)
+from .performance_periods import PerformanceInputError, validated_flows, validated_nav
+from .portfolio_analytics import daily_return_series
+
+PRICE_HISTORY_DAYS = 550      # calendar days of marks, enough for 252 sessions
+MAX_ADDED_TICKERS = 5
+TICKER_PATTERN = re.compile(r"^[A-Za-z0-9.^=\-]{1,20}$")
+COMPOSITE_MESSAGE = "Composite sleeves have no security-level price history, so this model uses holdings it cannot see."
+
+
+def _number(value: str | None, name: str, *, low: float, high: float) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=f"{name} must be a number") from error
+    if not math.isfinite(parsed) or not low <= parsed <= high:
+        raise HTTPException(status_code=400, detail=f"{name} must be between {low:g} and {high:g}")
+    return parsed
+
+
+def _parse_weights(text: str | None) -> dict[str, float]:
+    """``conid:0.1,conid:0.2`` as fractions of NAV."""
+
+    weights: dict[str, float] = {}
+    for part in (text or "").split(","):
+        if not part.strip():
+            continue
+        key, _, raw = part.partition(":")
+        key = key.strip()
+        if not key or len(key) > 40:
+            raise HTTPException(status_code=400, detail="Weights must be written as id:fraction")
+        weights[key] = _number(raw, "Each weight", low=0.0, high=2.0) or 0.0
+    return weights
+
+
+def _yahoo_closes(symbol: str, start: date, end: date) -> dict[str, float]:
+    """Daily closes for a ticker the portfolio does not hold yet, keyed by local trading date."""
+
+    from .market_data import _chart_url, _download_json
+
+    payload = _download_json(_chart_url(symbol, start, end), timeout=20)
+    results = (payload.get("chart") or {}).get("result") or []
+    if not results:
+        raise RuntimeError(f"No prices were found for {symbol}")
+    result = results[0]
+    try:
+        zone = ZoneInfo(str((result.get("meta") or {}).get("exchangeTimezoneName") or "UTC"))
+    except Exception:
+        zone = timezone.utc
+    quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0].get("close") or []
+    closes = {}
+    for stamp, close in zip(result.get("timestamp") or [], quotes):
+        if close is None or not math.isfinite(float(close)) or float(close) <= 0:
+            continue
+        closes[datetime.fromtimestamp(int(stamp), timezone.utc).astimezone(zone).date().isoformat()] = float(close)
+    if not closes:
+        raise RuntimeError(f"No prices were found for {symbol}")
+    return closes
+
+
+# Forward-looking models are slower; keep the latest results per portfolio and data.
+FORECAST_CACHE_LIMIT = 64
+_forecast_cache: dict[tuple, dict[str, Any]] = {}
+_forecast_lock = threading.Lock()
+
+
+def _cached(key: tuple, build: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    with _forecast_lock:
+        if key in _forecast_cache:
+            return _forecast_cache[key]
+    result = build()
+    with _forecast_lock:
+        if len(_forecast_cache) >= FORECAST_CACHE_LIMIT:
+            _forecast_cache.pop(next(iter(_forecast_cache)))
+        _forecast_cache[key] = result
+    return result
+
+
+def _shocks(text: str | None) -> dict[str, float]:
+    """``Mkt-RF:-0.2,HML:0.05`` as fractions."""
+
+    shocks = {}
+    for part in (text or "").split(","):
+        if not part.strip():
+            continue
+        name, _, raw = part.partition(":")
+        name = name.strip()
+        if name not in risk_forecasting_factor_names():
+            raise HTTPException(status_code=400, detail=f"{name[:20]} is not a factor")
+        shocks[name] = _number(raw, "Each factor shock", low=-risk_forecasting.MAX_FACTOR_SHOCK,
+                               high=risk_forecasting.MAX_FACTOR_SHOCK) or 0.0
+    return shocks
+
+
+def risk_forecasting_factor_names() -> tuple[str, ...]:
+    from .modelling import FACTOR_NAMES
+
+    return FACTOR_NAMES
+
+
+# Crisis replays of the what-if ---------------------------------------------------------
+
+CRISIS_WORKERS = 8
+CRISIS_CACHE_LIMIT = 4000      # price windows kept in memory; crisis windows never change
+CRISIS_STAND_IN = "SPY"
+_crisis_market_lock = threading.Lock()
+_crisis_market_prices: crisis_scenarios.Prices | None = None
+
+
+def _crisis_market() -> crisis_scenarios.Prices:
+    """One shared Yahoo Finance price cache for crisis replays, cleared when it grows too large."""
+
+    global _crisis_market_prices
+    with _crisis_market_lock:
+        if _crisis_market_prices is None or len(_crisis_market_prices.cache) > CRISIS_CACHE_LIMIT:
+            _crisis_market_prices = crisis_scenarios.Prices()
+        return _crisis_market_prices
+
+
+# Yahoo suffixes of tickers someone may add in the what-if, and their trading currency; any other
+# ticker is taken to be a U.S. listing in USD.
+_SUFFIX_CURRENCY = {".KS": "KRW", ".KQ": "KRW", ".HK": "HKD", ".TW": "TWD"}
+
+
+def _ticker_currency(symbol: str) -> str:
+    return next((currency for suffix, currency in _SUFFIX_CURRENCY.items() if symbol.upper().endswith(suffix)), "USD")
+
+
+def _crisis_path(prices: Any, key: str, holding: Mapping[str, Any], component: Mapping[str, Any] | None,
+                 calendar: list[str], start: date, end: date, reporting: str = "USD") -> tuple[list[float], str]:
+    """One holding's value path through a stored crisis window and how it was built.
+
+    Stored scenarios record, for each holding, whether it was replayed on its
+    own prices or on a stand-in fund scaled by beta. The same choice is rebuilt
+    here, so the current mix reproduces the stored result and the proposed mix
+    is replayed on exactly the same paths. A ticker added in the what-if uses
+    its own prices when it traded through the window, otherwise the S&P 500
+    fund at a beta of one, as does a holding the stored run did not cover.
+    Every path is in the stored scenarios' reporting currency (won for a Korean-won account).
+    """
+
+    def in_reporting(symbol: str, native: str) -> dict[str, float]:
+        return prices.in_currency(symbol, native, reporting, start, end)
+
+    symbol = str(holding.get("symbol") or "").upper()
+    if symbol.endswith(".REC"):
+        return [1.0] * len(calendar), "cash"
+    try:
+        if key.startswith("new:"):
+            own = in_reporting(key[4:], _ticker_currency(key[4:]))
+            if crisis_scenarios.has_own_history(own, calendar):
+                aligned = crisis_scenarios.align(own, calendar)
+                if aligned is not None:
+                    return crisis_scenarios.scaled_path(aligned, calendar, 1.0), "direct"
+        elif component and component.get("method") == "direct" and component.get("source_symbol"):
+            native = str(holding.get("currency") or "USD").upper()
+            own = in_reporting(str(component["source_symbol"]), native)
+            aligned = crisis_scenarios.align(own, calendar) if own else None
+            if aligned is not None:
+                return crisis_scenarios.scaled_path(aligned, calendar, 1.0), "direct"
+        elif component and component.get("method") == "market_proxy" and component.get("source_symbol"):
+            source = str(component["source_symbol"])
+            proxy = crisis_scenarios.align(
+                in_reporting(source, crisis_scenarios.STAND_IN_CURRENCY.get(source, "USD")), calendar)
+            if proxy is not None:
+                return crisis_scenarios.scaled_path(proxy, calendar, float(component.get("beta") or 1.0)), "stand_in"
+    except (RuntimeError, ValueError, KeyError, ZeroDivisionError):
+        pass
+    market = crisis_scenarios.align(in_reporting(CRISIS_STAND_IN, "USD"), calendar)
+    if market is None:
+        raise RuntimeError(f"{CRISIS_STAND_IN} has no prices for this window")
+    return crisis_scenarios.scaled_path(market, calendar, 1.0), "default"
+
+
+def crisis_what_if(stored: Mapping[str, Any], current: Mapping[str, float], proposed: Mapping[str, float],
+                   holdings: Mapping[str, Mapping[str, Any]], prices: Any) -> list[dict[str, Any]]:
+    """Replay the current and proposed weights through each stored crisis scenario.
+
+    ``holdings`` maps each key in the weights (a conid, or ``new:SYMBOL`` for an
+    added ticker) to its symbol and currency. Weights are shares of NAV; the
+    rest is cash held flat, as in the stored scenarios.
+    """
+
+    reporting = str(stored.get("reporting_currency") or "USD").upper()
+    keys = sorted(key for key in set(current) | set(proposed)
+                  if (current.get(key) or 0) > 0 or (proposed.get(key) or 0) > 0)
+    jobs = []
+    for item in stored.get("scenarios") or []:
+        if not item.get("available") or not item.get("daily"):
+            continue
+        calendar = [str(row["date"]) for row in item["daily"]]
+        start = date.fromisoformat(str(item["crisis_start"])) - timedelta(days=crisis_scenarios.LOOKBACK_DAYS)
+        end = date.fromisoformat(str(item["crisis_end"]))
+        components = {str(c.get("conid")): c for c in item.get("components") or []}
+        for key in keys:
+            jobs.append((item["scenario_id"], key, components.get(key), calendar, start, end))
+
+    def build(job):
+        scenario_id, key, component, calendar, start, end = job
+        try:
+            return scenario_id, key, _crisis_path(prices, key, holdings.get(key) or {}, component, calendar, start, end,
+                                                  reporting)
+        except RuntimeError as error:
+            return scenario_id, key, error
+
+    with ThreadPoolExecutor(max_workers=CRISIS_WORKERS) as pool:
+        built = list(pool.map(build, jobs))
+    paths: dict[str, dict[str, Any]] = {}
+    for scenario_id, key, outcome in built:
+        paths.setdefault(scenario_id, {})[key] = outcome
+
+    def label(key):
+        return key[4:] if key.startswith("new:") else str((holdings.get(key) or {}).get("symbol") or key)
+
+    results = []
+    for item in stored.get("scenarios") or []:
+        base = {"scenario_id": item.get("scenario_id"), "label": item.get("label"),
+                "crisis_start": item.get("crisis_start"), "crisis_end": item.get("crisis_end")}
+        if not item.get("available") or not item.get("daily"):
+            results.append({**base, "available": False,
+                            "reason": item.get("reason") or "This scenario has no stored replay."})
+            continue
+        calendar = [str(row["date"]) for row in item["daily"]]
+        built_paths = paths.get(item["scenario_id"], {})
+        failed = next((value for value in built_paths.values() if isinstance(value, Exception)), None)
+        if failed is not None:
+            results.append({**base, "available": False, "reason": str(failed)[:300]})
+            continue
+        series = {key: value[0] for key, value in built_paths.items()}
+
+        def replay(weights):
+            used = {key: float(weights.get(key) or 0.0) for key in keys if (weights.get(key) or 0) > 0}
+            outcome = crisis_scenarios.combine(used, series, calendar)
+            return {"maximum_drawdown": outcome["maximum_drawdown"],
+                    "period_return": outcome["daily"][-1]["value"] - 1.0, "cash_weight": outcome["cash_weight"]}
+
+        now, then = replay(current), replay(proposed)
+        results.append({
+            **base, "available": True, "observations": len(calendar),
+            "stored_maximum_drawdown": item.get("maximum_drawdown"),
+            "current": now, "proposed": then,
+            "difference": {name: then[name] - now[name] for name in ("maximum_drawdown", "period_return")},
+            "stand_ins": sorted(label(k) for k, v in built_paths.items() if v[1] == "stand_in"),
+            "defaults": sorted(label(k) for k, v in built_paths.items() if v[1] == "default"),
+        })
+    return results
+
+
+def install(
+    app: FastAPI,
+    *,
+    authorized_user: Callable[..., dict[str, str]],
+    access_context: Callable[[str, dict], dict],
+    parse_as_of: Callable[[str | None], str | None],
+    read_database: Callable[[], Any],
+    nav_values: Callable[[Any, str, dict, str | None], list[tuple[str, str]]],
+    external_flows: Callable[[Any, str, dict], dict[str, float] | None],
+    latest_holdings: Callable[[Any, str, str | None], list[dict]],
+    enrich_holdings: Callable[..., dict],
+    comparison_version: Callable[[str, str], str],
+    tenant_id: str,
+    risk_analytics_version: str,
+    fetch_closes: Callable[[str, date, date], dict[str, float]] = _yahoo_closes,
+    load_factors: Callable[[str], dict[str, Any]] = fama_french.load_factor_data,
+    crisis_enabled: Callable[[], bool] = crisis_scenarios.website_enabled,
+    crisis_prices: Callable[[], Any] = _crisis_market,
+    load_crisis_scenarios: Callable[..., dict[str, Any] | None] = crisis_scenarios.load,
+) -> None:
+    """Add the /api/portfolio/{account_id}/modelling/* routes."""
+
+    def portfolio_returns(connection, account_id: str, access: dict, as_of: str | None):
+        nav = validated_nav(nav_values(connection, account_id, access, as_of))
+        flows = validated_flows(external_flows(connection, account_id, access) or {})
+        returns, failures = daily_return_series(nav, flows)
+        if failures:
+            raise HTTPException(status_code=409, detail=failures[0])
+        return nav, returns
+
+    def risk_free_rate(connection, account_id: str, as_of: str | None) -> float | None:
+        from .risk_snapshots import decoded_payload
+
+        row = connection.execute(
+            """
+            SELECT payload_json FROM risk_analytics_snapshots
+            WHERE tenant_id = %s AND subject_id = %s AND analytics_version = %s
+              AND (%s::text IS NULL OR as_of_date <= %s)
+            ORDER BY as_of_date DESC LIMIT 1
+            """,
+            (tenant_id, account_id, risk_analytics_version, as_of, as_of),
+        ).fetchone()
+        if row is None:
+            return None
+        rate = (decoded_payload(row["payload_json"]).get("metrics") or {}).get("risk_free_annual_rate")
+        try:
+            return float(rate) if rate is not None and math.isfinite(float(rate)) else None
+        except (TypeError, ValueError):
+            return None
+
+    def benchmark_returns(connection, account_id: str, as_of: str | None) -> tuple[dict[str, float], str | None]:
+        mapping = connection.execute(
+            """
+            SELECT b.benchmark_id, b.name, m.reporting_currency
+            FROM portfolio_benchmark_mapping m
+            JOIN benchmark_master b ON b.benchmark_id = m.benchmark_id AND b.tenant_id = m.tenant_id
+            WHERE m.tenant_id = %s AND m.subject_id = %s AND b.active = true
+              AND m.effective_from <= CURRENT_DATE::text
+              AND (m.effective_to IS NULL OR m.effective_to >= CURRENT_DATE::text)
+            ORDER BY CASE m.mapping_type WHEN 'primary' THEN 0 ELSE 1 END, b.name
+            LIMIT 1
+            """,
+            (tenant_id, account_id),
+        ).fetchone()
+        if mapping is None:
+            return {}, None
+        rows = connection.execute(
+            """
+            SELECT observation_date, benchmark_return FROM performance_comparison_daily
+            WHERE tenant_id = %s AND subject_id = %s AND benchmark_id = %s
+              AND calculation_version = %s AND reporting_currency = %s
+              AND quality_status IN ('pass', 'warn') AND benchmark_return IS NOT NULL
+              AND (%s::text IS NULL OR observation_date <= %s)
+            ORDER BY observation_date
+            """,
+            (tenant_id, account_id, mapping["benchmark_id"],
+             comparison_version(account_id, mapping["reporting_currency"]),
+             mapping["reporting_currency"], as_of, as_of),
+        ).fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[str(row["observation_date"])[:10]] = float(row["benchmark_return"])
+            except (TypeError, ValueError):
+                continue
+        return result, str(mapping["name"])
+
+    def holdings_and_prices(connection, account_id: str, access: dict, as_of: str | None):
+        rows = latest_holdings(connection, account_id, as_of)
+        if not rows:
+            raise HTTPException(status_code=404, detail="No holdings are available for this date")
+        view = enrich_holdings(
+            connection, account_id, rows, subject_type=str(access.get("subject_type") or "physical_account"),
+            reporting_currency=str(access["reporting_currency"]), nav_currency=str(access["reporting_currency"]),
+        )
+        held = [row for row in view["holdings"] if row.get("weight") is not None]
+        snapshot = str(rows[0]["snapshot_date"])[:10]
+        start = (date.fromisoformat(snapshot) - timedelta(days=PRICE_HISTORY_DAYS)).isoformat()
+        prices: dict[str, dict[str, float]] = {}
+        if held:
+            for mark in connection.execute(
+                """
+                SELECT snapshot_date, conid::text AS conid, mark_price_text
+                FROM subject_position_series
+                WHERE tenant_id = %s AND subject_id = %s AND conid::text = ANY(%s)
+                  AND snapshot_date BETWEEN %s AND %s
+                """,
+                (tenant_id, account_id, [str(row["conid"]) for row in held], start, snapshot),
+            ).fetchall():
+                try:
+                    value = float(mark["mark_price_text"])
+                except (TypeError, ValueError):
+                    continue
+                prices.setdefault(str(mark["conid"]), {})[str(mark["snapshot_date"])[:10]] = value
+        return snapshot, held, prices
+
+    def holding_access(account_id: str, user: dict) -> dict:
+        access = access_context(account_id, user)
+        if str(access.get("subject_type") or "") == "composite_portfolio":
+            raise HTTPException(status_code=409, detail=COMPOSITE_MESSAGE)
+        return access
+
+    def model_error(error: Exception) -> HTTPException:
+        return HTTPException(status_code=422, detail=str(error))
+
+    def what_if_inputs(weights: str | None, add: str | None) -> tuple[dict[str, float], dict[str, float]]:
+        changes = _parse_weights(weights)
+        added = _parse_weights(add)
+        if len(added) > MAX_ADDED_TICKERS:
+            raise HTTPException(status_code=400, detail=f"Add at most {MAX_ADDED_TICKERS} new tickers at a time")
+        for symbol in added:
+            if not TICKER_PATTERN.match(symbol):
+                raise HTTPException(status_code=400, detail=f"{symbol} is not a valid ticker")
+        return changes, {symbol.upper(): weight for symbol, weight in added.items()}
+
+    @app.get("/api/portfolio/{account_id}/modelling/projection")
+    def modelling_projection(
+        account_id: str,
+        as_of: str | None = None,
+        years: int = 10,
+        monthly_flow: str | None = None,
+        target: str | None = None,
+        annual_return: str | None = None,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Monte Carlo projection of NAV from the portfolio's own daily returns."""
+        access = access_context(account_id, user)
+        requested = parse_as_of(as_of)
+        flow = _number(monthly_flow, "The monthly contribution", low=-1e12, high=1e12) or 0.0
+        goal = _number(target, "The target value", low=0.0, high=1e15)
+        assumed = _number(annual_return, "The return assumption", low=-50.0, high=100.0)
+        with read_database() as connection:
+            try:
+                nav, returns = portfolio_returns(connection, account_id, access, requested)
+            except PerformanceInputError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        if not nav:
+            raise HTTPException(status_code=404, detail="No NAV history is available for this date")
+        last_day = next(reversed(nav))
+        try:
+            result = project_wealth(
+                [value for _, value in returns], start_value=float(nav[last_day]), start_date=last_day,
+                years=years, monthly_flow=flow, target=goal or None,
+                annual_return=None if assumed is None else assumed / 100.0,
+            )
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        return {"account_id": account_id, "currency": access["reporting_currency"],
+                "history_start": returns[0][0] if returns else None, **result}
+
+    @app.get("/api/portfolio/{account_id}/modelling/what-if")
+    def modelling_what_if(
+        account_id: str,
+        as_of: str | None = None,
+        weights: str | None = None,
+        add: str | None = None,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Risk of current holdings against proposed weights (``conid:fraction`` pairs)."""
+        access = holding_access(account_id, user)
+        requested = parse_as_of(as_of)
+        changes, added = what_if_inputs(weights, add)
+        with read_database() as connection:
+            snapshot, held, prices = holdings_and_prices(connection, account_id, access, requested)
+            risk_free = risk_free_rate(connection, account_id, requested)
+            benchmark, benchmark_name = benchmark_returns(connection, account_id, requested)
+        current = {str(row["conid"]): float(row["weight"]) for row in held}
+        unknown = sorted(set(changes) - set(current))
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Not a current holding: {', '.join(unknown[:3])}")
+        proposed = {**current, **changes}
+        added_status = []
+        start = date.fromisoformat(snapshot) - timedelta(days=PRICE_HISTORY_DAYS)
+        for symbol, weight in added.items():
+            key = f"new:{symbol.upper()}"
+            try:
+                prices[key] = fetch_closes(symbol.upper(), start, date.fromisoformat(snapshot))
+                proposed[key] = weight
+                added_status.append({"conid": key, "symbol": symbol.upper(), "weight": weight, "available": True})
+            except Exception as error:  # a bad or unknown ticker is reported, not fatal
+                added_status.append({"conid": key, "symbol": symbol.upper(), "weight": weight,
+                                     "available": False, "message": str(error)[:200]})
+        matrix = holding_return_matrix(prices)
+        try:
+            result = what_if(current, proposed, matrix, risk_free=risk_free or 0.0, benchmark=benchmark or None)
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        coverage = matrix["coverage"]
+        return {
+            "account_id": account_id,
+            "snapshot_date": snapshot,
+            "benchmark_name": benchmark_name,
+            "risk_free_available": risk_free is not None,
+            "holdings": [
+                {
+                    "conid": str(row["conid"]), "symbol": row.get("symbol") or str(row["conid"]),
+                    "description": row.get("description") or "", "current_weight": float(row["weight"]),
+                    "proposed_weight": proposed[str(row["conid"])],
+                    "sessions": coverage.get(str(row["conid"]), 0),
+                    "modelled": str(row["conid"]) in matrix["returns"],
+                }
+                for row in sorted(held, key=lambda r: -float(r["weight"]))
+            ],
+            "added": added_status,
+            "excluded_price_breaks": matrix["excluded_price_breaks"],
+            **result,
+        }
+
+    @app.get("/api/portfolio/{account_id}/modelling/what-if-crisis")
+    def modelling_what_if_crisis(
+        account_id: str,
+        as_of: str | None = None,
+        weights: str | None = None,
+        add: str | None = None,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Current and proposed weights replayed through the stored crisis scenarios."""
+        access = holding_access(account_id, user)
+        requested = parse_as_of(as_of)
+        changes, added = what_if_inputs(weights, add)
+        if not crisis_enabled():
+            raise HTTPException(status_code=409, detail="Crisis scenarios are not switched on for the website yet.")
+        with read_database() as connection:
+            rows = latest_holdings(connection, account_id, requested)
+            if not rows:
+                raise HTTPException(status_code=404, detail="No holdings are available for this date")
+            view = enrich_holdings(
+                connection, account_id, rows, subject_type=str(access.get("subject_type") or "physical_account"),
+                reporting_currency=str(access["reporting_currency"]), nav_currency=str(access["reporting_currency"]),
+            )
+            try:
+                stored = load_crisis_scenarios(connection, account_id, as_of=requested, tenant_id=tenant_id, daily=True)
+            except Exception as error:  # the optional table may not exist yet
+                raise HTTPException(status_code=409, detail="Crisis scenarios have not been calculated yet.") from error
+        if not stored or not stored.get("scenarios"):
+            raise HTTPException(status_code=409, detail="Crisis scenarios have not been calculated for this portfolio yet.")
+        held = [row for row in view["holdings"] if row.get("weight") is not None]
+        holdings = {str(row["conid"]): {"symbol": row.get("symbol") or str(row["conid"]),
+                                        "currency": row.get("currency")} for row in held}
+        current = {str(row["conid"]): float(row["weight"]) for row in held}
+        unknown = sorted(set(changes) - set(current))
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Not a current holding: {', '.join(unknown[:3])}")
+        proposed = {**current, **changes}
+        for symbol, weight in added.items():
+            proposed[f"new:{symbol}"] = weight
+            holdings[f"new:{symbol}"] = {"symbol": symbol, "currency": None}
+        if sum(proposed.values()) > 2.0 + 1e-9:
+            raise HTTPException(status_code=422, detail="The proposed holdings add up to more than 200% of NAV.")
+        try:
+            scenarios = crisis_what_if(stored, current, proposed, holdings, crisis_prices())
+        except Exception as error:  # a provider outage is reported, not a server error
+            raise HTTPException(status_code=503, detail=f"Crisis prices could not be read: {error}") from error
+        return {
+            "account_id": account_id,
+            "holdings_as_of": str(rows[0]["snapshot_date"])[:10],
+            "scenarios_holdings_as_of": stored.get("holdings_as_of"),
+            "currency": str(stored.get("reporting_currency") or "USD"),
+            "limitations": (
+                "Both mixes are replayed as fixed units through each historical window in "
+                f"{stored.get('reporting_currency') or 'USD'}, on the same "
+                "price paths as the stored crisis scenarios: a holding's own prices where it traded through the "
+                "window, otherwise its stand-in fund scaled by beta. Cash is held flat; no rebalancing or costs."
+            ),
+            "scenarios": scenarios,
+        }
+
+    @app.get("/api/portfolio/{account_id}/modelling/optimise")
+    def modelling_optimise(
+        account_id: str,
+        as_of: str | None = None,
+        max_weight: str | None = None,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Risk budget, efficient frontier and optimised weights of the current holdings."""
+        access = holding_access(account_id, user)
+        requested = parse_as_of(as_of)
+        cap = _number(max_weight, "The maximum weight", low=1.0, high=100.0)
+        with read_database() as connection:
+            snapshot, held, prices = holdings_and_prices(connection, account_id, access, requested)
+            risk_free = risk_free_rate(connection, account_id, requested)
+        current = {str(row["conid"]): float(row["weight"]) for row in held}
+        labels = {str(row["conid"]): {"symbol": row.get("symbol"), "description": row.get("description")}
+                  for row in held}
+        try:
+            result = optimise(current, labels, holding_return_matrix(prices), risk_free=risk_free or 0.0,
+                              cap=(cap or 25.0) / 100.0)
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        result["excluded"] = [labels[k]["symbol"] or k for k in result["excluded"]]
+        return {"account_id": account_id, "snapshot_date": snapshot,
+                "risk_free_available": risk_free is not None, **result}
+
+    def returns_key(account_id: str, returns: list[tuple[str, float]], kind: str) -> tuple:
+        return (kind, tenant_id, account_id, returns[0][0] if returns else None, returns[-1][0] if returns else None,
+                len(returns), round(math.fsum(r for _, r in returns), 12))
+
+    @app.get("/api/portfolio/{account_id}/modelling/risk-outlook")
+    def modelling_risk_outlook(
+        account_id: str,
+        as_of: str | None = None,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Volatility forecast, forward VaR and expected tail loss with a backtest, and drawdown odds."""
+        access = access_context(account_id, user)
+        requested = parse_as_of(as_of)
+        with read_database() as connection:
+            try:
+                nav, returns = portfolio_returns(connection, account_id, access, requested)
+            except PerformanceInputError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+
+        def build() -> dict[str, Any]:
+            forecast = risk_forecasting.volatility_forecast(returns)
+            forecast.pop("_fit", None)
+            values = [r for _, r in returns]
+            history = forecast["long_run_volatility_annual"]
+            scale = forecast["forecast_volatility_next_month_annual"] / history if history else 1.0
+            forecast["drawdown_odds"] = {
+                "historical": risk_forecasting.drawdown_odds(values),
+                "current_volatility": risk_forecasting.drawdown_odds(values, volatility_scale=scale),
+            }
+            return forecast
+
+        try:
+            result = _cached(returns_key(account_id, returns, "risk"), build)
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        last_day = next(reversed(nav)) if nav else None
+        return {"account_id": account_id, "currency": access["reporting_currency"], "as_of": last_day,
+                "nav": float(nav[last_day]) if last_day else None, **result}
+
+    @app.get("/api/portfolio/{account_id}/modelling/regimes")
+    def modelling_regimes(
+        account_id: str,
+        as_of: str | None = None,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Market regimes from the portfolio's own returns and a scored one-to-three-month outlook."""
+        access = access_context(account_id, user)
+        requested = parse_as_of(as_of)
+        with read_database() as connection:
+            try:
+                nav, returns = portfolio_returns(connection, account_id, access, requested)
+            except PerformanceInputError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            result = _cached(returns_key(account_id, returns, "regimes"),
+                             lambda: risk_forecasting.regime_outlook(returns))
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        last_day = next(reversed(nav)) if nav else None
+        value = float(nav[last_day]) if last_day else None
+        outlook = [{**row, **{f"{band}_value": value * (1.0 + row[band]) for band in ("p5", "p25", "p50", "p75", "p95")}}
+                   for row in result["outlook"]] if value else result["outlook"]
+        return {"account_id": account_id, "currency": access["reporting_currency"], "as_of": last_day,
+                "nav": value, **result, "outlook": outlook}
+
+    def fitted_factors(account_id: str, access: dict, requested: str | None, region: str):
+        if region not in fama_french.REGIONS:
+            raise HTTPException(status_code=400, detail="Unknown factor region")
+        with read_database() as connection:
+            try:
+                nav, returns = portfolio_returns(connection, account_id, access, requested)
+            except PerformanceInputError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+        try:
+            factors = load_factors(region)
+        except fama_french.FactorDataError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        try:
+            result = factor_model(returns, factors["factors"], region_label=factors["region_label"],
+                                  source_url=factors["source_url"], labels=factors.get("labels"))
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        return factors, result, (float(nav[next(reversed(nav))]) if nav else None)
+
+    @app.get("/api/portfolio/{account_id}/modelling/factor-stress")
+    def modelling_factor_stress(
+        account_id: str,
+        as_of: str | None = None,
+        region: str = fama_french.DEFAULT_REGION,
+        scenario: str | None = None,
+        shocks: str | None = None,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Portfolio move implied by its factor betas for a preset or custom set of factor shocks."""
+        access = access_context(account_id, user)
+        requested = parse_as_of(as_of)
+        if scenario:
+            if scenario not in risk_forecasting.STRESS_PRESETS:
+                raise HTTPException(status_code=400, detail="Unknown stress scenario")
+            label, chosen = risk_forecasting.STRESS_PRESETS[scenario]
+        else:
+            label, chosen = "Custom shocks", _shocks(shocks)
+        factors, model, value = fitted_factors(account_id, access, requested, region)
+        try:
+            result = risk_forecasting.factor_stress(model, chosen)
+        except ModellingInputError as error:
+            raise model_error(error) from error
+        return {"account_id": account_id, "currency": access["reporting_currency"], "scenario": scenario,
+                "scenario_label": label, "region": model["region"], "factor_source": factors.get("source", "kenneth_french"),
+                "nav": value, "impact_value": value * result["impact"] if value else None,
+                "presets": {k: v[0] for k, v in risk_forecasting.STRESS_PRESETS.items()}, **result}
+
+    @app.get("/api/portfolio/{account_id}/modelling/factors")
+    def modelling_factors(
+        account_id: str,
+        as_of: str | None = None,
+        region: str = fama_french.DEFAULT_REGION,
+        user: dict[str, str] = Depends(authorized_user),
+    ) -> dict:
+        """Fama-French five-factor plus momentum exposures of the portfolio's returns."""
+        access = access_context(account_id, user)
+        factors, result, _ = fitted_factors(account_id, access, parse_as_of(as_of), region)
+        return {"account_id": account_id, "currency": access["reporting_currency"],
+                "factor_data_through": factors["latest_date"], "momentum_note": factors["momentum_note"],
+                "source": factors.get("source", "kenneth_french"), "source_note": factors.get("source_note", ""),
+                "regions": {key: value[0] for key, value in fama_french.REGIONS.items()}, **result}
+
+
+MODELLING_CARDS = r"""
+<div class="card wide" id="model-projection"><div class="label">Wealth projection</div><div class="muted">Thousands of simulated futures built from this portfolio's own month-by-month returns, with regular contributions or withdrawals. A range of outcomes, not a forecast. <a class="metric-guide-inline" href="/metrics-guide#metric-wealth-projection-range">How it is worked out <span aria-hidden="true">↗</span></a></div>
+<div class="filter-grid"><label><span class="label">Horizon</span><select id="projection-years" aria-label="Projection horizon"><option value="1">1 year</option><option value="3">3 years</option><option value="5">5 years</option><option value="10" selected>10 years</option><option value="20">20 years</option><option value="30">30 years</option></select></label><label><span class="label">Monthly contribution (<span class="model-ccy"></span>, negative to withdraw)</span><input id="projection-flow" type="number" step="any" value="0" aria-label="Monthly contribution or withdrawal"></label><label><span class="label">Target value (<span class="model-ccy"></span>, optional)</span><input id="projection-target" type="number" step="any" min="0" aria-label="Target value"></label><label><span class="label">Return assumption (% a year, blank for history)</span><input id="projection-return" type="number" step="0.1" min="-50" max="100" aria-label="Annual return assumption"></label></div>
+<div class="actions"><button id="projection-run" class="button" type="button">Run projection</button></div>
+<div id="projection-metrics" class="metrics"></div><div class="chart-wrap"><canvas id="projection-chart" width="1100" height="300" aria-label="Projected NAV range"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div><div id="projection-note" class="muted">Loading…</div></div>
+<div class="card wide" id="model-risk"><div class="label">Risk outlook</div><div class="muted">How volatile the portfolio is likely to be from here, how much it could lose on a bad day or month, whether that measure has held up in the past, and the chance of a large fall over the next year. <a class="metric-guide-inline" href="/metrics-guide#metric-forecast-volatility">How it is worked out <span aria-hidden="true">↗</span></a></div>
+<div id="model-risk-metrics" class="metrics"></div>
+<div class="label model-subhead">Has the VaR line held? Daily returns against the 95% one-day VaR</div><div class="chart-wrap"><canvas id="risk-backtest-chart" width="1100" height="280" aria-label="Daily returns against the forecast VaR"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div><div id="risk-backtest" class="muted"></div>
+<div class="label model-subhead">Chance of a fall from a high within the next 12 months</div><div class="table-scroll"><table><thead><tr><th class="text-col">Fall of at least</th><th>At its historical volatility</th><th>At today's forecast volatility</th></tr></thead><tbody id="risk-drawdown"></tbody></table></div>
+<div id="model-risk-note" class="muted">Loading…</div></div>
+<div class="card wide" id="model-regimes"><div class="label">Market regime and outlook</div><div class="muted">Sorts the portfolio's history into calm and stressed periods from its own returns, shows which one it is in now and how likely a switch is, and gives a range for its value one to three months ahead, scored against how past ranges turned out. <a class="metric-guide-inline" href="/metrics-guide#metric-market-regime">How it is worked out <span aria-hidden="true">↗</span></a></div>
+<div id="regime-metrics" class="metrics"></div>
+<div class="table-scroll"><table><thead><tr><th class="text-col">Regime</th><th>Return (a year)</th><th>Volatility</th><th>Share of time</th><th>Typical length</th><th>Chance now</th><th>Chance in a month</th></tr></thead><tbody id="regime-table"></tbody></table></div>
+<div class="label model-subhead">Chance of being in the stressed regime</div><div class="chart-wrap"><canvas id="regime-chart" width="1100" height="260" aria-label="Probability of the stressed regime over time"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div>
+<div class="label model-subhead">Range for the portfolio's value</div><div class="table-scroll"><table><thead><tr><th class="text-col">Horizon</th><th>Weak case (5th)</th><th>25th</th><th>Middle</th><th>75th</th><th>Strong case (95th)</th><th>Chance of a loss</th></tr></thead><tbody id="regime-outlook"></tbody></table></div>
+<div class="label model-subhead">How past outlooks held up</div><div id="regime-score-metrics" class="metrics"></div><div id="regime-score" class="muted"></div>
+<div id="regime-note" class="muted">Loading…</div></div>
+<div class="card wide" id="model-whatif"><div class="label">What-if rebalancing</div><div class="muted">Change the weight of any holding, or add a ticker you do not hold, and compare the risk of the proposed portfolio with today's over the same year of daily prices. Weights are shares of NAV; whatever is left over is cash. <a class="metric-guide-inline" href="/metrics-guide#metric-what-if-comparison">How it is worked out <span aria-hidden="true">↗</span></a></div>
+<div class="table-scroll"><table><thead><tr><th class="text-col">Holding</th><th>Current weight</th><th>Proposed weight (%)</th><th>Price history</th></tr></thead><tbody id="whatif-holdings"></tbody></table></div>
+<div class="filter-grid"><label><span class="label">Add a ticker (Yahoo Finance symbol)</span><input id="whatif-add-symbol" type="text" maxlength="20" autocomplete="off" placeholder="e.g. VOO or 0700.HK" aria-label="Ticker to add"></label><label><span class="label">Weight (%)</span><input id="whatif-add-weight" type="number" step="0.1" min="0" max="200" aria-label="Weight of the added ticker"></label></div>
+<div class="actions"><button id="whatif-add" class="button" type="button">Add ticker</button><button id="whatif-run" class="button" type="button">Compare portfolios</button><button id="whatif-reset" class="button" type="button">Reset to current</button></div>
+<div id="whatif-total" class="muted"></div><div class="table-scroll"><table><thead><tr><th class="text-col">Measure</th><th>Current</th><th>Proposed</th><th>Change</th></tr></thead><tbody id="whatif-results"></tbody></table></div><div id="whatif-note" class="muted">Loading…</div>
+<div class="label model-subhead">Through past crises</div><div class="table-scroll"><table><thead><tr><th class="text-col">Scenario</th><th>Current: worst fall</th><th>Proposed: worst fall</th><th>Change</th><th>Current: whole window</th><th>Proposed: whole window</th></tr></thead><tbody id="whatif-crisis"></tbody></table></div><div id="whatif-crisis-note" class="muted"></div></div>
+<div class="card wide" id="model-optimise"><div class="label">Optimisation and risk budget</div><div class="muted">How much of the portfolio's risk each holding carries, and three alternative mixes of the same holdings: lowest risk (minimum variance), equal risk from each holding (risk parity) and best return per unit of risk (maximum Sharpe). <a class="metric-guide-inline" href="/metrics-guide#metric-share-of-risk">How it is worked out <span aria-hidden="true">↗</span></a></div>
+<div class="filter-grid"><label><span class="label">Maximum weight per holding (%)</span><input id="optimise-cap" type="number" step="1" min="1" max="100" value="25" aria-label="Maximum weight per holding"></label></div>
+<div class="actions"><button id="optimise-run" class="button" type="button">Optimise</button></div>
+<div class="table-scroll"><table><thead><tr><th class="text-col">Portfolio</th><th>Expected return</th><th>Volatility</th><th>Sharpe ratio</th><th></th></tr></thead><tbody id="optimise-portfolios"></tbody></table></div>
+<div id="optimise-frontier" class="model-frontier" aria-label="Efficient frontier chart"></div>
+<div class="table-scroll"><table><thead><tr><th class="text-col">Holding</th><th>Volatility</th><th>Weight now</th><th>Share of risk now</th><th>Minimum variance</th><th>Risk parity</th><th>Maximum Sharpe</th></tr></thead><tbody id="optimise-holdings"></tbody></table></div><div id="optimise-note" class="muted">Loading…</div></div>
+<div class="card wide" id="model-factors"><div class="label">Factor model</div><div class="muted">Splits the portfolio's weekly returns into exposure to the market, company size, value, profitability, investment style and momentum (Fama-French five factors plus momentum), and the return those factors do not explain (alpha). <a class="metric-guide-inline" href="/metrics-guide#metric-factor-beta">How it is worked out <span aria-hidden="true">↗</span></a></div>
+<div class="filter-grid"><label><span class="label">Factor region</span><select id="factor-region" aria-label="Factor region"><option value="developed" selected>Developed markets</option><option value="us">United States</option><option value="asia_pacific_ex_japan">Asia Pacific ex Japan</option></select></label></div>
+<div class="actions"><button id="factor-run" class="button" type="button">Run factor model</button></div>
+<div id="factor-metrics" class="metrics"></div><div class="table-scroll"><table><thead><tr><th class="text-col">Factor</th><th>Beta</th><th>t-statistic</th><th>Factor return (a year)</th><th>Return contribution (a year)</th></tr></thead><tbody id="factor-exposures"></tbody></table></div><div id="factor-note" class="muted">Loading…</div>
+<div id="model-stress" class="label model-subhead">Factor stress test</div><div class="muted">Moves the portfolio through its fitted factor betas for a one-off shock to the factors. <a class="metric-guide-inline" href="/metrics-guide#metric-factor-stress-test-impact">How it is worked out <span aria-hidden="true">↗</span></a></div>
+<div class="filter-grid"><label><span class="label">Scenario</span><select id="stress-scenario" aria-label="Stress scenario"><option value="market_down_20">Market falls 20%</option><option value="growth_selloff">Growth and momentum sell-off</option><option value="flight_to_quality">Flight to quality</option><option value="small_cap_rally">Small-cap and value rally</option><option value="value_rotation">Rotation from growth to value</option><option value="custom">Custom shocks</option></select></label></div>
+<div id="stress-custom" class="filter-grid" hidden><label><span class="label">Market (%)</span><input type="number" step="1" min="-60" max="60" data-factor="Mkt-RF" aria-label="Market shock"></label><label><span class="label">Size (%)</span><input type="number" step="1" min="-60" max="60" data-factor="SMB" aria-label="Size shock"></label><label><span class="label">Value (%)</span><input type="number" step="1" min="-60" max="60" data-factor="HML" aria-label="Value shock"></label><label><span class="label">Profitability (%)</span><input type="number" step="1" min="-60" max="60" data-factor="RMW" aria-label="Profitability shock"></label><label><span class="label">Investment (%)</span><input type="number" step="1" min="-60" max="60" data-factor="CMA" aria-label="Investment shock"></label><label><span class="label">Momentum (%)</span><input type="number" step="1" min="-60" max="60" data-factor="MOM" aria-label="Momentum shock"></label></div>
+<div class="actions"><button id="stress-run" class="button" type="button">Run stress test</button></div>
+<div id="stress-metrics" class="metrics"></div><div class="table-scroll"><table><thead><tr><th class="text-col">Factor</th><th>Shock</th><th>Beta</th><th>Effect on the portfolio</th></tr></thead><tbody id="stress-table"></tbody></table></div><div id="stress-note" class="muted"></div></div>
+"""
+
+MODELLING_CSS = """
+.model-subhead{margin-top:22px}
+.model-frontier{margin:16px 0}.model-frontier svg{width:100%;height:auto;max-height:340px;display:block}
+.model-frontier .axis{stroke:var(--line,#d0d5dd)}.model-frontier text{fill:var(--muted,#667085);font-size:12px}
+.model-frontier .frontier{fill:none;stroke:var(--chart-portfolio,#2646a6);stroke-width:2}
+.model-frontier .point{stroke:var(--surface,#fff);stroke-width:1.5}
+[data-section="modelling"] input[type=number]{min-width:0;width:100%;max-width:100%;margin-top:7px;padding:10px 13px;color:var(--ink);background:var(--surface);border:1px solid var(--line-strong);font:inherit}
+[data-section="modelling"] .filter-grid label{display:flex;flex-direction:column;justify-content:flex-end}
+#whatif-holdings input[type=number]{width:8em;margin-top:0;padding:6px 10px;text-align:right}
+"""
+
+MODELLING_SCRIPT = r"""
+const modelFail=async(response)=>{let detail='';try{const body=await response.json();detail=typeof body.detail==='string'?body.detail:''}catch(error){}return detail||`The model could not run (error ${response.status}).`};
+const modelFetch=async(path,params)=>{const response=await fetch(`/api/portfolio/${account}/modelling/${path}?${new URLSearchParams(params)}`);if(!response.ok)throw new Error(await modelFail(response));return response.json()};
+const modelTile=(label,value,hint)=>`<div class="metric"${hint?` title="${esc(hint)}"`:''}><div class="label">${esc(label)}</div><div class="value">${value}</div></div>`;
+const modelMoney=n=>n==null||!Number.isFinite(Number(n))?'—':`${money(n)} ${esc(modelState.currency)}`;
+const modelState={asOf:null,currency:reportingCurrency,whatif:null,added:{},optimised:null};
+document.querySelectorAll('.model-ccy').forEach(x=>x.textContent=reportingCurrency);
+const runProjection=async()=>{
+  const note=document.querySelector('#projection-note'),metrics=document.querySelector('#projection-metrics');note.textContent='Simulating…';
+  const params={as_of:modelState.asOf,years:document.querySelector('#projection-years').value,monthly_flow:document.querySelector('#projection-flow').value||'0'};
+  const target=document.querySelector('#projection-target').value,assumed=document.querySelector('#projection-return').value;if(target)params.target=target;if(assumed!=='')params.annual_return=assumed;
+  let r;try{r=await modelFetch('projection',params)}catch(error){metrics.innerHTML='';draw('#projection-chart',[],[],{emptyMessage:'No projection.'});note.textContent=error.message;return}
+  modelState.currency=r.currency||reportingCurrency;const s=r.summary,a=r.assumptions;
+  metrics.innerHTML=[
+    modelTile(`Median value in ${r.years} ${r.years===1?'year':'years'}`,modelMoney(s.median_end),'Half of the simulated paths end above this value.'),
+    modelTile('Weak case (5th percentile)',modelMoney(s.p5_end),'Only 1 path in 20 ends below this value.'),
+    modelTile('Strong case (95th percentile)',modelMoney(s.p95_end),'Only 1 path in 20 ends above this value.'),
+    modelTile('Total contributions',r.total_flows?toned(modelMoney(r.total_flows),r.total_flows):'—'),
+    r.target?modelTile('Chance of reaching the target',pct2(s.probability_target)):'',
+    r.monthly_flow<0?modelTile('Chance of running out',pct2(s.probability_depleted)):modelTile('Chance of ending below money put in',pct2(s.probability_loss)),
+    modelTile(a.return_source==='user'?'Assumed return (your input)':'Historical return used',pct2(a.annual_return),'Compound annual growth of the sampled months.'),
+    modelTile('Volatility used',pct2(a.annual_volatility),'Annualised spread of the sampled monthly returns.'),
+  ].join('');
+  draw('#projection-chart',r.series,[{key:'p95',color:'#98a2b3',label:'95th percentile'},{key:'p75',color:'#7a8fd6',label:'75th percentile'},{key:'p50',color:chartColors.portfolio,label:'Median'},{key:'p25',color:'#7a8fd6',label:'25th percentile'},{key:'p5',color:'#98a2b3',label:'5th percentile'}],{yLabel:`NAV (${modelState.currency})`,unit:modelState.currency,niceYTicks:true,targetYIntervals:6,emptyMessage:'No projection.'});
+  note.textContent=`${r.method} Starting value ${modelMoney(r.start_value)} on ${analyticsDate(r.start_date)}, sampled from returns since ${analyticsDate(r.history_start)}. ${(r.warnings||[]).join(' ')} ${r.disclaimer}`;
+};
+const whatifWeights=()=>[...document.querySelectorAll('#whatif-holdings input[data-conid]')].map(input=>[input.dataset.conid,Number(input.value)/100]).filter(([,w])=>Number.isFinite(w));
+const whatifTotal=()=>{const total=whatifWeights().reduce((sum,[,w])=>sum+w,0)+Object.values(modelState.added).reduce((sum,w)=>sum+w,0);document.querySelector('#whatif-total').textContent=`Proposed holdings add up to ${weightPct(total)} of NAV, leaving ${weightPct(1-total)} in cash${total>1?' (borrowed)':''}.`};
+const renderWhatifHoldings=r=>{
+  const added=Object.entries(modelState.added).map(([symbol,weight])=>{const status=(r.added||[]).find(x=>x.symbol===symbol);return `<tr><td class="text-col"><strong>${esc(symbol)}</strong><div class="muted">Added ticker${status&&!status.available?` · ${esc(status.message||'no prices')}`:''}</div></td><td>—</td><td>${esc((100*weight).toFixed(1))} <button type="button" class="button" data-remove="${esc(symbol)}">Remove</button></td><td>${status&&status.available?'Yahoo Finance':'—'}</td></tr>`}).join('');
+  document.querySelector('#whatif-holdings').innerHTML=r.holdings.map(h=>`<tr><td class="text-col"><strong>${esc(h.symbol)}</strong><div class="muted">${esc(h.description)}</div></td><td>${weightPct(h.current_weight)}</td><td><input type="number" step="0.1" min="0" max="200" data-conid="${esc(h.conid)}" value="${(100*h.proposed_weight).toFixed(2)}" aria-label="Proposed weight of ${esc(h.symbol)}"></td><td>${h.modelled?`${esc(h.sessions)} sessions`:`<span class="muted">${esc(h.sessions)} sessions, carried at 0%</span>`}</td></tr>`).join('')+added;
+  document.querySelectorAll('#whatif-holdings input[data-conid]').forEach(input=>input.addEventListener('input',whatifTotal));
+  document.querySelectorAll('#whatif-holdings [data-remove]').forEach(button=>button.addEventListener('click',()=>{delete modelState.added[button.dataset.remove];void runWhatif()}));
+  whatifTotal();
+};
+const whatifRows=[['Annual return (historical)','annual_return',pct2,true],['Volatility','annual_volatility',pct2,false],['Sharpe ratio','sharpe_ratio',ratio,true],['Daily VaR (95%)','var_95_daily',pct2,false],['Daily expected tail loss (95%)','cvar_95_daily',pct2,false],['Maximum drawdown','maximum_drawdown',pct2,true],['Worst month (21 sessions)','worst_month',pct2,true],['Beta to benchmark','beta',ratio,null],['Cash','cash_weight',weightPct,null]];
+const runWhatif=async(useInputs=true)=>{
+  const note=document.querySelector('#whatif-note');note.textContent='Comparing…';
+  const params={as_of:modelState.asOf};
+  if(useInputs){const weights=whatifWeights();if(weights.length)params.weights=weights.map(([k,w])=>`${k}:${Math.max(0,w)}`).join(',')}
+  const added=Object.entries(modelState.added);if(added.length)params.add=added.map(([s,w])=>`${s}:${w}`).join(',');
+  let r;try{r=await modelFetch('what-if',params)}catch(error){note.textContent=error.message;document.querySelector('#whatif-results').innerHTML='';crisisRun++;document.querySelector('#whatif-crisis').innerHTML='';document.querySelector('#whatif-crisis-note').textContent='';return}
+  modelState.whatif=r;renderWhatifHoldings(r);void runWhatifCrisis(r);
+  document.querySelector('#whatif-results').innerHTML=whatifRows.map(([label,key,format,higherBetter])=>{const d=r.difference[key];const change=d==null?'—':higherBetter==null?format(d):`<span class="${Math.abs(d)<1e-9?'':((d>0)===higherBetter?'gain':'loss')}">${d>0?'+':''}${format(d)}</span>`;return `<tr><td class="text-col">${esc(label)}</td><td>${format(r.current[key])}</td><td>${format(r.proposed[key])}</td><td>${key==='cash_weight'?format(r.proposed[key]-r.current[key]):change}</td></tr>`}).join('');
+  note.textContent=`Both portfolios are replayed over ${r.observations} sessions from ${analyticsDate(r.window_start)} to ${analyticsDate(r.window_end)} using each holding's daily price in its own currency (currency moves are not included). Cash earns ${r.risk_free_available?`the ${pct2(r.risk_free_rate)} risk-free rate`:'0% (no risk-free rate on file)'}. ${r.benchmark_name?`Beta is measured against ${r.benchmark_name}.`:'No benchmark is mapped, so beta is not shown.'} Holdings with less than 60% price coverage are carried at 0% return.${r.excluded_price_breaks?` ${r.excluded_price_breaks} one-day moves above 50% were treated as corporate actions and left out.`:''} ${r.disclaimer}`;
+};
+let crisisRun=0;
+const runWhatifCrisis=async r=>{
+  const body=document.querySelector('#whatif-crisis'),note=document.querySelector('#whatif-crisis-note'),run=++crisisRun;
+  body.innerHTML='';note.textContent='Replaying both mixes through past crises…';
+  const params={as_of:modelState.asOf,weights:r.holdings.map(h=>`${h.conid}:${Math.max(0,h.proposed_weight)}`).join(',')};
+  const added=Object.entries(modelState.added);if(added.length)params.add=added.map(([s,w])=>`${s}:${w}`).join(',');
+  let c;try{c=await modelFetch('what-if-crisis',params)}catch(error){if(run===crisisRun)note.textContent=error.message;return}
+  if(run!==crisisRun)return;
+  const change=d=>`<span class="${Math.abs(d)<1e-9?'':(d>0?'gain':'loss')}">${d>0?'+':''}${pct2(d)}</span>`;
+  body.innerHTML=c.scenarios.map(x=>`<tr><td class="text-col"><strong>${esc(x.label)}</strong><div class="muted">${esc(analyticsDate(x.crisis_start))} to ${esc(analyticsDate(x.crisis_end))}</div></td>${x.available?`<td>${pct2(x.current.maximum_drawdown)}</td><td>${pct2(x.proposed.maximum_drawdown)}</td><td>${change(x.difference.maximum_drawdown)}</td><td>${signedPct(x.current.period_return)}</td><td>${signedPct(x.proposed.period_return)}</td>`:`<td colspan="5" class="muted">${esc(x.reason||'Unavailable')}</td>`}</tr>`).join('')||'<tr><td colspan="6">No scenarios.</td></tr>';
+  const defaults=[...new Set(c.scenarios.flatMap(x=>x.defaults||[]))];
+  note.textContent=`Holdings as of ${analyticsDate(c.holdings_as_of)}; stored scenarios use holdings as of ${analyticsDate(c.scenarios_holdings_as_of)}. ${c.limitations}${defaults.length?` Replayed on the S&P 500 fund because they have no prices of their own in at least one window: ${defaults.join(', ')}.`:''} Hypothetical, not a forecast or a recommendation.`;
+};
+document.querySelector('#whatif-run').addEventListener('click',()=>void runWhatif());
+document.querySelector('#whatif-reset').addEventListener('click',()=>{modelState.added={};void runWhatif(false)});
+document.querySelector('#whatif-add').addEventListener('click',()=>{const symbol=document.querySelector('#whatif-add-symbol').value.trim().toUpperCase(),weight=Number(document.querySelector('#whatif-add-weight').value)/100;if(!/^[A-Z0-9.^=\-]{1,20}$/.test(symbol)||!(weight>0)){document.querySelector('#whatif-note').textContent='Enter a ticker and a weight above 0% to add it.';return}if(!modelState.added[symbol]&&Object.keys(modelState.added).length>=5){document.querySelector('#whatif-note').textContent='Add at most 5 tickers at a time.';return}modelState.added[symbol]=weight;document.querySelector('#whatif-add-symbol').value='';document.querySelector('#whatif-add-weight').value='';void runWhatif()});
+const portfolioNames={current:'Current mix',minimum_variance:'Minimum variance',risk_parity:'Risk parity',maximum_sharpe:'Maximum Sharpe'};
+const portfolioColors={current:chartColors.benchmark,minimum_variance:'#0e9384',risk_parity:'#7a5af8',maximum_sharpe:chartColors.portfolio};
+const frontierSvg=r=>{
+  const points=[...r.frontier,...Object.values(r.portfolios)],xs=points.map(p=>p.volatility),ys=points.map(p=>p.expected_return);
+  const x0=Math.min(...xs)*0.9,x1=Math.max(...xs)*1.05,ylo=Math.min(...ys),yhi=Math.max(...ys),pad=(yhi-ylo)*0.1||0.01,y0=ylo-pad,y1=yhi+pad,W=720,H=320,L=70,R=20,T=16,B=66;
+  const X=v=>L+(v-x0)/(x1-x0||1)*(W-L-R),Y=v=>T+(y1-v)/(y1-y0||1)*(H-T-B),ticks=(a,b)=>Array.from({length:5},(_,i)=>a+i*(b-a)/4);
+  const path=r.frontier.map((p,i)=>`${i?'L':'M'}${X(p.volatility).toFixed(1)},${Y(p.expected_return).toFixed(1)}`).join('');
+  const dots=Object.entries(r.portfolios).map(([k,p])=>`<g><circle class="point" cx="${X(p.volatility).toFixed(1)}" cy="${Y(p.expected_return).toFixed(1)}" r="7" fill="${portfolioColors[k]}"><title>${esc(portfolioNames[k])}: ${pct2(p.expected_return)} return, ${pct2(p.volatility)} volatility</title></circle></g>`).join('');
+  const legend=Object.keys(r.portfolios).map((k,i)=>`<g transform="translate(${L+10+i*150},${H-8})"><circle r="5" fill="${portfolioColors[k]}"></circle><text x="10" y="4">${esc(portfolioNames[k])}</text></g>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Efficient frontier: expected return against volatility"><line class="axis" x1="${L}" y1="${H-B}" x2="${W-R}" y2="${H-B}"></line><line class="axis" x1="${L}" y1="${T}" x2="${L}" y2="${H-B}"></line>${ticks(x0,x1).map(v=>`<text x="${X(v)}" y="${H-B+16}" text-anchor="middle">${pct2(v)}</text>`).join('')}${ticks(y0,y1).map(v=>`<text x="${L-8}" y="${Y(v)+4}" text-anchor="end">${pct2(v)}</text>`).join('')}<text x="${(L+W-R)/2}" y="${H-B+34}" text-anchor="middle">Volatility (a year) →</text><path class="frontier" d="${path}"></path>${dots}${legend}</svg>`;
+};
+const useInWhatif=name=>{const r=modelState.optimised;if(!r||!modelState.whatif)return;const weights=Object.fromEntries(r.holdings.map(h=>[h.conid,h[`${name}_weight`]*r.sleeve_weight]));document.querySelectorAll('#whatif-holdings input[data-conid]').forEach(input=>{if(input.dataset.conid in weights)input.value=(100*weights[input.dataset.conid]).toFixed(2)});whatifTotal();void runWhatif();document.querySelector('#model-whatif').scrollIntoView({behavior:'smooth'})};
+const runOptimise=async()=>{
+  const note=document.querySelector('#optimise-note');note.textContent='Optimising…';
+  let r;try{r=await modelFetch('optimise',{as_of:modelState.asOf,max_weight:document.querySelector('#optimise-cap').value||'25'})}catch(error){note.textContent=error.message;['#optimise-portfolios','#optimise-holdings','#optimise-frontier'].forEach(x=>document.querySelector(x).innerHTML='');return}
+  modelState.optimised=r;
+  document.querySelector('#optimise-portfolios').innerHTML=Object.entries(r.portfolios).map(([k,p])=>`<tr><td class="text-col"><span aria-hidden="true" style="color:${portfolioColors[k]}">●</span> ${esc(portfolioNames[k])}</td><td>${pct2(p.expected_return)}</td><td>${pct2(p.volatility)}</td><td>${ratio(p.sharpe_ratio)}</td><td>${k==='current'?'':`<button type="button" class="button" data-use="${k}">Try in what-if</button>`}</td></tr>`).join('');
+  document.querySelectorAll('#optimise-portfolios [data-use]').forEach(b=>b.addEventListener('click',()=>useInWhatif(b.dataset.use)));
+  document.querySelector('#optimise-frontier').innerHTML=frontierSvg(r);
+  const riskCell=(w,share)=>`${weightPct(w)}<div class="muted">${weightPct(share)} of risk</div>`;
+  document.querySelector('#optimise-holdings').innerHTML=r.holdings.map(h=>`<tr><td class="text-col"><strong>${esc(h.symbol)}</strong><div class="muted">${esc(h.description)}</div></td><td>${pct2(h.annual_volatility)}</td><td>${weightPct(h.current_weight)}</td><td><span class="${h.current_risk>h.current_weight*1.25?'loss':''}">${weightPct(h.current_risk)}</span></td><td>${riskCell(h.minimum_variance_weight,h.minimum_variance_risk)}</td><td>${riskCell(h.risk_parity_weight,h.risk_parity_risk)}</td><td>${riskCell(h.maximum_sharpe_weight,h.maximum_sharpe_risk)}</td></tr>`).join('');
+  note.textContent=`Weights are shares of the ${weightPct(r.sleeve_weight)} of NAV in these holdings; cash stays as it is. A share of risk well above the holding's weight is marked red. ${r.method} Risk-free rate ${r.risk_free_available?pct2(r.risk_free_rate):'0% (none on file)'}. Window ${analyticsDate(r.window_start)} to ${analyticsDate(r.window_end)}.${r.excluded.length?` Not optimised (smaller or without a year of prices): ${r.excluded.join(', ')}.`:''} Expected returns from one year of prices are very uncertain, so treat the maximum Sharpe mix as an illustration. ${r.disclaimer}`;
+};
+document.querySelector('#optimise-run').addEventListener('click',()=>void runOptimise());
+const runFactors=async()=>{
+  const note=document.querySelector('#factor-note'),metrics=document.querySelector('#factor-metrics'),body=document.querySelector('#factor-exposures');note.textContent='Downloading factor data and fitting…';
+  let r;try{r=await modelFetch('factors',{as_of:modelState.asOf,region:document.querySelector('#factor-region').value})}catch(error){note.textContent=error.message;metrics.innerHTML='';body.innerHTML='';return}
+  metrics.innerHTML=[modelTile('Alpha (a year)',toned(pct2(r.alpha_annual),r.alpha_annual),`t-statistic ${ratio(r.alpha_t_statistic)}`),modelTile('Explained by factors (R²)',pct2(r.r_squared)),modelTile('Unexplained volatility',pct2(r.residual_volatility_annual)),modelTile('Weeks used',esc(r.weeks))].join('');
+  body.innerHTML=r.exposures.map(x=>`<tr><td class="text-col"><strong>${esc(x.label)}</strong>${x.significant?'':' <span class="muted">(not significant)</span>'}</td><td>${ratio(x.beta)}</td><td>${ratio(x.t_statistic)}</td><td>${signedPct(x.factor_annual_return)}</td><td>${toned(pct2(x.return_contribution),x.return_contribution)}</td></tr>`).join('');
+  note.textContent=`${r.region} factors from ${r.source==='etf_proxy'?'fund stand-ins on Yahoo Finance':'the Kenneth French data library'} (through ${analyticsDate(r.factor_data_through)}), weeks of ${analyticsDate(r.window_start)} to ${analyticsDate(r.window_end)}. ${r.method} Factor returns are in US dollars; the portfolio is measured in ${r.currency}.${r.momentum_note?' '+r.momentum_note:''}${r.source_note?' '+r.source_note:''} ${r.disclaimer}`;
+};
+document.querySelector('#factor-run').addEventListener('click',()=>void runFactors());
+document.querySelector('#projection-run').addEventListener('click',()=>void runProjection());
+const riskPair=(x,nav)=>`${pct2(x)}${nav?`<div class="muted">${modelMoney(x*nav)}</div>`:''}`;
+const runRisk=async()=>{
+  const note=document.querySelector('#model-risk-note'),metrics=document.querySelector('#model-risk-metrics');note.textContent='Forecasting volatility and backtesting…';
+  let r;try{r=await modelFetch('risk-outlook',{as_of:modelState.asOf})}catch(error){note.textContent=error.message;metrics.innerHTML='';document.querySelector('#risk-drawdown').innerHTML='';document.querySelector('#risk-backtest').textContent='';draw('#risk-backtest-chart',[],[],{emptyMessage:'No forecast.'});return}
+  const d1=r.one_day['95'],d99=r.one_day['99'],m1=r.one_month['95'];
+  metrics.innerHTML=[
+    modelTile('Forecast volatility (next month, a year)',pct2(r.forecast_volatility_next_month_annual),`Long-run ${pct2(r.long_run_volatility_annual)}; last year ${pct2(r.realised_volatility_last_year)}`),
+    modelTile('Long-run volatility',pct2(r.long_run_volatility_annual)),
+    modelTile('One-day VaR (95%)',riskPair(d1.var,r.nav),'A loss this large or larger is expected on about 1 day in 20.'),
+    modelTile('One-day expected tail loss (95%)',riskPair(d1.expected_tail_loss,r.nav),'The average loss on those worst 1-in-20 days.'),
+    modelTile('One-day VaR (99%)',riskPair(d99.var,r.nav),'About 1 day in 100.'),
+    modelTile('One-month VaR (95%)',riskPair(m1.var,r.nav),'A 21-session loss this large or larger in about 1 month in 20.'),
+    modelTile('One-month expected tail loss (95%)',riskPair(m1.expected_tail_loss,r.nav)),
+    modelTile('Shock half-life',r.shock_half_life_days==null?'—':`${Math.round(r.shock_half_life_days)} sessions`,'How long it takes half of a volatility spike to fade.'),
+  ].join('');
+  const b=r.backtest;
+  draw('#risk-backtest-chart',b.available?b.series.map(x=>({date:x.date,ret:100*x.return,limit:-100*x.var})):[],[{key:'ret',color:chartColors.portfolio,label:'Daily return'},{key:'limit',color:chartColors.benchmark,label:'95% VaR line'}],{yLabel:'Daily return (%)',unit:'%',emptyMessage:b.available?'No backtest.':b.reason});
+  document.querySelector('#risk-backtest').textContent=b.available?`${b.verdict}${b.kupiec_p_value!=null?` Kupiec test p-value ${ratio(b.kupiec_p_value)}.`:''}`:b.reason;
+  const h=r.drawdown_odds.historical,c=r.drawdown_odds.current_volatility;
+  document.querySelector('#risk-drawdown').innerHTML=h.probabilities.map((x,i)=>`<tr><td class="text-col">${weightPct(x.threshold)}</td><td>${pct2(x.probability)}</td><td>${pct2(c.probabilities[i].probability)}</td></tr>`).join('')+`<tr><td class="text-col">Typical worst fall (median)</td><td>${pct2(h.median_worst_fall)}</td><td>${pct2(c.median_worst_fall)}</td></tr><tr><td class="text-col">Bad-case worst fall (1 in 20)</td><td>${pct2(h.bad_case_worst_fall)}</td><td>${pct2(c.bad_case_worst_fall)}</td></tr>`;
+  note.textContent=`${r.method_name}, fitted on ${r.observations} daily returns from ${analyticsDate(r.window_start)} to ${analyticsDate(r.window_end)}. ${r.method} Today's-volatility column replays history scaled by ${ratio(c.volatility_scale)}×. ${r.disclaimer}`;
+};
+const runRegimes=async()=>{
+  const note=document.querySelector('#regime-note'),metrics=document.querySelector('#regime-metrics');note.textContent='Fitting regimes and scoring past outlooks…';
+  let r;try{r=await modelFetch('regimes',{as_of:modelState.asOf})}catch(error){note.textContent=error.message;['#regime-metrics','#regime-table','#regime-outlook','#regime-score-metrics'].forEach(x=>document.querySelector(x).innerHTML='');document.querySelector('#regime-score').textContent='';draw('#regime-chart',[],[],{emptyMessage:'No regimes.'});return}
+  const stressed=r.regimes[r.regimes.length-1];
+  metrics.innerHTML=[modelTile('Regime now',esc(r.current_regime),`${pct2(r.current_probability)} likely`),modelTile(`Chance of ${stressed.regime.toLowerCase()} now`,pct2(stressed.probability_now)),modelTile(`Chance of ${stressed.regime.toLowerCase()} in a month`,pct2(stressed.probability_in_a_month)),modelTile('Chance of a loss over 3 months',pct2(r.outlook[r.outlook.length-1].probability_loss))].join('');
+  document.querySelector('#regime-table').innerHTML=r.regimes.map(x=>`<tr><td class="text-col"><strong>${esc(x.regime)}</strong>${x.regime===r.current_regime?' <span class="muted">(now)</span>':''}</td><td>${signedPct(x.annual_return)}</td><td>${pct2(x.annual_volatility)}</td><td>${pct2(x.share_of_time)}</td><td>${x.expected_duration_days==null?'—':`${Math.round(x.expected_duration_days)} sessions`}</td><td>${pct2(x.probability_now)}</td><td>${pct2(x.probability_in_a_month)}</td></tr>`).join('');
+  draw('#regime-chart',r.timeline.map(x=>({date:x.date,p:100*x.stressed_probability})),[{key:'p',color:chartColors.benchmark,label:`Chance of ${stressed.regime.toLowerCase()}`}],{yLabel:'Probability (%)',unit:'%',emptyMessage:'No regimes.'});
+  const cell=(row,band)=>`${row[`${band}_value`]!=null?modelMoney(row[`${band}_value`]):'—'}<div class="muted">${signedPct(row[band])}</div>`;
+  document.querySelector('#regime-outlook').innerHTML=r.outlook.map(x=>`<tr><td class="text-col">${x.months} ${x.months===1?'month':'months'}</td>${['p5','p25','p50','p75','p95'].map(b=>`<td>${cell(x,b)}</td>`).join('')}<td>${pct2(x.probability_loss)}</td></tr>`).join('');
+  const s=r.score;
+  document.querySelector('#regime-score-metrics').innerHTML=s.available?[modelTile('90% range held the outcome',pct2(s.coverage_90),'Should be close to 90%.'),modelTile('Middle 50% range held it',pct2(s.coverage_50),'Should be close to 50%.'),modelTile('Direction right',pct2(s.direction_hit_rate),`Against ${pct2(s.naive_hit_rate)} for assuming the more common past direction.`),modelTile('Directional skill',s.directional_skill?'Some':'None shown')].join(''):'';
+  document.querySelector('#regime-score').textContent=s.available?s.verdict:s.reason;
+  note.textContent=`${r.states} regimes from ${r.observations} daily returns, ${analyticsDate(r.window_start)} to ${analyticsDate(r.window_end)}. ${r.method} ${r.disclaimer}`;
+};
+const stressScenario=document.querySelector('#stress-scenario');
+stressScenario.addEventListener('change',()=>{document.querySelector('#stress-custom').hidden=stressScenario.value!=='custom'});
+const runStress=async()=>{
+  const note=document.querySelector('#stress-note'),metrics=document.querySelector('#stress-metrics'),body=document.querySelector('#stress-table');note.textContent='Running the stress test…';
+  const params={as_of:modelState.asOf,region:document.querySelector('#factor-region').value};
+  if(stressScenario.value==='custom'){const shocks=[...document.querySelectorAll('#stress-custom input[data-factor]')].filter(i=>i.value!=='').map(i=>`${i.dataset.factor}:${Number(i.value)/100}`);if(!shocks.length){note.textContent='Enter at least one factor shock.';metrics.innerHTML='';body.innerHTML='';return}params.shocks=shocks.join(',')}else params.scenario=stressScenario.value;
+  let r;try{r=await modelFetch('factor-stress',params)}catch(error){note.textContent=error.message;metrics.innerHTML='';body.innerHTML='';return}
+  metrics.innerHTML=[modelTile(`Portfolio move: ${esc(r.scenario_label)}`,toned(signedPct(r.impact),r.impact)),modelTile('In money',r.impact_value==null?'—':toned(modelMoney(r.impact_value),r.impact_value)),modelTile('Typical unexplained move in a month',r.unexplained_monthly_range==null?'—':`± ${pct2(r.unexplained_monthly_range)}`),modelTile('Explained by factors (R²)',pct2(r.r_squared))].join('');
+  body.innerHTML=r.factors.map(x=>`<tr><td class="text-col"><strong>${esc(x.label)}</strong>${x.significant?'':' <span class="muted">(beta not significant)</span>'}</td><td>${signedPct(x.shock)}</td><td>${ratio(x.beta)}</td><td>${toned(signedPct(x.impact),x.impact)}</td></tr>`).join('');
+  note.textContent=`${r.method}${r.factors_not_in_model.length?` Not in the fitted model, so left out: ${r.factors_not_in_model.join(', ')}.`:''} ${r.disclaimer}`;
+};
+document.querySelector('#stress-run').addEventListener('click',()=>void runStress());
+const renderModelling=asOf=>{modelState.asOf=asOf;modelState.added={};void runProjection();void runRisk();void runRegimes();void runWhatif(false).then(()=>runOptimise());void runFactors().then(()=>runStress())};
+"""

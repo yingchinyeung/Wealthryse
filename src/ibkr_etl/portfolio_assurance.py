@@ -281,10 +281,12 @@ def evaluate_portfolio_assurance(
         latest_by_period.setdefault(key, row)
     future_periods = sorted({period for period, _ in latest_by_period if period > "2026-08-31"})
     for period in future_periods:
+        # Decks are no longer built: a month needs its factsheet, and a deck is checked only where one exists.
         pair = {kind: latest_by_period.get((period, kind)) for kind in ("factsheet", "presentation")}
-        if any(value is None for value in pair.values()):
-            findings.append(_finding(f"reports.{period}.pair", "error", "The future month-end package is missing either its factsheet or presentation."))
+        if pair["factsheet"] is None:
+            findings.append(_finding(f"reports.{period}.pair", "error", "The future month-end package is missing its factsheet."))
             continue
+        pair = {kind: row for kind, row in pair.items() if row is not None}
         expected = {
             "factsheet": factsheet_layout_version(subject_id),
             "presentation": presentation_content_contract_version(subject_id),

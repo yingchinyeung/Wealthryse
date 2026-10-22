@@ -77,7 +77,7 @@ resource webIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-3
 resource web 'Microsoft.App/containerApps@2024-03-01' = {
   name: appName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'website', hop: 'serve+publish' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

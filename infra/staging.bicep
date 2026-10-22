@@ -20,9 +20,6 @@ param databaseName string = 'ibkr_staging'
 param postgresSkuName string = 'Standard_B1ms'
 param postgresSkuTier string = 'Burstable'
 param postgresVersion string = '16'
-param budgetAmount int = 120000
-param budgetStartDate string
-param budgetContactEmail string = 'anthony.ying@wealthryse.ai'
 
 param tags object = {
   application: 'ibkr-portfolio-platform'
@@ -47,7 +44,7 @@ var privateDnsZoneName = '${prefix}.postgres.database.azure.com'
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: workspaceName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'logging' })
   properties: {
     retentionInDays: 30
     features: {
@@ -147,7 +144,7 @@ resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
 resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   name: registryName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'registry' })
   sku: {
     name: 'Basic'
   }
@@ -160,7 +157,7 @@ resource registry 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'data', component: 'storage', dataLayer: 'bronze+gold+ops' })
   sku: {
     name: 'Standard_LRS'
   }
@@ -248,7 +245,7 @@ resource approvedContainer 'Microsoft.Storage/storageAccounts/blobServices/conta
 resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: vaultName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'secrets' })
   properties: {
     tenantId: tenant().tenantId
     enableRbacAuthorization: true
@@ -266,37 +263,37 @@ resource vault 'Microsoft.KeyVault/vaults@2023-07-01' = {
 resource webIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-web-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource ingestionIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-ingestion-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource publisherIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-publisher-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource diagnosticsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-diagnostics-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource approvedActionsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${prefix}-approved-actions-identity'
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'identity' })
 }
 
 resource postgres 'Microsoft.DBforPostgreSQL/flexibleServers@2024-08-01' = {
   name: postgresName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'data', component: 'database', dataLayer: 'bronze+silver+gold+ops' })
   sku: {
     name: postgresSkuName
     tier: postgresSkuTier
@@ -405,19 +402,61 @@ resource publisherSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-
   }
 }
 
-resource webBlobReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, webIdentity.id, storageBlobReaderRoleId)
-  scope: storage
+// The web identity's account-wide Storage Blob Data Reader came off on 18 Oct 2026; it reads
+// only through its container roles (staging-web-report-reader.bicep, staging-onboarding-intake.bicep).
+
+// The ingestion and publisher identities' account-wide Storage Blob Data Contributor came off on
+// 21 Oct 2026 (medallion S4a storage narrowing); each keeps only the container roles below and in
+// staging-internal-release.bicep. A deployment leaves an assignment it no longer declares in place, so
+// the removal was a separate step (storage_narrow.py), and its undo puts both back under their earlier
+// names, guid(storage.id, <identity>.id, storageBlobContributorRoleId).
+
+// Containers made outside this file (onboarding-intake by staging-onboarding-intake.bicep,
+// bronze-market-data by the medallion S2 step), referenced for the container roles below.
+resource onboardingIntakeContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'onboarding-intake'
+}
+resource bronzeMarketDataContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'bronze-market-data'
+}
+// Made by staging-internal-release.bicep, which also gives the publisher identity its role there.
+resource internalReportsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'internal-reports'
+}
+// Made by staging-flex-discovery.bicep; the Flex identity writes the raw statements there.
+resource rawStatementsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'ibkr-raw'
+}
+
+// Container-scope storage roles (medallion S4a). Each name is the assignment made on
+// 18 Oct 2026, so a redeploy updates it instead of failing on a duplicate.
+resource publisherDraftsContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: '1650cae9-0811-4165-bdba-24be733c4a08'
+  scope: draftContainer
   properties: {
-    principalId: webIdentity.properties.principalId
+    principalId: publisherIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobContributorRoleId
+  }
+}
+
+resource publisherIntakeReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: '8b7c44bf-33fd-4a1d-a66c-1a9a8621dee9'
+  scope: onboardingIntakeContainer
+  properties: {
+    principalId: publisherIdentity.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: storageBlobReaderRoleId
   }
 }
 
-resource ingestionBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, ingestionIdentity.id, storageBlobContributorRoleId)
-  scope: storage
+resource ingestionInputContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: 'e49deab7-7272-4de6-995d-6e7e54fa48a6'
+  scope: inputContainer
   properties: {
     principalId: ingestionIdentity.properties.principalId
     principalType: 'ServicePrincipal'
@@ -425,13 +464,81 @@ resource ingestionBlobContributor 'Microsoft.Authorization/roleAssignments@2022-
   }
 }
 
-resource publisherBlobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, publisherIdentity.id, storageBlobContributorRoleId)
-  scope: storage
+// The bootstrap job reads the raw statements as the ingestion identity: the corrections history
+// backfill and check, the FX step and the rehearsals on restored copies. Read only; the container is
+// under legal hold. The name is the assignment the narrowing step made.
+resource ingestionRawReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: 'f2cbbd24-51eb-4cf6-b159-3e8ec4d55785'
+  scope: rawStatementsContainer
   properties: {
-    principalId: publisherIdentity.properties.principalId
+    principalId: ingestionIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobReaderRoleId
+  }
+}
+
+// The onboarding render job (as the ingestion identity) writes rendered factsheets to internal-reports
+// and reads the onboarding uploads. The names are the assignments the narrowing step made.
+resource ingestionInternalReportsContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: 'f2ab1682-51fe-44d9-a209-9426919e0f40'
+  scope: internalReportsContainer
+  properties: {
+    principalId: ingestionIdentity.properties.principalId
     principalType: 'ServicePrincipal'
     roleDefinitionId: storageBlobContributorRoleId
+  }
+}
+
+resource ingestionIntakeReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: '943026b5-f7a1-4087-b4a7-68803110ede1'
+  scope: onboardingIntakeContainer
+  properties: {
+    principalId: ingestionIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobReaderRoleId
+  }
+}
+
+// The four market-data jobs write their raw copies here as the ingestion identity.
+resource ingestionBronzeMarketDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: 'ce61af0c-490d-4e11-8956-8f4b08b376a6'
+  scope: bronzeMarketDataContainer
+  properties: {
+    principalId: ingestionIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobContributorRoleId
+  }
+}
+
+// For the supervisor's bronze-market-data file checks (still off, see staging-autonomous-admin.bicep).
+resource diagnosticsBronzeMarketDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: '9f644dc9-64c7-4ae0-90db-f760b639048b'
+  scope: bronzeMarketDataContainer
+  properties: {
+    principalId: diagnosticsIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: storageBlobReaderRoleId
+  }
+}
+
+// Delete locks placed on 18 Oct 2026 (medallion S4a). A lock blocks deletes, not changes, but
+// removing a storage role needs the storage lock lifted briefly. No lock on the key vault yet:
+// role removal there was refused under a lock, so it waits for the credential work (R11, R12).
+resource postgresDeleteLock 'Microsoft.Authorization/locks@2020-05-01' = {
+  name: 'medallion-no-delete'
+  scope: postgres
+  properties: {
+    level: 'CanNotDelete'
+    notes: 'Medallion S4a: delete only with Ying approval'
+  }
+}
+
+resource storageDeleteLock 'Microsoft.Authorization/locks@2020-05-01' = {
+  name: 'medallion-no-delete'
+  scope: storage
+  properties: {
+    level: 'CanNotDelete'
+    notes: 'Medallion S4a: delete only with Ying approval; lift briefly to remove a storage role'
   }
 }
 
@@ -459,62 +566,6 @@ resource databaseAppPasswordSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01
   }
 }
 
-resource stagingBudget 'Microsoft.Consumption/budgets@2024-08-01' = {
-  name: '${prefix}-monthly-budget'
-  properties: {
-    amount: budgetAmount
-    category: 'Cost'
-    timeGrain: 'Monthly'
-    timePeriod: {
-      startDate: budgetStartDate
-    }
-    filter: {
-      tags: {
-        name: 'environment'
-        operator: 'In'
-        values: [
-          'staging'
-        ]
-      }
-    }
-    notifications: {
-      warning75k: {
-        enabled: true
-        operator: 'GreaterThan'
-        threshold: json('62.5')
-        thresholdType: 'Actual'
-        contactEmails: [
-          budgetContactEmail
-        ]
-        contactGroups: []
-        contactRoles: []
-      }
-      warning100k: {
-        enabled: true
-        operator: 'GreaterThan'
-        threshold: json('83.33')
-        thresholdType: 'Actual'
-        contactEmails: [
-          budgetContactEmail
-        ]
-        contactGroups: []
-        contactRoles: []
-      }
-      review120k: {
-        enabled: true
-        operator: 'GreaterThan'
-        threshold: 100
-        thresholdType: 'Forecasted'
-        contactEmails: [
-          budgetContactEmail
-        ]
-        contactGroups: []
-        contactRoles: []
-      }
-    }
-  }
-}
-
 output registryName string = registry.name
 output registryLoginServer string = registry.properties.loginServer
 output storageAccountName string = storage.name
@@ -528,4 +579,3 @@ output ingestionIdentityResourceId string = ingestionIdentity.id
 output publisherIdentityResourceId string = publisherIdentity.id
 output diagnosticsIdentityResourceId string = diagnosticsIdentity.id
 output approvedActionsIdentityResourceId string = approvedActionsIdentity.id
-output monthlyBudgetAmount int = budgetAmount

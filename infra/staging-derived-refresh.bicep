@@ -5,8 +5,11 @@ param environmentName string = 'ibkrv2stg-env'
 param registryName string
 param keyVaultName string
 param storageAccountName string
-param referenceStorageAccountName string = 'ibkrv115rcc62xxqblay'
-param referenceStorageContainer string = 'analytics-reports'
+// 'database' (since the switch on 17 Oct 2026) builds reference_data.json from v2's own
+// instrument_classifications and risk_free_rates tables. 'blob' reads a published file
+// from reportContainer only: v1.1's analytics-reports copy is no longer read.
+@allowed(['blob', 'database'])
+param referenceDataSource string = 'database'
 param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
@@ -38,7 +41,7 @@ resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' 
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'daily-pipeline', hop: 'conform' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -85,10 +88,10 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${storageAccountName}.blob.${environment().suffixes.storage}' }
             { name: 'AZURE_REPORT_CONTAINER', value: reportContainer }
-            { name: 'REFERENCE_STORAGE_ACCOUNT_URL', value: 'https://${referenceStorageAccountName}.blob.${environment().suffixes.storage}' }
-            { name: 'REFERENCE_STORAGE_CONTAINER', value: referenceStorageContainer }
+            { name: 'REFERENCE_DATA_SOURCE', value: referenceDataSource }
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
             { name: 'ALLOW_UNLICENSED_BENCHMARK', value: 'true' }
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
           ]
           resources: {
             cpu: json('0.5')

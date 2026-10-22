@@ -2,8 +2,9 @@
 // reviewed redaction/retention design before export; never enable allLogs here.
 targetScope = 'resourceGroup'
 param workspaceName string
-param postgresNames array = ['ibkrv2stg-pg-auhecwc4itaoo', 'ibkrv11-pg-5rcc62xxqblay']
-param vaultNames array = ['ibkrv2stg-auhecwc4itaoo', 'ibkrv2flexauhecwc4ita', 'ibkrv11-5rcc62xxqblay']
+// v1.1's Postgres server and vault were deleted on 21 Oct 2026.
+param postgresNames array = ['ibkrv2stg-pg-auhecwc4itaoo']
+param vaultNames array = ['ibkrv2stg-auhecwc4itaoo', 'ibkrv2flexauhecwc4ita']
 
 resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' existing = {
   name: workspaceName

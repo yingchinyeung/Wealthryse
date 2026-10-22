@@ -9,7 +9,7 @@ from typing import Any, Callable, Mapping
 
 from .benchmark_analytics import ComparisonRow, comparison_metrics, portfolio_risk_metrics
 from .crisis_replay import load_crisis_replay
-from .sector_classification import YAHOO_PROVIDER, aggregate_sector_allocation
+from .sector_classification import YAHOO_PROVIDER, aggregate_sector_allocation, has_long_name
 from .util import canonical_json, utc_now_iso
 from .subject_read_contract import ACTIVE_NAV_CURRENCY_SQL, require_ms_hkd_contract, synthetic_exposure
 
@@ -307,7 +307,12 @@ def _holdings(connection, subject_id: str, as_of: str | None, arguments: Mapping
 
 
 def _benchmark(connection, subject_id: str, as_of: str | None, arguments: Mapping[str, Any]) -> AgentToolResult:
+    from .website_benchmarks import website_comparison_version
     effective = _effective_as_of(connection, subject_id, as_of)
+    # Composite website comparisons use the currently approved HKD mapping,
+    # even when a historical NAV cutoff predates that mapping's migration.
+    # Observation cutoff and mapping selection are deliberately separate.
+    composite = subject_id in ('alpha-world-ms', 'alpha-world-t')
     requested = arguments.get("benchmark_id")
     benchmark = connection.execute(
         """
@@ -316,17 +321,19 @@ def _benchmark(connection, subject_id: str, as_of: str | None, arguments: Mappin
         FROM portfolio_benchmark_mapping m
         JOIN benchmark_master b ON b.benchmark_id = m.benchmark_id
         WHERE m.subject_id = %s AND (%s::text IS NULL OR b.benchmark_id = %s)
-          AND b.active = true AND m.effective_from <= %s
-          AND (m.effective_to IS NULL OR m.effective_to >= %s)
+          AND b.active = true
+          AND m.effective_from <= CASE WHEN %s THEN CURRENT_DATE::text ELSE %s END
+          AND (m.effective_to IS NULL OR m.effective_to >= CASE WHEN %s THEN CURRENT_DATE::text ELSE %s END)
         ORDER BY CASE m.mapping_type WHEN 'primary' THEN 0 ELSE 1 END, b.name
         LIMIT 1
         """,
-        (subject_id, requested, requested, effective, effective),
+        (subject_id, requested, requested, composite, effective, composite, effective),
     ).fetchone()
     if benchmark is None:
         raise AgentToolError(404, "benchmark_unavailable", "The requested benchmark is not configured for this account and date.")
     if subject_id in ('alpha-world-ms','alpha-world-t') and benchmark['reporting_currency']!='HKD':
         raise AgentToolError(409,'ms_benchmark_currency_not_ready','MS benchmark comparison has not been qualified in HKD.')
+    comparison_version = website_comparison_version(subject_id, benchmark['reporting_currency'])
     records = connection.execute(
         """
         SELECT observation_date, portfolio_value, benchmark_level,
@@ -339,7 +346,7 @@ def _benchmark(connection, subject_id: str, as_of: str | None, arguments: Mappin
           AND observation_date <= %s
         ORDER BY observation_date
         """,
-        (subject_id, benchmark["benchmark_id"], CALCULATION_VERSION, benchmark['reporting_currency'], effective),
+        (subject_id, benchmark["benchmark_id"], comparison_version, benchmark['reporting_currency'], effective),
     ).fetchall()
     rows = _comparison_rows(records)
     quality = "warn" if benchmark["license_status"] != "approved" else "pass"
@@ -350,6 +357,8 @@ def _benchmark(connection, subject_id: str, as_of: str | None, arguments: Mappin
         quality if rows else "fail",
         {
             "benchmark": dict(benchmark),
+            "reporting_currency": benchmark['reporting_currency'],
+            "mapping_policy": "current-approved" if composite else "as-of-date",
             "metrics": comparison_metrics(rows) if rows else {},
             "series": [
                 {"date": row.observation_date, "portfolio": row.normalized_portfolio, "benchmark": row.normalized_benchmark}
@@ -359,10 +368,10 @@ def _benchmark(connection, subject_id: str, as_of: str | None, arguments: Mappin
         },
         (
             {"table": "portfolio_benchmark_mapping", "subject_id": subject_id, "benchmark_id": benchmark["benchmark_id"]},
-            {"table": "performance_comparison_daily", "subject_id": subject_id, "benchmark_id": benchmark["benchmark_id"], "through": effective, "calculation_version": CALCULATION_VERSION},
+            {"table": "performance_comparison_daily", "subject_id": subject_id, "benchmark_id": benchmark["benchmark_id"], "through": effective, "calculation_version": comparison_version},
         ),
         utc_now_iso(),
-        CALCULATION_VERSION,
+        comparison_version,
     )
 
 
@@ -377,6 +386,17 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         snapshot,metrics,evidence=load_risk_snapshot(portable,effective,tenant_id=tenant)
         try:crisis=load_crisis(portable,snapshot,tenant_id=tenant);crisis_error=None
         except ValueError as error:crisis=None;crisis_error=str(error)
+        from .qualified_agent_risk import t_agent_payload
+        try:
+            qualified = t_agent_payload(connection, tenant_id=tenant, as_of=effective,
+                source_snapshot=snapshot, core_metrics=metrics, crisis=crisis)
+        except ValueError:
+            return AgentToolResult('get_risk_metrics', subject_id, effective, 'fail',
+                {'metrics': {}, 'reporting_currency': 'HKD', 'crisis_replay': None,
+                 'message': 'Exact-date T risk cache needs validated refresh; no stale values substituted.'},
+                ({'table':'risk_analytics_snapshots','subject_id':subject_id,'through':effective},),
+                utc_now_iso(), evidence['version'])
+        metrics = qualified['metrics']
         return AgentToolResult('get_risk_metrics',subject_id,snapshot['data_as_of'],'warn',
             {'metrics':metrics,'risk_free':snapshot['risk']['risk_free'],'analytics_evidence':evidence,
              'reporting_currency':'HKD','crisis_replay':crisis,'crisis_qualification_error':crisis_error},
@@ -390,15 +410,27 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         # receive a raw psycopg connection; workers already use the adapter.
         portable = (PostgresConnection(connection)
                     if type(connection).__module__.startswith('psycopg') else connection)
-        snapshot,metrics,evidence=load_risk_snapshot(portable,effective)
+        tenant=arguments.get('_verified_tenant_id')
+        snapshot,metrics,evidence=load_risk_snapshot(portable,effective,tenant_id=tenant)
         from .alpha_world_ms_crisis import load as load_ms_crisis
         try:
-            crisis=load_ms_crisis(portable,snapshot)
+            crisis=load_ms_crisis(portable,snapshot,tenant_id=tenant,identity_proxy=True)
             crisis_error=None
         except ValueError as error:
             # Missing or inconsistent stress evidence remains unavailable. Never
             # clear the release blocker by falling back to the legacy USD replay.
             crisis=None;crisis_error=str(error)
+        from .qualified_agent_risk import ms_agent_payload
+        try:
+            qualified=ms_agent_payload(connection,tenant_id=tenant,as_of=effective,
+                source_snapshot=snapshot,core_metrics=metrics,crisis=crisis)
+        except ValueError:
+            return AgentToolResult('get_risk_metrics',subject_id,effective,'fail',
+                {'metrics':{},'reporting_currency':'HKD','crisis_replay':None,
+                 'message':'Exact-date MS risk cache needs validated refresh; no stale values substituted.'},
+                ({'table':'risk_analytics_snapshots','subject_id':subject_id,'through':effective},),
+                utc_now_iso(),evidence['version'])
+        metrics=qualified['metrics']
         return AgentToolResult('get_risk_metrics',subject_id,snapshot['data_as_of'],'warn',
             {'metrics':metrics,'risk_free':snapshot['risk']['risk_free'],'analytics_evidence':evidence,
              'reporting_currency':'HKD','crisis_replay':crisis,'crisis_qualification_error':crisis_error},
@@ -426,14 +458,22 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         """,
         (subject_id, mapping["benchmark_id"], CALCULATION_VERSION, effective),
     ).fetchall()
+    from .risk_snapshots import OWN_CURRENCY_RISK_FREE, own_rate_cutoff
+    subject = connection.execute(
+        "SELECT COALESCE(reporting_currency, base_currency) AS currency FROM platform_subjects WHERE subject_id = %s",
+        (subject_id,),
+    ).fetchone()
+    # As the risk snapshots: a won account's own rate once loaded, else the U.S. 3-month Treasury.
+    own_rate = OWN_CURRENCY_RISK_FREE.get(str((subject["currency"] if subject else None) or "USD").upper(), "USD")
     rate = connection.execute(
         """
         SELECT rate_date, series_id, currency, tenor, annual_rate, provider, quality_status
         FROM risk_free_rates
-        WHERE currency = 'USD' AND rate_date <= %s AND quality_status IN ('pass', 'warn')
-        ORDER BY rate_date DESC LIMIT 1
+        WHERE currency IN (%s, 'USD') AND rate_date <= %s AND (currency = 'USD' OR rate_date >= %s)
+          AND quality_status IN ('pass', 'warn')
+        ORDER BY (currency = %s) DESC, rate_date DESC LIMIT 1
         """,
-        (effective,),
+        (own_rate, effective, own_rate_cutoff(str(effective)), own_rate),
     ).fetchone()
     rows = _comparison_rows(records)
     metrics = portfolio_risk_metrics(rows, float(rate["annual_rate"]) if rate else None)
@@ -455,7 +495,7 @@ def _risk(connection, subject_id: str, as_of: str | None, arguments: Mapping[str
         },
         (
             {"table": "performance_comparison_daily", "subject_id": subject_id, "through": effective, "calculation_version": CALCULATION_VERSION},
-            {"table": "risk_free_rates", "currency": "USD", "through": effective},
+            {"table": "risk_free_rates", "currency": rate["currency"] if rate else own_rate, "through": effective},
             {
                 "table": "crisis_replay_daily",
                 "subject_id": subject_id,
@@ -616,7 +656,7 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
         """
         SELECT p.conid, i.symbol, p.market_value_text, p.currency, p.snapshot_date,
                i.listing_exchange, c.sector, c.industry, c.exchange,
-               c.checked_at, c.quality_status, c.license_status
+               c.checked_at, c.quality_status, c.license_status{long_name}
         FROM subject_position_series p
         LEFT JOIN instruments i ON i.conid = p.conid
         LEFT JOIN instrument_classifications c
@@ -624,10 +664,11 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
         WHERE p.subject_id = %s AND p.snapshot_date = %s
           AND COALESCE(NULLIF(p.quantity_text, ''), '0')::numeric <> 0
         ORDER BY ABS(COALESCE(NULLIF(p.market_value_text, ''), '0')::numeric) DESC
-        """,
+        """.format(long_name=", c.long_name" if has_long_name(connection) else ""),
         (YAHOO_PROVIDER, subject_id, position_date),
     ).fetchall()
-    data = aggregate_sector_allocation([dict(row) for row in records])
+    records = [_with_delisted_classification(dict(row)) for row in records]
+    data = aggregate_sector_allocation(records)
     fx_citations = ()
     if records:
         from .db import PostgresConnection
@@ -673,6 +714,22 @@ def _sector_allocation(connection, subject_id: str, as_of: str | None, arguments
     )
 
 
+def _with_delisted_classification(row: dict[str, Any]) -> dict[str, Any]:
+    """A Kiwoom U.S. holding Yahoo stopped quoting after a takeover keeps the name and industry it had while
+    listed (us_istrategy_securities.DELISTED), as its factsheet prints them. Only where Yahoo has no sector."""
+    if str(row.get("sector") or "").strip():
+        return row
+    from .us_istrategy_securities import delisted_classification
+
+    fallback = delisted_classification(row.get("conid"), row.get("symbol"))
+    if fallback is None:
+        return row
+    row = {**row, "sector": fallback["sector"], "industry": fallback["industry"]}
+    if "long_name" in row and not row.get("long_name"):
+        row["long_name"] = fallback["long_name"]
+    return row
+
+
 TOOL_DEFINITIONS: tuple[AgentToolDefinition, ...] = (
     AgentToolDefinition("get_portfolio_summary", "Return account metadata, NAV coverage, latest NAV and position count.", _subject_schema(), _summary),
     AgentToolDefinition("get_performance_series", "Return the validated daily NAV series through an as-of date.", _subject_schema(), _performance),
@@ -714,7 +771,11 @@ def _audit(context: AgentToolContext, tool_name: str, subject_id: str | None, re
     TOOL_AUDIT_LOGGER.info("AGENT_TOOL_AUDIT %s", json.dumps(event, sort_keys=True, separators=(",", ":")))
 
 
-def execute_tool(connection, context: AgentToolContext, tool_name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+def execute_tool(connection, context: AgentToolContext, tool_name: str, arguments: Mapping[str, Any], *,
+                 certified_mode: str | None = None) -> dict[str, Any]:
+    """``certified_mode`` (fallback or on) reads certified figures alongside, as
+    certified_tool_figures says. Only the website analyst passes it: the month-end snapshot
+    builder, the pages and every other caller never do, so their figures cannot change."""
     request_hash = hashlib.sha256(canonical_json(dict(arguments)).encode("utf-8")).hexdigest()
     definition = TOOL_REGISTRY.get(tool_name)
     subject_id = str(arguments.get("subject_id") or "").strip()
@@ -750,6 +811,7 @@ def execute_tool(connection, context: AgentToolContext, tool_name: str, argument
                 require_ms_hkd_contract(connection,tenant_id=context.tenant_id)
             except ValueError as error:
                 raise AgentToolError(409,'ms_hkd_contract_not_ready',str(error)) from error
+            executor_arguments={**arguments,'_verified_tenant_id':context.tenant_id}
         result = definition.executor(connection, subject_id, str(as_of) if as_of else None, executor_arguments)
     except AgentToolError as error:
         _audit(context, tool_name, subject_id, request_hash, "denied" if error.status_code in (401, 403) else "failed", error_code=error.code)
@@ -757,6 +819,10 @@ def execute_tool(connection, context: AgentToolContext, tool_name: str, argument
     except (TypeError, ValueError) as error:
         _audit(context, tool_name, subject_id, request_hash, "failed", error_code="invalid_arguments")
         raise AgentToolError(400, "invalid_arguments", "The request contains invalid argument values.") from error
+    if certified_mode in ("fallback", "on"):
+        from .certified_tool_figures import apply_to_result
+
+        result = apply_to_result(result, tenant_id=context.tenant_id, mode_now=certified_mode)
     payload = result.as_dict()
     response_hash = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
     _audit(context, tool_name, subject_id, request_hash, "success", response_hash=response_hash)

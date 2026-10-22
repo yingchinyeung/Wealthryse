@@ -189,6 +189,11 @@ def assemble_month_end_payload(
                 from .alpha_world_ms_crisis import validate
             validate(crisis,as_of=effective.isoformat(),holdings=sanitized['holdings']['data']['holdings'],
                      nav=sanitized['summary']['data']['latest_nav']['total_text'])
+        elif str(crisis.get('calculation_version') or '').startswith('alpha-world-design-composite-'):
+            from .profiled_crisis import validate as validate_profiled_crisis
+            validate_profiled_crisis(crisis, as_of=effective.isoformat(),
+                                     holdings=sanitized['holdings']['data']['holdings'],
+                                     nav=sanitized['summary']['data']['latest_nav']['total_text'])
         crisis_as_of = date.fromisoformat(str(crisis["holdings_as_of"]))
         if crisis_as_of > effective:
             raise ReportingSnapshotError(
@@ -239,6 +244,15 @@ def assemble_month_end_payload(
             name: result.get("citations", []) for name, result in sanitized.items()
         },
     }
+    design = sanitized.get('report_profile') if subject_id not in ('alpha-world-ms','alpha-world-t') else None
+    if design is not None:
+        from .profiled_composite import analyze as analyze_profiled, ANALYTICS_VERSION
+        evidence_data = design.get('data') or {}
+        payload['report_profile'] = evidence_data.get('report_profile')
+        payload['methodology_identity'] = evidence_data.get('methodology_identity')
+        inception = (payload['report_profile'] or {}).get('inception')
+        _check_hkd_design(payload, label="The composite", analyze=analyze_profiled, version=ANALYTICS_VERSION,
+                          reporting_currency=reporting_currency, inception=inception)
     if subject_id in ('alpha-world-ms','alpha-world-t'):
         if subject_id=='alpha-world-t':
             from .alpha_world_t_analytics import analyze,VERSION,methodology_identity
@@ -247,31 +261,51 @@ def assemble_month_end_payload(
             from .alpha_world_ms_analytics import analyze
             from .alpha_world_ms_hkd import VERSION
         label='T' if subject_id=='alpha-world-t' else 'MS'
-        if reporting_currency.upper() != 'HKD' or payload['period_start'] != '2025-01-20':
-            raise ReportingSnapshotError(label+' requires the approved HKD inception contract')
-        account = (payload['portfolio_summary'] or {}).get('account') or {}
-        nav = (payload['portfolio_summary'] or {}).get('latest_nav') or {}
-        if account.get('base_currency') != 'HKD' or nav.get('currency') != 'HKD':
-            raise ReportingSnapshotError(label+' summary currency differs from the reporting contract')
-        series = (payload['performance'] or {}).get('series') or []
-        if not series or not math.isclose(float(nav['total_text']),float(series[-1]['nav']),rel_tol=1e-12):
-            raise ReportingSnapshotError(label+' summary NAV differs from its full history')
-        if any(row.get('currency') != 'HKD' for row in (payload['holdings'] or {}).get('holdings', [])):
-            raise ReportingSnapshotError(label+' holdings contain another reporting currency')
-        metrics,_,evidence = analyze(payload)
-        stored = (payload['risk'] or {}).get('metrics') or {}
-        for field,value in metrics.items():
-            recorded = stored.get(field)
-            if (recorded is None) != (value is None) or (value is not None and
-                    (not math.isfinite(float(recorded)) or not math.isclose(float(recorded),value,rel_tol=1e-10,abs_tol=1e-12))):
-                raise ReportingSnapshotError(label+' reported metric differs from full HKD history: '+field)
-        payload['formula_version'] = VERSION
-        payload['risk']['analytics_evidence'] = evidence
-        points = {}
-        for row in series:
-            points[row['date'][:7]] = {'date':row['date'],'portfolio':float(row['nav'])}
-        payload['month_end_performance'] = [points[key] for key in sorted(points)]
+        _check_hkd_design(payload, label=label, analyze=analyze, version=VERSION,
+                          reporting_currency=reporting_currency, inception='2025-01-20')
     return payload, quality_status, publication_allowed, tuple(blockers)
+
+
+def _check_hkd_design(payload, *, label, analyze, version, reporting_currency, inception):
+    """MS, T and design composites: recompute every metric from the full HKD history."""
+    if reporting_currency.upper() != 'HKD' or payload['period_start'] != inception:
+        raise ReportingSnapshotError(label+' requires the approved HKD inception contract')
+    account = (payload['portfolio_summary'] or {}).get('account') or {}
+    nav = (payload['portfolio_summary'] or {}).get('latest_nav') or {}
+    if account.get('base_currency') != 'HKD' or nav.get('currency') != 'HKD':
+        raise ReportingSnapshotError(label+' summary currency differs from the reporting contract')
+    series = (payload['performance'] or {}).get('series') or []
+    if not series or not math.isclose(float(nav['total_text']),float(series[-1]['nav']),rel_tol=1e-12):
+        raise ReportingSnapshotError(label+' summary NAV differs from its full history')
+    if any(row.get('currency') != 'HKD' for row in (payload['holdings'] or {}).get('holdings', [])):
+        raise ReportingSnapshotError(label+' holdings contain another reporting currency')
+    metrics,_,evidence = analyze(payload)
+    stored = (payload['risk'] or {}).get('metrics') or {}
+    for field,value in metrics.items():
+        recorded = stored.get(field)
+        if (recorded is None) != (value is None) or (value is not None and
+                (not math.isfinite(float(recorded)) or not math.isclose(float(recorded),value,rel_tol=1e-10,abs_tol=1e-12))):
+            raise ReportingSnapshotError(label+' reported metric differs from full HKD history: '+field)
+    payload['formula_version'] = version
+    payload['risk']['analytics_evidence'] = evidence
+    points = {}
+    for row in series:
+        points[row['date'][:7]] = {'date':row['date'],'portfolio':float(row['nav'])}
+    payload['month_end_performance'] = [points[key] for key in sorted(points)]
+
+
+def _onboarded_without_benchmarks(connection, subject_id: str) -> bool:
+    """A subject that went through new onboarding (broker_onboarding_cases), which asks for no
+    benchmark. Its snapshot is collected with no comparison, or with its one primary benchmark
+    once a benchmark contract is approved, instead of being refused."""
+    try:
+        if connection.execute("SELECT to_regclass('public.broker_onboarding_cases')").fetchone()[0] is None:
+            return False
+    except Exception:  # SQLite: no to_regclass, and no new onboarding
+        return False
+    return connection.execute(
+        "SELECT 1 FROM broker_onboarding_cases WHERE target_subject_id = ? AND source_kind = 'broker_account' LIMIT 1",
+        (subject_id,)).fetchone() is not None
 
 
 def _collect_tool_results(
@@ -323,6 +357,16 @@ def _collect_tool_results(
         results['monthly_reporting']=build_monthly_reporting_analytics(connection,
             subject_id=subject_id,period_end=period_end,reporting_currency=reporting_currency)
         return results
+    if reporting_currency == 'HKD':
+        from .profiled_composite import is_profiled
+        if is_profiled(connection, subject_id, tenant_id=tenant_id):
+            # A composite in the Alpha World MS or T design: T's reporting
+            # inputs from its own approved definition, never the USD tools.
+            from .profiled_reporting import load as load_profiled, tool_results
+            try:
+                return tool_results(load_profiled(connection, subject_id, period_end, tenant_id=tenant_id))
+            except ValueError as error:
+                raise ReportingSnapshotError(str(error)) from error
     mappings = connection.execute(
         """
         SELECT benchmark_id, mapping_type
@@ -338,6 +382,10 @@ def _collect_tool_results(
     if len(benchmark_ids) < 2:
         if subject_id == "U16088571":
             benchmark_ids = ["GSPC", "IXIC"]
+        elif _onboarded_without_benchmarks(connection, subject_id):
+            # New onboarding asks for no benchmark: none, or the one primary benchmark approved for the
+            # account (benchmark contract), is collected below; a missing secondary is not configured.
+            pass
         else:
             raise ReportingSnapshotError(
                 "At least one primary and one secondary benchmark must be configured"
@@ -355,24 +403,36 @@ def _collect_tool_results(
         "holdings": execute_tool(
             connection, context, "get_holdings", {**common, "limit": 200}
         ),
-        "primary_benchmark": execute_tool(
-            connection,
-            context,
-            "compare_with_benchmarks",
-            {**common, "benchmark_id": benchmark_ids[0]},
-        ),
-        "secondary_benchmark": execute_tool(
-            connection,
-            context,
-            "compare_with_benchmarks",
-            {**common, "benchmark_id": benchmark_ids[1]},
-        ),
         "risk": execute_tool(connection, context, "get_risk_metrics", common),
         "freshness": execute_tool(connection, context, "get_data_freshness", common),
         "sector_allocation": execute_tool(
             connection, context, "get_sector_allocation", common
         ),
     }
+    if not benchmark_ids:
+        for name in ("primary_benchmark", "secondary_benchmark"):
+            results[name] = {
+                "as_of": results["summary"].get("as_of"), "quality_status": "warn", "citations": [],
+                "data": {"available": False, "series": [], "metrics": {}, "publication_allowed": False,
+                         "reason": "No benchmark is configured: a new-onboarding account has no benchmark step"},
+            }
+        # Risk metrics are computed on the benchmark comparison, so with none they are not
+        # available rather than failed; the factsheet of such an account prints none.
+        risk = dict(results["risk"])
+        if risk.get("quality_status") == "fail" and (risk.get("data") or {}).get("benchmark_id") is None:
+            risk["quality_status"] = "warn"
+            risk["data"] = {**risk["data"], "reason": "Risk metrics need a benchmark comparison; none is configured"}
+            results["risk"] = risk
+    else:
+        for name, benchmark_id in zip(("primary_benchmark", "secondary_benchmark"), benchmark_ids):
+            results[name] = execute_tool(
+                connection, context, "compare_with_benchmarks", {**common, "benchmark_id": benchmark_id})
+        if len(benchmark_ids) == 1:
+            results["secondary_benchmark"] = {
+                "as_of": results["summary"].get("as_of"), "quality_status": "warn", "citations": [],
+                "data": {"available": False, "series": [], "metrics": {}, "publication_allowed": False,
+                         "reason": "No secondary benchmark is configured: the account has one primary benchmark"},
+            }
     for index, benchmark_id in enumerate(benchmark_ids[2:], start=1):
         results[f"additional_benchmark_{index}"] = execute_tool(
             connection,
@@ -390,7 +450,7 @@ def _collect_tool_results(
     return normalize_collected_report_holdings(connection, subject_id, reporting_currency, results)
 
 
-def freeze_month_end_snapshot(
+def build_month_end_payload(
     connection,
     *,
     tenant_id: str,
@@ -398,8 +458,15 @@ def freeze_month_end_snapshot(
     period_start: str,
     period_end: str,
     reporting_currency: str,
-    reject_quality_fail: bool = False,
-) -> ReportingSnapshotResult:
+    environ: Mapping[str, str] | None = None,
+    out=None,
+) -> tuple[dict[str, Any], str, bool, tuple[str, ...], dict[str, Any] | None]:
+    """The month-end payload a freeze stores, without storing it: collected, assembled, and with
+    the certified figures applied as MONTHLY_REPORTS_CERTIFIED says (certified_reports; off, the
+    default, leaves it exactly as assembled and reads nothing). Returns the payload, its quality,
+    publication_allowed, the blockers and the certified comparison (None when off)."""
+    from .certified_reports import apply_certified
+
     tool_results = _collect_tool_results(
         connection,
         tenant_id=tenant_id,
@@ -413,6 +480,29 @@ def freeze_month_end_snapshot(
         period_end=period_end,
         reporting_currency=reporting_currency,
         tool_results=tool_results,
+    )
+    comparison = apply_certified(connection, tenant_id=tenant_id, subject_id=subject_id, payload=payload,
+                                 environ=environ, out=out)
+    return payload, quality, publication_allowed, blockers, comparison
+
+
+def freeze_month_end_snapshot(
+    connection,
+    *,
+    tenant_id: str,
+    subject_id: str,
+    period_start: str,
+    period_end: str,
+    reporting_currency: str,
+    reject_quality_fail: bool = False,
+) -> ReportingSnapshotResult:
+    payload, quality, publication_allowed, blockers, _ = build_month_end_payload(
+        connection,
+        tenant_id=tenant_id,
+        subject_id=subject_id,
+        period_start=period_start,
+        period_end=period_end,
+        reporting_currency=reporting_currency,
     )
     if reject_quality_fail and (
         quality == "fail" or not (payload.get("monthly_reporting") or {}).get("available")

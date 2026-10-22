@@ -8,6 +8,33 @@ param identityResourceId string
 param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
 param riskFreeStartDate string = '2025-01-20'
+// S2 raw market-data capture, on since 18 Oct 2026: the default matches the live job.
+// The job's identity (ingestionIdentity in staging.bicep) holds Storage Blob Data
+// Contributor on bronze-market-data. Empty switches capture off and drops these settings.
+param rawMarketDataContainer string = 'bronze-market-data'
+param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
+var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [
+  { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
+  { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
+  { name: 'AZURE_CLIENT_ID', value: jobIdentity.properties.clientId }
+]
+
+// Korea's won risk-free rate (Bank of Korea ECOS, CD 91-day). Empty (the default) keeps the
+// job exactly as it is; set to the Key Vault secret holding the ECOS API key to load it too.
+param bokEcosApiKeySecretName string = ''
+var bokEcosSecrets = empty(bokEcosApiKeySecretName) ? [] : [
+  {
+    name: 'bok-ecos-api-key'
+    keyVaultUrl: '${vault.properties.vaultUri}secrets/${bokEcosApiKeySecretName}'
+    identity: jobIdentity.id
+  }
+]
+var bokEcosEnv = empty(bokEcosApiKeySecretName) ? [] : [
+  { name: 'BOK_ECOS_API_KEY', secretRef: 'bok-ecos-api-key' }
+]
+// Without an ECOS key: load the OECD's monthly Korea CD rate from FRED (no key needed).
+param koreaCdMonthly bool = false
+var koreaCdEnv = concat(bokEcosEnv, koreaCdMonthly ? [ { name: 'KOREA_CD_MONTHLY', value: 'true' } ] : [])
 
 var tags = {
   application: 'ibkr-portfolio-platform'
@@ -35,7 +62,7 @@ resource jobIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-3
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'daily-pipeline', hop: 'ingest+conform' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -60,13 +87,13 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           identity: jobIdentity.id
         }
       ]
-      secrets: [
+      secrets: concat([
         {
           name: 'database-url'
           keyVaultUrl: '${vault.properties.vaultUri}secrets/database-app-url'
           identity: jobIdentity.id
         }
-      ]
+      ], bokEcosSecrets)
     }
     template: {
       containers: [
@@ -75,12 +102,15 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           image: '${registry.properties.loginServer}/ibkr-platform@${imageDigest}'
           command: ['python']
           args: ['scripts/refresh_staging_risk_free.py']
-          env: [
+          env: concat(concat([
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'RISK_FREE_START_DATE', value: riskFreeStartDate }
             { name: 'DEPLOYMENT_ENVIRONMENT', value: 'staging' }
-          ]
+            // The app login cannot create tables, so the job must not try migrations
+            // (live since 18 Oct 2026, as on the institutional daily job).
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
+          ], rawMarketDataEnv), koreaCdEnv)
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'

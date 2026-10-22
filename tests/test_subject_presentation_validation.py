@@ -42,7 +42,7 @@ class SubjectPresentationGateTests(unittest.TestCase):
         return {'status': 'passed', 'financial_charts_verified': 6, 'risk_metrics_verified': 7,
                 'snapshot_sha256': hashlib.sha256(self.snapshot.read_bytes()).hexdigest(),
                 'generic_validation': {'slides': 20, 'performance_axis': {}},
-                'version': 'alpha-world-ms-presentation-hkd-hibor-v1'}
+                'version': 'alpha-world-ms-presentation-hkd-hibor-v2'}
 
     def run_gate(self, subject_id='alpha-world-ms', strategy='iStrategy: Alpha World MS'):
         return gate.validate_subject_presentation(self.output, self.snapshot,
@@ -61,8 +61,9 @@ class SubjectPresentationGateTests(unittest.TestCase):
         self.assertNotEqual(presentation_content_contract_version('alpha-world-t'), MS_VERSION)
         self.assertEqual(len(presentation_content_requirements('alpha-world-t')), 6)
 
-    def test_both_workers_share_exact_output_gate(self):
-        self.assertIs(monthly.validate_subject_presentation, gate.validate_subject_presentation)
+    def test_the_historical_worker_uses_the_exact_output_gate(self):
+        # The month-end package job no longer builds decks, so it has no deck gate.
+        self.assertFalse(hasattr(monthly, 'validate_subject_presentation'))
         self.assertIs(historical.validate_subject_presentation, gate.validate_subject_presentation)
 
     def test_ms_receipt_binds_financial_audit_snapshot_output_and_contract(self):

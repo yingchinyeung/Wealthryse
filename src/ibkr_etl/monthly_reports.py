@@ -26,6 +26,33 @@ REPORT_TYPES = {
     },
 }
 
+# What a month's package must hold. Per-account decks are no longer built:
+# past decks stay supported above so they can still be downloaded, but a
+# month is complete with its factsheet alone.
+REQUIRED_REPORT_TYPES = frozenset({"factsheet"})
+
+
+# Kiwoom subjects are stored under their account number; readers download them by market instead.
+KIWOOM_DOWNLOAD_PREFIXES = {"KRW": "Korea", "USD": "US"}
+
+
+def download_prefix(connection: Any, tenant_id: str, subject_id: str) -> str | None:
+    """The reader-facing name a subject's downloads start with, or None to keep its own id.
+
+    A Kiwoom account downloads as "Korea_Factsheet_<date>.pdf" (KRW) or "US_Factsheet_<date>.pdf" (USD),
+    so the account number stays out of the file name. The subject is found by broker prefix and reporting
+    currency, so no account number is in this code either. Reporting currency first: a Kiwoom U.S.
+    account is a Korean account whose broker record may say KRW, as kiwoom_us_account.is_usd_account knows.
+    """
+    if not subject_id.startswith("KIWOOM-"):
+        return None
+    row = connection.execute(
+        "SELECT COALESCE(reporting_currency, base_currency) AS currency FROM platform_subjects "
+        "WHERE tenant_id = %s AND subject_id = %s",
+        (tenant_id, subject_id),
+    ).fetchone()
+    return KIWOOM_DOWNLOAD_PREFIXES.get(str(row["currency"] or "").upper()) if row is not None else None
+
 
 def validate_period_end(value: str) -> str:
     try:
@@ -197,13 +224,15 @@ def build_monthly_report_catalog(
             key=lambda item: item["report_type"],
         )
         available_types = {item["report_type"] for item in artifacts}
-        ready = available_types == set(REPORT_TYPES)
+        ready = REQUIRED_REPORT_TYPES <= available_types
         review_artifacts = sorted(
             review_artifacts_by_snapshot.get(snapshot_id, []),
             key=lambda item: item["report_type"],
         )
         replacement_pending = any(item['snapshot_id'] != snapshot_id for item in artifacts)
-        review_ready = (not ready or replacement_pending) and {item["report_type"] for item in review_artifacts} == set(REPORT_TYPES)
+        review_ready = (not ready or replacement_pending) and REQUIRED_REPORT_TYPES <= {
+            item["report_type"] for item in review_artifacts
+        }
         runs = runs_by_snapshot.get(snapshot_id, {})
         partially_released = bool(artifacts) and not ready
         catalog.append(

@@ -1,0 +1,37 @@
+# Starts everything on ibkrv2stg-ibkr-gateway, in this order:
+#   1. fetch-secrets.sh: Key Vault secrets to tmpfs (/run/ibkr-secrets) and
+#      the registry login, with the VM's user-assigned managed identity.
+#   2. imds-guard.sh: DOCKER-USER rule so no container can reach the
+#      instance metadata endpoint (also applied before Docker itself starts,
+#      by ibkr-imds-guard.service; re-applied here, it is idempotent).
+#   3. docker compose up: IB Gateway and the live collector.
+# Stopping the unit removes the containers and wipes the secret files.
+[Unit]
+Description=IBKR live data: fetch secrets, guard IMDS, start IB Gateway and the live collector
+Wants=network-online.target
+After=network-online.target docker.service ibkr-imds-guard.service
+Requires=docker.service ibkr-imds-guard.service
+# Restart with Docker so the containers come back after a Docker upgrade.
+PartOf=docker.service
+StartLimitIntervalSec=1h
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+EnvironmentFile=/etc/ibkr-live/ibkr-live.env
+Environment=DOCKER_CONFIG=/run/ibkr-docker
+ExecStartPre=/usr/bin/install -d -m 0750 -o 10001 -g 10001 /run/ibkr-live
+ExecStartPre=/opt/ibkr-live/fetch-secrets.sh
+ExecStartPre=/opt/ibkr-live/imds-guard.sh
+ExecStart=/usr/bin/docker compose --project-directory /opt/ibkr-live --env-file /etc/ibkr-live/ibkr-live.env -f /opt/ibkr-live/docker-compose.yml up --detach --remove-orphans
+ExecStop=/usr/bin/docker compose --project-directory /opt/ibkr-live --env-file /etc/ibkr-live/ibkr-live.env -f /opt/ibkr-live/docker-compose.yml down
+ExecStopPost=/usr/bin/rm -rf /run/ibkr-secrets /run/ibkr-docker
+# Key Vault or registry access can lag behind new role assignments.
+Restart=on-failure
+RestartSec=2min
+TimeoutStartSec=30min
+
+[Install]
+WantedBy=multi-user.target

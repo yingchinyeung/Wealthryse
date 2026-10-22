@@ -1,0 +1,347 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.fx_transactions_history
+name: fx_transactions_history
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Every version of each silver.fx_transactions row: what IBKR reported, when it happened (valid_date)
+    and when we learned it (recorded_from until recorded_to). A past figure can be rebuilt as it was published,
+    and a correction shows as a new version with the time it arrived (review item U8).'
+  usage: silver.fx_transactions_as_known(at) returns silver.fx_transactions as it stood at that moment, with the
+    table's own columns. To list what IBKR changed since a figure was published, select versions whose recorded_from
+    is after its as_of_at. Readers of today's rows keep reading silver.fx_transactions.
+  limitations: Empty and unused until migrations/postgres/074_silver_history.sql has run and
+    recording is on (public.silver_history_settings). Written only by the record_version trigger on silver.fx_transactions
+    and the owner's backfill; the jobs' logins only read it, and it refuses edits other than closing a version.
+    Isolated by account like the table. Versions from before the switch-on come from the backfill (v2's raw statements,
+    and account-sync's daily copies before the switch), recorded when those loads ran.
+tags:
+- silver
+- ibkr
+schema:
+- name: fx_transactions_history
+  physicalName: silver.fx_transactions_history
+  physicalType: table
+  logicalType: object
+  description: Every version of silver.fx_transactions rows (review item U8). Written only by the record_version
+    trigger while recording is on, and by the owner's backfill.
+  properties:
+  - name: version_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: true
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Identifies the version.
+  - name: valid_date
+    physicalType: date
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'When it happened: the row''s report_date as a date (NULL when that is not a valid yyyy-MM-dd date).'
+  - name: recorded_from
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: 'When this version reached silver: the loading transaction''s start time. For versions the backfill
+      wrote, the time the real load ran.'
+  - name: recorded_to
+    physicalType: timestamp with time zone
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: 'When a newer version replaced it, or the row was removed. NULL: the current version.'
+  - name: opened_by
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: first (a new row), restated (a changed row), or baseline (a row the backfill could not explain
+      from the kept raw files; known from the earliest time it can be shown).
+    quality:
+    - name: opened_by_is_known
+      description: opened_by is one of first, restated, baseline.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_transactions_history WHERE opened_by IS NOT NULL AND opened_by NOT IN
+        ('first', 'restated', 'baseline')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: closed_by
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: restated, merged (the FX step), withdrawn (IBKR stopped reporting it; an approved step) or deleted.
+      NULL while current.
+    quality:
+    - name: closed_by_is_known
+      description: closed_by is one of restated, merged, withdrawn, deleted.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_transactions_history WHERE closed_by IS NOT NULL AND closed_by NOT IN
+        ('restated', 'merged', 'withdrawn', 'deleted')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: recorded_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The ingestion run that brought this version, which names the raw statement file and its sha256
+      (for account-sync copies, the import run).
+  - name: lineage_run_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The job run, when the writing job records lineage (review item U4).
+  - name: opened_note
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Why an approved step or the backfill opened this version (the session's silver_history.note).
+  - name: closed_note
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Why an approved step or the backfill closed this version (the session's silver_history.note).
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: 'IBKR account number. Restricted: never shown or logged in full.'
+  - name: source_key
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Stable key of the statement row (parser._source_key).
+  - name: event_datetime
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: dateTime as IBKR sends it (not normalised).
+  - name: activity_description
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR activity description.
+  - name: model_code
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR model code.
+  - name: report_date
+    physicalType: text
+    logicalType: date
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    description: Report date of the statement row.
+  - name: functional_currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The account's functional currency.
+  - name: fx_currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency bought or sold.
+  - name: quantity_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Quantity of fx_currency as decimal text.
+  - name: proceeds_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Proceeds in the functional currency as decimal text.
+  - name: cost_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Cost in the functional currency as decimal text.
+  - name: realized_pnl_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Realised P&L (realizedPL) as decimal text.
+  - name: row_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows.
+  - name: last_seen_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ingestion run that last wrote the row (ingestion_runs.run_id).
+  dataGranularityDescription: One row per version of a silver.fx_transactions row, identified by version_id. At
+    most one current version (recorded_to NULL) per account_id, source_key.
+  quality:
+  - name: one_current_version_per_key
+    description: At most one current version per account_id, source_key.
+    type: sql
+    query: SELECT COUNT(*) FROM (SELECT 1 FROM silver.fx_transactions_history WHERE recorded_to IS NULL GROUP BY
+      account_id, source_key HAVING COUNT(*) > 1) d
+    mustBe: 0
+    severity: error
+    dimension: uniqueness
+  - name: known_until_after_known_from
+    description: A version ends at or after it starts, and says why exactly when it has ended.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.fx_transactions_history WHERE recorded_to < recorded_from OR (recorded_to
+      IS NULL) <> (closed_by IS NULL)
+    mustBe: 0
+    severity: error
+    dimension: consistency
+  - name: versions_do_not_overlap
+    description: No version of a key starts before the one before it ended.
+    type: sql
+    query: SELECT COUNT(*) FROM (SELECT recorded_from, lag(recorded_to) OVER w AS before_to, lag(version_id) OVER
+      w AS before FROM silver.fx_transactions_history WINDOW w AS (PARTITION BY account_id, source_key ORDER BY
+      recorded_from, version_id)) d WHERE before IS NOT NULL AND (before_to IS NULL OR recorded_from < before_to)
+    mustBe: 0
+    severity: error
+    dimension: consistency
+  - name: current_versions_equal_the_table
+    description: While recording is on, silver.fx_transactions equals its current versions row for row, apart from
+      last_seen_run_id (the run that last saw the row).
+    type: sql
+    query: SELECT COUNT(*) FROM ((SELECT account_id, source_key, event_datetime, activity_description, model_code,
+      report_date, functional_currency, fx_currency, quantity_text, proceeds_text, cost_text, realized_pnl_text,
+      row_sha256 FROM silver.fx_transactions EXCEPT ALL SELECT account_id, source_key, event_datetime, activity_description,
+      model_code, report_date, functional_currency, fx_currency, quantity_text, proceeds_text, cost_text, realized_pnl_text,
+      row_sha256 FROM silver.fx_transactions_history WHERE recorded_to IS NULL) UNION ALL (SELECT account_id, source_key,
+      event_datetime, activity_description, model_code, report_date, functional_currency, fx_currency, quantity_text,
+      proceeds_text, cost_text, realized_pnl_text, row_sha256 FROM silver.fx_transactions_history WHERE recorded_to
+      IS NULL EXCEPT ALL SELECT account_id, source_key, event_datetime, activity_description, model_code, report_date,
+      functional_currency, fx_currency, quantity_text, proceeds_text, cost_text, realized_pnl_text, row_sha256 FROM
+      silver.fx_transactions)) d WHERE silver.history_recording()
+    mustBe: 0
+    severity: error
+    dimension: consistency
+  - name: removals_carry_a_note
+    description: A version closed as deleted, merged or withdrawn carries the closing note of the approved step
+      that removed the row.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.fx_transactions_history WHERE closed_by IN ('deleted', 'merged', 'withdrawn')
+      AND closed_note IS NULL
+    mustBe: 0
+    severity: warning
+    dimension: completeness
+  - name: account_in_accounts
+    description: Every version's account is in silver.accounts. A version of an unknown account is invisible to
+      every tenant under the account_isolation policy, so run this with a role that bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.fx_transactions_history h WHERE NOT EXISTS (SELECT 1 FROM silver.accounts
+      a WHERE a.account_id = h.account_id)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Every version of silver.fx_transactions rows, with when it happened and when we learned it (review item
+    U8). Written only by the record_version trigger and the owner's backfill.
+- property: consumers
+  value:
+  - ibkr_etl.silver_history
+contractCreatedTs: '2026-10-18T00:00:00Z'

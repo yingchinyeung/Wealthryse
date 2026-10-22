@@ -186,6 +186,7 @@ def validate(
     expected_summary_table_rows: dict[int, dict[str, str]] | None = None,
     expected_slide_text: dict[int, list[str]] | None = None,
     ms_hkd: bool = False,
+    composite_design: bool = False,
 ) -> dict[str, object]:
     if ms_hkd and _identity(expected_strategy or "") != _identity("iStrategy: Alpha World MS"):
         raise RuntimeError("MS HKD content validation requires the Alpha World MS identity")
@@ -252,7 +253,8 @@ def validate(
                 raise RuntimeError(
                     "Presentation contains a strategy name from another account"
                 )
-        for required_title in _required_page_titles(ms_hkd=ms_hkd):
+        # A composite in the Alpha World MS or T design keeps MS's absolute-return heading.
+        for required_title in _required_page_titles(ms_hkd=ms_hkd or composite_design):
             if required_title not in text:
                 raise RuntimeError(
                     f"Presentation is missing approved v23 page {required_title!r}"
@@ -283,7 +285,7 @@ def validate(
             else {}
         )
     largest_detractor = str(
-        expected_summary_table_rows.get(9, {}).get("Largest detractor", "N/A")
+        (expected_summary_table_rows or {}).get(9, {}).get("Largest detractor", "N/A")
     )
     platform_native_evidence = validate_platform_native_evidence(
         path,

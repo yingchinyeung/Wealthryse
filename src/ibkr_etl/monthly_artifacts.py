@@ -7,7 +7,7 @@ import math
 import random
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -253,7 +253,6 @@ def _factsheet_classification(
         "software",
         "software-infrastructure",
         "software-application",
-        "electronic gaming and multimedia",
         "information technology services",
         "packaged software",
         "internet software and services",
@@ -294,8 +293,11 @@ def _factsheet_classification(
         return "United States", "Industrials", "Capital Goods"
     if key == "aerospace and defense":
         return "United States", "Industrials", "Aerospace & Defense"
+    # Video-game publishers sit in Communication Services (Media &
+    # Entertainment) under GICS, as in the provider data the deck uses.
     if key in {
         "entertainment",
+        "electronic gaming and multimedia",
         "internet content and information",
         "broadcasting",
         "advertising agencies",
@@ -337,6 +339,8 @@ def _factsheet_classification(
 
 
 def _company_name(holding: dict[str, Any]) -> str:
+    if holding.get("english_name"):
+        return str(holding["english_name"])
     symbol = str(holding.get("symbol") or "").upper()
     if symbol in FACTSHEET_COMPANY_NAMES:
         return FACTSHEET_COMPANY_NAMES[symbol]
@@ -350,6 +354,8 @@ def _specific_region(
 
     if holding.get("composite_sleeve"):
         return "Multi-asset"
+    if holding.get("factsheet_region"):
+        return str(holding["factsheet_region"])
 
     # USD-valued report snapshots retain native currency as listing evidence.
     # Reporting currency must not relabel Hong Kong or Taiwan holdings as US.
@@ -559,11 +565,14 @@ def _trailing_twelve_month_return(
         target = end.replace(year=end.year - 1)
     except ValueError:
         target = end.replace(year=end.year - 1, day=28)
-    eligible = [row for row in normalized_nav if date.fromisoformat(row["date"]) >= target]
-    if not eligible or date.fromisoformat(normalized_nav[0]["date"]) > target:
+    # The window starts at the last close on or before the same day a year
+    # earlier (a month-end that fell on a weekend or holiday uses the prior
+    # close), matching the month-end rows in the factsheet's own NAV table.
+    eligible = [row for row in normalized_nav if date.fromisoformat(row["date"]) <= target]
+    if not eligible:
         return None
     # Use the flow-adjusted index so deposits and withdrawals are not returns.
-    start_value = float(eligible[0]["value"])
+    start_value = float(eligible[-1]["value"])
     end_value = float(normalized_nav[-1]["value"])
     return end_value / start_value - 1.0
 
@@ -661,7 +670,19 @@ def _factsheet_sector_rows(
     return tuple(rows)
 
 
-def factsheet_inputs(snapshot: dict[str, Any]) -> FactsheetInputs:
+def factsheet_inputs(
+    snapshot: dict[str, Any], *, reporting_currencies: Iterable[str] | None = None,
+    securities: str | None = None,
+) -> FactsheetInputs:
+    """The validated values every account-design factsheet prints.
+
+    ``reporting_currencies`` lets a design spec that is qualified for other
+    currencies use the same builder; left out, the approved rule applies
+    (HKD for Alpha World MS, USD for every other subject).
+    ``securities="us_istrategy"`` prints every holding with Yahoo's English
+    name, "United States" and the U.S. iStrategy sectors (us_istrategy_securities),
+    except in a synthetic preview snapshot, whose made-up tickers Yahoo cannot know.
+    """
     required = {
         "period_end",
         "data_as_of",
@@ -677,9 +698,13 @@ def factsheet_inputs(snapshot: dict[str, Any]) -> FactsheetInputs:
     if missing:
         raise MonthlyArtifactError(f"Snapshot is missing: {', '.join(missing)}")
     subject_id = str(snapshot["subject_id"] or "").strip()
-    expected_currency = 'HKD' if subject_id == 'alpha-world-ms' else 'USD'
-    if not subject_id or snapshot["reporting_currency"] != expected_currency:
-        raise MonthlyArtifactError('Factsheet renderer requires a subject id and ' + expected_currency + ' reporting')
+    allowed_currencies = (
+        tuple(reporting_currencies) if reporting_currencies is not None
+        else ('HKD',) if subject_id == 'alpha-world-ms' else ('USD',)
+    )
+    if not subject_id or snapshot["reporting_currency"] not in allowed_currencies:
+        raise MonthlyArtifactError(
+            'Factsheet renderer requires a subject id and ' + ' or '.join(allowed_currencies) + ' reporting')
     performance_series = list(snapshot["performance"].get("series") or [])
     history_start_date = str(
         snapshot.get("period_start")
@@ -710,6 +735,33 @@ def factsheet_inputs(snapshot: dict[str, Any]) -> FactsheetInputs:
         snapshot["sector_allocation"].get("classification_basis")
         == "composite sleeve type"
     )
+    # KRX holdings (Kiwoom) carry Korean names: print Yahoo's English name and map Yahoo's
+    # industry to the Korea iStrategy sectors, and stop on a code that has neither.
+    from .korea_securities import REGION as KOREA, KoreaSecurityError, is_krx, lookup as korea_lookup
+    for holding in holdings:
+        if not is_composite and is_krx(holding):
+            try:
+                name, sector, sub_sector = korea_lookup(
+                    holding, classifications.get(str(holding.get("conid") or "")))
+            except KoreaSecurityError as error:
+                raise MonthlyArtifactError(str(error)) from error
+            holding["english_name"] = name
+            classifications[str(holding.get("conid") or "")] = {
+                "symbol": holding.get("symbol"), "region": KOREA, "sector": sector, "sub_sector": sub_sector}
+    if securities == "us_istrategy" and not is_composite and not snapshot.get("synthetic_data"):
+        from .us_istrategy_securities import REGION as UNITED_STATES, UsIstrategySecurityError, lookup as us_lookup
+        for holding in holdings:
+            try:
+                name, sector, sub_sector = us_lookup(
+                    holding, classifications.get(str(holding.get("conid") or "")))
+            except UsIstrategySecurityError as error:
+                raise MonthlyArtifactError(str(error)) from error
+            holding["english_name"] = name
+            holding["factsheet_region"] = UNITED_STATES
+            classifications[str(holding.get("conid") or "")] = {
+                "symbol": holding.get("symbol"), "region": UNITED_STATES, "sector": sector, "sub_sector": sub_sector}
+    elif securities is not None and securities != "us_istrategy":
+        raise MonthlyArtifactError(f"Unknown factsheet securities: {securities}")
     if is_composite:
         for holding in holdings:
             component_type = str(holding.get("asset_category") or "").lower()
@@ -899,6 +951,41 @@ def _draw_table(
             cursor += width
 
 
+FACTSHEET_HISTORY_MONTHS_SHOWN = 36
+
+
+def _history_display(inputs: FactsheetInputs) -> tuple[str, list[list[str]]]:
+    """The Historical Performance heading and body rows printed on page one.
+
+    Up to 36 month-ends every row is shown. A longer history keeps its
+    inception row, then a "..." row, then the latest 36 month-ends; their
+    cumulative figures still run from inception.
+    """
+    def row(entry: dict[str, Any]) -> list[str]:
+        return [
+            entry["date"],
+            f"{entry['normalized_nav']:.2f}",
+            "-" if entry["monthly_return"] is None else _percent(entry["monthly_return"]),
+            "-" if entry["monthly_return"] is None else _percent(entry["cumulative_return"]),
+        ]
+
+    inception, months = inputs.history[0], inputs.history[1:]
+    end = _display_date(inputs.period_end, short=True)
+    if len(months) <= FACTSHEET_HISTORY_MONTHS_SHOWN:
+        return (
+            f"Historical Performance from {_display_date(inputs.history_start_date, short=True)} to {end}",
+            [row(entry) for entry in inputs.history],
+        )
+    return (
+        f"Historical Performance, last {FACTSHEET_HISTORY_MONTHS_SHOWN} months to {end}",
+        [
+            [f"Inception {_display_date(inception['date'], short=True)}", f"{inception['normalized_nav']:.2f}", "-", "-"],
+            ["...", "", "", ""],
+            *(row(entry) for entry in months[-FACTSHEET_HISTORY_MONTHS_SHOWN:]),
+        ],
+    )
+
+
 def _historical_performance_geometry(body_rows: int) -> tuple[float, float, float]:
     """Keep the growing history table bottom-aligned and expand it upward."""
     if body_rows < 1:
@@ -994,31 +1081,18 @@ def _draw_factsheet_page_one(
         bold_last_row=True,
     )
 
-    body_rows = len(inputs.history)
+    history_heading, history_body = _history_display(inputs)
     history_heading_y, history_table_top, body_height = _historical_performance_geometry(
-        body_rows
+        len(history_body)
     )
     c.setFont("Helvetica-Bold", 7.8)
-    c.drawString(
-        27,
-        history_heading_y,
-        f"Historical Performance from {_display_date(inputs.history_start_date, short=True)} to {_display_date(inputs.period_end, short=True)}",
-    )
+    c.drawString(27, history_heading_y, history_heading)
     history_rows = [[
         "DATE",
         "NORMALIZED NAV",
         "PERFORMANCE VS\nPREVIOUS MONTH",
         "CUMULATIVE PERFORMANCE\nFR INITIAL DATE",
-    ]]
-    for row in inputs.history:
-        history_rows.append(
-            [
-                row["date"],
-                f"{row['normalized_nav']:.2f}",
-                "-" if row["monthly_return"] is None else _percent(row["monthly_return"]),
-                "-" if row["monthly_return"] is None else _percent(row["cumulative_return"]),
-            ]
-        )
+    ], *history_body]
     _draw_table(
         c,
         x=27,
@@ -1049,6 +1123,53 @@ def _draw_factsheet_page_one(
     )
 
 
+def _account_chart_month_ticks(start: date, end: date) -> tuple[date, ...]:
+    """First-of-month ticks after ``start``: every odd month, thinned for long histories.
+
+    Up to three years keeps the approved Jan/Mar/May... cadence. Longer
+    histories step to Jan/Jul, then to January only, so labels stay apart.
+    """
+    month_span = (end.year - start.year) * 12 + end.month - start.month
+    month_step = 2 if month_span <= 36 else 6 if month_span <= 72 else 12
+    # Zero-based month index; January is index 0, so odd months are even indices.
+    index = start.year * 12 + start.month - 1
+    index += (-index) % month_step
+    if date(index // 12, index % 12 + 1, 1) <= start:
+        index += month_step
+    ticks: list[date] = []
+    while (tick := date(index // 12, index % 12 + 1, 1)) <= end:
+        ticks.append(tick)
+        index += month_step
+    return tuple(ticks)
+
+
+def _account_chart_date_labels(start: date, end: date) -> tuple[tuple[date, str], ...]:
+    """The account chart's dated gridlines and their labels.
+
+    The odd-month cadence leaves a history of a few weeks or months with one
+    label or none (Korea iStrategy's March and April 2025 factsheets, 20 October
+    2026). Such a history steps to every month, then to every Monday, so its
+    bottom axis is always dated.
+    """
+    ticks = _account_chart_month_ticks(start, end)
+    if len(ticks) < 2:
+        monthly = []
+        index = start.year * 12 + start.month  # the first of the month after start
+        while (tick := date(index // 12, index % 12 + 1, 1)) <= end:
+            monthly.append(tick)
+            index += 1
+        ticks = tuple(monthly)
+    if len(ticks) >= 2:
+        return tuple((tick, str(tick.year) if tick.month == 1 else tick.strftime("%b")) for tick in ticks)
+    mondays = []
+    day = start + timedelta(days=7 - start.weekday())
+    step = 7 if (end - start).days <= 42 else 14
+    while day <= end:
+        mondays.append(day)
+        day += timedelta(days=step)
+    return tuple((tick, f"{tick.day} {tick:%b}") for tick in mondays)
+
+
 def _draw_factsheet_page_two(
     c: canvas.Canvas, inputs: FactsheetInputs, page_width: float, page_height: float
 ) -> None:
@@ -1069,11 +1190,18 @@ def _draw_factsheet_page_two(
         f"Historical Performance ({_display_date(inputs.history_start_date, short=True)} to {_display_date(inputs.period_end, short=True)})",
     )
 
-    x0 = layout["chart_x"]
-    y0 = layout["chart_y"]
-    width = layout["chart_width"]
-    height = layout["chart_height"]
-    values = [float(row["value"]) for row in inputs.normalized_nav]
+    _draw_account_nav_chart(
+        c, inputs.normalized_nav,
+        box=(layout["chart_x"], layout["chart_y"], layout["chart_width"], layout["chart_height"]),
+    )
+
+
+def _draw_account_nav_chart(
+    c: canvas.Canvas, normalized_nav: tuple[dict[str, Any], ...], *, box: tuple[float, float, float, float]
+) -> None:
+    """The account design's page-two NAV line chart; also a design-spec component."""
+    x0, y0, width, height = box
+    values = [float(row["value"]) for row in normalized_nav]
     value_range = max(values) - min(values)
     padding = max(2.0, value_range * 0.05)
     minimum = min(values) - padding
@@ -1081,11 +1209,20 @@ def _draw_factsheet_page_two(
     if maximum <= minimum:
         minimum -= 5.0
         maximum += 5.0
-    first_tick = math.ceil(minimum / 10.0) * 10.0
-    last_tick = math.floor(maximum / 10.0) * 10.0
+    # Ten-point gridlines, widened for strongly trending histories so the
+    # labels never pile up (no more than ten across the plot).
+    y_step = next(
+        step
+        for step in (10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, math.inf)
+        if (maximum - minimum) / step <= 10.0
+    )
+    if not math.isfinite(y_step):
+        y_step = 10.0 ** math.ceil(math.log10((maximum - minimum) / 10.0))
+    first_tick = math.ceil(minimum / y_step) * y_step
+    last_tick = math.floor(maximum / y_step) * y_step
     y_ticks = tuple(
-        first_tick + 10.0 * index
-        for index in range(max(0, int(round((last_tick - first_tick) / 10.0))) + 1)
+        first_tick + y_step * index
+        for index in range(max(0, int(round((last_tick - first_tick) / y_step))) + 1)
     )
     c.setStrokeColor(GRID)
     c.setFillColor(MUTED)
@@ -1097,35 +1234,17 @@ def _draw_factsheet_page_two(
         c.line(x0, y, x0 + width, y)
         c.setDash()
         c.drawRightString(x0 - 5, y - 2.2, f"{value:.0f}")
-    start_date = date.fromisoformat(inputs.normalized_nav[0]["date"])
-    end_date = date.fromisoformat(inputs.normalized_nav[-1]["date"])
+    start_date = date.fromisoformat(normalized_nav[0]["date"])
+    end_date = date.fromisoformat(normalized_nav[-1]["date"])
     start_ordinal = start_date.toordinal()
     ordinal_span = max(1, end_date.toordinal() - start_ordinal)
-    tick_year, tick_month = start_date.year, start_date.month
-    if tick_month % 2 == 0:
-        tick_month += 1
-    while date(tick_year, tick_month, 1) <= start_date:
-        tick_month += 2
-        if tick_month > 12:
-            tick_month -= 12
-            tick_year += 1
-    date_ticks: list[date] = []
-    while True:
-        tick_date = date(tick_year, tick_month, 1)
-        if tick_date > end_date:
-            break
-        date_ticks.append(tick_date)
-        tick_month += 2
-        if tick_month > 12:
-            tick_month -= 12
-            tick_year += 1
+    date_ticks = _account_chart_date_labels(start_date, end_date)
     c.setFont("Helvetica", 6.5)
-    for tick_date in date_ticks:
+    for tick_date, label in date_ticks:
         x = x0 + width * (tick_date.toordinal() - start_ordinal) / ordinal_span
         c.setDash(2, 2)
         c.line(x, y0, x, y0 + height)
         c.setDash()
-        label = str(tick_date.year) if tick_date.month == 1 else tick_date.strftime("%b")
         c.saveState()
         c.translate(x - 2, y0 - 8)
         c.rotate(-45)
@@ -1147,7 +1266,7 @@ def _draw_factsheet_page_two(
     c.setStrokeColor(HexColor("#4054ff"))
     c.setLineWidth(0.75)
     path = c.beginPath()
-    for index, row in enumerate(inputs.normalized_nav):
+    for index, row in enumerate(normalized_nav):
         observed = date.fromisoformat(row["date"])
         x = x0 + width * (observed.toordinal() - start_ordinal) / ordinal_span
         y = y0 + height * (float(row["value"]) - minimum) / (maximum - minimum)
@@ -1443,6 +1562,10 @@ def _alpha_world_return_distribution(
     if inputs.subject_id == 'alpha-world-t' and inputs.chart_daily_returns is not None:
         from .alpha_world_t_analytics import simulate
         return simulate(inputs.chart_daily_returns, inputs.period_end, paths=paths)
+    from .profiled_composite import ANALYTICS_VERSION as COMPOSITE_VERSION
+    if (inputs.chart_evidence or {}).get('version') == COMPOSITE_VERSION and inputs.chart_daily_returns is not None:
+        from .profiled_composite import simulate
+        return simulate(inputs.chart_daily_returns, inputs.period_end, subject_id=inputs.subject_id, paths=paths)
     returns = [
         float(current["value"]) / float(previous["value"]) - 1.0
         for previous, current in zip(inputs.normalized_nav, inputs.normalized_nav[1:])
@@ -1996,9 +2119,19 @@ def _draw_alpha_world_page_one(
             c.drawString(80,58,"Limited history: indicative bootstrap only, not a forecast; parameter uncertainty is not shown.")
 
 
-def _draw_alpha_world_ms_allocation(c: canvas.Canvas) -> None:
+ALPHA_WORLD_MS_ALLOCATION_LABELS = {
+    "parents": ("70%", "30%"),
+    "headings": ("130% LONG", "70% SHORT", "150% LONG", "150% SHORT"),
+    "captions": (("China & Hong Kong", "Portfolio"), ("Hang Seng Index",),
+                 ("US Technology &", "BioTechnology"), ("S&P500",)),
+    "branches": ("91%", "-49%", "45%", "-45%"),
+}
+
+
+def _draw_alpha_world_ms_allocation(c: canvas.Canvas, labels: dict[str, Any] | None = None) -> None:
     """Owner-requested geometry only; preserve all wording and percentages."""
     layout = ALPHA_WORLD_MS_ALLOCATION_LAYOUT
+    labels = labels or ALPHA_WORLD_MS_ALLOCATION_LABELS
     c.saveState()
     c.setFillColor(white)
     c.rect(*layout['clear'], fill=1, stroke=0)
@@ -2017,12 +2150,9 @@ def _draw_alpha_world_ms_allocation(c: canvas.Canvas) -> None:
         c.rect(x, layout['child_y'], layout['child_width'], layout['child_height'], fill=1, stroke=0)
     c.setFillColor(white)
     c.setFont('Helvetica-Bold', 12.0)
-    for center, label in zip(parents, ('70%', '30%')):
+    for center, label in zip(parents, labels['parents']):
         c.drawCentredString(center, layout['parent_caption_y'], label)
-    headings = ('130% LONG', '70% SHORT', '150% LONG', '150% SHORT')
-    captions = (('China & Hong Kong', 'Portfolio'), ('Hang Seng Index',),
-        ('US Technology &', 'BioTechnology'), ('S&P500',))
-    for center, heading, lines in zip(centers, headings, captions):
+    for center, heading, lines in zip(centers, labels['headings'], labels['captions']):
         c.setFont('Helvetica-Bold', 10.8)
         c.drawCentredString(center, layout['heading_y'], heading)
         c.setFont('Helvetica', 9.4)
@@ -2031,7 +2161,7 @@ def _draw_alpha_world_ms_allocation(c: canvas.Canvas) -> None:
             c.drawCentredString(center, y, text)
     c.setFillColor(black)
     c.setFont('Helvetica-Bold', 10.8)
-    for i, (child, label) in enumerate(zip(centers, ('91%', '-49%', '45%', '-45%'))):
+    for i, (child, label) in enumerate(zip(centers, labels['branches'])):
         parent = parents[i//2]
         offset = -layout['branch_label_offset'] if i%2 == 0 else layout['branch_label_offset']
         c.drawCentredString((parent+child)/2+offset, layout['branch_label_y'], label)
@@ -2244,12 +2374,13 @@ def validate_factsheet_layout(path: str | Path, inputs: FactsheetInputs) -> None
             y=row_y,
             size=4.7,
         )
+    history_heading, history_body = _history_display(inputs)
     history_heading_y, history_table_top, _ = _historical_performance_geometry(
-        len(inputs.history)
+        len(history_body)
     )
     _require_run(
         page_one_runs,
-        f"Historical Performance from {_display_date(inputs.history_start_date, short=True)} to {_display_date(inputs.period_end, short=True)}",
+        history_heading,
         x=27,
         y=history_heading_y,
         size=7.8,
@@ -2648,6 +2779,15 @@ def render_factsheet(
     output_path: str | Path,
     design_model_path: str | Path | None = None,
 ) -> dict[str, Any]:
+    from .report_profiles import ReportProfileError, snapshot_profile
+    try:
+        profile = snapshot_profile(snapshot)
+    except ReportProfileError as error:
+        raise MonthlyArtifactError(str(error)) from error
+    if profile is not None and not profile.built_in:
+        from .profiled_factsheet import render
+        return render(snapshot, template_path=template_path, output_path=output_path,
+                      design_model_path=design_model_path)
     if snapshot.get('subject_id') == 'alpha-world-t':
         from .alpha_world_t_factsheet import render
         return render(snapshot, template_path=template_path, output_path=output_path,

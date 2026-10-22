@@ -32,6 +32,14 @@ resource databaseSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
   name: storageAccountName
 }
+resource rawBlobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' existing = {
+  parent: storage
+  name: 'default'
+}
+resource rawContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: rawBlobService
+  name: 'ibkr-raw'
+}
 
 resource tokenVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: flexTokenVaultName
@@ -58,7 +66,7 @@ resource tokenVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${jobName}-identity'
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', owner: 'ying' })
 }
 
 resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -94,9 +102,11 @@ resource databaseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-0
 }
 
 // Retain each validated Flex response in the immutable raw-data archive before import.
+// Scoped to the ibkr-raw container (it was account-wide until 18 Oct 2026). The name is
+// the assignment made on 18 Oct, so a redeploy updates it instead of failing on a duplicate.
 resource rawArchiveWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, identity.id, 'flex-discovery-raw-writer')
-  scope: storage
+  name: 'bf64d2a3-4683-4558-89ed-3d35d86a3cf4'
+  scope: rawContainer
   properties: {
     principalId: identity.properties.principalId
     principalType: 'ServicePrincipal'
@@ -107,7 +117,7 @@ resource rawArchiveWriter 'Microsoft.Authorization/roleAssignments@2022-04-01' =
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', hop: 'ingest+ops', owner: 'ying' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

@@ -4,8 +4,9 @@ import os
 import sys
 import uuid
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +14,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from ibkr_etl import lineage  # noqa: E402
 from ibkr_etl.config import load_settings  # noqa: E402
 from ibkr_etl.db import DEFAULT_TENANT_ID, connect  # noqa: E402
 from ibkr_etl.flex_client import FlexClient, FlexError, is_lockout_error  # noqa: E402
@@ -38,6 +40,7 @@ def _work_source(connection, flex_source_id: str) -> dict:
     row = connection.execute(
         """
         SELECT q.flex_source_id, q.query_id, q.credential_id,
+               q.schedule_time_zone, q.schedule_hour, q.schedule_minute,
                c.key_vault_secret_name
         FROM ibkr_flex_queries q
         JOIN ibkr_flex_credentials c
@@ -52,6 +55,28 @@ def _work_source(connection, flex_source_id: str) -> dict:
     return dict(row)
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _send_block(source: dict, now: datetime) -> str | None:
+    """Why no IBKR request may be sent now, or None.
+
+    Nothing is sent unless INSTITUTIONAL_FLEX_SENDS_ENABLED=true, and never
+    before the source's scheduled time on that day.
+    """
+    if os.environ.get("INSTITUTIONAL_FLEX_SENDS_ENABLED", "").strip().lower() != "true":
+        return "institutional_flex_sends_disabled"
+    local = now.astimezone(ZoneInfo(str(source["schedule_time_zone"])))
+    scheduled = local.replace(
+        hour=int(source["schedule_hour"]), minute=int(source["schedule_minute"]),
+        second=0, microsecond=0,
+    )
+    if local < scheduled:
+        return "before_scheduled_send_time"
+    return None
+
+
 def _update_payload(connection, work_item_id: str, evidence: dict) -> None:
     connection.execute(
         """
@@ -63,9 +88,55 @@ def _update_payload(connection, work_item_id: str, evidence: dict) -> None:
     )
 
 
+# Silver tables load_report writes for each Flex record type (see loader.load_report).
+SILVER_BY_RECORD_TYPE = (
+    (lambda kind: kind == "trade", "silver.trades"),
+    (lambda kind: "cashtransaction" in kind, "silver.cash_transactions"),
+    (lambda kind: "corporateaction" in kind, "silver.corporate_actions"),
+    (lambda kind: "openposition" in kind, "silver.position_snapshots"),
+    (lambda kind: "cashreportcurrency" in kind or kind == "cashreport", "silver.cash_snapshots"),
+    (lambda kind: "netassetvalue" in kind or "equitysummarybyreportdate" in kind, "silver.nav_snapshots"),
+    (lambda kind: "conversionrate" in kind or kind in {"fxrate", "currencyconversionrate"}, "silver.fx_rates"),
+    (lambda kind: kind == "fxtransaction", "silver.fx_transactions"),
+)
+
+
+def _record_statement(result: dict) -> None:
+    """The statement this run read and the tables it loaded, for its lineage record
+    (a no-op unless recording is on)."""
+    record = lineage.current()
+    if not record.active:
+        return
+    try:
+        ingestion_run_id = result.get("run_id")
+        record.append("ingestion_run_ids", ingestion_run_id)
+        blob = lineage.blob_dataset(result.get("raw_path"))
+        if blob:
+            record.input(blob, sha256=result.get("raw_sha256"), ingestion_run_id=ingestion_run_id)
+        counts = (result.get("reconciliation") or {}).get("record_types") or {}
+        rows = sum(int(value) for key, value in counts.items() if key != "legacy_source_keys_reused")
+        record.output("bronze.raw_reports", rows=1)
+        record.output("bronze.flex_rows", rows=rows)
+        record.output("silver.accounts")
+        record.output("silver.instruments")
+        for record_type, count in counts.items():
+            kind = str(record_type).lower()
+            for matches, table in SILVER_BY_RECORD_TYPE:
+                if matches(kind):
+                    record.output(table, rows=int(count))
+                    break
+    except Exception:  # noqa: BLE001 - lineage never fails the job
+        pass
+
+
 def _request_statement(connection, claim, *, database_url: str, tenant_id: str) -> dict:
     source = _work_source(connection, str(claim.flex_source_id))
+    blocked = _send_block(source, _now())
+    if blocked:
+        # Ends as any blocked send: no lock, no circuit change, no IBKR request.
+        raise ValidationBlocked(blocked)
     request = {**source, "flex_source_id": claim.flex_source_id}
+    # Commits the send record before the request, so a crash cannot lose it.
     _authorize_send(connection, tenant_id, request)
     token = ""
     try:
@@ -114,6 +185,7 @@ def _request_statement(connection, claim, *, database_url: str, tenant_id: str) 
             """,
             (source["credential_id"],),
         )
+        _record_statement(result)
         return {
             "ingestion_run_id": result["run_id"],
             "requested_from": start_date.isoformat(),
@@ -158,16 +230,20 @@ def _process_non_request(connection, claim) -> dict:
         raise RuntimeError("Downstream Flex work has no subject")
     evidence = _subject_evidence(connection, claim.subject_id)
     if claim.work_kind == "account_import":
+        # A subject can have more than one onboarding case (an existing_v11 case and an
+        # ibkr_flex one, for example), so this joins rather than expecting a single case.
         connection.execute(
             """
-            UPDATE account_onboarding_checks
+            UPDATE account_onboarding_checks AS checks
             SET status = 'pass',
                 message = 'The IBKR data import and row-count reconciliation passed.',
                 evidence_json = ?::jsonb, checked_at = now()
-            WHERE case_id = (
-                SELECT case_id FROM account_onboarding_cases
-                WHERE target_subject_id = ?
-            ) AND check_id = 'data_import_reconciled'
+            FROM account_onboarding_cases AS cases
+            WHERE checks.tenant_id = cases.tenant_id
+              AND checks.case_id = cases.case_id
+              AND checks.check_id = 'data_import_reconciled'
+              AND cases.target_subject_id = ?
+              AND cases.status <> 'cancelled'
             """,
             (canonical_json(evidence), claim.subject_id),
         )
@@ -220,7 +296,8 @@ def main() -> int:
                 lockout = isinstance(error, FlexError) and (
                     error.lockout or is_lockout_error(error.code, str(error))
                 )
-                if claim.flex_source_id:
+                # A preflight block sent nothing; never weaken the circuit it found.
+                if claim.flex_source_id and isinstance(error, FlexError):
                     source = _work_source(connection, str(claim.flex_source_id))
                     connection.execute(
                         """
@@ -267,4 +344,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-institutional-daily", main))

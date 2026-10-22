@@ -38,7 +38,6 @@ REQUIRED_REPORT_ASSETS = frozenset(
     {
         ("factsheet", "template"),
         ("factsheet", "completed_example"),
-        ("presentation", "template"),
     }
 )
 

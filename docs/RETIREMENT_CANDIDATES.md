@@ -3,6 +3,14 @@
 Prepared 2026-10-12 for review. **Nothing here has been deleted or stopped.**
 Each item needs the owner's go-ahead before anything is removed.
 
+**Update, 21 Oct 2026:** v1.1 was deleted: its vault, storage, registry,
+Postgres server, environment, jobs, identity, workspace, action group and
+alerts, with its data archived into v2 storage first. Its network stays.
+account-sync, which only imported v1.1's export, and institutional-shadow,
+which compared v2's schedules with v1.1's daily job, were retired too: their
+jobs and Bicep files are gone. institutional-shadow's script and its table
+stay, because the website still shows the last reconciliation.
+
 ## How this list was made
 
 A module counts as "in use" if the live platform can reach it. That means it
@@ -68,7 +76,7 @@ public access disabled.
 | Resource | What it appears to be | Suggested action |
 |---|---|---|
 | ibkrv2stg-pg-auhecwc4itaoo | Main production database | Keep |
-| ibkrv11-pg-5rcc62xxqblay | v1.1 database used by the 3 legacy jobs | Keep while ibkr-v11-daily runs |
+| ibkrv11-pg-5rcc62xxqblay | v1.1 database used by the 3 legacy jobs | Deleted with v1.1 on 21 Oct 2026 |
 | ibkrv2stg-upgrade-recovery-1009 | Private recovery host holding the QA databases `upgrade_g04_20261010` and `upgrade_g04_migration_20261011` (per the 2026-10-11 handover) | Keep until the stage 44 QA work is closed, then stop or delete |
 | ibkrv2stg-ha-recovery-20261006 | Restore taken 6 Oct | Confirm unused, then stop or delete |
 | ibkrv2stg-app-recovery-20261008 | Restore taken 8 Oct | Confirm unused, then stop or delete |

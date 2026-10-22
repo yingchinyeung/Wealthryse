@@ -20,17 +20,20 @@ def verify_generated_pair(connection,tenant_id,plan,item):
     rows=connection.execute('''SELECT DISTINCT ON (report_type)
         generation_run_id,report_type,template_version,status,output_sha256,output_reference
         FROM report_generation_runs WHERE tenant_id=? AND snapshot_id=?
-        AND report_type IN ('factsheet','presentation') ORDER BY report_type,generation_run_id DESC''',
+        AND report_type='factsheet' ORDER BY report_type,generation_run_id DESC''',
         (tenant_id,item['snapshot_id'])).fetchall()
+    # Decks are no longer built: the regenerated package is the factsheet; an earlier deck stays as it was.
     result={}
     for r in rows:
-        kind=r['report_type'];expected=plan['template_versions'][kind]+'+design:'+plan['design_version']
+        kind=r['report_type']
+        if kind!='factsheet':continue
+        expected=plan['template_versions'][kind]+'+design:'+plan['design_version']
         if (r['template_version']!=expected or r['status'] not in ('awaiting_approval','released_internal')
                 or not re.fullmatch('[0-9a-f]{64}', str(r['output_sha256'] or ''))
                 or not r['output_reference']):
             raise ValueError('Replacement pair is not fully validated under the selected design')
         result[kind]={'generation_run_id':r['generation_run_id'],'sha256':r['output_sha256']}
-    if set(result)!={'factsheet','presentation'}:raise ValueError('Replacement pair is incomplete')
+    if set(result)!={'factsheet'}:raise ValueError('Replacement factsheet is missing')
     return result
 
 

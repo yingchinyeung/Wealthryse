@@ -8,7 +8,7 @@ param environmentName string = 'ibkrv2stg-env'
 param jobName string = 'ibkrv2stg-autonomous-admin'
 param reviewJobName string = 'ibkrv2stg-autonomy-review'
 param webAppName string = 'ibkrv2stg-web'
-param actionGroupName string = 'ibkr-v11-daily-alerts'
+param actionGroupName string = 'ibkrv2stg-alerts'
 param benchmarkJobName string = 'ibkrv2stg-benchmark-daily'
 param riskFreeJobName string = 'ibkrv2stg-risk-free-daily'
 param approvalDatabaseSecretName string = 'database-approval-url'
@@ -24,6 +24,30 @@ param aiProcessingScope string = 'apac-data-zone'
 param azureSubscriptionId string
 param portfolioTenantId string = '00000000-0000-0000-0000-000000000001'
 param pilotAccountId string = 'U16088571'
+// Medallion layer freshness (src/ibkr_etl/layer_freshness.py), on since 18 Oct 2026:
+// the default matches the live supervisor. The bronze-market-data file checks have their
+// own switch and stay off; they also need the container name (the diagnostics identity
+// holds Storage Blob Data Reader on bronze-market-data since 18 Oct, in staging.bicep).
+param layerFreshnessEnabled bool = true
+param layerFreshnessBlobChecks bool = false
+param rawMarketDataContainer string = ''
+param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
+var layerFreshnessBlobEnv = !layerFreshnessBlobChecks ? [] : concat([
+  { name: 'LAYER_FRESHNESS_BLOB_CHECKS', value: 'true' }
+], empty(rawMarketDataContainer) ? [] : [
+  { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
+  { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
+])
+var layerFreshnessEnv = !layerFreshnessEnabled ? [] : concat([
+  { name: 'LAYER_FRESHNESS_ENABLED', value: 'true' }
+], layerFreshnessBlobEnv)
+// Medallion layer quality (src/ibkr_etl/layer_quality.py): off by default. shadow measures and
+// records quietly; warn also raises late layers and failed error checks as warnings.
+@allowed(['off', 'shadow', 'warn'])
+param layerQualityMode string = 'off'
+var layerQualityEnv = layerQualityMode == 'off' ? [] : [
+  { name: 'LAYER_QUALITY_MODE', value: layerQualityMode }
+]
 
 var tags = {
   application: 'wealthryse-portfolio-data-platform'
@@ -154,7 +178,7 @@ resource exactRevisionRecoveryAssignment 'Microsoft.Authorization/roleAssignment
 resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ops', component: 'monitoring', hop: 'ops' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -193,7 +217,7 @@ resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
           image: '${registry.properties.loginServer}/ibkr-portfolio@${imageDigest}'
           command: ['python']
           args: ['scripts/run_autonomous_administrator.py']
-          env: [
+          env: concat(concat([
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'PORTAL_URL', value: portalUrl }
             { name: 'ENTRA_TENANT_ID', value: entraTenantId }
@@ -210,7 +234,8 @@ resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'AZURE_AI_REGION', value: aiRegion }
             { name: 'AZURE_AI_PROCESSING_SCOPE', value: aiProcessingScope }
             { name: 'AI_ADMIN_ENABLED', value: 'true' }
-          ]
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
+          ], layerFreshnessEnv), layerQualityEnv)
           resources: {
             cpu: json('0.25')
             memory: '0.5Gi'
@@ -231,7 +256,7 @@ resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
 resource monthlyAuthorityReview 'Microsoft.App/jobs@2024-03-01' = {
   name: reviewJobName
   location: resourceGroup().location
-  tags: union(tags, { purpose: 'monthly-authority-review' })
+  tags: union(union(tags, { purpose: 'monthly-authority-review' }), { layer: 'ops', component: 'monitoring', hop: 'ops' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -289,7 +314,7 @@ resource monthlyAuthorityReview 'Microsoft.App/jobs@2024-03-01' = {
 resource supervisorFailureAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   name: '${jobName}-failed-execution'
   location: 'global'
-  tags: tags
+  tags: union(tags, { layer: 'ops', component: 'alerts' })
   properties: {
     description: 'Controlled-autonomy alert: the five-minute administrator supervisor failed.'
     severity: 1
@@ -326,7 +351,7 @@ resource supervisorFailureAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
 resource monthlyReviewFailureAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   name: '${reviewJobName}-failed-execution'
   location: 'global'
-  tags: union(tags, { purpose: 'monthly-authority-review' })
+  tags: union(union(tags, { purpose: 'monthly-authority-review' }), { layer: 'ops', component: 'alerts' })
   properties: {
     description: 'Controlled-autonomy alert: the monthly owner-authority review job failed.'
     severity: 1

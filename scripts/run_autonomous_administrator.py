@@ -25,16 +25,24 @@ from ibkr_etl.admin_actions import (  # noqa: E402
 )
 from ibkr_etl.admin_chat import SYSTEM_UPDATES_SOURCE_KEY  # noqa: E402
 from ibkr_etl.ai_analyst import AIAnalystConfig, AIAnalystError  # noqa: E402
+from ibkr_etl import layer_freshness, layer_quality  # noqa: E402
 from ibkr_etl.autonomous_admin import (  # noqa: E402
+    LAYER_FRESHNESS_PREFIX,
+    LAYER_QUALITY_PREFIX,
     AutonomyControl,
+    LayerFreshnessReview,
     ROLLBACK_ACTION,
     RecoveryContext,
     authority_review_current,
+    combine_reviews,
     diagnose_findings,
     evaluate_supervisor_state,
     plan_safe_repairs,
+    review_layer_freshness,
+    review_layer_quality,
 )
-from ibkr_etl.burn_in import now_hkt_date, portal_boundary_check  # noqa: E402
+from ibkr_etl.burn_in import collect_import_state, now_hkt_date, portal_boundary_check  # noqa: E402
+from ibkr_etl.ops_agent_posts import post_connection_reports, post_new_diagnoses  # noqa: E402
 from ibkr_etl.util import canonical_json, utc_now_iso  # noqa: E402
 
 
@@ -131,7 +139,7 @@ def _activate_web_revision(
     return f"revision-activated:{app_name}:{revision_name}"
 
 
-def _database_state(connection, account_id: str) -> dict:
+def _database_state(connection, account_id: str, today_hkt) -> dict:
     dates = connection.execute(
         """
         SELECT
@@ -145,14 +153,7 @@ def _database_state(connection, account_id: str) -> dict:
         """,
         (account_id,),
     ).fetchone()
-    latest_import = connection.execute(
-        """
-        SELECT run_id, status, requested_to, completed_at
-        FROM ingestion_runs
-        WHERE run_type = 'staging-snapshot-import'
-        ORDER BY run_id DESC LIMIT 1
-        """
-    ).fetchone()
+    imports = collect_import_state(connection, account_id, as_of=today_hkt)
     latest_snapshot = connection.execute(
         """
         SELECT snapshot_id, period_end, data_as_of, status, quality_status
@@ -187,7 +188,7 @@ def _database_state(connection, account_id: str) -> dict:
     ).fetchone()
     return {
         **dict(dates),
-        "latest_import": None if latest_import is None else dict(latest_import),
+        **imports,
         "latest_snapshot": None if latest_snapshot is None else dict(latest_snapshot),
         "ready_report_types": ready_report_types,
         "client_approval_count": int(client_approvals["n"]),
@@ -291,7 +292,92 @@ def _recovery_context(
     )
 
 
-def _sync_incidents(connection, findings, now_iso: str) -> tuple[dict[str, int], set[str]]:
+def _open_layer_freshness_incidents(connection, prefix: str = LAYER_FRESHNESS_PREFIX) -> dict[str, dict]:
+    """Open incidents whose key starts with `prefix` (layer_freshness by default), with their
+    severity and evidence. Runs under a savepoint so a failure here cannot abort the
+    supervisor's transaction."""
+    try:
+        with connection.transaction():
+            rows = connection.execute(
+                """
+                SELECT incident_key, severity, evidence_json FROM system_incidents
+                WHERE status IN ('open', 'acknowledged') AND starts_with(incident_key, %s)
+                """,
+                (prefix,),
+            ).fetchall()
+    except Exception:  # noqa: BLE001
+        return {}
+    incidents = {}
+    for row in rows:
+        try:
+            evidence = json.loads(row["evidence_json"] or "{}")
+        except ValueError:
+            evidence = {}
+        incidents[str(row["incident_key"])] = {"severity": str(row["severity"]), "evidence": evidence}
+    return incidents
+
+
+def _layer_freshness_review(
+    connection, database_url: str, tenant_id: str, *, now: datetime | None = None,
+    results_out: list | None = None,
+) -> LayerFreshnessReview | None:
+    """Medallion layer freshness, off (None) unless LAYER_FRESHNESS_ENABLED. Reads on
+    its own read-only session, by default as this job's DATABASE_URL. Never raises: a
+    failed check is reported as unreadable and holds its incidents open. The results
+    are added to `results_out`, for layer quality's readiness."""
+    if not layer_freshness.enabled():
+        return None
+    now = now or datetime.now(timezone.utc)
+    open_incidents = _open_layer_freshness_incidents(connection)
+    try:
+        results = layer_freshness.run_read_only(
+            os.environ.get(layer_freshness.DATABASE_URL_ENV) or database_url, tenant_id, now=now
+        )
+        print("LAYER_FRESHNESS " + canonical_json(layer_freshness.summary(results)), flush=True)
+    except Exception as error:  # noqa: BLE001
+        print("LAYER_FRESHNESS " + canonical_json({"status": "failed", "error_code": type(error).__name__}),
+              flush=True)
+        results = None
+    if results is not None and results_out is not None:
+        results_out.extend(results)
+    try:
+        return review_layer_freshness(results, now=now, open_incidents=open_incidents)
+    except Exception:  # noqa: BLE001
+        return LayerFreshnessReview(hold_open=frozenset(open_incidents))
+
+
+def _layer_quality_review(
+    connection, database_url: str, tenant_id: str, *, now: datetime | None = None,
+    freshness_results: list | None = None,
+) -> LayerFreshnessReview | None:
+    """Medallion layer quality, off (None, with no query and no log line) unless
+    LAYER_QUALITY_MODE is shadow or warn. Measures on its own sessions within a hard time
+    limit and records its history on its own connection, never in this transaction.
+    Never raises; shadow findings are info, recorded quietly."""
+    selected, note = layer_quality.mode()
+    if selected == layer_quality.OFF:
+        return None
+    now = now or datetime.now(timezone.utc)
+    open_incidents = _open_layer_freshness_incidents(connection, LAYER_QUALITY_PREFIX)
+    try:
+        outcome = layer_quality.run_in_administrator(
+            database_url, tenant_id, now=now, mode_name=selected, mode_note=note,
+            freshness=freshness_results or None,
+        )
+        print(layer_quality.LOG_PREFIX + canonical_json(layer_quality.summary(outcome)), flush=True)
+    except Exception as error:  # noqa: BLE001
+        print(layer_quality.LOG_PREFIX + canonical_json({"status": "failed", "error_code": type(error).__name__}),
+              flush=True)
+        outcome = None
+    try:
+        return review_layer_quality(outcome, warn=selected == layer_quality.WARN, open_incidents=open_incidents)
+    except Exception:  # noqa: BLE001
+        return LayerFreshnessReview(hold_open=frozenset(open_incidents))
+
+
+def _sync_incidents(
+    connection, findings, now_iso: str, *, hold_open=()
+) -> tuple[dict[str, int], set[str]]:
     existing = {
         str(row["incident_key"]): int(row["incident_id"])
         for row in connection.execute(
@@ -328,13 +414,15 @@ def _sync_incidents(connection, findings, now_iso: str) -> tuple[dict[str, int],
             ),
         ).fetchone()
         active[finding.incident_key] = int(row["incident_id"])
-    if active:
+    # Open incidents held open (a check that did not come back fresh) are not resolved.
+    keep = [*active, *(key for key in hold_open if key not in active)]
+    if keep:
         connection.execute(
             """
             UPDATE system_incidents SET status = 'resolved', resolved_at = %s
             WHERE status IN ('open', 'acknowledged') AND NOT (incident_key = ANY(%s))
             """,
-            (now_iso, list(active)),
+            (now_iso, keep),
         )
     else:
         connection.execute(
@@ -345,6 +433,19 @@ def _sync_incidents(connection, findings, now_iso: str) -> tuple[dict[str, int],
             (now_iso,),
         )
     return active, set(active) - set(existing)
+
+
+def _synchronize(
+    connection, findings, now_iso: str, freshness: LayerFreshnessReview | None
+) -> tuple[dict[str, int], set[str]]:
+    """Record findings as incidents. Returns incident ids and the keys to announce.
+    With layer freshness or layer quality on (`freshness` is their combined review),
+    incidents they hold stay open, their info findings are recorded quietly, and one
+    that turns into a warning is announced."""
+    if freshness is None:
+        return _sync_incidents(connection, findings, now_iso)
+    incident_ids, new_keys = _sync_incidents(connection, findings, now_iso, hold_open=freshness.hold_open)
+    return incident_ids, (new_keys - freshness.quiet) | (freshness.escalated & set(incident_ids))
 
 
 def _recent_actions(connection) -> dict[str, datetime | None]:
@@ -471,6 +572,10 @@ def _publish_admin_chat_updates(
             },
             incident_ids.get(finding.incident_key),
         )
+    # The operations agent's diagnoses of open incidents and the connection agent's
+    # reports, posted here because only the administrator writes this conversation.
+    post_new_diagnoses(connection, conversation_id, append)
+    post_connection_reports(connection, conversation_id, append)
 
 
 def _ai_config(identity_client_id: str) -> AIAnalystConfig:
@@ -525,7 +630,7 @@ def main() -> int:
         connection.commit()
 
         stage = "collect_database_state"
-        state = _database_state(connection, account_id)
+        state = _database_state(connection, account_id, now_hkt_date())
         stage = "check_portal_boundary"
         portal_failure = _portal_failure(portal_url, entra_tenant_id)
         stage = "update_recovery_state"
@@ -540,11 +645,25 @@ def main() -> int:
         )
         connection.commit()
         findings = evaluate_supervisor_state(
-            state, today_hkt=now_hkt_date(), portal_failure=portal_failure
+            state, today_hkt=now_hkt_date(), portal_failure=portal_failure,
+            now_utc=datetime.now(timezone.utc),
         )
+        stage = "check_layer_freshness"
+        freshness_results: list = []
+        freshness = _layer_freshness_review(connection, database_url, tenant_id, results_out=freshness_results)
+        stage = "check_layer_quality"
+        freshness = combine_reviews(
+            freshness,
+            _layer_quality_review(connection, database_url, tenant_id, freshness_results=freshness_results),
+        )
+        if freshness is not None and freshness.findings:
+            findings = sorted(
+                [*findings, *freshness.findings],
+                key=lambda item: (item.severity != "critical", item.incident_key),
+            )
         now_iso = utc_now_iso()
         stage = "synchronize_incidents"
-        incident_ids, new_keys = _sync_incidents(connection, findings, now_iso)
+        incident_ids, new_keys = _synchronize(connection, findings, now_iso, freshness)
         connection.commit()
 
         diagnosis: dict | None = None
@@ -660,7 +779,8 @@ def main() -> int:
             and control.production_active
             and authority_review_current(control, now=datetime.now(timezone.utc))
         )
-        status = "paused" if not current_authority else ("degraded" if findings else "healthy")
+        counted = [f for f in findings if freshness is None or f.incident_key not in freshness.quiet]
+        status = "paused" if not current_authority else ("degraded" if counted else "healthy")
         summary = (
             diagnosis.get("summary")
             if diagnosis and diagnosis.get("summary")

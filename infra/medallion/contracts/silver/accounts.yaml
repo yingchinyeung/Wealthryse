@@ -1,0 +1,149 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.accounts
+name: accounts
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: One row per IBKR account seen in a Flex statement, with the tenant it belongs to. The account-level Flex
+    tables are isolated by tenant through this table.
+tags:
+- silver
+- ibkr
+schema:
+- name: accounts
+  physicalName: silver.accounts
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per account_id.
+  properties:
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: true
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: restricted
+    description: 'IBKR account number. Restricted: never shown or logged in full.'
+  - name: alias
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: Account alias from the statement (accountAlias); kept when a later statement leaves it out.
+  - name: base_currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Account base currency from the statement.
+  - name: account_type
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Account type from the statement.
+  - name: ib_entity
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR entity that holds the account (ibEntity).
+  - name: first_seen_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) the account was first loaded.
+  - name: last_seen_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the latest load that named the account.
+  - name: source_json
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: 'The account''s statement attributes as canonical JSON. Restricted: it can name the holder.'
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Tenant that owns the account. The account_isolation policy on the Flex tables reads it.
+  quality:
+  - name: first_seen_not_after_last_seen
+    description: first_seen_at is not later than last_seen_at.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.accounts WHERE first_seen_at > last_seen_at
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Dimension.
+- property: readByViews
+  value:
+  - silver.subject_cash_activity_series
+  - silver.subject_cash_balance_series
+  - silver.subject_live_summary
+  - silver.subject_nav_series
+  - silver.subject_position_series
+- property: consumers
+  value:
+  - ibkr_etl.alpha_world_t_crisis
+  - ibkr_etl.analyst_export
+  - ibkr_etl.cashflow_source_evidence
+  - ibkr_etl.comparison_cashflow_evidence
+  - ibkr_etl.derived_portfolio
+  - ibkr_etl.export_agent_source
+  - ibkr_etl.onboarding
+  - ibkr_etl.pilot_import
+  - ibkr_etl.pilot_snapshot
+  - ibkr_etl.provisional_benchmark
+  - ibkr_etl.report
+  - ibkr_etl.service
+  - ibkr_etl.silver_history
+  - ibkr_etl.snapshot_atomic_import
+  - ibkr_etl.snapshot_preflight
+  - ibkr_etl.subject_exports
+  - ibkr_etl.switch_dry_run
+  - ibkr_etl.workflow_financial_inputs
+- property: producers
+  value:
+  - ibkr_etl.loader
+contractCreatedTs: '2026-10-18T00:00:00Z'

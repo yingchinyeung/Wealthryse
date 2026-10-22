@@ -61,7 +61,7 @@ resource jobAiInferenceRole 'Microsoft.Authorization/roleAssignments@2022-04-01'
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'reporting', hop: 'analytics+publish' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -108,6 +108,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           env: [
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'DEPLOYMENT_ENVIRONMENT', value: 'internal-production' }
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'PILOT_ACCOUNT_ID', value: pilotAccountId }
             { name: 'REPORTING_PERIOD_START', value: '2025-01-20' }

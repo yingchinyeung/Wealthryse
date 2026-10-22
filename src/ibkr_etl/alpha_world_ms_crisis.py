@@ -15,8 +15,10 @@ from uuid import UUID
 
 from .subject_onboarding import approved_reference_definitions, configuration_sha256
 from .util import canonical_json
+from .crisis_identity_policy import apply_identity_proxy, VERSION as IDENTITY_PROXY_VERSION
 
 VERSION = 'alpha-world-ms-hkd-crisis-replay-v1'
+IDENTITY_VERSION = 'alpha-world-ms-hkd-crisis-replay-v2'
 MARKET_SHA256 = '422df9135669fe1478f0d18544d1a55926e612859659ea72b151c73a496d81e2'
 SOURCE_VERSION = 'as-of-holdings-crisis-replay-v3'
 SLEEVE_VERSION = 'independent-recorded-price-sleeve-replay-v1'
@@ -88,7 +90,7 @@ def align(observations, calendar, field, *, hong_kong_sessions=False):
     return output, audit
 
 
-def verify_sleeve(records, subject, holdings_day, calendar):
+def verify_sleeve(records, subject, holdings_day, calendar, *, identity_proxy=False):
     """Verify each stored sleeve against its exact holdings, FX, prices and NAV."""
     def scoped(name, day_field):
         return [r for r in records[name] if r['subject_id'] == subject and str(r[day_field]) == holdings_day]
@@ -98,6 +100,9 @@ def verify_sleeve(records, subject, holdings_day, calendar):
     held = scoped('source_positions', 'snapshot_date')
     holdings = {str(r['conid']): r for r in held}
     maps = scoped('mappings', 'holdings_as_of')
+    original_maps = maps
+    if identity_proxy and subject == 'U16088571':
+        maps = [apply_identity_proxy(r, subject_id='alpha-world-ms', crisis_start=calendar[0]) for r in maps]
     require(len(holdings) == len(held) == len(maps) and set(holdings) == {str(r['conid']) for r in maps},
             'Exact sleeve holdings/mapping identities differ')
     stored = scoped('replays', 'holdings_as_of')
@@ -168,6 +173,11 @@ def verify_sleeve(records, subject, holdings_day, calendar):
                   'symbol':r['source_symbol']} for r in maps],
                   'prices':{symbol:[prices[symbol,day] for day in calendar] for symbol in sorted(symbols)}},
               'daily': rebuilt}
+    if identity_proxy:
+        source['identity_proxy_policy_version'] = IDENTITY_PROXY_VERSION
+        source['identity_proxy_evidence'] = {'original_mappings': original_maps, 'effective_mappings': maps}
+        source['source_sha256'] = sha({'original_source_sha256': source['source_sha256'],
+                                     'identity_proxy_evidence': source['identity_proxy_evidence']})
     return source
 
 
@@ -204,8 +214,20 @@ def compute(inputs):
     hsi,hsi_audit=align(market['hedges']['hsi']['observations'],days,'price',hong_kong_sessions=True)
     spy,spy_audit=align(market['hedges']['spy']['observations'],days,'price')
     paths={}
+    identity_proxy = 'identity_proxy_policy_version' in inputs
+    if identity_proxy:
+        require(inputs['identity_proxy_policy_version'] == IDENTITY_PROXY_VERSION, 'Unapproved MS crisis identity policy')
     require(set(inputs['sleeves'])==set(SLEEVES), 'Missing stress sleeve')
     for subject,source in inputs['sleeves'].items():
+        if identity_proxy:
+            require(source.get('identity_proxy_policy_version') == IDENTITY_PROXY_VERSION, 'MS source policy missing')
+            proof = source['identity_proxy_evidence']
+            expected = [apply_identity_proxy(r, subject_id='alpha-world-ms', crisis_start=days[0])
+                        for r in proof['original_mappings']] if subject == 'U16088571' else proof['original_mappings']
+            require(expected == proof['effective_mappings'], 'MS crisis proxy evidence differs')
+            require(source['reconciliation_inputs']['components'] == [
+                {'value':float(r['current_market_value']), 'symbol':r['source_symbol']} for r in expected],
+                'MS crisis price proof does not use the approved proxy')
         require(source['subject_id']==subject and source['reporting_currency']=='USD'
                 and source['calculation_version']==SLEEVE_VERSION and source['independent_decimal_verified'] is True
                 and source['holdings_as_of']==inputs['holdings_as_of'], 'Source sleeve stress qualification differs')
@@ -235,7 +257,7 @@ def compute(inputs):
             require(math.isclose(float(independent),level,rel_tol=0,abs_tol=2e-12)
                     and math.isclose(float(independent/decimal_peak-1),dd,rel_tol=0,abs_tol=2e-12), 'Independent HKD composite reconciliation failed')
             daily.append({'observation_date':day,'normalized_value':level,'drawdown':dd})
-    return {'subject_id':'alpha-world-ms','reporting_currency':'HKD','calculation_version':VERSION,
+    return {'subject_id':'alpha-world-ms','reporting_currency':'HKD','calculation_version':IDENTITY_VERSION if identity_proxy else VERSION,
             'requested_as_of':inputs['requested_as_of'],'holdings_as_of':inputs['holdings_as_of'],
             'crisis_start':days[0],'crisis_end':days[-1],'observations':len(days),
             'maximum_drawdown':min(r['drawdown'] for r in daily),'cash_weight':values['constant-cash']/nav,
@@ -250,7 +272,7 @@ def compute(inputs):
 
 
 def validate(replay, *, as_of=None, holdings=None, nav=None):
-    require(isinstance(replay,dict) and replay.get('calculation_version')==VERSION, 'Qualified HKD MS stress replay required')
+    require(isinstance(replay,dict) and replay.get('calculation_version') in (VERSION, IDENTITY_VERSION), 'Qualified HKD MS stress replay required')
     require(compute(replay['inputs'])==replay, 'MS stress payload differs from deterministic verification')
     if as_of is not None:require(replay['holdings_as_of']==as_of, 'Stress holdings date differs')
     if holdings is not None:
@@ -260,20 +282,21 @@ def validate(replay, *, as_of=None, holdings=None, nav=None):
     return replay
 
 
-def from_capture(records, snapshot):
+def from_capture(records, snapshot, *, identity_proxy=False):
     day=snapshot['data_as_of'];holding_rows=snapshot['holdings']['holdings']
     require(all(r['currency']=='HKD' for r in holding_rows), 'Frozen stress holdings are not HKD')
     inputs={'subject_id':'alpha-world-ms','reporting_currency':'HKD','requested_as_of':snapshot['period_end'],
             'holdings_as_of':day,'contract_sha256':configuration_sha256(approved_reference_definitions()['alpha-world-ms']),
             'nav':float(snapshot['portfolio_summary']['latest_nav']['total_text']),
             'component_values':{r['conid']:float(r['market_value_text']) for r in holding_rows},
-            'sleeves':{subject:verify_sleeve(records,subject,day,market_sources()['calendar']) for subject in SLEEVES}}
+            'sleeves':{subject:verify_sleeve(records,subject,day,market_sources()['calendar'], identity_proxy=identity_proxy) for subject in SLEEVES}}
+    if identity_proxy: inputs['identity_proxy_policy_version'] = IDENTITY_PROXY_VERSION
     result=compute(inputs)
     validate(result,as_of=day,holdings=holding_rows,nav=inputs['nav'])
     return result
 
 
-def load(connection, snapshot, *, tenant_id=None):
+def load(connection, snapshot, *, tenant_id=None, identity_proxy=False):
     """Read-only producer: exact as-of inputs, no fetches or source-table writes."""
     from .subject_read_contract import require_ms_hkd_contract
     require_ms_hkd_contract(connection,tenant_id=tenant_id)
@@ -302,7 +325,7 @@ def load(connection, snapshot, *, tenant_id=None):
                       ['crisis-replay-%','2008-09-05','2009-03-09'],'symbol,price_date'),
         'source_fx':rows('reference_fx_rates',"from_currency = 'HKD' AND to_currency = 'USD' AND rate_date BETWEEN ? AND ?",
                          [(date.fromisoformat(day)-timedelta(days=4)).isoformat(),day],'rate_date,provider')}
-    return from_capture(records,snapshot)
+    return from_capture(records,snapshot,identity_proxy=identity_proxy)
 
 
 def qualified_snapshot(snapshot,replay):

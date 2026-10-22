@@ -62,7 +62,7 @@ class DesignServiceTests(unittest.TestCase):
             elif mutation=='retired':row['retired_at']='2026-10-07'
             elif mutation=='receipt':evidence['evidence_sha256']='invalid'
             elif mutation=='evidence_image':evidence['runtime_image_sha256']='d'*64
-            else:row['template_versions_json']='{"factsheet":"v2"}'
+            else:row['template_versions_json']='{"presentation":"v2"}'
             row['qualification_json']=json.dumps(evidence)
             with self.subTest(mutation=mutation),self.assertRaises(ValueError):
                 service.qualified_design(row,installed_image_sha256=IMAGE)
@@ -176,10 +176,14 @@ class DesignWorkerTests(unittest.TestCase):
             'status':'awaiting_approval','output_sha256':'e'*64,'output_reference':'private/file'}
             for idx,(kind,value) in enumerate(VERSIONS.items(),1)]
 
+    def test_worker_accepts_a_regenerated_factsheet_without_a_deck(self):
+        connection=Mock();connection.execute.return_value.fetchall.return_value=self.pair_rows()[:1]
+        self.assertEqual({'factsheet'},set(worker.verify_generated_pair(connection,TENANT,plan(),snapshots()[0])))
+
     def test_worker_requires_complete_exact_version_and_valid_hash(self):
         for mutation in ('missing','version','hash','status','reference'):
             rows=self.pair_rows()
-            if mutation=='missing':rows=rows[:1]
+            if mutation=='missing':rows=rows[1:]
             elif mutation=='version':rows[0]['template_version']='old'
             elif mutation=='hash':rows[0]['output_sha256']='invalid'
             elif mutation=='status':rows[0]['status']='running'
@@ -250,7 +254,7 @@ class DesignGeneratorTests(unittest.TestCase):
             period_end='2026-09-30',expected_versions=VERSIONS,allow_replacement=True,snapshot_id=ID))
         sql,parameters=connection.execute.call_args.args
         self.assertIn('s.snapshot_id = CAST(? AS uuid)',sql)
-        self.assertEqual(parameters[-2:],(ID,ID))
+        self.assertEqual(parameters[-1],ID)
 
     def test_normal_scheduler_cannot_overwrite_month_under_design_review(self):
         connection=Mock();current=plan()
@@ -262,17 +266,26 @@ class DesignGeneratorTests(unittest.TestCase):
         connection=Mock(); rows=[{'report_type':kind,'status':'released_internal','template_version':'old'}
             for kind in VERSIONS]
         connection.execute.return_value.fetchall.return_value=rows
-        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS)
+        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS,snapshot_id=ID)
         self.assertEqual(_existing_package(connection,**kwargs),'already_released')
         self.assertIsNone(_existing_package(connection,**kwargs,allow_replacement=True))
         for row in rows:row['template_version']=VERSIONS[row['report_type']]
         self.assertEqual(_existing_package(connection,**kwargs,allow_replacement=True),'already_released')
 
-    def test_qualified_retry_accepts_partial_release_but_normal_job_fails(self):
+    def test_missing_frozen_snapshot_never_reuses_a_package(self):
+        connection=Mock();connection.execute.return_value.fetchall.return_value=[
+            {'report_type':kind,'status':'released_internal','template_version':VERSIONS[kind]} for kind in VERSIONS]
+        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS)
+        self.assertIsNone(_existing_package(connection,**kwargs))
+        connection.execute.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError,'exact approved snapshot'):
+            _existing_package(connection,**kwargs,allow_replacement=True)
+
+    def test_qualified_retry_replaces_a_released_factsheet_but_normal_job_keeps_it(self):
         connection=Mock();connection.execute.return_value.fetchall.return_value=[
             {'report_type':'factsheet','status':'released_internal','template_version':'old'}]
-        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS)
-        with self.assertRaisesRegex(RuntimeError,'partial release'):_existing_package(connection,**kwargs)
+        kwargs=dict(tenant_id=TENANT,account_id=SUBJECT,period_end='2026-09-30',expected_versions=VERSIONS,snapshot_id=ID)
+        self.assertEqual('already_released',_existing_package(connection,**kwargs))
         self.assertIsNone(_existing_package(connection,**kwargs,allow_replacement=True))
 
 

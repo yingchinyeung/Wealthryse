@@ -1,0 +1,233 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.fx_transactions
+name: fx_transactions
+version: 1.0.1
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: FX transactions per account from the Flex statements, with proceeds, cost and realised P&L.
+  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
+    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
+    item U8's history is switched on, every version is also kept in silver.fx_transactions_history, and silver.fx_transactions_as_known(at)
+    returns this table as it stood at any moment.
+tags:
+- silver
+- ibkr
+schema:
+- name: fx_transactions
+  physicalName: silver.fx_transactions
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per account_id and source_key.
+  properties:
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: restricted
+    description: 'IBKR account number. Restricted: never shown or logged in full.'
+  - name: source_key
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: Stable key of the statement row (parser._source_key).
+  - name: event_datetime
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: dateTime as IBKR sends it (not normalised).
+  - name: activity_description
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR activity description.
+  - name: model_code
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR model code.
+  - name: report_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Report date of the statement row.
+    quality:
+    - name: report_date_is_iso_date
+      description: report_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_transactions WHERE report_date IS NOT NULL AND report_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: functional_currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The account's functional currency.
+  - name: fx_currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency bought or sold.
+  - name: quantity_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Quantity of fx_currency as decimal text.
+    quality:
+    - name: quantity_text_is_decimal
+      description: quantity_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_transactions WHERE quantity_text IS NOT NULL AND quantity_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: proceeds_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Proceeds in the functional currency as decimal text.
+    quality:
+    - name: proceeds_text_is_decimal
+      description: proceeds_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_transactions WHERE proceeds_text IS NOT NULL AND proceeds_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: cost_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Cost in the functional currency as decimal text.
+    quality:
+    - name: cost_text_is_decimal
+      description: cost_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_transactions WHERE cost_text IS NOT NULL AND cost_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: realized_pnl_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Realised P&L (realizedPL) as decimal text.
+    quality:
+    - name: realized_pnl_text_is_decimal
+      description: realized_pnl_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_transactions WHERE realized_pnl_text IS NOT NULL AND realized_pnl_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: row_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows.
+    quality:
+    - name: row_sha256_is_sha256
+      description: row_sha256 is a lowercase hex sha256 (util.sha256_text of the row).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.fx_transactions WHERE row_sha256 IS NOT NULL AND row_sha256 !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: last_seen_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ingestion run that last wrote the row (ingestion_runs.run_id).
+  quality:
+  - name: account_in_accounts
+    description: Every row's account is in silver.accounts. A row of an unknown account is invisible to every tenant
+      under the account_isolation policy, so run this with a role that bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.fx_transactions t WHERE NOT EXISTS (SELECT 1 FROM silver.accounts a WHERE
+      a.account_id = t.account_id)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Typed Flex sections; values are still stored as text and cast on read.
+- property: consumers
+  value:
+  - ibkr_etl.analyst_export
+  - ibkr_etl.loader
+  - ibkr_etl.silver_history
+- property: producers
+  value:
+  - ibkr_etl.loader
+  - ibkr_etl.silver_history
+contractCreatedTs: '2026-10-18T00:00:00Z'

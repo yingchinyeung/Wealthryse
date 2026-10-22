@@ -18,11 +18,13 @@ from ibkr_etl.db import (  # noqa: E402
     finish_run_success,
     start_run,
 )
-from ibkr_etl.provisional_benchmark import refresh_and_materialize  # noqa: E402
+from ibkr_etl import input_readiness, publish_gate  # noqa: E402
+from ibkr_etl.provisional_benchmark import NoBenchmarkContract, refresh_and_materialize  # noqa: E402
 from ibkr_etl.crisis_replay import (  # noqa: E402
     refresh_composite_crisis_replay,
     refresh_crisis_replay,
 )
+from ibkr_etl import crisis_scenarios, lineage, raw_capture  # noqa: E402
 from ibkr_etl.util import canonical_json, sha256_text  # noqa: E402
 
 
@@ -39,6 +41,40 @@ def _external_market_data_approved(connection, account_id: str) -> bool:
         (account_id,),
     ).fetchone()
     return row is not None
+
+
+def _crisis_scenario_subjects(connection) -> tuple[list[str], list[str]]:
+    """Active subjects whose owner approved sending holdings symbols to Yahoo."""
+
+    rows = connection.execute(
+        """
+        SELECT DISTINCT s.subject_id, s.subject_type
+        FROM platform_subjects s
+        JOIN account_onboarding_approvals a ON a.subject_id = s.subject_id
+        WHERE s.lifecycle_status = 'active'
+          AND a.approval_type = 'external_market_data'
+          AND a.approval_status = 'approved' AND a.revoked_at IS NULL
+          AND a.disclosure_version = 'yahoo-ticker-disclosure-v1'
+        ORDER BY s.subject_id
+        """
+    ).fetchall()
+    accounts = [str(r["subject_id"]) for r in rows
+                if r["subject_type"] in {"physical_account", "filtered_portfolio"}]
+    composites = [str(r["subject_id"]) for r in rows if r["subject_type"] == "composite_portfolio"]
+    return accounts, composites
+
+
+def _refresh_crisis_scenarios(connection) -> dict:
+    """The extra crisis scenarios; a failure here never fails the benchmark job."""
+
+    if not crisis_scenarios.website_enabled():
+        return {"status": "disabled"}
+    try:
+        accounts, composites = _crisis_scenario_subjects(connection)
+        return crisis_scenarios.refresh(connection, accounts=accounts, composites=composites)
+    except Exception as error:  # noqa: BLE001
+        connection.rollback()
+        return {"status": "failed", "error": " ".join(str(error).split())[:300]}
 
 
 def _mark_wave0_benchmark_fx_reconciled(connection, result: dict) -> None:
@@ -130,7 +166,29 @@ def _mark_wave0_benchmark_fx_reconciled(connection, result: dict) -> None:
     )
 
 
+def _record_outputs(result: dict) -> None:
+    """What this run wrote, for its lineage record (a no-op unless recording is on)."""
+    record = lineage.current()
+    if not record.active:
+        return
+    try:
+        accounts = result.get("accounts") or []
+        record.output("silver.benchmark_prices", rows=result.get("benchmark_observations"))
+        record.output("silver.reference_fx_rates")
+        record.output("gold.performance_comparison_daily",
+                      rows=sum(int(item.get("comparison_rows") or 0) for item in accounts))
+        if any(item.get("crisis_replay") for item in accounts):
+            record.output("gold.crisis_replay_daily", rows=result.get("crisis_replay_observations"))
+            record.output("gold.crisis_replay_components")
+            record.output("silver.market_data_prices")
+        if (result.get("crisis_scenarios") or {}).get("subjects"):
+            record.output("gold.crisis_scenario_results")
+    except Exception:  # noqa: BLE001 - lineage never fails the job
+        pass
+
+
 def main() -> int:
+    input_readiness.gate("benchmark-daily")
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() not in {
         "staging",
         "internal-production",
@@ -150,6 +208,8 @@ def main() -> int:
     )
     start = date.fromisoformat(os.environ.get("BENCHMARK_START_DATE", "2025-01-20"))
     connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
+    # With lineage recording on, the gold rows this session writes name this run.
+    lineage.current().bind(connection)
     configured_ids = os.environ.get("BENCHMARK_ACCOUNT_IDS", "").strip()
     if configured_ids:
         account_ids = [
@@ -178,16 +238,33 @@ def main() -> int:
     run_id = start_run(
         connection, "staging-yfinance-benchmark", start.isoformat(), None
     )
+    raw_capture.set_job_run_id(run_id)
+    lineage.current().facet(job_run_id=run_id)
     try:
         accounts: list[dict] = []
+        held_back: list[dict] = []
         for account_id in account_ids:
             subject = connection.execute(
                 "SELECT subject_type FROM platform_subjects WHERE subject_id = ?",
                 (account_id,),
             ).fetchone()
-            result = refresh_and_materialize(
-                connection, account_id=account_id, start_date=start
-            )
+            try:
+                result = refresh_and_materialize(
+                    connection, account_id=account_id, start_date=start
+                )
+            except publish_gate.BuildHeldBack as error:
+                # The publish gate (enforce) kept this subject's last good comparison;
+                # the other subjects carry on.
+                connection.rollback()
+                held_back.append({"account_id": account_id, "reason": str(error)[:1000]})
+                continue
+            except NoBenchmarkContract as error:
+                # A subject live before its benchmark was chosen has nothing to compare
+                # with; it waits for its contract while the other subjects carry on.
+                connection.rollback()
+                held_back.append({"account_id": account_id, "reason": str(error)[:1000],
+                                  "kind": "no_benchmark_contract"})
+                continue
             _mark_wave0_benchmark_fx_reconciled(connection, result)
             # Crisis-period holdings and symbols may leave Azure only after the
             # owner has approved the exact disclosure in the onboarding wizard.
@@ -202,6 +279,7 @@ def main() -> int:
                         connection, account_id=account_id
                     )
             accounts.append(result)
+        scenarios = _refresh_crisis_scenarios(connection)
         result = {
             "status": "success",
             "accounts": accounts,
@@ -213,7 +291,10 @@ def main() -> int:
                 int(item.get("crisis_replay", {}).get("observations", 0))
                 for item in accounts
             ),
+            "crisis_scenarios": scenarios,
         }
+        if held_back:
+            result["held_back_by_publish_gate"] = held_back
         payload = canonical_json(result)
         finish_run_success(
             connection,
@@ -225,8 +306,11 @@ def main() -> int:
             + int(result["crisis_replay_observations"]),
             reconciliation_json=payload,
         )
+        _record_outputs(result)
         print(payload)
-        return 0
+        # The run record stays a success, so the next jobs' readiness is not stopped for
+        # every subject; the exit code shows the hold.
+        return publish_gate.EXIT_REJECTED if held_back else 0
     except Exception as error:
         finish_run_failure(connection, run_id, str(error))
         raise
@@ -235,4 +319,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-benchmark-daily", main))

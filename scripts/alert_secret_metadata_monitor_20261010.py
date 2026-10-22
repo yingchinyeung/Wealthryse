@@ -8,6 +8,8 @@ RULE='ibkr-v2-secret-metadata-findings'
 PATH=c.rid('Microsoft.Insights/scheduledQueryRules',RULE)+'?api-version=2023-12-01'
 WORKSPACE='5264a124-10cd-45f6-93a5-6d65c37e9bfb'
 OUT=c.OUT/'alert-v3'
+# v2's own owner route since 18 Oct 2026; v1.1's ibkr-v11-daily-alerts was deleted with v1.1.
+ACTION_GROUP=c.BASE+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts'
 
 
 def query(source='ContainerAppConsoleLogs_CL'):
@@ -20,9 +22,9 @@ def query(source='ContainerAppConsoleLogs_CL'):
 | top 1 by TimeGenerated desc;
 union
 (Latest
-| extend Stamp=todatetime(E.checked_at), MissingVaults=set_difference(dynamic(VAULTS), pack_array(tostring(E.vaults[0].vault),tostring(E.vaults[1].vault),tostring(E.vaults[2].vault)))
+| extend Stamp=todatetime(E.checked_at), MissingVaults=set_difference(dynamic(VAULTS), pack_array(tostring(E.vaults[0].vault),tostring(E.vaults[1].vault)))
 | extend Invalid=isempty(tostring(E.schema)) or tostring(E.schema) != 'wealthryse-secret-metadata-v1' or tostring(E.version) != '20261010-v1'
-    or tostring(E.kind) != 'complete' or isnull(toint(E.vault_count)) or toint(E.vault_count) != 3 or array_length(E.vaults) != 3 or array_length(MissingVaults) != 0
+    or tostring(E.kind) != 'complete' or isnull(toint(E.vault_count)) or toint(E.vault_count) != 2 or array_length(E.vaults) != 2 or array_length(MissingVaults) != 0
     or isnull(Stamp) or Stamp > now()+5m or TimeGenerated > now()+5m
     or isnull(toint(E.secret_values_read)) or toint(E.secret_values_read) != 0
     or isnull(toint(E.secret_values_changed)) or toint(E.secret_values_changed) != 0
@@ -45,7 +47,7 @@ def definition():
             'criteria':{'allOf':[{'query':query(),'timeAggregation':'Count','operator':'GreaterThan','threshold':0,
                 'dimensions':[{'name':'Scope','operator':'Include','values':['*']}],
                 'failingPeriods':{'numberOfEvaluationPeriods':1,'minFailingPeriodsToAlert':1}}]},
-            'actions':{'actionGroups':[c.BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts']}}}
+            'actions':{'actionGroups':[ACTION_GROUP]}}}
 
 
 def verify(live):
@@ -61,7 +63,7 @@ def verify(live):
 
 
 def cases():
-    now=datetime.now(timezone.utc);base={'schema':c.monitor.SCHEMA,'version':c.monitor.VERSION,'checked_at':now.isoformat(),'kind':'complete','vault_count':3,
+    now=datetime.now(timezone.utc);base={'schema':c.monitor.SCHEMA,'version':c.monitor.VERSION,'checked_at':now.isoformat(),'kind':'complete','vault_count':len(c.monitor.VAULTS),
         'vaults':[{'vault':v} for v in c.monitor.VAULTS],'errors':[],'finding_count':0,'secret_values_read':0,'secret_values_changed':0,'expiry_changes':0,'permissions_changed':0}
     yield 'healthy',base,now,0
     yield 'empty',None,now,1
@@ -69,8 +71,8 @@ def cases():
     yield 'stale_payload_recent_ingestion',dict(base,checked_at=(now-timedelta(hours=27)).isoformat()),now,1
     yield 'future',dict(base,checked_at=(now+timedelta(hours=1)).isoformat()),now,1
     yield 'findings',dict(base,finding_count=2),now,1
-    yield 'partial',dict(base,vault_count=2,vaults=base['vaults'][:2]),now,1
-    yield 'wrong_vault',dict(base,vaults=[{'vault':'other'}]*3),now,1
+    yield 'partial',dict(base,vault_count=1,vaults=base['vaults'][:1]),now,1
+    yield 'wrong_vault',dict(base,vaults=[{'vault':'other'}]*len(c.monitor.VAULTS)),now,1
     yield 'failed',dict(base,kind='failed',errors=[{'error_type':'RuntimeError'}]),now,1
     yield 'malformed',{'schema':'invalid'},now,1
     for key in ('schema','version','checked_at','vault_count','vaults','errors','finding_count','secret_values_read','secret_values_changed','expiry_changes','permissions_changed'):
@@ -101,7 +103,7 @@ def main(stage):
     if not runtime['passed'] or not schedule['passed']:raise ValueError('Monitor not accepted')
     if stage=='plan':
         if c.request('GET',PATH,missing=True) is not None:raise ValueError('Existing alert must not be overwritten')
-        group=c.request('GET',c.BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts?api-version=2023-01-01')['properties']
+        group=c.request('GET',ACTION_GROUP+'?api-version=2023-01-01')['properties']
         emails=group.get('emailReceivers',[])
         if group.get('enabled') is not True or len(emails)!=1 or emails[0].get('emailAddress')!='anthony.ying@wealthryse.ai' or emails[0].get('status')!='Enabled' or any(v for k,v in group.items() if k.endswith('Receivers') and k!='emailReceivers'):raise ValueError('Previously approved owner-only route required')
         live=c.az('monitor','log-analytics','query','-w',WORKSPACE,'--analytics-query',query())
@@ -113,7 +115,7 @@ def main(stage):
     if plan['definition']!=definition():raise ValueError('Alert definition drift')
     if stage=='apply':
         if c.request('GET',PATH,missing=True) is not None or (OUT/'apply-intent.json').exists():raise ValueError('Reconcile existing alert')
-        group=c.request('GET',c.BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts?api-version=2023-01-01')['properties']
+        group=c.request('GET',ACTION_GROUP+'?api-version=2023-01-01')['properties']
         if c.fingerprint(group)!=plan['owner_route_sha256']:raise ValueError('Alert recipient drift')
         c.save(OUT,'apply-intent',{'definition':definition(),'plan_receipt':plan['protected_receipt']});ack=c.request('PUT',PATH,data=definition())
         c.save(OUT,'apply-ack',{'id':ack['id']});print('Owner-routed metadata alert created');return

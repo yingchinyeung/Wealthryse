@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from unittest.mock import MagicMock, patch
 import hashlib
@@ -26,6 +27,7 @@ from ibkr_etl.web import (
     _security_audit_event,
     SECURITY_HEADERS,
     account_page,
+    account_subpage,
     account_root,
     cash_activity,
     home,
@@ -364,12 +366,13 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("account_onboarding_approvals", source)
         self.assertIn('"transmission_started": False', source)
 
-    def test_risk_attribution_converts_validated_native_currency_positions_to_usd(self) -> None:
+    def test_risk_attribution_converts_validated_native_currency_positions_to_reporting_currency(self) -> None:
         source = Path("src/ibkr_etl/risk_snapshots.py").read_text(encoding="utf-8")
         self.assertIn("LEFT JOIN LATERAL", source)
         self.assertIn("FROM reference_fx_rates AS r", source)
         self.assertIn("p.snapshot_date::date - INTERVAL '4 days'", source)
-        self.assertIn("WHEN fx.rate IS NOT NULL THEN 'USD'", source)
+        self.assertIn("WHEN fx.rate IS NOT NULL THEN ?", source)
+        self.assertIn("AND r.to_currency = ?", source)
         self.assertIn("NOT LIKE '%%.REC'", source)
         self.assertIn("p.snapshot_date = ANY(?::text[])", source)
 
@@ -600,6 +603,14 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertEqual(SECURITY_HEADERS["Cache-Control"], "no-store")
         self.assertEqual(SECURITY_HEADERS["X-Content-Type-Options"], "nosniff")
         self.assertEqual(SECURITY_HEADERS["Referrer-Policy"], "same-origin")
+        self.assertIn("frame-ancestors 'none'", SECURITY_HEADERS["Content-Security-Policy"])
+
+    def test_only_pdfs_may_be_framed_and_only_by_the_portal(self) -> None:
+        pdf = web.security_headers_for("application/pdf")["Content-Security-Policy"]
+        self.assertIn("frame-ancestors 'self'", pdf)
+        self.assertNotIn("frame-ancestors 'none'", pdf)
+        for kind in ("text/html; charset=utf-8", "application/json", None):
+            self.assertIn("frame-ancestors 'none'", web.security_headers_for(kind)["Content-Security-Policy"])
         self.assertIn("frame-ancestors 'none'", SECURITY_HEADERS["Content-Security-Policy"])
 
     def test_authorized_user_requires_every_configured_identity_claim(self) -> None:
@@ -972,14 +983,64 @@ class PortfolioWebTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.status_code, 404)
 
+    def test_filtered_portfolio_trade_history_uses_kept_source_trades(self) -> None:
+        access = {
+            "subject_id": "hong-kong-china",
+            "subject_type": "filtered_portfolio",
+            "reporting_currency": "USD",
+            "history_start_date": "2025-01-20",
+        }
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = {"latest": "2026-10-07"}
+        connection.execute.return_value.fetchall.return_value = [
+            {"trade_date": "2026-10-06", "symbol": "700", "currency": "HKD", "total_count": 1}
+        ]
+        database = MagicMock()
+        database.__enter__.return_value = connection
+        with patch.object(web, "_portfolio_access_context", return_value=access), patch.object(
+            web, "_database", return_value=database
+        ):
+            result = trade_history(
+                "hong-kong-china",
+                user={"email": "analyst@example.com", "object_id": "object-123"},
+            )
+        self.assertNotIn("not_applicable", result)
+        self.assertEqual(result["total_count"], 1)
+        self.assertEqual(result["trades"][0]["symbol"], "700")
+        latest_sql, latest_params = connection.execute.call_args_list[0].args
+        self.assertIn("subject_nav_series", latest_sql)
+        self.assertEqual(latest_params, (web.TENANT_ID, "hong-kong-china", "USD"))
+        trade_sql, trade_params = connection.execute.call_args_list[1].args
+        self.assertIn("derived_portfolio_cash_ledger", trade_sql)
+        self.assertIn("LIMIT 500", trade_sql)
+        self.assertIn("t.trade_date DESC", trade_sql)
+        self.assertEqual(trade_params[:2], (web.TENANT_ID, "hong-kong-china"))
+        self.assertEqual(trade_params[6:8], ("2025-01-20", "2026-10-07"))
+
+    def test_composite_portfolio_trade_history_is_not_applicable(self) -> None:
+        access = {
+            "subject_id": "alpha-world-ms",
+            "subject_type": "composite_portfolio",
+            "reporting_currency": "HKD",
+            "history_start_date": "2025-01-20",
+        }
+        with patch.object(web, "_portfolio_access_context", return_value=access), patch.object(
+            web, "_database", side_effect=AssertionError("database must not be opened")
+        ):
+            result = trade_history(
+                "alpha-world-ms",
+                user={"email": "analyst@example.com", "object_id": "object-123"},
+            )
+        self.assertTrue(result["not_applicable"])
+
     def test_home_is_account_directory(self) -> None:
         page = home(None, {"email": "analyst@example.com"})
         self.assertIn("<h1>Accounts</h1>", page)
         self.assertIn("WealthRyse Portfolio Data Platform", page)
         self.assertNotIn(">IBKR Portfolio Platform<", page)
         self.assertIn('href="/accounts/U16088571/overview"', page)
-        self.assertIn("U16088571-U.S. Technology and Biotechnology", page)
-        self.assertNotIn("U16088571 (U.S. Technology and Biotechnology)", page)
+        self.assertIn('<div class="account-id">U.S. Technology and Biotechnology</div>', page)
+        self.assertNotIn("U16088571-U.S. Technology and Biotechnology", page)
         self.assertIn("Select an account to open its portfolio workspace", page)
         self.assertIn('class="company-logo"', page)
         self.assertIn('alt="Sprout Asset Management (Asia) Limited company logo"', page)
@@ -1012,7 +1073,7 @@ class PortfolioWebTests(unittest.TestCase):
         }
         health_page = web.system_health_page(None, owner)
         self.assertIn("Platform-wide data freshness", health_page)
-        self.assertIn("All accounts and portfolios", health_page)
+        self.assertNotIn("Platform workspace", health_page)
         self.assertIn('aria-current="page">System health</a>', health_page)
         self.assertNotIn('aria-label="U16088571 sections"', health_page)
 
@@ -1151,6 +1212,7 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("grid-template-columns: repeat(4, minmax(0, 1fr))", page)
         self.assertIn("@media (max-width: 650px)", page)
         self.assertIn("WealthRyse Portfolio Data Platform", page)
+        self.assertNotIn('class="brand-title"', page)
         self.assertNotIn(">IBKR Portfolio Platform<", page)
         self.assertIn('href="/accounts/U16088571/performance"', page)
         self.assertIn('href="/accounts/U16088571/trades"', page)
@@ -1174,7 +1236,7 @@ class PortfolioWebTests(unittest.TestCase):
         self.assertIn("Risk analytics through", page)
         self.assertIn("Expected maximum drawdown (1 year)", page)
         self.assertIn("Crisis maximum drawdown (15/9/2008–9/3/2009)", page)
-        self.assertIn("hypothetical fixed-unit replay", page)
+        self.assertIn("Hypothetical fixed-unit crisis replay", page)
         self.assertIn("Daily Expected Tail Loss (95%)", page)
         self.assertIn("Top 5 Expected Tail Loss contributors", page)
         self.assertIn("Bottom 5 Expected Tail Loss contributors", page)
@@ -1278,8 +1340,42 @@ class PortfolioWebTests(unittest.TestCase):
             {"email": "analyst@example.com"},
         )
         self.assertIn('class="page-view active" data-section="risk"', risk_page)
-        self.assertIn('<h2>Risk analytics</h2>', risk_page)
+        self.assertIn('<h2 class="sr-only">Risk analytics</h2>', risk_page)
         self.assertEqual(risk_page.count('class="page-view active"'), 1)
+
+        modelling_page = account_page(
+            "U16088571",
+            "modelling",
+            None,
+            {"email": "analyst@example.com"},
+        )
+        self.assertIn('class="page-view active" data-section="modelling"', modelling_page)
+        self.assertIn('href="/accounts/U16088571/modelling"', modelling_page)
+        for card in ("model-projection", "model-risk", "model-regimes", "model-whatif", "model-optimise",
+                     "model-factors", "model-stress"):
+            self.assertIn(f'id="{card}"', modelling_page)
+            self.assertIn(f'data-part-link="{card}"', modelling_page)
+        self.assertIn("if(activeSection==='modelling')renderModelling(asOf);", modelling_page)
+        # Every section is in one page, so a reused element ID sends one card's results into another.
+        for page_html in (risk_page, modelling_page):
+            ids = re.findall(r'\bid="([^"]+)"', page_html)
+            self.assertEqual(sorted({x for x in ids if ids.count(x) > 1}), [])
+        self.assertIn("document.querySelector('#model-risk-note')", modelling_page)
+
+    def test_account_sections_split_into_subpages(self) -> None:
+        user = {"email": "analyst@example.com"}
+        what_if = account_subpage("U16088571", "modelling", "what-if", None, user)
+        self.assertIn('href="/accounts/U16088571/modelling/what-if" data-part-link="model-whatif" aria-current="page"', what_if)
+        self.assertIn('href="/accounts/U16088571/risk/drawdowns"', what_if)
+        self.assertIn('class="account-nav-menu"', what_if)
+        self.assertIn('"model-whatif"', what_if)
+        risk = account_page("U16088571", "risk", None, user)
+        self.assertIn('href="/accounts/U16088571/risk/snapshot" data-part-link="risk-summary" aria-current="page"', risk)
+        for account_id, section, part in (("U16088571", "modelling", "nope"), ("U16088571", "cash", "snapshot"),
+                                          ("ANOTHER_ACCOUNT", "risk", "snapshot")):
+            with self.subTest(section=section, part=part), self.assertRaises(HTTPException) as raised:
+                account_subpage(account_id, section, part, None, user)
+            self.assertEqual(raised.exception.status_code, 404)
 
     def test_account_subpages_reject_unknown_accounts_and_sections(self) -> None:
         for account_id, section in (
@@ -1491,6 +1587,39 @@ class PortfolioWebTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(raised.exception.detail["code"], "admin_actions_disabled")
+
+
+class DerivedRefreshStartTests(unittest.TestCase):
+    """Onboarding starts derived-daily with the readiness check in shadow, so it never waits or stops."""
+
+    def test_web_starts_derived_daily_with_readiness_in_shadow(self) -> None:
+        from ibkr_etl import input_readiness
+
+        self.assertEqual(web.WEB_DERIVED_REFRESH_ENV, {input_readiness.MODE_ENV: "shadow"})
+        with patch.object(web, "start_job_with_env", return_value="execution-1") as start:
+            self.assertEqual(web._start_derived_refresh(), "execution-1")
+        start.assert_called_once_with(web.ADMIN_ACTION_CONFIG, web.DERIVED_REFRESH_JOB_NAME,
+                                      {"INPUT_READINESS_MODE": "shadow"}, needed=web._readiness_could_hold)
+
+    def test_only_a_job_set_to_enforce_needs_the_override(self) -> None:
+        # Unset, off, shadow or not understood (runs as shadow): the job starts as configured.
+        for own in ({}, {"INPUT_READINESS_MODE": "off"}, {"INPUT_READINESS_MODE": "shadow"},
+                    {"INPUT_READINESS_MODE": "bogus"}, {"OTHER": "enforce"}):
+            self.assertFalse(web._readiness_could_hold(own), own)
+        # Enforce, or a value held in a secret that the web cannot see.
+        for own in ({"INPUT_READINESS_MODE": "enforce"}, {"INPUT_READINESS_MODE": " ENFORCE "},
+                    {"INPUT_READINESS_MODE": None}):
+            self.assertTrue(web._readiness_could_hold(own), own)
+
+    def test_every_onboarding_start_of_derived_daily_uses_it(self) -> None:
+        import inspect
+
+        for endpoint in (web.queue_onboarding_calculation, web.queue_onboarding_analytics):
+            source = inspect.getsource(endpoint)
+            self.assertIn("_start_derived_refresh()", source)
+            self.assertNotIn("_default_job_starter(ADMIN_ACTION_CONFIG, DERIVED_REFRESH_JOB_NAME", source)
+        self.assertNotIn("_default_job_starter(ADMIN_ACTION_CONFIG, DERIVED_REFRESH_JOB_NAME",
+                         inspect.getsource(web))
 
 
 if __name__ == "__main__":

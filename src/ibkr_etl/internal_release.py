@@ -14,6 +14,11 @@ ALLOWED_INTERNAL_BLOCKERS = frozenset(
         "sector_allocation:not_licensed_for_publication",
     }
 )
+# An owner's own design (factsheet_spec, template_version "spec:<sha>") has no crisis
+# replay component, so a missing replay leaves nothing on its pages unfilled (Korea
+# iStrategy, 20 October 2026). Every built-in design still requires one.
+CRISIS_REPLAY_BLOCKER = "risk:crisis_replay_unavailable"
+SPEC_TEMPLATE_PREFIX = "spec:"
 _BENCHMARK_LICENSE_BLOCKER = re.compile(
     r"(?:primary|secondary(?:_[1-9][0-9]*)?)_benchmark:not_licensed_for_publication\Z"
 )
@@ -47,19 +52,23 @@ def approve_internal_release(
 
     raw_blockers = snapshot.get("publication_blockers_json") or "[]"
     blockers = tuple(json.loads(raw_blockers) if isinstance(raw_blockers, str) else raw_blockers)
+    allowed = set(ALLOWED_INTERNAL_BLOCKERS)
+    if report_runs and all(str(row.get("template_version") or "").startswith(SPEC_TEMPLATE_PREFIX)
+                           for row in report_runs):
+        allowed.add(CRISIS_REPLAY_BLOCKER)
     unexpected = {
         blocker for blocker in blockers
-        if blocker not in ALLOWED_INTERNAL_BLOCKERS
+        if blocker not in allowed
         and not _BENCHMARK_LICENSE_BLOCKER.fullmatch(blocker)
     }
     if unexpected:
         raise InternalReleaseError(
             f"Internal release has non-licensing blockers: {sorted(unexpected)}"
         )
-    expected_types = {"factsheet", "presentation"}
-    actual_types = {str(row.get("report_type")) for row in report_runs}
-    if actual_types != expected_types or len(report_runs) != 2:
-        raise InternalReleaseError("Internal release requires one factsheet and one presentation")
+    # The factsheet, plus a deck only where one was built before decks were retired.
+    kinds = [str(row.get("report_type")) for row in report_runs]
+    if len(kinds) != len(set(kinds)) or "factsheet" not in kinds or not set(kinds) <= {"factsheet", "presentation"}:
+        raise InternalReleaseError("Internal release requires one factsheet, and at most one presentation")
     for row in report_runs:
         if str(row.get("snapshot_id")) != str(snapshot.get("snapshot_id")):
             raise InternalReleaseError("Every artifact must reference the approved snapshot")

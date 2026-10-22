@@ -5,18 +5,23 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Callable, Iterable, Mapping
 
+from . import publish_gate, raw_capture
 from .provisional_benchmark import (
     convert_levels_to_reporting_currency,
     fetch_fx_to_reporting_yfinance,
 )
 from .sector_classification import candidate_symbols
 from .util import utc_now_iso
+from .crisis_identity_policy import apply_identity_proxy
 
 
 CRISIS_START = date(2008, 9, 15)
 CRISIS_END = date(2009, 3, 9)
 CRISIS_OPENING_LOOKBACK_DAYS = 10
 PROVIDER = "Yahoo Finance via yfinance"
+# Raw-capture feed for crisis-window prices. Callers name it explicitly, so other
+# users of fetch_adjusted_history (such as fama_french) never file under it.
+RAW_FEED = "yahoo-crisis-history"
 PRICE_TYPE = "adjusted_close"
 CALCULATION_VERSION = "as-of-holdings-crisis-replay-v3"
 
@@ -88,12 +93,13 @@ def fetch_adjusted_history(
     *,
     start_date: date = CRISIS_START,
     end_date: date = CRISIS_END,
+    capture_feed: str | None = None,
 ) -> dict[str, float]:
     if ticker_factory is None:
         import yfinance as yf
 
         ticker_factory = yf.Ticker
-    frame = ticker_factory(symbol).history(
+    request = dict(
         start=start_date.isoformat(),
         end=(end_date + timedelta(days=1)).isoformat(),
         interval="1d",
@@ -102,6 +108,18 @@ def fetch_adjusted_history(
         actions=False,
         timeout=30,
     )
+    requested_at = raw_capture.utc_now()
+    frame = ticker_factory(symbol).history(**request)
+    if capture_feed:
+        raw_capture.capture_frame(
+            capture_feed,
+            PROVIDER,
+            frame=frame,
+            request={"symbol": symbol, "method": "history", **request},
+            key=raw_capture.request_key(symbol, request["start"], request["end"], request["interval"]),
+            requested_at=requested_at,
+            history=raw_capture.settled(end_date, now=requested_at),
+        )
     return _normalized_adjusted_history(
         frame,
         start_date=start_date,
@@ -384,6 +402,7 @@ def refresh_composite_crisis_replay(
                 ticker_factory,
                 start_date=start_date,
                 end_date=CRISIS_END,
+                capture_feed=RAW_FEED,
             )
             cache[symbol] = {**fetched, **(current or {})}
         return cache[symbol]
@@ -554,11 +573,21 @@ def refresh_composite_crisis_replay(
                 CALCULATION_VERSION, generated_at,
             ),
         )
+    _before_commit(connection, account_id, latest)
     connection.commit()
     loaded = load_crisis_replay(connection, account_id=account_id, as_of=latest)
     if loaded is None:
         raise RuntimeError("The composite crisis replay could not be reloaded")
     return loaded
+
+
+def _before_commit(connection: Any, account_id: str, latest: str) -> None:
+    """The publish gate on the replay just written (off by default). It logs its verdict
+    only: readers show the replay for one exact holdings date."""
+    partition = {"subject_id": account_id, "holdings_as_of": latest}
+    publish_gate.before_commit(
+        connection, {"gold.crisis_replay_daily": partition, "gold.crisis_replay_components": partition},
+        writer="crisis_replay")
 
 
 def load_crisis_replay(
@@ -637,6 +666,99 @@ def load_crisis_replay(
     }
 
 
+# A Korean-won account (Kiwoom) is replayed in won, on its own market: each KRX
+# holding's adjusted close, or the KOSPI or KOSDAQ index for a holding with no
+# complete crisis history. The window and its trading days are the same SPY
+# calendar every other account uses; a KRX close is carried across Korean
+# holidays (Chuseok closed KRX on 15 September 2008) from the latest earlier
+# close, never a later one.
+KRX_PROXY_BY_SUFFIX = {".KS": "^KS11", ".KQ": "^KQ11"}
+KRX_PROXY_NAMES = {"^KS11": "KOSPI Composite Index", "^KQ11": "KOSDAQ Composite Index"}
+PROXY_NAMES.update(KRX_PROXY_NAMES)
+
+
+def _subject_reporting_currency(connection: Any, account_id: str, sqlite: bool) -> str:
+    if sqlite:
+        return "USD"
+    row = _execute(
+        connection, "SELECT reporting_currency FROM platform_subjects WHERE subject_id = ?", (account_id,),
+    ).fetchone()
+    return str((row["reporting_currency"] if row else None) or "USD")
+
+
+def _krx_complete(series: Mapping[str, float], market_days: list[str]) -> bool:
+    """A KRX close on or before the window opens, and one on every KRX trading day in it."""
+    return bool(series) and min(series) <= CRISIS_START.isoformat() and all(day in series for day in market_days)
+
+
+def _krw_components(
+    holdings: Iterable[Mapping[str, Any]],
+    ticker_factory: Callable[[str], Any] | None,
+    cache: dict[str, dict[str, float]],
+) -> tuple[list[ReplayComponent], dict[str, dict[str, float]], list[str]]:
+    start = CRISIS_START - timedelta(days=CRISIS_OPENING_LOOKBACK_DAYS)
+
+    def load(symbol: str, *, lookback: bool) -> dict[str, float]:
+        key = f"{symbol}@lookback" if lookback else symbol
+        if key not in cache:
+            cache[key] = fetch_adjusted_history(
+                symbol, ticker_factory, start_date=start if lookback else CRISIS_START, capture_feed=RAW_FEED)
+        return cache[key]
+
+    spy = load("SPY", lookback=False)
+    calendar = list(spy)
+    if not _complete(spy, calendar) or calendar[0] != CRISIS_START.isoformat() or calendar[-1] != CRISIS_END.isoformat():
+        raise RuntimeError("SPY does not provide a complete crisis-period calendar")
+    kospi = load("^KS11", lookback=True)
+    market_days = [day for day in kospi if CRISIS_START.isoformat() <= day <= CRISIS_END.isoformat()]
+    if not market_days or min(kospi) > CRISIS_START.isoformat():
+        raise RuntimeError("The KOSPI index does not cover the crisis window")
+    fetched: dict[str, dict[str, float]] = {"^KS11": _align_to_calendar(kospi, calendar)}
+    if not _krx_complete(kospi, market_days):
+        raise RuntimeError("Market proxy ^KS11 lacks complete crisis-period data")
+
+    def proxy_for(suffix: str) -> str:
+        # KOSDAQ names take the KOSDAQ index when Yahoo has it for the whole window, else KOSPI.
+        proxy = KRX_PROXY_BY_SUFFIX[suffix]
+        if proxy not in fetched:
+            series = load(proxy, lookback=True)
+            if not _krx_complete(series, market_days):
+                return "^KS11"
+            fetched[proxy] = _align_to_calendar(series, calendar)
+        return proxy
+    components: list[ReplayComponent] = []
+    for row in holdings:
+        symbol = str(row["symbol"]).strip().upper()
+        currency = str(row["currency"] or "").strip().upper()
+        if currency != "KRW":
+            raise RuntimeError(f"{symbol} is held in {currency or 'no currency'}; a won replay takes KRW holdings only")
+        source_symbol, listed_suffix = "", ".KS"
+        for candidate in candidate_symbols(symbol, str(row["listing_exchange"] or ""), currency):
+            suffix = next((s for s in KRX_PROXY_BY_SUFFIX if candidate.endswith(s)), None)
+            if suffix is None:
+                continue
+            series = load(candidate, lookback=True)
+            if series and suffix == ".KQ":
+                listed_suffix = ".KQ"
+            if _krx_complete(series, market_days):
+                source_symbol = candidate
+                fetched[candidate] = _align_to_calendar(series, calendar)
+                break
+        if source_symbol:
+            mapping_method, reason = "direct", None
+        else:
+            source_symbol = proxy_for(listed_suffix)
+            mapping_method = "market_proxy"
+            reason = f"{symbol} lacks a complete adjusted-close series for the crisis window"
+        components.append(ReplayComponent(
+            conid=str(row["conid"]), symbol=symbol, description=str(row["description"] or ""),
+            currency="KRW", market_value=float(row["market_value"]), source_symbol=source_symbol,
+            mapping_method=mapping_method, proxy_reason=reason,
+        ))
+    used = {component.source_symbol for component in components}
+    return components, {symbol: series for symbol, series in fetched.items() if symbol in used}, calendar
+
+
 def refresh_crisis_replay(
     connection: Any,
     *,
@@ -645,6 +767,7 @@ def refresh_crisis_replay(
     ticker_factory: Callable[[str], Any] | None = None,
     price_cache: dict[str, dict[str, float]] | None = None,
     persisted_price_symbols: set[str] | None = None,
+    reporting_currency: str | None = None,
 ) -> dict[str, Any]:
     requested = _iso_date(holdings_as_of)
     latest = resolve_holdings_as_of(
@@ -682,11 +805,43 @@ def refresh_crisis_replay(
     if not holdings:
         raise RuntimeError(f"No holdings are available for {account_id} on {latest}")
     cache = price_cache if price_cache is not None else {}
+    reporting = (reporting_currency or (
+        # Only a subject holding won needs its reporting currency looked up.
+        _subject_reporting_currency(connection, account_id, sqlite)
+        if any(str(row["currency"] or "").strip().upper() == "KRW" for row in holdings) else "USD"
+    )).upper()
+    if reporting == "KRW":
+        components, fetched, calendar = _krw_components(holdings, ticker_factory, cache)
+    else:
+        components, fetched, calendar = _usd_components(
+            connection, account_id=account_id, latest=latest, holdings=holdings,
+            ticker_factory=ticker_factory, cache=cache,
+        )
+    result = _store_replay(
+        connection, account_id=account_id, requested=requested, latest=latest,
+        components=components, prices=fetched, calendar=calendar, portfolio_nav=portfolio_nav,
+        persisted_price_symbols=persisted_price_symbols, currency=reporting,
+    )
+    _before_commit(connection, account_id, latest)
+    connection.commit()
+    return result
+
+
+
+def _usd_components(
+    connection: Any,
+    *,
+    account_id: str,
+    latest: str,
+    holdings: Iterable[Mapping[str, Any]],
+    ticker_factory: Callable[[str], Any] | None,
+    cache: dict[str, dict[str, float]],
+) -> tuple[list[ReplayComponent], dict[str, dict[str, float]], list[str]]:
     fx_cache: dict[str, list[tuple[str, float]]] = {}
 
     def load_prices(symbol: str) -> dict[str, float]:
         if symbol not in cache:
-            cache[symbol] = fetch_adjusted_history(symbol, ticker_factory)
+            cache[symbol] = fetch_adjusted_history(symbol, ticker_factory, capture_feed=RAW_FEED)
         return cache[symbol]
 
     def prices_in_usd(symbol: str, currency: str) -> dict[str, float]:
@@ -742,6 +897,19 @@ def refresh_crisis_replay(
             as_of=latest,
         )
         market_value = float(row["market_value"]) * fx_rate
+        identity = None
+        if account_id == 'U16088571':
+            identity = apply_identity_proxy({'conid':str(row['conid']), 'holding_symbol':symbol},
+                                            subject_id=account_id, crisis_start=CRISIS_START.isoformat())
+        if identity and identity.get('proxy_policy_version'):
+            # Apply verified identity policy BEFORE vendor history can appear
+            # complete. A historical ticker path alone is not lineage proof.
+            components.append(ReplayComponent(
+                conid=str(row['conid']), symbol=symbol,
+                description=str(row['description'] or ''), currency='USD',
+                market_value=market_value, source_symbol=identity['source_symbol'],
+                mapping_method=identity['mapping_method'], proxy_reason=identity['proxy_reason']))
+            continue
         source_symbol = ""
         for candidate in candidate_symbols(
             symbol, str(row["listing_exchange"] or ""), currency
@@ -777,7 +945,25 @@ def refresh_crisis_replay(
                 proxy_reason=reason,
             )
         )
+    return components, fetched, calendar
 
+
+def _store_replay(
+    connection: Any,
+    *,
+    account_id: str,
+    requested: str | None,
+    latest: str,
+    components: list[ReplayComponent],
+    prices: Mapping[str, Mapping[str, float]],
+    calendar: list[str],
+    portfolio_nav: float,
+    persisted_price_symbols: set[str] | None,
+    currency: str,
+) -> dict[str, Any]:
+    """Calculate the fixed-unit replay and store it with its components and prices."""
+
+    fetched = prices
     replay = calculate_fixed_unit_replay(
         components=components,
         portfolio_nav=portfolio_nav,
@@ -799,13 +985,13 @@ def refresh_crisis_replay(
                 INSERT INTO market_data_prices(
                     instrument_id, price_date, symbol, instrument_name, price_type,
                     currency, price, source, source_url, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tenant_id, instrument_id, price_date, price_type)
                 DO UPDATE SET price = excluded.price, source = excluded.source,
                     source_url = excluded.source_url, fetched_at = excluded.fetched_at
                 """,
                 (instrument_id, price_date, source_symbol, instrument_name, PRICE_TYPE,
-                 price, PROVIDER,
+                 currency, price, PROVIDER,
                  f"yfinance:TICKER({source_symbol}):history(auto_adjust=False):Adj Close",
                  generated_at),
             )
@@ -850,7 +1036,6 @@ def refresh_crisis_replay(
              row["drawdown"], CRISIS_START.isoformat(), CRISIS_END.isoformat(),
              CALCULATION_VERSION, generated_at),
         )
-    connection.commit()
     direct_count = sum(component.mapping_method == "direct" for component in components)
     proxy_count = len(components) - direct_count
     return {
@@ -869,5 +1054,6 @@ def refresh_crisis_replay(
         "provider": PROVIDER,
         "price_type": PRICE_TYPE,
         "calculation_version": CALCULATION_VERSION,
+        "reporting_currency": currency,
         "publication_allowed": False,
     }

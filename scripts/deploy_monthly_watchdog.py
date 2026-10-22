@@ -65,7 +65,7 @@ def main():
                 or props["evaluationFrequency"] != "PT15M" or props["overrideQueryTimeRange"] != "P2D"
                 or props["severity"] != 2 or props["autoMitigate"] is not True
                 or len(props["actions"]["actionGroups"]) != 1
-                or not props["actions"]["actionGroups"][0].lower().endswith("/actiongroups/ibkr-v11-daily-alerts")):
+                or not props["actions"]["actionGroups"][0].lower().endswith("/actiongroups/ibkrv2stg-alerts")):
             raise RuntimeError("Monthly watchdog readback mismatch")
         after = az("containerapp", "job", "show", "-g", RG, "-n", JOB)["properties"]["configuration"]
         if config != after:

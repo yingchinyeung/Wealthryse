@@ -7,6 +7,7 @@ import urllib.request
 from collections import defaultdict
 from typing import Any, Callable, Mapping
 
+from . import raw_capture
 from .util import canonical_json, sha256_text, utc_now_iso
 
 
@@ -47,6 +48,21 @@ VERIFIED_HISTORICAL_OVERRIDES: dict[str, dict[str, str]] = {
             "8a8216d697769dcf0197b0abcc8900e4.pdf"
         ),
         "evidence": "verified_historical_override:twse-delisting-2025-06-27",
+    },
+    # Skydance distributed one SKYD WS warrant per SKYD Class B share (record
+    # date 5 Oct 2026); regular-way NYSE trading began 14 Oct 2026, before Yahoo
+    # published a profile for the warrant.  Each warrant converts into one SKYD
+    # share, so it carries the underlying's sector.  Owner-approved on
+    # 15 Oct 2026 and bound to the exact IBKR conid observed in U16088571.
+    # Yahoo still wins once it classifies the warrant itself.
+    "931131905": {
+        "symbol": "SKYD WS",
+        "lookup_symbol": "SKYD",
+        "sector": "Communication Services",
+        "industry": "Entertainment",
+        "exchange": "NYQ",
+        "source_url": "https://infomemo.theocc.com/infomemos?number=59906",
+        "evidence": "owner_approved_underlying_override:occ-memo-59906",
     },
 }
 
@@ -144,21 +160,52 @@ def _fetch_yahoo_search(symbol: str, timeout: int) -> Mapping[str, Any]:
             "enableFuzzyQuery": "false",
         }
     )
+    url = f"{YAHOO_SEARCH_URL}?{query}"
     request = urllib.request.Request(
-        f"{YAHOO_SEARCH_URL}?{query}",
+        url,
         headers={
             "Accept": "application/json",
             "User-Agent": "IBKR-Portfolio-Platform-Staging/2.0",
         },
     )
+    requested_at = raw_capture.utc_now()
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+        body = response.read()
+        status = getattr(response, "status", None)
+    raw_capture.capture_http("yahoo-sector-search", YAHOO_PROVIDER, url=url, body=body,
+                             key=symbol, status=status, extension="json",
+                             requested_at=requested_at)
+    return json.loads(body.decode("utf-8"))
 
 
 def _fetch_yfinance_profile(symbol: str) -> Mapping[str, Any]:
     import yfinance as yf
 
-    return yf.Ticker(symbol).get_info()
+    requested_at = raw_capture.utc_now()
+    profile = yf.Ticker(symbol).get_info()
+    raw_capture.capture_document("yahoo-sector-profile", "Yahoo Finance via yfinance",
+                                 payload=profile, request={"symbol": symbol, "method": "get_info"},
+                                 key=raw_capture.request_key(symbol, "info"), requested_at=requested_at)
+    return profile
+
+
+def _name(*values: Any) -> str | None:
+    """Yahoo's English company name: the long name, else the short one; None when it gives neither."""
+    for value in values:
+        text = " ".join(str(value or "").split())
+        if text:
+            return text[:200]
+    return None
+
+
+def has_long_name(connection) -> bool:
+    """Whether instrument_classifications has migration 080's long_name column yet."""
+    if connection.__class__.__module__.startswith("sqlite3"):
+        return any(row[1] == "long_name" for row in connection.execute(
+            "PRAGMA table_info(instrument_classifications)").fetchall())
+    return connection.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_name = 'instrument_classifications' "
+        "AND column_name = 'long_name' LIMIT 1").fetchone() is not None
 
 
 def lookup_classification(
@@ -200,6 +247,7 @@ def lookup_classification(
                 "sector": sector,
                 "industry": str(quote.get("industry") or "").strip(),
                 "exchange": str(quote.get("exchange") or "").strip(),
+                "long_name": _name(quote.get("longname"), quote.get("shortname")),
                 "status": "classified",
                 "quality_status": "warn",
                 "license_status": "restricted",
@@ -217,6 +265,7 @@ def lookup_classification(
             "sector": override["sector"],
             "industry": override["industry"],
             "exchange": override["exchange"],
+            "long_name": override.get("long_name"),
             "status": "classified",
             "quality_status": "warn",
             "license_status": "restricted",
@@ -246,6 +295,7 @@ def lookup_classification(
             "sector": sector,
             "industry": str(profile.get("industry") or "").strip(),
             "exchange": str(profile.get("exchange") or "").strip(),
+            "long_name": _name(profile.get("longName"), profile.get("shortName")),
             "status": "classified",
             "quality_status": "warn",
             "license_status": "restricted",
@@ -261,6 +311,7 @@ def lookup_classification(
         "sector": None,
         "industry": None,
         "exchange": None,
+        "long_name": None,
         "status": "unclassified",
         "quality_status": "warn",
         "license_status": "restricted",
@@ -302,6 +353,7 @@ def aggregate_sector_allocation(rows: list[Mapping[str, Any]]) -> dict[str, Any]
                     "sub_sector": sub_sector,
                     "market_value": market_value,
                     "weight": None,
+                    **({"long_name": row["long_name"]} if row.get("long_name") else {}),
                 }
             )
             if row.get("checked_at"):
@@ -377,15 +429,16 @@ def _classify_and_store(
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
 
+    named = has_long_name(connection) if results else False
     for result in results:
         connection.execute(
             """
             INSERT INTO instrument_classifications(
                 conid, provider, symbol, lookup_symbol, sector, industry,
                 exchange, status, quality_status, license_status, source_url,
-                response_sha256, error_code, checked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (tenant_id, conid, provider) DO UPDATE SET
+                response_sha256, error_code, checked_at{name_column}
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{name_value})
+            ON CONFLICT (tenant_id, conid, provider) DO UPDATE SET{name_update}
                 symbol = excluded.symbol,
                 lookup_symbol = excluded.lookup_symbol,
                 sector = excluded.sector,
@@ -398,7 +451,8 @@ def _classify_and_store(
                 response_sha256 = excluded.response_sha256,
                 error_code = excluded.error_code,
                 checked_at = excluded.checked_at
-            """,
+            """.format(name_column=", long_name" if named else "", name_value=", ?" if named else "",
+                       name_update=" long_name = excluded.long_name," if named else ""),
             (
                 result["conid"],
                 YAHOO_PROVIDER,
@@ -414,8 +468,14 @@ def _classify_and_store(
                 result["response_sha256"],
                 result["error_code"],
                 result["checked_at"],
+                *((result.get("long_name"),) if named else ()),
             ),
         )
+    if named:
+        # An instrument named in another script (Kiwoom names stocks in Korean) shows Yahoo's English name.
+        from .kiwoom_english import apply_english_names
+
+        apply_english_names(connection, [result["conid"] for result in results])
     connection.commit()
     return results
 
@@ -501,7 +561,13 @@ def refresh_sector_classifications_range(
     timeout: int = 20,
     fetcher: Callable[[str, int], Mapping[str, Any]] = _fetch_yahoo_search,
 ) -> dict[str, Any]:
-    """Classify every previously unclassified holding seen in a date range."""
+    """Classify every previously unclassified holding seen in a date range.
+
+    A KRW holding (Kiwoom) classified without Yahoo's English name is looked up again: its broker
+    name is Korean, so the factsheet prints Yahoo's. So is a Kiwoom U.S. holding (conid ``US:<ticker>``):
+    Kiwoom names it by its ticker only.
+    """
+    named = has_long_name(connection)
 
     unified = not connection.__class__.__module__.startswith("sqlite3") or connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = 'subject_position_series'"
@@ -513,7 +579,7 @@ def refresh_sector_classifications_range(
         SELECT DISTINCT p.conid, COALESCE(i.symbol, p.conid) AS symbol,
                COALESCE(i.listing_exchange, '') AS listing_exchange,
                COALESCE(p.currency, i.currency, '') AS currency,
-               CASE WHEN existing.status = 'classified' THEN 1 ELSE 0 END AS classified
+               CASE WHEN existing.status = 'classified'{needs_name} THEN 1 ELSE 0 END AS classified
         FROM {relation} p
         LEFT JOIN instruments i ON i.conid = p.conid
         LEFT JOIN instrument_classifications existing
@@ -521,7 +587,10 @@ def refresh_sector_classifications_range(
         WHERE p.{subject_column} = ? AND p.snapshot_date BETWEEN ? AND ?
           AND CAST(COALESCE(NULLIF(p.quantity_text, ''), '0') AS NUMERIC) <> 0
         ORDER BY p.conid
-        """.format(relation=relation, subject_column=subject_column),
+        """.format(relation=relation, subject_column=subject_column, needs_name=(
+            " AND NOT ((UPPER(COALESCE(p.currency, i.currency, '')) = 'KRW' OR p.conid LIKE 'US:%%')"
+            " AND existing.long_name IS NULL)"
+            if named else "")),
         (YAHOO_PROVIDER, subject_id, start_date, end_date),
     ).fetchall()
     holdings = [dict(row) for row in all_rows if not bool(row["classified"])]

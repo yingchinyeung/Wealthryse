@@ -1,0 +1,181 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.cash_snapshots
+name: cash_snapshots
+version: 1.0.1
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: Cash balance per account, statement date and currency, from the Flex cash report, or for a Kiwoom account
+    from Kiwoom's account answers.
+  limitations: 'Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks
+    the account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
+    are not versioned yet (review item 8). Kiwoom accounts (written by ibkr_etl.kiwoom_collector): today''s KRW
+    row has the D+2 deposit (kt00004 d2_entra) as ending cash and the deposit (entr) as settled cash. A past day''s
+    KRW row has the deposit (ka01690 dbst_bal) as both, since it already moves on the trade date. Each US currency
+    row has that currency''s deposit (fx_entr: ust21120 today, ust21132 for a past day) and Kiwoom''s rate to KRW.
+    A Kiwoom row''s row_sha256 is the sha256 of the row as written, not of a Flex row.'
+tags:
+- silver
+- ibkr
+- kiwoom
+schema:
+- name: cash_snapshots
+  physicalName: silver.cash_snapshots
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per account_id, snapshot_date and currency.
+  properties:
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: restricted
+    description: 'Broker account number (IBKR or Kiwoom). Restricted: never shown or logged in full.'
+  - name: snapshot_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: confidential-financial
+    description: Statement date.
+    quality:
+    - name: snapshot_date_is_iso_date
+      description: snapshot_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.cash_snapshots WHERE snapshot_date IS NOT NULL AND snapshot_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: Currency of the balance.
+  - name: ending_cash_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Ending cash (endingCash) as decimal text.
+    quality:
+    - name: ending_cash_text_is_decimal
+      description: ending_cash_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.cash_snapshots WHERE ending_cash_text IS NOT NULL AND ending_cash_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: settled_cash_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Ending settled cash (endingSettledCash) as decimal text.
+    quality:
+    - name: settled_cash_text_is_decimal
+      description: settled_cash_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.cash_snapshots WHERE settled_cash_text IS NOT NULL AND settled_cash_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: fx_rate_to_base_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Rate to the account's base currency (fxRateToBase) as decimal text.
+    quality:
+    - name: fx_rate_to_base_text_is_decimal
+      description: fx_rate_to_base_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.cash_snapshots WHERE fx_rate_to_base_text IS NOT NULL AND fx_rate_to_base_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: row_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows. For a Kiwoom row,
+      the sha256 of the row as written.
+    quality:
+    - name: row_sha256_is_sha256
+      description: row_sha256 is a lowercase hex sha256 (util.sha256_text of the row).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.cash_snapshots WHERE row_sha256 IS NOT NULL AND row_sha256 !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: last_seen_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ingestion run that last wrote the row (ingestion_runs.run_id).
+  quality:
+  - name: account_in_accounts
+    description: Every row's account is in silver.accounts. A row of an unknown account is invisible to every tenant
+      under the account_isolation policy, so run this with a role that bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.cash_snapshots t WHERE NOT EXISTS (SELECT 1 FROM silver.accounts a WHERE
+      a.account_id = t.account_id)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Typed Flex sections; values are still stored as text and cast on read.
+- property: readByViews
+  value:
+  - silver.subject_cash_balance_series
+- property: consumers
+  value:
+  - ibkr_etl.analyst_export
+- property: producers
+  value:
+  - ibkr_etl.loader
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
+contractCreatedTs: '2026-10-18T00:00:00Z'

@@ -9,7 +9,17 @@ param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
 param classificationAccountIds string = ''
 param classificationAsOf string = ''
-param actionGroupName string = 'ibkr-v11-daily-alerts'
+param actionGroupName string = 'ibkrv2stg-alerts'
+// S2 raw market-data capture, on since 18 Oct 2026: the default matches the live job.
+// The job's identity (ingestionIdentity in staging.bicep) holds Storage Blob Data
+// Contributor on bronze-market-data. Empty switches capture off and drops these settings.
+param rawMarketDataContainer string = 'bronze-market-data'
+param rawMarketDataStorageAccountName string = 'ibkrv2stgauhecwc4itaoo'
+var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [
+  { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
+  { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
+  { name: 'AZURE_CLIENT_ID', value: jobIdentity.properties.clientId }
+]
 
 var tags = {
   application: 'ibkr-portfolio-platform'
@@ -39,7 +49,7 @@ resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' existing = {
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'daily-pipeline', hop: 'ingest+conform' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -80,14 +90,17 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           image: '${registry.properties.loginServer}/ibkr-platform@${imageDigest}'
           command: ['python']
           args: ['scripts/refresh_staging_sector_classifications.py']
-          env: [
+          env: concat([
             { name: 'DATABASE_URL', secretRef: 'database-url' }
             { name: 'DEPLOYMENT_ENVIRONMENT', value: 'internal-production' }
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'SECTOR_CLASSIFICATION_ACCOUNT_IDS', value: classificationAccountIds }
             { name: 'SECTOR_CLASSIFICATION_AS_OF', value: classificationAsOf }
             { name: 'SECTOR_CLASSIFICATION_WORKERS', value: '4' }
-          ]
+            // The app login cannot create tables, so the job must not try migrations
+            // (live since 18 Oct 2026, as on the institutional daily job).
+            { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
+          ], rawMarketDataEnv)
           resources: {
             cpu: json('0.5')
             memory: '1Gi'
@@ -101,7 +114,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
 resource failureAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   name: '${jobName}-failed-execution'
   location: 'global'
-  tags: tags
+  tags: union(tags, { layer: 'ops', component: 'alerts' })
   properties: {
     description: 'The daily current-holdings sector-classification job failed.'
     severity: 1

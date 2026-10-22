@@ -13,6 +13,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
+from ibkr_etl import lineage  # noqa: E402
 from ibkr_etl.cloud_storage import download_blob_snapshot  # noqa: E402
 from ibkr_etl.reference_snapshot import inspect_reference_bytes  # noqa: E402
 from ibkr_etl.config import load_settings  # noqa: E402
@@ -21,12 +22,22 @@ from ibkr_etl.crisis_replay import (  # noqa: E402
     refresh_crisis_replay,
 )
 from ibkr_etl.db import connect  # noqa: E402
+from ibkr_etl import input_readiness  # noqa: E402
 from ibkr_etl.derived_portfolio import (  # noqa: E402
     refresh_filtered_portfolio,
     refresh_fixed_unit_composite,
 )
 from ibkr_etl.market_data import refresh_alpha_world_market_data  # noqa: E402
+from ibkr_etl.onboarding_agents import run_reconciliations  # noqa: E402
+from ibkr_etl.onboarding_dry_run import record_history_build, run_portfolio_dry_runs  # noqa: E402
+from ibkr_etl.profiled_composite import is_profiled  # noqa: E402
 from ibkr_etl.provisional_benchmark import refresh_and_materialize  # noqa: E402
+from ibkr_etl.reference_data_source import (  # noqa: E402
+    BLOB as REFERENCE_FROM_BLOB,
+    DATABASE as REFERENCE_FROM_DATABASE,
+    materialize_database_reference,
+    reference_data_source,
+)
 from ibkr_etl.risk_snapshots import build_risk_snapshot  # noqa: E402
 from ibkr_etl.sector_classification import (  # noqa: E402
     refresh_sector_classifications_range,
@@ -37,15 +48,10 @@ from ibkr_etl.subject_onboarding import (  # noqa: E402
 from ibkr_etl.util import canonical_json  # noqa: E402
 
 
-def _download_reference_data(settings, destination: Path) -> dict:
-    """Load the governed reference cache, preferring the website archive.
+def _reference_sources(settings) -> list[tuple[str, str, str]]:
+    """Where the published file is looked for, in order."""
 
-    The current production reference artifact is still published by v1.1.  The
-    explicit read-only fallback keeps the derived migration reproducible until
-    the institutional importer publishes the same artifact into v2 storage.
-    """
-
-    sources = [
+    return [
         (
             settings.azure_storage_account_url,
             settings.azure_report_container,
@@ -57,8 +63,18 @@ def _download_reference_data(settings, destination: Path) -> dict:
             "legacy-production",
         ),
     ]
+
+
+def _download_reference_data(settings, destination: Path) -> dict:
+    """Load the governed reference cache, preferring the website archive.
+
+    The current production reference artifact is still published by v1.1.  The
+    explicit read-only fallback keeps the derived migration reproducible until
+    the institutional importer publishes the same artifact into v2 storage.
+    """
+
     blob_name = f"{settings.tenant_id}/reference/reference_data.json"
-    for account_url, container, source in sources:
+    for account_url, container, source in _reference_sources(settings):
         if not account_url or not container:
             continue
         snapshot = download_blob_snapshot(account_url, container, blob_name)
@@ -73,6 +89,14 @@ def _download_reference_data(settings, destination: Path) -> dict:
                 **manifest,
             }
     raise RuntimeError("Published reference_data.json is missing")
+
+
+def _load_reference_input(settings, connection, destination: Path, source: str = REFERENCE_FROM_BLOB) -> dict:
+    """The published file by default; v2's own tables when REFERENCE_DATA_SOURCE=database."""
+
+    if source == REFERENCE_FROM_DATABASE:
+        return materialize_database_reference(connection, settings.tenant_id, destination)
+    return _download_reference_data(settings, destination)
 
 
 def _approved_targets(connection) -> list[dict]:
@@ -256,6 +280,18 @@ def _refresh_analytics_if_approved(
             'benchmark_comparison':benchmark,
             'crisis_replay':{'available':False,'reason':'Composite crisis attribution not qualified'},
             'onboarding_activated':False,'acceptance_check_changed':False}
+    if row.get('subject_type')=='composite_portfolio':
+        from ibkr_etl.profiled_composite import require_contract as require_design_contract
+        if is_profiled(connection,row['subject_id'],tenant_id=tenant_id):
+            # A composite in the Alpha World MS or T design is measured as MS
+            # and T are: its own HKD/HIBOR contract, never the USD comparison.
+            require_design_contract(connection,row['subject_id'],tenant_id=tenant_id)
+            latest=connection.execute("SELECT MAX(snapshot_date) AS latest FROM subject_nav_series WHERE tenant_id=? AND subject_id=? AND currency='HKD'",(tenant_id,row['subject_id'])).fetchone()['latest']
+            return {'risk_snapshot':None if latest is None else build_risk_snapshot(connection,
+                tenant_id=tenant_id,subject_id=row['subject_id'],as_of=str(latest)),
+                'benchmark_comparison':{'available':False,'reason':'HIBOR + Spread comparison methodology is not qualified'},
+                'crisis_replay':{'available':False,'reason':'Composite crisis attribution not qualified'},
+                'onboarding_activated':False,'acceptance_check_changed':False}
     approved = connection.execute(
         """
         SELECT 1 FROM account_onboarding_approvals
@@ -356,15 +392,104 @@ def _refresh_analytics_if_approved(
     return evidence
 
 
+def _has_onboarding_cases(connection) -> bool:
+    """The new onboarding's tables exist once migration 064 is applied."""
+
+    return connection.execute(
+        "SELECT to_regclass('public.broker_onboarding_cases')"
+    ).fetchone()[0] is not None
+
+
+def _record_history_build(connection, tenant_id: str, subject_id: str, error: str | None) -> dict | None:
+    """Stage 3's history check on a new-onboarding portfolio case; never fails the refresh."""
+
+    try:
+        return record_history_build(
+            connection, tenant_id, subject_id, error=error, today=datetime.now(timezone.utc).date()
+        )
+    except Exception as failure:  # the subject's own refresh result stands either way
+        connection.rollback()
+        return {"error_type": type(failure).__name__, "error": str(failure)[:400]}
+
+
+def _record_agent_reconciliations(connection, tenant_id: str) -> dict:
+    """Stage 2's four checks on new IBKR account cases, from the reconciliation agent's newest results.
+
+    Does nothing while ONBOARDING_AGENTS_ENABLED is off; never fails the refresh.
+    """
+
+    try:
+        return run_reconciliations(connection, tenant_id)
+    except Exception as failure:  # the refresh's own result stands either way
+        connection.rollback()
+        return {"status": "failed", "error_type": type(failure).__name__, "error": str(failure)[:400]}
+
+
+def _dry_run_portfolio_cases(connection, tenant_id: str, reference_path: Path, reference) -> list[dict]:
+    """Stage 2 of each new-onboarding portfolio case: calculate, measure, roll back.
+
+    Nothing runs until migration 064 exists, and nothing is kept for a
+    portfolio the owner has not approved.
+    """
+
+    if not _has_onboarding_cases(connection):
+        return []
+
+    def calculate(dry_connection, definition: dict) -> dict:
+        if definition["subject_type"] == "filtered_portfolio":
+            return refresh_filtered_portfolio(
+                dry_connection, reference_path, contract=definition,
+                expected_reference_sha256=reference()["content_sha256"],
+            )
+        # The builder gives every HKD composite the MS or T design, so its dry
+        # run applies the same HKD rules its daily refresh will.
+        return refresh_fixed_unit_composite(
+            dry_connection, definition, strict_hkd=str(definition["base_currency"]).upper() == "HKD")
+
+    return run_portfolio_dry_runs(
+        connection, tenant_id, calculate=calculate, today=datetime.now(timezone.utc).date()
+    )
+
+
+DERIVED_OUTPUTS = ("silver.derived_portfolio_nav", "silver.derived_portfolio_positions",
+                   "silver.derived_portfolio_cash_ledger", "silver.derived_portfolio_cash_balances",
+                   "silver.derived_portfolio_exclusions", "silver.synthetic_portfolio_components")
+ANALYTICS_OUTPUTS = ("silver.benchmark_prices", "silver.reference_fx_rates", "silver.instrument_classifications",
+                     "silver.market_data_prices", "gold.performance_comparison_daily", "gold.crisis_replay_daily",
+                     "gold.crisis_replay_components", "gold.risk_analytics_snapshots")
+
+
+def _record_outputs(market_data: dict, results: list[dict]) -> None:
+    """What this run wrote, for its lineage record (a no-op unless recording is on)."""
+    record = lineage.current()
+    if not record.active:
+        return
+    try:
+        instruments = (market_data.get("instruments") or {}).values()
+        record.output("silver.market_data_prices", rows=sum(int(item.get("rows_received") or 0) for item in instruments))
+        if any(item.get("validation") for item in results):
+            for table in DERIVED_OUTPUTS:
+                record.output(table)
+        if any(item.get("analytics") for item in results):
+            for table in ANALYTICS_OUTPUTS:
+                record.output(table)
+    except Exception:  # noqa: BLE001 - lineage never fails the job
+        pass
+
+
 def main() -> int:
+    input_readiness.gate("derived-daily")
     settings = load_settings()
     if not settings.database_url:
         raise RuntimeError("Self-service derived refresh requires DATABASE_URL")
     if not settings.azure_storage_account_url:
         raise RuntimeError("Self-service derived refresh requires AZURE_STORAGE_ACCOUNT_URL")
+    reference_kind = reference_data_source()
     connection = connect(
         settings.database_path, settings.database_url, settings.tenant_id
     )
+    # With lineage recording on, the gold rows this session writes name this run.
+    lineage.current().bind(connection)
     lock_name = f"self-service-derived:{settings.tenant_id}"
     acquired = False
     try:
@@ -381,22 +506,37 @@ def main() -> int:
         # validate normalization-date coverage while a portfolio is still in
         # onboarding; waiting until activation would create a circular gate.
         market_data = refresh_alpha_world_market_data(connection)
+        reference_path = PROJECT_ROOT / "data" / "reference_data.json"
+        downloaded: dict = {}
+
+        def reference() -> dict:
+            if "source" not in downloaded:
+                downloaded["source"] = _load_reference_input(
+                    settings, connection, reference_path, reference_kind
+                )
+            return downloaded["source"]
+
+        portfolio_cases = _dry_run_portfolio_cases(connection, settings.tenant_id, reference_path, reference)
+        agent_reconciliations = _record_agent_reconciliations(connection, settings.tenant_id)
+        onboarding_cases = _has_onboarding_cases(connection)
         targets = _ordered_targets(_approved_targets(connection))
         if not targets:
+            _record_outputs(market_data, [])
             print(
                 canonical_json(
                     {
                         "status": "success",
                         "subjects": [],
                         "market_data": market_data,
+                        "portfolio_cases": portfolio_cases,
+                        "agent_reconciliations": agent_reconciliations,
                     }
                 )
             )
             return 0
-        reference_path = PROJECT_ROOT / "data" / "reference_data.json"
         reference_source = None
         if any(row["subject_type"] == "filtered_portfolio" for row in targets):
-            reference_source = _download_reference_data(settings, reference_path)
+            reference_source = reference()
         results: list[dict] = []
         failures: list[dict] = []
         requested_to = datetime.now(timezone.utc).date().isoformat()
@@ -416,6 +556,8 @@ def main() -> int:
                         connection, reference_path, contract=definition,
                         expected_reference_sha256=reference_source["content_sha256"],
                     )
+                elif is_profiled(connection, str(row["subject_id"]), tenant_id=settings.tenant_id):
+                    calculation = refresh_fixed_unit_composite(connection, definition, strict_hkd=True)
                 else:
                     calculation = refresh_fixed_unit_composite(connection, definition)
                 runtime_contract = {
@@ -432,6 +574,10 @@ def main() -> int:
                 # benchmark-provider problem cannot falsely invalidate the
                 # deterministic portfolio calculation.
                 connection.commit()
+                if onboarding_cases:
+                    validation["onboarding_case"] = _record_history_build(
+                        connection, settings.tenant_id, str(row["subject_id"]), None
+                    )
             except Exception as error:
                 connection.rollback()
                 connection.execute(
@@ -496,6 +642,10 @@ def main() -> int:
                     "error_type": type(error).__name__,
                     "error": str(error),
                 }
+                if onboarding_cases:
+                    failure["onboarding_case"] = _record_history_build(
+                        connection, settings.tenant_id, str(row["subject_id"]), str(error)
+                    )
                 failures.append(failure)
                 results.append({**failure, "status": "failed"})
                 continue
@@ -557,6 +707,7 @@ def main() -> int:
                     }
                 )
                 continue
+        _record_outputs(market_data, results)
         print(
             canonical_json(
                 {
@@ -565,6 +716,8 @@ def main() -> int:
                     "failures": failures,
                     "reference_data": reference_source,
                     "market_data": market_data,
+                    "portfolio_cases": portfolio_cases,
+                    "agent_reconciliations": agent_reconciliations,
                 }
             )
         )
@@ -579,4 +732,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(lineage.run_main("ibkrv2stg-derived-daily", main))

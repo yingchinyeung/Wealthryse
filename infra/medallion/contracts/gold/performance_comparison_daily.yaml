@@ -1,0 +1,291 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.gold.performance_comparison_daily
+name: performance_comparison_daily
+version: 1.2.0
+status: active
+domain: gold
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Daily portfolio-versus-benchmark comparison for each subject and benchmark: portfolio value, benchmark
+    level in the reporting currency, indexed values and daily returns. The website''s performance charts and the
+    risk analytics read it.'
+  usage: 'Read the calculation_version the reader expects: benchmark-comparison-v1, or benchmark-comparison-v2-ms-hkd
+    and benchmark-comparison-v2-t-hkd for the two HKD website subjects. Rows of other versions are kept, not overwritten.'
+  limitations: 'A comparison that fails its quality checks is not stored. Provisional Yahoo benchmark levels. Rows
+    for a benchmark with no portfolio_benchmark_mapping row for the subject are website-only comparison rows
+    (WEBSITE_ALL_BENCHMARKS): best effort, not judged by the publish gate, and read only by the website''s benchmark
+    picker.'
+tags:
+- gold
+- derived
+schema:
+- name: performance_comparison_daily
+  physicalName: gold.performance_comparison_daily
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, subject_id, benchmark_id, observation_date and calculation_version.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: subject_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: restricted
+    description: 'Subject: an IBKR account number for accounts, a slug for portfolios and composites. Restricted.'
+  - name: benchmark_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: Benchmark id in benchmark_master.
+  - name: observation_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: confidential-financial
+    description: A date with both a portfolio value and a benchmark level.
+    quality:
+    - name: observation_date_is_iso_date
+      description: observation_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE observation_date IS NOT NULL AND observation_date
+        !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: reporting_currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of portfolio_value and benchmark_level.
+  - name: portfolio_value
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Portfolio NAV in the reporting currency.
+  - name: benchmark_level
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Benchmark level converted to the reporting currency.
+    quality:
+    - name: benchmark_level_positive
+      description: benchmark_level is above zero.
+      type: sql
+      query: SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE benchmark_level <= 0
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: normalized_portfolio
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'Portfolio index: 100 on the first date, then chained with portfolio_return.'
+  - name: normalized_benchmark
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'Benchmark index: 100 on the first date, then chained with benchmark_return.'
+  - name: portfolio_return
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'Cash-flow-adjusted daily return: (value − previous value − external flows) / (previous value +
+      half the external flows). Empty on the first date.'
+    quality:
+    - name: portfolio_return_above_minus_one
+      description: portfolio_return is above -1 (a return of -100% or worse is rejected).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE portfolio_return <= -1
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: benchmark_return
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: level / previous level − 1. Empty on the first date.
+  - name: excess_return
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: portfolio_return − benchmark_return.
+  - name: calculation_version
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 5
+    classification: internal
+    description: Comparison method version; part of the key.
+  - name: quality_status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: pass or warn for stored rows (fail is never stored).
+    quality:
+    - name: quality_status_allowed_values
+      description: quality_status is one of pass, warn, fail (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE quality_status NOT IN ('pass', 'warn',
+        'fail')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+    - name: quality_status_not_fail
+      description: No stored row has quality_status fail; a failed comparison stops before it is written.
+      type: sql
+      query: SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE quality_status = 'fail'
+      mustBe: 0
+      severity: error
+      dimension: accuracy
+  - name: generated_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the run that wrote the row.
+  - name: lineage_run_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The recorded job run that last inserted or updated this row (lineage_runs); NULL when that run
+      was not recorded.
+  quality:
+  - name: excess_is_difference
+    description: excess_return equals portfolio_return − benchmark_return.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE ABS(excess_return - (portfolio_return -
+      benchmark_return)) > 1e-12
+    mustBe: 0
+    severity: error
+    dimension: accuracy
+  - name: returns_empty_together
+    description: The three returns are all empty (first date) or all set.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE (portfolio_return IS NULL) <> (benchmark_return
+      IS NULL) OR (portfolio_return IS NULL) <> (excess_return IS NULL)
+    mustBe: 0
+    severity: error
+    dimension: consistency
+  - name: first_date_indexed_at_100
+    description: A row without returns (the first date) has both indexes at 100.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE portfolio_return IS NULL AND (normalized_portfolio
+      <> 100 OR normalized_benchmark <> 100)
+    mustBe: 0
+    severity: error
+    dimension: accuracy
+slaDefaultElement: performance_comparison_daily.observation_date
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: performance_comparison_daily.observation_date
+- property: timeOfAvailability
+  value: 09:30+00:00
+  element: performance_comparison_daily.observation_date
+  driver: operational
+- property: latency
+  value: 4
+  unit: d
+  element: performance_comparison_daily.observation_date
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: Portfolio vs benchmark returns.
+- property: consumers
+  value:
+  - ibkr_etl.agent_tools
+  - ibkr_etl.alpha_world_t_onboarding
+  - ibkr_etl.comparison_source_evidence
+  - ibkr_etl.layer_freshness
+  - ibkr_etl.risk_snapshots
+  - ibkr_etl.web
+  - ibkr_etl.web_modelling
+- property: producers
+  value:
+  - ibkr_etl.provisional_benchmark
+- property: freshnessCheck
+  value:
+    checkId: gold.performance_comparison_daily
+    measure: as_of_date
+    required: true
+    query: SELECT MAX(observation_date) AS observed FROM performance_comparison_daily
+    source: ibkr_etl.layer_freshness.RULES
+- property: calculationVersionColumn
+  value: calculation_version
+- property: calculationVersionSource
+  value:
+  - ibkr_etl.provisional_benchmark.CALCULATION_VERSION
+  - ibkr_etl.website_benchmarks.website_comparison_version
+contractCreatedTs: '2026-10-18T00:00:00Z'

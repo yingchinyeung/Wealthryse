@@ -24,6 +24,10 @@ PROVISION='ibkrv2stg-observe-prov'
 SECRET='database-specialist-observation-url'
 FOLDER=ROOT/'.work/specialist-observation-worker-20261002'
 PURPOSE='specialist-observation-acceptance'
+# The readers moved to the security-patched ibkr-platform image on 10 Oct
+# (scripts/control_upgrade_readers_20261010.py), as deploy/deployed-images.json records.
+# The temporary provisioner keeps the image it was first built with.
+READER_IMAGE='ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:3e9841a5abc3a37592a7c4134f07040db2ec4103ee28f333be0304cd1c9f3ebe'
 
 
 def job_path(name):
@@ -58,7 +62,7 @@ def definition(provision=False):
         'configuration':{'triggerType':'Manual','replicaTimeout':180,'replicaRetryLimit':0,
             'manualTriggerConfig':{'parallelism':1,'replicaCompletionCount':1},'secrets':refs,
             'registries':[{'server':'ibkrv2stgauhecwc4itaoo.azurecr.io','identity':identity}]},
-        'template':{'containers':[{'name':name,'image':IMAGE,'command':['python'],'args':args,'env':env,
+        'template':{'containers':[{'name':name,'image':IMAGE if provision else READER_IMAGE,'command':['python'],'args':args,'env':env,
             'resources':{'cpu':0.5,'memory':'1Gi'}}]}}}
 
 
@@ -171,9 +175,46 @@ def deploy(provision=False):
     request('PUT',job_path(name)+'?api-version=2024-03-01',data=definition_value)
 
 
+def update():
+    """Give the installed reader this checkout's code. Everything else about the job (image,
+    identity, credential bindings, limits) must already match the reviewed definition, so
+    the PUT changes only the bundled code and its payloadSha256 tag."""
+    current=request('GET',job_path(JOB)+'?api-version=2024-03-01')
+    if current.get('tags',{}).get('purpose')!=PURPOSE:
+        raise ValueError('Unregistered observation job')
+    wanted=definition();digest=wanted['tags']['payloadSha256']
+    containers=current['properties']['template'].get('containers') or []
+    before=current.get('tags',{}).get('payloadSha256')
+    if before==digest:
+        validate(current)
+        print(json.dumps({'updated':False,'job':JOB,'payload_sha256':digest}))
+        return
+    reviewed=wanted['properties']['template']['containers'][0]
+    differ=[k for k in ('image','command','env') if len(containers)==1 and containers[0].get(k)!=reviewed[k]]
+    if differ:
+        raise ValueError('Observation job differs beyond its code: '+', '.join(differ))
+    candidate=json.loads(json.dumps(current))
+    if len(containers)==1:
+        candidate['properties']['template']['containers'][0]['args']=wanted['properties']['template']['containers'][0]['args']
+    validate(candidate)
+    idle(JOB)
+    wanted['tags']={**current['tags'],'payloadSha256':digest}
+    if current['properties'].get('workloadProfileName'):
+        wanted['properties']['workloadProfileName']=current['properties']['workloadProfileName']
+    FOLDER.mkdir(parents=True,exist_ok=True)
+    (FOLDER/(JOB+'-before-'+str(before)[:12]+'.json')).write_text(json.dumps(current,indent=2),encoding='utf-8')
+    (FOLDER/(JOB+'-definition-'+digest[:12]+'.json')).write_text(json.dumps(wanted,indent=2),encoding='utf-8')
+    request('PUT',job_path(JOB)+'?api-version=2024-03-01',data=wanted)
+    after=request('GET',job_path(JOB)+'?api-version=2024-03-01')
+    validate(after)
+    if after.get('tags',{}).get('payloadSha256')!=digest:
+        raise ValueError('Observation job readback differs from the update')
+    print(json.dumps({'updated':True,'job':JOB,'payload_sha256_before':before,'payload_sha256':digest,'image':READER_IMAGE}))
+
+
 def main():
     parser=argparse.ArgumentParser()
-    parser.add_argument('stage',choices=['prepare','provision','install','test','verify','cleanup-provisioner'])
+    parser.add_argument('stage',choices=['prepare','provision','install','update','test','verify','cleanup-provisioner'])
     parser.add_argument('--execution')
     args=parser.parse_args()
     if az('account','show','--query','id')!=SUB: raise ValueError('Unexpected subscription')
@@ -184,6 +225,7 @@ def main():
         idle(name)
         if args.stage=='test': verify_cloud_identity()
         print(json.dumps({'execution':request('POST',job_path(name)+'/start?api-version=2024-03-01')['name']}))
+    elif args.stage=='update': update()
     elif args.stage=='install':
         verify_execution(PROVISION,args.execution)
         deploy()

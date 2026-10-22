@@ -182,7 +182,10 @@ def apply_emergency_closures(calendars, closures):
 
 
 CALENDARS = apply_emergency_closures(CALENDARS, EMERGENCY_CLOSURES)
-BENCHMARK_MARKETS = {"GSPC":"XNYS", "IXIC":"XNAS", "HSI":"XHKG", "SHCOMP":"XSHG", "TAIEX":"XTAI"}
+# US-listed ETFs trade on NYSE Arca, which keeps the NYSE holiday calendar. KS200 has no
+# reviewed Korea Exchange calendar yet, so it stays unmapped and uses the bounded-lag rule.
+BENCHMARK_MARKETS = {"GSPC":"XNYS", "IXIC":"XNAS", "HSI":"XHKG", "SHCOMP":"XSHG", "TAIEX":"XTAI",
+                     "EWH":"XNYS", "EWT":"XNYS", "SPY":"XNYS", "XLK":"XNYS"}
 
 
 def benchmark_session_on_or_before(benchmark_id: str, cutoff: date) -> date:

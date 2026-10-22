@@ -14,14 +14,15 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 
-SECRET_PATTERN = re.compile(r"^ibkr-flex-source-[0-9a-f]{32}$")
+# IBKR Flex tokens, and Kiwoom app key and secret stored together as one JSON value.
+SECRET_PATTERN = re.compile(r"^(ibkr-flex-source|broker-kiwoom-rest)-[0-9a-f]{32}$")
 VAULT_SCOPE = "https://vault.azure.net/.default"
 
 
 class CredentialSubmission(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    secret_name: str = Field(pattern=r"^ibkr-flex-source-[0-9a-f]{32}$")
+    secret_name: str = Field(pattern=r"^(ibkr-flex-source|broker-kiwoom-rest)-[0-9a-f]{32}$")
     token: SecretStr
 
 
@@ -53,9 +54,10 @@ def store_flex_secret(
     *, vault_uri: str, client_id: str, secret_name: str, token: str
 ) -> dict[str, str]:
     if not SECRET_PATTERN.fullmatch(secret_name):
-        raise ValueError("Secret name is outside the dedicated IBKR prefix")
+        raise ValueError("Secret name is outside the dedicated broker prefixes")
     if not token.strip() or len(token) > 1024:
-        raise ValueError("Flex token is invalid")
+        raise ValueError("Credential value is invalid")
+    purpose = "flex-web-service" if secret_name.startswith("ibkr-flex-source-") else "kiwoom-rest-api"
     access_token = ManagedIdentityCredential(client_id=client_id).get_token(VAULT_SCOPE).token
     request = urllib.request.Request(
         f"{vault_uri}/secrets/{secret_name}?api-version=7.4",
@@ -65,7 +67,7 @@ def store_flex_secret(
                 "attributes": {"enabled": True},
                 "tags": {
                     "application": "ibkr-portfolio-platform",
-                    "purpose": "flex-web-service",
+                    "purpose": purpose,
                     "managedBy": "credential-broker",
                 },
             },

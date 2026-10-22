@@ -1,0 +1,415 @@
+{
+ "source": "infra/medallion/contracts",
+ "tables": {
+  "gold.crisis_replay_components": {
+   "calculation_version_column": null,
+   "contract": "wealthryse.gold.crisis_replay_components",
+   "rules": [
+    {
+     "column": null,
+     "dimension": "consistency",
+     "mustBe": 0,
+     "name": "direct_has_no_proxy_reason",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_components WHERE mapping_method = 'direct' AND proxy_reason IS NOT NULL",
+     "severity": "warning"
+    },
+    {
+     "column": null,
+     "dimension": "consistency",
+     "mustBe": 0,
+     "name": "has_daily_path",
+     "query": "SELECT COUNT(*) FROM (SELECT DISTINCT tenant_id, subject_id, holdings_as_of FROM gold.crisis_replay_components) c WHERE NOT EXISTS (SELECT 1 FROM gold.crisis_replay_daily d WHERE d.tenant_id = c.tenant_id AND d.subject_id = c.subject_id AND d.holdings_as_of = c.holdings_as_of)",
+     "severity": "warning"
+    },
+    {
+     "column": "holdings_as_of",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "holdings_as_of_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_components WHERE holdings_as_of IS NOT NULL AND holdings_as_of !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": "mapping_method",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "mapping_method_allowed_values",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_components WHERE mapping_method NOT IN ('direct', 'market_proxy')",
+     "severity": "error"
+    }
+   ],
+   "version": "1.0.0"
+  },
+  "gold.crisis_replay_daily": {
+   "calculation_version_column": "calculation_version",
+   "contract": "wealthryse.gold.crisis_replay_daily",
+   "rules": [
+    {
+     "column": null,
+     "dimension": "completeness",
+     "mustBe": 0,
+     "name": "covers_both_ends",
+     "query": "SELECT COUNT(*) FROM (SELECT tenant_id, subject_id, holdings_as_of FROM gold.crisis_replay_daily GROUP BY 1, 2, 3 HAVING COUNT(*) FILTER (WHERE observation_date = crisis_start) = 0 OR COUNT(*) FILTER (WHERE observation_date = crisis_end) = 0) d",
+     "severity": "warning"
+    },
+    {
+     "column": "crisis_end",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "crisis_end_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_daily WHERE crisis_end IS NOT NULL AND crisis_end !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": "crisis_start",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "crisis_start_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_daily WHERE crisis_start IS NOT NULL AND crisis_start !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": "drawdown",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "drawdown_not_positive",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_daily WHERE drawdown > 0",
+     "severity": "error"
+    },
+    {
+     "column": "holdings_as_of",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "holdings_as_of_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_daily WHERE holdings_as_of IS NOT NULL AND holdings_as_of !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "inside_crisis_window",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_daily WHERE observation_date < crisis_start OR observation_date > crisis_end",
+     "severity": "error"
+    },
+    {
+     "column": "normalized_value",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "normalized_value_positive",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_daily WHERE normalized_value <= 0",
+     "severity": "error"
+    },
+    {
+     "column": "observation_date",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "observation_date_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_daily WHERE observation_date IS NOT NULL AND observation_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": "quality_status",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "quality_status_allowed_values",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_daily WHERE quality_status NOT IN ('pass', 'warn', 'fail')",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "accuracy",
+     "mustBe": 0,
+     "name": "starts_at_one",
+     "query": "SELECT COUNT(*) FROM gold.crisis_replay_daily WHERE observation_date = crisis_start AND ABS(normalized_value - 1) > 1e-9",
+     "severity": "error"
+    }
+   ],
+   "version": "1.0.0"
+  },
+  "gold.crisis_scenario_results": {
+   "calculation_version_column": "calculation_version",
+   "contract": "wealthryse.gold.crisis_scenario_results",
+   "rules": [
+    {
+     "column": "crisis_end",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "crisis_end_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE crisis_end IS NOT NULL AND crisis_end !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": "crisis_start",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "crisis_start_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE crisis_start IS NOT NULL AND crisis_start !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "consistency",
+     "mustBe": 0,
+     "name": "drawdown_matches_availability",
+     "query": "SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE available <> (maximum_drawdown IS NOT NULL)",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "completeness",
+     "mustBe": 0,
+     "name": "every_scenario_stored",
+     "query": "SELECT COUNT(*) FROM (SELECT tenant_id, subject_id, holdings_as_of, calculation_version FROM gold.crisis_scenario_results GROUP BY 1, 2, 3, 4 HAVING COUNT(*) <> 4) d",
+     "severity": "warning"
+    },
+    {
+     "column": "holdings_as_of",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "holdings_as_of_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE holdings_as_of IS NOT NULL AND holdings_as_of !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": "maximum_drawdown",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "maximum_drawdown_in_range",
+     "query": "SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE maximum_drawdown < -1 OR maximum_drawdown > 0",
+     "severity": "error"
+    },
+    {
+     "column": "scenario_id",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "scenario_id_allowed_values",
+     "query": "SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE scenario_id NOT IN ('lehman_2008', 'china_2015', 'covid_2020', 'rates_2022')",
+     "severity": "warning"
+    },
+    {
+     "column": null,
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "window_in_order",
+     "query": "SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE crisis_start >= crisis_end",
+     "severity": "error"
+    }
+   ],
+   "version": "1.1.0"
+  },
+  "gold.performance_comparison_daily": {
+   "calculation_version_column": "calculation_version",
+   "contract": "wealthryse.gold.performance_comparison_daily",
+   "rules": [
+    {
+     "column": "benchmark_level",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "benchmark_level_positive",
+     "query": "SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE benchmark_level <= 0",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "accuracy",
+     "mustBe": 0,
+     "name": "excess_is_difference",
+     "query": "SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE ABS(excess_return - (portfolio_return - benchmark_return)) > 1e-12",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "accuracy",
+     "mustBe": 0,
+     "name": "first_date_indexed_at_100",
+     "query": "SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE portfolio_return IS NULL AND (normalized_portfolio <> 100 OR normalized_benchmark <> 100)",
+     "severity": "error"
+    },
+    {
+     "column": "observation_date",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "observation_date_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE observation_date IS NOT NULL AND observation_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": "portfolio_return",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "portfolio_return_above_minus_one",
+     "query": "SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE portfolio_return <= -1",
+     "severity": "error"
+    },
+    {
+     "column": "quality_status",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "quality_status_allowed_values",
+     "query": "SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE quality_status NOT IN ('pass', 'warn', 'fail')",
+     "severity": "error"
+    },
+    {
+     "column": "quality_status",
+     "dimension": "accuracy",
+     "mustBe": 0,
+     "name": "quality_status_not_fail",
+     "query": "SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE quality_status = 'fail'",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "consistency",
+     "mustBe": 0,
+     "name": "returns_empty_together",
+     "query": "SELECT COUNT(*) FROM gold.performance_comparison_daily WHERE (portfolio_return IS NULL) <> (benchmark_return IS NULL) OR (portfolio_return IS NULL) <> (excess_return IS NULL)",
+     "severity": "error"
+    }
+   ],
+   "version": "1.2.0"
+  },
+  "gold.reporting_snapshots": {
+   "calculation_version_column": "formula_version",
+   "contract": "wealthryse.gold.reporting_snapshots",
+   "rules": [
+    {
+     "column": null,
+     "dimension": "completeness",
+     "mustBe": 0,
+     "name": "approved_has_approval",
+     "query": "SELECT COUNT(*) FROM gold.reporting_snapshots WHERE status = 'approved' AND approved_at IS NULL",
+     "severity": "warning"
+    },
+    {
+     "column": "data_sha256",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "data_sha256_is_sha256",
+     "query": "SELECT COUNT(*) FROM gold.reporting_snapshots WHERE data_sha256 IS NOT NULL AND data_sha256 !~ '^[0-9a-f]{64}$'",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "accuracy",
+     "mustBe": 0,
+     "name": "digest_matches_payload",
+     "query": "SELECT COUNT(*) FROM gold.reporting_snapshots WHERE data_sha256 <> encode(sha256(convert_to(snapshot_payload_json, 'UTF8')), 'hex')",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "uniqueness",
+     "mustBe": 0,
+     "name": "one_frozen_per_period",
+     "query": "SELECT COUNT(*) FROM (SELECT tenant_id, subject_id, period_end FROM gold.reporting_snapshots WHERE status = 'frozen' GROUP BY 1, 2, 3 HAVING COUNT(*) > 1) d",
+     "severity": "error"
+    },
+    {
+     "column": "period_end",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "period_end_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.reporting_snapshots WHERE period_end IS NOT NULL AND period_end !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "period_in_order",
+     "query": "SELECT COUNT(*) FROM gold.reporting_snapshots WHERE period_start > period_end",
+     "severity": "error"
+    },
+    {
+     "column": "period_start",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "period_start_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.reporting_snapshots WHERE period_start IS NOT NULL AND period_start !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "consistency",
+     "mustBe": 0,
+     "name": "publication_needs_pass",
+     "query": "SELECT COUNT(*) FROM gold.reporting_snapshots WHERE publication_allowed AND (quality_status <> 'pass' OR publication_blockers_json <> '[]')",
+     "severity": "error"
+    },
+    {
+     "column": "quality_status",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "quality_status_allowed_values",
+     "query": "SELECT COUNT(*) FROM gold.reporting_snapshots WHERE quality_status NOT IN ('pass', 'warn', 'fail')",
+     "severity": "error"
+    },
+    {
+     "column": "status",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "status_allowed_values",
+     "query": "SELECT COUNT(*) FROM gold.reporting_snapshots WHERE status NOT IN ('draft', 'frozen', 'approved', 'superseded')",
+     "severity": "error"
+    }
+   ],
+   "version": "1.0.0"
+  },
+  "gold.risk_analytics_snapshots": {
+   "calculation_version_column": "analytics_version",
+   "contract": "wealthryse.gold.risk_analytics_snapshots",
+   "rules": [
+    {
+     "column": "as_of_date",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "as_of_date_is_iso_date",
+     "query": "SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE as_of_date IS NOT NULL AND as_of_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'",
+     "severity": "error"
+    },
+    {
+     "column": "duration_ms",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "duration_not_negative",
+     "query": "SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE duration_ms < 0",
+     "severity": "error"
+    },
+    {
+     "column": "payload_sha256",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "payload_sha256_is_sha256",
+     "query": "SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE payload_sha256 IS NOT NULL AND payload_sha256 !~ '^[0-9a-f]{64}$'",
+     "severity": "error"
+    },
+    {
+     "column": null,
+     "dimension": "consistency",
+     "mustBe": 0,
+     "name": "payload_version_matches",
+     "query": "SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE payload_json ? 'analytics_version' AND payload_json->>'analytics_version' <> analytics_version",
+     "severity": "warning"
+    },
+    {
+     "column": "quality_status",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "quality_status_allowed_values",
+     "query": "SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE quality_status NOT IN ('pass', 'warn', 'fail')",
+     "severity": "error"
+    },
+    {
+     "column": "source_data_sha256",
+     "dimension": "conformity",
+     "mustBe": 0,
+     "name": "source_data_sha256_is_sha256",
+     "query": "SELECT COUNT(*) FROM gold.risk_analytics_snapshots WHERE source_data_sha256 IS NOT NULL AND source_data_sha256 !~ '^[0-9a-f]{64}$'",
+     "severity": "error"
+    }
+   ],
+   "version": "1.1.0"
+  }
+ }
+}

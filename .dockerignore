@@ -53,4 +53,5 @@ output/pdf/*
 .pytest_cache
 tests
 infra
+!infra/medallion
 *.md

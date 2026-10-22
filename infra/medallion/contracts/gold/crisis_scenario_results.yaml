@@ -1,0 +1,259 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.gold.crisis_scenario_results
+name: crisis_scenario_results
+version: 1.1.0
+status: active
+domain: gold
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Hypothetical crisis scenarios (Lehman 2008, China 2015-16, COVID 2020, rates 2022) for every account,
+    portfolio and composite: the current holdings held as fixed units through each historical sell-off. The website
+    risk page shows them.'
+  limitations: Hypothetical, not actual performance. Provisional Yahoo prices; a holding without its own prices
+    is replayed with a proxy ETF scaled by its two-year weekly beta.
+tags:
+- gold
+- derived
+schema:
+- name: crisis_scenario_results
+  physicalName: gold.crisis_scenario_results
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, subject_id, holdings_as_of, scenario_id and calculation_version.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: subject_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: restricted
+    description: 'Subject: an IBKR account number for accounts, a slug for portfolios and composites. Restricted.'
+  - name: holdings_as_of
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: Date of the holdings replayed.
+    quality:
+    - name: holdings_as_of_is_iso_date
+      description: holdings_as_of is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE holdings_as_of IS NOT NULL AND holdings_as_of
+        !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: scenario_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: confidential-financial
+    description: lehman_2008, china_2015, covid_2020 or rates_2022.
+    quality:
+    - name: scenario_id_allowed_values
+      description: scenario_id is one of lehman_2008, china_2015, covid_2020, rates_2022 (crisis_scenarios.SCENARIOS;
+        a new scenario is a contract change).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE scenario_id NOT IN ('lehman_2008', 'china_2015',
+        'covid_2020', 'rates_2022')
+      mustBe: 0
+      severity: warning
+      dimension: conformity
+  - name: calculation_version
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 5
+    classification: internal
+    description: Scenario method version; part of the key.
+  - name: reporting_currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the replay.
+  - name: crisis_start
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: First day of the scenario window.
+    quality:
+    - name: crisis_start_is_iso_date
+      description: crisis_start is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE crisis_start IS NOT NULL AND crisis_start !~
+        '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: crisis_end
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Last day of the scenario window.
+    quality:
+    - name: crisis_end_is_iso_date
+      description: crisis_end is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE crisis_end IS NOT NULL AND crisis_end !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: available
+    physicalType: boolean
+    logicalType: boolean
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Whether the scenario could be computed for these holdings.
+  - name: maximum_drawdown
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Worst drawdown in the window, from -1 to 0; empty when unavailable.
+    quality:
+    - name: maximum_drawdown_in_range
+      description: maximum_drawdown is between -1 and 0 (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE maximum_drawdown < -1 OR maximum_drawdown >
+        0
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: result_json
+    physicalType: jsonb
+    logicalType: object
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'The scenario result: daily path, component evidence and counts, or the reason it is unavailable.'
+  - name: generated_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the run that wrote the row.
+  - name: lineage_run_id
+    physicalType: uuid
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: The recorded job run that last inserted or updated this row (lineage_runs); NULL when that run
+      was not recorded.
+  quality:
+  - name: drawdown_matches_availability
+    description: An available scenario has a maximum drawdown and an unavailable one has none.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE available <> (maximum_drawdown IS NOT NULL)
+    mustBe: 0
+    severity: error
+    dimension: consistency
+  - name: window_in_order
+    description: crisis_start is before crisis_end.
+    type: sql
+    query: SELECT COUNT(*) FROM gold.crisis_scenario_results WHERE crisis_start >= crisis_end
+    mustBe: 0
+    severity: error
+    dimension: conformity
+  - name: every_scenario_stored
+    description: Each subject, holdings date and version has a row for every scenario (available or not).
+    type: sql
+    query: SELECT COUNT(*) FROM (SELECT tenant_id, subject_id, holdings_as_of, calculation_version FROM gold.crisis_scenario_results
+      GROUP BY 1, 2, 3, 4 HAVING COUNT(*) <> 4) d
+    mustBe: 0
+    severity: warning
+    dimension: completeness
+slaDefaultElement: crisis_scenario_results.holdings_as_of
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: crisis_scenario_results.holdings_as_of
+- property: timeOfAvailability
+  value: 10:00+00:00
+  element: crisis_scenario_results.holdings_as_of
+  driver: operational
+- property: latency
+  value: 4
+  unit: d
+  element: crisis_scenario_results.holdings_as_of
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: Hypothetical crisis scenarios.
+- property: consumers
+  value:
+  - ibkr_etl.crisis_scenarios
+  - ibkr_etl.layer_freshness
+- property: producers
+  value:
+  - ibkr_etl.crisis_scenarios
+- property: freshnessCheck
+  value:
+    checkId: gold.crisis_scenario_results
+    measure: as_of_date
+    required: true
+    query: SELECT MAX(holdings_as_of) AS observed FROM crisis_scenario_results
+    source: ibkr_etl.layer_freshness.RULES
+- property: calculationVersionColumn
+  value: calculation_version
+- property: calculationVersionSource
+  value:
+  - ibkr_etl.crisis_scenarios.VERSION
+contractCreatedTs: '2026-10-18T00:00:00Z'

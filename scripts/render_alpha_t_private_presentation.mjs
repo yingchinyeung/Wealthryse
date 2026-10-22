@@ -5,7 +5,7 @@ import {createHash} from 'node:crypto';
 import {pathToFileURL} from 'node:url';
 import {artifactToolUrl,bindTemplateObjectIds,bindTReportImports} from './alpha_t_presentation_runtime.mjs';
 const src=await fs.readFile(new URL('./render_monthly_presentation.mjs',import.meta.url),'utf8');
-if(createHash('sha256').update(src).digest('hex')!=='7beb470735441d3955b1c18c5e53a19f23480788aea22aa498b5f998efe50f0a')
+if(createHash('sha256').update(src).digest('hex')!=='c3d268fc87340f83ee7f4a568f295082474760f1568d25eb04825e7c1da8b9da')
   throw Error('Reference renderer changed; inspect before adapting');
 // Desktop finalization remains enabled when its complete environment is set.
 // Azure uses the installed, image-pinned package and the same financial audit.
@@ -14,6 +14,7 @@ let code=src.replaceAll('alpha-world-ms','alpha-world-t').replaceAll('Alpha Worl
  .replaceAll('line: { fill:',"line: { style: 'solid', fill:")
  .replaceAll('chartLine: { fill:',"chartLine: { style: 'solid', fill:")
  .replace("['-m','ibkr_etl.alpha_world_ms_presentation',snapshotPath]","['-m','ibkr_etl.alpha_world_t_presentation',snapshotPath]")
+ .replace("'alpha-world-t-presentation-hkd-hibor-v2'","'alpha-world-t-presentation-hkd-hibor-v1'")
  .replace("from \"@oai/artifact-tool\"",`from ${JSON.stringify(artifactRuntimeUrl)}`)
  .replace("scripts/audit_alpha_ms_presentation.py","scripts/audit_alpha_t_private_presentation.py")
  .replaceAll('Frongello-linked contribution to return','Fixed-unit contribution to return')
@@ -83,7 +84,6 @@ const safeText=new Map([
  ['Rebalancing Explanations: Quarterly end','Constant cash: 58 per initial NAV 100'],
  ['Performance fees calculated as the delta versus the prior quarter and only deemed earned if higher than the prior quarter and is a positive return (no watermark).',
   'Underlying account NAV includes its cash and interest. No additional financing charge is added. T fee terms are not established by this model.'],
- ['inquiry@www.sprout-asset.com','Contact details under review']
 ]);
 for(const line of templateText.ndjson.split('\\n').filter(Boolean)){
  const x=JSON.parse(line),old=String(x.text||x.textPreview||'').replace(/\\s+/g,' ').trim();

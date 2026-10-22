@@ -128,7 +128,9 @@ class SecurityDefinitionTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("param scheduleUtc string = '0 8 * * *'", template)
         self.assertIn("replicaRetryLimit: 0", template)
-        self.assertIn("triggerType: 'Schedule'", template)
+        # Scheduled unless the switch to v2's own Flex pull turns it off.
+        self.assertIn("param scheduleEnabled bool = true", template)
+        self.assertIn("triggerType: scheduleEnabled ? 'Schedule' : 'Manual'", template)
         self.assertIn("keyVaultUrl:", template)
         self.assertIn("name: 'IBKR_RUN_MIGRATIONS'", template)
         self.assertIn("value: 'false'", template)
@@ -296,35 +298,6 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("refresh_crisis_replay", script)
         self.assertIn("crisis_replay_observations", script)
 
-    def test_daily_account_sync_is_bounded_multi_account_digest_pinned_and_no_retry(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        template = (
-            root / "infra" / "staging-daily-account-sync.bicep"
-        ).read_text(encoding="utf-8")
-        role = (
-            root / "infra" / "staging-production-export-reader.bicep"
-        ).read_text(encoding="utf-8")
-        script = (
-            root / "scripts" / "sync_daily_pilot_account.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn("cronExpression: '10 8 * * *'", template)
-        self.assertIn("replicaRetryLimit: 0", template)
-        self.assertIn("parallelism: 1", template)
-        self.assertIn("ibkr-platform@${imageDigest}", template)
-        self.assertIn("sourceScope: 'physical-account-wave-0'", template)
-        self.assertIn("account_id: 'U16088571'", template)
-        self.assertIn("account_id: 'U16088606'", template)
-        self.assertIn("ACCOUNT_SYNC_TARGETS_JSON", template)
-        self.assertIn("ONBOARDING_WAVE0_ACCOUNT_ID", template)
-        self.assertIn("Storage/storageAccounts/blobServices/containers", role)
-        self.assertIn("storageBlobReaderRoleId", role)
-        self.assertIn("build_pilot_snapshot", script)
-        self.assertIn("validate_production_export_manifest", script)
-        self.assertIn("parse_account_sync_targets", script)
-        self.assertIn("register_source_discoveries", script)
-        self.assertNotIn("FLEX_TOKEN", template)
-        self.assertNotIn("ibkr-flex", template.lower())
-
     def test_treasury_risk_free_job_is_staging_only_and_has_no_retry(self) -> None:
         root = Path(__file__).resolve().parents[1]
         template = (root / "infra" / "staging-risk-free-job.bicep").read_text(
@@ -368,7 +341,7 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("replicaRetryLimit: 0", template)
         self.assertIn("parallelism: 1", template)
         self.assertIn("failed-execution", template)
-        self.assertIn("ibkr-v11-daily-alerts", template)
+        self.assertIn("ibkrv2stg-alerts", template)
         self.assertIn("database-approval-url", template)
         self.assertIn("ibkrv2stg-benchmark-daily", template)
         self.assertIn("ibkrv2stg-risk-free-daily", template)
@@ -412,7 +385,11 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("idx_burn_in_one_running_window", migration)
         self.assertIn("cronExpression: '15 9 * * *'", template)
         self.assertIn("replicaRetryLimit: 0", template)
-        self.assertIn("ibkr-v11-daily", template)
+        # v1.1's pull and account-sync stopped on 17 Oct 2026; v1.1 was deleted on 21 Oct.
+        self.assertNotIn("  'ibkr-v11-daily'\n", template)
+        self.assertNotIn("ibkrv2stg-account-sync-daily", template)
+        self.assertIn("ibkrv2stg-institutional-daily", template)
+        self.assertIn("param actionGroupName string = 'ibkrv2stg-alerts'", template)
         self.assertIn("ibkrv2stg-autonomous-admin", template)
         self.assertIn("ibkrv2stg-autonomy-review", template)
         self.assertIn("database-approval-url", template)
@@ -496,9 +473,11 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("render_factsheet", script)
         self.assertIn("layout_authority", script)
         self.assertIn("deterministic-renderers", script)
-        self.assertIn("generate_month_end_commentary", script)
-        self.assertIn("render_monthly_presentation.mjs", script)
-        self.assertIn("validate_subject_presentation", script)
+        # Factsheets only: no deck and no commentary (commentary belonged to the deck).
+        self.assertNotIn("generate_month_end_commentary", script)
+        self.assertNotIn("render_monthly_presentation.mjs", script)
+        self.assertNotIn("PRESENTATION_TEMPLATE_PATH", script)
+        self.assertIn('PACKAGE_REPORT_TYPES = ("factsheet",)', script)
         self.assertIn("month_end_report_package_generated", script)
         self.assertIn("'system', 'gpt-5.6-sol-portfolio-analyst'", script)
         self.assertIn("awaiting_approval", script)
@@ -813,7 +792,8 @@ class SecurityDefinitionTests(unittest.TestCase):
         month_end_script = (
             root / "scripts" / "generate_month_end_package.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("validate_subject_presentation", month_end_script)
+        # Per-account decks are no longer built by the month-end job.
+        self.assertNotIn("validate_subject_presentation", month_end_script)
         self.assertIn("platform_content_expectations", output_gate)
         self.assertIn("expected_security_axis_labels", output_gate)
         self.assertIn("expected_summary_table_rows", output_gate)
@@ -979,13 +959,24 @@ class SecurityDefinitionTests(unittest.TestCase):
         analytics = (
             root / "infra" / "staging-onboarding-analytics-job.bicep"
         ).read_text(encoding="utf-8")
-        self.assertIn("cronExpression: '0 8 * * *'", institutional)
+        # Deploying with the defaults keeps the live job since v2's own Flex pull began on
+        # 17 Oct 2026: 08:20 UTC, data up to yesterday, sends on.
+        self.assertIn("param scheduleUtc string = '20 8 * * *'", institutional)
+        self.assertIn("cronExpression: scheduleUtc", institutional)
+        self.assertIn("param dispatchRunDate string = 'previous_hkt_day'", institutional)
+        self.assertIn("{ name: 'INSTITUTIONAL_DISPATCH_RUN_DATE', value: dispatchRunDate }", institutional)
+        self.assertIn("param flexSendsEnabled bool = true", institutional)
+        self.assertIn("{ name: 'INSTITUTIONAL_FLEX_SENDS_ENABLED', value: flexSendsEnabled ? 'true' : 'false' }",
+                      institutional)
         self.assertIn("INSTITUTIONAL_FLEX_LOOKBACK_DAYS", institutional)
+        self.assertIn("{ name: 'IBKR_RUN_MIGRATIONS', value: 'false' }", institutional)
         self.assertIn("AZURE_RAW_CONTAINER", institutional)
         self.assertIn("cronExpression: '50 8 * * *'", derived)
         self.assertIn("run_self_service_derived_refresh.py", derived)
-        self.assertIn("REFERENCE_STORAGE_ACCOUNT_URL", derived)
-        self.assertIn("REFERENCE_STORAGE_CONTAINER", derived)
+        # Reference data comes from v2's own tables; nothing points at v1.1's storage.
+        self.assertIn("param referenceDataSource string = 'database'", derived)
+        self.assertNotIn("REFERENCE_STORAGE_ACCOUNT_URL", derived)
+        self.assertNotIn("ibkrv115", derived)
         self.assertIn("triggerType: 'Manual'", analytics)
         for template in (institutional, derived, analytics):
             self.assertIn("replicaRetryLimit: 0", template)

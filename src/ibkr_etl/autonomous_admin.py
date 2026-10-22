@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from .ai_analyst import AIAnalystConfig, AIAnalystError, _default_client
-from .burn_in import freshness_check
+from .burn_in import first_flex_pull_due, flex_import_failures, freshness_check
 from .util import canonical_json
 
 
@@ -103,8 +103,13 @@ def evaluate_supervisor_state(
     *,
     today_hkt: date,
     portal_failure: str | None = None,
+    now_utc: datetime | None = None,
 ) -> list[Finding]:
-    """Convert deterministic observations into a stable, typed incident set."""
+    """Convert deterministic observations into a stable, typed incident set.
+
+    now_utc only opens the switch-morning window for v2's first Flex pull;
+    without it there is no such window.
+    """
     findings: list[Finding] = []
     freshness_specs = (
         (
@@ -154,7 +159,50 @@ def evaluate_supervisor_state(
             findings.append(finding)
 
     latest_import = state.get("latest_import") or {}
-    if latest_import.get("status") != "success":
+    if state.get("daily_feed") == "ibkr_flex":
+        # This runs every five minutes, so it accepts yesterday's pull; the
+        # 17:15 HKT burn-in check requires today's.
+        failures = flex_import_failures(state, today_hkt=today_hkt, maximum_age_days=1)
+        due = first_flex_pull_due(state, today_hkt=today_hkt, now_utc=now_utc) if failures else None
+        if due is not None:
+            # Switch morning: the first pull has not run yet and is not late.
+            findings.append(
+                Finding(
+                    incident_key="first_flex_pull_pending",
+                    check_id="account_import_status",
+                    severity="warning",
+                    description=(
+                        "Waiting for v2's first Flex pull, due by "
+                        f"{due.astimezone(timezone.utc):%H:%M} UTC"
+                    ),
+                    evidence={
+                        "daily_feed": "ibkr_flex",
+                        "daily_feed_effective_from": str(state.get("daily_feed_effective_from")),
+                        "due_by_utc": due.astimezone(timezone.utc).isoformat(),
+                    },
+                    autonomous_action=None,
+                )
+            )
+        elif failures:
+            nav_run = state.get("latest_nav_run") or {}
+            findings.append(
+                Finding(
+                    incident_key="account_import_status",
+                    check_id="account_import_status",
+                    severity="critical",
+                    description="; ".join(failures),
+                    evidence={
+                        "daily_feed": "ibkr_flex",
+                        "status": latest_import.get("status"),
+                        "completed_at": latest_import.get("completed_at"),
+                        "latest_nav_run_type": nav_run.get("run_type"),
+                        "latest_nav_run_completed_at": nav_run.get("completed_at"),
+                    },
+                    # Deliberately no automatic retry: this path calls IBKR Flex.
+                    autonomous_action=None,
+                )
+            )
+    elif latest_import.get("status") != "success":
         findings.append(
             Finding(
                 incident_key="account_import_status",
@@ -193,13 +241,13 @@ def evaluate_supervisor_state(
         )
 
     ready_types = sorted(set(state.get("ready_report_types") or []))
-    if ready_types != ["factsheet", "presentation"]:
+    if "factsheet" not in ready_types:
         findings.append(
             Finding(
                 "month_end_report_pair",
                 "month_end_report_pair",
                 "warning",
-                "Latest month-end snapshot does not have one ready report pair",
+                "Latest month-end snapshot does not have a ready factsheet",
                 {"ready_report_types": ready_types},
             )
         )
@@ -226,6 +274,257 @@ def evaluate_supervisor_state(
             )
         )
     return sorted(findings, key=lambda item: (item.severity != "critical", item.incident_key))
+
+
+LAYER_FRESHNESS_CHECK = "layer_freshness"
+LAYER_FRESHNESS_PREFIX = LAYER_FRESHNESS_CHECK + ":"
+LAYER_FRESHNESS_UNAVAILABLE_PREFIX = LAYER_FRESHNESS_PREFIX + "unavailable:"
+# A required check that cannot be read for this long raises a warning of its own.
+LAYER_FRESHNESS_UNAVAILABLE_AFTER = timedelta(hours=1)
+
+
+@dataclass(frozen=True)
+class LayerFreshnessReview:
+    """What one administrator run does with the layer freshness results.
+
+    findings: late layers (warning) and required checks that cannot be read (info for
+    the first hour, then warning). hold_open: open layer_freshness incidents this run
+    must not close, because their check did not come back fresh. quiet: info findings,
+    recorded but not announced. escalated: open info incidents that are now warnings,
+    to announce as if new.
+    """
+
+    findings: tuple[Finding, ...] = ()
+    hold_open: frozenset[str] = frozenset()
+    quiet: frozenset[str] = frozenset()
+    escalated: frozenset[str] = frozenset()
+
+
+def _unavailable_since(previous: Mapping[str, Any] | None) -> datetime | None:
+    try:
+        value = (previous or {}).get("evidence", {}).get("unavailable_since")
+        parsed = datetime.fromisoformat(str(value))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _unavailable_finding(key: str, subject: str, error: str, evidence: Mapping[str, Any], *,
+                         now: datetime, open_incidents: Mapping[str, Mapping[str, Any]]) -> Finding:
+    since = _unavailable_since(open_incidents.get(key)) or now
+    since_text = since.astimezone(timezone.utc).isoformat(timespec="seconds")
+    late = now - since >= LAYER_FRESHNESS_UNAVAILABLE_AFTER
+    return Finding(
+        incident_key=key,
+        check_id=LAYER_FRESHNESS_CHECK,
+        severity="warning" if late else "info",
+        description=f"{subject} cannot be read since {since_text}: {error}",
+        evidence={**dict(evidence), "unavailable_since": since_text},
+    )
+
+
+def review_layer_freshness(
+    results: Sequence[Mapping[str, Any]] | None,
+    *,
+    now: datetime,
+    open_incidents: Mapping[str, Mapping[str, Any]] | None = None,
+) -> LayerFreshnessReview:
+    """Turn freshness results (None: the check itself failed) into findings. Report
+    only: no autonomous action, so the repair policy never acts on them.
+
+    `open_incidents` maps each open layer_freshness incident key to its severity and
+    evidence, so an unreadable check keeps the time it was first unreadable.
+    """
+    open_incidents = open_incidents or {}
+    findings: list[Finding] = []
+    for result in results or ():
+        if not result.get("late"):
+            continue
+        source = result.get("feed") or result.get("target")
+        findings.append(
+            Finding(
+                incident_key=f"{LAYER_FRESHNESS_PREFIX}{result['check_id']}",
+                check_id=LAYER_FRESHNESS_CHECK,
+                severity="warning",
+                description=(
+                    f"{str(result.get('layer', '')).capitalize()} layer is late: {source} is "
+                    f"{result.get('state')} (newest {result.get('observed') or 'none'}, "
+                    f"expected from {result.get('earliest_expected') or result.get('due')})"
+                ),
+                evidence=dict(result),
+            )
+        )
+    unreadable = [r for r in results or () if r.get("required") and r.get("state") == "unavailable"]
+    # One incident for a failed session (no database, no storage settings, no time
+    # left), one per check for a query or listing that fails on its own.
+    session = [r for r in unreadable if r.get("error_scope") == "session"]
+    for result in unreadable:
+        if result.get("error_scope") == "session":
+            continue
+        findings.append(_unavailable_finding(
+            f"{LAYER_FRESHNESS_UNAVAILABLE_PREFIX}{result['check_id']}",
+            f"{str(result.get('layer', '')).capitalize()} layer check {result['check_id']}",
+            str(result.get("error") or "unavailable"), result, now=now, open_incidents=open_incidents))
+    if results is None or session:
+        errors = sorted({str(r.get("error") or "unavailable") for r in session}) or ["the check failed to run"]
+        findings.append(_unavailable_finding(
+            f"{LAYER_FRESHNESS_UNAVAILABLE_PREFIX}session", "The layer freshness check",
+            "; ".join(errors), {"checks": sorted(r["check_id"] for r in session)},
+            now=now, open_incidents=open_incidents))
+
+    active = {finding.incident_key for finding in findings}
+    by_check = None if results is None else {r["check_id"]: r for r in results}
+    hold = set()
+    for key in open_incidents:
+        if not key.startswith(LAYER_FRESHNESS_PREFIX) or key in active:
+            continue
+        if by_check is None:
+            hold.add(key)  # nothing was measured, so nothing came back fresh
+        elif key.startswith(LAYER_FRESHNESS_UNAVAILABLE_PREFIX):
+            result = by_check.get(key[len(LAYER_FRESHNESS_UNAVAILABLE_PREFIX):])
+            if result is not None and result.get("state") == "unavailable":
+                hold.add(key)
+        else:
+            result = by_check.get(key[len(LAYER_FRESHNESS_PREFIX):])
+            if result is not None and result.get("state") != "fresh":
+                hold.add(key)
+    return LayerFreshnessReview(
+        findings=tuple(findings),
+        hold_open=frozenset(hold),
+        quiet=frozenset(f.incident_key for f in findings if f.severity == "info"),
+        escalated=frozenset(
+            f.incident_key for f in findings
+            if f.severity != "info" and (open_incidents.get(f.incident_key) or {}).get("severity") == "info"
+        ),
+    )
+
+
+LAYER_QUALITY_CHECK = "layer_quality"
+LAYER_QUALITY_PREFIX = LAYER_QUALITY_CHECK + ":"
+_QUALITY_EVIDENCE = ("typical", "recent", "low", "high", "direction", "date", "day_kind", "differences",
+                     "contract_version", "rule", "column", "must_be", "band", "subjects_checked", "reason", "error")
+
+
+def _quality_evidence(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Counts, dates and masked subjects only; never a figure."""
+    detail = result.get("detail") or {}
+    evidence = {key: result.get(key) for key in ("check_id", "kind", "layer", "target", "state", "severity",
+                                                  "observed")}
+    evidence.update({key: detail[key] for key in _QUALITY_EVIDENCE if key in detail})
+    if detail.get("failed"):
+        evidence["subjects"] = sorted({str(item.get("subject")) for item in detail["failed"]})
+    return evidence
+
+
+def _quality_description(result: Mapping[str, Any]) -> str:
+    layer = str(result.get("layer", "")).capitalize()
+    detail = result.get("detail") or {}
+    kind, target, observed = result.get("kind"), result.get("target"), result.get("observed")
+    if kind == "volume":
+        if detail.get("direction"):
+            return (f"{layer} row count {detail['direction']}: {target} has {observed} rows for {detail.get('date')}, "
+                    f"typically {detail.get('typical')}")
+        return f"{layer} row count: {target} has {observed} rows ({detail.get('reason', 'failed')})"
+    if kind == "schema":
+        return f"{layer} schema drift: {target} differs from its data contract in {observed} way(s)"
+    if kind == "value":
+        return f"{layer} value check {result.get('check_id')} failed for {observed} subject(s)"
+    return f"{layer} quality check {result.get('check_id')} failed on {target} ({observed} rows)"
+
+
+def review_layer_quality(
+    outcome: Mapping[str, Any] | None,
+    *,
+    warn: bool,
+    open_incidents: Mapping[str, Mapping[str, Any]] | None = None,
+) -> LayerFreshnessReview:
+    """Turn one run's layer quality outcome (layer_quality.run_in_administrator; None: the check
+    itself failed) into findings. Report only: no autonomous action.
+
+    Shadow (warn False): every finding is info, recorded quietly and never announced. Warn: a
+    layer late for its target time, or a failed check of severity error, is a warning; the rest
+    stay info for the weekly report. Readiness is judged every run and its incident closes only
+    when the layer is ready; a daily check's incident closes only when that check passes.
+    """
+    open_incidents = open_incidents or {}
+    readiness = list((outcome or {}).get("readiness") or ())
+    daily = None if outcome is None else outcome.get("daily")
+    findings: list[Finding] = []
+    for item in readiness:
+        if item.get("state") != "late":
+            continue
+        waiting = sorted(check for check, value in (item.get("checks") or {}).items() if not value.get("ready"))
+        findings.append(Finding(
+            incident_key=f"{LAYER_QUALITY_PREFIX}{item['check_id']}",
+            check_id=LAYER_QUALITY_CHECK,
+            severity="warning" if warn else "info",
+            description=(f"{str(item.get('layer', '')).capitalize()} layer not ready by "
+                         f"{str(item.get('ready_by', ''))[11:16]} UTC: data for {item.get('business_day')} "
+                         f"has not arrived in {', '.join(waiting)}"),
+            evidence={key: item.get(key) for key in ("check_id", "layer", "business_day", "ready_by", "checks")},
+        ))
+    for result in daily or ():
+        if result.get("state") != "fail":
+            continue
+        findings.append(Finding(
+            incident_key=f"{LAYER_QUALITY_PREFIX}{result['check_id']}",
+            check_id=LAYER_QUALITY_CHECK,
+            severity="warning" if warn and result.get("severity") == "error" else "info",
+            description=_quality_description(result),
+            evidence=_quality_evidence(result),
+        ))
+
+    active = {finding.incident_key for finding in findings}
+    by_target = {f"{LAYER_QUALITY_PREFIX}{item['check_id']}": item for item in readiness}
+    ready_keys = {f"{LAYER_QUALITY_PREFIX}{target}" for target in _ready_target_ids()}
+    by_check = None if daily is None else {f"{LAYER_QUALITY_PREFIX}{r['check_id']}": r for r in daily}
+    session_failed = any((r.get("detail") or {}).get("error_scope") == "session" for r in daily or ())
+    hold = set()
+    for key in open_incidents:
+        if not key.startswith(LAYER_QUALITY_PREFIX) or key in active:
+            continue
+        if outcome is None:
+            hold.add(key)
+        elif key in ready_keys:
+            if (by_target.get(key) or {}).get("state") != "ready":
+                hold.add(key)  # closes only once the layer is ready
+        elif by_check is None:
+            hold.add(key)  # no daily pass this run
+        elif key in by_check:
+            if by_check[key].get("state") != "pass":
+                hold.add(key)
+        elif session_failed:
+            hold.add(key)
+    return LayerFreshnessReview(
+        findings=tuple(findings),
+        hold_open=frozenset(hold),
+        quiet=frozenset(f.incident_key for f in findings if f.severity == "info"),
+        escalated=frozenset(
+            f.incident_key for f in findings
+            if f.severity != "info" and (open_incidents.get(f.incident_key) or {}).get("severity") == "info"
+        ),
+    )
+
+
+def _ready_target_ids() -> tuple[str, ...]:
+    from .layer_quality import READY, TARGETS
+
+    return tuple(target.target_id for target in TARGETS if target.kind == READY)
+
+
+def combine_reviews(*reviews: LayerFreshnessReview | None) -> LayerFreshnessReview | None:
+    """One review from several (layer freshness, layer quality); None when all are off."""
+    present = [review for review in reviews if review is not None]
+    if not present:
+        return None
+    if len(present) == 1:
+        return present[0]
+    return LayerFreshnessReview(
+        findings=tuple(finding for review in present for finding in review.findings),
+        hold_open=frozenset().union(*(review.hold_open for review in present)),
+        quiet=frozenset().union(*(review.quiet for review in present)),
+        escalated=frozenset().union(*(review.escalated for review in present)),
+    )
 
 
 def plan_safe_repairs(

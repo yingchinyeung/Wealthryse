@@ -3,13 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from zoneinfo import ZoneInfo
 from pypdf import PdfReader
+from azure.core.exceptions import ResourceExistsError
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,19 +20,11 @@ if str(SOURCE_ROOT) not in sys.path:
 from ibkr_etl.cloud_storage import download_blob_bytes, upload_bytes  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.historical_reporting import queue_report_generation_run  # noqa: E402
-from ibkr_etl.month_end_agent import (  # noqa: E402
-    MonthEndAgentConfig,
-    generate_month_end_commentary,
-)
 from ibkr_etl.monthly_artifacts import (  # noqa: E402
     ALPHA_WORLD_MS_FACTSHEET_AUTHORITY_SHA256,
     ALPHA_WORLD_MS_FACTSHEET_LAYOUT_VERSION,
     factsheet_layout_version,
     render_factsheet,
-)
-from ibkr_etl.presentation_design import (  # noqa: E402
-    presentation_content_contract_version,
-    presentation_content_requirements,
 )
 from ibkr_etl.reporting_snapshot import (  # noqa: E402
     active_month_end_snapshot_id,
@@ -44,10 +36,13 @@ from ibkr_etl.template_upload import (  # noqa: E402
 )
 from ibkr_etl.util import canonical_json, utc_now_iso  # noqa: E402
 from ibkr_etl.report_design_updates import active_design, qualified_design, decoded  # noqa: E402
-from validate_subject_presentation import validate_subject_presentation  # noqa: E402
+from ms_review_upload import upload_ms_review  # noqa: E402
 
 
 HONG_KONG = ZoneInfo("Asia/Hong_Kong")
+# Per-account decks are no longer built: a month's package is its factsheet.
+# Decks generated before stay in place and downloadable.
+PACKAGE_REPORT_TYPES = ("factsheet",)
 
 
 def previous_calendar_month_end(today: date) -> date:
@@ -186,6 +181,12 @@ def _existing_package(
     allow_replacement: bool = False,
     snapshot_id: str | None = None,
 ) -> str | None:
+    if allow_replacement and not snapshot_id:
+        raise RuntimeError('Replacement requires an exact approved snapshot')
+    if not snapshot_id:
+        # No active frozen input means an older/superseded package cannot
+        # establish completion for this run. Main must freeze a valid input.
+        return None
     rows = connection.execute(
         """
         SELECT r.report_type, r.status, r.template_version,
@@ -195,23 +196,23 @@ def _existing_package(
           ON s.tenant_id = r.tenant_id AND s.snapshot_id = r.snapshot_id
         WHERE r.tenant_id = ? AND s.subject_id = ? AND s.period_end = ?
           AND r.report_type IN ('factsheet', 'presentation')
-          AND (CAST(? AS uuid) IS NULL OR s.snapshot_id = CAST(? AS uuid))
+          AND s.snapshot_id = CAST(? AS uuid)
         ORDER BY r.generation_run_id DESC
         """,
-        (tenant_id, account_id, period_end, snapshot_id, snapshot_id),
+        (tenant_id, account_id, period_end, snapshot_id),
     ).fetchall()
     latest: dict[str, object] = {}
     for row in rows:
         latest.setdefault(str(row["report_type"]), row)
+    # A deck built before decks were retired neither completes nor blocks a package.
+    latest = {kind: row for kind, row in latest.items() if kind in PACKAGE_REPORT_TYPES}
     released = {
         kind
         for kind, row in latest.items()
         if str(row["status"]) in {"released_internal", "published"}
     }
-    if released and released != {"factsheet", "presentation"} and not allow_replacement:
-        raise RuntimeError("Month-end package has an inconsistent partial release")
-    if released == {"factsheet", "presentation"} and (
-        not allow_replacement or all(str(latest[k]['template_version'])==expected_versions[k] for k in released)
+    if released == set(PACKAGE_REPORT_TYPES) and (
+        not allow_replacement or all(str(latest[k]['template_version']) == expected_versions[k] for k in released)
     ):
         return "already_released"
     complete = all(
@@ -220,7 +221,7 @@ def _existing_package(
         and str(latest[kind]["template_version"]) == expected_versions[kind]
         and bool(latest[kind]["output_reference"])
         and bool(latest[kind]["output_sha256"])
-        for kind in ("factsheet", "presentation")
+        for kind in PACKAGE_REPORT_TYPES
     )
     return "already_generated" if complete else None
 
@@ -259,6 +260,63 @@ def _load_frozen_snapshot(
     return json.loads(payload_text), digest
 
 
+def _acquire_package_lock(connection, tenant_id, account_id, period_end):
+    # A snapshot freeze may commit internally. A session lock remains held
+    # through that commit and is released by the existing finally/close path.
+    row = connection.execute(
+        'SELECT pg_try_advisory_lock(hashtextextended(?,0)) AS acquired',
+        (f'report-release:{tenant_id}:{account_id}:{period_end}',),
+    ).fetchone()
+    if not row or row['acquired'] is not True:
+        raise RuntimeError('Another report operation is active for this account and month')
+
+
+def _verify_existing_artifacts(connection, *, tenant_id, account_id, snapshot_id,
+                               storage_url, container):
+    rows = connection.execute('''SELECT r.report_type,r.output_reference,r.output_sha256
+        FROM report_generation_runs r JOIN reporting_snapshots s
+          ON s.tenant_id=r.tenant_id AND s.snapshot_id=r.snapshot_id
+        WHERE r.tenant_id=? AND s.subject_id=? AND s.snapshot_id=CAST(? AS uuid)
+          AND r.report_type='factsheet'
+        ORDER BY r.generation_run_id DESC''',(tenant_id,account_id,snapshot_id)).fetchall()
+    latest={}
+    for row in rows:
+        if str(row['report_type']) in PACKAGE_REPORT_TYPES:latest.setdefault(str(row['report_type']),row)
+    if set(latest)!=set(PACKAGE_REPORT_TYPES):
+        raise RuntimeError('Existing report package is incomplete')
+    for row in latest.values():
+        bucket, separator, name=str(row['output_reference'] or '').partition('/')
+        digest=str(row['output_sha256'] or '')
+        if (bucket!=container or not separator or not name or name.startswith('/')
+                or '\\' in name or any(part in ('..','.') for part in name.split('/'))
+                or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest)):
+            raise RuntimeError('Existing report artifact reference or hash is invalid')
+        content=download_blob_bytes(storage_url,container,name,maximum_bytes=64*1024*1024)
+        if _sha256(content)!=digest:
+            raise RuntimeError('Existing report artifact failed integrity verification')
+
+
+def _upload_immutable_artifact(storage_url, container, name, content, content_type):
+    try:
+        uploaded=upload_bytes(storage_url,container,name,content,
+                              overwrite=False,content_type=content_type)
+    except ResourceExistsError:
+        if download_blob_bytes(storage_url,container,name)!=content:
+            raise RuntimeError('Existing immutable report differs')
+        uploaded=True
+    if not uploaded or download_blob_bytes(storage_url,container,name)!=content:
+        raise RuntimeError('Immutable report upload/readback failed')
+    return uploaded
+
+
+def _factsheet_template_version(template_sha, design_sha, layout):
+    # An identical PDF occupying both approved asset roles is one authority,
+    # not a second supporting file. Preserve T's existing canonical version.
+    if design_sha and design_sha != template_sha:
+        return f'sha256:{design_sha}+supporting-sha256:{template_sha}+layout:{layout}'
+    return f'sha256:{template_sha}+layout:{layout}'
+
+
 def main() -> int:
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() != "internal-production":
         raise RuntimeError("Month-end package automation is restricted to internal production")
@@ -287,26 +345,10 @@ def main() -> int:
     factsheet_sha = os.environ.get("FACTSHEET_TEMPLATE_SHA256", "").strip().lower()
     factsheet_design_sha = ""
     factsheet_container = container
-    presentation_path = Path(_required("PRESENTATION_TEMPLATE_PATH"))
-    presentation_sha = _required("PRESENTATION_TEMPLATE_SHA256").lower()
-    if not presentation_path.is_file():
-        raise RuntimeError("Approved presentation template is not present in the image")
-    presentation_content = presentation_path.read_bytes()
-    if _sha256(presentation_content) != presentation_sha:
-        raise RuntimeError("Presentation template SHA-256 does not match the approved version")
-
-    agent_config = MonthEndAgentConfig(
-        endpoint=_required("AZURE_OPENAI_ENDPOINT"),
-        deployment=_required("AZURE_OPENAI_DEPLOYMENT"),
-        region=_required("AI_RESOURCE_REGION"),
-        processing_scope=_required("AI_PROCESSING_SCOPE"),
-        managed_identity_client_id=_required("AZURE_CLIENT_ID"),
-    )
 
     connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
     try:
-        connection.execute('SELECT pg_advisory_xact_lock(hashtextextended(?,0))',
-            (f'report-release:{tenant_id}:{account_id}:{period_end.isoformat()}',))
+        _acquire_package_lock(connection,tenant_id,account_id,period_end.isoformat())
         if (os.environ.get('REPORT_DESIGN_UPDATES_ENABLED')=='true'
                 and not os.environ.get('REPORT_DESIGN_VERSION')
                 and _pending_design_update(connection,tenant_id=tenant_id,account_id=account_id,
@@ -383,17 +425,9 @@ def main() -> int:
             factsheet_design_container = ""
             factsheet_design_blob = ""
         active_factsheet_layout = factsheet_layout_version(account_id)
-        factsheet_version = f"sha256:{factsheet_sha}+layout:{active_factsheet_layout}"
-        if factsheet_design_sha:
-            factsheet_version = (
-                f"sha256:{factsheet_design_sha}+supporting-sha256:{factsheet_sha}"
-                f"+layout:{active_factsheet_layout}"
-            )
-        presentation_layout = presentation_content_contract_version(account_id)
-        template_versions = {
-            "factsheet": factsheet_version,
-            "presentation": f"sha256:{presentation_sha}+layout:{presentation_layout}",
-        }
+        factsheet_version = _factsheet_template_version(
+            factsheet_sha,factsheet_design_sha,active_factsheet_layout)
+        template_versions = {"factsheet": factsheet_version}
         design=None
         if os.environ.get('REPORT_DESIGN_UPDATES_ENABLED')=='true':
             image=os.environ.get('REPORT_RENDERER_IMAGE_SHA256','')
@@ -406,7 +440,9 @@ def main() -> int:
             else:
                 design=active_design(connection,tenant_id,account_id,installed_image_sha256=image)
             if design:
-                if decoded(design['template_versions_json'])!=template_versions:
+                # A design qualified while decks were built also names a deck template; only the
+                # factsheet's must match now.
+                if decoded(design['template_versions_json']).get('factsheet')!=template_versions['factsheet']:
                     raise RuntimeError('Installed templates differ from the qualified design')
                 template_versions={k:v+'+design:'+design['design_version'] for k,v in template_versions.items()}
         elif os.environ.get('REPORT_DESIGN_VERSION'):
@@ -422,6 +458,10 @@ def main() -> int:
             bound_payload,verified_sha=_load_frozen_snapshot(connection,tenant_id=tenant_id,account_id=account_id,snapshot_id=bound_id)
             if verified_sha!=bound_sha or bound_payload.get('period_end')!=period_end.isoformat():
                 raise RuntimeError('Frozen historical input no longer matches the approved plan')
+        snapshot_id = bound_id or active_month_end_snapshot_id(
+            connection, tenant_id=tenant_id, subject_id=account_id,
+            period_end=period_end.isoformat(),
+        )
         package_status = _existing_package(
             connection,
             tenant_id=tenant_id,
@@ -429,10 +469,11 @@ def main() -> int:
             period_end=period_end.isoformat(),
             expected_versions=template_versions,
             allow_replacement=bool(design),
-            snapshot_id=(bound_id or active_month_end_snapshot_id(connection,tenant_id=tenant_id,
-                subject_id=account_id,period_end=period_end.isoformat())) if design else None,
+            snapshot_id=snapshot_id,
         )
         if package_status:
+            _verify_existing_artifacts(connection,tenant_id=tenant_id,account_id=account_id,
+                snapshot_id=snapshot_id,storage_url=storage_url,container=container)
             print(canonical_json({"status": package_status, "period_end": period_end.isoformat()}))
             return 0
 
@@ -456,12 +497,6 @@ def main() -> int:
                     "Factsheet completed design model SHA-256 does not match the approved version"
                 )
 
-        snapshot_id = active_month_end_snapshot_id(
-            connection,
-            tenant_id=tenant_id,
-            subject_id=account_id,
-            period_end=period_end.isoformat(),
-        )
         snapshot_action = "reused_existing"
         if bound_id and str(snapshot_id)!=bound_id:
             raise RuntimeError('Current historical snapshot changed during regeneration')
@@ -492,23 +527,14 @@ def main() -> int:
         ).get("available"):
             raise RuntimeError("Frozen month-end snapshot failed data-quality checks")
 
-        agent_result = generate_month_end_commentary(payload, agent_config)
-        commentary = agent_result["commentary"]
         with TemporaryDirectory(prefix="month-end-package-") as directory:
             root = Path(directory)
             factsheet_template = root / "approved-factsheet-template.pdf"
             factsheet_design_model = root / "approved-completed-factsheet-model.pdf"
-            snapshot_file = root / "snapshot.json"
-            commentary_file = root / "commentary.json"
             factsheet_output = root / f"{account_id}_Factsheet_{period_end.isoformat()}.pdf"
-            presentation_output = root / (
-                f"{account_id}_Monthly_Presentation_{period_end.isoformat()}.pptx"
-            )
             factsheet_template.write_bytes(factsheet_content)
             if factsheet_design_content is not None:
                 factsheet_design_model.write_bytes(factsheet_design_content)
-            snapshot_file.write_text(canonical_json(payload), encoding="utf-8")
-            commentary_file.write_text(canonical_json(commentary), encoding="utf-8")
 
             factsheet_result = render_factsheet(
                 payload,
@@ -530,68 +556,28 @@ def main() -> int:
                 _require_factsheet_identity(
                     factsheet_output, strategy_name, subject_id=account_id
                 )
-            presentation_environment = dict(os.environ)
-            if strategy_name:
-                presentation_environment["PRESENTATION_STRATEGY_NAME"] = strategy_name
-            subprocess.run(
-                [
-                    os.environ.get("NODE_EXECUTABLE", "node"),
-                    str(PROJECT_ROOT / "scripts" / ("render_alpha_t_presentation.mjs" if payload.get('subject_id') == 'alpha-world-t' else "render_monthly_presentation.mjs")),
-                    str(presentation_path),
-                    str(snapshot_file),
-                    str(presentation_output),
-                    str(commentary_file),
-                ],
-                check=True,
-                cwd=PROJECT_ROOT,
-                env=presentation_environment,
-            )
-            presentation_validation = validate_subject_presentation(
-                presentation_output, snapshot_file,
-                subject_id=account_id, period_end=period_end.isoformat(),
-                expected_strategy=strategy_name or None,
-            )
-            if (presentation_validation["snapshot_sha256"] != snapshot_sha
-                    or presentation_validation["content_contract_version"] != presentation_layout):
-                raise RuntimeError("Presentation validation differs from the frozen input/content contract")
-
             artifacts = {
                 "factsheet": {
                     "path": factsheet_output,
                     "content_type": "application/pdf",
                     "template_id": f"{account_id}-monthly-factsheet",
                 },
-                "presentation": {
-                    "path": presentation_output,
-                    "content_type": (
-                        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                    ),
-                    "template_id": f"{account_id}-monthly-presentation",
-                },
             }
             for kind, artifact in artifacts.items():
                 path = artifact["path"]
                 content = path.read_bytes()
                 artifact["sha256"] = _sha256(content)
-                if kind == "presentation" and artifact["sha256"] != presentation_validation["output_sha256"]:
-                    raise RuntimeError("Presentation changed after output validation")
                 artifact["blob_name"] = (
                     f"review/{account_id}/{period_end.isoformat()}/{artifact['sha256']}-{path.name}"
-                    if design else f"review/{account_id}/{period_end.isoformat()}/{path.name}"
                 )
-                try:
-                    uploaded = upload_bytes(storage_url,container,artifact['blob_name'],content,
-                        overwrite=not bool(design),content_type=artifact['content_type'])
-                except Exception:
-                    if not design:raise
-                    # Resume only an identical create-only output. Never overwrite.
-                    existing_bytes=download_blob_bytes(storage_url,container,artifact['blob_name'])
-                    if existing_bytes!=content:raise RuntimeError('Conflicting immutable report exists')
-                    uploaded=True
+                if account_id == "alpha-world-ms" and not design:
+                    uploaded = upload_ms_review(storage_url, container, artifact["blob_name"],
+                        content, content_type=artifact["content_type"])
+                else:
+                    uploaded = _upload_immutable_artifact(storage_url,container,
+                        artifact['blob_name'],content,artifact['content_type'])
                 if not uploaded:
                     raise RuntimeError(f"Private {kind} storage is unavailable")
-                if design and download_blob_bytes(storage_url,container,artifact['blob_name'])!=content:
-                    raise RuntimeError('Immutable report readback differs')
 
         now = utc_now_iso()
         run_ids: dict[str, int] = {}
@@ -633,18 +619,8 @@ def main() -> int:
                 "design_version": design['design_version'] if design else None,
                 "factsheet_template_sha256": factsheet_sha,
                 "factsheet_design_model_sha256": factsheet_design_sha or factsheet_sha,
-                "presentation_template_sha256": presentation_sha,
                 "factsheet_layout_version": active_factsheet_layout,
-                "presentation_layout_version": presentation_layout,
-                "presentation_content_requirements": list(
-                    presentation_content_requirements(account_id)
-                ),
-                "presentation_validation": presentation_validation,
-                "model_role": agent_result["model_role"],
-                "model_deployment": agent_result["model_deployment"],
-                "model_request_sha256": agent_result["request_sha256"],
-                "model_response_sha256": agent_result["response_sha256"],
-                "model_usage": agent_result["usage"],
+                "report_types": list(PACKAGE_REPORT_TYPES),
                 "layout_authority": "deterministic-renderers",
                 "publication_state": "awaiting_owner_approval",
             }
@@ -670,7 +646,6 @@ def main() -> int:
                     "snapshot_action": snapshot_action,
                     "generation_run_ids": run_ids,
                     "factsheet_layout_version": factsheet_result["layout_version"],
-                    "presentation_layout_version": presentation_layout,
                     "website_download_state": "ready_for_review",
                 }
             )

@@ -27,6 +27,12 @@ TAIWAN_COUNTRY_NAMES = {
 TAIWAN_EXCHANGES = {"TWSE", "TWO", "TPEX", "ROCO", "TAIFEX"}
 ALLOWED_DERIVED_CASH_CURRENCIES = {"HKD", "USD"}
 OPENING_CASH = {"HKD": 484_300.0, "USD": 0.0}
+# Ledger reasons that mean a source trade is outside the filtered portfolio
+# itself, as opposed to cash-policy reasons such as a non-permitted currency.
+# The website's filtered trade history keys on these exact strings.
+DUPLICATE_TRADE_REASON = "duplicate logical trade"
+EXCLUDED_INSTRUMENT_TRADE_REASON_PREFIX = "trade belongs to excluded Taiwan instrument: "
+EXCLUDED_CURRENCY_TRADE_REASON = "all legs of an excluded-currency trade are excluded"
 _SOURCE_ACCOUNT_SUFFIX = re.compile(r"\s+from\s+U\d+\s*$", re.IGNORECASE)
 _EXTERNAL_FLOW_PATTERN = re.compile(
     r"\b(DEPOSIT|WITHDRAW(?:AL)?|TRANSFER|WIRE|ACH|FPS|CONTRIBUTION|DISTRIBUTION)\b",
@@ -477,11 +483,11 @@ def _build_cash_ledger(
         )
         common_reason: str | None = None
         if duplicate:
-            common_reason = "duplicate logical trade"
+            common_reason = DUPLICATE_TRADE_REASON
         elif instrument_reason:
-            common_reason = f"trade belongs to excluded Taiwan instrument: {instrument_reason}"
+            common_reason = EXCLUDED_INSTRUMENT_TRADE_REASON_PREFIX + instrument_reason
         elif excluded_pair:
-            common_reason = "all legs of an excluded-currency trade are excluded"
+            common_reason = EXCLUDED_CURRENCY_TRADE_REASON
 
         if asset == "CASH" and "." in symbol:
             base_code, quote_code = symbol.split(".", 1)
@@ -1542,19 +1548,24 @@ def refresh_fixed_unit_composite(
     contract: dict[str, Any],
     *,
     generated_at: str | None = None,
+    strict_hkd: bool = False,
 ) -> dict[str, Any]:
     """Evaluate one canonical fixed-unit Studio contract.
 
     Account and portfolio sleeves define the common daily calendar. Benchmark
     observations may carry only up to the approved number of days. Every sleeve
     is converted to the reporting currency before it is normalized to 100.
+    strict_hkd applies MS and T's FX carry and positive-value rules to a
+    composite that reports in their design.
     """
 
     generated_at = generated_at or datetime.now(HKT).isoformat(timespec="seconds")
     portfolio_id = str(contract["subject_id"])
-    reference_hkd = portfolio_id in ('alpha-world-ms', 'alpha-world-t')
-    reference_label = 'MS' if portfolio_id == 'alpha-world-ms' else 'T'
-    if reference_hkd:
+    reference_hkd = portfolio_id in ('alpha-world-ms', 'alpha-world-t') or strict_hkd
+    reference_label = {'alpha-world-ms': 'MS', 'alpha-world-t': 'T'}.get(portfolio_id, 'The composite')
+    if strict_hkd and str(contract["base_currency"]).upper() != 'HKD':
+        raise ValueError('Only an HKD composite can report in the Alpha World design')
+    if portfolio_id in ('alpha-world-ms', 'alpha-world-t'):
         from .subject_onboarding import validate_reference_runtime_contract, configuration_sha256
         validate_reference_runtime_contract(portfolio_id,contract,configuration_sha256(contract))
     portfolio_name = str(contract["display_name"])

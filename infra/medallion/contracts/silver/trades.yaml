@@ -1,0 +1,330 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.trades
+name: trades
+version: 1.0.1
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Trade executions per account from the Flex statements: quantity, price, proceeds, commission, net cash
+    and realised P&L.'
+  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
+    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
+    item U8's history is switched on, every version is also kept in silver.trades_history, and silver.trades_as_known(at)
+    returns this table as it stood at any moment.
+tags:
+- silver
+- ibkr
+schema:
+- name: trades
+  physicalName: silver.trades
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per account_id and source_key.
+  properties:
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: restricted
+    description: 'IBKR account number. Restricted: never shown or logged in full.'
+  - name: source_key
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: Stable key of the statement row (parser._source_key).
+  - name: execution_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR execution id (ibExecID).
+  - name: trade_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR tradeID.
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Contract traded (silver.instruments.conid), or a synthetic FLEX- id.
+  - name: trade_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Trade date; the report date when the row has none.
+    quality:
+    - name: trade_date_is_iso_date
+      description: trade_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.trades WHERE trade_date IS NOT NULL AND trade_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: trade_time
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: tradeTime or dateTime as IBKR sends it (not normalised).
+  - name: settle_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Settle date.
+    quality:
+    - name: settle_date_is_iso_date
+      description: settle_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.trades WHERE settle_date IS NOT NULL AND settle_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: buy_sell
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: BUY or SELL as IBKR sends it.
+  - name: quantity_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Quantity as decimal text; negative for sells.
+    quality:
+    - name: quantity_text_is_decimal
+      description: quantity_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.trades WHERE quantity_text IS NOT NULL AND quantity_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: trade_price_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Trade price as decimal text.
+    quality:
+    - name: trade_price_text_is_decimal
+      description: trade_price_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.trades WHERE trade_price_text IS NOT NULL AND trade_price_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: proceeds_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Proceeds as decimal text.
+    quality:
+    - name: proceeds_text_is_decimal
+      description: proceeds_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.trades WHERE proceeds_text IS NOT NULL AND proceeds_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: commission_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Commission (ibCommission) as decimal text.
+    quality:
+    - name: commission_text_is_decimal
+      description: commission_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.trades WHERE commission_text IS NOT NULL AND commission_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: commission_currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the commission.
+  - name: net_cash_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Net cash as decimal text.
+    quality:
+    - name: net_cash_text_is_decimal
+      description: net_cash_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.trades WHERE net_cash_text IS NOT NULL AND net_cash_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: realized_pnl_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Realised P&L (fifoPnlRealized) as decimal text.
+    quality:
+    - name: realized_pnl_text_is_decimal
+      description: realized_pnl_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.trades WHERE realized_pnl_text IS NOT NULL AND realized_pnl_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Trade currency.
+  - name: order_reference
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Order reference.
+  - name: model_code
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR model code.
+  - name: row_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows.
+    quality:
+    - name: row_sha256_is_sha256
+      description: row_sha256 is a lowercase hex sha256 (util.sha256_text of the row).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.trades WHERE row_sha256 IS NOT NULL AND row_sha256 !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: last_seen_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ingestion run that last wrote the row (ingestion_runs.run_id).
+  quality:
+  - name: account_in_accounts
+    description: Every row's account is in silver.accounts. A row of an unknown account is invisible to every tenant
+      under the account_isolation policy, so run this with a role that bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.trades t WHERE NOT EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id
+      = t.account_id)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Typed Flex sections; values are still stored as text and cast on read.
+- property: consumers
+  value:
+  - ibkr_etl.analyst_export
+  - ibkr_etl.derived_portfolio
+  - ibkr_etl.export_agent_source
+  - ibkr_etl.live_view
+  - ibkr_etl.onboarding
+  - ibkr_etl.reconcile
+  - ibkr_etl.reference_data_source
+  - ibkr_etl.report
+  - ibkr_etl.subject_exports
+  - ibkr_etl.web
+- property: producers
+  value:
+  - ibkr_etl.loader
+contractCreatedTs: '2026-10-18T00:00:00Z'

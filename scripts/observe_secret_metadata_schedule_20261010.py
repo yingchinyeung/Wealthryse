@@ -22,7 +22,7 @@ def main(name):
     rows=c.az('monitor','log-analytics','query','-w',a.WORKSPACE,'--analytics-query',query)
     if len(rows)!=1:raise ValueError('One complete scheduled record required')
     proof=json.loads(rows[0]['Result'])
-    if proof.get('kind')!='complete' or proof.get('schema')!=c.monitor.SCHEMA or proof.get('version')!=c.monitor.VERSION or proof.get('vault_count')!=3 or len(proof['vaults'])!=3 or {v['vault'] for v in proof['vaults']}!=set(c.monitor.VAULTS) or proof.get('errors')!=[]:raise ValueError('Incomplete scheduled evidence')
+    if proof.get('kind')!='complete' or proof.get('schema')!=c.monitor.SCHEMA or proof.get('version')!=c.monitor.VERSION or proof.get('vault_count')!=len(c.monitor.VAULTS) or len(proof['vaults'])!=len(c.monitor.VAULTS) or {v['vault'] for v in proof['vaults']}!=set(c.monitor.VAULTS) or proof.get('errors')!=[]:raise ValueError('Incomplete scheduled evidence')
     for k in ('secret_values_read','secret_values_changed','expiry_changes','permissions_changed'):
         if type(proof.get(k)) is not int or proof[k]!=0:raise ValueError('Metadata-only boundary exceeded')
     a.verify(c.request('GET',a.PATH))

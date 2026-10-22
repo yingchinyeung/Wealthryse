@@ -1,0 +1,688 @@
+"""Institutional return, drawdown and concentration analytics for the website.
+
+Pure functions only. Callers load the NAV series and net external flows exactly
+as for the period returns table and pass plain mappings in, so every figure here
+uses the same chain-linked daily Modified Dietz return as
+:mod:`ibkr_etl.performance_periods`. Monthly and yearly calendar returns are
+computed with :func:`performance_periods.period_return`, so a month in the
+calendar always equals that month's figure in the period returns table.
+
+An invalid daily return (a non-positive denominator or a loss of 100% or more)
+fails the whole analysis closed instead of being skipped.
+"""
+from __future__ import annotations
+
+import calendar
+import math
+import statistics
+from bisect import bisect_right
+from collections import defaultdict
+from datetime import date, timedelta
+from typing import Any, Iterable, Mapping
+
+from .performance_periods import (
+    PerformanceInputError,
+    _annualized,
+    period_return,
+    validated_flows,
+    validated_nav,
+)
+
+
+CALCULATION_VERSION = "portfolio-analytics-v1"
+TRADING_DAYS_PER_YEAR = 252
+ROLLING_VOLATILITY_OBSERVATIONS = 63
+ROLLING_RETURN_DAYS = 365
+DRAWDOWN_EPISODES = 5
+METHODOLOGY = (
+    "Daily returns chain-link the same cash-flow-adjusted Modified Dietz returns as the "
+    "period returns table, on every validated NAV date. Monthly and calendar-year cells are "
+    "time-weighted returns from the last NAV before the period to the last NAV in it. "
+    "Volatility and downside deviation are annualised with 252 observations a year; Sortino "
+    "uses a 0% minimum acceptable return. Annualised return and Calmar need at least one year "
+    "of history. Skewness and excess kurtosis are bias-adjusted sample statistics. Rolling "
+    "volatility uses the latest 63 daily returns (about three months); rolling return compares "
+    "each NAV with the last NAV at least 12 months earlier."
+)
+
+
+def daily_return_series(
+    nav: Mapping[str, float], flows: Mapping[str, float]
+) -> tuple[list[tuple[str, float]], list[str]]:
+    """Daily ``(date, return)`` pairs and any intervals that failed validation.
+
+    ``nav`` and ``flows`` must be outputs of ``validated_nav`` and
+    ``validated_flows`` (sorted ISO-date keys).
+    """
+
+    dates = list(nav)
+    flow_days = list(flows)
+    returns: list[tuple[str, float]] = []
+    failures: list[str] = []
+    for previous_day, current_day in zip(dates, dates[1:]):
+        lo = bisect_right(flow_days, previous_day)
+        hi = bisect_right(flow_days, current_day)
+        external = sum(flows[day] for day in flow_days[lo:hi])
+        denominator = nav[previous_day] + 0.5 * external
+        if not denominator > 0:
+            failures.append(f"The cash-flow-adjusted denominator is not positive on {current_day}.")
+            continue
+        daily = (nav[current_day] - nav[previous_day] - external) / denominator
+        if not math.isfinite(daily) or daily <= -1:
+            failures.append(f"The portfolio return is invalid on {current_day}.")
+            continue
+        returns.append((current_day, daily))
+    return returns, failures
+
+
+def monthly_calendar(
+    nav: Mapping[str, float], flows: Mapping[str, float], as_of: str
+) -> list[dict[str, Any]]:
+    """One row per calendar year (newest first) with 12 monthly TWRs and the year's TWR."""
+
+    if not nav:
+        return []
+    first = date.fromisoformat(next(iter(nav)))
+    end = date.fromisoformat(as_of)
+    rows = []
+    for year in range(end.year, first.year - 1, -1):
+        months = []
+        for month in range(1, 13):
+            month_start = date(year, month, 1)
+            month_end = date(year, month, calendar.monthrange(year, month)[1])
+            if month_end < first or month_start > end:
+                months.append(None)
+                continue
+            result = period_return(
+                nav, flows, month_start.isoformat(), min(month_end, end).isoformat(),
+                key=f"{year}-{month:02d}", label=month_start.strftime("%b %Y"), kind="month",
+            )
+            months.append(_calendar_cell(result, month_end > end))
+        year_result = period_return(
+            nav, flows, f"{year}-01-01", min(date(year, 12, 31), end).isoformat(),
+            key=f"year_{year}", label=str(year), kind="calendar_year",
+        )
+        rows.append({
+            "year": year,
+            "months": months,
+            "year_return": _calendar_cell(year_result, date(year, 12, 31) > end),
+        })
+    return rows
+
+
+def _calendar_cell(result, to_date: bool) -> dict[str, Any] | None:
+    if result.status == "empty":
+        return None
+    return {
+        "twr": result.twr,
+        "status": result.status,
+        "partial": result.partial,
+        "to_date": to_date,
+        "start_date": result.start_date,
+        "end_date": result.end_date,
+        "issues": list(result.issues),
+    }
+
+
+def drawdown_analysis(
+    returns: list[tuple[str, float]], first_date: str, episodes: int = DRAWDOWN_EPISODES
+) -> dict[str, Any]:
+    """Underwater series and the deepest peak-to-trough episodes.
+
+    ``first_date`` is the NAV date the first return is measured from; it is the
+    starting peak at wealth 1.0.
+    """
+
+    wealth = peak = 1.0
+    peak_date = first_date
+    series = [{"date": first_date, "drawdown": 0.0}]
+    found: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for day, daily in returns:
+        wealth *= 1.0 + daily
+        if wealth >= peak:
+            if current is not None:
+                current["recovery_date"] = day
+                found.append(current)
+                current = None
+            peak, peak_date = wealth, day
+            series.append({"date": day, "drawdown": 0.0})
+            continue
+        drawdown = wealth / peak - 1.0
+        series.append({"date": day, "drawdown": drawdown})
+        if current is None:
+            current = {"peak_date": peak_date, "trough_date": day, "depth": drawdown,
+                       "recovery_date": None}
+        elif drawdown < current["depth"]:
+            current["trough_date"], current["depth"] = day, drawdown
+    if current is not None:
+        found.append(current)
+    last_date = series[-1]["date"]
+    for episode in found:
+        peak_day = date.fromisoformat(episode["peak_date"])
+        episode["days_to_trough"] = (date.fromisoformat(episode["trough_date"]) - peak_day).days
+        recovery = episode["recovery_date"]
+        episode["recovered"] = recovery is not None
+        episode["days_to_recover"] = (
+            (date.fromisoformat(recovery) - date.fromisoformat(episode["trough_date"])).days
+            if recovery else None
+        )
+        episode["length_days"] = (date.fromisoformat(recovery or last_date) - peak_day).days
+    deepest = sorted(found, key=lambda item: item["depth"])[:episodes]
+    return {
+        "series": series,
+        "maximum_drawdown": min((item["depth"] for item in found), default=0.0),
+        "current_drawdown": series[-1]["drawdown"],
+        "episodes": deepest,
+    }
+
+
+def _skewness(values: list[float]) -> float | None:
+    n = len(values)
+    if n < 3:
+        return None
+    mean = statistics.fmean(values)
+    deviation = statistics.stdev(values)
+    if deviation == 0:
+        return None
+    third = sum(((value - mean) / deviation) ** 3 for value in values)
+    return n / ((n - 1) * (n - 2)) * third
+
+
+def _excess_kurtosis(values: list[float]) -> float | None:
+    n = len(values)
+    if n < 4:
+        return None
+    mean = statistics.fmean(values)
+    deviation = statistics.stdev(values)
+    if deviation == 0:
+        return None
+    fourth = sum(((value - mean) / deviation) ** 4 for value in values)
+    return (n * (n + 1) / ((n - 1) * (n - 2) * (n - 3)) * fourth
+            - 3 * (n - 1) ** 2 / ((n - 2) * (n - 3)))
+
+
+def return_statistics(
+    returns: list[tuple[str, float]],
+    first_date: str,
+    months: list[dict[str, Any]],
+    maximum_drawdown: float,
+) -> dict[str, Any]:
+    """Distribution and risk-adjusted statistics of the daily return series."""
+
+    values = [value for _, value in returns]
+    last_date = returns[-1][0] if returns else first_date
+    total = math.prod(1.0 + value for value in values) - 1.0 if values else None
+    annualized = _annualized(total, first_date, last_date)
+    root_year = math.sqrt(TRADING_DAYS_PER_YEAR)
+    mean = statistics.fmean(values) if values else None
+    deviation = statistics.stdev(values) if len(values) >= 2 else None
+    downside = (
+        math.sqrt(sum(min(value, 0.0) ** 2 for value in values) / len(values)) if values else None
+    )
+    best = max(returns, key=lambda item: item[1]) if returns else None
+    worst = min(returns, key=lambda item: item[1]) if returns else None
+    measured = [month for month in months if month["twr"] is not None]
+    positive = [month["twr"] for month in measured if month["twr"] > 0]
+    negative = [month["twr"] for month in measured if month["twr"] < 0]
+    best_month = max(measured, key=lambda month: month["twr"]) if measured else None
+    worst_month = min(measured, key=lambda month: month["twr"]) if measured else None
+    return {
+        "period_start": first_date,
+        "period_end": last_date,
+        "return_observations": len(values),
+        "total_return": total,
+        "annualized_return": annualized,
+        "annualized_volatility": deviation * root_year if deviation is not None else None,
+        "downside_deviation": downside * root_year if downside is not None else None,
+        "sortino_ratio": (
+            mean / downside * root_year if mean is not None and downside not in (None, 0) else None
+        ),
+        "calmar_ratio": (
+            annualized / abs(maximum_drawdown)
+            if annualized is not None and maximum_drawdown < 0 else None
+        ),
+        "skewness": _skewness(values),
+        "excess_kurtosis": _excess_kurtosis(values),
+        "best_day": {"date": best[0], "return": best[1]} if best else None,
+        "worst_day": {"date": worst[0], "return": worst[1]} if worst else None,
+        "best_month": (
+            {"month": best_month["month"], "return": best_month["twr"]} if best_month else None
+        ),
+        "worst_month": (
+            {"month": worst_month["month"], "return": worst_month["twr"]} if worst_month else None
+        ),
+        "measured_months": len(measured),
+        "positive_months": len(positive),
+        "positive_month_ratio": len(positive) / len(measured) if measured else None,
+        "average_gain_month": statistics.fmean(positive) if positive else None,
+        "average_loss_month": statistics.fmean(negative) if negative else None,
+        "gain_loss_ratio": (
+            statistics.fmean(positive) / abs(statistics.fmean(negative))
+            if positive and negative else None
+        ),
+    }
+
+
+def rolling_series(
+    returns: list[tuple[str, float]],
+    first_date: str,
+    *,
+    volatility_window: int = ROLLING_VOLATILITY_OBSERVATIONS,
+    return_days: int = ROLLING_RETURN_DAYS,
+) -> list[dict[str, Any]]:
+    """Rolling annualised volatility and trailing 12-month return per NAV date."""
+
+    dates = [first_date] + [day for day, _ in returns]
+    wealth = [1.0]
+    for _, value in returns:
+        wealth.append(wealth[-1] * (1.0 + value))
+    values = [value for _, value in returns]
+    root_year = math.sqrt(TRADING_DAYS_PER_YEAR)
+    series = []
+    for index in range(1, len(dates)):
+        day = dates[index]
+        window = values[max(0, index - volatility_window):index]
+        volatility = (
+            statistics.stdev(window) * root_year if len(window) == volatility_window else None
+        )
+        cutoff = (date.fromisoformat(day) - timedelta(days=return_days)).isoformat()
+        base = bisect_right(dates, cutoff) - 1
+        trailing = wealth[index] / wealth[base] - 1.0 if base >= 0 else None
+        if volatility is None and trailing is None:
+            continue
+        series.append({"date": day, "volatility": volatility, "trailing_return": trailing})
+    return series
+
+
+def portfolio_analytics(
+    nav_values: Mapping[object, object] | Iterable[tuple[object, object]],
+    flow_values: Mapping[object, object] | Iterable[tuple[object, object]] | None,
+    *,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    """Monthly calendar, drawdowns, return statistics and rolling risk as JSON-ready data."""
+
+    nav = validated_nav(nav_values)
+    flows = validated_flows(flow_values)
+    if as_of is not None:
+        nav = {day: value for day, value in nav.items() if day <= as_of}
+        flows = {day: value for day, value in flows.items() if day <= as_of}
+    base = {"calculation_version": CALCULATION_VERSION, "methodology": METHODOLOGY}
+    if len(nav) < 2:
+        return {**base, "available": False, "effective_as_of": next(reversed(nav), None),
+                "issues": ["At least two NAV observations are needed."]}
+    first_date, effective = next(iter(nav)), next(reversed(nav))
+    returns, failures = daily_return_series(nav, flows)
+    if failures:
+        return {**base, "available": False, "effective_as_of": effective, "issues": failures}
+    calendar_rows = monthly_calendar(nav, flows, as_of or effective)
+    months = [
+        {"month": f"{row['year']}-{index + 1:02d}", "twr": cell["twr"]}
+        for row in calendar_rows
+        for index, cell in enumerate(row["months"])
+        if cell is not None and cell["status"] in ("pass", "partial")
+    ]
+    drawdowns = drawdown_analysis(returns, first_date)
+    return {
+        **base,
+        "available": True,
+        "inception_date": first_date,
+        "effective_as_of": effective,
+        "statistics": return_statistics(
+            returns, first_date, months, drawdowns["maximum_drawdown"]
+        ),
+        "monthly_calendar": calendar_rows,
+        "drawdown": drawdowns,
+        "rolling": rolling_series(returns, first_date),
+        "issues": [],
+    }
+
+
+def holdings_concentration(view: Mapping[str, Any]) -> dict[str, Any]:
+    """Top-weight, effective-number and currency concentration of a holdings view.
+
+    ``view`` is the output of ``holdings_view.enrich_holdings``. Holdings without
+    a weight (for example, those missing FX) are excluded and counted.
+    """
+
+    holdings = view.get("holdings") or []
+    weighted = [row for row in holdings if row.get("weight") is not None]
+    if not weighted or not view.get("weight_basis"):
+        return {"available": False, "holdings_count": len(holdings),
+                "reason": "No weighted holdings are available for this date."}
+    weights = sorted((abs(float(row["weight"])) for row in weighted), reverse=True)
+    gross = sum(weights)
+    net = sum(float(row["weight"]) for row in weighted)
+    herfindahl = sum((weight / gross) ** 2 for weight in weights) if gross else None
+    currencies: dict[str, float] = defaultdict(float)
+    for row in weighted:
+        currencies[str(row.get("currency") or "Unknown").upper()] += float(row["weight"])
+    largest = max(weighted, key=lambda row: abs(float(row["weight"])))
+    return {
+        "available": True,
+        "weight_basis": view["weight_basis"],
+        "holdings_count": len(holdings),
+        "weighted_count": len(weighted),
+        "largest": {"symbol": largest.get("symbol") or largest.get("conid"),
+                    "description": largest.get("description"),
+                    "weight": float(largest["weight"])},
+        "top_1_weight": sum(weights[:1]),
+        "top_5_weight": sum(weights[:5]),
+        "top_10_weight": sum(weights[:10]),
+        "gross_exposure": gross,
+        "net_exposure": net,
+        "herfindahl_index": herfindahl,
+        "effective_holdings": 1.0 / herfindahl if herfindahl else None,
+        "residual_weight": 1.0 - net if view["weight_basis"] == "nav" else None,
+        "currency_exposure": [
+            {"currency": currency, "weight": weight}
+            for currency, weight in sorted(currencies.items(), key=lambda item: -abs(item[1]))
+        ],
+    }
+
+
+ROLLING_BENCHMARK_OBSERVATIONS = 126
+CORRELATION_HOLDINGS = 10
+CORRELATION_OBSERVATIONS = 252
+CORRELATION_MINIMUM_OBSERVATIONS = 40
+# A one-day price move this large in a position mark is far more likely to be
+# a split or other corporate action than a market move, so it is left out.
+PRICE_BREAK_THRESHOLD = 0.5
+
+
+def rolling_benchmark_statistics(
+    rows: Iterable[Any], window: int = ROLLING_BENCHMARK_OBSERVATIONS
+) -> list[dict[str, Any]]:
+    """Rolling beta and correlation of portfolio against benchmark daily returns.
+
+    ``rows`` are validated benchmark comparison rows (``observation_date``,
+    ``portfolio_return``, ``benchmark_return``); rows without both returns are
+    skipped. Each point uses the latest ``window`` common-date returns.
+    """
+
+    pairs = [
+        (row.observation_date, float(row.portfolio_return), float(row.benchmark_return))
+        for row in rows
+        if row.portfolio_return is not None and row.benchmark_return is not None
+    ]
+    series = []
+    for index in range(window, len(pairs) + 1):
+        sample = pairs[index - window:index]
+        portfolio = [item[1] for item in sample]
+        benchmark = [item[2] for item in sample]
+        variance = statistics.variance(benchmark)
+        spread = statistics.stdev(portfolio)
+        beta = statistics.covariance(portfolio, benchmark) / variance if variance else None
+        correlation = (
+            statistics.correlation(portfolio, benchmark) if variance and spread else None
+        )
+        series.append({"date": sample[-1][0], "beta": beta, "correlation": correlation})
+    return series
+
+
+def _number(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def trading_activity(
+    trades: Iterable[Mapping[str, Any]],
+    nav: Mapping[str, float],
+    rate: Any,
+    *,
+    as_of: str,
+) -> dict[str, Any]:
+    """Monthly traded value, turnover, commissions and realised P&L.
+
+    ``rate(currency, day)`` returns the non-forward-looking FX rate into the
+    reporting currency or None. Trades whose currency cannot be converted are
+    left out and their currencies listed. Turnover is the lesser of purchases
+    and sales divided by the month's average NAV, so contributions that are
+    simply invested do not count as turnover.
+    """
+
+    months: dict[str, dict[str, Any]] = {}
+    missing: set[str] = set()
+    for trade in trades:
+        day = str(trade.get("trade_date") or "")[:10]
+        if not day or day > as_of:
+            continue
+        currency = str(trade.get("currency") or "").upper()
+        fx = rate(currency, day)
+        if fx is None:
+            missing.add(currency or "Unknown")
+            continue
+        month = months.setdefault(day[:7], {
+            "month": day[:7], "trades": 0, "purchases": 0.0, "sales": 0.0,
+            "commissions": 0.0, "realized_pnl": 0.0,
+        })
+        month["trades"] += 1
+        proceeds = _number(trade.get("proceeds_text"))
+        if proceeds is not None:
+            side = str(trade.get("buy_sell") or "").upper()
+            is_buy = side.startswith("BUY") if side else proceeds < 0
+            month["purchases" if is_buy else "sales"] += abs(proceeds) * fx
+        commission = _number(trade.get("commission_text"))
+        if commission is not None:
+            commission_currency = str(trade.get("commission_currency") or currency).upper()
+            commission_fx = rate(commission_currency, day)
+            if commission_fx is None:
+                missing.add(commission_currency)
+            else:
+                month["commissions"] += -commission * commission_fx
+        realized = _number(trade.get("realized_pnl_text"))
+        if realized is not None:
+            month["realized_pnl"] += realized * fx
+    nav_by_month: dict[str, list[float]] = defaultdict(list)
+    for day, value in nav.items():
+        if day <= as_of:
+            nav_by_month[day[:7]].append(value)
+    rows = []
+    for key in sorted(set(months) | set(nav_by_month), reverse=True):
+        month = months.get(key) or {"month": key, "trades": 0, "purchases": 0.0, "sales": 0.0,
+                                    "commissions": 0.0, "realized_pnl": 0.0}
+        values = nav_by_month.get(key)
+        average = statistics.fmean(values) if values else None
+        month["average_nav"] = average
+        month["turnover"] = (
+            min(month["purchases"], month["sales"]) / average if average and average > 0 else None
+        )
+        month["commission_ratio"] = month["commissions"] / average if average and average > 0 else None
+        rows.append(month)
+    last_year = rows[:12]
+    navs = [row["average_nav"] for row in last_year if row["average_nav"]]
+    average_nav = statistics.fmean(navs) if navs else None
+    totals = {
+        "months": len(last_year),
+        "trades": sum(row["trades"] for row in last_year),
+        "purchases": sum(row["purchases"] for row in last_year),
+        "sales": sum(row["sales"] for row in last_year),
+        "commissions": sum(row["commissions"] for row in last_year),
+        "realized_pnl": sum(row["realized_pnl"] for row in last_year),
+        "average_nav": average_nav,
+    }
+    totals["turnover"] = (
+        min(totals["purchases"], totals["sales"]) / average_nav if average_nav else None
+    )
+    totals["annualized_turnover"] = (
+        totals["turnover"] * 12 / len(last_year) if totals["turnover"] is not None and last_year else None
+    )
+    totals["commission_ratio"] = totals["commissions"] / average_nav if average_nav else None
+    return {
+        "available": bool(rows),
+        "monthly": rows,
+        "trailing_12_months": totals,
+        "missing_fx_currencies": sorted(missing),
+    }
+
+
+def holdings_correlation(
+    prices: Mapping[str, Mapping[str, float]],
+    labels: Mapping[str, str],
+    *,
+    observations: int = CORRELATION_OBSERVATIONS,
+    minimum: int = CORRELATION_MINIMUM_OBSERVATIONS,
+) -> dict[str, Any]:
+    """Pairwise correlation of daily mark-price returns for a set of holdings.
+
+    ``prices`` maps conid to ``{date: mark price}`` in the holding's own
+    currency. Returns use consecutive observations of each holding; each pair
+    uses the dates both share within the latest ``observations`` dates. One-day
+    moves beyond PRICE_BREAK_THRESHOLD are treated as corporate actions and left out.
+    """
+
+    conids = [conid for conid in labels if conid in prices]
+    returns: dict[str, dict[str, float]] = {}
+    excluded_breaks = 0
+    all_dates: set[str] = set()
+    for conid in conids:
+        series = sorted((day, value) for day, value in prices[conid].items() if value and value > 0)
+        result = {}
+        for (_, previous), (day, current) in zip(series, series[1:]):
+            change = current / previous - 1.0
+            if abs(change) > PRICE_BREAK_THRESHOLD:
+                excluded_breaks += 1
+                continue
+            result[day] = change
+        returns[conid] = result
+        all_dates.update(result)
+    window = set(sorted(all_dates)[-observations:])
+    matrix = []
+    pair_values = []
+    minimum_pair = None
+    for left in conids:
+        row = []
+        for right in conids:
+            if left == right:
+                row.append({"correlation": 1.0, "observations": len(window & set(returns[left]))})
+                continue
+            common = sorted(window & set(returns[left]) & set(returns[right]))
+            value = None
+            if len(common) >= minimum:
+                a = [returns[left][day] for day in common]
+                b = [returns[right][day] for day in common]
+                if statistics.stdev(a) and statistics.stdev(b):
+                    value = statistics.correlation(a, b)
+            row.append({"correlation": value, "observations": len(common)})
+            if value is not None and left < right:
+                pair_values.append(value)
+                minimum_pair = len(common) if minimum_pair is None else min(minimum_pair, len(common))
+        matrix.append(row)
+    return {
+        "available": len(conids) >= 2 and bool(pair_values),
+        "holdings": [{"conid": conid, "symbol": labels[conid]} for conid in conids],
+        "matrix": matrix,
+        "average_correlation": statistics.fmean(pair_values) if pair_values else None,
+        "window_start": min(window) if window else None,
+        "window_end": max(window) if window else None,
+        "minimum_pair_observations": minimum_pair,
+        "excluded_price_breaks": excluded_breaks,
+    }
+
+
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70.0
+RSI_OVERSOLD = 30.0
+# Calendar days of marks loaded for RSI: about 200 trading days, enough for
+# Wilder's smoothing to settle well past its 14-day seed.
+RSI_LOOKBACK_DAYS = 300
+# A gap this long between marks means the position was closed and reopened,
+# so the change across it is not one day's move.
+RSI_MAXIMUM_GAP_DAYS = 14
+
+
+def wilder_rsi(closes: Iterable[float], period: int = RSI_PERIOD) -> float | None:
+    """Wilder's relative strength index of the last value in ``closes``.
+
+    Seeds average gain and loss with the simple mean of the first ``period``
+    changes, then smooths each later change with weight 1/``period``. Needs at
+    least ``period`` + 1 closes; returns None otherwise. A run with no losses
+    is 100, with no gains 0, and with no movement at all 50.
+    """
+
+    values = list(closes)
+    if len(values) < period + 1:
+        return None
+    changes = [current - previous for previous, current in zip(values, values[1:])]
+    gain = sum(max(change, 0.0) for change in changes[:period]) / period
+    loss = sum(max(-change, 0.0) for change in changes[:period]) / period
+    for change in changes[period:]:
+        gain = (gain * (period - 1) + max(change, 0.0)) / period
+        loss = (loss * (period - 1) + max(-change, 0.0)) / period
+    if loss == 0:
+        return 50.0 if gain == 0 else 100.0
+    return 100.0 - 100.0 / (1.0 + gain / loss)
+
+
+def rsi_signal(value: float | None) -> str | None:
+    if value is None:
+        return None
+    if value > RSI_OVERBOUGHT:
+        return "overbought"
+    if value < RSI_OVERSOLD:
+        return "oversold"
+    return "neutral"
+
+
+def holding_rsi(
+    prices: Mapping[str, float], as_of: str, *, period: int = RSI_PERIOD
+) -> dict[str, Any]:
+    """14-day Wilder RSI for one holding from its daily mark prices.
+
+    ``prices`` maps ISO date to mark price in the holding's own currency.
+    Weekend dates and non-positive marks are ignored. A one-day move beyond
+    PRICE_BREAK_THRESHOLD is treated as a split or other corporate action, and
+    a gap over RSI_MAXIMUM_GAP_DAYS as a closed and reopened position, so only
+    marks after the latest break or gap are used. The latest mark must be on
+    ``as_of`` so a stale price never produces a current-looking reading.
+    """
+
+    series = sorted(
+        (day, float(value)) for day, value in prices.items()
+        if day <= as_of and value is not None and math.isfinite(float(value)) and float(value) > 0
+        and date.fromisoformat(day[:10]).weekday() < 5
+    )
+    start = 0
+    for index in range(1, len(series)):
+        (previous_day, previous), (day, current) = series[index - 1], series[index]
+        gap = (date.fromisoformat(day[:10]) - date.fromisoformat(previous_day[:10])).days
+        if abs(current / previous - 1.0) > PRICE_BREAK_THRESHOLD or gap > RSI_MAXIMUM_GAP_DAYS:
+            start = index
+    usable = series[start:]
+    result: dict[str, Any] = {
+        "rsi": None, "rsi_signal": None, "rsi_observations": len(usable),
+        "rsi_reason": None, "rsi_series_restarted": start > 0,
+    }
+    if not usable or usable[-1][0] != as_of:
+        result["rsi_reason"] = "no_current_mark"
+        return result
+    value = wilder_rsi([price for _, price in usable], period)
+    if value is None:
+        result["rsi_reason"] = "insufficient_history"
+        return result
+    result.update(rsi=value, rsi_signal=rsi_signal(value))
+    return result
+
+
+__all__ = [
+    "CALCULATION_VERSION",
+    "PerformanceInputError",
+    "daily_return_series",
+    "drawdown_analysis",
+    "holdings_concentration",
+    "holdings_correlation",
+    "holding_rsi",
+    "monthly_calendar",
+    "portfolio_analytics",
+    "return_statistics",
+    "rolling_benchmark_statistics",
+    "rolling_series",
+    "trading_activity",
+    "wilder_rsi",
+]

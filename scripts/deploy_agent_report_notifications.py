@@ -20,7 +20,7 @@ from ibkr_etl.agent_report_notifications import (
 )
 
 WORKSPACE='5264a124-10cd-45f6-93a5-6d65c37e9bfb'
-GROUP_PATH=BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts'
+GROUP_PATH=BASE+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts'
 RULE_PATH=BASE+'Microsoft.Insights/scheduledQueryRules/'+RULE
 FOLDER=ROOT/'.work/specialist-notifications-20261003'
 

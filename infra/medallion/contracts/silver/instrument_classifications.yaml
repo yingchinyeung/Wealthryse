@@ -1,0 +1,239 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.instrument_classifications
+name: instrument_classifications
+version: 1.1.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: Sector and industry for each held instrument, from Yahoo Finance search or profile data or a verified
+    override, with licence and quality flags.
+  limitations: Yahoo data is licence-restricted and stored with quality_status warn.
+tags:
+- silver
+- market-data
+schema:
+- name: instrument_classifications
+  physicalName: silver.instrument_classifications
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, conid and provider.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: IBKR contract id; a foreign key to silver.instruments.
+  - name: provider
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: internal
+    description: Classification provider.
+  - name: symbol
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: IBKR symbol of the holding.
+  - name: lookup_symbol
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Provider symbol that matched; empty when unclassified.
+  - name: sector
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Sector; empty when unclassified.
+  - name: industry
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Industry.
+  - name: exchange
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Exchange the provider reports.
+  - name: status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: classified, unclassified or failed.
+    quality:
+    - name: status_allowed_values
+      description: status is one of classified, unclassified, failed (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.instrument_classifications WHERE status NOT IN ('classified', 'unclassified',
+        'failed')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: quality_status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: pass, warn or fail. The current writer stores warn.
+    quality:
+    - name: quality_status_allowed_values
+      description: quality_status is one of pass, warn, fail (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.instrument_classifications WHERE quality_status NOT IN ('pass', 'warn',
+        'fail')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: license_status
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: approved or restricted. Yahoo data is restricted.
+    quality:
+    - name: license_status_allowed_values
+      description: license_status is one of approved, restricted (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.instrument_classifications WHERE license_status NOT IN ('approved', 'restricted')
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: source_url
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Provider endpoint or call used.
+  - name: response_sha256
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the canonical JSON of the provider evidence used.
+    quality:
+    - name: response_sha256_is_sha256
+      description: response_sha256 is a lowercase hex sha256 (util.sha256_text).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.instrument_classifications WHERE response_sha256 IS NOT NULL AND response_sha256
+        !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: error_code
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: 'The last lookup error for an unclassified row. A classified row can carry evidence here instead:
+      yfinance_profile_fallback, or a verified override''s evidence.'
+  - name: checked_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the lookup.
+  - name: long_name
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Yahoo's English company name from the same lookup; the factsheet name of a KRX holding,
+      whose broker name is Korean. Null for rows not looked up since migration 080.
+  quality:
+  - name: classified_has_sector
+    description: A classified row has a sector.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.instrument_classifications WHERE status = 'classified' AND COALESCE(sector,
+      '') = ''
+    mustBe: 0
+    severity: error
+    dimension: completeness
+  - name: unclassified_has_no_sector
+    description: An unclassified row has no sector.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.instrument_classifications WHERE status = 'unclassified' AND sector IS NOT
+      NULL
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: market-data
+- property: catalogNote
+  value: Sector and industry enrichment.
+- property: consumers
+  value:
+  - ibkr_etl.agent_tools
+  - ibkr_etl.monthly_reporting_analytics
+  - ibkr_etl.reference_data_source
+  - ibkr_etl.sector_classification
+  - ibkr_etl.web
+- property: producers
+  value:
+  - ibkr_etl.sector_classification
+contractCreatedTs: '2026-10-18T00:00:00Z'

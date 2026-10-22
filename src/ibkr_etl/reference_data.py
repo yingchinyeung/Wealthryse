@@ -27,13 +27,24 @@ def _ssl_context() -> ssl.SSLContext:
     return context
 
 
+class HttpBody(bytes):
+    """Response bytes that also carry the HTTP status and content type."""
+
+    status: int | None = None
+    content_type: str | None = None
+
+
 def _get(url: str, timeout: int = 30) -> bytes:
     request = urllib.request.Request(
         url,
         headers={"User-Agent": USER_AGENT, "Accept": "application/json,application/xml,text/xml,*/*"},
     )
     with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
-        return response.read()
+        body = HttpBody(response.read())
+        body.status = getattr(response, "status", None)
+        headers = getattr(response, "headers", None)
+        body.content_type = headers.get("Content-Type") if headers is not None else None
+        return body
 
 
 def load_reference_data(path: Path) -> dict[str, Any]:

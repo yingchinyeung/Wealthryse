@@ -5,7 +5,7 @@ from urllib.parse import unquote
 import psycopg
 from psycopg import sql
 from psycopg.rows import dict_row
-from ibkr_etl.specialist_observation_access import ROLE,grant_statements,verify_permissions
+from ibkr_etl.specialist_observation_access import ROLE,grant_statements,layer_grant_statements,verify_permissions
 from ibkr_etl.specialist_observation_runtime import LOGIN,HOST,DATABASE,validate_database_url,bind_observation_session,verify_observation_access
 
 
@@ -31,7 +31,7 @@ def main():
                 if admin.execute('SELECT 1 FROM pg_roles WHERE rolname=ANY(%s)',([LOGIN,ROLE],)).fetchone():
                     raise ValueError('Observation roles already exist; refusing implicit alteration')
                 admin.execute('CREATE ROLE ibkr_specialist_observation_reader NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS')
-                for statement in grant_statements(ROLE): admin.execute(statement)
+                for statement in grant_statements(ROLE)+layer_grant_statements(admin,ROLE): admin.execute(statement)
                 verify_creator_membership(admin,ROLE)
                 verify_permissions(admin,ROLE)
                 admin.execute(sql.SQL('CREATE ROLE ibkr_specialist_observation_login LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 2 PASSWORD {}').format(sql.Literal(unquote(target.password))))

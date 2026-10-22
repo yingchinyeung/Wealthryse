@@ -68,6 +68,23 @@ class FactsheetFlowAdjustedReturnTests(unittest.TestCase):
         ])
         self.assertAlmostEqual(_trailing_twelve_month_return(rows, "2026-01-31"), 0.10)
 
+    def test_trailing_twelve_months_starts_at_prior_close_when_month_end_is_closed(self):
+        # 31 May 2025 was a Saturday: the window starts at the 30 May close,
+        # not the first close after it.
+        rows = _normalize_nav([
+            {"date": "2025-05-30", "nav": 100.0},
+            {"date": "2025-06-02", "nav": 104.0},
+            {"date": "2026-05-29", "nav": 120.0},
+        ])
+        self.assertAlmostEqual(_trailing_twelve_month_return(rows, "2026-05-31"), 0.20)
+
+    def test_trailing_twelve_months_needs_a_full_year_of_history(self):
+        rows = _normalize_nav([
+            {"date": "2025-06-02", "nav": 100.0},
+            {"date": "2026-05-29", "nav": 120.0},
+        ])
+        self.assertIsNone(_trailing_twelve_month_return(rows, "2026-05-31"))
+
 
 class CompositeSleeveFlowTests(unittest.TestCase):
     def adjusted(self, values, flows):
@@ -134,6 +151,59 @@ class ExternalFlowSourceTests(unittest.TestCase):
         self.add("Transfers", accountId="U1", currency="USD", date="20260526",
                  assetCategory="CASH", cashTransfer="25000", type="INTERNAL")
         self.assertEqual(self.flows(), {"2026-05-26": 25000.0})
+
+
+class KiwoomExternalFlowTests(unittest.TestCase):
+    """A Kiwoom account has no Flex file: its DEPOSIT and WITHDRAWAL cash rows are its flows (USD only)."""
+
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.connection.executescript(
+            """
+            CREATE TABLE accounts (account_id TEXT, base_currency TEXT, account_type TEXT);
+            CREATE TABLE fx_rates (account_id TEXT, rate_date TEXT, from_currency TEXT,
+                                   to_currency TEXT, rate_text TEXT);
+            CREATE TABLE flex_rows (account_id TEXT, section TEXT, data_json TEXT);
+            CREATE TABLE cash_transactions (account_id TEXT, effective_date TEXT, transaction_type TEXT,
+                                            amount_text TEXT, currency TEXT);
+            INSERT INTO accounts VALUES ('KIWOOM-US', 'USD', 'kiwoom'), ('KIWOOM-KR', 'KRW', 'kiwoom'),
+                ('U1', 'USD', 'Individual'), ('U2', 'USD', 'Individual');
+            """
+        )
+
+    def cash(self, account, day, kind, amount, currency):
+        self.connection.execute("INSERT INTO cash_transactions VALUES (?, ?, ?, ?, ?)",
+                                (account, day, kind, amount, currency))
+
+    def flows(self, account):
+        return _external_flows(self.connection, account, subject_type="physical_account")
+
+    def test_usd_kiwoom_deposits_and_withdrawals_are_flows_and_income_is_not(self):
+        self.cash("KIWOOM-US", "2025-11-26", "DEPOSIT", "377.2", "USD")
+        self.cash("KIWOOM-US", "2026-01-08", "DEPOSIT", "167.19", "USD")
+        self.cash("KIWOOM-US", "2026-01-08", "WITHDRAWAL", "-20", "USD")
+        self.cash("KIWOOM-US", "2025-11-26", "DIVIDEND", "1.96", "USD")
+        self.cash("KIWOOM-US", "2026-01-22", "CORPORATE_ACTION_CASH", "770", "USD")
+        flows = self.flows("KIWOOM-US")
+        self.assertEqual(set(flows), {"2025-11-26", "2026-01-08"})
+        self.assertAlmostEqual(flows["2025-11-26"], 377.2)
+        self.assertAlmostEqual(flows["2026-01-08"], 147.19)
+
+    def test_korea_kiwoom_account_is_unchanged(self):
+        self.cash("KIWOOM-KR", "2025-11-26", "DEPOSIT", "500000", "KRW")
+        self.assertEqual(self.flows("KIWOOM-KR"), {})
+
+    def test_an_account_with_a_flex_file_reads_only_the_flex_file(self):
+        self.connection.execute("INSERT INTO flex_rows VALUES ('U1', 'Trades', '{}')")
+        self.cash("U1", "2026-01-08", "DEPOSIT", "100", "USD")
+        self.assertEqual(self.flows("U1"), {})
+
+    def test_an_ibkr_account_never_reads_cash_rows_even_without_a_flex_file(self):
+        # The agents' scoped views have no cash_transactions, so reading it would fail there.
+        self.cash("U2", "2026-01-08", "DEPOSIT", "100", "USD")
+        self.connection.execute("DROP TABLE cash_transactions")
+        self.assertEqual(self.flows("U2"), {})
 
 
 class AttributionCashClassifierTests(unittest.TestCase):

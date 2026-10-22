@@ -4,7 +4,7 @@ import hashlib
 import json
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 from dataclasses import asdict
 from typing import Any, Mapping
 
@@ -16,12 +16,43 @@ from .benchmark_analytics import (
     portfolio_risk_metrics,
 )
 from .crisis_replay import load_crisis_replay
+from . import publish_gate
 from .util import canonical_json, utc_now_iso
 from .market_calendar import BENCHMARK_MARKETS, CALENDARS, CALENDAR_VERSION, benchmark_session_on_or_before
 
 
 LOGGER = logging.getLogger(__name__)
 RISK_ANALYTICS_VERSION = "risk-analytics-v2"
+# Reporting currencies with their own risk-free series in risk_free_rates (see korea_cd_rate).
+OWN_CURRENCY_RISK_FREE = {"KRW": "KRW"}
+# A won rate older than this is not used: the monthly OECD series runs one to two months
+# behind, so a quarter without a new month means the feed has stopped.
+OWN_RATE_MAX_AGE_DAYS = 100
+
+
+def own_rate_cutoff(as_of: str) -> str:
+    return (date.fromisoformat(str(as_of)[:10]) - timedelta(days=OWN_RATE_MAX_AGE_DAYS)).isoformat()
+
+
+def risk_free_rate(connection, *, tenant_id: str, reporting_currency: str, as_of: str):
+    """The latest validated risk-free observation for a subject reporting in this currency.
+
+    A won account takes the won CD rate once it is loaded and recent; until then, and for
+    every other currency here, the U.S. 3-month Treasury rate as before.
+    """
+    own_rate = OWN_CURRENCY_RISK_FREE.get(str(reporting_currency or "USD").upper(), "USD")
+    return connection.execute(
+        """
+        SELECT rate_date, series_id, currency, tenor, annual_rate, provider,
+               quality_status
+        FROM risk_free_rates
+        WHERE tenant_id = ? AND currency IN (?, 'USD') AND rate_date <= ?
+          AND (currency = 'USD' OR rate_date >= ?)
+          AND quality_status IN ('pass', 'warn')
+        ORDER BY (currency = ?) DESC, rate_date DESC LIMIT 1
+        """,
+        (tenant_id, own_rate, as_of, own_rate_cutoff(as_of), own_rate),
+    ).fetchone()
 
 
 class RiskInputsNotReady(ValueError):
@@ -35,6 +66,12 @@ def validate_risk_input_readiness(inputs: Mapping[str, Any]) -> None:
         try:validate_inputs(inputs)
         except (KeyError,ValueError,TypeError,OverflowError) as error:
             raise RiskInputsNotReady('T HKD/HIBOR inputs are not qualified: '+str(error)) from error
+        return
+    if 'profiled_hkd_snapshot' in inputs:
+        from .profiled_composite import validate_inputs as validate_profiled
+        try:validate_profiled(inputs)
+        except (KeyError,ValueError,TypeError,OverflowError) as error:
+            raise RiskInputsNotReady('Composite HKD/HIBOR inputs are not qualified: '+str(error)) from error
         return
     if inputs['subject_id'] == 'alpha-world-ms':
         from .alpha_world_ms_analytics import analyze
@@ -151,25 +188,50 @@ def load_risk_inputs(
     query_started = time.perf_counter()
     subject = connection.execute(
         """
-        SELECT subject_type FROM platform_subjects
+        SELECT subject_type, COALESCE(reporting_currency, base_currency) AS reporting_currency
+        FROM platform_subjects
         WHERE tenant_id = ? AND subject_id = ?
         """,
         (tenant_id, subject_id),
     ).fetchone()
     subject_type = str(subject["subject_type"]) if subject else "physical_account"
+    # The NAV, comparison and holdings below are in this currency; so is the risk-free rate.
+    reporting_currency = str((subject["reporting_currency"] if subject else None) or "USD").upper()
+    from .profiled_composite import is_profiled
+    if (subject_type == 'composite_portfolio' and subject_id not in ('alpha-world-ms','alpha-world-t')
+            and is_profiled(connection, subject_id, tenant_id=tenant_id)):
+        # A composite reporting in the Alpha World MS or T design: full HKD
+        # NAV and HIBOR, never the USD benchmark comparison path below.
+        from .profiled_composite import load_risk_snapshot as load_profiled
+        try:
+            snapshot,_,_=load_profiled(connection,subject_id,as_of,tenant_id=tenant_id)
+            from .profiled_crisis import load as load_profiled_crisis
+            # As MS: without exact-date sleeve evidence the replay is shown as unavailable.
+            try:crisis=load_profiled_crisis(connection,snapshot,tenant_id=tenant_id)
+            except (ValueError,KeyError,TypeError):crisis=None
+            inputs={'subject_id':subject_id,'subject_type':subject_type,'as_of':as_of,
+                'benchmark_id':None,'rows':[],'positions':[],'risk_free':snapshot['risk']['risk_free'],
+                'crisis_replay':crisis,'profiled_hkd_snapshot':snapshot}
+            validate_risk_input_readiness(inputs)
+        except (ValueError,KeyError,TypeError) as error:
+            raise RiskInputsNotReady('Composite qualified stored inputs unavailable: '+str(error)) from error
+        return inputs,{'input_query_ms':round((time.perf_counter()-started)*1000,3),'tail_position_query_ms':0.}
     if subject_id == 'alpha-world-ms':
         from .alpha_world_ms_hkd import load_risk_snapshot
+        from .alpha_world_ms_crisis import load as load_ms_crisis
         try:
             snapshot, _, _ = load_risk_snapshot(connection, as_of, tenant_id=tenant_id)
         except ValueError as error:
             raise RiskInputsNotReady(str(error)) from error
         timings['input_query_ms'] = round((time.perf_counter()-started)*1000, 3)
         timings['tail_position_query_ms'] = 0.0
+        try: crisis = load_ms_crisis(connection, snapshot, tenant_id=tenant_id, identity_proxy=True)
+        except ValueError: crisis = None
         # Benchmark comparison is a separate, unqualified capability. Never
         # intersect full HKD NAV metrics with legacy USD/GSPC comparison rows.
         return {'subject_id':subject_id, 'subject_type':subject_type, 'as_of':as_of,
             'benchmark_id':None, 'rows':[], 'positions':[],
-            'risk_free':snapshot['risk']['risk_free'], 'crisis_replay':None,
+            'risk_free':snapshot['risk']['risk_free'], 'crisis_replay':crisis,
             'ms_hkd_snapshot':snapshot}, timings
     benchmark = connection.execute(
         """
@@ -201,17 +263,7 @@ def load_risk_inputs(
             as_of,
         ),
     ).fetchall()
-    risk_free = connection.execute(
-        """
-        SELECT rate_date, series_id, currency, tenor, annual_rate, provider,
-               quality_status
-        FROM risk_free_rates
-        WHERE tenant_id = ? AND currency = 'USD' AND rate_date <= ?
-          AND quality_status IN ('pass', 'warn')
-        ORDER BY rate_date DESC LIMIT 1
-        """,
-        (tenant_id, as_of),
-    ).fetchone()
+    risk_free = risk_free_rate(connection, tenant_id=tenant_id, reporting_currency=reporting_currency, as_of=as_of)
     rows = _rows(records)
     timings["comparison_and_rate_query_ms"] = round(
         (time.perf_counter() - query_started) * 1000, 3
@@ -225,13 +277,13 @@ def load_risk_inputs(
             """
             SELECT p.snapshot_date, p.conid, p.model_code,
                    CASE
-                     WHEN UPPER(COALESCE(p.currency, '')) = 'USD' THEN 'USD'
-                     WHEN fx.rate IS NOT NULL THEN 'USD'
+                     WHEN UPPER(COALESCE(p.currency, '')) = ? THEN ?
+                     WHEN fx.rate IS NOT NULL THEN ?
                      ELSE p.currency
                    END AS currency,
                    p.quantity_text,
                    CASE
-                     WHEN UPPER(COALESCE(p.currency, '')) = 'USD'
+                     WHEN UPPER(COALESCE(p.currency, '')) = ?
                        THEN p.market_value_text
                      WHEN fx.rate IS NOT NULL
                        THEN (COALESCE(NULLIF(p.market_value_text, ''), '0')::numeric * fx.rate)::text
@@ -245,19 +297,20 @@ def load_risk_inputs(
                 FROM reference_fx_rates AS r
                 WHERE r.tenant_id = ?
                   AND r.from_currency = UPPER(COALESCE(p.currency, ''))
-                  AND r.to_currency = 'USD'
+                  AND r.to_currency = ?
                   AND r.quality_status IN ('pass', 'warn')
                   AND r.rate_date <= p.snapshot_date
                   AND r.rate_date >= (p.snapshot_date::date - INTERVAL '4 days')::text
                 ORDER BY r.rate_date DESC
                 LIMIT 1
-            ) AS fx ON UPPER(COALESCE(p.currency, '')) <> 'USD'
+            ) AS fx ON UPPER(COALESCE(p.currency, '')) <> ?
             WHERE p.tenant_id = ? AND p.subject_id = ?
               AND p.snapshot_date = ANY(?::text[])
               AND UPPER(COALESCE(i.symbol, '')) NOT LIKE '%%.REC'
             ORDER BY p.snapshot_date, p.conid, p.model_code
             """,
-            (tenant_id, tenant_id, subject_id, required_dates),
+            (reporting_currency, reporting_currency, reporting_currency, reporting_currency,
+             tenant_id, reporting_currency, reporting_currency, tenant_id, subject_id, required_dates),
         ).fetchall()
     timings["tail_position_query_ms"] = round(
         (time.perf_counter() - positions_started) * 1000, 3
@@ -272,6 +325,7 @@ def load_risk_inputs(
     return {
         "subject_id": subject_id, "subject_type": subject_type, "as_of": as_of,
         "benchmark_id": benchmark["benchmark_id"] if benchmark else None,
+        "reporting_currency": reporting_currency,
         "rows": rows, "positions": [dict(row) for row in position_records],
         "risk_free": dict(risk_free) if risk_free else None,
         "crisis_replay": dict(crisis_replay) if crisis_replay else None,
@@ -300,12 +354,19 @@ def risk_input_fingerprint(inputs: Mapping[str, Any]) -> str:
     }
     if 'ms_hkd_snapshot' in inputs:
         from .alpha_world_ms_analytics import VERSION
+        from .alpha_world_ms_runtime import VERSION as RUNTIME_VERSION
         manifest['ms_hkd_snapshot']=inputs['ms_hkd_snapshot']
         manifest['ms_methodology_version']=VERSION
+        manifest['ms_runtime_version']=RUNTIME_VERSION
     if 't_hkd_snapshot' in inputs:
         from .alpha_world_t_runtime import VERSION
         manifest['t_hkd_snapshot']=inputs['t_hkd_snapshot']
         manifest['t_runtime_version']=VERSION
+    if 'profiled_hkd_snapshot' in inputs:
+        from .profiled_composite import ANALYTICS_VERSION, RUNTIME_VERSION
+        manifest['profiled_hkd_snapshot']=inputs['profiled_hkd_snapshot']
+        manifest['profiled_methodology_version']=ANALYTICS_VERSION
+        manifest['profiled_runtime_version']=RUNTIME_VERSION
     # Reject NaN/infinity rather than giving an invalid calculation a cache key.
     serialized = canonical_json(manifest)
     json.loads(serialized, parse_constant=lambda value: (_ for _ in ()).throw(
@@ -322,7 +383,7 @@ def compute_risk_snapshot(
         connection, tenant_id=tenant_id, subject_id=subject_id, as_of=as_of)
     if inputs['subject_id'] != subject_id or inputs['as_of'] != as_of:
         raise RiskInputsNotReady('Risk input identity does not match the requested subject and date')
-    if subject_id == 'alpha-world-t':
+    if subject_id == 'alpha-world-t' or 'profiled_hkd_snapshot' in inputs:
         # Supplied loaded_inputs must not bypass the same T qualification gate
         # enforced by load_risk_inputs and the ordinary background worker.
         validate_risk_input_readiness(inputs)
@@ -339,27 +400,28 @@ def compute_risk_snapshot(
         timings['total_ms']=round(timings['input_query_ms']+timings['deterministic_metrics_ms'],3)
         return payload,timings,source_sha256
 
+    if 'profiled_hkd_snapshot' in inputs:
+        from .profiled_composite import build_payload as build_profiled
+        started=time.perf_counter();payload=build_profiled(inputs)
+        timings['deterministic_metrics_ms']=round((time.perf_counter()-started)*1000,3)
+        timings['total_ms']=round(timings['input_query_ms']+timings['deterministic_metrics_ms'],3)
+        return payload,timings,source_sha256
+
     if subject_id == 'alpha-world-ms':
-        from .alpha_world_ms_analytics import analyze
-        from .alpha_world_ms_cache import methodology_identity, UNAVAILABLE
+        from .alpha_world_ms_runtime import build_payload
         validate_risk_input_readiness(inputs)
         analytics_started=time.perf_counter()
-        metrics,_,evidence=analyze(inputs['ms_hkd_snapshot'])
+        payload=build_payload(inputs)
         timings['deterministic_metrics_ms']=round((time.perf_counter()-analytics_started)*1000,3)
         timings['total_ms']=round(timings['input_query_ms']+timings['deterministic_metrics_ms'],3)
-        return {'account_id':subject_id,'as_of':as_of,'benchmark_id':None,
-            'methodology_identity':methodology_identity(), 'unavailable_capabilities':dict(UNAVAILABLE),
-            'reporting_currency':'HKD','metrics':metrics,'risk_free':dict(risk_free),
-            'expected_tail_loss_contributors':{'top':[], 'bottom':[]}, 'crisis_replay':None,'quality_status':'warn',
-            'message':'HKD NAV metrics use period-average 1M HIBOR from inception. Composite crisis replay and security-level tail allocation are not qualified.',
-            'analytics_evidence':evidence,'analytics_version':RISK_ANALYTICS_VERSION},timings,source_sha256
+        return payload,timings,source_sha256
 
     analytics_started = time.perf_counter()
     metrics = portfolio_risk_metrics(
         rows, float(risk_free["annual_rate"]) if risk_free else None
     )
     contributors = expected_tail_loss_contributors(
-        rows, position_records, reporting_currency="USD"
+        rows, position_records, reporting_currency=str(inputs.get("reporting_currency") or "USD")
     )
     timings["deterministic_metrics_ms"] = round(
         (time.perf_counter() - analytics_started) * 1000, 3
@@ -380,7 +442,7 @@ def compute_risk_snapshot(
         "risk_free": dict(risk_free) if risk_free else None,
         "quality_status": quality_status,
         "message": (
-            "Risk metrics use validated, cash-flow-adjusted portfolio returns on common primary-benchmark trading dates. Sharpe is unavailable until a validated USD risk-free series is loaded."
+            "Risk metrics use validated, cash-flow-adjusted portfolio returns on common primary-benchmark trading dates. Sharpe is unavailable until a validated risk-free series is loaded."
             if rows and risk_free is None
             else (
                 "Risk metrics use validated, cash-flow-adjusted portfolio returns on common primary-benchmark trading dates."
@@ -405,12 +467,13 @@ def store_risk_snapshot(
 ) -> None:
     payload_json = canonical_json(payload)
     payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
-    if subject_id in ('alpha-world-ms','alpha-world-t'):
+    if subject_id in ('alpha-world-ms','alpha-world-t') or _profiled_payload(payload):
         status = snapshot_read_status({'payload_json':payload, 'payload_sha256':payload_sha256,
             'quality_status':payload.get('quality_status'), 'comparison_version':CALCULATION_VERSION},
             subject_id=subject_id, as_of=as_of)
         if status != 'current':
-            raise RiskInputsNotReady(('T' if subject_id=='alpha-world-t' else 'MS')+' output did not pass cache validation: ' + status)
+            label = {'alpha-world-t':'T','alpha-world-ms':'MS'}.get(subject_id,'Composite')
+            raise RiskInputsNotReady(label+' output did not pass cache validation: ' + status)
     connection.execute(
         """
         INSERT INTO risk_analytics_snapshots(
@@ -488,6 +551,11 @@ def build_risk_snapshot(
         timings=timings,
         source_data_sha256=source_sha256,
     )
+    # The publish gate (off by default). It logs its verdict only: the risk page shows one
+    # exact date, so holding this back would show "being prepared" instead.
+    publish_gate.before_commit(connection, {"gold.risk_analytics_snapshots": {
+        "subject_id": subject_id, "as_of_date": as_of, "analytics_version": RISK_ANALYTICS_VERSION}},
+        writer="risk_snapshots")
     connection.commit()
     LOGGER.info(
         "risk_snapshot subject=%s as_of=%s total_ms=%.3f tail_position_ms=%.3f",
@@ -514,6 +582,11 @@ def decoded_payload(value: Any) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
     raise ValueError("Risk analytics snapshot payload is not a JSON object")
+
+
+def _profiled_payload(payload: Any) -> bool:
+    from .profiled_composite import RUNTIME_VERSION
+    return isinstance(payload, Mapping) and payload.get('runtime_version') == RUNTIME_VERSION
 
 
 def snapshot_read_status(existing, *, subject_id: str, as_of: str,
@@ -546,19 +619,29 @@ def snapshot_read_status(existing, *, subject_id: str, as_of: str,
         expected["benchmark_id"] = benchmark_id
     if any(payload.get(key) != value for key, value in expected.items()):
         return "payload_identity_mismatch"
+    profiled = _profiled_payload(payload)
     if (not isinstance(payload.get("metrics"), dict)
-            or (subject_id not in ('alpha-world-ms','alpha-world-t') and
+            or (subject_id not in ('alpha-world-ms','alpha-world-t') and not profiled and
                 (not isinstance(payload.get("benchmark_id"), str) or not payload["benchmark_id"]))
             or payload.get("quality_status") != existing["quality_status"]):
         return "invalid_payload_structure"
     if hashlib.sha256(serialized.encode("utf-8")).hexdigest() != existing.get("payload_sha256"):
         return "payload_hash_mismatch"
     if subject_id == 'alpha-world-ms':
-        from .alpha_world_ms_cache import validate_payload
         try:
+            if payload.get('runtime_version'):
+                from .alpha_world_ms_runtime import validate_payload
+            else:
+                from .alpha_world_ms_cache import validate_payload
             validate_payload(payload)
         except (KeyError, ValueError, TypeError, OverflowError):
             return 'ms_methodology_mismatch'
+    if profiled:
+        try:
+            from .profiled_composite import validate_payload as validate_profiled
+            validate_profiled(payload)
+        except (KeyError, ValueError, TypeError, OverflowError):
+            return 'composite_methodology_mismatch'
     return "current"
 
 

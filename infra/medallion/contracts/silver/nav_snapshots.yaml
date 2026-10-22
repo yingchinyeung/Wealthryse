@@ -1,0 +1,336 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.nav_snapshots
+name: nav_snapshots
+version: 1.0.3
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: Net asset value per account and statement date, in total and by asset class, from the Flex NAV and equity
+    summary sections, or for a Kiwoom account from Kiwoom's account answers. The source of every account NAV the
+    platform reports.
+  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
+    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
+    item U8's history is switched on, every version is also kept in silver.nav_snapshots_history, and silver.nav_snapshots_as_known(at)
+    returns this table as it stood at any moment. Kiwoom accounts (written by ibkr_etl.kiwoom_collector) have one
+    KRW TOTAL row per day. total_text is Kiwoom's own total (kt00004 prsm_dpst_aset_amt today, ka01690 day_stk_asst
+    for a past day), which is after Kiwoom's estimated tax and fee for selling every holding, plus any US holdings
+    and deposits at Kiwoom's rate to KRW. stock_text is Kiwoom's own value of the holdings (the holdings kt00004
+    lists today; kt00016 scrt_evlt_amt_to for a past day, whose entr_to must equal dbst_bal), which is the holdings
+    at the official KRX close, so the account's positions add up to it to the won. cash_text is the deposit (d2_entra
+    today, dbst_bal for a past day) plus any US deposits, and accruals_text Kiwoom's selling cost as a negative
+    amount, worked out per stock (see kiwoom_selling_cost_rule), so stock + cash + accruals = total. Reports use
+    total_text as the account's NAV (decided 19 Oct 2026). The daily run (08:00 UTC, 17:00 KST, inside KRX's after-market)
+    writes today's row at the prices Kiwoom lists then; the next run's history pass writes the day again at the
+    official close. A Kiwoom row is final once a kiwoom_rest_history run has written it (last_seen_run_id), so a
+    month-end is final after the next trading day's run, and month-end reports render after it (ibkr_etl.designed_reports.month_ready
+    checks the month-end row's run). A Kiwoom row's row_sha256 is the sha256 of the row as written, not of a Flex
+    row.
+tags:
+- silver
+- ibkr
+- kiwoom
+schema:
+- name: nav_snapshots
+  physicalName: silver.nav_snapshots
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per account_id, snapshot_date, currency and asset_class.
+  properties:
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: restricted
+    description: 'Broker account number (IBKR or Kiwoom). Restricted: never shown or logged in full.'
+  - name: snapshot_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: confidential-financial
+    description: Statement date of the NAV.
+    quality:
+    - name: snapshot_date_is_iso_date
+      description: snapshot_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.nav_snapshots WHERE snapshot_date IS NOT NULL AND snapshot_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: Currency of the figures; BASE when the statement did not name it.
+  - name: asset_class
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: confidential-financial
+    description: Asset class of the row; TOTAL for the account total. subject_nav_series reads TOTAL rows only,
+      v_daily_nav reads TOTAL, ALL and blank.
+  - name: total_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Total NAV as decimal text (total, endingValue, netLiquidationValue or nav; for an equity summary
+      row without a total, the sum of its components and accruals). For a Kiwoom account, Kiwoom's total after its
+      estimated selling cost.
+    quality:
+    - name: total_text_is_decimal
+      description: total_text is plain decimal text when present. v_daily_nav casts these to double precision, so
+        one bad value breaks every read of that view.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.nav_snapshots WHERE total_text IS NOT NULL AND total_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: cash_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Cash as decimal text.
+    quality:
+    - name: cash_text_is_decimal
+      description: cash_text is plain decimal text when present. v_daily_nav casts these to double precision, so
+        one bad value breaks every read of that view.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.nav_snapshots WHERE cash_text IS NOT NULL AND cash_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: stock_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'Stocks as decimal text. For a Kiwoom account, Kiwoom''s own value of the holdings (kt00016 scrt_evlt_amt_to
+      for a past day): the holdings at the official KRX close, which its positions add up to.'
+    quality:
+    - name: stock_text_is_decimal
+      description: stock_text is plain decimal text when present. v_daily_nav casts these to double precision, so
+        one bad value breaks every read of that view.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.nav_snapshots WHERE stock_text IS NOT NULL AND stock_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: options_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Options as decimal text.
+    quality:
+    - name: options_text_is_decimal
+      description: options_text is plain decimal text when present. v_daily_nav casts these to double precision,
+        so one bad value breaks every read of that view.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.nav_snapshots WHERE options_text IS NOT NULL AND options_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: futures_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Futures as decimal text.
+    quality:
+    - name: futures_text_is_decimal
+      description: futures_text is plain decimal text when present. v_daily_nav casts these to double precision,
+        so one bad value breaks every read of that view.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.nav_snapshots WHERE futures_text IS NOT NULL AND futures_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: bonds_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Bonds as decimal text.
+    quality:
+    - name: bonds_text_is_decimal
+      description: bonds_text is plain decimal text when present. v_daily_nav casts these to double precision, so
+        one bad value breaks every read of that view.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.nav_snapshots WHERE bonds_text IS NOT NULL AND bonds_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: accruals_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'Accruals as decimal text: the accruals field, or the sum of the CFD, withholding, dividend, interest
+      and margin accrual fields. For a Kiwoom account, Kiwoom''s estimated selling cost as a negative amount (its
+      value of the holdings plus cash, less its total).'
+    quality:
+    - name: accruals_text_is_decimal
+      description: accruals_text is plain decimal text when present. v_daily_nav casts these to double precision,
+        so one bad value breaks every read of that view.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.nav_snapshots WHERE accruals_text IS NOT NULL AND accruals_text !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: row_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows. For a Kiwoom row,
+      the sha256 of the row as written.
+    quality:
+    - name: row_sha256_is_sha256
+      description: row_sha256 is a lowercase hex sha256 (util.sha256_text of the row).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.nav_snapshots WHERE row_sha256 IS NOT NULL AND row_sha256 !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: last_seen_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ingestion run that last wrote the row (ingestion_runs.run_id).
+  quality:
+  - name: account_in_accounts
+    description: Every row's account is in silver.accounts. A row of an unknown account is invisible to every tenant
+      under the account_isolation policy, so run this with a role that bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.nav_snapshots t WHERE NOT EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id
+      = t.account_id)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+  - name: kiwoom_positions_add_up_to_stock
+    description: 'A Kiwoom account''s KRW TOTAL row: when all its positions that day are in KRW, they add up to
+      stock_text to the won (ibkr_etl.kiwoom_collector''s holdings check). A day stored at ka01690''s after-market
+      prices fails until it is collected again. Run with a role that bypasses row-level security.'
+    type: sql
+    query: SELECT COUNT(*) FROM silver.nav_snapshots n WHERE n.asset_class = 'TOTAL' AND n.currency = 'KRW' AND
+      EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id = n.account_id AND a.account_type = 'kiwoom') AND
+      NOT EXISTS (SELECT 1 FROM silver.position_snapshots p WHERE p.account_id = n.account_id AND p.snapshot_date
+      = n.snapshot_date AND p.currency <> 'KRW') AND COALESCE((SELECT SUM(p.market_value_text::numeric) FROM silver.position_snapshots
+      p WHERE p.account_id = n.account_id AND p.snapshot_date = n.snapshot_date), 0) <> n.stock_text::numeric
+    mustBe: 0
+    severity: warning
+    dimension: accuracy
+  - name: kiwoom_selling_cost_rule
+    description: 'A Kiwoom account''s KRW TOTAL row: minus accruals_text is Kiwoom''s selling cost worked out per
+      KRW position, within 1 KRW a position (ibkr_etl.kiwoom_client.kiwoom_selling_cost). Tax rounded down to the
+      won: 0.15% before 26 Dec 2025, then 0.05% and 0.15% rounded down apart; fee 0.015% rounded down to 10 won.
+      Run with a role that bypasses row-level security.'
+    type: sql
+    query: SELECT COUNT(*) FROM silver.nav_snapshots n CROSS JOIN LATERAL (SELECT COUNT(*) AS held, COALESCE(SUM(CASE
+      WHEN n.snapshot_date >= '2025-12-26' THEN floor(v.mv * 0.0005) + floor(v.mv * 0.0015) ELSE floor(v.mv * 0.0015)
+      END + floor(v.mv * 0.00015 / 10) * 10), 0) AS cost FROM (SELECT p.market_value_text::numeric AS mv FROM silver.position_snapshots
+      p WHERE p.account_id = n.account_id AND p.snapshot_date = n.snapshot_date AND p.currency = 'KRW') v) k WHERE
+      n.asset_class = 'TOTAL' AND n.currency = 'KRW' AND EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id
+      = n.account_id AND a.account_type = 'kiwoom') AND abs(k.cost + COALESCE(n.accruals_text::numeric, 0)) > k.held
+    mustBe: 0
+    severity: warning
+    dimension: accuracy
+slaDefaultElement: nav_snapshots.snapshot_date
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: nav_snapshots.snapshot_date
+- property: timeOfAvailability
+  value: 09:30+00:00
+  element: nav_snapshots.snapshot_date
+  driver: operational
+- property: latency
+  value: 4
+  unit: d
+  element: nav_snapshots.snapshot_date
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Typed Flex sections; values are still stored as text and cast on read.
+- property: readByViews
+  value:
+  - silver.subject_nav_series
+  - silver.v_daily_nav
+- property: consumers
+  value:
+  - ibkr_etl.analyst_export
+  - ibkr_etl.burn_in
+  - ibkr_etl.designed_reports
+  - ibkr_etl.flex_cutover
+  - ibkr_etl.historical_reporting
+  - ibkr_etl.layer_freshness
+  - ibkr_etl.onboarding
+  - ibkr_etl.onboarding_reports
+  - ibkr_etl.switch_dry_run
+  - ibkr_etl.web
+- property: producers
+  value:
+  - ibkr_etl.loader
+- property: freshnessCheck
+  value:
+    checkId: silver.nav_snapshots
+    measure: as_of_date
+    required: true
+    query: SELECT MAX(snapshot_date) AS observed FROM nav_snapshots
+    source: ibkr_etl.layer_freshness.RULES
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
+contractCreatedTs: '2026-10-18T00:00:00Z'

@@ -1,0 +1,34 @@
+name: Deployed image drift check
+
+# Weekly and read-only: lists the ibkrv2stg container apps and jobs and compares
+# their images with deploy/deployed-images.json and deploy/report-layouts.json.
+# Nothing in Azure changes. A red run lists what drifted.
+on:
+  schedule:
+    - cron: '0 1 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  drift:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AZURE_CLIENT_ID: 17708c85-b855-4209-81dd-a613a91315d3
+      AZURE_TENANT_ID: 0578a50b-a7a1-40a4-905b-8b20dba84124
+      AZURE_SUBSCRIPTION_ID: 3956e821-cee4-403f-8708-e84e2ed490eb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      - name: Compare deployed images with the repo record
+        run: python deploy/drift_check.py

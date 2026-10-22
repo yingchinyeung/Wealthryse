@@ -1,0 +1,246 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.derived_portfolio_nav
+name: derived_portfolio_nav
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Daily NAV of each derived portfolio: the source account''s NAV less the excluded positions, with the
+    source account''s cash replaced by the portfolio''s own cash ledger.'
+  limitations: Rebuilt in full for a portfolio on each refresh. Only dates with source positions are kept.
+tags:
+- silver
+- derived
+schema:
+- name: derived_portfolio_nav
+  physicalName: silver.derived_portfolio_nav
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, portfolio_id, snapshot_date and currency.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: portfolio_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: confidential-financial
+    description: Derived portfolio id (derived_portfolios.portfolio_id).
+  - name: snapshot_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: NAV date of the source account.
+    quality:
+    - name: snapshot_date_is_iso_date
+      description: snapshot_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_nav WHERE snapshot_date IS NOT NULL AND snapshot_date
+        !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: confidential-financial
+    description: Currency of the source NAV row.
+  - name: total_nav
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: source_total_nav − excluded_market_value_base − the source account's cash + cash.
+    quality:
+    - name: total_nav_present
+      description: total_nav is set; subject_nav_series serves it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_nav WHERE total_nav IS NULL
+      mustBe: 0
+      severity: error
+      dimension: completeness
+  - name: cash
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'The portfolio''s own cash: the sum of its cash balances'' base_value on this date.'
+  - name: stock
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Source stocks less the excluded stocks.
+  - name: options
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Source options less the excluded options.
+  - name: futures
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Source futures less the excluded futures.
+  - name: bonds
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Source bonds less the excluded bonds.
+  - name: accruals
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Source accruals, unchanged.
+  - name: source_total_nav
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: The source account's total NAV on this date.
+  - name: excluded_market_value_base
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Value of the excluded positions in the base currency.
+  - name: source_position_count
+    physicalType: integer
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Positions in the source account on this date.
+  - name: included_position_count
+    physicalType: integer
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Positions kept in the portfolio.
+  - name: excluded_position_count
+    physicalType: integer
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Positions left out.
+  - name: generated_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the run that wrote the row.
+  quality:
+  - name: position_counts_add_up
+    description: included_position_count + excluded_position_count equals source_position_count.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.derived_portfolio_nav WHERE included_position_count + excluded_position_count
+      <> source_position_count
+    mustBe: 0
+    severity: error
+    dimension: accuracy
+  - name: cash_matches_balances
+    description: cash equals the sum of the portfolio's cash balances (base_value) on the same date.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.derived_portfolio_nav n JOIN (SELECT tenant_id, portfolio_id, snapshot_date,
+      SUM(base_value) AS total FROM silver.derived_portfolio_cash_balances GROUP BY 1, 2, 3) b USING (tenant_id,
+      portfolio_id, snapshot_date) WHERE ABS(n.cash - b.total) > 1e-6 * GREATEST(1, ABS(b.total))
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+  - name: excluded_value_matches_exclusions
+    description: excluded_market_value_base equals the sum of the date's exclusions (market_value_base).
+    type: sql
+    query: SELECT COUNT(*) FROM silver.derived_portfolio_nav n LEFT JOIN (SELECT tenant_id, portfolio_id, snapshot_date,
+      SUM(market_value_base) AS total FROM silver.derived_portfolio_exclusions GROUP BY 1, 2, 3) e USING (tenant_id,
+      portfolio_id, snapshot_date) WHERE ABS(n.excluded_market_value_base - COALESCE(e.total, 0)) > 1e-6 * GREATEST(1,
+      ABS(n.excluded_market_value_base))
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: Filtered and composite subjects, conformed to the same shape as account data.
+- property: readByViews
+  value:
+  - silver.subject_nav_series
+- property: consumers
+  value:
+  - ibkr_etl.analyst_export
+  - ibkr_etl.derived_portfolio
+  - ibkr_etl.designed_reports
+  - ibkr_etl.onboarding_dry_run
+  - ibkr_etl.onboarding_reports
+  - ibkr_etl.report
+  - ibkr_etl.web
+- property: producers
+  value:
+  - ibkr_etl.derived_portfolio
+contractCreatedTs: '2026-10-18T00:00:00Z'

@@ -5,15 +5,6 @@
     "prefix": {
       "value": "ibkrv2stg"
     },
-    "budgetAmount": {
-      "value": 120000
-    },
-    "budgetStartDate": {
-      "value": "2026-09-01"
-    },
-    "budgetContactEmail": {
-      "value": "anthony.ying@wealthryse.ai"
-    },
     "administratorLoginPassword": {
       "value": "<supply securely at deployment time>"
     },

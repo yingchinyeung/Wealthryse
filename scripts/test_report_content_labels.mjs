@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {cashActivityNote, monthlyCalendarNote, attributionResidualNote} from './report_content_labels.mjs';
+import {cashActivityNote, monthlyCalendarNote, portfolioMonthlyNote, attributionResidualNote} from './report_content_labels.mjs';
 const cash={total_dividends:184.1,interest_received:0,interest_paid:0,fees_and_withholding:0,other_internal_cash:69.18,net_listed_cash_activity:253.28};
 test('cash explanation includes other internal activity',()=>assert.equal(cashActivityNote(cash,x=>x.toFixed(2)), 'Dividends 184.10, net interest/fees 0.00 and other internal cash 69.18 total 253.28.'));
 test('signed financing reconciles',()=>assert.match(cashActivityNote({...cash,interest_paid:-5,net_listed_cash_activity:248.28},String),/net interest\/fees -5/));
@@ -14,3 +14,4 @@ test('unmatched interval disclosure includes complete NAV coverage',()=>assert.m
 test('complete positions preserve original wording',()=>assert.equal(attributionResidualNote({...coverage,position_coverage:{...coverage.position_coverage,matched_position_intervals:9,residual_only_intervals:[],missing_position_dates:[]}},String),attributionResidualNote({residual_contribution:0.01},String)));
 test('inconsistent or missing position coverage is rejected',()=>{for(const c of [null,{...coverage.position_coverage,nav_intervals:8},{...coverage.position_coverage,matched_position_intervals:0},{...coverage.position_coverage,residual_only_intervals:['2025-01-21','2025-01-21']},{...coverage.position_coverage,residual_only_intervals:['2025-02-30']},{...coverage.position_coverage,residual_only_intervals:['2025-02-01']}])assert.throws(()=>attributionResidualNote({...coverage,position_coverage:c},String));});
 test('nonfinite residual is rejected',()=>assert.throws(()=>attributionResidualNote({...coverage,residual_contribution:NaN},String)));
+test('portfolio monthly note names the full-history start',()=>{assert.match(portfolioMonthlyNote({period_start:'2025-01-20',month_rows:[{date:'2025-01-31'}]},String),/2025-01-20.*factsheet/);assert.throws(()=>portfolioMonthlyNote({period_start:'2025-01-20',month_rows:[]},String));});

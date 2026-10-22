@@ -1,7 +1,7 @@
 // Infrastructure-only monitoring. No application images, identities or timers.
 targetScope = 'resourceGroup'
 param rules array
-param actionGroupName string = 'ibkr-v11-daily-alerts'
+param actionGroupName string = 'ibkrv2stg-alerts'
 param enabled bool = false
 
 resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' existing = {

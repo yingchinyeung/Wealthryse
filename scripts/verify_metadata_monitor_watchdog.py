@@ -54,7 +54,7 @@ def main():
             raise RuntimeError("Watchdog deployment did not succeed")
         resource = az("rest", "--method", "get", "--url", f"https://management.azure.com/subscriptions/3956e821-cee4-403f-8708-e84e2ed490eb/resourceGroups/{RG}/providers/Microsoft.Insights/scheduledQueryRules/{RULE}?api-version=2023-12-01")
         props = resource["properties"]
-        if props["enabled"] is not True or props["criteria"]["allOf"][0]["query"] != query() or len(props["actions"]["actionGroups"]) != 1 or not props["actions"]["actionGroups"][0].lower().endswith("/actiongroups/ibkr-v11-daily-alerts"):
+        if props["enabled"] is not True or props["criteria"]["allOf"][0]["query"] != query() or len(props["actions"]["actionGroups"]) != 1 or not props["actions"]["actionGroups"][0].lower().endswith("/actiongroups/ibkrv2stg-alerts"):
             raise RuntimeError("Watchdog readback mismatch")
         result["deployed"] = True
     (folder / "monitor-watchdog-evidence.json").write_text(json.dumps(result, indent=2), encoding="utf-8")

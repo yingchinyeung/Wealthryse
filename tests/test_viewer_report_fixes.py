@@ -2,8 +2,8 @@ import copy
 import unittest
 from unittest.mock import patch
 from fastapi import HTTPException
-from ibkr_etl.viewer_labels import account_card_title
-from ibkr_etl.subject_exports import subject_export, PERFORMANCE, EXPOSURES
+from ibkr_etl.viewer_labels import account_card_name, account_card_title
+from ibkr_etl.subject_exports import subject_export, PERFORMANCE, EXPOSURES, TRADES
 from ibkr_etl.ai_analyst import prepare_model_context,AIAnalystError,AIAnalystConfig,generate_grounded_narrative,_deterministic_outputs,ANALYSIS_TOOLS
 from ibkr_etl.agent_tools import AgentToolContext
 from test_ai_analyst import _overview_results,_Client
@@ -22,16 +22,28 @@ class ViewerFixTests(unittest.TestCase):
     def test_card_names(self):
         for sid,name,expected in [('U16088571','U16088571-U.S. Technology','U16088571 - U.S. Technology'),('U16088606','U16088606 - Greater China','U16088606 - Greater China'),('hong-kong-china','China & Hong Kong','hong-kong-china - China & Hong Kong'),('alpha-world-ms','Alpha World MS','alpha-world-ms - Alpha World MS')]:
             self.assertEqual(account_card_title({'subject_id':sid,'display_name':name}),expected)
+    def test_home_card_shows_only_the_name(self):
+        for sid,name,expected in [('U16088571','U16088571-U.S. Technology','U.S. Technology'),('alpha-world-t','alpha-world-t - Alpha World T','Alpha World T'),('hong-kong-china','China & Hong Kong','China & Hong Kong'),('U16088606','U16088606','U16088606')]:
+            self.assertEqual(account_card_name({'subject_id':sid,'display_name':name}),expected)
     def test_derived_performance_reads_scoped_view(self):
         connection=Connection([[{'latest':'2026-10-07'}],[{'snapshot_date':'2026-10-07','currency':'USD','total_text':'100'}]])
         columns,rows,end,start=subject_export(connection,**self.args())
         self.assertEqual(columns,PERFORMANCE);self.assertEqual(len(rows),1)
         for sql,params in connection.queries:
             self.assertIn('subject_nav_series',sql);self.assertIn('tenant_id=%s',sql);self.assertIn('currency=%s',sql);self.assertEqual(params[:3],('tenant','hong-kong-china','USD'))
-    def test_derived_trades_are_explicit_not_blank_csv(self):
-        args=self.args();args['dataset']='trades';connection=Connection([])
+    def test_composite_trades_are_explicit_not_blank_csv(self):
+        args=self.args();args['dataset']='trades';args['access']={**args['access'],'subject_type':'composite_portfolio'};connection=Connection([])
         with self.assertRaises(HTTPException) as error:subject_export(connection,**args)
         self.assertEqual(error.exception.status_code,409);self.assertFalse(connection.queries)
+    def test_filtered_trades_export_source_trades_kept_by_the_portfolio(self):
+        args=self.args();args['dataset']='trades';args['symbol']='700';args['side']='BUY'
+        connection=Connection([[{'latest':'2026-10-07'}],[{'trade_date':'2026-10-06'}]])
+        columns,rows,end,start=subject_export(connection,**args)
+        self.assertEqual(columns,TRADES);self.assertEqual(rows,[{'trade_date':'2026-10-06'}])
+        sql,params=connection.queries[-1]
+        self.assertIn('FROM derived_portfolio_cash_ledger l JOIN trades t',sql)
+        self.assertIn("l.event_key LIKE '%%:net'",sql);self.assertNotIn('LIMIT',sql)
+        self.assertEqual(params,('tenant','hong-kong-china','duplicate logical trade','all legs of an excluded-currency trade are excluded',len('trade belongs to excluded Taiwan instrument: '),'trade belongs to excluded Taiwan instrument: ','2025-01-20','2026-10-07','700','700','BUY','BUY'))
     def test_missing_data_is_not_successful_empty_export(self):
         with self.assertRaises(HTTPException) as error:subject_export(Connection([[{'latest':None}]]),**self.args())
         self.assertEqual(error.exception.status_code,404)

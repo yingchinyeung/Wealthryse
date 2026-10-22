@@ -13,7 +13,7 @@ class WatchdogTests(unittest.TestCase):
 
     def test_fixed_destination_and_activation(self):
         args=dict(workspace_id=BASE+'Microsoft.OperationalInsights/workspaces/ibkrv2stg-logs',
-                  action_group_id=BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts')
+                  action_group_id=BASE+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts')
         dormant=watchdog_definition(**args); live=watchdog_definition(**args, enabled=True)
         self.assertFalse(dormant['properties']['enabled']); self.assertTrue(live['properties']['enabled'])
         self.assertEqual(live['properties']['severity'], 2)

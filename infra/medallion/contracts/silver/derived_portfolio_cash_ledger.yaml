@@ -1,0 +1,301 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.derived_portfolio_cash_ledger
+name: derived_portfolio_cash_ledger
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Every cash event considered for a derived portfolio: its approved opening balances, and the source account''s
+    cash transactions, FX trades, security trade cash and commissions, each included or excluded with a reason.
+    External flows marked here are the cash flows in the portfolio''s returns.'
+  limitations: Rebuilt in full for a portfolio on each refresh.
+tags:
+- silver
+- derived
+schema:
+- name: derived_portfolio_cash_ledger
+  physicalName: silver.derived_portfolio_cash_ledger
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per tenant_id, portfolio_id and event_key.
+  properties:
+  - name: tenant_id
+    physicalType: uuid
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: internal
+    description: Tenant that owns the row; row-level security filters on it.
+  - name: portfolio_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: confidential-financial
+    description: Derived portfolio id (derived_portfolios.portfolio_id).
+  - name: event_key
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: opening:<date>:<currency>, cash:<source_key>, or trade:<source_key>:<part> for a trade's net cash,
+      commission or FX leg.
+  - name: source_account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: restricted
+    description: IBKR account the portfolio is filtered from. Restricted.
+  - name: event_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Date the event counts from.
+    quality:
+    - name: event_date_is_iso_date
+      description: event_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_cash_ledger WHERE event_date IS NOT NULL AND event_date
+        !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: settle_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Settle date, when known.
+    quality:
+    - name: settle_date_is_iso_date
+      description: settle_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_cash_ledger WHERE settle_date IS NOT NULL AND settle_date
+        !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: source_type
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: opening_balance, cash_transaction, fx_trade, security_trade or trade_commission.
+    quality:
+    - name: source_type_allowed_values
+      description: source_type is one of opening_balance, cash_transaction, fx_trade, security_trade, trade_commission
+        (derived_portfolio._build_cash_ledger).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_cash_ledger WHERE source_type NOT IN ('opening_balance',
+        'cash_transaction', 'fx_trade', 'security_trade', 'trade_commission')
+      mustBe: 0
+      severity: warning
+      dimension: conformity
+  - name: source_key
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Key of the source row in cash_transactions or trades; empty for opening balances.
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Related contract, when there is one.
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the amount; UNKNOWN when the source row had none.
+  - name: amount
+    physicalType: double precision
+    logicalType: number
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Amount in currency; negative for money out.
+  - name: fx_rate_to_base
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Rate to the portfolio's base currency on event_date; empty when the currency is not an allowed
+      cash currency.
+  - name: amount_base
+    physicalType: double precision
+    logicalType: number
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: amount × fx_rate_to_base.
+  - name: included
+    physicalType: integer
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 1 when the event counts toward the portfolio's cash, 0 when excluded.
+    quality:
+    - name: included_is_flag
+      description: included is 0 or 1 (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_cash_ledger WHERE included NOT IN (0, 1)
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: external_flow
+    physicalType: integer
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 1 when an included event is money in or out of the portfolio (a deposit, withdrawal, transfer and
+      the like, matched on its type and description; credit and debit interest never). Always 0 for excluded events.
+    quality:
+    - name: external_flow_is_flag
+      description: external_flow is 0 or 1 (a CHECK constraint).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.derived_portfolio_cash_ledger WHERE external_flow NOT IN (0, 1)
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: classification
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'Event label: the IBKR transaction type, or opening balance, FX trade, security trade net cash
+      or commission.'
+  - name: description
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Description of the event.
+  - name: exclusion_reason
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Why the event is excluded; empty when included.
+  - name: generated_at
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: UTC time (ISO 8601) of the run that wrote the row.
+  quality:
+  - name: external_flow_only_when_included
+    description: An excluded event is never an external flow.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.derived_portfolio_cash_ledger WHERE external_flow = 1 AND included = 0
+    mustBe: 0
+    severity: error
+    dimension: consistency
+  - name: included_has_base_amount
+    description: An included event has a rate and a base amount; the refresh stops when a rate is missing.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.derived_portfolio_cash_ledger WHERE included = 1 AND (fx_rate_to_base IS
+      NULL OR amount_base IS NULL)
+    mustBe: 0
+    severity: error
+    dimension: completeness
+  - name: amount_base_matches
+    description: amount_base equals amount × fx_rate_to_base.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.derived_portfolio_cash_ledger WHERE amount_base IS NOT NULL AND ABS(amount_base
+      - amount * fx_rate_to_base) > 1e-9 * GREATEST(1, ABS(amount_base))
+    mustBe: 0
+    severity: error
+    dimension: accuracy
+  - name: exclusion_reason_matches_included
+    description: An event is excluded exactly when it has an exclusion reason.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.derived_portfolio_cash_ledger WHERE (included = 0) <> (exclusion_reason IS
+      NOT NULL)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: derived
+- property: catalogNote
+  value: Filtered and composite subjects, conformed to the same shape as account data.
+- property: readByViews
+  value:
+  - silver.subject_cash_activity_series
+- property: consumers
+  value:
+  - ibkr_etl.analyst_export
+  - ibkr_etl.cashflow_source_evidence
+  - ibkr_etl.comparison_cashflow_evidence
+  - ibkr_etl.provisional_benchmark
+  - ibkr_etl.report
+  - ibkr_etl.subject_exports
+- property: producers
+  value:
+  - ibkr_etl.derived_portfolio
+contractCreatedTs: '2026-10-18T00:00:00Z'

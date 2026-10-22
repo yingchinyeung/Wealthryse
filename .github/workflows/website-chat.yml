@@ -1,0 +1,45 @@
+name: Website chat setting
+
+# Manual: switches the website chat off, on for owners, or on for all users, by setting
+# AGENT_UI_MODE (and the agent address and audience) on ibkrv2stg-web. The
+# image is left as it is. Rolls back to the previous mode if checks fail.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: off, owner or all
+        required: true
+        type: choice
+        options: [owner, all, 'off']
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-website
+  cancel-in-progress: false
+
+jobs:
+  chat:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AZURE_CLIENT_ID: 17708c85-b855-4209-81dd-a613a91315d3
+      AZURE_TENANT_ID: 0578a50b-a7a1-40a4-905b-8b20dba84124
+      AZURE_SUBSCRIPTION_ID: 3956e821-cee4-403f-8708-e84e2ed490eb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      - name: Set the chat mode
+        run: python deploy/website_release.py chat "${{ inputs.mode }}"
+      - name: Check health and sign-in
+        run: python deploy/website_release.py verify
+      - name: Roll back if the change or checks failed
+        if: failure() && hashFiles('release-state.json') != ''
+        run: python deploy/website_release.py rollback

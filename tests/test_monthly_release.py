@@ -70,9 +70,13 @@ class MonthlyReleaseTests(unittest.TestCase):
         with self.assertRaises(MonthlyReportError):
             _review(runs=runs)
 
+    def test_a_factsheet_alone_is_a_package(self):
+        package = _review(runs=_runs()[:1])
+        self.assertEqual(["factsheet"], [item["report_type"] for item in package["artifacts"]])
+
     def test_incomplete_or_failed_pair_cannot_be_released(self):
         with self.assertRaises(MonthlyReportError):
-            _review(runs=_runs()[:1])
+            _review(runs=_runs()[1:])
         runs = _runs()
         runs[1]["status"] = "failed"
         with self.assertRaises(MonthlyReportError):

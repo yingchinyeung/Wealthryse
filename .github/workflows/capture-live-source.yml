@@ -2,12 +2,15 @@ name: Capture live website source
 
 # Manual, read-only on Azure: copies named src/ibkr_etl files out of the image
 # the website runs today and pushes them to a new branch under
-# deploy/live-snapshot/ so they can be compared and merged with the repo.
+# deploy/image-captures/ so they can be compared and merged with the repo.
+# Starting the files input with "--image <registry>/ibkr-platform@sha256:<digest>"
+# copies from that deployed image instead (paths src/ibkr_etl/... or scripts/...),
+# into deploy/image-captures/<digest>/.
 on:
   workflow_dispatch:
     inputs:
       files:
-        description: Space-separated file names in src/ibkr_etl
+        description: Space-separated file names in src/ibkr_etl, optionally after --image <image by digest>
         required: true
         default: web.py monthly_reporting_analytics.py agent_tools.py monthly_artifacts.py
 
@@ -40,11 +43,11 @@ jobs:
         run: python deploy/website_release.py capture $FILES
       - name: Push them to a branch
         run: |
-          branch="live-snapshot-${GITHUB_RUN_ID}"
+          branch="image-capture-${GITHUB_RUN_ID}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add deploy/live-snapshot
+          git add --all -- deploy/image-captures
           git commit -m "Snapshot of live website source: $FILES"
           git push origin "$branch"
           echo "Pushed $branch"

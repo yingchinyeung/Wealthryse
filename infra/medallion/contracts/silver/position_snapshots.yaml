@@ -1,0 +1,287 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.position_snapshots
+name: position_snapshots
+version: 1.0.1
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: 'Open positions per account and statement date from the Flex statements, or for a Kiwoom account from
+    Kiwoom''s account answers: quantity, cost, mark price, market value and unrealised P&L.'
+  limitations: 'Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks
+    the account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row; corrections
+    are not versioned yet (review item 8). Kiwoom accounts (written by ibkr_etl.kiwoom_collector): conid is the
+    platform security key (silver.instruments), cost basis is Kiwoom''s average price times the quantity, and unrealised
+    P&L is market value less cost basis. Today''s prices are those kt00004 lists. A past day''s are those ka01690
+    lists, except from 14 Sep 2026, when ka01690 lists the 20:00 after-market price: each stock is then priced at
+    its official KRX close, which is the next trading day''s base price on Kiwoom''s unadjusted daily chart (ka10081:
+    that day''s cur_prc less its pred_pre, since the chart''s own cur_prc is the last trade to 20:00), kept only
+    when the holdings add up to Kiwoom''s own value (kt00016) to the won. A KRW day''s positions add up to nav_snapshots.stock_text
+    (rule kiwoom_positions_add_up_to_stock there). A Kiwoom row''s row_sha256 is the sha256 of the row as written,
+    not of a Flex row.'
+tags:
+- silver
+- ibkr
+- kiwoom
+schema:
+- name: position_snapshots
+  physicalName: silver.position_snapshots
+  physicalType: table
+  logicalType: object
+  dataGranularityDescription: One row per account_id, snapshot_date, conid and model_code.
+  properties:
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: restricted
+    description: 'Broker account number (IBKR or Kiwoom). Restricted: never shown or logged in full.'
+  - name: snapshot_date
+    physicalType: text
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: confidential-financial
+    description: Statement date of the position.
+    quality:
+    - name: snapshot_date_is_iso_date
+      description: snapshot_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.position_snapshots WHERE snapshot_date IS NOT NULL AND snapshot_date !~
+        '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 3
+    classification: confidential-financial
+    description: IBKR contract id (silver.instruments.conid), or a synthetic FLEX- id; for a Kiwoom account, the
+      platform security key.
+  - name: model_code
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 4
+    classification: confidential-financial
+    description: IBKR model code; empty when the position is not in a model.
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the position's values.
+  - name: quantity_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Position quantity as decimal text.
+    quality:
+    - name: quantity_text_is_decimal
+      description: quantity_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.position_snapshots WHERE quantity_text IS NOT NULL AND quantity_text !~
+        '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: cost_basis_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Cost basis (costBasisMoney) as decimal text.
+    quality:
+    - name: cost_basis_text_is_decimal
+      description: cost_basis_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.position_snapshots WHERE cost_basis_text IS NOT NULL AND cost_basis_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: mark_price_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Mark price as decimal text. For a Kiwoom account, the price Kiwoom lists, or the official KRX close
+      (see limitations).
+    quality:
+    - name: mark_price_text_is_decimal
+      description: mark_price_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.position_snapshots WHERE mark_price_text IS NOT NULL AND mark_price_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: market_value_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Market value (positionValue) as decimal text, in currency. For a Kiwoom account, quantity times
+      the mark price.
+    quality:
+    - name: market_value_text_is_decimal
+      description: market_value_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.position_snapshots WHERE market_value_text IS NOT NULL AND market_value_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: unrealized_pnl_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Unrealised P&L (fifoPnlUnrealized) as decimal text.
+    quality:
+    - name: unrealized_pnl_text_is_decimal
+      description: unrealized_pnl_text is plain decimal text when present. The loader writes decimal text (util.decimal_text);
+        readers cast it.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.position_snapshots WHERE unrealized_pnl_text IS NOT NULL AND unrealized_pnl_text
+        !~ '^-?[0-9]+(\.[0-9]+)?$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: row_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the source Flex row; the same digest as the row in bronze.flex_rows.
+    quality:
+    - name: row_sha256_is_sha256
+      description: row_sha256 is a lowercase hex sha256 (util.sha256_text of the row).
+      type: sql
+      query: SELECT COUNT(*) FROM silver.position_snapshots WHERE row_sha256 IS NOT NULL AND row_sha256 !~ '^[0-9a-f]{64}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
+  - name: last_seen_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ingestion run that last wrote the row (ingestion_runs.run_id).
+  quality:
+  - name: account_in_accounts
+    description: Every row's account is in silver.accounts. A row of an unknown account is invisible to every tenant
+      under the account_isolation policy, so run this with a role that bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.position_snapshots t WHERE NOT EXISTS (SELECT 1 FROM silver.accounts a WHERE
+      a.account_id = t.account_id)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+  - name: conid_in_instruments
+    description: Every position's contract is in silver.instruments; the loader loads contracts first.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.position_snapshots p WHERE NOT EXISTS (SELECT 1 FROM silver.instruments i
+      WHERE i.conid = p.conid)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+slaDefaultElement: position_snapshots.snapshot_date
+slaProperties:
+- property: frequency
+  value: 1
+  unit: d
+  element: position_snapshots.snapshot_date
+- property: timeOfAvailability
+  value: 09:30+00:00
+  element: position_snapshots.snapshot_date
+  driver: operational
+- property: latency
+  value: 4
+  unit: d
+  element: position_snapshots.snapshot_date
+  driver: operational
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: Typed Flex sections; values are still stored as text and cast on read.
+- property: readByViews
+  value:
+  - silver.subject_position_series
+  - silver.v_latest_positions
+- property: consumers
+  value:
+  - ibkr_etl.alpha_world_t_crisis
+  - ibkr_etl.analyst_export
+  - ibkr_etl.derived_portfolio
+  - ibkr_etl.designed_reports
+  - ibkr_etl.historical_reporting
+  - ibkr_etl.layer_freshness
+  - ibkr_etl.onboarding
+  - ibkr_etl.onboarding_reports
+  - ibkr_etl.position_recovery
+  - ibkr_etl.reference_data_source
+  - ibkr_etl.service
+  - ibkr_etl.web
+- property: producers
+  value:
+  - ibkr_etl.loader
+  - ibkr_etl.position_recovery
+- property: freshnessCheck
+  value:
+    checkId: silver.position_snapshots
+    measure: as_of_date
+    required: true
+    query: SELECT MAX(snapshot_date) AS observed FROM position_snapshots
+    source: ibkr_etl.layer_freshness.RULES
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
+contractCreatedTs: '2026-10-18T00:00:00Z'

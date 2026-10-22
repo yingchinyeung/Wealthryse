@@ -8,9 +8,11 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 
-DAILY_V1 = (("ibkr-v11-daily", 480, 60),)
+# Daily jobs, all in the v2 workspace: (job, UTC minute of the day, runtime minutes).
+# v1.1's ibkr-v11-daily and account-sync stopped when v2 began its own daily
+# Flex pull on 17 Oct 2026, which moved institutional-daily to 08:20 UTC; v1.1
+# was deleted on 21 Oct 2026.
 DAILY_V2 = (
-    ("ibkrv2stg-account-sync-daily", 490, 30),
     ("ibkrv2stg-benchmark-daily", 510, 20),
     ("ibkrv2stg-sector-classification", 525, 30),
     ("ibkrv2stg-derived-daily", 530, 60),
@@ -18,7 +20,7 @@ DAILY_V2 = (
     ("ibkrv2stg-month-end-factsheet", 540, 60),
     ("ibkrv2stg-analyst-assurance", 550, 10),
     ("ibkrv2stg-burn-in-monitor", 555, 5),
-    ("ibkrv2stg-institutional-daily", 480, 50),
+    ("ibkrv2stg-institutional-daily", 500, 50),
     ("ibkrv2stg-risk-free-daily", 1380, 20),
 )
 HEARTBEATS = ("ibkrv2stg-autonomous-admin", "ibkrv2stg-flex-discovery")

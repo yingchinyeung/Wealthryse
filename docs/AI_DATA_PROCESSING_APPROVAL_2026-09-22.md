@@ -57,3 +57,27 @@ returned a strict-schema narrative with citations limited to the supplied
 grounding set and recorded 1,753 input tokens and 797 output tokens. Prompt and
 response bodies were not written to the audit log. An unauthorized subject test
 returned HTTP 403 before database or model activity.
+
+## Amendment — 13 October 2026: global processing for the portfolio agent
+
+Ying chose to move the new portfolio agent (`wealthryse_agent`: the
+`ibkrv2stg-agent` chat service and the three `ibkrv2stg-agent-*` jobs) from
+`gpt-5.6-sol` on APAC Data Zone Standard to `gpt-6-astra` version
+`2026-09-03` on **Global Standard**. Azure offers `gpt-6-astra` in Southeast
+Asia only as Global Standard; its Data Zone versions exist only in the US.
+
+What this changes:
+
+- Prompts and responses for the agent may be processed in any Azure region,
+  not only the APAC Data Zone. The Foundry resource, and data at rest, stay in
+  Southeast Asia, and calls stay stateless (`store=False`).
+- The agent accepts processing scope `global` as well as `apac-data-zone`.
+
+What does not change:
+
+- The approved data categories and exclusions above.
+- The older AI pieces (`ai_analyst.py`, the month-end factsheet worker, the
+  portfolio-assurance job and the `ibkrv2stg-ai-auhecwc4itaoo` account) stay on
+  APAC Data Zone processing and still reject any other scope.
+- Trading, arbitrary SQL, shell access, credential retrieval, permission
+  changes and model self-modification remain prohibited.

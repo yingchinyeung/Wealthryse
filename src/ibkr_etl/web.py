@@ -16,16 +16,18 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Any, Literal, Mapping
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 from psycopg.errors import InsufficientPrivilege
 from psycopg import Error as PostgresError
 from psycopg.rows import dict_row
+from .ops_agent_posts import open_incidents
 from .platform_health import aggregate_health
+from .risk_display import RISK_DISPLAY_SCRIPT
 from .subject_read_contract import ACTIVE_NAV_CURRENCY_SQL
 from pypdf.errors import PdfReadError
 
@@ -53,6 +55,7 @@ from .admin_actions import (
     claim_action_for_execution,
     create_action_preview,
     execute_claimed_action,
+    start_job_with_env,
     _default_job_starter,
 )
 from .admin_chat import (
@@ -70,13 +73,15 @@ from .benchmark_analytics import (
     ComparisonRow,
     comparison_metrics,
 )
-from .cloud_storage import download_blob_bytes, upload_bytes
+from .cloud_storage import download_blob_bytes, list_blobs, upload_bytes
 from .db import PostgresConnection
 from .subject_read_contract import require_ms_hkd_contract, synthetic_exposure
+from .model_cash_display import load_model_cash
 from .monthly_artifacts import MonthlyArtifactError, validate_factsheet_return_typography
 from .monthly_reports import (
     MonthlyReportError,
     build_monthly_report_catalog,
+    download_prefix,
     validate_artifact,
     validate_period_end,
     validate_review_artifact,
@@ -87,7 +92,7 @@ from .performance_periods import (
     flow_statement,
     performance_periods as calculate_performance_periods,
 )
-from . import report_design_updates
+from . import certified_charts, certified_pages, input_readiness, report_design_updates
 from .report_design_ui import controls as report_design_controls, SCRIPT as REPORT_DESIGN_SCRIPT
 from .internal_release import InternalReleaseError
 from .risk_snapshots import RISK_ANALYTICS_VERSION, decoded_payload, snapshot_read_status
@@ -103,6 +108,7 @@ from .template_upload import (
     validate_pptx_upload,
     validate_subject_id,
 )
+from .subject_activation import activate_subject
 from .subject_onboarding import (
     POST_WAVE0_ONBOARDING_SEQUENCE,
     approved_reference_definitions,
@@ -139,9 +145,40 @@ from .authorization import (
     subject_access_levels,
 )
 from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_guide
+from . import onboarding_v2_web, yahoo_disclosure
+from .broker_connections import onboarding_v2_enabled
 from .util import canonical_json, sha256_text, utc_now_iso
-from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS
+from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS, THEME_TOGGLE_HTML, WEB_FONT_FILES, web_font_bytes
+from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
+from .web_ui import CERTIFIED_LINE_SCRIPT
+from . import web_next
+from .web_analytics_ui import (
+    ANALYTICS_SCRIPT,
+    CORRELATION_CARD,
+    HOLDINGS_CONCENTRATION_CARD,
+    PERFORMANCE_ANALYTICS_CARDS,
+    RISK_ANALYTICS_CARDS,
+    TRADING_ACTIVITY_CARD,
+)
+from .web_modelling import (
+    MODELLING_CARDS,
+    MODELLING_CSS,
+    MODELLING_SCRIPT,
+    install as _install_modelling,
+)
+from .portfolio_analytics import (
+    CORRELATION_HOLDINGS,
+    holdings_concentration,
+    RSI_LOOKBACK_DAYS,
+    holding_rsi,
+    holdings_correlation as calculate_holdings_correlation,
+    portfolio_analytics as calculate_portfolio_analytics,
+    rolling_benchmark_statistics,
+    trading_activity as calculate_trading_activity,
+)
 from .holdings_view import combine_holdings, enrich_holdings
+from .live_ui import live_assets
+from .live_view import live_view_allowed, read_positions, read_summary, read_trades
 from .sector_classification import YAHOO_PROVIDER as HOLDINGS_SECTOR_PROVIDER
 
 
@@ -198,29 +235,18 @@ CREDENTIAL_BROKER_AUTH = os.environ.get("CREDENTIAL_BROKER_AUTH", "").strip()
 DERIVED_REFRESH_JOB_NAME = os.environ.get(
     "DERIVED_REFRESH_JOB_NAME", "ibkrv2stg-derived-daily"
 ).strip()
+# Onboarding starts derived-daily outside the daily chain. When the job is set to enforce
+# input readiness, those executions run it in shadow, so it never waits or stops them.
+WEB_DERIVED_REFRESH_ENV = {"INPUT_READINESS_MODE": "shadow"}
 ONBOARDING_REPORT_JOB_NAME = os.environ.get(
     "ONBOARDING_REPORT_JOB_NAME", "ibkrv2stg-onboard-render"
 ).strip()
 ONBOARDING_ANALYTICS_JOB_NAME = os.environ.get(
     "ONBOARDING_ANALYTICS_JOB_NAME", "ibkrv2stg-onboard-analytics"
 ).strip()
-YAHOO_ONBOARDING_DISCLOSURE_VERSION = "yahoo-ticker-disclosure-v1"
-YAHOO_ONBOARDING_SCOPE = {
-    "data": ["current_ticker_symbols", "historical_ticker_symbols"],
-    "destination": "Yahoo Finance via yfinance",
-    "excluded": [
-        "raw_ibkr_files",
-        "ibkr_account_identifiers",
-        "flex_credentials",
-        "database_credentials",
-        "personal_information",
-    ],
-    "purposes": [
-        "provisional_sector_classification",
-        "crisis_period_price_retrieval",
-    ],
-}
-YAHOO_ONBOARDING_SCOPE_SHA256 = sha256_text(canonical_json(YAHOO_ONBOARDING_SCOPE))
+YAHOO_ONBOARDING_DISCLOSURE_VERSION = yahoo_disclosure.VERSION
+YAHOO_ONBOARDING_SCOPE = yahoo_disclosure.SCOPE
+YAHOO_ONBOARDING_SCOPE_SHA256 = yahoo_disclosure.SCOPE_SHA256
 COMPANY_LOGO_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAHEAAABxCAMAAADVoLziAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAJVUExURQAAAAYGBiMjIyQkJCAgIBYWFgUFBSIiItnZ2d/f397e3t3d3dDQ0L29vZ+fn3Jycjg4OBMTEwICAigoKPv7+/////r6+sfHx4GBgTY2NicnJ/n5+ePj45qamjExMenp6YCAgLy8vDs7O1JSUvHx8WZmZgEBAe7u7mVlZe3t7UxMTNra2rGxsRISEnBwcJCQkOXl5SsrK/7+/vDw8Pf3939/f7u7u56envz8/Pj4+MvLy/b29qurq6mpqcnJyRoaGsXFxbS0tKioqB4eHpWVlc7OzvPz80lJSdbW1iEhISYmJtjY2BUVFba2tuLi4j8/Pw8PD8PDw4WFhTU1NU5OTubm5iwsLNPT02RkZBsbG9LS0g4ODkdHR3FxcfT09GJiYkpKSoqKii4uLuHh4dzc3FtbW5aWlv39/YaGhm5ubrKysg0NDREREQgICJOTk8zMzCUlJVNTU1VVVYeHhxcXF7m5uUVFRZ2dnUZGRjo6OlFRUW1tbZycnMjIyAMDA+jo6PX19fLy8kRERCkpKezs7OTk5EFBQW9vb1hYWJubm2NjY2lpaaWlpWFhYS0tLaOjo8DAwAkJCaSkpDAwMFdXV3V1dYKCggQEBO/v73Nzc9fX1yoqKjc3N+rq6qqqqjk5OYmJicrKyhkZGY6OjpGRkUtLSwcHB5eXl6ysrNvb21paWmpqagsLC7W1tYiIiD09Pevr60BAQAoKClxcXNXV1TMzM3p6esHBwWxsbGtra7+/vxQUFHR0dKCgoB8fH8/Pz5KSkl5eXqenp3l5eUNDQ3h4eF9fX+DjzmUAAAAJcEhZcwAAFxEAABcRAcom8z8AAAQjSURBVGhD7Zn5W1RlGIY/wI1EU4Z3XEJEBadEUhERxQgwdxTLNDfcQsmttE1LUwytzH1Hzdxya9G0tCzK3b+r65wZZr73uaR532/8wcvr3L8MZ97nPPd1hnPmLGNMQEBAQEBAwDNPWnpGEtI7dOyEa6VC5y6ZL/w/Xbtkdev+Yo+e2biqI6EcEhHu1bvP09nUvi9hd7vk9svDtV1QGIn65/fE9fWojEQDBmKBGqWRMgdhgxatkQoKB2OHDrWRIi9jhw69kV4ZgiUqHIxUlNJR4mKkocVYo8DJmPMq1ihwMlLXvtgjx81Iw7BHjqNx+AgsEmMbS0aW2q2McKSELY/CIjFsG8tGlycWxoytsEbjXrMWiKjydWySwoxVoerEQs34NxILE0bUJBY8Jk7CJinMOHnK1Gltf1dmmNrpbQsz6ma+GU9FeQubpDDjjFnm7f7RP2d7p6U570QXKuaaefOtnEfZAqwSwoyRhcbU+28sWuxPl0T895d2MsvetXIeDR2wSggzhpcbk7aCiBrfi13TrAwT0arVxtQVWDmPkXVYJYQfj/XGmNoyonFrYuO17xN9sM4Ys96O+XwITVK48SPvrbyirPT4/ONPIp96r4V2zGeu1aKBGzf4H+bGz6xA3uf+S74d89lkhTRwY3W7O+BmO+bzdIxfdMR5G/FDM04hRoRwY8N4nMfYgocj0XLMCOHGrctwHqM41455NPk7lAPcuO1LnMdo3m7HPHY0Y0YIN5a391F9tciOeVS6XutwI32N8xjfeN89jJ2ud1pgrP5215NYvJufj4loDzZJAWNjzpNpZClvr96LTVLAKGZfGjZJcTRWRL/7XHA07j+ARWLcjDnum+hoPLgWe+Q4GYsOYY0CF+O2w9iiwcEYPpLSfbneWHr0GJaoUBtbjjsf+1G0xhPrsUGLzti08yQWqNEYS4duTO1f6KMxzv4O13ZBY6TurmdhGzBWnGLAmX9MSod+DDB+f3qgRY8zcOo/ew7X1wPG83y6popNqcT99j8OGH+A8YWJbEy5pyGgJ4nx4iU2Jrp8ERJqkhjNyStsTuU/YkJLMqP5CS7jstq7NZGS1PjzLyxAdBUTSpIazbVfWYKGX8eEjuTG7DMsQbTqBkZUJDeaKWNZxP0JQBSB0fwGvzT93hkTGiTGY/BMjoZtwYgCidHczGQhOrUQEwpERnOLhYimz8SEHJnx3B8sRfQnJuTIjGYJ3JU3uD+aFxoH92MxohXOlwNCownFH/VGabmACSlSo7kNVyB//Y0JIWJjsfUI3aOkFRNCxEZzvYUlKdfxJw+50eA3+j9ut60K4793WJQK3G5BQnyHuItzm3tNLEtVtZiQEJJvo7lxn2WJemNCQnH9kdYEDx7inNHcaodbHz1O+cJOTUq35wEBAQEBAQHPF/8BnNCgQv/VCxcAAAAASUVORK5CYII="
@@ -296,6 +322,17 @@ SECURITY_HEADERS = {
         "form-action 'self'"
     ),
 }
+# A PDF the portal serves may be shown in a frame on the portal's own pages (the
+# factsheet designer's preview); every other response still refuses all framing.
+PDF_FRAME_ANCESTORS = "frame-ancestors 'self'"
+
+
+def security_headers_for(content_type: str | None) -> dict[str, str]:
+    headers = dict(SECURITY_HEADERS)
+    if (content_type or "").split(";")[0].strip().lower() == "application/pdf":
+        headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
+            "frame-ancestors 'none'", PDF_FRAME_ANCESTORS)
+    return headers
 
 
 def _identity_digest(value: str) -> str | None:
@@ -362,9 +399,31 @@ async def security_audit_middleware(request: Request, call_next):
         "SECURITY_AUDIT %s", json.dumps(event, sort_keys=True, separators=(",", ":"))
     )
     response.headers["X-Correlation-ID"] = request.state.correlation_id
-    for name, value in SECURITY_HEADERS.items():
+    for name, value in security_headers_for(response.headers.get("content-type")).items():
         response.headers[name] = value
     return response
+
+
+@app.middleware("http")
+async def page_design_middleware(request: Request, call_next):
+    """Serve the classic design or WealthRyse Next, per the WEB_DESIGN switch (see web_next)."""
+    response = await call_next(request)
+    path = request.url.path
+    if (web_next.setting() == "classic" or request.method != "GET" or response.status_code != 200
+            or path.startswith(("/api/", "/assets/", "/agents/", "/design/", "/.auth"))
+            or not response.headers.get("content-type", "").startswith("text/html")):
+        return response
+    user = getattr(request.state, "portal_user", None) or {}
+    role = str(user.get("role") or "") or None
+    design = web_next.design_for(request.cookies.get(web_next.COOKIE), role)
+    if design == "classic" and not (web_next.setting() == "preview" and role == "owner"):
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    back = path + (f"?{request.url.query}" if request.url.query else "")
+    html = web_next.transform(body.decode("utf-8"), design=design, role=role, back=back,
+                              page_scripts={"home": HOME_SCRIPT}, metric_anchors=METRIC_ANCHORS)
+    headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+    return Response(html, status_code=response.status_code, headers=headers, media_type="text/html")
 
 
 @app.exception_handler(Exception)
@@ -501,13 +560,16 @@ def _portable_database_connection(connection):
 
 
 def _authorized_user(request: Request) -> dict[str, object]:
+    user = None
     if AUTHORIZATION_MODE in {"hybrid", "database"}:
-        database_user = _database_authorized_user(request)
-        if database_user is not None:
-            return database_user
-        if AUTHORIZATION_MODE == "database":
+        user = _database_authorized_user(request)
+        if user is None and AUTHORIZATION_MODE == "database":
             raise HTTPException(status_code=403, detail="This account is not authorized")
-    return _legacy_authorized_user(request)
+    if user is None:
+        user = _legacy_authorized_user(request)
+    # Kept for the page-design switch (web_next), so it needs no second lookup.
+    request.state.portal_user = user
+    return user
 
 
 def _owner_user(request: Request) -> dict[str, object]:
@@ -992,9 +1054,27 @@ def _admin_structured_sources(connection) -> list[dict]:
     ]
 
 
+@app.get("/assets/fonts/{name}", include_in_schema=False)
+def web_font(name: str) -> Response:
+    # Self-hosted so the CSP (font-src falls back to 'self') allows it.
+    if name not in WEB_FONT_FILES:
+        raise HTTPException(status_code=404, detail="Font not found")
+    return Response(
+        web_font_bytes(name),
+        media_type="font/woff2",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
 @app.get("/healthz")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readiness():
+    from .platform_readiness import database_readiness
+    return database_readiness()
 
 
 def _parse_as_of(as_of: str | None) -> str | None:
@@ -1184,6 +1264,17 @@ def _portfolio_access_context(
     }
 
 
+def _certified(endpoint: str, account_id: str, requested_as_of: str | None, build) -> dict:
+    """The page's answer from build(as_of); with CERTIFIED_FIGURES_PAGES unset, exactly today's.
+
+    Call only after the account check has passed (certified_pages explains the modes; the
+    charts on the answer follow the page key charts, certified_charts).
+    """
+    payload = certified_pages.serve(endpoint, tenant_id=TENANT_ID, subject_id=account_id,
+                                    requested_as_of=requested_as_of, build=build)
+    return certified_charts.serve(endpoint, payload, tenant_id=TENANT_ID, subject_id=account_id)
+
+
 def _authorized_subject_ids(
     user: dict[str, object], *, feature_key: str | None = None
 ) -> list[str]:
@@ -1308,6 +1399,11 @@ def portfolio_summary(
 ) -> dict:
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("summary", account_id, requested_as_of,
+                      lambda day: _portfolio_summary(account_id, access, day, user))
+
+
+def _portfolio_summary(account_id: str, access: dict, requested_as_of: str | None, user: dict) -> dict:
     with _database() as connection:
         account = {
             "account_id": account_id,
@@ -1485,6 +1581,18 @@ def performance_periods_view(
     custom_start, custom_end = _parse_as_of(start), _parse_as_of(end)
     if custom_start and custom_end and custom_start > custom_end:
         raise HTTPException(status_code=400, detail="The custom start date cannot be after the end date")
+
+    def build(day: str | None) -> dict:
+        # The Overview's day change (as-of date to itself) follows the date it is built for.
+        moved = requested_as_of is not None and day != requested_as_of and custom_start == custom_end == requested_as_of
+        return _performance_periods(account_id, access, day, day if moved else custom_start,
+                                    day if moved else custom_end, user)
+
+    return _certified("performance-periods", account_id, requested_as_of, build)
+
+
+def _performance_periods(account_id: str, access: dict, requested_as_of: str | None,
+                         custom_start: str | None, custom_end: str | None, user: dict) -> dict:
     with _database() as connection:
         nav = _subject_nav_values(connection, account_id, access, requested_as_of)
         flows = _subject_external_flows(connection, account_id, access)
@@ -1513,6 +1621,185 @@ def performance_periods_view(
         ),
         "viewer": user["email"],
     }
+
+
+@app.get("/api/portfolio/{account_id}/analytics")
+def portfolio_analytics_view(
+    account_id: str,
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Monthly returns calendar, drawdowns, return statistics and rolling risk."""
+    access = _portfolio_access_context(account_id, user)
+    requested_as_of = _parse_as_of(as_of)
+    return _certified("analytics", account_id, requested_as_of,
+                      lambda day: _portfolio_analytics(account_id, access, day))
+
+
+def _portfolio_analytics(account_id: str, access: dict, requested_as_of: str | None) -> dict:
+    with _database() as connection:
+        nav = _subject_nav_values(connection, account_id, access, requested_as_of)
+        flows = _subject_external_flows(connection, account_id, access)
+    try:
+        result = calculate_portfolio_analytics(nav, flows or {}, as_of=requested_as_of)
+    except PerformanceInputError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "account_id": account_id,
+        "currency": access["reporting_currency"],
+        "requested_as_of": requested_as_of,
+        "flows_applicable": flows is not None,
+        **result,
+    }
+
+
+@app.get("/api/portfolio/{account_id}/attribution")
+def monthly_attribution_view(
+    account_id: str,
+    month: str,
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Contribution to return by holding and sector for one calendar month."""
+    access = _portfolio_access_context(account_id, user)
+    requested_as_of = _parse_as_of(as_of)
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month or ""):
+        raise HTTPException(status_code=400, detail="Month must be YYYY-MM")
+    if requested_as_of and month > requested_as_of[:7]:
+        raise HTTPException(status_code=400, detail="Month is after the as-of date")
+    # The month is worked out to its calendar end whatever the as-of date, as before.
+    return _certified("attribution", account_id, requested_as_of,
+                      lambda day: _monthly_attribution(account_id, access, month))
+
+
+def _monthly_attribution(account_id: str, access: dict, month: str) -> dict:
+    from .monthly_reporting_analytics import build_monthly_reporting_analytics
+
+    year, number = int(month[:4]), int(month[5:])
+    next_month = date(year + number // 12, number % 12 + 1, 1)
+    period_end = (next_month - timedelta(days=1)).isoformat()
+    try:
+        with _database() as connection:
+            result = build_monthly_reporting_analytics(
+                _portable_database_connection(connection), subject_id=account_id,
+                period_end=period_end, reporting_currency=str(access["reporting_currency"]),
+            )
+    except (RuntimeError, ValueError) as error:
+        return {"account_id": account_id, "month": month, "available": False,
+                "quality_status": "fail", "message": str(error)}
+    return {
+        "account_id": account_id,
+        "month": month,
+        "quality_status": result["quality_status"],
+        "message": result["message"],
+        **result["data"],
+    }
+
+
+@app.get("/api/portfolio/{account_id}/trading-activity")
+def trading_activity_view(
+    account_id: str,
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Monthly traded value, turnover, commissions and realised P&L in the reporting currency."""
+    from .holdings_view import fx_history, reporting_fx
+    from .subject_exports import subject_export
+
+    access = _portfolio_access_context(account_id, user)
+    subject_type = str(access.get("subject_type") or "physical_account")
+    if subject_type == "composite_portfolio":
+        return {"account_id": account_id, "available": False, "not_applicable": True,
+                "message": "A composite portfolio has no independently executed trades."}
+    requested_as_of = _parse_as_of(as_of)
+    target = str(access["reporting_currency"]).upper()
+    with _database() as connection:
+        nav = _subject_nav_values(connection, account_id, access, requested_as_of)
+        if not nav:
+            return {"account_id": account_id, "available": False, "message": "No NAV history is available."}
+        effective = requested_as_of or nav[-1][0]
+        _, trades, _, _ = subject_export(
+            connection, tenant_id=TENANT_ID, subject_id=account_id, access=access,
+            dataset="trades", requested_as_of=effective, from_date=None, symbol=None, side=None,
+            cash_filter=_cash_filter_values, trade_filter=_trade_filter_values,
+        )
+        fx_account = _holdings_fx_account(connection, account_id, subject_type)
+        fx_rows = [] if fx_account is None else connection.execute(
+            """
+            SELECT rate_date, from_currency, to_currency, rate_text
+            FROM fx_rates
+            WHERE account_id = %s AND rate_date <= %s
+            ORDER BY from_currency, to_currency, rate_date
+            """,
+            (fx_account, effective),
+        ).fetchall()
+    history = fx_history(fx_rows)
+
+    def rate(currency: str, day: str) -> float | None:
+        quote, _ = reporting_fx(history, currency, target, day)
+        return float(quote["rate"]) if quote else None
+
+    nav_values = {}
+    for day, value in nav:
+        try:
+            nav_values[day] = float(value)
+        except (TypeError, ValueError):
+            continue
+    result = calculate_trading_activity([dict(row) for row in trades], nav_values, rate, as_of=effective)
+    return {"account_id": account_id, "currency": target, "effective_as_of": effective, **result}
+
+
+@app.get("/api/portfolio/{account_id}/holdings-correlation")
+def holdings_correlation_view(
+    account_id: str,
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Correlation of daily price returns between the ten largest holdings."""
+    access = _portfolio_access_context(account_id, user)
+    subject_type = str(access.get("subject_type") or "physical_account")
+    if subject_type == "composite_portfolio":
+        return {"account_id": account_id, "available": False, "not_applicable": True,
+                "message": "Composite sleeves have no security-level price history."}
+    requested_as_of = _parse_as_of(as_of)
+    with _database() as connection:
+        rows = _latest_subject_holdings(connection, account_id, requested_as_of)
+        if not rows:
+            return {"account_id": account_id, "available": False, "message": "No holdings are available."}
+        view = _enrich_subject_holdings(
+            connection, account_id, rows, subject_type=subject_type,
+            reporting_currency=str(access["reporting_currency"]),
+            nav_currency=str(access["reporting_currency"]),
+        )
+        ranked = sorted(
+            (row for row in view["holdings"] if row.get("weight") is not None),
+            key=lambda row: -abs(float(row["weight"])),
+        )[:CORRELATION_HOLDINGS]
+        labels = {str(row["conid"]): str(row.get("symbol") or row["conid"]) for row in ranked}
+        snapshot = str(rows[0]["snapshot_date"])
+        start = (date.fromisoformat(snapshot[:10]) - timedelta(days=550)).isoformat()
+        price_rows = connection.execute(
+            """
+            SELECT snapshot_date, conid::text AS conid, mark_price_text
+            FROM subject_position_series
+            WHERE tenant_id = %s AND subject_id = %s AND conid::text = ANY(%s)
+              AND snapshot_date BETWEEN %s AND %s
+            ORDER BY snapshot_date
+            """,
+            (TENANT_ID, account_id, list(labels), start, snapshot),
+        ).fetchall() if labels else []
+    prices: dict[str, dict[str, float]] = {}
+    for row in price_rows:
+        try:
+            value = float(row["mark_price_text"])
+        except (TypeError, ValueError):
+            continue
+        prices.setdefault(str(row["conid"]), {})[str(row["snapshot_date"])] = value
+    return certified_charts.serve("holdings-correlation", {
+        "account_id": account_id,
+        "snapshot_date": snapshot,
+        **calculate_holdings_correlation(prices, labels),
+    }, tenant_id=TENANT_ID, subject_id=account_id)
 
 
 @app.get("/api/portfolio/{account_id}/flows")
@@ -1604,6 +1891,50 @@ def _holdings_fx_account(connection, subject_id: str, subject_type: str) -> str 
     return str(definition["source_account_id"]) if definition and definition["source_account_id"] else None
 
 
+# A market reference rate stands in only within this many days before the snapshot.
+REFERENCE_FX_MAX_AGE_DAYS = 4
+
+
+def _reference_fx_fallback(connection, rows: list[dict], fx_rows, *, reporting_currency: str,
+                           snapshot_date: str) -> dict:
+    """Market reference FX for currency pairs the account's own FX history lacks.
+
+    An account converts with its own dated FX history. A Kiwoom won account keeps no FX
+    (it holds only won), so to show it in another currency, such as USD in Combined
+    holdings, the validated reference rate (Yahoo close in reference_fx_rates) is used
+    instead, dated within REFERENCE_FX_MAX_AGE_DAYS of the snapshot. Pairs the account
+    has any history for are never replaced.
+    """
+    target = str(reporting_currency or "").upper()
+    own = {(str(r["from_currency"]).upper(), str(r["to_currency"]).upper()) for r in fx_rows}
+    natives = sorted({str(r.get("currency") or "").upper() for r in rows} - {target, ""})
+    missing = [n for n in natives if (n, target) not in own and (target, n) not in own]
+    if not missing or len(target) != 3:
+        return {"rows": [], "pairs": []}
+    earliest = (date.fromisoformat(snapshot_date[:10])
+                - timedelta(days=REFERENCE_FX_MAX_AGE_DAYS)).isoformat()
+    found: dict[tuple[str, str, str], dict] = {}
+    pairs: set[str] = set()
+    for native in missing:
+        for row in connection.execute(
+            """
+            SELECT rate_date, from_currency, to_currency, rate, provider
+            FROM reference_fx_rates
+            WHERE tenant_id = %s AND from_currency = %s AND to_currency = %s
+              AND rate_date >= %s AND rate_date <= %s
+              AND quality_status IN ('pass', 'warn')
+            ORDER BY rate_date, provider
+            """,
+            (TENANT_ID, native, target, earliest, snapshot_date[:10]),
+        ).fetchall():
+            key = (native, target, str(row["rate_date"])[:10])
+            # One observation a day (the first provider), so the dated lookup is never ambiguous.
+            found.setdefault(key, {"rate_date": key[2], "from_currency": native, "to_currency": target,
+                                   "rate_text": str(row["rate"])})
+            pairs.add(f"{native}/{target}")
+    return {"rows": [found[key] for key in sorted(found)], "pairs": sorted(pairs)}
+
+
 def _enrich_subject_holdings(
     connection,
     subject_id: str,
@@ -1633,6 +1964,9 @@ def _enrich_subject_holdings(
             """,
             (fx_account, snapshot_date),
         ).fetchall()
+    reference_pairs = _reference_fx_fallback(
+        connection, rows, fx_rows, reporting_currency=reporting_currency, snapshot_date=snapshot_date)
+    fx_rows = [*fx_rows, *reference_pairs["rows"]]
     nav_total = None
     if nav_currency is not None:
         nav = connection.execute(
@@ -1652,7 +1986,37 @@ def _enrich_subject_holdings(
         fx_unavailable_reason=None if fx_account is not None else "fx_source_unavailable",
     )
     view["fx_account_id"] = fx_account
+    view["fx_reference_pairs"] = reference_pairs["pairs"]
     return view
+
+
+def _attach_holdings_rsi(connection, subject_id: str, rows: list[dict]) -> None:
+    """Add 14-day Wilder RSI from each holding's stored daily marks, in place."""
+    if not rows:
+        return
+    snapshot = str(rows[0]["snapshot_date"])[:10]
+    start = (date.fromisoformat(snapshot) - timedelta(days=RSI_LOOKBACK_DAYS)).isoformat()
+    held = {str(row["conid"]) for row in rows}
+    prices: dict[str, dict[str, float]] = {}
+    for mark in connection.execute(
+        """
+        SELECT snapshot_date, conid::text AS conid, mark_price_text
+        FROM subject_position_series
+        WHERE tenant_id = %s AND subject_id = %s
+          AND snapshot_date BETWEEN %s AND %s
+        """,
+        (TENANT_ID, subject_id, start, snapshot),
+    ).fetchall():
+        conid = str(mark["conid"])
+        if conid not in held:
+            continue
+        try:
+            value = float(mark["mark_price_text"])
+        except (TypeError, ValueError):
+            continue
+        prices.setdefault(conid, {})[str(mark["snapshot_date"])[:10]] = value
+    for row in rows:
+        row.update(holding_rsi(prices.get(str(row["conid"]), {}), snapshot))
 
 
 @app.get("/api/portfolio/{account_id}/holdings")
@@ -1663,6 +2027,11 @@ def holdings(
 ) -> dict:
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("holdings", account_id, requested_as_of,
+                      lambda day: _holdings(account_id, access, day))
+
+
+def _holdings(account_id: str, access: dict, requested_as_of: str | None) -> dict:
     with _database() as connection:
         if access.get("subject_type", "physical_account") == "composite_portfolio":
             rows = connection.execute(
@@ -1701,11 +2070,13 @@ def holdings(
                 reporting_currency=str(access["reporting_currency"]),
                 nav_currency=str(access["reporting_currency"]),
             )
+            _attach_holdings_rsi(connection, account_id, view["holdings"])
             return {
                 "account_id": account_id,
                 "requested_as_of": requested_as_of,
                 "snapshot_date": rows[0]["snapshot_date"] if rows else None,
                 **view,
+                "concentration": holdings_concentration(view),
             }
     return {
         "account_id": account_id,
@@ -1713,6 +2084,137 @@ def holdings(
         "snapshot_date": rows[0]["snapshot_date"] if rows else None,
         "holdings": rows,
     }
+
+
+def _live_access(account_id: str, user: dict[str, object]) -> dict[str, object]:
+    """Live data needs view access to the account and its live_view switch."""
+    access = _portfolio_access_context(account_id, user)
+    if not live_view_allowed(access, user):
+        raise HTTPException(status_code=404, detail="Live data not available")
+    return access
+
+
+@app.get("/api/portfolio/{account_id}/live")
+def live_summary(
+    account_id: str, user: dict[str, object] = Depends(_authorized_user)
+) -> dict:
+    _live_access(account_id, user)
+    with _database() as connection:
+        return read_summary(connection, TENANT_ID, account_id, datetime.now(timezone.utc))
+
+
+@app.get("/api/portfolio/{account_id}/live/positions")
+def live_positions(
+    account_id: str, user: dict[str, object] = Depends(_authorized_user)
+) -> dict:
+    _live_access(account_id, user)
+    with _database() as connection:
+        return read_positions(connection, TENANT_ID, account_id)
+
+
+@app.get("/api/portfolio/{account_id}/live/trades")
+def live_trades(
+    account_id: str, user: dict[str, object] = Depends(_authorized_user)
+) -> dict:
+    _live_access(account_id, user)
+    with _database() as connection:
+        return read_trades(connection, TENANT_ID, account_id, datetime.now(timezone.utc))
+
+
+@app.get("/api/portfolio/{account_id}/sectors")
+def sector_allocation(
+    account_id: str,
+    request: Request,
+    as_of: str | None = None,
+    user: dict[str, str] = Depends(_authorized_user),
+) -> dict:
+    """Sector weights from the same validated tool the AI analyst and factsheets use."""
+    _portfolio_access_context(account_id, user)
+    requested_as_of = _parse_as_of(as_of)
+    return _certified("sectors", account_id, requested_as_of,
+                      lambda day: _sector_allocation(account_id, request, day, user))
+
+
+def _sector_allocation(account_id: str, request: Request, requested_as_of: str | None, user: dict) -> dict:
+    context = AgentToolContext(
+        tenant_id=TENANT_ID,
+        actor_object_id=str(user.get("object_id") or user.get("email") or "viewer"),
+        allowed_subject_ids=frozenset({account_id}),
+        correlation_id=getattr(request.state, "correlation_id", str(uuid.uuid4())),
+    )
+    arguments = {"subject_id": account_id}
+    if requested_as_of:
+        arguments["as_of"] = requested_as_of
+    try:
+        with _database() as connection:
+            result = execute_tool(
+                _portable_database_connection(connection), context, "get_sector_allocation", arguments
+            )
+    except AgentToolError as error:
+        if error.status_code in (401, 403):
+            raise HTTPException(status_code=error.status_code, detail=error.code) from error
+        return {
+            "account_id": account_id,
+            "requested_as_of": requested_as_of,
+            "available": False,
+            "allocation": [],
+            "reason": str(error),
+            "code": error.code,
+        }
+    return {
+        "account_id": account_id,
+        "requested_as_of": requested_as_of,
+        "as_of": result["as_of"],
+        "quality_status": result["quality_status"],
+        **result["data"],
+    }
+
+
+@app.get("/api/accounts/overview")
+def accounts_overview(user: dict[str, object] = Depends(_authorized_user)) -> dict:
+    """Latest NAV, month-to-date and year-to-date return for each visible account."""
+    accounts = []
+    for subject in _account_directory(user):
+        subject_id = str(subject["subject_id"])
+        try:
+            access = _portfolio_access_context(subject_id, user)
+        except (HTTPException, PerformanceInputError, PostgresError, ValueError):
+            accounts.append(_account_overview_entry(subject, None, None))
+            continue
+        accounts.append(_certified(
+            "accounts-overview", subject_id, None,
+            lambda day, subject=subject, access=access: _account_overview_entry(subject, access, day)))
+    return {"accounts": accounts}
+
+
+def _account_overview_entry(subject: dict, access: dict | None, as_of: str | None) -> dict:
+    subject_id = str(subject["subject_id"])
+    entry = {
+        "account_id": subject_id,
+        "currency": subject.get("reporting_currency"),
+        "nav": None,
+        "nav_date": None,
+        "mtd": None,
+        "ytd": None,
+    }
+    if access is None:
+        return entry
+    try:
+        with _database() as connection:
+            nav = _subject_nav_values(connection, subject_id, access, as_of)
+            if not nav:
+                return entry
+            entry["currency"] = access["reporting_currency"]
+            entry["nav_date"], latest = nav[-1]
+            entry["nav"] = float(latest)
+            flows = _subject_external_flows(connection, subject_id, access)
+        periods = calculate_performance_periods(nav, flows or {}, as_of=as_of)["periods"]
+    except (HTTPException, PerformanceInputError, PostgresError, ValueError):
+        return entry
+    for period in periods:
+        if period["key"] in ("mtd", "ytd") and period["status"] not in ("fail", "empty"):
+            entry[period["key"]] = period["twr"]
+    return entry
 
 
 @app.get("/api/holdings/combined")
@@ -1733,6 +2235,7 @@ def combined_holdings(
         raise HTTPException(status_code=400, detail="currency must be a three-letter ISO code")
     requested_as_of = _parse_as_of(as_of)
     accounts = []
+    certified: list[dict] = []
     skipped: list[dict[str, str]] = []
     for subject in _account_directory(user):
         subject_id = str(subject["subject_id"])
@@ -1748,7 +2251,14 @@ def combined_holdings(
         if access.get("subject_type", "physical_account") != "physical_account":
             continue
         with _database() as connection:
-            rows = _latest_subject_holdings(connection, subject_id, requested_as_of)
+            # The account's holding records (certified when the page is on), converted and
+            # added up below with today's functions.
+            records = _certified(
+                "combined-holdings", subject_id, requested_as_of,
+                lambda day: _holding_records(connection, subject_id, day))
+            rows = records["rows"]
+            if "certified" in records:
+                certified.append(records["certified"])
             view = _enrich_subject_holdings(
                 connection,
                 subject_id,
@@ -1778,7 +2288,13 @@ def combined_holdings(
         ],
         "skipped_accounts": skipped,
         **combined,
+        **({"certified": certified_pages.combined_block(certified)} if certified else {}),
     }
+
+
+def _holding_records(connection, subject_id: str, as_of: str | None) -> dict:
+    rows = _latest_subject_holdings(connection, subject_id, as_of)
+    return {"snapshot_date": rows[0]["snapshot_date"] if rows else None, "rows": rows}
 
 
 @app.get("/api/portfolio/{account_id}/cash")
@@ -1791,6 +2307,12 @@ def cash_activity(
 ) -> dict:
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(to_date or as_of)
+    return _certified("cash", account_id, requested_as_of,
+                      lambda day: _cash_activity(account_id, access, day, from_date, user))
+
+
+def _cash_activity(account_id: str, access: dict, requested_as_of: str | None,
+                   from_date: str | None, user: dict) -> dict:
     with _database() as connection:
         effective_as_of = requested_as_of or connection.execute(
             "SELECT MAX(snapshot_date) AS latest FROM subject_nav_series WHERE tenant_id = %s AND subject_id = %s AND currency = " + ACTIVE_NAV_CURRENCY_SQL,
@@ -1810,6 +2332,18 @@ def cash_activity(
         activity_from, activity_to = _cash_filter_values(
             from_date or str(access["history_start_date"]), effective_as_of
         )
+        if account_id in ('alpha-world-ms','alpha-world-t'):
+            if access.get('subject_type')!='composite_portfolio':
+                raise HTTPException(status_code=409,detail='Model cash requires approved composite metadata')
+            try:
+                model=load_model_cash(connection,tenant_id=TENANT_ID,subject_id=account_id,
+                    reporting_currency=access['reporting_currency'],as_of=effective_as_of)
+            except (ValueError,TypeError,KeyError) as error:
+                raise HTTPException(status_code=409,detail='Model cash is withheld because its approved inputs do not reconcile') from error
+            return {'account_id':account_id,'as_of':effective_as_of,'balances_date':model['as_of'] if model else None,
+                'balances':[],'activity_from':activity_from,'activity_to':activity_to,'total_count':0,'transactions':[],
+                'viewer':user['email'],'model_cash':model,'activity_applicable':False,
+                'message':model['message'] if model else 'No validated model cash observation is available on or before this date.'}
         balances_date = connection.execute(
             "SELECT MAX(snapshot_date) AS latest FROM subject_cash_balance_series WHERE tenant_id = %s AND subject_id = %s AND snapshot_date <= %s",
             (TENANT_ID, account_id, effective_as_of),
@@ -1858,7 +2392,8 @@ def trade_history(
     user: dict[str, str] = Depends(_authorized_user),
 ) -> dict:
     access = _portfolio_access_context(account_id, user)
-    if access.get("subject_type", "physical_account") in {"filtered_portfolio", "composite_portfolio"}:
+    subject_type = access.get("subject_type", "physical_account")
+    if subject_type == "composite_portfolio":
         return {
             "account_id": account_id,
             "date_from": from_date or str(access["history_start_date"]),
@@ -1871,16 +2406,25 @@ def trade_history(
             "trades": [],
             "not_applicable": True,
             "message": (
-                "A derived portfolio has no independently executed trades. "
-                "Use its holdings, component exposures and reconstructed cash activity."
+                "A composite portfolio has no independently executed trades. "
+                "Use its component exposures and reconstructed cash activity."
             ),
             "viewer": user["email"],
         }
     requested_to = _parse_as_of(to_date)
     with _database() as connection:
+        if subject_type == "filtered_portfolio":
+            latest_sql, latest_params = (
+                "SELECT MAX(snapshot_date) AS latest FROM subject_nav_series WHERE tenant_id = %s AND subject_id = %s AND currency = %s",
+                (TENANT_ID, account_id, access["reporting_currency"]),
+            )
+        else:
+            latest_sql, latest_params = (
+                "SELECT MAX(snapshot_date) AS latest FROM nav_snapshots WHERE account_id = %s AND asset_class = 'TOTAL'",
+                (account_id,),
+            )
         effective_to = requested_to or connection.execute(
-            "SELECT MAX(snapshot_date) AS latest FROM nav_snapshots WHERE account_id = %s AND asset_class = 'TOTAL'",
-            (account_id,),
+            latest_sql, latest_params
         ).fetchone()["latest"]
         if effective_to is None:
             return {
@@ -1901,33 +2445,48 @@ def trade_history(
             symbol,
             side,
         )
-        records = connection.execute(
-            """
-            SELECT t.trade_date, t.trade_time, t.settle_date, t.execution_id,
-                   t.trade_id, t.conid, i.symbol, i.description, i.asset_category,
-                   t.buy_sell, t.quantity_text, t.trade_price_text, t.currency,
-                   t.proceeds_text, t.commission_text, t.commission_currency,
-                   t.net_cash_text, t.realized_pnl_text,
-                   COUNT(*) OVER() AS total_count
-            FROM trades AS t
-            LEFT JOIN instruments AS i ON i.conid = t.conid
-            WHERE t.account_id = %s
-              AND t.trade_date BETWEEN %s AND %s
-              AND (%s::text IS NULL OR POSITION(UPPER(%s) IN UPPER(COALESCE(i.symbol, ''))) > 0)
-              AND (%s::text IS NULL OR UPPER(COALESCE(t.buy_sell, '')) = %s)
-            ORDER BY t.trade_date DESC, t.trade_time DESC, t.source_key DESC
-            LIMIT 500
-            """,
-            (
-                account_id,
-                start,
-                end,
-                normalized_symbol,
-                normalized_symbol,
-                normalized_side,
-                normalized_side,
-            ),
-        ).fetchall()
+        if subject_type == "filtered_portfolio":
+            from .subject_exports import filtered_trade_query
+
+            sql, params = filtered_trade_query(
+                tenant_id=TENANT_ID,
+                subject_id=account_id,
+                start=start,
+                end=end,
+                symbol=normalized_symbol,
+                side=normalized_side,
+                latest_first=True,
+                limit=500,
+            )
+            records = connection.execute(sql, params).fetchall()
+        else:
+            records = connection.execute(
+                """
+                SELECT t.trade_date, t.trade_time, t.settle_date, t.execution_id,
+                       t.trade_id, t.conid, i.symbol, i.description, i.asset_category,
+                       t.buy_sell, t.quantity_text, t.trade_price_text, t.currency,
+                       t.proceeds_text, t.commission_text, t.commission_currency,
+                       t.net_cash_text, t.realized_pnl_text,
+                       COUNT(*) OVER() AS total_count
+                FROM trades AS t
+                LEFT JOIN instruments AS i ON i.conid = t.conid
+                WHERE t.account_id = %s
+                  AND t.trade_date BETWEEN %s AND %s
+                  AND (%s::text IS NULL OR POSITION(UPPER(%s) IN UPPER(COALESCE(i.symbol, ''))) > 0)
+                  AND (%s::text IS NULL OR UPPER(COALESCE(t.buy_sell, '')) = %s)
+                ORDER BY t.trade_date DESC, t.trade_time DESC, t.source_key DESC
+                LIMIT 500
+                """,
+                (
+                    account_id,
+                    start,
+                    end,
+                    normalized_symbol,
+                    normalized_symbol,
+                    normalized_side,
+                    normalized_side,
+                ),
+            ).fetchall()
     total_count = int(records[0]["total_count"]) if records else 0
     trades = [
         {key: value for key, value in dict(record).items() if key != "total_count"}
@@ -1956,6 +2515,11 @@ def risk_analytics(
 ) -> dict:
     _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("risk", account_id, requested_as_of,
+                      lambda day: _risk_analytics(account_id, day, response, user))
+
+
+def _risk_analytics(account_id: str, requested_as_of: str | None, response: Response | None, user: dict) -> dict:
     started = time.perf_counter()
     with _database() as connection:
         effective_as_of = requested_as_of or connection.execute(
@@ -2031,6 +2595,11 @@ def risk_analytics_details(
 ) -> dict:
     _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("risk-details", account_id, requested_as_of,
+                      lambda day: _risk_analytics_details(account_id, day, response))
+
+
+def _risk_analytics_details(account_id: str, requested_as_of: str | None, response: Response | None) -> dict:
     started = time.perf_counter()
     with _database() as connection:
         effective_as_of = requested_as_of or connection.execute(
@@ -2086,9 +2655,23 @@ def risk_analytics_details(
             "expected_tail_loss_contributors", {"top": [], "bottom": []}
         ),
         "crisis_replay": payload.get("crisis_replay"),
+        "crisis_scenarios": _crisis_scenarios(account_id, effective_as_of),
         "unavailable_capabilities": payload.get("unavailable_capabilities", {}),
         "request_duration_ms": lookup_ms,
     }
+
+
+def _crisis_scenarios(subject_id: str, as_of) -> dict | None:
+    """The stored crisis scenarios, apart from the risk snapshot; None until they exist or are switched on."""
+    from .crisis_scenarios import load as load_scenarios, website_enabled
+    if not website_enabled():
+        return None
+    try:
+        with _database() as connection:
+            return load_scenarios(connection, subject_id, as_of=str(as_of) if as_of else None, tenant_id=TENANT_ID)
+    except Exception:  # never let the optional table withhold the rest of the risk page
+        logging.getLogger(__name__).exception("Crisis scenarios could not be read for %s", subject_id)
+        return None
 
 
 @app.get("/api/system/health")
@@ -2173,6 +2756,7 @@ def system_health(user: dict[str, str] = Depends(_authorized_user)) -> dict:
             ORDER BY s.subject_id
             """
         ).fetchall()
+        incidents = open_incidents(connection)
     analyst_assurance = max(
         all_assurance, key=lambda row: str(row.get("completed_at") or ""), default=None
     )
@@ -2195,6 +2779,7 @@ def system_health(user: dict[str, str] = Depends(_authorized_user)) -> dict:
         "status": status,
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "issues": issues,
+        "incidents": incidents,
         "environment": "internal-production",
         "release_channel": RELEASE_CHANNEL,
         "portfolio": portfolio,
@@ -3113,8 +3698,8 @@ def _prepare_monthly_report_downloads(
         raise HTTPException(
             status_code=409,
             detail=(
-                "The frozen month-end snapshot exists, but the complete PDF and "
-                "PowerPoint package is not available yet"
+                "The frozen month-end snapshot exists, but its factsheet "
+                "is not available yet"
             ),
         )
     review_only = bool(month["review_ready"] and user["role"] == "owner")
@@ -3161,10 +3746,10 @@ def prepare_subject_monthly_report_downloads(
 def _validate_release_factsheet(connection, content: bytes, *, subject_id: str,
                                period_end: str, snapshot_id: str) -> None:
     """Apply the subject's governed contract; never use another account's panel."""
-    if subject_id != "alpha-world-ms":
+    if subject_id not in ("alpha-world-ms", "alpha-world-t"):
         validate_factsheet_return_typography(content)
         return
-    from .ms_factsheet_release import validate_ms_factsheet_release
+    label = "MS" if subject_id == "alpha-world-ms" else "T"
     row = connection.execute(
         """
         SELECT snapshot_payload_json, data_sha256, subject_id, period_end
@@ -3175,11 +3760,16 @@ def _validate_release_factsheet(connection, content: bytes, *, subject_id: str,
         (TENANT_ID, snapshot_id, subject_id, period_end),
     ).fetchone()
     if row is None or row["subject_id"] != subject_id or str(row["period_end"]) != period_end:
-        raise MonthlyArtifactError("MS release snapshot identity is unavailable")
+        raise MonthlyArtifactError(label + " release snapshot identity is unavailable")
     raw = row["snapshot_payload_json"]
     if not isinstance(raw, str) or hashlib.sha256(raw.encode("utf-8")).hexdigest() != row["data_sha256"]:
-        raise MonthlyArtifactError("MS release snapshot integrity check failed")
+        raise MonthlyArtifactError(label + " release snapshot integrity check failed")
     snapshot = json.loads(raw)
+    if subject_id == "alpha-world-t":
+        from .t_factsheet_release import validate_t_factsheet_release
+        validate_t_factsheet_release(content, snapshot, period_end=period_end)
+        return
+    from .ms_factsheet_release import validate_ms_factsheet_release
     validate_ms_factsheet_release(content, snapshot, period_end=period_end)
 
 
@@ -3210,6 +3800,36 @@ def _report_design_owner(subject_id,user):
     if user.get('role')!='owner':raise HTTPException(status_code=403,detail='Owner access is required')
     if _portfolio_access_context(subject_id,user)['preview_mode']:
         raise HTTPException(status_code=409,detail='Design updates are available after onboarding')
+
+
+def _onboarding_design_case(subject_id):
+    """The open new-onboarding case of a subject that reports in its owner's own design, or None.
+
+    Its factsheets are rendered from the design submitted in the factsheet designer
+    (designed_reports.py), so the designer opens for it before it goes live.
+    """
+    if not onboarding_v2_enabled():
+        return None
+    try:
+        with _database() as connection:
+            row = connection.execute(
+                """SELECT case_id, reporting_currency FROM broker_onboarding_cases
+                WHERE tenant_id = %s AND subject_id = %s AND report_style IS NULL AND status <> 'cancelled'
+                  AND stage IN ('request', 'load_and_reconcile', 'build_history')
+                ORDER BY created_at DESC LIMIT 1""",
+                (TENANT_ID, subject_id),
+            ).fetchone()
+    except PostgresError:
+        return None
+    return {"case_id": str(row["case_id"]), "reporting_currency": str(row["reporting_currency"])} if row else None
+
+
+def _factsheet_designer_owner(subject_id, user):
+    """The owner designs for a live subject, or for one their open onboarding case is building."""
+    if user.get('role') != 'owner':
+        raise HTTPException(status_code=403, detail='Owner access is required')
+    if _portfolio_access_context(subject_id, user)['preview_mode'] and _onboarding_design_case(subject_id) is None:
+        raise HTTPException(status_code=409, detail='Design updates are available after onboarding')
 
 
 @app.get('/api/accounts/{subject_id}/reporting/design-updates')
@@ -3316,7 +3936,7 @@ def _monthly_release_candidate(connection, subject_id: str, period_end: str, *, 
     runs = connection.execute(
         """
         SELECT generation_run_id, snapshot_id, report_type, status,
-               output_reference, output_sha256
+               output_reference, output_sha256, template_version
         FROM report_generation_runs
         WHERE tenant_id = %s AND snapshot_id = %s
           AND report_type IN ('factsheet', 'presentation')
@@ -3387,6 +4007,20 @@ def preview_subject_monthly_release(
         **preview,
         "message": "Tick the files to release, untick files to revoke, then submit the checklist.",
     }
+
+
+def _record_first_month_end(connection, subject_id: str, period_end: str) -> None:
+    """Close a new-onboarding case waiting on its first month-end; never blocks the release itself."""
+
+    found = connection.execute("SELECT to_regclass('public.broker_onboarding_cases') AS t", ()).fetchone()
+    if not found or found["t"] is None:
+        return
+    try:
+        with connection.transaction():  # a savepoint: a refusal here leaves the release intact
+            onboarding_v2_web.record_first_month_end(
+                _portable_database_connection(connection), TENANT_ID, subject_id, period_end)
+    except Exception:  # noqa: BLE001 - the savepoint rolled the check back; the release stands
+        logging.getLogger(__name__).exception("First month-end not recorded for %s %s", subject_id, period_end)
 
 
 @app.post("/api/accounts/{subject_id}/reporting/monthly/{period_end}/release")
@@ -3555,6 +4189,12 @@ def release_subject_monthly_reports(
             retired=_supersede_prior_monthly_releases(
                 connection,TENANT_ID,subject_id,period_end,
                 report_type,artifact['artifact_release_id'],str(user['email']),now)
+            if report_type=='factsheet' and 'presentation' not in by_type:
+                # Decks are no longer built: a new month-end factsheet also withdraws the deck an
+                # earlier snapshot released for this month, as its figures no longer match.
+                retired+=_supersede_prior_monthly_releases(
+                    connection,TENANT_ID,subject_id,period_end,
+                    'presentation',artifact['artifact_release_id'],str(user['email']),now)
             artifact['superseded_release_ids']=[r['artifact_release_id'] for r in retired]
         for report_type in sorted(revocations):
             artifact = by_type[report_type]
@@ -3590,6 +4230,8 @@ def release_subject_monthly_reports(
                  "superseded_release_ids": {kind:by_type[kind].get('superseded_release_ids',[]) for kind in sorted(additions)},
              })),
         )
+        if "factsheet" in additions:
+            _record_first_month_end(connection, subject_id, period_end)
     return {
         "status": "approval_updated",
         "subject_id": subject_id,
@@ -3603,12 +4245,24 @@ def release_subject_monthly_reports(
     }
 
 
+def _download_prefix(subject_id: str) -> str | None:
+    """Korea_ or US_ for a Kiwoom subject's downloads (monthly_reports.download_prefix), else None."""
+    if not subject_id.startswith("KIWOOM-"):
+        return None
+    try:
+        with _database() as connection:
+            return download_prefix(connection, TENANT_ID, subject_id)
+    except (PostgresError, RuntimeError):
+        return None
+
+
 def _monthly_download_filename(
-    artifact: dict[str, object], *, subject_id: str, period_end: str
+    artifact: dict[str, object], *, subject_id: str, period_end: str, prefix: str | None = None
 ) -> str:
-    """Keep content-addressed storage private; name MS and T downloads for readers."""
+    """Keep content-addressed storage private; name MS, T and prefixed downloads for readers."""
     prefixes = {"alpha-world-ms": "AlphaWorld_MS", "alpha-world-t": "AlphaWorld_T"}
-    if subject_id in prefixes:
+    prefix = prefixes.get(subject_id, prefix)
+    if prefix:
         period = validate_period_end(period_end)
         kind = str(artifact["report_type"])
         definitions = {
@@ -3618,8 +4272,12 @@ def _monthly_download_filename(
         if kind not in definitions:
             raise MonthlyReportError("Unsupported monthly report type")
         label, extension = definitions[kind]
-        return f"{prefixes[subject_id]}_{label}_{period}{extension}"
-    return PurePosixPath(str(artifact["filename"])).name
+        return f"{prefix}_{label}_{period}{extension}"
+    name = PurePosixPath(str(artifact["filename"])).name
+    # Stored files are content-addressed as "<sha256>-<name>" (twice once released);
+    # readers get the plain name.
+    readable = re.sub(r"^(?:[0-9a-f]{64}-)+", "", name)
+    return readable if readable and not readable.startswith(".") else name
 
 
 def _download_monthly_report(
@@ -3686,7 +4344,7 @@ def _download_monthly_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end, prefix=_download_prefix(subject_id))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Subject-ID": subject_id,
@@ -3784,7 +4442,7 @@ def _download_monthly_review_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end, prefix=_download_prefix(subject_id))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Subject-ID": subject_id,
@@ -4295,6 +4953,49 @@ def _benchmark_return_basis(return_convention: object) -> dict[str, str]:
     return {"return_basis": basis, "return_basis_label": label}
 
 
+def _catalog_comparison_benchmarks(connection: Any, account_id: str, mapped: list) -> list:
+    """Active catalog benchmarks outside the account's contract that the benchmark job has
+    compared it with (WEBSITE_ALL_BENCHMARKS). Website only: listed as 'comparison', after
+    the contract's own benchmarks, and only once comparison rows exist."""
+
+    primary = next((row for row in mapped if row["mapping_type"] == "primary"), mapped[0])
+    currency = str(primary["reporting_currency"])
+    return connection.execute(
+        """
+        SELECT b.benchmark_id, b.symbol, b.name, b.provider, b.currency,
+               b.return_convention, b.license_status, 'comparison' AS mapping_type,
+               NULL AS effective_from, %s AS reporting_currency,
+               (SELECT COUNT(*) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'official_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS observations,
+               (SELECT MAX(p.observation_date) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'official_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS latest_observation,
+               (SELECT COUNT(*) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'provisional_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS provisional_observations,
+               (SELECT MAX(p.observation_date) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'provisional_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS latest_provisional_observation
+        FROM benchmark_master b
+        WHERE b.tenant_id = %s AND b.active = true
+          AND NOT (b.benchmark_id = ANY(%s))
+          AND EXISTS (
+              SELECT 1 FROM performance_comparison_daily c
+              WHERE c.tenant_id = b.tenant_id AND c.subject_id = %s
+                AND c.benchmark_id = b.benchmark_id AND c.calculation_version = %s
+                AND c.reporting_currency = %s AND c.quality_status IN ('pass', 'warn'))
+        ORDER BY b.name
+        """,
+        (currency, TENANT_ID, [str(row["benchmark_id"]) for row in mapped], account_id,
+         website_comparison_version(account_id, currency), currency),
+    ).fetchall()
+
+
 @app.get("/api/portfolio/{account_id}/benchmark-status")
 def benchmark_status(
     account_id: str, user: dict[str, str] = Depends(_authorized_user)
@@ -4333,6 +5034,8 @@ def benchmark_status(
             """,
             (account_id,),
         ).fetchall()
+        if benchmarks:
+            benchmarks = [*benchmarks, *_catalog_comparison_benchmarks(connection, account_id, benchmarks)]
     if not benchmarks:
         return {
             "account_id": account_id,
@@ -4390,6 +5093,12 @@ def benchmark_comparison(
 ) -> dict:
     _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
+    return _certified("benchmark-comparison", account_id, requested_as_of,
+                      lambda day: _benchmark_comparison(account_id, benchmark_id, day, user))
+
+
+def _benchmark_comparison(account_id: str, benchmark_id: str | None, requested_as_of: str | None,
+                          user: dict) -> dict:
     with _database() as connection:
         benchmark = connection.execute(
             """
@@ -4411,6 +5120,24 @@ def benchmark_comparison(
             ,
             (TENANT_ID, account_id, benchmark_id, benchmark_id),
         ).fetchone()
+        if benchmark is None and benchmark_id:
+            # A catalog benchmark outside the contract, compared in the account's reporting
+            # currency (WEBSITE_ALL_BENCHMARKS); rows exist only if the job built them.
+            benchmark = connection.execute(
+                """
+                SELECT b.benchmark_id, b.symbol, b.name, b.provider,
+                       b.license_status, b.return_convention, 'comparison' AS mapping_type,
+                       m.reporting_currency
+                FROM benchmark_master b
+                JOIN portfolio_benchmark_mapping m
+                  ON m.tenant_id = b.tenant_id AND m.subject_id = %s AND m.mapping_type = 'primary'
+                 AND m.effective_from <= CURRENT_DATE::text
+                 AND (m.effective_to IS NULL OR m.effective_to >= CURRENT_DATE::text)
+                WHERE b.tenant_id = %s AND b.benchmark_id = %s AND b.active = true
+                LIMIT 1
+                """,
+                (account_id, TENANT_ID, benchmark_id),
+            ).fetchone()
         if benchmark is None:
             records = []
         else:
@@ -4463,6 +5190,7 @@ def benchmark_comparison(
         "reporting_currency": benchmark["reporting_currency"],
         "calculation_version": website_comparison_version(account_id, benchmark["reporting_currency"]),
         "metrics": comparison_metrics(rows),
+        "rolling": rolling_benchmark_statistics(rows),
         "series": [
             {
                 "date": row.observation_date,
@@ -4479,13 +5207,69 @@ def benchmark_comparison(
 ACCOUNT_SECTIONS = {
     "overview": "Overview",
     "performance": "Performance",
+    "holdings": "Holdings",
     "risk": "Risk analytics",
+    "modelling": "Modelling",
     "cash": "Cash",
     "trades": "Trade history",
-    "holdings": "Holdings",
     "reports": "Monthly reports",
     "exports": "Data exports",
     "ai-analyst": "AI analyst",
+}
+
+# Sections split into subpages: (slug, label, id of the card that starts the
+# subpage). A subpage is that card plus the cards after it, up to the next one.
+ACCOUNT_SUBPAGES = {
+    "performance": (
+        ("nav-chart", "NAV chart", "perf-chart"),
+        ("period-returns", "Period returns", "perf-returns"),
+        ("monthly-returns", "Monthly returns", "perf-calendar"),
+        ("attribution", "Attribution", "perf-attribution"),
+        ("benchmark", "Vs benchmark", "perf-benchmark"),
+        ("contributions", "Contributions", "perf-flows"),
+    ),
+    "risk": (
+        ("snapshot", "Risk snapshot", "risk-summary"),
+        ("statistics", "Statistics", "analytics-statistics-card"),
+        ("drawdowns", "Drawdowns", "risk-drawdowns"),
+        ("rolling", "Rolling risk", "risk-rolling"),
+        ("correlation", "Correlation", "risk-correlation"),
+    ),
+    "modelling": (
+        ("wealth-projection", "Wealth projection", "model-projection"),
+        ("risk-outlook", "Risk outlook", "model-risk"),
+        ("market-regimes", "Market regimes", "model-regimes"),
+        ("what-if", "What-if", "model-whatif"),
+        ("optimisation", "Optimisation", "model-optimise"),
+        ("factor-model", "Factor model", "model-factors"),
+        ("stress-test", "Stress test", "model-stress"),
+    ),
+}
+
+# Shows one subpage of the open section. A subpage can also start part way
+# through a card (the stress test inside the factor model card). Every card
+# stays in the page, so switching subpages needs no reload and cross-card
+# actions (such as "Try in what-if") still find their target.
+ACCOUNT_SUBPAGE_SCRIPT = r"""(()=>{const view=document.querySelector('.page-view.active');const parts=__PARTS__;const base=__BASE__;let current=__CURRENT__;
+if(!view||!parts.length)return;const anchors=parts.map(p=>p[1]);const slugOf=id=>(parts.find(p=>p[1]===id)||parts[0])[0];
+const assign=()=>{let part=null;[...view.children].forEach(c=>{if(anchors.includes(c.id))part=c.id;if(!part)return;c.dataset.part=part;const inner=[...c.children].filter(k=>k.id!==c.id&&anchors.includes(k.id));
+if(!inner.length){c.classList.toggle('part-off',part!==current);return}let sub=part;const own=[part];[...c.children].forEach(k=>{if(anchors.includes(k.id)){sub=k.id;own.push(sub)}k.classList.toggle('part-off',sub!==current)});c.classList.toggle('part-off',!own.includes(current))})};
+const mark=()=>document.querySelectorAll('[data-part-link]').forEach(a=>{if(a.dataset.partLink===current)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});
+const show=(id,url)=>{if(!anchors.includes(id))return;if(url&&location.pathname+location.hash!==url)history.pushState({part:id},'',url);if(id===current)return;current=id;assign();mark();window.scrollTo({top:0});window.dispatchEvent(new Event('resize'))};
+assign();mark();new MutationObserver(assign).observe(view,{childList:true});
+document.addEventListener('click',e=>{const a=e.target.closest('a[data-part-link]');if(!a||e.defaultPrevented||e.button||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||!anchors.includes(a.dataset.partLink))return;e.preventDefault();show(a.dataset.partLink,a.getAttribute('href'));a.blur()});
+addEventListener('popstate',()=>{const slug=location.pathname.split('/')[4];const p=parts.find(p=>p[0]===slug)||parts[0];show(p[1])});
+const toCard=el=>{const card=el&&el.closest('[data-part]');if(card&&card.dataset.part!==current)show(card.dataset.part,base+'/'+slugOf(card.dataset.part)+location.hash)};
+if(location.hash){try{toCard(document.querySelector(decodeURIComponent(location.hash)))}catch(_){}}
+addEventListener('hashchange',()=>{try{toCard(document.querySelector(decodeURIComponent(location.hash)))}catch(_){}});
+const scroll=Element.prototype.scrollIntoView;Element.prototype.scrollIntoView=function(...args){toCard(this);return scroll.apply(this,args)};})();"""
+
+# Shorter names for the account tab bar; page headings keep the full names.
+ACCOUNT_TAB_LABELS = {
+    "risk": "Risk",
+    "trades": "Trades",
+    "reports": "Reports",
+    "exports": "Exports",
 }
 
 ONBOARDING_PREVIEW_SECTIONS = {
@@ -4511,30 +5295,67 @@ ALL_PAGE_SECTIONS = ACCOUNT_SECTIONS | PLATFORM_SECTIONS
 
 
 def _platform_navigation(user: dict[str, object], *, active: str | None = None) -> str:
+    from . import agent_web, month_team_web
+
     links = [
         ("accounts", "Accounts", "/"),
         ("combined-holdings", "Combined holdings", "/combined-holdings"),
-        ("system-health", "System health", "/system-health"),
         ("metrics-guide", "Metrics guide", "/metrics-guide"),
     ]
+    # The agents' outputs (weekly briefs, alerts, drafts, data checks) sit one click from every page.
+    if agent_web.ui_enabled_for(user):
+        links.append(("agent-inbox", "Agent inbox", "/agent-inbox"))
+    operations = [("system-health", "System health", "/system-health")]
     if user.get("role", "owner") in {
         "owner",
         "platform_admin",
         "onboarding_operator",
     }:
-        links.append(
-            ("ibkr-connections", "IBKR connections", "/ibkr-connections")
+        operations.append(
+            ("broker-connections", "Broker connections", "/broker-connections")
+            if onboarding_v2_enabled()
+            else ("ibkr-connections", "IBKR connections", "/ibkr-connections")
         )
-        links.append(
+        operations.append(
             ("account-onboarding", "Account onboarding", "/account-onboarding")
         )
+    if month_team_web.is_month_owner(user):
+        operations.append(("month-end", "Month-end", "/month-end"))
     if user.get("role", "owner") == "owner":
-        links.append(("administration", "Administration", "/administration"))
-    return '<nav class="platform-nav" aria-label="Platform navigation">' + "".join(
-        f'<a class="platform-nav-link{" active" if key == active else ""}" href="{href}"'
-        f'{" aria-current=\"page\"" if key == active else ""}>{escape(label)}</a>'
-        for key, label, href in links
-    ) + "</nav>"
+        operations.append(("administration", "Administration", "/administration"))
+
+    def link(key: str, label: str, href: str, css: str) -> str:
+        return (
+            f'<a class="{css}{" active" if key == active else ""}" href="{href}"'
+            f'{" data-agent-inbox" if key == "agent-inbox" else ""}'
+            f'{" aria-current=\"page\"" if key == active else ""}>{escape(label)}</a>'
+        )
+
+    in_operations = any(key == active for key, _, _ in operations)
+    return (
+        '<nav class="platform-nav" aria-label="Platform navigation">'
+        + "".join(link(key, label, href, "platform-nav-link") for key, label, href in links)
+        + '<details class="platform-menu"><summary class="platform-nav-link'
+        + (" active" if in_operations else "")
+        + '">Operations</summary><div class="platform-menu-list">'
+        + "".join(link(key, label, href, "platform-menu-link") for key, label, href in operations)
+        + "</div></details></nav>"
+    )
+
+
+@app.get("/design/{choice}", include_in_schema=False)
+def choose_design(
+    choice: str,
+    back: str = "/",
+    user: dict[str, object] = Depends(_authorized_user),
+) -> RedirectResponse:
+    """Keep this person's choice of the classic design or WealthRyse Next in their browser."""
+    if not web_next.may_choose(choice, str(user.get("role") or "")):
+        raise HTTPException(status_code=404, detail="Not found")
+    response = RedirectResponse(url=web_next.safe_return_path(back), status_code=303)
+    response.set_cookie(web_next.COOKIE, choice, max_age=web_next.COOKIE_MAX_AGE, path="/",
+                        secure=True, httponly=True, samesite="lax")
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -4544,8 +5365,8 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
     account_cards = []
     for subject in _account_directory(user):
         account = escape(str(subject["subject_id"]))
-        from .viewer_labels import account_card_title
-        account_display_name = escape(account_card_title(subject))
+        from .viewer_labels import account_card_name
+        account_display_name = escape(account_card_name(subject))
         currency = escape(str(subject["reporting_currency"]))
         start_value = subject["history_start_date"]
         try:
@@ -4555,9 +5376,13 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
             start_label = str(start_value)
         account_cards.append(
             f'<a class="account-card" href="/accounts/{account}/overview">'
-            '<div class="account-badge">Managed portfolio</div>'
+            f'<div class="account-badge">{currency} reporting</div>'
             f'<div class="account-id">{account_display_name}</div>'
-            f'<div class="muted">{currency} reporting · Data from {escape(start_label)}</div>'
+            f'<div class="account-stats" data-account-stats="{account}">'
+            '<div class="account-nav-value" data-nav>…</div>'
+            '<div class="account-returns" data-returns></div>'
+            '<div class="muted" data-asof></div></div>'
+            f'<div class="muted account-since">Data from {escape(start_label)}</div>'
             '<div class="open">Open account <span aria-hidden="true">→</span></div></a>'
         )
     cards_html = "".join(account_cards) or (
@@ -4569,17 +5394,19 @@ def home(request: Request, user: dict[str, object] = Depends(_authorized_user)) 
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Accounts · {PLATFORM_NAME}</title>
 <style>{HOME_THEME_CSS}</style></head><body>
-<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
-<main><section class="home-hero"><div class="eyebrow">Portfolio intelligence</div><h1>Accounts</h1><div class="lead">Select an account to open its portfolio workspace. Each workspace brings validated data, risk analytics and reporting into one institutional view.</div><div class="actions"><a class="button" href="/combined-holdings">Combined holdings</a></div></section><div class="accounts">{cards_html}</div></main>
-</body></html>"""
+<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header>
+<main><section class="home-hero"><div class="eyebrow">Portfolio intelligence</div><h1>Accounts</h1><div class="lead">Select an account to open its portfolio workspace.</div><div id="accounts-summary" class="accounts-summary" aria-live="polite"></div></section><div class="accounts">{cards_html}</div></main>
+{HOME_SCRIPT}</body></html>"""
 
 
 COMBINED_HOLDINGS_PAGE_SCRIPT = r"""
-<script>
+<script>""" + CERTIFIED_LINE_SCRIPT + r"""
 const esc=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 const json=async response=>{const payload=await response.json();if(!response.ok)throw new Error(payload.detail||`http_${response.status}`);return payload};
 const fmt=n=>n==null||n===''?'—':new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(n));
 const pct=n=>n==null?'—':new Intl.NumberFormat('en-US',{style:'percent',maximumFractionDigits:2}).format(Number(n));
+const money=n=>n==null||n===''||!Number.isFinite(Number(n))?'—':new Intl.NumberFormat('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}).format(Number(n)).replace(/^-/,'−');
+const toned=(text,n)=>!Number.isFinite(Number(n))||n==null||Math.abs(Number(n))<1e-12?text:`<span class="${Number(n)>0?'gain':'loss'}">${Number(n)>0?'+':''}${text.replace(/^-/,'−')}</span>`;
 const combinedForm=document.querySelector('#combined-form');
 const loadCombined=()=>{
   const currency=document.querySelector('#combined-currency').value.trim().toUpperCase()||'USD',asOf=document.querySelector('#combined-asof').value,params=new URLSearchParams({currency});
@@ -4588,11 +5415,13 @@ const loadCombined=()=>{
   fetch(`/api/holdings/combined?${params}`).then(json).then(data=>{
     document.querySelector('#combined-currency-label').textContent=data.currency;
     document.querySelector('#combined-accounts').innerHTML=data.accounts.map(item=>`<div class="status-item"><span class="label">${esc(item.display_name)}</span><strong>${esc(item.snapshot_date||'No snapshot')}</strong><span class="muted">${esc(item.holdings_count)} holdings${item.fx_missing_conids.length?` · ${esc(item.fx_missing_conids.length)} without FX`:''}</span></div>`).join('');
-    document.querySelector('#combined-holdings').innerHTML=data.holdings.map(x=>`<tr><td>${esc(x.symbol||x.conid)}</td><td>${esc(x.description||'')}</td><td>${esc(x.sector||'')}</td><td><details><summary>${esc(x.account_count)}</summary>${x.accounts.map(a=>`<div class="muted">${esc(a.display_name)}: ${fmt(a.quantity_text)} · ${a.fx_missing?'FX unavailable':esc(fmt(a.reporting_market_value_text))}</div>`).join('')}</details></td><td>${fmt(x.quantity_text)}</td><td>${fmt(x.reporting_market_value_text)}${x.incomplete?' <span class="muted" title="At least one account has no usable FX rate for this holding">(partial)</span>':''}</td><td>${fmt(x.reporting_cost_basis_text)}</td><td>${fmt(x.reporting_unrealized_pnl_text)}</td><td>${pct(x.unrealized_pnl_pct)}</td><td>${pct(x.weight)}</td></tr>`).join('')||'<tr><td colspan="10">No holdings are available for your accounts on or before this date.</td></tr>';
-    document.querySelector('#combined-note').textContent=`${data.accounts.length} physical account(s) combined in ${data.currency}. Filtered and composite portfolios are excluded because they are built from these accounts. Each account uses its own latest snapshot and dated FX history. Weights are shares of gross combined holdings value (cash excluded).${data.incomplete?' Some holdings have no usable FX rate; their values are partial.':''}${data.skipped_accounts.length?` ${data.skipped_accounts.length} account(s) could not be included.`:''}`;
+    document.querySelector('#combined-holdings').innerHTML=data.holdings.map(x=>`<tr><td>${esc(x.symbol||x.conid)}</td><td>${esc(x.description||'')}</td><td>${esc(x.sector||'')}</td><td><details><summary>${esc(x.account_count)}</summary>${x.accounts.map(a=>`<div class="muted">${esc(a.display_name)}: ${fmt(a.quantity_text)} · ${a.fx_missing?'FX unavailable':esc(fmt(a.reporting_market_value_text))}</div>`).join('')}</details></td><td>${fmt(x.quantity_text)}</td><td>${money(x.reporting_market_value_text)}${x.incomplete?' <span class="muted" title="At least one account has no usable FX rate for this holding">(partial)</span>':''}</td><td>${money(x.reporting_cost_basis_text)}</td><td>${toned(money(x.reporting_unrealized_pnl_text),x.reporting_unrealized_pnl_text)}</td><td>${toned(pct(x.unrealized_pnl_pct),x.unrealized_pnl_pct)}</td><td data-sort="${x.weight??''}">${pct(x.weight)}</td></tr>`).join('')||'<tr><td colspan="10">No holdings are available for your accounts on or before this date.</td></tr>';
+    certifiedLine(document.querySelector('#combined-holdings'),data.certified);
+    document.querySelector('#combined-note').textContent=`${data.accounts.length} physical account(s) combined in ${data.currency}. Filtered and composite portfolios are excluded because they are built from these accounts. Each account uses its own latest snapshot and dated FX history, or a market reference rate where it keeps none. Weights are shares of gross combined holdings value (cash excluded).${data.incomplete?' Some holdings have no usable FX rate; their values are partial.':''}${data.skipped_accounts.length?` ${data.skipped_accounts.length} account(s) could not be included.`:''}`;
   }).catch(error=>{document.querySelector('#combined-note').textContent=`Combined holdings are unavailable: ${error.message}`;document.querySelector('#combined-holdings').innerHTML=''});
 };
 combinedForm.addEventListener('submit',event=>{event.preventDefault();loadCombined()});
+wrTable('#combined-holdings',{filter:'#combined-filter',count:'#combined-filter-count'});
 loadCombined();
 </script>
 """
@@ -4602,23 +5431,40 @@ SYSTEM_HEALTH_PAGE_SCRIPT = r"""
 <script>
 const esc=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 const json=async response=>{const payload=await response.json();if(!response.ok)throw new Error(`http_${response.status}`);return payload};
+const when=value=>{if(!value)return'—';const parsed=new Date(value);return isNaN(parsed)||!/T|:/.test(String(value))?String(value):parsed.toLocaleString(undefined,{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})};
+const words=value=>{const text=String(value||'').replaceAll('_',' ').trim();return text?text[0].toUpperCase()+text.slice(1):''};
+const pill=(value,label)=>`<span class="ops-pill is-${esc(String(value||'').toLowerCase())}">${esc(label||words(value)||'—')}</span>`;
+const healthView=document.querySelector('[data-section="system-health"]'),adminChat=healthView?.dataset.adminChat==='1';
+const githubLink=url=>url&&/^https:\/\/github\.com\//.test(url)?url:'';
+const askAdministrator=text=>'/administration?ask='+encodeURIComponent(text);
+const headline={pass:'Everything is running normally',warn:'A few things need a look',fail:'Something needs attention'};
+const incidentCard=item=>{const d=item.diagnosis,severity=String(item.severity||'').toLowerCase(),name=words(item.check_id),fix=githubLink(d?.pull_request_url);
+  const ask=adminChat?`<a class="button" href="${esc(askAdministrator(`Tell me about the open ${name} incident and what I should do about it.`))}">Ask the administrator about this</a>`:'';
+  const diagnosis=!d?`<div class="agent-diagnosis"><span class="ops-pill is-agent">Operations agent</span><p class="muted">The operations agent has not diagnosed this incident yet. Its findings will appear here.</p>${ask?'<div class="actions">'+ask+'</div>':''}</div>`
+    :`<div class="agent-diagnosis"><span class="ops-pill is-agent">Operations agent</span> <strong>${d.status==='diagnosed'?'Diagnosis':'Inconclusive'}</strong><span class="muted">${d.confidence?' · '+esc(d.confidence)+' confidence':''}${d.diagnosed_at?' · '+esc(when(d.diagnosed_at)):''}</span><p>${esc(d.summary||'')}</p>${d.likely_cause?'<p><strong>Likely cause:</strong> '+esc(d.likely_cause)+'</p>':''}${(d.owner_steps||[]).length?'<strong>What to do</strong><ol>'+d.owner_steps.map(step=>`<li>${esc(step)}</li>`).join('')+'</ol>':''}${(d.evidence||[]).length?'<details><summary>Evidence the agent used</summary>'+d.evidence.map(e=>`<div class="muted">${esc(e.finding)} <code>${esc(e.source_id)}</code></div>`).join('')+'</details>':''}${fix||ask?`<div class="actions">${fix?`<a class="button" href="${esc(fix)}" target="_blank" rel="noopener">Review the draft fix</a>`:''}${ask}</div>`:''}${fix?'<p class="muted">The draft fix has not been run or reviewed. Nothing changes until a person merges it.</p>':''}</div>`;
+  return `<article class="health-incident is-${esc(severity)}">${pill(severity)} <span class="muted">${esc(item.status==='acknowledged'?'Acknowledged':'Open')} · first seen ${esc(when(item.first_seen_at))} · latest ${esc(when(item.last_seen_at))} · ${esc(item.occurrence_count)} checks</span><h3>${esc(name)}</h3><p>${esc(item.description)}</p>${diagnosis}</article>`};
 let healthPollTimer=null,healthLastChecked=null;
 function refreshHealth(){
 fetch('/api/system/health',{cache:'no-store'}).then(json).then(health=>{
-  const run=health.latest_run||{},portfolio=health.portfolio||{},assurance=health.portfolio_analyst_assurance||{},assuranceResult=assurance.result_json||{},burnIn=health.burn_in||{},burnResults=health.burn_in_recent_results||[],release=health.internal_release||{};
-  document.querySelector('#health-status').innerHTML=[['Environment',health.environment],['Status',health.status],['Tracked NAV subjects',portfolio.subjects??0],['Latest portfolio date',portfolio.latest_date||'—'],['Latest ingestion run',run.completed_at||'—'],['Latest internal release',release.approved_at||'—']].map(item=>`<div class="status-item"><span class="label">${esc(item[0])}</span><strong>${esc(item[1]||'—')}</strong></div>`).join('');
+  const run=health.latest_run||{},portfolio=health.portfolio||{},assurance=health.portfolio_analyst_assurance||{},assuranceResult=assurance.result_json||{},burnIn=health.burn_in||{},burnResults=health.burn_in_recent_results||[],release=health.internal_release||{},incidents=health.incidents||[],issues=health.issues||[];
+  const critical=incidents.some(item=>item.severity==='critical'),overall=critical?'fail':(incidents.length&&health.status==='pass'?'warn':(health.status||'warn')),diagnosed=incidents.filter(item=>item.diagnosis).length,fixes=incidents.filter(item=>githubLink(item.diagnosis?.pull_request_url)).length;
   healthLastChecked=health.checked_at||new Date().toISOString();
-  document.querySelector('#health-note').textContent=(health.message||'')+' Last checked: '+new Date(healthLastChecked).toLocaleString()+'. Updates automatically every 60 seconds while this page is visible.';
-  document.querySelector('#health-findings').innerHTML=(health.issues||[]).map(item=>`<p><strong>${esc(item.display_name||item.subject_id)} — ${esc(item.severity)}</strong><br>${esc(item.message)}${item.metrics?.length?'<br>Metrics needing reconciliation: '+esc(item.metrics.join(', ')):''}</p>`).join('')||'<p>No account assurance findings were returned. Data dates and missing assurance still need to be checked.</p>';
-  document.querySelector('#benchmark-health').innerHTML=(health.benchmarks||[]).map(item=>`<div class="status-item"><span class="label">${esc(item.benchmark_id)}</span><strong>${esc(item.latest_date||'—')}</strong><span class="muted">${esc(item.observations??0)} observations · ${esc(item.quality_status||'—')}</span></div>`).join('')||'<div class="empty">No benchmark observations are available.</div>';
+  document.querySelector('#health-headline').textContent=headline[overall]||'Status unknown';
+  document.querySelector('#health-pill').innerHTML=pill(overall,{pass:'Pass',warn:'Warning',fail:'Attention'}[overall]);
+  document.querySelector('#health-overview').innerHTML=[['Open incidents',incidents.length],['Diagnosed by the operations agent',`${diagnosed} of ${incidents.length}`],['Draft fixes to review',fixes],['Accounts with findings',issues.length],['Latest portfolio date',portfolio.latest_date||'—'],['Last checked',when(healthLastChecked)]].map(item=>`<div class="status-item"><span class="label">${esc(item[0])}</span><strong>${esc(item[1])}</strong></div>`).join('');
+  document.querySelector('#health-status').innerHTML=[['Environment',words(health.environment)],['Status',health.status],['Tracked NAV subjects',portfolio.subjects??0],['Latest portfolio date',portfolio.latest_date||'—'],['Latest ingestion run',when(run.completed_at)],['Latest internal release',when(release.approved_at)]].map(item=>`<div class="status-item"><span class="label">${esc(item[0])}</span><strong>${item[0]==='Status'?pill(item[1]):esc(item[1]||'—')}</strong></div>`).join('');
+  document.querySelector('#health-note').textContent=(health.message||'')+' Last checked: '+when(healthLastChecked)+'. Updates automatically every 60 seconds while this page is visible.';
+  document.querySelector('#health-findings').innerHTML=issues.map(item=>`<p>${pill(item.severity)} <strong>${esc(item.display_name||item.subject_id)}</strong><br>${esc(item.message)}${item.metrics?.length?'<br>Metrics needing reconciliation: '+esc(item.metrics.join(', ')):''}</p>`).join('')||'<p>No account assurance findings were returned. Data dates and missing assurance still need to be checked.</p>';
+  document.querySelector('#health-incidents').innerHTML=incidents.map(incidentCard).join('')||'<p>No open incidents.</p>';
+  document.querySelector('#benchmark-health').innerHTML=(health.benchmarks||[]).map(item=>`<div class="status-item"><span class="label">${esc(String(item.benchmark_id||'').replaceAll('_',' '))}</span><strong>${esc(item.latest_date||'—')}</strong><span class="muted">${esc(item.observations??0)} observations · ${pill(item.quality_status)}</span></div>`).join('')||'<div class="empty">No benchmark observations are available.</div>';
   const assuranceRows=health.portfolio_analyst_assurance_all||[];
   document.querySelector('#assurance-status').textContent=`${assuranceRows.length} active portfolios checked for coverage`;
-  document.querySelector('#assurance-summary').innerHTML=assuranceRows.map(item=>`<div class="status-item"><span class="label">${esc(item.display_name||item.subject_id)}</span><strong>${esc((item.status||'Awaiting first run').toUpperCase())}</strong><span class="muted">Assurance: ${esc(item.assurance_date||'—')} · Data: ${esc(item.as_of_date||'—')}<br>Passed: ${esc(item.checks_passed??0)} · Warnings: ${esc(item.checks_warned??0)} · Failures: ${esc(item.checks_failed??0)}</span></div>`).join('')||'<div class="warning">No active portfolio assurance is available.</div>';
+  document.querySelector('#assurance-summary').innerHTML=assuranceRows.map(item=>`<div class="status-item"><span class="label">${esc(item.display_name||item.subject_id)}</span><strong>${item.status?pill(item.status,String(item.status).toUpperCase()):'Awaiting first run'}</strong><span class="muted">Assurance: ${esc(item.assurance_date||'—')} · Data: ${esc(item.as_of_date||'—')}<br>Passed: ${esc(item.checks_passed??0)} · Warnings: ${esc(item.checks_warned??0)} · Failures: ${esc(item.checks_failed??0)}</span></div>`).join('')||'<div class="warning">No active portfolio assurance is available.</div>';
   document.querySelector('#assurance-note').textContent='Each active physical or derived portfolio is evaluated separately. Missing or stale assurance prevents an overall pass; any failed account makes the overall status fail.';
   document.querySelector('#burn-in-status').textContent=burnIn.status?burnIn.status.toUpperCase():'Not started';
-  document.querySelector('#burn-in-summary').innerHTML=[['Subject',burnIn.subject_id||'—'],['Start date',burnIn.start_date||'—'],['Consecutive passing days',`${burnIn.consecutive_pass_days??0} / ${burnIn.required_consecutive_days??14}`],['Earliest completion',burnIn.earliest_completion_date||'—'],['Last result',burnIn.last_result_date||'Awaiting Day 1'],['Last failure',burnIn.last_failure_date||'None']].map(item=>`<div class="status-item"><span class="label">${esc(item[0])}</span><strong>${esc(item[1])}</strong></div>`).join('');
-  document.querySelector('#burn-in-results').innerHTML=burnResults.length?'<h3>Recent daily acceptance results</h3>'+burnResults.map(item=>`<p><strong>${esc(item.result_date)} — ${esc(item.status.toUpperCase())}</strong><br><span class="muted">Checked ${esc(item.checked_at)}</span></p>`).join(''):'<p>No formal acceptance result has been recorded yet.</p>';
-}).catch(()=>{document.querySelector('#health-note').textContent='Live status could not be refreshed. Displayed results may be stale.'+(healthLastChecked?' Last successful check: '+new Date(healthLastChecked).toLocaleString():'')+' Retrying automatically; this is not a health pass.';})
+  document.querySelector('#burn-in-summary').innerHTML=[['Subject',burnIn.subject_id||'—'],['Start date',burnIn.start_date||'—'],['Consecutive passing days',`${burnIn.consecutive_pass_days??0} / ${burnIn.required_consecutive_days??14}`],['Original earliest completion',burnIn.earliest_completion_date||'—'],['Last result',burnIn.last_result_date||'Awaiting Day 1'],['Last failure',burnIn.last_failure_date||'None']].map(item=>`<div class="status-item"><span class="label">${esc(item[0])}</span><strong>${esc(item[1])}</strong></div>`).join('');
+  document.querySelector('#burn-in-results').innerHTML=burnResults.length?'<h3>Recent daily acceptance results</h3>'+burnResults.map(item=>`<p>${pill(item.status,String(item.status||'').toUpperCase())} <strong>${esc(item.result_date)}</strong><br><span class="muted">Checked ${esc(when(item.checked_at))}</span></p>`).join(''):'<p>No formal acceptance result has been recorded yet.</p>';
+}).catch(()=>{document.querySelector('#health-headline').textContent='Live status could not be refreshed';document.querySelector('#health-note').textContent='Live status could not be refreshed. Displayed results may be stale.'+(healthLastChecked?' Last successful check: '+when(healthLastChecked):'')+' Retrying automatically; this is not a health pass.';})
 .finally(()=>{clearTimeout(healthPollTimer);healthPollTimer=setTimeout(()=>{if(!document.hidden)refreshHealth();},60000);});
 }
 document.addEventListener('visibilitychange',()=>{clearTimeout(healthPollTimer);if(!document.hidden)refreshHealth();});
@@ -4631,18 +5477,20 @@ ADMINISTRATION_PAGE_SCRIPT = r"""
 <script>
 const esc=value=>String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
 const json=async response=>{const payload=await response.json();if(!response.ok)throw new Error(`http_${response.status}`);return payload};
+const when=value=>{if(!value)return'';const parsed=new Date(value);return isNaN(parsed)||!/T|:/.test(String(value))?String(value):parsed.toLocaleString(undefined,{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'})};
+const words=value=>{const text=String(value||'').replaceAll('_',' ').trim();return text?text[0].toUpperCase()+text.slice(1):''};
 Promise.all([fetch('/api/system/autonomous-administrator').then(json),fetch('/api/agent/tools').then(json),fetch('/api/system/institutional-control-plane').then(json)]).then(([autonomy,tools,controlPlane])=>{
   const latest=autonomy.latest_run||{},control=autonomy.control||{},recovery=autonomy.recovery||{},baseline=autonomy.last_known_good||{};
   document.querySelector('#autonomy-status').textContent=autonomy.status==='active'?'Active — controlled-autonomy-v1':'Paused';
   document.querySelector('#autonomy-note').textContent='Platform-wide administrator monitoring runs in Azure every five minutes. Its authority remains constrained by deterministic policy, cooldowns and owner approval gates.';
-  document.querySelector('#autonomy-summary').innerHTML=[['Latest run',latest.completed_at||'Awaiting first run'],['Run status',latest.status||'—'],['Production authority',control.production_active?'Active':'Not active'],['Open incidents',(autonomy.open_incidents||[]).length],['Portal failure count',recovery.consecutive_portal_failures??0],['Rollback threshold',control.rollback_failure_threshold??3],['Last-known-good revision',baseline.revision_name||'Not registered'],['Monthly review due',control.monthly_review_due_at||'Not scheduled']].map(item=>`<div class="status-item"><span class="label">${esc(item[0])}</span><strong>${esc(item[1])}</strong></div>`).join('');
-  document.querySelector('#autonomy-incidents').innerHTML=(autonomy.open_incidents||[]).length?'<h3>Open incidents</h3>'+autonomy.open_incidents.map(item=>`<p><strong>${esc(item.severity.toUpperCase())} — ${esc(item.check_id)}</strong><br>${esc(item.description)}<br><span class="muted">Last observed ${esc(item.last_seen_at)} · ${esc(item.occurrence_count)} checks</span></p>`).join(''):'<p>No open incidents.</p>';
+  document.querySelector('#autonomy-summary').innerHTML=[['Latest run',when(latest.completed_at)||'Awaiting first run'],['Run status',words(latest.status)||'—'],['Production authority',control.production_active?'Active':'Not active'],['Open incidents',(autonomy.open_incidents||[]).length],['Portal failure count',recovery.consecutive_portal_failures??0],['Rollback threshold',control.rollback_failure_threshold??3],['Last-known-good revision',baseline.revision_name||'Not registered'],['Monthly review due',control.monthly_review_due_at||'Not scheduled']].map(item=>`<div class="status-item"><span class="label">${esc(item[0])}</span><strong>${esc(item[1])}</strong></div>`).join('');
+  document.querySelector('#autonomy-incidents').innerHTML=(autonomy.open_incidents||[]).length?'<h3>Open incidents</h3>'+autonomy.open_incidents.map(item=>`<p><span class="ops-pill is-${esc(String(item.severity||'').toLowerCase())}">${esc(words(item.severity))}</span> <strong>${esc(words(item.check_id))}</strong><br>${esc(item.description)}<br><span class="muted">Last observed ${esc(when(item.last_seen_at))} · ${esc(item.occurrence_count)} checks</span></p>`).join('')+'<p><a href="/system-health">See the operations agent\'s diagnoses and draft fixes on System health</a></p>':'<p>No open incidents.</p>';
   const registry=controlPlane.identity_registry||{},registrations=controlPlane.registrations||{},workItems=controlPlane.work_items||{},shadow=controlPlane.shadow_reconciliation||{};
   document.querySelector('#control-plane-status').textContent=controlPlane.authorization_cutover_ready?'Reconciled — cutover eligible':'Compatibility mode — reconciliation required';
   document.querySelector('#control-plane-note').textContent=controlPlane.message+' The proven 16:00 HKT production refresh remains authoritative. Reconciliation readiness does not itself activate or pause Azure schedules.';
   document.querySelector('#control-plane-summary').innerHTML=[['Authorization mode',controlPlane.authorization_mode],['Registered users',registry.users??0],['Active roles',registry.roles??0],['Subject entitlements',registry.entitlements??0],['Active capabilities',registrations.active??0],['Preview capabilities',registrations.preview??0],['Shadow dispatcher',shadow.status?shadow.status.toUpperCase():'Not run'],['Shadow run date',shadow.run_date||'—'],['Planned capabilities',shadow.planned_capability_count??0],['Shadow mismatches',shadow.mismatch_count??0],['Queued work',workItems.queued??0],['Dead letters',controlPlane.dead_letters??0],['Last identity revision',registry.last_applied_at||'Not applied']].map(item=>`<div class="status-item"><span class="label">${esc(item[0])}</span><strong>${esc(item[1])}</strong></div>`).join('');
   const reviews=autonomy.authority_reviews||[],pendingReview=reviews.find(item=>item.status!=='approved');
-  document.querySelector('#autonomy-reviews').innerHTML='<h3>Monthly authority reviews</h3>'+(reviews.length?reviews.map(item=>`<p><strong>${esc(item.review_month)} — ${esc(item.status)}</strong><br>Due ${esc(item.due_at)}${item.status==='approved'?' · Approved '+esc(item.approved_at||''):''}</p>`).join(''):'<p>The first monthly review will be created on the first day of the next month.</p>')+(pendingReview?`<div class="actions"><input id="authority-review-confirmation" maxlength="80" aria-label="Monthly authority review confirmation" placeholder="APPROVE MONTHLY AUTHORITY REVIEW ${esc(pendingReview.review_month)}"><button id="authority-review-approve" class="button" type="button">Approve ${esc(pendingReview.review_month)} review</button></div><div id="authority-review-result" class="muted"></div>`:'');
+  document.querySelector('#autonomy-reviews').innerHTML='<h3>Monthly authority reviews</h3>'+(reviews.length?reviews.map(item=>`<p><strong>${esc(item.review_month)} — ${esc(item.status)}</strong><br>Due ${esc(when(item.due_at))}${item.status==='approved'?' · Approved '+esc(when(item.approved_at)):''}</p>`).join(''):'<p>The first monthly review will be created on the first day of the next month.</p>')+(pendingReview?`<div class="actions"><input id="authority-review-confirmation" maxlength="80" aria-label="Monthly authority review confirmation" placeholder="APPROVE MONTHLY AUTHORITY REVIEW ${esc(pendingReview.review_month)}"><button id="authority-review-approve" class="button" type="button">Approve ${esc(pendingReview.review_month)} review</button></div><div id="authority-review-result" class="muted"></div>`:'');
   if(pendingReview){document.querySelector('#authority-review-approve').addEventListener('click',async()=>{const button=document.querySelector('#authority-review-approve'),result=document.querySelector('#authority-review-result');button.disabled=true;try{const approved=await fetch(`/api/system/autonomous-administrator/reviews/${pendingReview.review_id}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirmation:document.querySelector('#authority-review-confirmation').value})}).then(json);result.textContent=`Approved ${approved.review_month}. Next review due ${approved.next_review_due_at}.`}catch(error){result.textContent='Review was not approved. Type the exact confirmation phrase.';button.disabled=false}})}
   const admin=tools.admin_actions,adminAction=document.querySelector('#admin-action'),adminPreview=document.querySelector('#admin-preview'),adminExecute=document.querySelector('#admin-execute'),adminConfirmation=document.querySelector('#admin-confirmation');let currentApproval=null;
   document.querySelector('#admin-status').textContent=admin.enabled?'Approval workflow ready':'Disabled';
@@ -4665,7 +5513,10 @@ let active=null,busy=false,activeSourceKey=null;
 const empty=()=>{thread.innerHTML='<div class="ai-chat-empty"><div class="label">Controlled system administration</div><div class="value">Ask the administrator</div><div class="muted">Ask about system health or give an order. Supported changes become an expiring preview and still require your exact approval before execution.</div><div class="ai-prompt-chips"><button class="admin-prompt-chip ai-prompt-chip" type="button">Give me a system health summary</button><button class="admin-prompt-chip ai-prompt-chip" type="button">Show all open incidents</button><button class="admin-prompt-chip ai-prompt-chip" type="button">Refresh the Treasury risk-free rate</button></div></div>';bindPrompts()};
 const updateHeader=conversation=>{title.textContent=conversation?.title||'New administrator conversation';activeSourceKey=conversation?.source_key||null;const enabled=Boolean(conversation?.conversation_id);exportMd.hidden=!enabled;exportJson.hidden=!enabled;archive.hidden=!enabled||Boolean(activeSourceKey);if(enabled){exportMd.href=`/api/admin/conversations/${conversation.conversation_id}/export.md`;exportJson.href=`/api/admin/conversations/${conversation.conversation_id}/export.json`}};
 const actionCard=(preview)=>{if(!preview)return'';const p=preview.preview||{};return `<div class="admin-action-preview" data-approval-id="${escAdmin(preview.approval_id)}" data-digest="${escAdmin(preview.action_payload_sha256)}"><div class="label">Owner approval required</div><strong>${escAdmin(p.label||preview.action_type)}</strong><p>${escAdmin(p.description||'')}</p><p>Target: <code>${escAdmin(p.target||'')}</code><br>Expires: ${escAdmin(preview.expires_at)}<br>Type exactly: <code>${escAdmin(preview.confirmation_phrase)}</code></p><div class="actions"><input class="admin-chat-confirmation" type="text" maxlength="80" placeholder="${escAdmin(preview.confirmation_phrase)}" aria-label="Exact action approval phrase"><button class="button admin-chat-approve" type="button">Approve and execute once</button></div><div class="muted admin-chat-action-result"></div></div>`};
-const append=(message)=>{const row=document.createElement('div'),owner=message.role==='owner',response=message.response_json||{};row.className=`ai-message ${owner?'user':'assistant'}`;if(owner){row.innerHTML=`<div class="ai-message-bubble"><div>${escAdmin(message.content_text)}</div><div class="ai-message-meta">${escAdmin(message.created_at||'Saved')}</div></div>`}else{const points=(response.status_points||[]).map(point=>`<p>• ${escAdmin(point.text)} <span class="admin-message-source">[${escAdmin(point.source_id)}]</span></p>`).join(''),limits=(response.limitations||[]).map(value=>`<p><strong>Control:</strong> ${escAdmin(value)}</p>`).join(''),result=response.action_result?`<div class="admin-action-preview"><strong>Controlled action completed</strong><p>${escAdmin(message.content_text)}</p><p class="muted">Approval ${escAdmin(response.action_result.approval_id)} · ${escAdmin(response.action_result.correlation_id)}</p></div>`:'';row.innerHTML=`<div class="ai-message-bubble ai-answer"><div class="label">${message.message_kind==='incident'?'Administrator initiated':'AI System Administrator'}</div><h3>${escAdmin(response.title||'System administrator')}</h3><p>${escAdmin(response.message||message.content_text)}</p>${points}${limits}${actionCard(response.action_preview)}${result}<div class="ai-message-meta">${escAdmin(message.created_at||'Saved')} ${response.correlation_id?'· '+escAdmin(response.correlation_id):''}</div></div>`}thread.appendChild(row);row.querySelectorAll('.admin-chat-approve').forEach(button=>button.addEventListener('click',()=>approveAction(button)));thread.scrollTop=thread.scrollHeight};
+const whenAdmin=value=>{if(!value)return'Saved';const parsed=new Date(value);return isNaN(parsed)||!/T|:/.test(String(value))?String(value):parsed.toLocaleString(undefined,{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})};
+const authorOf=(message,response)=>response.investigation_id?'Operations agent':response.connection_report_id?'Connection agent':message.message_kind==='incident'?'Administrator initiated':'AI System Administrator';
+const bodyOf=(message,response)=>{const steps=(response.owner_steps||[]).filter(Boolean),fix=response.pull_request?.url&&/^https:\/\/github\.com\//.test(response.pull_request.url)?response.pull_request.url:'';const paragraphs=String(response.message||message.content_text||'').split(/\n\s*\n/).filter(text=>text.trim()&&!(steps.length&&/^What to do:/.test(text))&&!(fix&&/^I opened a draft pull request/.test(text)));return paragraphs.map(text=>`<p>${escAdmin(text)}</p>`).join('')+(steps.length?'<strong>What to do</strong><ol>'+steps.map(step=>`<li>${escAdmin(step)}</li>`).join('')+'</ol>':'')+(fix?`<div class="actions"><a class="button" href="${escAdmin(fix)}" target="_blank" rel="noopener">Review the draft fix</a></div>`:'')};
+const append=(message)=>{const row=document.createElement('div'),owner=message.role==='owner',response=message.response_json||{};row.className=`ai-message ${owner?'user':'assistant'}`;if(owner){row.innerHTML=`<div class="ai-message-bubble"><div>${escAdmin(message.content_text)}</div><div class="ai-message-meta">${escAdmin(whenAdmin(message.created_at))}</div></div>`}else{const points=(response.status_points||[]).map(point=>`<p>• ${escAdmin(point.text)} <span class="admin-message-source">[${escAdmin(point.source_id)}]</span></p>`).join(''),limits=(response.limitations||[]).map(value=>`<p><strong>Control:</strong> ${escAdmin(value)}</p>`).join(''),result=response.action_result?`<div class="admin-action-preview"><strong>Controlled action completed</strong><p>${escAdmin(message.content_text)}</p><p class="muted">Approval ${escAdmin(response.action_result.approval_id)} · ${escAdmin(response.action_result.correlation_id)}</p></div>`:'';const author=authorOf(message,response);row.innerHTML=`<div class="ai-message-bubble ai-answer"><div class="label">${author.endsWith(' agent')?`<span class="ops-pill is-agent">${escAdmin(author)}</span>`:escAdmin(author)}${response.confidence?' · '+escAdmin(response.confidence)+' confidence':''}</div><h3>${escAdmin(response.title||'System administrator')}</h3>${bodyOf(message,response)}${points}${limits}${actionCard(response.action_preview)}${result}<div class="ai-message-meta">${escAdmin(whenAdmin(message.created_at))} ${response.correlation_id?'· '+escAdmin(response.correlation_id):''}</div></div>`}thread.appendChild(row);row.querySelectorAll('.admin-chat-approve').forEach(button=>button.addEventListener('click',()=>approveAction(button)));thread.scrollTop=thread.scrollHeight};
 const approveAction=async button=>{const card=button.closest('.admin-action-preview'),confirmation=card.querySelector('.admin-chat-confirmation'),result=card.querySelector('.admin-chat-action-result');button.disabled=true;result.textContent='Executing the single approved action…';try{await fetch(`/api/admin/conversations/${active}/actions/${card.dataset.approvalId}/approve`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action_payload_sha256:card.dataset.digest,confirmation:confirmation.value})}).then(jsonAdmin);await openConversation(active)}catch(error){result.textContent=`Action was not executed: ${error.message}`;button.disabled=false}};
 const renderList=(items,selected)=>{list.innerHTML=items.length?items.map(item=>`<button class="ai-conversation-item${item.conversation_id===selected?' active':''}" type="button" data-admin-conversation="${escAdmin(item.conversation_id)}"><strong>${escAdmin(item.title)}${Number(item.unread_count)>0?`<span class="admin-chat-badge">${escAdmin(item.unread_count)}</span>`:''}</strong><span>${escAdmin(item.initiated_by==='administrator'?'Administrator initiated':'Owner chat')} · ${escAdmin(item.message_count)} messages</span></button>`).join(''):'<div class="muted">No administrator conversations yet.</div>';list.querySelectorAll('[data-admin-conversation]').forEach(button=>button.addEventListener('click',()=>openConversation(button.dataset.adminConversation)))};
 const refresh=async selected=>{const result=await fetch('/api/admin/conversations').then(jsonAdmin);renderList(result.conversations,selected);return result.conversations};
@@ -4675,7 +5526,8 @@ const showTyping=()=>{const row=document.createElement('div');row.className='ai-
 const sendMessage=async()=>{const message=input.value.trim();if(!message||busy)return;busy=true;send.disabled=true;try{if(!active)await createConversation();if(thread.querySelector('.ai-chat-empty'))thread.innerHTML='';append({role:'owner',content_text:message,created_at:'Sending…'});input.value='';showTyping();await fetch(`/api/admin/conversations/${active}/messages`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message})}).then(jsonAdmin);document.querySelector('#admin-typing')?.remove();await openConversation(active)}catch(error){document.querySelector('#admin-typing')?.remove();append({role:'administrator',message_kind:'chat',content_text:`The request was not applied. ${error.message}`,response_json:{title:'Request stopped safely',message:`The request was not applied. ${error.message}`,status_points:[],limitations:['No system change was executed.']}})}finally{busy=false;send.disabled=false;input.focus()}};
 const bindPrompts=()=>document.querySelectorAll('.admin-prompt-chip').forEach(button=>button.addEventListener('click',()=>{input.value=button.textContent;input.focus()}));
 document.querySelector('#admin-new-chat').addEventListener('click',()=>createConversation().catch(()=>{}));send.addEventListener('click',sendMessage);input.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}});archive.addEventListener('click',async()=>{if(!active||activeSourceKey)return;await fetch(`/api/admin/conversations/${active}/archive`,{method:'POST'}).then(jsonAdmin);active=null;updateHeader(null);empty();const items=await refresh(null);if(items.length)await openConversation(items[0].conversation_id)});
-refresh(null).then(async items=>{if(items.length)await openConversation(items[0].conversation_id);else empty()}).catch(()=>{thread.innerHTML='<div class="warning">The administrator chat is unavailable and remains fail-closed.</div>'});
+const asked=new URLSearchParams(location.search).get('ask');
+refresh(null).then(async items=>{if(asked){active=null;updateHeader(null);empty();input.value=asked.slice(0,1200);input.focus();return}if(items.length)await openConversation(items[0].conversation_id);else empty()}).catch(()=>{thread.innerHTML='<div class="warning">The administrator chat is unavailable and remains fail-closed.</div>'});
 setInterval(async()=>{if(document.hidden)return;const items=await refresh(active).catch(()=>[]);const selected=items.find(item=>item.conversation_id===active);if(selected&&Number(selected.unread_count)>0)await openConversation(active)},30000);
 })();
 </script>
@@ -4784,7 +5636,11 @@ def system_health_page(
 @app.get("/ibkr-connections", response_class=HTMLResponse)
 def ibkr_connections_page(
     request: Request, user: dict[str, str] = Depends(_onboarding_user)
-) -> str:
+):
+    # With the new onboarding on, Broker connections replaces this page (it lists the
+    # IBKR logins already on the platform too), so old links and bookmarks go there.
+    if onboarding_v2_enabled():
+        return RedirectResponse(url="/broker-connections", status_code=307)
     return _render_platform_page(user, section="ibkr-connections")
 
 
@@ -5101,6 +5957,17 @@ def account_onboarding_summary(
     }
 
 
+def _refuse_classic_studio() -> None:
+    """With the new onboarding on, portfolios start from the portfolio builder instead."""
+
+    if onboarding_v2_enabled():
+        raise HTTPException(
+            status_code=409,
+            detail="The Derived Portfolio Studio has been replaced by the portfolio builder: "
+            "Account onboarding, New portfolio.",
+        )
+
+
 def _create_derived_studio_case(
     connection,
     *,
@@ -5285,6 +6152,202 @@ def _create_derived_studio_case(
     return str(case_id), definition_digest
 
 
+def _studio_filtered_definition(
+    connection,
+    submission: DerivedStudioFilteredStartRequest,
+    subject: str,
+    source: str,
+) -> dict:
+    """Validate a filtered-portfolio form against its live source account."""
+
+    source_row = connection.execute(
+        """
+        SELECT subject_id, subject_type, lifecycle_status,
+               COALESCE(reporting_currency, base_currency) AS currency,
+               history_start_date
+        FROM platform_subjects
+        WHERE tenant_id = %s AND subject_id = %s
+        FOR SHARE
+        """,
+        (TENANT_ID, source),
+    ).fetchone()
+    if (
+        source_row is None
+        or str(source_row["subject_type"]) != "physical_account"
+        or str(source_row["lifecycle_status"]) != "active"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A filtered portfolio requires an active physical source account",
+        )
+    if (
+        source_row["history_start_date"] is not None
+        and submission.history_start_date < source_row["history_start_date"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The requested history starts before the source account coverage",
+        )
+    if str(source_row["currency"] or "").upper() != submission.base_currency:
+        raise HTTPException(
+            status_code=409,
+            detail="The filtered portfolio base currency must match its source account",
+        )
+    try:
+        definition = filtered_portfolio_definition(
+            subject_id=subject,
+            display_name=submission.display_name,
+            source_account_id=source,
+            base_currency=submission.base_currency,
+            history_start_date=submission.history_start_date.isoformat(),
+            excluded_countries=submission.excluded_countries,
+            excluded_exchanges=submission.excluded_exchanges,
+            excluded_currencies=submission.excluded_currencies,
+            opening_cash=submission.opening_cash,
+            allowed_cash_currencies=submission.allowed_cash_currencies,
+            include_actual_interest=submission.include_actual_interest,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return definition
+
+
+def _studio_composite_definition(
+    connection,
+    submission: DerivedStudioCompositeStartRequest,
+    subject: str,
+) -> dict:
+    """Validate a composite form against live sleeves and approved market history."""
+
+    market_catalog = {
+        item.instrument_id: item for item in ALPHA_WORLD_MARKET_INSTRUMENTS
+    }
+    component_ids = [item.component_id for item in submission.components]
+    rows = connection.execute(
+        """
+        SELECT subject_id, subject_type, display_name,
+               COALESCE(reporting_currency, base_currency) AS currency,
+               lifecycle_status
+        FROM platform_subjects
+        WHERE tenant_id = %s AND subject_id = ANY(%s)
+        FOR SHARE
+        """,
+        (TENANT_ID, component_ids),
+    ).fetchall()
+    registered = {str(row["subject_id"]): dict(row) for row in rows}
+    components = []
+    for request in submission.components:
+        component_id = request.component_id
+        row = registered.get(component_id)
+        if row is not None:
+            if str(row["lifecycle_status"]) != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Component {component_id} is not active",
+                )
+            source_type = str(row["subject_type"])
+            if source_type == "physical_account":
+                component_type = "account"
+            elif source_type in {"filtered_portfolio", "composite_portfolio"}:
+                component_type = "portfolio"
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Component {component_id} is not an investable sleeve",
+                )
+            components.append(
+                {
+                    "component_id": component_id,
+                    "component_name": str(row["display_name"]),
+                    "component_type": component_type,
+                    "coefficient": request.coefficient,
+                    "source_currency": str(row["currency"]),
+                    "price_convention": "nav",
+                }
+            )
+            continue
+        market = market_catalog.get(component_id)
+        if market is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Component {component_id} is not in the approved catalogue",
+            )
+        coverage = connection.execute(
+            """
+            SELECT MAX(price_date) FILTER (WHERE price_date <= %s) AS base_date,
+                   MAX(price_date) AS latest_date
+            FROM market_data_prices WHERE instrument_id = %s
+            """,
+            (submission.normalization_date.isoformat(), component_id),
+        ).fetchone()
+        if coverage is None or coverage["base_date"] is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Component {component_id} has no normalization-date market history",
+            )
+        components.append(
+            {
+                "component_id": component_id,
+                "component_name": market.name,
+                "component_type": "benchmark",
+                "coefficient": request.coefficient,
+                "source_currency": market.currency,
+                "price_convention": _studio_price_convention(market.price_type),
+            }
+        )
+    try:
+        definition = fixed_unit_composite_definition(
+            subject_id=subject,
+            display_name=submission.display_name,
+            base_currency=submission.base_currency,
+            normalization_date=submission.normalization_date.isoformat(),
+            constant_cash=submission.constant_cash,
+            components=components,
+            market_carry_days=submission.market_carry_days,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return definition
+
+
+_BUILDER_FIELD_LABELS = {
+    "subject_id": "the portfolio ID",
+    "display_name": "the name",
+    "source_account_id": "the account",
+    "base_currency": "the reporting currency",
+    "allowed_cash_currencies": "the cash currencies",
+    "opening_cash": "the opening cash",
+    "components": "the sleeves",
+}
+
+
+def _builder_definition(connection, kind: str, fields: dict) -> dict:
+    """The new portfolio builder runs exactly the Studio's validation."""
+
+    try:
+        if kind == "filtered_portfolio":
+            filtered = DerivedStudioFilteredStartRequest.model_validate(fields)
+            return _studio_filtered_definition(
+                connection, filtered,
+                validate_subject_id(filtered.subject_id),
+                validate_subject_id(filtered.source_account_id),
+            )
+        composite = DerivedStudioCompositeStartRequest.model_validate(fields)
+        return _studio_composite_definition(
+            connection, composite, validate_subject_id(composite.subject_id)
+        )
+    except ValidationError as error:
+        first = error.errors()[0] if error.errors() else {}
+        field = str((first.get("loc") or ("",))[0])
+        raise HTTPException(
+            status_code=400,
+            detail=f"Check {_BUILDER_FIELD_LABELS.get(field, 'the portfolio fields')}: "
+            f"{first.get('msg', 'invalid value')}",
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @app.post("/api/onboarding/derived-studio/filtered/start")
 def start_studio_filtered_portfolio(
     submission: DerivedStudioFilteredStartRequest,
@@ -5292,6 +6355,7 @@ def start_studio_filtered_portfolio(
 ) -> dict:
     """Create a private filtered-portfolio case from typed website fields."""
 
+    _refuse_classic_studio()
     try:
         subject = validate_subject_id(submission.subject_id)
         source = validate_subject_id(submission.source_account_id)
@@ -5299,55 +6363,7 @@ def start_studio_filtered_portfolio(
         raise HTTPException(status_code=400, detail=str(error)) from error
     actor = _identity_digest(user["object_id"] or user["email"])
     with _approval_database() as connection:
-        source_row = connection.execute(
-            """
-            SELECT subject_id, subject_type, lifecycle_status,
-                   COALESCE(reporting_currency, base_currency) AS currency,
-                   history_start_date
-            FROM platform_subjects
-            WHERE tenant_id = %s AND subject_id = %s
-            FOR SHARE
-            """,
-            (TENANT_ID, source),
-        ).fetchone()
-        if (
-            source_row is None
-            or str(source_row["subject_type"]) != "physical_account"
-            or str(source_row["lifecycle_status"]) != "active"
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="A filtered portfolio requires an active physical source account",
-            )
-        if (
-            source_row["history_start_date"] is not None
-            and submission.history_start_date < source_row["history_start_date"]
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="The requested history starts before the source account coverage",
-            )
-        if str(source_row["currency"] or "").upper() != submission.base_currency:
-            raise HTTPException(
-                status_code=409,
-                detail="The filtered portfolio base currency must match its source account",
-            )
-        try:
-            definition = filtered_portfolio_definition(
-                subject_id=subject,
-                display_name=submission.display_name,
-                source_account_id=source,
-                base_currency=submission.base_currency,
-                history_start_date=submission.history_start_date.isoformat(),
-                excluded_countries=submission.excluded_countries,
-                excluded_exchanges=submission.excluded_exchanges,
-                excluded_currencies=submission.excluded_currencies,
-                opening_cash=submission.opening_cash,
-                allowed_cash_currencies=submission.allowed_cash_currencies,
-                include_actual_interest=submission.include_actual_interest,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
+        definition = _studio_filtered_definition(connection, submission, subject, source)
         case_id, digest = _create_derived_studio_case(
             connection, definition=definition, actor=actor
         )
@@ -5367,100 +6383,14 @@ def start_studio_fixed_unit_composite(
 ) -> dict:
     """Create a private fixed-unit composite from allow-listed components."""
 
+    _refuse_classic_studio()
     try:
         subject = validate_subject_id(submission.subject_id)
     except RuntimeError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    component_ids = [item.component_id for item in submission.components]
     actor = _identity_digest(user["object_id"] or user["email"])
-    market_catalog = {
-        item.instrument_id: item for item in ALPHA_WORLD_MARKET_INSTRUMENTS
-    }
     with _approval_database() as connection:
-        rows = connection.execute(
-            """
-            SELECT subject_id, subject_type, display_name,
-                   COALESCE(reporting_currency, base_currency) AS currency,
-                   lifecycle_status
-            FROM platform_subjects
-            WHERE tenant_id = %s AND subject_id = ANY(%s)
-            FOR SHARE
-            """,
-            (TENANT_ID, component_ids),
-        ).fetchall()
-        registered = {str(row["subject_id"]): dict(row) for row in rows}
-        components = []
-        for request in submission.components:
-            component_id = request.component_id
-            row = registered.get(component_id)
-            if row is not None:
-                if str(row["lifecycle_status"]) != "active":
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Component {component_id} is not active",
-                    )
-                source_type = str(row["subject_type"])
-                if source_type == "physical_account":
-                    component_type = "account"
-                elif source_type in {"filtered_portfolio", "composite_portfolio"}:
-                    component_type = "portfolio"
-                else:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Component {component_id} is not an investable sleeve",
-                    )
-                components.append(
-                    {
-                        "component_id": component_id,
-                        "component_name": str(row["display_name"]),
-                        "component_type": component_type,
-                        "coefficient": request.coefficient,
-                        "source_currency": str(row["currency"]),
-                        "price_convention": "nav",
-                    }
-                )
-                continue
-            market = market_catalog.get(component_id)
-            if market is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Component {component_id} is not in the approved catalogue",
-                )
-            coverage = connection.execute(
-                """
-                SELECT MAX(price_date) FILTER (WHERE price_date <= %s) AS base_date,
-                       MAX(price_date) AS latest_date
-                FROM market_data_prices WHERE instrument_id = %s
-                """,
-                (submission.normalization_date.isoformat(), component_id),
-            ).fetchone()
-            if coverage is None or coverage["base_date"] is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Component {component_id} has no normalization-date market history",
-                )
-            components.append(
-                {
-                    "component_id": component_id,
-                    "component_name": market.name,
-                    "component_type": "benchmark",
-                    "coefficient": request.coefficient,
-                    "source_currency": market.currency,
-                    "price_convention": _studio_price_convention(market.price_type),
-                }
-            )
-        try:
-            definition = fixed_unit_composite_definition(
-                subject_id=subject,
-                display_name=submission.display_name,
-                base_currency=submission.base_currency,
-                normalization_date=submission.normalization_date.isoformat(),
-                constant_cash=submission.constant_cash,
-                components=components,
-                market_carry_days=submission.market_carry_days,
-            )
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
+        definition = _studio_composite_definition(connection, submission, subject)
         case_id, digest = _create_derived_studio_case(
             connection, definition=definition, actor=actor
         )
@@ -7524,7 +8454,8 @@ def _store_flex_token_via_broker(secret_name: str, token: str) -> dict[str, str]
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    # The broker scales to zero; a cold start takes about 25 seconds, so wait well past that.
+    with urllib.request.urlopen(request, timeout=60) as response:
         payload = json.load(response)
     if (
         payload.get("status") != "stored"
@@ -8022,7 +8953,7 @@ def connection_onboarding_queue_page(
     script = CONNECTION_QUEUE_PAGE_SCRIPT.replace(
         "__SOURCE_ID__", json.dumps(source_id)
     )
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Choose accounts · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header><main><div class="breadcrumbs"><a href="/">Accounts</a><span>/</span><a href="/ibkr-connections">IBKR connections</a><span>/</span><span>Choose accounts</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Connection-scoped onboarding</div><h1 id="queue-title">Loading connection…</h1><div id="queue-status" class="muted">Choose which discovered accounts to onboard and the exact order.</div></div></div><section class="grid"><div class="card wide"><div class="label">Connection policy</div><div id="queue-summary" class="status-row"></div></div><div id="queue-workspace" class="grid" style="display:contents"><div class="card wide"><div class="muted">Loading discovered accounts…</div></div></div></section></main>{script}</body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Choose accounts · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header><main><div class="breadcrumbs"><a href="/">Accounts</a><span>/</span><a href="/ibkr-connections">IBKR connections</a><span>/</span><span>Choose accounts</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Connection-scoped onboarding</div><h1 id="queue-title">Loading connection…</h1><div id="queue-status" class="muted">Choose which discovered accounts to onboard and the exact order.</div></div></div><section class="grid"><div class="card wide"><div class="label">Connection policy</div><div id="queue-summary" class="status-row"></div></div><div id="queue-workspace" class="grid" style="display:contents"><div class="card wide"><div class="muted">Loading discovered accounts…</div></div></div></section></main>{script}</body></html>"""
 
 
 ONBOARDING_STEP_PAGE_SCRIPT = r"""
@@ -8238,14 +9169,73 @@ def account_onboarding_step_page(
     script = ONBOARDING_STEP_PAGE_SCRIPT.replace(
         "__SUBJECT__", json.dumps(subject)
     ).replace("__STEP__", json.dumps(step_slug))
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header><main><div class="breadcrumbs"><a href="/">Accounts</a><span>/</span><a href="/account-onboarding">Account onboarding</a><span>/</span><span>{escape(subject)}</span><span>/</span><span>{escape(title)}</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Page {index + 1} of {len(steps)}</div><h1>{escape(title)}</h1><div class="muted">{escape(str(case["display_name"]))} · {escape(str(case["status"]).replace("_", " ").title())}</div></div></div><section class="grid"><div class="card wide"><div class="label">Page-by-page workflow</div><div class="status-row">{step_cards}</div></div><div class="card wide"><div class="label">Current page</div><div id="step-workspace"><div class="muted">Loading current evidence and permitted actions…</div></div></div><div class="card wide"><div class="label">All evidence and approval gates</div><div class="onboarding-checks">{check_cards}</div></div><div class="card wide"><div class="actions">{pager}</div></div></section></main>{script}</body></html>"""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header><main><div class="breadcrumbs"><a href="/">Accounts</a><span>/</span><a href="/account-onboarding">Account onboarding</a><span>/</span><span>{escape(subject)}</span><span>/</span><span>{escape(title)}</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Page {index + 1} of {len(steps)}</div><h1>{escape(title)}</h1><div class="muted">{escape(str(case["display_name"]))} · {escape(str(case["status"]).replace("_", " ").title())}</div></div></div><section class="grid"><div class="card wide"><div class="label">Page-by-page workflow</div><div class="status-row">{step_cards}</div></div><div class="card wide"><div class="label">Current page</div><div id="step-workspace"><div class="muted">Loading current evidence and permitted actions…</div></div></div><div class="card wide"><div class="label">All evidence and approval gates</div><div class="onboarding-checks">{check_cards}</div></div><div class="card wide"><div class="actions">{pager}</div></div></section></main>{script}</body></html>"""
 
 
 @app.get("/account-onboarding", response_class=HTMLResponse)
 def account_onboarding_page(
     request: Request, user: dict[str, str] = Depends(_onboarding_user)
 ) -> str:
+    if onboarding_v2_enabled():
+        return _platform_shell(
+            user, active="account-onboarding", title="Account onboarding",
+            description=onboarding_v2_web.ONBOARDING_DESCRIPTION,
+            content=onboarding_v2_web.ONBOARDING_CONTENT, script=onboarding_v2_web.ONBOARDING_SCRIPT,
+        )
     return _render_platform_page(user, section="account-onboarding")
+
+
+@app.get("/account-onboarding/classic", response_class=HTMLResponse)
+def account_onboarding_classic_page(
+    request: Request, user: dict[str, str] = Depends(_onboarding_user)
+) -> Response:
+    """The earlier onboarding page, kept for master accounts and cases started before the new onboarding."""
+
+    if not onboarding_v2_enabled():
+        return RedirectResponse(url="/account-onboarding", status_code=307)
+    page = _render_platform_page(user, section="account-onboarding")
+    for old, new in _CLASSIC_PAGE_REPLACEMENTS:
+        page = page.replace(old, new, 1)
+    for opening in _CLASSIC_HIDDEN_CARDS:
+        page = page.replace(opening, opening.replace('<div class="card wide"', _HIDDEN_CARD, 1), 1)
+    return HTMLResponse(page)
+
+
+# With the new onboarding on, the earlier page keeps only what the new one does not
+# cover: starting a master account and finishing cases started on the earlier wizard.
+# The new Account onboarding, Broker connections and portfolio builder pages replace
+# everything else, so those cards stay in the page (its script expects them) but hidden.
+_HIDDEN_CARD = '<div class="card wide" style="display:none" aria-hidden="true"'
+_CLASSIC_HIDDEN_CARDS = (
+    '<div class="card wide"><div class="label">Guided onboarding wizard</div>',
+    '<div class="card wide"><div class="label">Choose what you are onboarding</div>',
+    '<div class="card wide" id="derived-portfolio-studio">',
+    '<div class="card wide"><div class="label">IBKR connection prerequisite</div>',
+    '<div class="card wide"><div class="label">Platform-wide presentation requirements</div>',
+    '<div class="card wide"><div class="label">Approved implementation sequence</div>',
+    '<div class="card wide"><div class="label">Existing v1.1 source accounts</div>',
+)
+_CLASSIC_TITLE = "Master accounts and earlier cases"
+_CLASSIC_PAGE_REPLACEMENTS = (
+    ("<title>Account onboarding ·", f"<title>{_CLASSIC_TITLE} ·"),
+    ("<span>Account onboarding</span></div>",
+     '<a href="/account-onboarding">Account onboarding</a><span aria-hidden="true">/</span>'
+     f"<span>{_CLASSIC_TITLE}</span></div>"),
+    ("<h1>Account onboarding</h1>", f"<h1>{_CLASSIC_TITLE}</h1>"),
+    ("Controlled account discovery, source configuration, reconciliation gates and feature activation for "
+     "safely scaling the platform beyond the U16088571 reference account.",
+     "Starting a master account, and cases started on the earlier onboarding wizard."),
+    ('<div class="card wide"><div class="label">Scalable account onboarding</div>',
+     '<div class="card wide"><div class="label">Where to start</div>'
+     "<h2>New accounts and portfolios start on Account onboarding</h2>"
+     '<p class="muted">Use this page only to start a master account or to finish a case started '
+     "before the new onboarding. Broker logins are on Broker connections, and new portfolios start "
+     "in the portfolio builder.</p><div class=\"actions\">"
+     '<a class="button" href="/account-onboarding">Account onboarding</a>'
+     '<a class="button" href="/broker-connections">Broker connections</a>'
+     '<a class="button" href="/account-onboarding/new-portfolio">Portfolio builder</a></div></div>'
+     '<div class="card wide"><div class="label">Scalable account onboarding</div>'),
+)
 
 
 def _reconciliation_prerequisite_status(checks: list[dict]) -> dict:
@@ -8738,6 +9728,19 @@ def _onboarding_activation_scope(payload: dict) -> dict:
     }
 
 
+def _readiness_could_hold(own_env: Mapping[str, str | None]) -> bool:
+    """Whether the job's own INPUT_READINESS_MODE could make the check wait or stop it."""
+    if input_readiness.MODE_ENV not in own_env:
+        return False
+    value = own_env[input_readiness.MODE_ENV]
+    return value is None or input_readiness.mode({input_readiness.MODE_ENV: value})[0] == input_readiness.ENFORCE
+
+
+def _start_derived_refresh() -> str:
+    return start_job_with_env(ADMIN_ACTION_CONFIG, DERIVED_REFRESH_JOB_NAME, WEB_DERIVED_REFRESH_ENV,
+                              needed=_readiness_could_hold)
+
+
 @app.post("/api/onboarding/{subject_id}/calculations/queue")
 def queue_onboarding_calculation(
     subject_id: str,
@@ -8841,9 +9844,7 @@ def queue_onboarding_calculation(
             ),
         )
     try:
-        reference = _default_job_starter(
-            ADMIN_ACTION_CONFIG, DERIVED_REFRESH_JOB_NAME
-        )
+        reference = _start_derived_refresh()
     except AdminActionError as error:
         with _approval_database() as connection:
             connection.execute(
@@ -9009,8 +10010,10 @@ def queue_onboarding_analytics(
             ),
         )
     try:
-        reference = _default_job_starter(
-            ADMIN_ACTION_CONFIG, job_name
+        reference = (
+            _start_derived_refresh()
+            if job_name == DERIVED_REFRESH_JOB_NAME
+            else _default_job_starter(ADMIN_ACTION_CONFIG, job_name)
         )
     except AdminActionError as error:
         with _approval_database() as connection:
@@ -9332,50 +10335,6 @@ def approve_onboarding_activation(
             """,
             (TENANT_ID, subject),
         )
-        connection.execute(
-            """
-            UPDATE subject_feature_states
-            SET feature_state = CASE
-                    WHEN %s = 'master_account'
-                     AND %s = 'administrative_only'
-                     AND feature_key <> 'viewer_access' THEN 'disabled'
-                    ELSE 'active'
-                END,
-                reason = CASE
-                    WHEN %s = 'master_account'
-                     AND %s = 'administrative_only'
-                     AND feature_key <> 'viewer_access'
-                    THEN 'This administrative-only master does not publish investment analytics or reports.'
-                    ELSE 'Every account-specific onboarding gate passed and the owner activated the subject.'
-                END,
-                updated_at = now()
-            WHERE tenant_id = %s AND subject_id = %s
-            """,
-            (
-                str(case["subject_type"]),
-                (
-                    (case.get("metadata_json") or {}).get("reporting_mode")
-                    if isinstance(case.get("metadata_json"), dict)
-                    else ""
-                ),
-                str(case["subject_type"]),
-                (
-                    (case.get("metadata_json") or {}).get("reporting_mode")
-                    if isinstance(case.get("metadata_json"), dict)
-                    else ""
-                ),
-                TENANT_ID,
-                subject,
-            ),
-        )
-        connection.execute(
-            """
-            UPDATE subject_flex_source_bindings
-            SET status = 'active', updated_at = now()
-            WHERE tenant_id = %s AND subject_id = %s AND status = 'pending'
-            """,
-            (TENANT_ID, subject),
-        )
         metadata = case.get("metadata_json") or {}
         if isinstance(metadata, str):
             try:
@@ -9383,67 +10342,20 @@ def approve_onboarding_activation(
             except json.JSONDecodeError:
                 metadata = {}
         subject_type = str(case["subject_type"])
-        administrative_master = bool(
-            subject_type == "master_account"
-            and isinstance(metadata, dict)
-            and metadata.get("reporting_mode") == "administrative_only"
-        )
-        if administrative_master:
-            capabilities = (("viewer_directory", {}),)
-        else:
-            source_name = (
-                "derived_calculation"
-                if subject_type in {"filtered_portfolio", "composite_portfolio"}
-                else str(case["source_system"])
-            )
-            capabilities = (
-                ("daily_ingestion", {"start_date": str(case["history_start_date"]), "source": source_name}),
-                ("benchmark_refresh", {"start_date": str(case["history_start_date"])}),
-                ("sector_refresh", {"external_approval_required": True}),
-                ("month_end_reporting", {"approval_required": True}),
-                ("analyst_assurance", {}),
-                ("viewer_directory", {}),
-            )
-        for capability, configuration in capabilities:
-            configuration_json = canonical_json(configuration)
-            connection.execute(
-                """
-                INSERT INTO subject_operating_registrations(
-                    registration_id, tenant_id, subject_id, capability,
-                    operating_state, effective_from, configuration_json,
-                    configuration_sha256, activation_approval_id,
-                    changed_by_identity_sha256, created_at, updated_at
-                ) VALUES (
-                    %s, %s, %s, %s, 'active', %s, %s::jsonb, %s,
-                    %s, %s, now(), now()
-                )
-                ON CONFLICT (tenant_id, subject_id, capability, effective_from)
-                DO UPDATE SET operating_state = 'active', effective_to = NULL,
-                              configuration_json = EXCLUDED.configuration_json,
-                              configuration_sha256 = EXCLUDED.configuration_sha256,
-                              activation_approval_id = EXCLUDED.activation_approval_id,
-                              changed_by_identity_sha256 = EXCLUDED.changed_by_identity_sha256,
-                              updated_at = now()
-                """,
-                (
-                    uuid.uuid4(), TENANT_ID, subject, capability,
-                    case["history_start_date"], configuration_json,
-                    sha256_text(configuration_json), approval_id, actor,
-                ),
-            )
-        connection.execute(
-            """
-            UPDATE ibkr_flex_queries q
-            SET schedule_enabled = true, status = 'active', updated_at = now()
-            WHERE q.tenant_id = %s
-              AND EXISTS (
-                  SELECT 1 FROM subject_flex_source_bindings b
-                  WHERE b.tenant_id = q.tenant_id
-                    AND b.flex_source_id = q.flex_source_id
-                    AND b.subject_id = %s AND b.status = 'active'
-              )
-            """,
-            (TENANT_ID, subject),
+        activate_subject(
+            connection,
+            tenant_id=TENANT_ID,
+            subject_id=subject,
+            subject_type=subject_type,
+            source_name=str(case["source_system"]),
+            history_start_date=str(case["history_start_date"]),
+            administrative_master=bool(
+                subject_type == "master_account"
+                and isinstance(metadata, dict)
+                and metadata.get("reporting_mode") == "administrative_only"
+            ),
+            approval_id=approval_id,
+            actor=actor,
         )
     return {
         "status": "active",
@@ -9848,7 +10760,7 @@ def download_onboarding_historical_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject, period_end=period_end, prefix=_download_prefix(subject))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Period-End": period_end,
@@ -10039,7 +10951,7 @@ fetch('/api/onboarding/{subject}/preview').then(async response=>{{const payload=
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Private onboarding preview · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body>
-<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
+<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header>
 <main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><a href="/account-onboarding">Account onboarding</a><span aria-hidden="true">/</span><span>{subject}</span></div><div class="account-hero"><div class="account-hero-copy"><div class="label">Owner-only reconciliation preview</div><h1 id="preview-title">{subject}</h1><div id="preview-note" class="muted">Loading validated onboarding evidence…</div></div></div><section class="grid"><div class="card wide"><div class="label">Current onboarding stage</div><div id="preview-stage" class="value">Loading…</div><div id="preview-contract" class="status-row"></div><div class="actions"><a class="button" href="/accounts/{subject}/overview">Open account analytics preview</a></div></div><div class="card wide"><div class="label">Imported portfolio coverage</div><div id="preview-data" class="status-row"></div></div><div class="card wide"><div class="label">USD benchmark reconciliation</div><div id="preview-benchmarks" class="status-row"></div></div><div class="card wide"><div class="label">Validated report templates and examples</div><div id="preview-templates" class="status-row"></div></div><div class="card wide"><div class="label">Private historical factsheets and presentations</div><div id="preview-historical"><div class="muted">Loading the historical report batch…</div></div></div><div class="card wide"><div class="label">Deterministic website-preview validation</div><div id="preview-validation" class="onboarding-checks"><div class="muted">Validating current evidence…</div></div><div id="preview-approval"></div></div><div class="card wide"><div class="label">Fail-closed feature controls</div><div id="preview-features" class="status-row"></div></div></section></main>{script}</body></html>"""
 
 
@@ -10112,20 +11024,17 @@ def metrics_guide_page(
 def _render_platform_page(user: dict[str, str], *, section: str) -> str:
     if section not in PLATFORM_SECTIONS:
         raise HTTPException(status_code=404, detail="Platform page not found")
-    viewer = escape(user["email"] or "authorized user")
-    role_label = escape(user.get("role", "owner").title())
-    page_title = escape(PLATFORM_SECTIONS[section])
-    platform_navigation = _platform_navigation(user, active=section)
     if section == "combined-holdings":
         description = "Latest holdings across every physical account you can view, converted into one currency with each account's own dated FX history and aggregated by instrument."
-        content = """<div class="page-view active" data-section="combined-holdings"><div class="card wide"><div class="label">Combined holdings</div><form id="combined-form" class="actions"><label><span class="label">Currency</span> <input id="combined-currency" name="currency" value="USD" maxlength="3" pattern="[A-Za-z]{3}" required size="4"></label><label><span class="label">As of</span> <input id="combined-asof" name="as_of" type="date"></label><button class="button" type="submit">Update</button></form><div id="combined-note" class="muted" aria-live="polite">Loading…</div><div id="combined-accounts" class="status-row"></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Accounts</th><th>Quantity</th><th>Value (<span id="combined-currency-label">USD</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="combined-holdings"></tbody></table></div></div></div>"""
-        script = COMBINED_HOLDINGS_PAGE_SCRIPT
+        content = """<div class="page-view active" data-section="combined-holdings"><div class="card wide"><div class="label">Combined holdings</div><form id="combined-form" class="actions"><label><span class="label">Currency</span> <input id="combined-currency" name="currency" value="USD" maxlength="3" pattern="[A-Za-z]{3}" required size="4"></label><label><span class="label">As of</span> <input id="combined-asof" name="as_of" type="date"></label><button class="button" type="submit">Update</button></form><div id="combined-note" class="muted" aria-live="polite">Loading…</div><div id="combined-accounts" class="status-row"></div><div class="table-tools"><input id="combined-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter combined holdings"><span id="combined-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Accounts</th><th>Quantity</th><th>Value (<span id="combined-currency-label">USD</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="combined-holdings"></tbody></table></div></div></div>"""
+        script = TABLE_SCRIPT + COMBINED_HOLDINGS_PAGE_SCRIPT
     elif section == "system-health":
         description = "Platform-wide data freshness, ingestion, benchmark, assurance and reporting status across every account and portfolio."
-        content = """<div class="page-view active" data-section="system-health"><div class="card wide"><div class="label">Platform health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Benchmark coverage</div><div id="benchmark-health" class="status-row"></div></div><div class="card wide"><div class="label">Latest portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Platform acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>"""
+        content = """<div class="page-view active" data-section="system-health"><div class="card wide"><div class="label">Platform health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Open incidents</div><div id="health-incidents"></div></div><div class="card wide"><div class="label">Benchmark coverage</div><div id="benchmark-health" class="status-row"></div></div><div class="card wide"><div class="label">Latest portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Platform acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>"""
         content = content.replace('<div id="health-note" class="muted"></div>',
                                   '<div id="health-note" class="muted" aria-live="polite"></div><div id="health-findings"></div>')
         content = content.replace('Platform acceptance burn-in', 'Registered account acceptance burn-in')
+        content = _system_health_agent_content(user, content)
         script = SYSTEM_HEALTH_PAGE_SCRIPT
     elif section == "metrics-guide":
         description = "Plain-language definitions, formulas, interpretation guidance and limitations for every metric and KPI in the current platform."
@@ -10150,13 +11059,68 @@ def _render_platform_page(user: dict[str, str], *, section: str) -> str:
         script = ACCOUNT_ONBOARDING_PAGE_SCRIPT
     else:
         description = "Live owner communication with the controlled AI system administrator, plus platform-wide autonomy, incidents, reviews and audited maintenance actions."
-        content = """<div class="page-view active" data-section="administration"><div class="card wide ai-chat-card admin-live-chat"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Administrator chats</div><strong>System operations</strong></div><button id="admin-new-chat" class="button" type="button">New chat</button></div><div id="admin-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="admin-chat-title">System administrator updates</strong><div class="muted">Owner-only · Monitored continuously · Changes remain approval-controlled</div></div><div class="actions"><a id="admin-chat-export-md" class="button" href="#" hidden>Save Markdown</a><a id="admin-chat-export-json" class="button" href="#" hidden>Save JSON</a><button id="admin-chat-archive" class="button" type="button" hidden>Archive</button></div></div><div id="admin-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Controlled system administration</div><div class="value">Connecting to the administrator…</div></div></div><div class="ai-chat-composer"><textarea id="admin-chat-input" maxlength="1200" aria-label="Message the AI System Administrator" placeholder="Ask about health or give a maintenance order…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Supported changes require an exact approval</div><button id="admin-chat-send" class="button" type="button">Send</button></div></div></section></div></div><div class="card wide"><div class="label">Institutional onboarding control plane</div><div id="control-plane-status" class="value">Loading…</div><div id="control-plane-note" class="muted"></div><div id="control-plane-summary" class="status-row"></div></div><div class="admin-layout"><div class="card admin-overview"><div class="label">24/7 controlled autonomy</div><div id="autonomy-status" class="value">Loading…</div><div id="autonomy-note" class="muted"></div><div id="autonomy-summary" class="status-row"></div><div id="autonomy-incidents" class="muted"></div><div id="autonomy-reviews" class="muted"></div></div><div class="card admin-actions-panel"><div class="label">Direct owner-approved actions</div><div id="admin-status" class="value">Loading…</div><div id="admin-note" class="muted"></div><div class="actions"><select id="admin-action" aria-label="Administrative action"></select><button id="admin-preview" class="button" type="button" disabled>Preview action</button></div><div id="admin-preview-result" class="muted" style="margin-top:14px"></div><div class="actions"><input id="admin-confirmation" type="text" maxlength="80" aria-label="Type the exact approval phrase" placeholder="Preview an action to obtain the approval phrase" disabled><button id="admin-execute" class="button" type="button" disabled>Approve and execute once</button></div><div id="admin-result" class="muted" style="margin-top:14px"></div></div></div></div>"""
+        content = """<div class="page-view active" data-section="administration"><div class="card wide ai-chat-card admin-live-chat"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Administrator chats</div><strong>System operations</strong></div><button id="admin-new-chat" class="button" type="button">New chat</button></div><div id="admin-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div><p class="muted admin-chat-who">The administrator, the operations agent and the connection agent post their updates in System administrator updates. Ask the administrator about any of them here.</p></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="admin-chat-title">System administrator updates</strong><div class="muted">Owner-only · Monitored continuously · Changes remain approval-controlled</div></div><div class="actions"><a id="admin-chat-export-md" class="button" href="#" hidden>Save Markdown</a><a id="admin-chat-export-json" class="button" href="#" hidden>Save JSON</a><button id="admin-chat-archive" class="button" type="button" hidden>Archive</button></div></div><div id="admin-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Controlled system administration</div><div class="value">Connecting to the administrator…</div></div></div><div class="ai-chat-composer"><textarea id="admin-chat-input" maxlength="1200" aria-label="Message the AI System Administrator" placeholder="Ask about health or give a maintenance order…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Supported changes require an exact approval</div><button id="admin-chat-send" class="button" type="button">Send</button></div></div></section></div></div><div class="admin-layout"><div class="card admin-overview"><div class="label">24/7 controlled autonomy</div><div id="autonomy-status" class="value">Loading…</div><div id="autonomy-note" class="muted"></div><div id="autonomy-summary" class="status-row"></div><div id="autonomy-incidents" class="muted"></div><div id="autonomy-reviews" class="muted"></div></div><div class="card admin-actions-panel"><div class="label">Direct owner-approved actions</div><div id="admin-status" class="value">Loading…</div><div id="admin-note" class="muted"></div><div class="actions"><select id="admin-action" aria-label="Administrative action"></select><button id="admin-preview" class="button" type="button" disabled>Preview action</button></div><div id="admin-preview-result" class="muted" style="margin-top:14px"></div><div class="actions"><input id="admin-confirmation" type="text" maxlength="80" aria-label="Type the exact approval phrase" placeholder="Preview an action to obtain the approval phrase" disabled><button id="admin-execute" class="button" type="button" disabled>Approve and execute once</button></div><div id="admin-result" class="muted" style="margin-top:14px"></div></div></div><div class="card wide"><div class="label">Institutional onboarding control plane</div><div id="control-plane-status" class="value">Loading…</div><div id="control-plane-note" class="muted"></div><div id="control-plane-summary" class="status-row"></div></div></div>"""
         script = ADMINISTRATION_PAGE_SCRIPT + ADMIN_LIVE_CHAT_SCRIPT
+    return _platform_shell(
+        user, active=section, title=PLATFORM_SECTIONS[section], description=description,
+        content=content, script=script,
+    )
+
+
+def _system_health_agent_content(user: dict[str, str], content: str) -> str:
+    """Leads System health with what needs attention: a plain summary, then the open incidents
+    with the operations agent's diagnosis and draft fix, and links to where the agents talk."""
+    from .agent_web import ui_enabled_for
+
+    owner = user.get("role", "owner") == "owner"
+    links = []
+    if owner:
+        links.append('<a class="button" href="/administration">Open the administrator chat</a>')
+    if ui_enabled_for(user):
+        links.append('<a class="button" href="/agent-inbox">Agent inbox</a>')
+    overview = (
+        '<div class="card wide"><div class="label">At a glance</div><div class="health-overview-head">'
+        '<span id="health-headline" class="value" aria-live="polite">Checking…</span><span id="health-pill"></span></div>'
+        '<div id="health-overview" class="status-row"></div>'
+        + (f'<div class="actions">{"".join(links)}</div>' if links else "")
+        + "</div>"
+    )
+    incidents = ('<div class="card wide"><div class="label">Open incidents</div><div id="health-incidents"></div></div>')
+    explained = (
+        '<div class="card wide"><div class="label">Open incidents</div><p class="muted">The operations agent '
+        "investigates each incident from the platform's telemetry and writes up what it finds here. It changes "
+        'nothing itself; when it can, it opens a draft fix for a person to review.</p><div id="health-incidents"></div></div>'
+    )
+    head = '<div class="page-view active" data-section="system-health">'
+    content = content.replace(incidents, "")
+    return content.replace(
+        head,
+        '<div class="page-view active" data-section="system-health"'
+        + (' data-admin-chat="1"' if owner else "") + ">"
+        + overview + explained,
+    )
+
+
+def _platform_shell(
+    user: dict[str, str], *, active: str, title: str, description: str, content: str, script: str
+) -> str:
+    viewer = escape(user["email"] or "authorized user")
+    role_label = escape(user.get("role", "owner").title())
+    page_title = escape(title)
+    platform_navigation = _platform_navigation(user, active=active)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_title} · {PLATFORM_NAME}</title><style>{ACCOUNT_THEME_CSS}</style></head><body>
-<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
-<main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>Platform</span><span aria-hidden="true">/</span><span>{page_title}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{page_title}</h1><div class="muted">{escape(description)}</div></div></div><div class="account-toolbar"><div><div class="label">Platform workspace</div><strong>{page_title}</strong></div><div class="label">All accounts and portfolios</div></div><section class="grid">{content}</section></main>{script}</body></html>"""
+<header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header>
+<main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>Platform</span><span aria-hidden="true">/</span><span>{page_title}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{page_title}</h1><div class="muted">{escape(description)}</div></div></div><section class="grid">{content}</section></main>{script}</body></html>"""
+
+
+def _agent_analyst_replaces_tab(user: dict[str, object]) -> bool:
+    """The "Ask about this account" analyst is on every tab, so while the older analyst's
+    model is off its AI analyst tab is left out and old links open Overview with the chat."""
+    from .agent_web import ui_enabled_for
+
+    return not AI_ANALYST_CONFIG.enabled and ui_enabled_for(user)
 
 
 @app.get("/accounts/{account_id}", response_class=RedirectResponse)
@@ -10174,6 +11138,39 @@ def account_root(
     return RedirectResponse(url=f"/accounts/{subject}/overview", status_code=307)
 
 
+@app.get("/accounts/{account_id}/{section}/{part}", response_class=HTMLResponse)
+def account_subpage(
+    account_id: str,
+    section: str,
+    part: str,
+    request: Request,
+    user: dict[str, str] = Depends(_authorized_user),
+):
+    if part not in {slug for slug, _label, _anchor in ACCOUNT_SUBPAGES.get(section, ())}:
+        raise HTTPException(status_code=404, detail="Account page not found")
+    return _account_page(account_id, section, user, part)
+
+
+# Factsheet designer: upload a template, review the design agents' draft, edit it in plain
+# words and submit it as a design request. Every route answers 404 unless
+# FACTSHEET_DESIGN_AGENTS_ENABLED is true; see factsheet_design_web.py. Installed before the
+# /accounts/{account_id}/{section} page route, which would otherwise answer the designer's page.
+from . import factsheet_design_web as _factsheet_design_web
+from .agent_web import design_api as _design_api
+
+_factsheet_design_web.install(
+    app,
+    owner_user=_owner_user,
+    check_subject=_factsheet_designer_owner,
+    write_database=lambda: _approval_database(),
+    portable=_portable_database_connection,
+    render_page=_platform_shell,
+    tenant_id=TENANT_ID,
+    agent_api=_design_api,
+    onboarding_case=_onboarding_design_case,
+)
+
+
 @app.get("/accounts/{account_id}/{section}", response_class=HTMLResponse)
 def account_page(
     account_id: str,
@@ -10181,6 +11178,10 @@ def account_page(
     request: Request,
     user: dict[str, str] = Depends(_authorized_user),
 ):
+    return _account_page(account_id, section, user, None)
+
+
+def _account_page(account_id: str, section: str, user: dict[str, str], part: str | None):
     if section not in ALL_PAGE_SECTIONS:
         raise HTTPException(status_code=404, detail="Account page not found")
     if section == "system-health":
@@ -10204,8 +11205,10 @@ def account_page(
     access = _portfolio_access_context(account_id, user)
     if access["preview_mode"] and section not in ONBOARDING_PREVIEW_SECTIONS:
         raise HTTPException(status_code=404, detail="Account page not found")
+    if section == "ai-analyst" and _agent_analyst_replaces_tab(user):
+        return RedirectResponse(url=f"/accounts/{urllib.parse.quote(account_id, safe='')}/overview#ask", status_code=307)
     return _render_account_page(
-        user, account_id=account_id, section=section, access=access
+        user, account_id=account_id, section=section, access=access, part=part
     )
 
 
@@ -10215,6 +11218,7 @@ def _render_account_page(
     account_id: str,
     section: str,
     access: dict[str, object] | None = None,
+    part: str | None = None,
 ) -> str:
     access = access or _portfolio_access_context(account_id, user)
     viewer = escape(user["email"] or "authorized user")
@@ -10231,18 +11235,88 @@ def _render_account_page(
     preview_mode = bool(access["preview_mode"])
     design_controls_html = report_design_controls(account_id) if is_owner and not preview_mode else ''
     design_controls_script = REPORT_DESIGN_SCRIPT if design_controls_html else ''
+    live_page_assets = (
+        live_assets(account_id, section) if live_view_allowed(access, user) else ""
+    )
     visible_sections = (
         ONBOARDING_PREVIEW_SECTIONS if preview_mode else set(ACCOUNT_SECTIONS)
     )
+    if _agent_analyst_replaces_tab(user):
+        visible_sections = visible_sections - {"ai-analyst"}
     page_title = escape(ACCOUNT_SECTIONS[section])
     active = {key: " active" if key == section else "" for key in ALL_PAGE_SECTIONS}
+    subpages = ACCOUNT_SUBPAGES.get(section, ())
+    if part is None and subpages:
+        part = subpages[0][0]
+    part_anchor = next((anchor for slug, _label, anchor in subpages if slug == part), "")
+
+    def nav_item(key: str, label: str) -> str:
+        current = " aria-current=\"page\"" if key == section else ""
+        parts = ACCOUNT_SUBPAGES.get(key, ())
+        link = (
+            f'<a class="account-nav-link{active[key]}" href="/accounts/{account}/{key}"{current}>'
+            f'{escape(ACCOUNT_TAB_LABELS.get(key, label))}'
+            + ('<span class="nav-caret" aria-hidden="true">▾</span>' if parts else "")
+            + "</a>"
+        )
+        if not parts:
+            return link
+        menu = "".join(
+            f'<a href="/accounts/{account}/{key}/{slug}" data-part-link="{anchor}"'
+            + (' aria-current="page"' if key == section and slug == part else "")
+            + f">{escape(sub_label)}</a>"
+            for slug, sub_label, anchor in parts
+        )
+        return (
+            f'<div class="account-nav-item">{link}'
+            f'<div class="account-nav-menu" aria-label="{escape(label)} pages">{menu}</div></div>'
+        )
+
     navigation = "".join(
-        f'<a class="account-nav-link{active[key]}" href="/accounts/{account}/{key}"'
-        f'{" aria-current=\"page\"" if key == section else ""}>{escape(label)}</a>'
-        for key, label in ACCOUNT_SECTIONS.items()
-        if key in visible_sections
+        nav_item(key, label) for key, label in ACCOUNT_SECTIONS.items() if key in visible_sections
     )
+
     platform_navigation = _platform_navigation(user)
+    try:
+        directory = [] if preview_mode else _account_directory(user)
+    except Exception:  # the switcher is optional; never fail the page for it
+        directory = []
+    account_switcher = (
+        '<label class="account-switcher"><span class="label">Switch account</span>'
+        '<select id="account-switcher" aria-label="Switch account" '
+        f'onchange="location.href=\'/accounts/\'+encodeURIComponent(this.value)+\'/{escape(section)}\'">'
+        + "".join(
+            f'<option value="{escape(str(item["subject_id"]))}"'
+            f'{" selected" if str(item["subject_id"]) == account_id else ""}>'
+            f'{escape(str(item.get("display_name") or item["subject_id"]))}</option>'
+            for item in directory
+        )
+        + "</select></label>"
+        if len(directory) > 1
+        else ""
+    )
+    subpage_script = (
+        "<script>"
+        + ACCOUNT_SUBPAGE_SCRIPT.replace("__BASE__", json.dumps(f"/accounts/{account_id}/{section}"))
+        .replace("__PARTS__", json.dumps([[slug, anchor] for slug, _label, anchor in subpages]))
+        .replace("__CURRENT__", json.dumps(part_anchor))
+        + "</script>"
+        if subpages
+        else ""
+    )
+    # Phones get the open section's subpages as a row under the tab bar.
+    section_jumps = (
+        '<nav class="section-jumps subpage-row" aria-label="Pages in this section">'
+        + "".join(
+            f'<a href="/accounts/{account}/{section}/{slug}" data-part-link="{anchor}"'
+            + (' aria-current="page"' if slug == part else "")
+            + f">{escape(label)}</a>"
+            for slug, label, anchor in subpages
+        )
+        + "</nav>"
+        if subpages
+        else ""
+    )
     metric_anchors_json = json.dumps(METRIC_ANCHORS, ensure_ascii=False)
     etl_contribution_href = escape(
         f"/metrics-guide#{METRIC_ANCHORS['Expected Tail Loss contribution']}",
@@ -10253,6 +11327,9 @@ def _render_account_page(
     )
     etl_bottom_href = escape(
         f"/metrics-guide#{METRIC_ANCHORS['Bottom 5 ETL contributors']}", quote=True
+    )
+    crisis_scenarios_href = escape(
+        f"/metrics-guide#{METRIC_ANCHORS['Crisis scenario maximum drawdown']}", quote=True
     )
     preview_notice = (
         '<div class="card wide"><div class="label">Owner-only onboarding preview</div>'
@@ -10269,30 +11346,37 @@ def _render_account_page(
         else '<a id="export-reporting-snapshot" class="button" '
         f'href="/api/reporting/snapshots/latest.json?download=true&amp;subject_id={account}">Owner-only frozen snapshot JSON</a>'
     )
+    trade_export_link = (
+        ""
+        if access.get("subject_type") == "composite_portfolio"
+        else '<a id="export-trades-csv" class="button" href="#">Trade history CSV</a>'
+    )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{page_title} · {account_display_name} · {PLATFORM_NAME}</title>
-<style>{ACCOUNT_THEME_CSS}</style></head>
-<body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a><strong class="brand-title">{PLATFORM_NAME}</strong></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a></div></header>
-<main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>{account_display_name}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{account_display_name}</h1><div class="muted">{reporting_currency} reporting · Data from {history_start_date}</div></div></div><nav class="account-nav" aria-label="{account} sections">{navigation}</nav><div class="account-toolbar"><div><div class="label">Account workspace</div><strong>{page_title}</strong></div><label class="asof-toolbar-control{' report-date-hidden' if section == 'reports' else ''}"><span class="label">As of</span><select id="asof-select" class="asof-select" aria-label="Portfolio as of date"><option>Loading…</option></select></label></div><h2>{page_title}</h2>
-<section class="grid" id="portfolio-grid">{preview_notice}<div class="page-view{active['overview']}" data-section="overview"><div class="card"><div class="label">NAV</div><div id="nav" class="value">—</div></div><div class="card"><div class="label">Observations</div><div id="obs" class="value">—</div></div><div class="card"><div class="label">Positions</div><div id="positions" class="value">—</div></div><div class="card"><div class="label">Reporting currency</div><div class="value">{reporting_currency}</div></div></div>
+<style>{ACCOUNT_THEME_CSS}{MODELLING_CSS}</style></head>
+<body><header><div class="brand-lockup"><a class="company-logo-link" href="/" aria-label="Go to Accounts home"><img class="company-logo" src="{COMPANY_LOGO_DATA_URI}" width="52" height="52" alt="Sprout Asset Management (Asia) Limited company logo"></a></div>{platform_navigation}<div class="session">{viewer} · {role_label} · <a href="/.auth/logout">Sign out</a>{THEME_TOGGLE_HTML}</div></header>
+<main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>{account_display_name}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{account_display_name}</h1><div class="muted">{reporting_currency} reporting · Data from {history_start_date}</div><div id="freshness" class="freshness" hidden></div></div><div class="account-hero-controls"><label class="asof-control{' report-date-hidden' if section == 'reports' else ''}"><span class="label">As of</span><select id="asof-select" class="asof-select" aria-label="Portfolio as of date"><option>Loading…</option></select></label>{account_switcher}</div></div><div class="account-sticky"><nav class="account-nav" aria-label="{account} sections">{navigation}</nav>{section_jumps}</div><h2 class="sr-only">{page_title}</h2>
+<section class="grid" id="portfolio-grid">{preview_notice}<div class="page-view{active['overview']}" data-section="overview"><div class="card wide overview-nav"><div class="overview-nav-head"><div class="overview-nav-copy"><div class="label">Net asset value</div><div class="overview-nav-line"><span id="nav" class="value">—</span><span id="overview-day" class="overview-day"></span></div><div id="overview-asof" class="muted">{reporting_currency} reporting</div></div><svg id="overview-spark" class="overview-spark" viewBox="0 0 320 64" preserveAspectRatio="none" role="img" aria-label="NAV trend over the last year"></svg></div><div id="overview-returns" class="metrics overview-returns"><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div></div></div><div class="card overview-half"><div class="label">Top holdings · <span id="positions">—</span> positions</div><div id="overview-holdings" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">All holdings <span aria-hidden="true">→</span></a></div><div class="card overview-half"><div class="label">Sector allocation</div><div id="overview-sectors" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">Sector detail <span aria-hidden="true">→</span></a></div></div>
 <div class="page-view{active['performance']}" data-section="performance">
-<div class="card wide"><div class="label">Comparison benchmark</div><select id="benchmark-select" aria-label="Comparison benchmark"></select><div id="benchmark" class="value">Loading…</div><div id="benchmark-note" class="muted"></div><div id="benchmark-metrics" class="metrics"></div></div>
-<div class="card wide"><div class="label">Rebased performance comparison</div><div class="legend"><span><i class="swatch portfolio"></i>{account_display_name}</span><span><i class="swatch index"></i><span id="benchmark-legend">Primary benchmark</span></span></div><div class="chart-wrap"><canvas id="benchmark-chart" width="1100" height="320" aria-label="Rebased performance comparison chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div>
-<div class="card wide"><div class="label">Period returns</div><div class="muted">Time-weighted returns (TWR) chain-link daily cash-flow-adjusted returns, so contributions and withdrawals do not count as performance. IRR is the annualised money-weighted return including the timing of those flows.</div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-returns"></tbody></table></div><div class="label" style="margin-top:18px">Custom period</div><div class="filter-grid"><label><span class="label">From</span><input id="period-from" type="date" min="{history_start_date}" aria-label="Custom period start date"></label><label><span class="label">To</span><input id="period-to" type="date" min="{history_start_date}" aria-label="Custom period end date"></label></div><div class="actions"><button id="period-apply" class="button" type="button">Calculate custom period</button></div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-custom"></tbody></table></div><div id="period-note" class="muted" style="margin-top:12px">Loading period returns…</div></div><div class="card wide"><div class="label">Contributions and withdrawals</div><div id="flows-totals" class="metrics"></div><div class="table-scroll"><table><thead><tr><th>Date</th><th>Type</th><th>Amount ({reporting_currency})</th></tr></thead><tbody id="flows-statement"></tbody></table></div><div id="flows-note" class="muted" style="margin-top:12px">Loading contributions and withdrawals…</div></div>
-<div class="card wide"><div class="label">NAV history</div><div class="chart-wrap"><canvas id="chart" width="1100" height="320" aria-label="NAV history chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div></div>
-<div class="page-view{active['risk']}" data-section="risk"><div class="card wide"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div></div>
-<div class="page-view{active['cash']}" data-section="cash"><div class="card wide"><div class="label">Cash balances as of <span id="cash-asof">—</span></div><div id="cash-balances" class="metrics"></div><div class="label" style="margin-top:18px">Cash activity history</div><div class="muted">Choose a custom date range to view every matching IBKR cash activity. The CSV download contains the same complete filtered result.</div><div class="filter-grid"><label><span class="label">From</span><input id="cash-from" type="date" min="{history_start_date}" aria-label="Cash activity start date"></label><label><span class="label">To</span><input id="cash-to" type="date" min="{history_start_date}" aria-label="Cash activity end date"></label></div><div class="actions"><button id="cash-apply" class="button" type="button">Apply cash filters</button><a id="cash-export" class="button" href="#">Download cash activity CSV</a></div><div id="cash-note" class="muted" style="margin-top:12px">Loading cash activity…</div><div class="table-scroll"><table><thead><tr><th>Date</th><th>Time</th><th>Type</th><th>Description</th><th>Currency</th><th>Amount</th></tr></thead><tbody id="cash-activity"></tbody></table></div></div></div>
-<div class="page-view{active['trades']}" data-section="trades"><div class="card wide"><div class="label">Trade history</div><div class="value">IBKR executions</div><div class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
-<div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
+<div class="card wide" id="perf-chart"><div class="chart-head"><div class="label chart-title">NAV history</div><div class="chart-mode" role="group" aria-label="Chart view"><button type="button" data-mode="value" data-title="NAV history" class="active" aria-pressed="true">Value</button><button type="button" data-mode="benchmark" data-title="Rebased performance comparison" aria-pressed="false">Vs benchmark</button></div></div><div class="chart-view" data-view="value"><div class="range-buttons" data-chart="#chart" role="group" aria-label="Chart period"><button type="button" data-range="1m">1M</button><button type="button" data-range="3m">3M</button><button type="button" data-range="ytd">YTD</button><button type="button" data-range="1y">1Y</button><button type="button" data-range="all" class="active" aria-pressed="true">All</button></div><div class="chart-wrap"><canvas id="chart" width="1100" height="320" aria-label="NAV history chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div><div class="chart-view" data-view="benchmark" hidden><div class="legend"><span><i class="swatch portfolio"></i>{account_display_name}</span><span><i class="swatch index"></i><span id="benchmark-legend">Primary benchmark</span></span></div><div class="range-buttons" data-chart="#benchmark-chart" role="group" aria-label="Chart period"><button type="button" data-range="1m">1M</button><button type="button" data-range="3m">3M</button><button type="button" data-range="ytd">YTD</button><button type="button" data-range="1y">1Y</button><button type="button" data-range="all" class="active" aria-pressed="true">All</button></div><div class="chart-wrap"><canvas id="benchmark-chart" width="1100" height="320" aria-label="Rebased performance comparison chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div></div>
+<div class="card wide" id="perf-returns"><div class="label">Period returns</div><div class="muted">Time-weighted returns (TWR) chain-link daily cash-flow-adjusted returns, so contributions and withdrawals do not count as performance. IRR is the annualised money-weighted return including the timing of those flows.</div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-returns"></tbody></table></div><div class="label" style="margin-top:18px">Custom period</div><div class="filter-grid"><label><span class="label">From</span><input id="period-from" type="date" min="{history_start_date}" aria-label="Custom period start date"></label><label><span class="label">To</span><input id="period-to" type="date" min="{history_start_date}" aria-label="Custom period end date"></label></div><div class="actions"><button id="period-apply" class="button" type="button">Calculate custom period</button></div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-custom"></tbody></table></div><div id="period-note" class="muted" style="margin-top:12px">Loading period returns…</div></div>
+{PERFORMANCE_ANALYTICS_CARDS}
+<div class="card wide" id="perf-benchmark"><div class="label">Comparison benchmark</div><select id="benchmark-select" aria-label="Comparison benchmark"></select><div id="benchmark" class="value">Loading…</div><div id="benchmark-note" class="muted"></div><div id="benchmark-metrics" class="metrics"></div></div>
+<div class="card wide" id="perf-flows"><div class="label">Contributions and withdrawals</div><div id="flows-totals" class="metrics"></div><div class="table-scroll"><table><thead><tr><th>Date</th><th>Type</th><th>Amount ({reporting_currency})</th></tr></thead><tbody id="flows-statement"></tbody></table></div><div id="flows-note" class="muted" style="margin-top:12px">Loading contributions and withdrawals…</div></div></div>
+<div class="page-view{active['risk']}" data-section="risk"><div class="card wide" id="risk-summary"><div class="label">Risk analytics through <span id="risk-asof">—</span></div><div id="risk-metrics" class="metrics"></div><div class="contributor-grid"><div><h3><a class="metric-guide-heading-link" href="{etl_top_href}">Top 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-top"></tbody></table></div><div><h3><a class="metric-guide-heading-link" href="{etl_bottom_href}">Bottom 5 Expected Tail Loss contributors <span aria-hidden="true">↗</span></a></h3><table><thead><tr><th>Holding</th><th><a class="metric-guide-table-link" href="{etl_contribution_href}">ETL contribution <span aria-hidden="true">↗</span></a></th></tr></thead><tbody id="etl-bottom"></tbody></table></div></div><div id="etl-note" class="muted"></div><div id="risk-note" class="muted"></div></div><div class="card wide" id="crisis-scenarios-card" hidden><div class="label"><a class="metric-guide-heading-link" href="{crisis_scenarios_href}">Crisis scenarios <span aria-hidden="true">↗</span></a></div><table><thead><tr><th>Crisis</th><th>Window</th><th>Maximum drawdown</th><th>Stand-ins (scaled)</th></tr></thead><tbody id="crisis-scenarios"></tbody></table><div id="crisis-scenarios-note" class="muted"></div></div>{RISK_ANALYTICS_CARDS}{CORRELATION_CARD}</div>
+<div class="page-view{active['modelling']}" data-section="modelling">{MODELLING_CARDS}</div>
+<div class="page-view{active['cash']}" data-section="cash"><div class="card wide"><div class="label"><span id="cash-kind">Cash balances</span> as of <span id="cash-asof">—</span></div><div id="cash-balances" class="metrics"></div><div id="cash-ledger-controls"><div class="label" style="margin-top:18px">Cash activity history</div><div class="muted">Choose a custom date range to view every matching IBKR cash activity. The CSV download contains the same complete filtered result.</div><div class="filter-grid"><label><span class="label">From</span><input id="cash-from" type="date" min="{history_start_date}" aria-label="Cash activity start date"></label><label><span class="label">To</span><input id="cash-to" type="date" min="{history_start_date}" aria-label="Cash activity end date"></label></div><div class="actions"><button id="cash-apply" class="button" type="button">Apply cash filters</button><a id="cash-export" class="button" href="#">Download cash activity CSV</a></div></div><div id="cash-note" class="muted" style="margin-top:12px">Loading cash activity…</div><div id="cash-ledger-table" class="table-scroll"><table><thead><tr><th>Date</th><th>Time</th><th>Type</th><th>Description</th><th>Currency</th><th>Amount</th></tr></thead><tbody id="cash-activity"></tbody></table></div></div></div>
+<div class="page-view{active['trades']}" data-section="trades">{TRADING_ACTIVITY_CARD}<div class="card wide"><div class="label">Trade history</div><div id="trade-source-title" class="value">Trade records</div><div id="trade-source-note" class="muted">Read-only executed trades imported from the daily IBKR account refresh. Filter the history or download the complete filtered result as CSV.</div><div id="trade-filter-controls" class="filter-grid"><label><span class="label">From</span><input id="trade-from" type="date" min="{history_start_date}" aria-label="Trade history start date"></label><label><span class="label">To</span><input id="trade-to" type="date" min="{history_start_date}" aria-label="Trade history end date"></label><label><span class="label">Symbol contains</span><input id="trade-symbol" type="text" maxlength="64" autocomplete="off" aria-label="Trade history symbol filter" placeholder="All symbols"></label><label><span class="label">Side</span><select id="trade-side" aria-label="Trade history side filter"><option value="">All sides</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select></label></div><div class="actions"><button id="trade-apply" class="button" type="button">Apply trade filters</button><a id="export-trades" class="button" href="#">Download trade history CSV</a></div><div id="trade-note" class="muted" style="margin-top:12px">Loading trade history…</div><div class="table-scroll"><table class="trade-table"><thead><tr><th>Date</th><th>Time</th><th>Instrument</th><th>Side</th><th>Quantity</th><th>Price</th><th>Currency</th><th>Proceeds</th><th>Commission</th><th>Net cash</th><th>Realized P&amp;L</th></tr></thead><tbody id="trade-history"></tbody></table></div></div></div>
+<div class="page-view{active['holdings']}" data-section="holdings"><div class="card wide"><div class="label">Sector allocation</div><div id="sector-summary" class="muted"></div><div id="sector-bars" class="sector-bars"></div><details class="sector-detail"><summary>Industries within each sector</summary><div class="table-scroll"><table><thead><tr><th class="text-col">Sector</th><th class="text-col">Industry</th><th class="text-col">Region</th><th>Holdings</th><th>Value (<span>{reporting_currency}</span>)</th><th>Weight</th></tr></thead><tbody id="sector-detail"></tbody></table></div></details><div id="sector-note" class="muted sector-note"></div></div>{HOLDINGS_CONCENTRATION_CARD}<div class="card wide"><div class="label">Holdings as of <span id="holdings-asof">—</span></div><div class="table-tools"><input id="holdings-filter" type="search" placeholder="Filter by symbol, name or sector" aria-label="Filter holdings"><span id="holdings-filter-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Symbol</th><th>Description</th><th>Sector</th><th>Currency</th><th id="holdings-quantity-label">Quantity</th><th>Market value</th><th>Value (<span id="holdings-reporting-currency">reporting</span>)</th><th>Cost basis</th><th>Unrealized P&amp;L</th><th>P&amp;L %</th><th title="14-day relative strength index from daily closing marks. Above 70 is overbought, below 30 oversold.">RSI (14)</th><th>Weight</th></tr></thead><tbody id="holdings"></tbody></table></div><div id="holdings-note" class="muted"></div></div></div>
 <div class="page-view{active['reports']}" data-section="reports"><div class="card wide"><div class="label">Monthly factsheets and presentations</div><div class="value">Report centre</div><div id="report-note" class="muted">Loading frozen month-end reports…</div><div class="actions"><select id="report-month" aria-label="Monthly report period"></select><button id="report-prepare" class="button" type="button" disabled>Generate secure downloads</button></div><div id="report-status" class="muted" style="margin-top:14px"></div><div id="report-downloads" class="actions"></div><div id="report-owner-review" style="display:none;margin-top:22px"><h3>Review and release files</h3><p class="muted">Tick a file to make it available to authorized users. Untick it and submit to revoke its download access. A newly approved replacement becomes the current download and withdraws the older version. The original file and approval history are retained. Review files before approving; client distribution remains prohibited.</p><div id="report-release-details" class="muted" style="margin-top:12px"></div><div id="report-release-list" style="display:grid;gap:12px;margin:16px 0"></div><button id="report-release" class="button" type="button" disabled>Submit approval changes</button><div id="report-release-status" class="muted" role="status" aria-live="polite"></div></div>{design_controls_html}</div></div>
-<div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a><a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
+<div class="page-view{active['exports']}" data-section="exports"><div class="card wide"><div class="label">Data exports</div><div class="muted">Downloads are account-scoped. CSV files use the selected as-of date.</div><div class="actions"><a id="export-performance" class="button" href="#">Performance CSV</a><a id="export-holdings" class="button" href="#">Holdings CSV</a><a id="export-cash" class="button" href="#">Cash activity CSV</a>{trade_export_link}<a class="button" href="/accounts/{account}/trades">Trade history controls</a>{reporting_snapshot_link}</div></div></div>
 <div class="page-view{active['ai-analyst']}" data-section="ai-analyst"><div class="card wide ai-chat-card"><div class="ai-chat-shell"><aside class="ai-chat-sidebar"><div class="ai-chat-sidebar-head"><div><div class="label">Saved chats</div><strong>AI Analyst</strong></div><button id="ai-new-chat" class="button" type="button">New chat</button></div><div id="ai-conversation-list" class="ai-conversation-list"><div class="muted">Loading conversations…</div></div></aside><section class="ai-chat-main"><div class="ai-chat-header"><div class="ai-chat-header-title"><strong id="ai-chat-title">New conversation</strong><div id="agent-status" class="muted">Loading analyst…</div></div><div class="actions"><a id="ai-export-md" class="button" href="#" hidden>Save Markdown</a><a id="ai-export-json" class="button" href="#" hidden>Save JSON</a><button id="ai-archive-chat" class="button" type="button" hidden>Archive</button></div></div><div id="ai-chat-thread" class="ai-chat-thread"><div class="ai-chat-empty"><div class="label">Live grounded analysis</div><div class="value">Ask about this portfolio</div><div id="agent-note" class="muted">The analyst uses validated portfolio tools for every figure and chart.</div><div class="ai-prompt-chips"><button class="ai-prompt-chip" type="button">Compare performance with the selected benchmark</button><button class="ai-prompt-chip" type="button">Explain the portfolio's main risks</button><button class="ai-prompt-chip" type="button">Show NAV history and key performance metrics</button></div></div></div><div class="ai-chat-composer"><textarea id="analysis-question" maxlength="1200" aria-label="Message the AI Portfolio Analyst" placeholder="Message the AI Portfolio Analyst…"></textarea><div class="ai-composer-footer"><div class="muted">Enter to send · Shift+Enter for a new line · Conversations save automatically</div><button id="analysis-run" class="button" type="button" disabled>Send</button></div></div></section></div></div></div>
 <div class="page-view{active['system-health']}" data-section="system-health"><div class="card wide"><div class="label">System health</div><div id="health-status" class="status-row"></div><div id="health-note" class="muted"></div></div><div class="card wide"><div class="label">Daily portfolio analyst assurance</div><div id="assurance-status" class="value">Loading…</div><div id="assurance-summary" class="status-row"></div><div id="assurance-note" class="muted"></div></div><div class="card wide"><div class="label">Stage 4 acceptance burn-in</div><div id="burn-in-status" class="value">Loading…</div><div id="burn-in-summary" class="status-row"></div><div id="burn-in-results" class="muted"></div></div></div>
 <div class="page-view{active['administration']}" data-section="administration"><div class="admin-layout"><div class="card admin-overview"><div class="label">24/7 controlled autonomy</div><div id="autonomy-status" class="value">Loading…</div><div id="autonomy-note" class="muted"></div><div id="autonomy-summary" class="status-row"></div><div id="autonomy-incidents" class="muted"></div><div id="autonomy-reviews" class="muted"></div></div><div class="card admin-actions-panel"><div class="label">Owner-approved administrator actions</div><div id="admin-status" class="value">Loading…</div><div id="admin-note" class="muted"></div><div class="actions"><select id="admin-action" aria-label="Staging administrative action"></select><button id="admin-preview" class="button" type="button" disabled>Preview action</button></div><div id="admin-preview-result" class="muted" style="margin-top:14px"></div><div class="actions"><input id="admin-confirmation" type="text" maxlength="80" aria-label="Type the exact approval phrase" placeholder="Preview an action to obtain the approval phrase" disabled><button id="admin-execute" class="button" type="button" disabled>Approve and execute once</button></div><div id="admin-result" class="muted" style="margin-top:14px"></div></div></div></div></section></main>
-<script>
+{TABLE_SCRIPT}<script>
 const account='{account}'; const accountDisplayName={json.dumps(account_display_name_value, ensure_ascii=False)}; const reportingCurrency={json.dumps(reporting_currency_value)}; const historyStartDate={json.dumps(history_start_date_value)}; const activeSection={json.dumps(section)}; const previewMode={str(preview_mode).lower()}; const portalOwner={str(is_owner).lower()}; const fmt=n=>n==null||n===''?'—':new Intl.NumberFormat('en-US',{{maximumFractionDigits:2}}).format(Number(n));
-const pct=n=>n==null?'—':new Intl.NumberFormat('en-US',{{style:'percent',maximumFractionDigits:2}}).format(Number(n));
+const pct=n=>{{if(n==null||!Number.isFinite(Number(n)))return '—';const formatter=new Intl.NumberFormat('en-US',{{style:'percent',maximumFractionDigits:2}}),parts=formatter.formatToParts(Number(n)),zero=parts.filter(p=>p.type==='integer'||p.type==='fraction').every(p=>Number(p.value)===0);return (zero?parts.filter(p=>p.type!=='minusSign'):parts).map(p=>p.value).join('');}};
 const axis=n=>new Intl.NumberFormat('en-US',{{maximumFractionDigits:2}}).format(Number(n));
 const exact=n=>new Intl.NumberFormat('en-US',{{minimumFractionDigits:2,maximumFractionDigits:6}}).format(Number(n));
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
@@ -10305,27 +11389,36 @@ const chartColors={{portfolio:rootStyle.getPropertyValue('--chart-portfolio').tr
 const chartState=new Map();
 const niceTickStep=(lo,hi,targetIntervals=8)=>{{const span=Math.abs(hi-lo)||Math.max(Math.abs(hi),1),rough=span/Math.max(1,targetIntervals),magnitude=10**Math.floor(Math.log10(rough)),normalized=rough/magnitude,multiplier=normalized<=1?1:normalized<=2?2:normalized<=5?5:10;return multiplier*magnitude}};
 const chartBounds=(values,options)=>{{let lo=Math.min(...values),hi=Math.max(...values);const requestedStep=Number(options.yTickStep),tickStep=Number.isFinite(requestedStep)&&requestedStep>0?requestedStep:options.niceYTicks?niceTickStep(lo,hi,Number(options.targetYIntervals)||8):null;if(tickStep){{lo=Math.floor(lo/tickStep)*tickStep;hi=Math.ceil(hi/tickStep)*tickStep;if(lo===hi){{lo-=tickStep;hi+=tickStep}}return {{lo,hi,tickStep}}}}let range=hi-lo;if(!range)range=Math.max(Math.abs(hi)*.02,1);lo-=range*.05;hi+=range*.05;return {{lo,hi,tickStep:null}}}};
-const renderChart=(id,hoverIndex=null)=>{{const state=chartState.get(id),c=document.querySelector(id),ctx=c.getContext('2d'),tip=c.parentElement.querySelector('.chart-tooltip');ctx.clearRect(0,0,c.width,c.height);if(!state||!state.series.length){{tip.style.display='none';return}}const {{series,lines,options}}=state,m={{left:100,right:22,top:18,bottom:48}},w=c.width-m.left-m.right,h=c.height-m.top-m.bottom,values=lines.flatMap(line=>series.map(row=>Number(row[line.key]))).filter(Number.isFinite),bounds=chartBounds(values,options),lo=bounds.lo,hi=bounds.hi,xFor=i=>m.left+i*w/Math.max(1,series.length-1),yFor=n=>m.top+(hi-n)*h/(hi-lo);ctx.font='12px Segoe UI';ctx.lineWidth=1;const yTicks=bounds.tickStep?Array.from({{length:Math.round((hi-lo)/bounds.tickStep)+1}},(_,i)=>hi-i*bounds.tickStep):Array.from({{length:5}},(_,i)=>hi-i*(hi-lo)/4);yTicks.forEach(value=>{{const y=yFor(value);ctx.strokeStyle='#e7ebf2';ctx.beginPath();ctx.moveTo(m.left,y);ctx.lineTo(c.width-m.right,y);ctx.stroke();ctx.fillStyle='#667085';ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(axis(value),m.left-9,y)}});for(let i=0;i<5;i++){{const index=Math.round(i*(series.length-1)/4),x=xFor(index);ctx.strokeStyle='#e7ebf2';ctx.beginPath();ctx.moveTo(x,m.top);ctx.lineTo(x,c.height-m.bottom);ctx.stroke();ctx.fillStyle='#667085';ctx.textAlign=i===0?'left':i===4?'right':'center';ctx.textBaseline='top';ctx.fillText(series[index].date,x,c.height-m.bottom+9)}}ctx.strokeStyle='#667085';ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(m.left,m.top);ctx.lineTo(m.left,c.height-m.bottom);ctx.lineTo(c.width-m.right,c.height-m.bottom);ctx.stroke();ctx.fillStyle='#667085';ctx.textAlign='center';ctx.textBaseline='bottom';ctx.fillText('Date',m.left+w/2,c.height-2);ctx.save();ctx.translate(16,m.top+h/2);ctx.rotate(-Math.PI/2);ctx.textBaseline='middle';ctx.fillText(options.yLabel,0,0);ctx.restore();lines.forEach(line=>{{ctx.strokeStyle=line.color;ctx.lineWidth=2;ctx.beginPath();series.forEach((row,i)=>{{const x=xFor(i),y=yFor(Number(row[line.key]));i?ctx.lineTo(x,y):ctx.moveTo(x,y)}});ctx.stroke()}});if(hoverIndex!==null){{const row=series[hoverIndex],x=xFor(hoverIndex);ctx.strokeStyle='#98a2b3';ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,m.top);ctx.lineTo(x,c.height-m.bottom);ctx.stroke();ctx.setLineDash([]);lines.forEach(line=>{{ctx.fillStyle=line.color;ctx.beginPath();ctx.arc(x,yFor(Number(row[line.key])),4,0,Math.PI*2);ctx.fill();ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.stroke()}});tip.innerHTML=`<strong>${{esc(row.date)}}</strong>`+lines.map(line=>`<div><span style="color:${{line.color}}">●</span> ${{esc(line.label)}}: <strong>${{exact(row[line.key])}}${{options.unit?' '+esc(options.unit):''}}</strong></div>`).join('');const cssX=x*c.clientWidth/c.width;tip.style.left=(cssX>c.clientWidth*.72?cssX-205:cssX+12)+'px';tip.style.top='12px';tip.style.display='block'}}else tip.style.display='none'}};
-const draw=(id,series,lines,options={{}})=>{{const c=document.querySelector(id);chartState.set(id,{{series,lines,options:{{yLabel:'Value',unit:'',...options}}}});c.onmousemove=e=>{{if(!series.length)return;const r=c.getBoundingClientRect(),x=(e.clientX-r.left)*c.width/r.width,left=100,right=22,index=Math.max(0,Math.min(series.length-1,Math.round((x-left)/(c.width-left-right)*Math.max(1,series.length-1))));renderChart(id,index)}};c.onmouseleave=()=>renderChart(id);renderChart(id)}};
+const renderChart=(id,hoverIndex=null)=>{{const state=chartState.get(id),c=document.querySelector(id),ctx=c.getContext('2d'),tip=c.parentElement.querySelector('.chart-tooltip'),dpr=window.devicePixelRatio||1,cw=c.clientWidth||1100,ch=c.clientHeight||320;if(c.width!==Math.round(cw*dpr)||c.height!==Math.round(ch*dpr)){{c.width=Math.round(cw*dpr);c.height=Math.round(ch*dpr)}}ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,cw,ch);if(!state||!state.series.length){{tip.style.display='none';const empty=state&&state.options.emptyMessage;if(empty){{ctx.fillStyle=chartInk('--chart-text','#667085');ctx.font='13px Segoe UI';ctx.textAlign='center';ctx.fillText(empty,cw/2,ch/2);ctx.textAlign='left'}}return}}const {{series,lines,options}}=state,m={{left:100,right:22,top:18,bottom:48}},w=cw-m.left-m.right,h=ch-m.top-m.bottom,values=lines.flatMap(line=>series.map(row=>Number(row[line.key]))).filter(Number.isFinite),bounds=chartBounds(values,options),lo=bounds.lo,hi=bounds.hi,xFor=i=>m.left+i*w/Math.max(1,series.length-1),yFor=n=>m.top+(hi-n)*h/(hi-lo);ctx.font='12px Segoe UI';ctx.lineWidth=1;const yTicks=bounds.tickStep?Array.from({{length:Math.round((hi-lo)/bounds.tickStep)+1}},(_,i)=>hi-i*bounds.tickStep):Array.from({{length:5}},(_,i)=>hi-i*(hi-lo)/4);yTicks.forEach(value=>{{const y=yFor(value);ctx.strokeStyle=chartInk('--chart-grid','#e7ebf2');ctx.beginPath();ctx.moveTo(m.left,y);ctx.lineTo(cw-m.right,y);ctx.stroke();ctx.fillStyle=chartInk('--chart-text','#667085');ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(axis(value),m.left-9,y)}});for(let i=0;i<5;i++){{const index=Math.round(i*(series.length-1)/4),x=xFor(index);ctx.strokeStyle=chartInk('--chart-grid','#e7ebf2');ctx.beginPath();ctx.moveTo(x,m.top);ctx.lineTo(x,ch-m.bottom);ctx.stroke();ctx.fillStyle=chartInk('--chart-text','#667085');ctx.textAlign=i===0?'left':i===4?'right':'center';ctx.textBaseline='top';ctx.fillText(series[index].date,x,ch-m.bottom+9)}}ctx.strokeStyle=chartInk('--chart-text','#667085');ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(m.left,m.top);ctx.lineTo(m.left,ch-m.bottom);ctx.lineTo(cw-m.right,ch-m.bottom);ctx.stroke();ctx.fillStyle=chartInk('--chart-text','#667085');ctx.textAlign='center';ctx.textBaseline='bottom';ctx.fillText('Date',m.left+w/2,ch-2);ctx.save();ctx.translate(16,m.top+h/2);ctx.rotate(-Math.PI/2);ctx.textBaseline='middle';ctx.fillText(options.yLabel,0,0);ctx.restore();lines.forEach(line=>{{ctx.strokeStyle=line.color;ctx.lineWidth=2;ctx.beginPath();series.forEach((row,i)=>{{const x=xFor(i),y=yFor(Number(row[line.key]));i?ctx.lineTo(x,y):ctx.moveTo(x,y)}});ctx.stroke()}});if(hoverIndex!==null){{const row=series[hoverIndex],x=xFor(hoverIndex);ctx.strokeStyle=chartInk('--chart-axis','#98a2b3');ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,m.top);ctx.lineTo(x,ch-m.bottom);ctx.stroke();ctx.setLineDash([]);lines.forEach(line=>{{ctx.fillStyle=line.color;ctx.beginPath();ctx.arc(x,yFor(Number(row[line.key])),4,0,Math.PI*2);ctx.fill();ctx.strokeStyle=chartInk('--chart-point-ring','#fff');ctx.lineWidth=1.5;ctx.stroke()}});tip.innerHTML=`<strong>${{esc(row.date)}}</strong>`+lines.map(line=>`<div><span style="color:${{line.color}}">●</span> ${{esc(line.label)}}: <strong>${{exact(row[line.key])}}${{options.unit?' '+esc(options.unit):''}}</strong></div>`).join('');const cssX=x*c.clientWidth/cw;tip.style.left=(cssX>c.clientWidth*.72?cssX-205:cssX+12)+'px';tip.style.top='12px';tip.style.display='block'}}else tip.style.display='none'}};
+const draw=(id,series,lines,options={{}})=>{{chartSource.set(id,{{series,lines,options}});series=rangeSeries(id,series,options);const c=document.querySelector(id);chartState.set(id,{{series,lines,options:{{yLabel:'Value',unit:'',...options}}}});c.onmousemove=e=>{{if(!series.length)return;const r=c.getBoundingClientRect(),x=(e.clientX-r.left)*c.clientWidth/r.width,left=100,right=22,index=Math.max(0,Math.min(series.length-1,Math.round((x-left)/(c.clientWidth-left-right)*Math.max(1,series.length-1))));renderChart(id,index)}};c.onmouseleave=()=>renderChart(id);renderChart(id)}};
 let benchmarks=[];
 const loadCashActivity=async()=>{{
+document.querySelector('#cash-balances').innerHTML='';document.querySelector('#cash-asof').textContent='Loading…';document.querySelector('#cash-activity').innerHTML='';document.querySelector('#cash-export').hidden=true;
 const start=document.querySelector('#cash-from').value||historyStartDate,end=document.querySelector('#cash-to').value||document.querySelector('#asof-select').value;
 const params=new URLSearchParams({{from_date:start,to_date:end}}),result=await fetch(`/api/portfolio/${{account}}/cash?${{params}}`).then(json);
 document.querySelector('#cash-asof').textContent=result.balances_date||'No snapshot';
-document.querySelector('#cash-balances').innerHTML=result.balances.map(x=>`<div class="metric"><div class="label">${{esc(x.currency)}} ending cash</div><div class="value">${{fmt(x.ending_cash_text)}} ${{esc(x.currency)}}</div><div class="muted">Settled: ${{fmt(x.settled_cash_text)}}</div></div>`).join('')||'<div class="empty">No cash balance snapshot is available.</div>';
+document.querySelector('#cash-export').hidden=result.activity_applicable===false;document.querySelector('#cash-ledger-controls').hidden=result.activity_applicable===false;document.querySelector('#cash-ledger-table').hidden=result.activity_applicable===false;document.querySelector('#cash-kind').textContent=result.activity_applicable===false?'Model cash':'Cash balances';
+if(result.activity_applicable===false){{
+const model=result.model_cash;
+document.querySelector('#cash-balances').innerHTML=model?`<div class="metric"><div class="label">Model cash (normalized NAV units)</div><div class="value">${{fmt(model.normalized_value)}}</div><div class="muted">${{esc(model.currency_context)}} reporting context; not a currency cash balance</div></div><div class="metric"><div class="label">Share of current model NAV</div><div class="value">${{pct(model.nav_weight)}}</div></div>`:'<div class="empty">Validated model cash is unavailable.</div>';
+document.querySelector('#cash-activity').innerHTML='<tr><td colspan="6">Not applicable: this model has no independently executed cash transactions.</td></tr>';
+document.querySelector('#cash-note').textContent=result.message;return;
+}}
+document.querySelector('#cash-balances').innerHTML=result.balances.map(x=>`<div class="metric"><div class="label">${{x.currency==='BASE_SUMMARY'?'Base-currency cash summary':esc(x.currency)+' ending cash'}}</div><div class="value">${{fmt(x.ending_cash_text)}}${{x.currency==='BASE_SUMMARY'?'':' '+esc(x.currency)}}</div><div class="muted">Settled: ${{fmt(x.settled_cash_text)}}${{x.currency==='BASE_SUMMARY'?'<br>Broker base-currency aggregate; currency code not supplied.':''}}</div></div>`).join('')||'<div class="empty">No cash balance snapshot is available.</div>';
+certifiedLine(document.querySelector('#cash-balances'),result.certified);
 const cashTime=x=>{{const value=String(x.event_datetime||'');return value.includes('T')?value.split('T')[1].slice(0,8):value.includes(' ')?value.split(' ')[1].slice(0,8):''}};
 document.querySelector('#cash-activity').innerHTML=result.transactions.map(x=>`<tr><td>${{esc(x.effective_date)}}</td><td>${{esc(cashTime(x))}}</td><td>${{esc(x.transaction_type||'')}}</td><td>${{esc(x.description||'')}}</td><td>${{esc(x.currency||'')}}</td><td>${{fmt(x.amount_text)}}</td></tr>`).join('')||'<tr><td colspan="6">No cash activity occurred in this date range.</td></tr>';
 document.querySelector('#cash-note').textContent=`Showing all ${{result.total_count}} cash activities from ${{result.activity_from}} through ${{result.activity_to}}.`;
 document.querySelector('#cash-export').href=`/api/portfolio/${{account}}/export/cash-activity.csv?${{new URLSearchParams({{as_of:end,from_date:start}})}}`;
 }};
-document.querySelector('#cash-apply').addEventListener('click',()=>loadCashActivity().catch(()=>{{document.querySelector('#cash-note').textContent='Unable to load cash activity for this date range. Check that the start date is not after the end date.'}}));
+document.querySelector('#cash-apply').addEventListener('click',()=>loadCashActivity().catch(()=>{{document.querySelector('#cash-note').textContent='Cash data is unavailable or its inputs did not pass validation. Check the selected dates or contact the platform owner.'}}));
 const loadTradeHistory=async()=>{{
 const start=document.querySelector('#trade-from').value||historyStartDate,end=document.querySelector('#trade-to').value||document.querySelector('#asof-select').value,symbol=document.querySelector('#trade-symbol').value.trim(),side=document.querySelector('#trade-side').value;
 const params=new URLSearchParams({{from_date:start,to_date:end}});if(symbol)params.set('symbol',symbol);if(side)params.set('side',side);
 const result=await fetch(`/api/portfolio/${{account}}/trades?${{params}}`).then(json);
 document.querySelector('#trade-history').innerHTML=result.trades.map(x=>`<tr><td>${{esc(x.trade_date)}}</td><td>${{esc(x.trade_time||'')}}</td><td><strong>${{esc(x.symbol||x.conid||'Unknown')}}</strong><div class="muted">${{esc(x.description||x.asset_category||'')}}</div></td><td>${{esc(x.buy_sell||'')}}</td><td>${{fmt(x.quantity_text)}}</td><td>${{fmt(x.trade_price_text)}}</td><td>${{esc(x.currency||'')}}</td><td>${{fmt(x.proceeds_text)}}</td><td>${{fmt(x.commission_text)}} ${{esc(x.commission_currency||x.currency||'')}}</td><td>${{fmt(x.net_cash_text)}}</td><td>${{fmt(x.realized_pnl_text)}}</td></tr>`).join('')||'<tr><td colspan="11">No executed trades match these filters.</td></tr>';
 document.querySelector('#trade-note').textContent=result.not_applicable?result.message:`Showing ${{result.returned_count}} of ${{result.total_count}} trades from ${{result.date_from}} through ${{result.date_to}}${{result.truncated?' (screen limited to the latest 500; CSV contains the complete filtered result)':''}}.`;
-if(result.not_applicable){{document.querySelector('#trade-history').innerHTML='<tr><td colspan="11">No independently executed trades for this derived portfolio.</td></tr>';document.querySelector('#export-trades').hidden=true;document.querySelector('#trade-apply').disabled=true;}}
+if(result.not_applicable){{document.querySelector('#trade-source-title').textContent='Derived portfolio — no independently executed trades';document.querySelector('#trade-source-note').textContent=result.message;document.querySelector('#trade-filter-controls').hidden=true;document.querySelector('#trade-history').innerHTML='<tr><td colspan="11">No independently executed trades for this derived portfolio.</td></tr>';document.querySelector('#export-trades').hidden=true;document.querySelector('#trade-apply').disabled=true;}}
 const exportParams=new URLSearchParams({{as_of:end,from_date:start}});if(symbol)exportParams.set('symbol',symbol);if(side)exportParams.set('side',side);document.querySelector('#export-trades').href=`/api/portfolio/${{account}}/export/trades.csv?${{exportParams}}`;
 }};
 document.querySelector('#trade-apply').addEventListener('click',()=>loadTradeHistory().catch(()=>{{document.querySelector('#trade-note').textContent='Unable to load trade history for these filters.'}}));
@@ -10335,7 +11428,7 @@ const asOf=document.querySelector('#asof-select').value,start=document.querySele
 const params=new URLSearchParams({{as_of:asOf}});if(start)params.set('start',start);if(end)params.set('end',end);
 const flowParams=new URLSearchParams({{from_date:start||historyStartDate,to_date:end||asOf}});
 const [r,f]=await Promise.all([fetch(`/api/portfolio/${{account}}/performance/periods?${{params}}`).then(json),fetch(`/api/portfolio/${{account}}/flows?${{flowParams}}`).then(json)]);
-document.querySelector('#period-returns').innerHTML=r.periods.map(periodRow).join('')||'<tr><td colspan="7">No NAV history is available on or before this date.</td></tr>';
+document.querySelector('#period-returns').innerHTML=r.periods.map(periodRow).join('')||'<tr><td colspan="7">No NAV history is available on or before this date.</td></tr>';certifiedLine(document.querySelector('#period-returns'),r.certified);
 document.querySelector('#period-custom').innerHTML=r.custom?periodRow(r.custom):'<tr><td colspan="7">Choose a start and end date, then calculate a custom period.</td></tr>';
 document.querySelector('#period-note').textContent=`Returns through ${{r.effective_as_of||'—'}} in ${{r.currency}}. Each period is valued from the last NAV before it starts to the last NAV on or before it ends. * Period under one year: the annualised IRR extrapolates a short-period result. ${{r.flows_message||''}}`;
 document.querySelector('#flows-totals').innerHTML=f.applicable?[['Contributions',f.totals.flows_in],['Withdrawals',f.totals.flows_out],['Net external flow',f.totals.net]].map(x=>`<div class="metric"><div class="label">${{esc(x[0])}}</div><div class="value">${{fmt(x[1])}} ${{esc(f.currency)}}</div></div>`).join(''):'';
@@ -10346,43 +11439,58 @@ document.querySelector('#period-apply').addEventListener('click',()=>loadPerform
 const renderBenchmark=async(id,meta,asOf)=>{{
 const query=`benchmark_id=${{encodeURIComponent(id)}}&as_of=${{encodeURIComponent(asOf)}}`;
 const bc=await fetch(`/api/portfolio/${{account}}/benchmark-comparison?${{query}}`).then(json);
-document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':'Secondary'}} · ${{meta.return_basis_label||meta.return_convention}}`;
+document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':meta.mapping_type==='comparison'?'Comparison':'Secondary'}} · ${{meta.return_basis_label||meta.return_convention}}`;
 document.querySelector('#benchmark-legend').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.return_basis==='price_return'?'price return':meta.return_basis==='total_return'?'total return':meta.return_convention}}`;
 document.querySelector('#benchmark-note').textContent=meta.message+`${{meta.return_basis==='price_return'?' The benchmark is a price index: its returns exclude dividends, while portfolio returns include income, so the comparison favours the portfolio by the index dividend yield.':''}} Provider: ${{meta.provider||'—'}} · Convention: ${{meta.return_convention}} · License: ${{meta.license_status}} · Provisional observations: ${{meta.provisional_observations}} · Latest feed observation: ${{meta.latest_provisional_observation||'—'}}`;
-document.querySelector('#benchmark-metrics').innerHTML='';
-draw('#benchmark-chart',[],[]);
+document.querySelector('#benchmark-metrics').innerHTML='';certifiedLine(document.querySelector('#benchmark-metrics'),null);
+draw('#benchmark-chart',[],[],{{emptyMessage:bc.available?'':'No validated comparison is available for this benchmark and date.'}});certifiedLine(document.querySelector('#benchmark-chart'),null);renderRollingBenchmark(null);
 if(bc.available){{
 const m=bc.metrics,items=[['Portfolio total return',pct(m.portfolio_total_return)],['Benchmark total return',pct(m.benchmark_total_return),bc.benchmark_return_basis==='price_return'?'Benchmark price return (excludes dividends)':undefined],['Excess total return',pct(m.excess_total_return),bc.benchmark_return_basis==='price_return'?'Excess return vs price index':undefined],['Tracking error',pct(m.tracking_error)],['Information ratio',m.information_ratio==null?'—':fmt(m.information_ratio)],['Beta',m.beta==null?'—':fmt(m.beta)],['Correlation',m.correlation==null?'—':fmt(m.correlation)],['Relative win rate',pct(m.relative_win_rate)]];
 document.querySelector('#benchmark-note').textContent+=` Aligned comparison: ${{m.period_start}} through ${{m.period_end}} · Reporting currency: ${{bc.reporting_currency}} · ${{m.observations}} common-date observations. Rebased to 100 at the first common observation; unmatched market dates are not filled.`;
-document.querySelector('#benchmark-metrics').innerHTML=items.map(metricCard).join('');
-draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}})
+document.querySelector('#benchmark-metrics').innerHTML=items.map(metricCard).join('');certifiedLine(document.querySelector('#benchmark-metrics'),bc.certified);
+renderRollingBenchmark(bc);
+draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}});
+certifiedLine(document.querySelector('#benchmark-chart'),chartsFor(bc.certified_charts,['series.portfolio_daily_return','series.benchmark_daily_return'],'Vs benchmark'))
 }}
 }};
-const mergeRiskResponses=(core,details)=>{{const risk={{...core,...details}};if(core.cache_status!=='hit'||details.cache_status!=='hit'||core.snapshot_payload_sha256!==details.snapshot_payload_sha256){{risk.metrics={{}};risk.risk_free=null;risk.expected_tail_loss_contributors={{top:[],bottom:[]}};risk.crisis_replay=null;risk.cache_status='unavailable';risk.message=core.message||details.message||'Risk cache changed during this request; refresh to load one validated version.';}}return risk;}};
+{RISK_DISPLAY_SCRIPT}
+const mergeRiskResponses=(core,details)=>{{const risk={{...core,...details}};if(core.cache_status!=='hit'||details.cache_status!=='hit'||core.snapshot_payload_sha256!==details.snapshot_payload_sha256){{risk.metrics={{}};risk.analytics_evidence={{}};risk.risk_free=null;risk.expected_tail_loss_contributors={{top:[],bottom:[]}};risk.crisis_replay=null;risk.cache_status='unavailable';risk.message=core.message||details.message||'Risk cache changed during this request; refresh to load one validated version.';}}return risk;}};
+{ACCOUNT_UI_SCRIPT}
+{ANALYTICS_SCRIPT}
+{MODELLING_SCRIPT}
 const renderAsOf=async asOf=>{{
 const grid=document.querySelector('#portfolio-grid');grid.classList.add('loading');
 try{{
 const suffix=`?as_of=${{encodeURIComponent(asOf)}}`;
-const performanceRequest=activeSection==='performance'?fetch(`/api/portfolio/${{account}}/performance${{suffix}}`).then(json):Promise.resolve({{series:[]}});
-const holdingsRequest=activeSection==='holdings'?fetch(`/api/portfolio/${{account}}/holdings${{suffix}}`).then(json):Promise.resolve({{snapshot_date:null,holdings:[]}});
-const riskRequest=activeSection==='risk'?fetch(`/api/portfolio/${{account}}/risk${{suffix}}`).then(json):Promise.resolve({{as_of:asOf,metrics:{{}},risk_free:null,message:'Open Risk analytics to view the validated risk snapshot.'}});
-const riskDetailsRequest=activeSection==='risk'?fetch(`/api/portfolio/${{account}}/risk/details${{suffix}}`).then(json):Promise.resolve({{expected_tail_loss_contributors:{{top:[],bottom:[]}},crisis_replay:null}});
+pageError('');
+const performanceRequest=activeSection==='performance'?fetch(`/api/portfolio/${{account}}/performance${{suffix}}`).then(json).catch(()=>({{series:[],failed:true}})):Promise.resolve({{series:[]}});
+const holdingsRequest=activeSection==='holdings'?fetch(`/api/portfolio/${{account}}/holdings${{suffix}}`).then(json).catch(()=>({{snapshot_date:null,holdings:[],failed:true}})):Promise.resolve({{snapshot_date:null,holdings:[]}});
+const riskRequest=activeSection==='risk'?fetch(`/api/portfolio/${{account}}/risk${{suffix}}`).then(json).catch(()=>({{as_of:asOf,metrics:{{}},risk_free:null,message:'The risk snapshot could not be loaded for this date. Refresh the page or pick another As of date.'}})):Promise.resolve({{as_of:asOf,metrics:{{}},risk_free:null,message:'Open Risk analytics to view the validated risk snapshot.'}});
+const riskDetailsRequest=activeSection==='risk'?fetch(`/api/portfolio/${{account}}/risk/details${{suffix}}`).then(json).catch(()=>({{expected_tail_loss_contributors:{{top:[],bottom:[]}},crisis_replay:null,crisis_scenarios:null}})):Promise.resolve({{expected_tail_loss_contributors:{{top:[],bottom:[]}},crisis_replay:null,crisis_scenarios:null}});
 const healthRequest=Promise.resolve({{environment:'staging',status:'available',message:'Open System health for platform-wide diagnostics.',latest_run:{{}},portfolio:{{}},portfolio_analyst_assurance:{{}},burn_in:{{}},burn_in_recent_results:[]}});
 const [s,p,h,riskCore,riskDetails,health]=await Promise.all([fetch(`/api/portfolio/${{account}}/summary${{suffix}}`).then(json),performanceRequest,holdingsRequest,riskRequest,riskDetailsRequest,healthRequest]);
 const risk=activeSection==='risk'?mergeRiskResponses(riskCore,riskDetails):{{...riskCore,...riskDetails}};
 if(!s.latest_nav)throw new Error('No NAV is available on or before this date');
-document.querySelector('#nav').textContent=fmt(s.latest_nav.total_text)+' '+s.latest_nav.currency;
-document.querySelector('#obs').textContent=s.nav_coverage.observations;
+document.querySelector('#nav').textContent=money(s.latest_nav.total_text)+' '+s.latest_nav.currency;
 document.querySelector('#positions').textContent=s.current_positions;
+if(activeSection==='overview')await renderOverview(asOf,s);
+if(activeSection==='holdings'){{void renderSectors(asOf);renderConcentration(h)}}
+if(activeSection==='performance'||activeSection==='risk')void renderAnalytics(asOf);
+if(activeSection==='trades')void renderTradingActivity(asOf);
+if(activeSection==='risk')void renderCorrelation(asOf);
+if(activeSection==='modelling')renderModelling(asOf);
 document.querySelector('#holdings-asof').textContent=h.snapshot_date||'No snapshot';
 document.querySelector('#holdings-quantity-label').textContent=h.holdings.some(x=>x.holding_kind==='synthetic_exposure')?'Sleeve coefficient (not shares)':'Quantity';
 document.querySelector('#holdings-reporting-currency').textContent=h.reporting_currency||reportingCurrency;
-document.querySelector('#holdings').innerHTML=h.holdings.map(x=>`<tr><td>${{esc(x.symbol||x.conid)}}</td><td>${{esc(x.description||'')}}</td><td>${{esc(x.sector||'')}}</td><td>${{esc(x.currency||'')}}</td><td>${{fmt(x.holding_kind==='synthetic_exposure'?x.coefficient:x.quantity_text)}}</td><td>${{fmt(x.market_value_text)}}</td><td>${{x.fx_missing?'<span class="muted" title="No dated FX rate is available for this currency">FX unavailable</span>':fmt(x.reporting_market_value_text)}}</td><td>${{fmt(x.cost_basis_text)}}</td><td>${{fmt(x.unrealized_pnl_text)}}</td><td>${{pct(x.unrealized_pnl_pct)}}</td><td>${{pct(x.weight)}}</td></tr>`).join('')||'<tr><td colspan="11">No holdings snapshot is available on or before this date.</td></tr>';
-document.querySelector('#holdings-note').textContent=h.weight_basis?`Cost basis and unrealized P&L are in each holding's own currency. Value is converted to ${{h.reporting_currency}} with the dated FX rate on or before the holdings date. Weight basis: ${{h.weight_basis==='nav'?'net asset value':'gross holdings value (NAV unavailable for this date)'}}.${{(h.fx_missing_conids||[]).length?` ${{h.fx_missing_conids.length}} holding(s) have no usable FX rate and are excluded from weights.`:''}}`:'';
+document.querySelector('#holdings').innerHTML=holdingsRows(h);certifiedLine(document.querySelector('#holdings'),h.certified);
+if(h.failed)document.querySelector('#holdings-asof').textContent='unavailable';
+document.querySelector('#holdings-note').textContent=h.weight_basis?`Cost basis and unrealized P&L are in each holding's own currency. Value is converted to ${{h.reporting_currency}} with the dated FX rate on or before the holdings date. Weight basis: ${{h.weight_basis==='nav'?'net asset value':'gross holdings value (NAV unavailable for this date)'}}.${{(h.fx_missing_conids||[]).length?` ${{h.fx_missing_conids.length}} holding(s) have no usable FX rate and are excluded from weights.`:''}} RSI (14) is Wilder's 14-day relative strength index from each holding's daily closing marks; above 70 is marked overbought and below 30 oversold.`:h.failed?'Holdings could not be loaded for this date. Refresh the page or pick another As of date.':'';
 const rm=risk.metrics||{{}},riskItems=[['Total return',pct(rm.total_return)],['Annualized return',pct(rm.annualized_return)],['Annualized volatility',pct(rm.annualized_volatility)],['Risk-free rate',rm.risk_free_annual_rate==null?'Unavailable':pct(rm.risk_free_annual_rate)],['Sharpe ratio',rm.sharpe_ratio==null?'Unavailable':fmt(rm.sharpe_ratio)],['Expected maximum drawdown (1 year)',rm.expected_maximum_drawdown_1y==null?'Unavailable':pct(rm.expected_maximum_drawdown_1y)],['Actual maximum drawdown (1 year)',rm.actual_maximum_drawdown_1y==null?'Unavailable':pct(rm.actual_maximum_drawdown_1y)],['Tail maximum drawdown (1 year)',rm.tail_maximum_drawdown_1y==null?'Unavailable':pct(rm.tail_maximum_drawdown_1y)],['Crisis maximum drawdown (15/9/2008–9/3/2009)',rm.crisis_maximum_drawdown==null?'Unavailable':pct(rm.crisis_maximum_drawdown)],['VaR 95% — daily',pct(rm.var_95_daily)],['Daily Expected Tail Loss (95%)',pct(rm.daily_expected_tail_loss)],['Win rate',pct(rm.win_rate)],['BLUE mean daily return',pct(rm.blue_mean_daily_return)]];
-document.querySelector('#risk-asof').textContent=rm.period_end||risk.as_of||'—';document.querySelector('#risk-metrics').innerHTML=riskItems.map(metricCard).join('');const etl=risk.expected_tail_loss_contributors||{{}},contributorRows=items=>items.map(x=>`<tr><td><strong>${{esc(x.symbol||x.conid)}}</strong><div class="muted">${{esc(x.description||'')}}</div></td><td>${{pct(x.expected_tail_loss_contribution)}}</td></tr>`).join('')||'<tr><td colspan="2">Unavailable</td></tr>';document.querySelector('#etl-top').innerHTML=contributorRows(etl.top||[]);document.querySelector('#etl-bottom').innerHTML=contributorRows(etl.bottom||[]);document.querySelector('#etl-note').innerHTML=`ETL contributors use unchanged carried USD positions on ${{etl.tail_observations||0}} portfolio tail days. Positive values added to loss; negative values offset loss. Residual from cash, fees, FX, trades and unmatched positions: ${{pct(etl.residual_contribution)}}. <a class="metric-guide-inline" href="${{esc(metricGuideHref('ETL residual contribution'))}}">Read the residual-contribution explanation <span aria-hidden="true">↗</span></a>`;const rf=risk.risk_free,cr=risk.crisis_replay;const crisisNote=cr?` Crisis drawdown is a hypothetical fixed-unit replay of holdings as of ${{cr.holdings_as_of}} from 15 September 2008 through 9 March 2009 using adjusted closes: ${{cr.direct_components}} direct holdings and ${{cr.proxy_components}} recorded sector or broad-market proxies; cash weight ${{pct(cr.cash_weight)}} remains flat and there is no rebalancing. Provider: ${{cr.provider}}; approved for internal and shareholder analysis, but not client distribution.`:' Crisis drawdown is unavailable until the current-holdings replay and its proxy data pass validation.';document.querySelector('#risk-note').textContent=risk.message+` Validated return intervals: ${{rm.return_observations||0}} from ${{rm.observations||0}} aligned valuations (the first valuation is a starting point, not a return) · Daily ETL is historical 95% expected shortfall. One-year expected and tail maximum drawdown use ${{rm.drawdown_simulation_paths||0}} deterministic five-day moving-block bootstrap paths of ${{rm.drawdown_horizon_sessions||252}} sessions.`+crisisNote+` · Calculation: benchmark-comparison-v1.`+(rf?` Risk-free source: ${{rf.provider}} · ${{rf.tenor}} · observation ${{rf.rate_date}}.`:'');
-const run=health.latest_run||{{}},portfolio=health.portfolio||{{}},assurance=health.portfolio_analyst_assurance||{{}},assuranceResult=assurance.result_json||{{}},burnIn=health.burn_in||{{}},burnResults=health.burn_in_recent_results||[];document.querySelector('#health-status').innerHTML=[['Environment',health.environment],['Status',health.status],['Latest portfolio date',portfolio.latest_date||'—'],['Latest successful run',run.completed_at||'—']].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1]||'—')}}</strong></div>`).join('');document.querySelector('#health-note').textContent=health.message;document.querySelector('#assurance-status').textContent=assurance.status?assurance.status.toUpperCase():'Awaiting first run';document.querySelector('#assurance-summary').innerHTML=[['Assurance date',assurance.assurance_date||'—'],['Portfolio as of',assurance.as_of_date||'—'],['Checks passed',assurance.checks_passed??0],['Warnings / failures',`${{assurance.checks_warned??0}} / ${{assurance.checks_failed??0}}`]].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1])}}</strong></div>`).join('');document.querySelector('#assurance-note').textContent=assuranceResult.model_review?.summary||'The daily assurance job independently reconciles portfolio data, analytics, report integrity and the approved August layouts.';document.querySelector('#burn-in-status').textContent=burnIn.status?burnIn.status.toUpperCase():'Not started';document.querySelector('#burn-in-summary').innerHTML=[['Start date',burnIn.start_date||'—'],['Consecutive passing days',`${{burnIn.consecutive_pass_days??0}} / ${{burnIn.required_consecutive_days??14}}`],['Earliest completion',burnIn.earliest_completion_date||'—'],['Last result',burnIn.last_result_date||'Awaiting Day 1'],['Last failure',burnIn.last_failure_date||'None']].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1])}}</strong></div>`).join('');document.querySelector('#burn-in-results').innerHTML=burnResults.length?'<h3>Recent daily acceptance results</h3>'+burnResults.map(x=>`<p><strong>${{esc(x.result_date)}} — ${{esc(x.status.toUpperCase())}}</strong><br><span class="muted">Checked ${{esc(x.checked_at)}}</span></p>`).join(''):'<p>No formal Stage 4 result has been recorded yet.</p>';
-if(account==='alpha-world-ms'){{
+document.querySelector('#risk-asof').textContent=rm.period_end||risk.as_of||'—';document.querySelector('#risk-metrics').innerHTML=riskItems.map(metricCard).join('');certifiedLine(document.querySelector('#risk-metrics'),risk.certified);const etl=risk.expected_tail_loss_contributors||{{}},contributorRows=items=>items.map(x=>`<tr><td><strong>${{esc(x.symbol||x.conid)}}</strong><div class="muted">${{esc(x.description||'')}}</div></td><td>${{pct(x.expected_tail_loss_contribution)}}</td></tr>`).join('')||'<tr><td colspan="2">Unavailable</td></tr>';document.querySelector('#etl-top').innerHTML=contributorRows(etl.top||[]);document.querySelector('#etl-bottom').innerHTML=contributorRows(etl.bottom||[]);const displayNotes=riskDisplayNotes(risk,pct);document.querySelector('#etl-note').textContent=displayNotes.attribution;document.querySelector('#risk-note').textContent=displayNotes.risk;
+const cs=risk.crisis_scenarios;document.querySelector('#crisis-scenarios-card').hidden=!cs;document.querySelector('#crisis-scenarios').innerHTML=cs&&(cs.scenarios||[]).length?cs.scenarios.map(x=>`<tr><td><strong>${{esc(x.label)}}</strong></td><td>${{esc(x.crisis_start)}} to ${{esc(x.crisis_end)}}</td><td>${{x.available?pct(x.maximum_drawdown):'Unavailable'}}${{x.available?'':`<div class="muted">${{esc(x.reason||'')}}</div>`}}</td><td>${{x.available?`${{x.proxy_components||0}} (${{x.scaled_components||0}})`:'—'}}</td></tr>`).join(''):'<tr><td colspan="4">Not calculated yet</td></tr>';document.querySelector('#crisis-scenarios-note').textContent=cs?`Holdings as of ${{cs.holdings_as_of}}, in ${{cs.reporting_currency||'—'}}. ${{cs.limitations||''}}`:'Crisis scenarios are not available for this portfolio yet.';
+if(displayNotes.attributionAvailable){{const guide=document.createElement('a');guide.className='metric-guide-inline';guide.href=metricGuideHref('ETL residual contribution');guide.textContent=' Read the residual-contribution explanation ↗';document.querySelector('#etl-note').appendChild(guide);}}
+const run=health.latest_run||{{}},portfolio=health.portfolio||{{}},assurance=health.portfolio_analyst_assurance||{{}},assuranceResult=assurance.result_json||{{}},burnIn=health.burn_in||{{}},burnResults=health.burn_in_recent_results||[];document.querySelector('#health-status').innerHTML=[['Environment',health.environment],['Status',health.status],['Latest portfolio date',portfolio.latest_date||'—'],['Latest successful run',run.completed_at||'—']].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1]||'—')}}</strong></div>`).join('');document.querySelector('#health-note').textContent=health.message;document.querySelector('#assurance-status').textContent=assurance.status?assurance.status.toUpperCase():'Awaiting first run';document.querySelector('#assurance-summary').innerHTML=[['Assurance date',assurance.assurance_date||'—'],['Portfolio as of',assurance.as_of_date||'—'],['Checks passed',assurance.checks_passed??0],['Warnings / failures',`${{assurance.checks_warned??0}} / ${{assurance.checks_failed??0}}`]].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1])}}</strong></div>`).join('');document.querySelector('#assurance-note').textContent=assuranceResult.model_review?.summary||'The daily assurance job independently reconciles portfolio data, analytics, report integrity and the approved August layouts.';document.querySelector('#burn-in-status').textContent=burnIn.status?burnIn.status.toUpperCase():'Not started';document.querySelector('#burn-in-summary').innerHTML=[['Start date',burnIn.start_date||'—'],['Consecutive passing days',`${{burnIn.consecutive_pass_days??0}} / ${{burnIn.required_consecutive_days??14}}`],['Original earliest completion',burnIn.earliest_completion_date||'—'],['Last result',burnIn.last_result_date||'Awaiting Day 1'],['Last failure',burnIn.last_failure_date||'None']].map(x=>`<div class="status-item"><span class="label">${{esc(x[0])}}</span><strong>${{esc(x[1])}}</strong></div>`).join('');document.querySelector('#burn-in-results').innerHTML=burnResults.length?'<h3>Recent daily acceptance results</h3>'+burnResults.map(x=>`<p><strong>${{esc(x.result_date)}} — ${{esc(x.status.toUpperCase())}}</strong><br><span class="muted">Checked ${{esc(x.checked_at)}}</span></p>`).join(''):'<p>No formal Stage 4 result has been recorded yet.</p>';
+if(account==='alpha-world-ms'&&!risk.runtime_version){{
  document.querySelector('#etl-note').textContent='Security-level tail attribution is not qualified for this synthetic composite; no USD-position attribution is substituted.';
  const evidence=risk.analytics_evidence||{{}},rate=risk.risk_free;
  document.querySelector('#risk-note').textContent=(risk.message||'MS risk results are unavailable.')+(risk.cache_status==='hit'?` HKD NAV period: ${{evidence.start}} to ${{evidence.end}}. Valid daily intervals: ${{evidence.daily_return_observations}}. Risk-free rate: 1M HIBOR, inception-to-valuation average of ${{rate?.observation_count||0}} published fixings. One-year drawdown, crisis replay and HIBOR + Spread benchmark comparison remain unqualified. Methodology: ${{evidence.version}}.`:'');
@@ -10392,20 +11500,22 @@ if(account==='alpha-world-ms'){{
   document.querySelector('#risk-metrics').innerHTML=msItems.map(metricCard).join('');
  }}
 }}
-[['#export-performance','performance'],['#export-holdings','holdings'],['#export-cash','cash-activity']].forEach(x=>document.querySelector(x[0]).href=`/api/portfolio/${{account}}/export/${{x[1]}}.csv?as_of=${{encodeURIComponent(asOf)}}`);
-const cashFrom=document.querySelector('#cash-from'),cashTo=document.querySelector('#cash-to');if(!cashFrom.value)cashFrom.value=historyStartDate;cashFrom.max=asOf;cashTo.max=asOf;cashTo.value=asOf;if(cashFrom.value>asOf)cashFrom.value=historyStartDate;if(activeSection==='cash')await loadCashActivity();
-const tradeFrom=document.querySelector('#trade-from'),tradeTo=document.querySelector('#trade-to');if(!tradeFrom.value)tradeFrom.value=historyStartDate;tradeTo.max=asOf;tradeTo.value=asOf;if(tradeFrom.value>asOf)tradeFrom.value=historyStartDate;if(activeSection==='trades')await loadTradeHistory();
-draw('#chart',p.series,[{{key:'nav',color:chartColors.portfolio,label:`${{accountDisplayName}} NAV`}}],{{yLabel:`NAV (${{reportingCurrency}})`,unit:reportingCurrency,niceYTicks:true,targetYIntervals:8}});
+[['#export-performance','performance'],['#export-holdings','holdings'],['#export-cash','cash-activity']].forEach(x=>document.querySelector(x[0]).href=`/api/portfolio/${{account}}/export/${{x[1]}}.csv?as_of=${{encodeURIComponent(asOf)}}`);const tradeCsv=document.querySelector('#export-trades-csv');if(tradeCsv)tradeCsv.href=`/api/portfolio/${{account}}/export/trades.csv?as_of=${{encodeURIComponent(asOf)}}`;
+const cashFrom=document.querySelector('#cash-from'),cashTo=document.querySelector('#cash-to');if(!cashFrom.value)cashFrom.value=historyStartDate;cashFrom.max=asOf;cashTo.max=asOf;cashTo.value=asOf;if(cashFrom.value>asOf)cashFrom.value=historyStartDate;if(activeSection==='cash')await loadCashActivity().catch(()=>{{document.querySelector('#cash-note').textContent='Cash activity could not be loaded for this date. Refresh the page or pick another As of date.'}});
+const tradeFrom=document.querySelector('#trade-from'),tradeTo=document.querySelector('#trade-to');if(!tradeFrom.value)tradeFrom.value=historyStartDate;tradeTo.max=asOf;tradeTo.value=asOf;if(tradeFrom.value>asOf)tradeFrom.value=historyStartDate;if(activeSection==='trades')await loadTradeHistory().catch(()=>{{document.querySelector('#trade-note').textContent='Trade history could not be loaded for this date. Refresh the page or pick another As of date.'}});
+draw('#chart',p.series,[{{key:'nav',color:chartColors.portfolio,label:`${{accountDisplayName}} NAV`}}],{{yLabel:`NAV (${{reportingCurrency}})`,unit:reportingCurrency,niceYTicks:true,targetYIntervals:8,emptyMessage:p.failed?'NAV history could not be loaded for this date.':'No NAV history up to this date.'}});
 const benchmarkSelect=document.querySelector('#benchmark-select'),selected=benchmarks.find(x=>x.benchmark_id===benchmarkSelect.value);
-if(activeSection==='performance'&&selected)await renderBenchmark(selected.benchmark_id,selected,asOf);
+if(activeSection==='performance'&&selected)await renderBenchmark(selected.benchmark_id,selected,asOf).catch(()=>{{document.querySelector('#benchmark-note').textContent='This benchmark comparison could not be loaded for this date.';draw('#benchmark-chart',[],[],{{emptyMessage:'The benchmark comparison could not be loaded.'}})}});
+if(activeSection==='risk'){{if(selected)fetch(`/api/portfolio/${{account}}/benchmark-comparison?benchmark_id=${{encodeURIComponent(selected.benchmark_id)}}&as_of=${{encodeURIComponent(asOf)}}`).then(json).then(bc=>renderRollingBenchmark(bc.available?bc:null)).catch(()=>renderRollingBenchmark(null));else renderRollingBenchmark(null)}}
 const periodFrom=document.querySelector('#period-from'),periodTo=document.querySelector('#period-to');periodFrom.max=asOf;periodTo.max=asOf;if(periodTo.value>asOf)periodTo.value=asOf;if(periodFrom.value>asOf)periodFrom.value='';
 if(activeSection==='performance')await loadPerformancePeriods().catch(()=>{{document.querySelector('#period-note').textContent='Period returns are unavailable for this date.'}})
 }}finally{{grid.classList.remove('loading')}}
 }};
-const autonomyRequest=portalOwner?fetch('/api/system/autonomous-administrator').then(json):Promise.resolve({{status:'viewer_restricted',control:{{}},latest_run:{{}},open_incidents:[],recent_actions:[],last_known_good:{{}},recovery:{{}},authority_reviews:[]}});
-const agentRequest=previewMode?Promise.resolve({{tools:[],ai_model:{{enabled:false,message:'AI analysis remains disabled until this account passes activation.'}},admin_actions:{{enabled:false,message:'Use the platform Administration page for approved actions.',approval_ttl_minutes:10,actions:[]}}}}):fetch('/api/agent/tools').then(json);
-const reportsRequest=previewMode?Promise.resolve({{message:'Monthly reporting remains disabled until account-specific templates and calculations pass validation.',ready_months:0,review_ready_months:0,months:[]}}):fetch(`/api/accounts/${{encodeURIComponent(account)}}/reporting/monthly`).then(json);
-Promise.all([fetch(`/api/portfolio/${{account}}/available-dates`).then(json),fetch(`/api/portfolio/${{account}}/benchmark-status`).then(json),agentRequest,reportsRequest,autonomyRequest]).then(async([d,b,a,reports,autonomy])=>{{
+const autonomyFallback={{status:'viewer_restricted',control:{{}},latest_run:{{}},open_incidents:[],recent_actions:[],last_known_good:{{}},recovery:{{}},authority_reviews:[]}};
+const autonomyRequest=portalOwner?fetch('/api/system/autonomous-administrator').then(json).catch(()=>autonomyFallback):Promise.resolve({{status:'viewer_restricted',control:{{}},latest_run:{{}},open_incidents:[],recent_actions:[],last_known_good:{{}},recovery:{{}},authority_reviews:[]}});
+const agentRequest=previewMode?Promise.resolve({{tools:[],ai_model:{{enabled:false,message:'AI analysis remains disabled until this account passes activation.'}},admin_actions:{{enabled:false,message:'Use the platform Administration page for approved actions.',approval_ttl_minutes:10,actions:[]}}}}):fetch('/api/agent/tools').then(json).catch(()=>({{tools:[],ai_model:{{enabled:false,message:'The AI analyst could not be reached. Refresh the page to try again.'}},admin_actions:{{enabled:false,message:'Approved actions could not be loaded. Refresh the page to try again.',approval_ttl_minutes:10,actions:[]}}}}));
+const reportsRequest=previewMode?Promise.resolve({{message:'Monthly reporting remains disabled until account-specific templates and calculations pass validation.',ready_months:0,review_ready_months:0,months:[]}}):fetch(`/api/accounts/${{encodeURIComponent(account)}}/reporting/monthly`).then(json).catch(()=>({{message:'Monthly reports could not be loaded. Refresh the page to try again.',ready_months:0,review_ready_months:0,months:[]}}));
+Promise.all([fetch(`/api/portfolio/${{account}}/available-dates`).then(json),fetch(`/api/portfolio/${{account}}/benchmark-status`).then(json).catch(()=>({{benchmarks:[],failed:true}})),agentRequest,reportsRequest,autonomyRequest]).then(async([d,b,a,reports,autonomy])=>{{
 const asOfSelect=document.querySelector('#asof-select'),benchmarkSelect=document.querySelector('#benchmark-select');
 if(!d.dates.length)throw new Error('No portfolio dates are available');
 const reportMonth=document.querySelector('#report-month'),reportPrepare=document.querySelector('#report-prepare'),reportStatus=document.querySelector('#report-status'),reportDownloads=document.querySelector('#report-downloads');
@@ -10418,7 +11528,7 @@ const selectedReportTypes=()=>Array.from(reportReleaseList.querySelectorAll('inp
 const updateReleaseButton=()=>{{if(!releasePreview){{reportRelease.disabled=true;return}}const selected=new Set(selectedReportTypes()),current=new Set(releasePreview.approved_types),changed=selected.size!==current.size||Array.from(selected).some(kind=>!current.has(kind)),adds=Array.from(selected).some(kind=>!current.has(kind));reportRelease.disabled=!changed||(adds&&!releasePreview.release_eligible);reportReleaseStatus.textContent=!changed?'No changes selected.':adds&&!releasePreview.release_eligible?'New approval is blocked: '+String(releasePreview.release_blocker||'validation unavailable').slice(0,220):'Ready to submit the selected file approvals.'}};
 reportReleaseList.addEventListener('change',updateReleaseButton);
 const loadReportChecklist=async()=>{{const request=++reportReviewRequest,period=reportMonth.value;releasePreview=null;reportRelease.disabled=true;reportReleaseList.innerHTML='';reportReleaseDetails.textContent='';reportReleaseStatus.textContent='Loading file approval status…';try{{const response=await fetch(`/api/accounts/${{encodeURIComponent(account)}}/reporting/monthly/${{encodeURIComponent(period)}}/release-preview`),payload=await response.json();if(!response.ok)throw new Error(typeof payload.detail==='string'?payload.detail:`HTTP ${{response.status}}`);if(request!==reportReviewRequest)return;releasePreview=payload;reportReleaseDetails.textContent=`${{payload.subject_id}} · ${{payload.period_end}} · Internal/shareholder use only`;reportReleaseList.innerHTML=payload.artifacts.map(item=>{{const url=`/api/accounts/${{encodeURIComponent(account)}}/reporting/review-artifacts/${{item.generation_run_id}}/download`;return `<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px;border:1px solid #dce2eb;border-radius:14px;flex-wrap:wrap"><label style="display:flex;align-items:center;gap:10px"><input type="checkbox" data-report-type="${{esc(item.report_type)}}" ${{item.approved?'checked':''}}><span><strong>${{esc(item.label)}}</strong><br><small>${{item.approved?'Released to authorized users':'Not released'}}</small></span></label><a href="${{esc(url)}}">Review / download file</a></div>`}}).join('');updateReleaseButton()}}catch(error){{if(request===reportReviewRequest)reportReleaseStatus.textContent='File checklist unavailable: '+String(error.message||'validation unavailable').slice(0,220)}}}};
-const updateReportMonth=async()=>{{const selected=reports.months.find(x=>x.period_end===reportMonth.value);reportDownloads.innerHTML='';releasePreview=null;reportReleaseList.innerHTML='';reportReleaseDetails.textContent='';reportReleaseStatus.textContent='';reportRelease.disabled=true;reportOwnerReview.style.display=portalOwner&&selected?.downloadable?'block':'none';if(!selected){{reportPrepare.disabled=true;reportStatus.textContent='No frozen month-end snapshot is available.';return}}reportPrepare.disabled=!selected.downloadable;reportStatus.textContent=selected.replacement_pending?`Previously approved ${{selected.period_end}} files remain available. Corrected inputs do not approve replacement files; replacements require a separate owner decision.`:selected.ready?`The ${{selected.period_end}} files are internally released.`:selected.partially_released?`Some ${{selected.period_end}} files are released; the owner can change each file below.`:selected.review_ready?`The ${{selected.period_end}} files are ready for owner review.`:`The ${{selected.period_end}} frozen snapshot exists, but its PDF and PowerPoint are not both available yet.`;if(portalOwner&&selected.downloadable)await loadReportChecklist()}};
+const updateReportMonth=async()=>{{const selected=reports.months.find(x=>x.period_end===reportMonth.value);reportDownloads.innerHTML='';releasePreview=null;reportReleaseList.innerHTML='';reportReleaseDetails.textContent='';reportReleaseStatus.textContent='';reportRelease.disabled=true;reportOwnerReview.style.display=portalOwner&&selected?.downloadable?'block':'none';if(!selected){{reportPrepare.disabled=true;reportStatus.textContent='No frozen month-end snapshot is available.';return}}reportPrepare.disabled=!selected.downloadable;reportStatus.textContent=selected.replacement_pending?`Previously approved ${{selected.period_end}} files remain available. Corrected inputs do not approve replacement files; replacements require a separate owner decision.`:selected.ready?`The ${{selected.period_end}} files are internally released.`:selected.partially_released?`Some ${{selected.period_end}} files are released; the owner can change each file below.`:selected.review_ready?`The ${{selected.period_end}} files are ready for owner review.`:`The ${{selected.period_end}} frozen snapshot exists, but its factsheet is not available yet.`;if(portalOwner&&selected.downloadable)await loadReportChecklist()}};
 reportMonth.addEventListener('change',()=>{{void updateReportMonth()}});void updateReportMonth();
 reportPrepare.addEventListener('click',async()=>{{reportPrepare.disabled=true;reportDownloads.innerHTML='';reportStatus.textContent='Validating available files for this portfolio…';try{{const prepared=await fetch(`/api/accounts/${{encodeURIComponent(account)}}/reporting/monthly/${{encodeURIComponent(reportMonth.value)}}/prepare`).then(json);if(prepared.account_id!==account)throw new Error('report_subject_mismatch');reportStatus.textContent=prepared.message;reportDownloads.innerHTML=prepared.artifacts.map(x=>`<a class="button" href="${{esc(x.download_url)}}">Download ${{esc(x.label)}}</a>`).join('')}}catch(error){{reportStatus.textContent='The files could not be prepared for this portfolio. Please check system health.'}}finally{{const selected=reports.months.find(x=>x.period_end===reportMonth.value);reportPrepare.disabled=!selected?.downloadable}}}});
 reportRelease.addEventListener('click',async()=>{{if(!releasePreview)return;const period=reportMonth.value,selected=selectedReportTypes();reportRelease.disabled=true;reportReleaseStatus.textContent='Applying file approval changes…';try{{const response=await fetch(`/api/accounts/${{encodeURIComponent(account)}}/reporting/monthly/${{encodeURIComponent(period)}}/release`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{snapshot_id:releasePreview.snapshot_id,package_sha256:releasePreview.package_sha256,selection_version:releasePreview.selection_version,selected_report_types:selected}})}}),result=await response.json();if(!response.ok)throw new Error(typeof result.detail==='string'?result.detail:`HTTP ${{response.status}}`);const fresh=await fetch(`/api/accounts/${{encodeURIComponent(account)}}/reporting/monthly`).then(json);reports.months=fresh.months;reports.ready_months=fresh.ready_months;reports.review_ready_months=fresh.review_ready_months;renderReportCounts();renderReportOptions();reportMonth.value=period;await updateReportMonth();reportReleaseStatus.textContent=result.message}}catch(error){{await loadReportChecklist();reportReleaseStatus.textContent='Could not confirm the changes: '+String(error.message||'request failed').slice(0,220)+'. Current file status is shown above.'}}}});
@@ -10443,11 +11553,92 @@ analysisRun.disabled=true;
 const admin=a.admin_actions,adminAction=document.querySelector('#admin-action'),adminPreview=document.querySelector('#admin-preview'),adminExecute=document.querySelector('#admin-execute'),adminConfirmation=document.querySelector('#admin-confirmation');let currentApproval=null;document.querySelector('#admin-status').textContent=admin.enabled?'Approval workflow ready':'Disabled';document.querySelector('#admin-note').textContent=admin.message+' Every preview expires after '+admin.approval_ttl_minutes+' minutes and can be executed only once.';adminAction.innerHTML=admin.actions.map(x=>`<option value="${{esc(x.action_type)}}">${{esc(x.label)}}</option>`).join('');adminPreview.disabled=!admin.enabled;
 adminPreview.addEventListener('click',async()=>{{adminPreview.disabled=true;adminExecute.disabled=true;adminConfirmation.disabled=true;document.querySelector('#admin-result').textContent='';const result=document.querySelector('#admin-preview-result');result.textContent='Creating an integrity-bound preview…';try{{currentApproval=await fetch('/api/admin/actions/preview',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action_type:adminAction.value}})}}).then(json);const p=currentApproval.preview;result.innerHTML=`<strong>${{esc(p.label)}}</strong><p>${{esc(p.description)}}</p><p>Target: <code>${{esc(p.target)}}</code> · Environment: <strong>${{esc(p.environment)}}</strong><br>Expires: ${{esc(currentApproval.expires_at)}}<br>Payload digest: <code>${{esc(currentApproval.action_payload_sha256)}}</code></p><p><strong>Will not allow:</strong> ${{p.does_not_allow.map(esc).join(', ')}}</p><p>Type exactly: <code>${{esc(currentApproval.confirmation_phrase)}}</code></p>`;adminConfirmation.value='';adminConfirmation.placeholder=currentApproval.confirmation_phrase;adminConfirmation.disabled=false;adminExecute.disabled=false}}catch(error){{currentApproval=null;result.textContent='Unable to create an approval preview.'}}finally{{adminPreview.disabled=!admin.enabled}}}});
 adminExecute.addEventListener('click',async()=>{{if(!currentApproval)return;adminExecute.disabled=true;adminPreview.disabled=true;const result=document.querySelector('#admin-result');result.textContent='Executing the single approved staging action…';try{{const response=await fetch(`/api/admin/actions/${{currentApproval.approval_id}}/approve`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action_payload_sha256:currentApproval.action_payload_sha256,confirmation:adminConfirmation.value}})}}).then(json);result.innerHTML=`<strong>Executed once.</strong> Action: ${{esc(response.action_type)}} · Approval ID: ${{esc(response.approval_id)}} · Correlation ID: ${{esc(response.correlation_id)}}`;currentApproval=null;adminConfirmation.value='';adminConfirmation.disabled=true}}catch(error){{result.textContent='Action was not executed. Check the exact approval phrase or create a new preview.';adminExecute.disabled=false}}finally{{adminPreview.disabled=!admin.enabled}}}});
-asOfSelect.innerHTML=d.dates.map(x=>`<option value="${{esc(x)}}">${{esc(x)}}</option>`).join('');asOfSelect.value=d.latest;
-benchmarks=b.benchmarks||[];benchmarkSelect.innerHTML=benchmarks.map(x=>`<option value="${{esc(x.benchmark_id)}}">${{x.mapping_type==='primary'?'Primary':'Secondary'}} — ${{esc(x.name)}} (${{esc(x.symbol)}})</option>`).join('');
-if(benchmarks.length){{const primary=benchmarks.find(x=>x.mapping_type==='primary')||benchmarks[0];benchmarkSelect.value=primary.benchmark_id;benchmarkSelect.addEventListener('change',()=>{{const selected=benchmarks.find(x=>x.benchmark_id===benchmarkSelect.value);renderBenchmark(selected.benchmark_id,selected,asOfSelect.value).catch(()=>{{document.querySelector('#benchmark-note').textContent='Unable to load this comparison.'}})}})}}else{{document.querySelector('#benchmark').textContent='Not configured';benchmarkSelect.disabled=true}}
-asOfSelect.addEventListener('change',()=>renderAsOf(asOfSelect.value).catch(()=>{{document.querySelector('#benchmark-note').textContent='Unable to load portfolio data for this date.'}}));
+asOfSelect.innerHTML=d.dates.map(x=>`<option value="${{esc(x)}}">${{esc(asOfLabel(x))}}</option>`).join('');asOfSelect.value=storedAsOf(d.dates)||d.latest;showFreshness(d.latest);
+benchmarks=b.benchmarks||[];benchmarkSelect.innerHTML=benchmarks.map(x=>`<option value="${{esc(x.benchmark_id)}}">${{x.mapping_type==='primary'?'Primary':x.mapping_type==='comparison'?'Comparison':'Secondary'}} — ${{esc(x.name)}} (${{esc(x.symbol)}})</option>`).join('');
+if(benchmarks.length){{const primary=benchmarks.find(x=>x.mapping_type==='primary')||benchmarks[0];benchmarkSelect.value=primary.benchmark_id;benchmarkSelect.addEventListener('change',()=>{{const selected=benchmarks.find(x=>x.benchmark_id===benchmarkSelect.value);renderBenchmark(selected.benchmark_id,selected,asOfSelect.value).catch(()=>{{document.querySelector('#benchmark-note').textContent='Unable to load this comparison.'}})}})}}else{{document.querySelector('#benchmark').textContent=b.failed?'Unavailable':'Not configured';if(b.failed)document.querySelector('#benchmark-note').textContent='The benchmark list could not be loaded. Refresh the page to try again.';benchmarkSelect.disabled=true}}
+asOfSelect.addEventListener('change',()=>(rememberAsOf(asOfSelect.value),renderAsOf(asOfSelect.value)).catch(error=>loadFailure(error,'The figures for this date could not be loaded. Pick another date or refresh the page.')));
 if(!previewMode){{const savedConversations=await refreshConversations(null);if(savedConversations.length)await openConversation(savedConversations[0].conversation_id);else{{updateChatHeader(null);emptyChat()}}}}else{{updateChatHeader(null);emptyChat()}}analysisRun.disabled=!a.ai_model.enabled;
-await renderAsOf(d.latest)
-}}).catch(()=>{{document.querySelector('main').insertAdjacentHTML('afterbegin','<div class="card">Unable to load validated portfolio data.</div>')}});
-</script>{design_controls_script}</body></html>"""
+await renderAsOf(asOfSelect.value)
+}}).catch(error=>loadFailure(error,'The figures for this account could not be loaded. Refresh the page. If this keeps happening, the daily data refresh may have failed.'));
+</script>{subpage_script}{live_page_assets}{design_controls_script}</body></html>"""
+
+
+# WealthRyse agents: chat panel, Explain buttons and inbox. Off unless
+# AGENT_UI_MODE is "owner" or "all"; see agent_web.py.
+from .agent_web import case_question_stream as _case_question_stream
+from .agent_web import install as _install_agent_web
+
+def _agent_account_names(user: dict[str, object]) -> dict[str, str]:
+    from .viewer_labels import account_card_title
+
+    return {str(item["subject_id"]): account_card_title(item) for item in _account_directory(user)}
+
+
+def _agent_export_source(user: dict[str, object], account_id: str):
+    """The export agent's reads for one account, after the same access check as the CSV exports."""
+    from .export_agent_source import PlatformExportSource
+
+    return PlatformExportSource(
+        database=_database, tenant_id=TENANT_ID, subject_id=account_id,
+        access=_portfolio_access_context(account_id, user),
+        cash_filter=_cash_filter_values, trade_filter=_trade_filter_values,
+    )
+
+
+_install_agent_web(
+    app,
+    _authorized_user,
+    lambda user: _authorized_subject_ids(user, feature_key="viewer_access"),
+    ACCOUNT_THEME_CSS,
+    render_page=_platform_shell,
+    account_names=_agent_account_names,
+    export_source=_agent_export_source,
+)
+
+
+def _upload_intake_document(container: str, blob: str, content: bytes, content_type: str) -> None:
+    if not AZURE_STORAGE_ACCOUNT_URL:
+        raise RuntimeError("Private intake storage is unavailable")
+    upload_bytes(AZURE_STORAGE_ACCOUNT_URL, container, blob, content, overwrite=False, content_type=content_type)
+
+
+# New account onboarding (broker connections and four-stage cases). Every
+# route answers 404 unless ONBOARDING_V2_ENABLED is true; see onboarding_v2_web.py.
+onboarding_v2_web.install(
+    app,
+    onboarding_user=_onboarding_user,
+    owner_user=_owner_user,
+    read_database=lambda: _database(),
+    write_database=lambda: _approval_database(),
+    render_page=_platform_shell,
+    identity_digest=_identity_digest,
+    store_secret=lambda name, value: _store_flex_token_via_broker(name, value),
+    tenant_id=TENANT_ID,
+    platform_ip=lambda: os.environ.get("BROKER_EGRESS_IP", "").strip() or None,
+    derived_definition=_builder_definition,
+    download_report=lambda container, blob: download_blob_bytes(AZURE_STORAGE_ACCOUNT_URL, container, blob),
+    report_container=INTERNAL_REPORT_CONTAINER,
+    # Case documents for the intake agent; only while ONBOARDING_AGENTS_ENABLED is on (onboarding_agents.py).
+    upload_document=_upload_intake_document,
+    list_documents=lambda container, prefix: list_blobs(AZURE_STORAGE_ACCOUNT_URL, container, prefix),
+    intake_container=ONBOARDING_INTAKE_CONTAINER,
+    # "Ask about this case", answered by the agent service from the case's facts (also behind that switch).
+    ask_case=lambda: _case_question_stream(),
+)
+
+
+# Account Modelling tab: wealth projection, what-if, optimisation and factor model (web_modelling.py).
+_install_modelling(
+    app,
+    authorized_user=_authorized_user,
+    access_context=_portfolio_access_context,
+    parse_as_of=_parse_as_of,
+    read_database=lambda: _database(),
+    nav_values=_subject_nav_values,
+    external_flows=_subject_external_flows,
+    latest_holdings=_latest_subject_holdings,
+    enrich_holdings=_enrich_subject_holdings,
+    comparison_version=website_comparison_version,
+    tenant_id=TENANT_ID,
+    risk_analytics_version=RISK_ANALYTICS_VERSION,
+)

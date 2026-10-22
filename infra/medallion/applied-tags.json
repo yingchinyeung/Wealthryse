@@ -1,0 +1,568 @@
+{
+ "about": "Tags and container labels that Medallion step S4a added to the v2 resources in rg-ibkr-database-v11 with the Azure CLI on 17 Oct 2026 (23:34 to 23:43 UTC). Only what the run added is listed: tags a resource already had (for example owner) were kept as they were. Recorded here instead of in each module, because many of these resources have no Bicep file. Account numbers in two job names are shortened to u…. Nothing is deployed from this file.",
+ "applied": "2026-10-17T23:43:33Z",
+ "tagged_resources": 102,
+ "tags": {
+  "microsoft.app/containerapps": {
+   "ibkrv2stg-agent": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-tools": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-credential-broker": {
+    "component": "credentials",
+    "hop": "ops",
+    "layer": "apps",
+    "owner": "ying"
+   },
+   "ibkrv2stg-rebalance": {
+    "component": "rebalancing",
+    "layer": "apps"
+   },
+   "ibkrv2stg-web": {
+    "component": "website",
+    "hop": "serve+publish",
+    "layer": "apps"
+   }
+  },
+  "microsoft.app/jobs": {
+   "ibkrv2stg-account-sync-daily": {
+    "component": "daily-pipeline",
+    "hop": "ingest+conform",
+    "layer": "apps"
+   },
+   "ibkrv2stg-agent-audit": {
+    "component": "agents",
+    "hop": "ops",
+    "layer": "ai",
+    "owner": "ying"
+   },
+   "ibkrv2stg-agent-data-quality": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-export-packs": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-guide-check": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-guide-keeper": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-holdings": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-live-market": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-month-end": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-month-team": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-onboarding": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-ops": {
+    "component": "agents",
+    "hop": "ops",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-risk-watch": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-agent-weekly-brief": {
+    "component": "agents",
+    "hop": "serve",
+    "layer": "ai"
+   },
+   "ibkrv2stg-analyst-assurance": {
+    "component": "reporting",
+    "hop": "quality-gate",
+    "layer": "apps"
+   },
+   "ibkrv2stg-authority": {
+    "component": "specialist-checks",
+    "hop": "ops",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-autonomous-admin": {
+    "component": "monitoring",
+    "hop": "ops",
+    "layer": "ops"
+   },
+   "ibkrv2stg-autonomy-review": {
+    "component": "monitoring",
+    "hop": "ops",
+    "layer": "ops"
+   },
+   "ibkrv2stg-benchmark-daily": {
+    "component": "daily-pipeline",
+    "hop": "ingest+conform+analytics",
+    "layer": "apps"
+   },
+   "ibkrv2stg-bootstrap": {
+    "component": "database-admin",
+    "hop": "ops",
+    "layer": "ops"
+   },
+   "ibkrv2stg-burn-in-monitor": {
+    "component": "monitoring",
+    "hop": "ops",
+    "layer": "ops"
+   },
+   "ibkrv2stg-crisis-scenarios-daily": {
+    "component": "daily-pipeline",
+    "hop": "analytics",
+    "layer": "apps"
+   },
+   "ibkrv2stg-derived-daily": {
+    "component": "daily-pipeline",
+    "hop": "conform",
+    "layer": "apps"
+   },
+   "ibkrv2stg-flex-discovery": {
+    "hop": "ingest+ops",
+    "layer": "apps",
+    "owner": "ying"
+   },
+   "ibkrv2stg-import-u…": {
+    "component": "onboarding",
+    "hop": "conform",
+    "layer": "apps"
+   },
+   "ibkrv2stg-inbox-acceptance": {
+    "component": "specialist-checks",
+    "hop": "ops",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-inbox-acceptance-r2": {
+    "component": "specialist-checks",
+    "hop": "ops",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-institutional-daily": {
+    "hop": "ingest+conform",
+    "layer": "apps",
+    "owner": "ying"
+   },
+   "ibkrv2stg-institutional-shadow": {
+    "component": "daily-pipeline",
+    "hop": "ops",
+    "layer": "apps"
+   },
+   "ibkrv2stg-internal-release": {
+    "component": "reporting",
+    "hop": "publish",
+    "layer": "apps",
+    "owner": "ying"
+   },
+   "ibkrv2stg-month-end-factsheet": {
+    "component": "reporting",
+    "hop": "analytics+publish",
+    "layer": "apps"
+   },
+   "ibkrv2stg-observe-reader": {
+    "component": "specialist-checks",
+    "hop": "ops",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-onboard-analytics": {
+    "hop": "analytics",
+    "layer": "apps",
+    "owner": "ying"
+   },
+   "ibkrv2stg-onboard-render": {
+    "component": "onboarding",
+    "hop": "publish",
+    "layer": "apps"
+   },
+   "ibkrv2stg-report-snapshot": {
+    "component": "reporting",
+    "hop": "analytics",
+    "layer": "apps"
+   },
+   "ibkrv2stg-review-registration": {
+    "component": "onboarding",
+    "hop": "publish",
+    "layer": "apps",
+    "owner": "ying"
+   },
+   "ibkrv2stg-risk-free-daily": {
+    "component": "daily-pipeline",
+    "hop": "ingest+conform",
+    "layer": "apps"
+   },
+   "ibkrv2stg-risk-snapshots": {
+    "component": "daily-pipeline",
+    "hop": "analytics",
+    "layer": "apps"
+   },
+   "ibkrv2stg-sector-classification": {
+    "component": "daily-pipeline",
+    "hop": "ingest+conform",
+    "layer": "apps"
+   },
+   "ibkrv2stg-template-intake": {
+    "component": "onboarding",
+    "hop": "conform",
+    "layer": "apps",
+    "owner": "ying"
+   },
+   "ibkrv2stg-verify-u…": {
+    "component": "onboarding",
+    "hop": "quality-gate",
+    "layer": "apps"
+   }
+  },
+  "microsoft.cognitiveservices/accounts": {
+   "ibkrv2stg-ai-auhecwc4itaoo": {
+    "component": "ai-models",
+    "layer": "ai"
+   },
+   "wr-agents-sea": {
+    "component": "ai-models",
+    "layer": "ai"
+   }
+  },
+  "microsoft.cognitiveservices/accounts/projects": {
+   "wr-agents-sea/wealthryse-agents": {
+    "component": "ai-models",
+    "layer": "ai"
+   }
+  },
+  "microsoft.compute/disks": {
+   "ibkrv2stg-private-admin-os": {
+    "component": "build-vm",
+    "layer": "ops"
+   }
+  },
+  "microsoft.compute/virtualmachines": {
+   "ibkrv2stg-private-admin": {
+    "component": "build-vm",
+    "layer": "ops"
+   }
+  },
+  "microsoft.containerregistry/registries": {
+   "ibkrv2stgauhecwc4itaoo": {
+    "component": "registry",
+    "layer": "foundation"
+   }
+  },
+  "microsoft.dbforpostgresql/flexibleservers": {
+   "ibkrv2stg-pg-auhecwc4itaoo": {
+    "component": "database",
+    "dataLayer": "bronze+silver+gold+ops",
+    "layer": "data"
+   }
+  },
+  "microsoft.insights/components": {
+   "ibkrv2stg-availability-ai": {
+    "component": "monitoring",
+    "layer": "ops",
+    "owner": "ying"
+   }
+  },
+  "microsoft.insights/metricalerts": {
+   "ibkrv2stg-account-sync-daily-failed-execution": {
+    "component": "alerts",
+    "layer": "ops"
+   },
+   "ibkrv2stg-analyst-assurance-failed-execution": {
+    "component": "alerts",
+    "layer": "ops"
+   },
+   "ibkrv2stg-autonomous-admin-failed-execution": {
+    "component": "alerts",
+    "layer": "ops"
+   },
+   "ibkrv2stg-autonomy-review-failed-execution": {
+    "component": "alerts",
+    "layer": "ops"
+   },
+   "ibkrv2stg-benchmark-daily-failed-execution": {
+    "component": "alerts",
+    "layer": "ops"
+   },
+   "ibkrv2stg-burn-in-monitor-failed-execution": {
+    "component": "alerts",
+    "layer": "ops"
+   },
+   "ibkrv2stg-derived-daily-failed-execution": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-flex-discovery-failed-execution": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-historical-reports-failed-execution": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-institutional-daily-failed-execution": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-metadata-monitor-failed-execution": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-month-end-factsheet-failed-execution": {
+    "component": "alerts",
+    "layer": "ops"
+   },
+   "ibkrv2stg-onboard-analytics-failed-execution": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-onboard-render-failed-execution": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-pg-auhecwc4itaoo-connections-failed": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-pg-auhecwc4itaoo-connections-near-limit": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-pg-auhecwc4itaoo-cpu-high": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-pg-auhecwc4itaoo-db-not-alive": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-pg-auhecwc4itaoo-memory-high": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-pg-auhecwc4itaoo-storage-high": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-risk-free-daily-failed-execution": {
+    "component": "alerts",
+    "layer": "ops"
+   },
+   "ibkrv2stg-risk-snapshots-failed-execution": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-sector-classification-failed-execution": {
+    "component": "alerts",
+    "layer": "ops"
+   },
+   "ibkrv2stg-web-availability-test": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-web-no-replicas": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-web-restarts": {
+    "component": "alerts",
+    "layer": "ops",
+    "owner": "ying"
+   },
+   "ibkrv2stg-web-server-errors": {
+    "component": "alerts",
+    "layer": "ops"
+   }
+  },
+  "microsoft.insights/webtests": {
+   "ibkrv2stg-web-auth-boundary": {
+    "component": "monitoring",
+    "layer": "ops",
+    "owner": "ying"
+   }
+  },
+  "microsoft.keyvault/vaults": {
+   "ibkrv2flexauhecwc4ita": {
+    "layer": "foundation",
+    "owner": "ying"
+   },
+   "ibkrv2stg-auhecwc4itaoo": {
+    "component": "secrets",
+    "layer": "foundation"
+   }
+  },
+  "microsoft.managedidentity/userassignedidentities": {
+   "ibkrv2stg-approved-actions-identity": {
+    "component": "identity",
+    "layer": "foundation"
+   },
+   "ibkrv2stg-credential-broker-identity": {
+    "component": "identity",
+    "layer": "foundation",
+    "owner": "ying"
+   },
+   "ibkrv2stg-diagnostics-identity": {
+    "component": "identity",
+    "layer": "foundation"
+   },
+   "ibkrv2stg-flex-discovery-identity": {
+    "layer": "foundation",
+    "owner": "ying"
+   },
+   "ibkrv2stg-ingestion-identity": {
+    "component": "identity",
+    "layer": "foundation"
+   },
+   "ibkrv2stg-publisher-identity": {
+    "component": "identity",
+    "layer": "foundation"
+   },
+   "ibkrv2stg-specialist-audit-identity": {
+    "component": "identity",
+    "layer": "foundation",
+    "owner": "ying"
+   },
+   "ibkrv2stg-specialist-authority-identity": {
+    "component": "identity",
+    "layer": "foundation",
+    "owner": "ying"
+   },
+   "ibkrv2stg-specialist-mail-identity": {
+    "component": "identity",
+    "layer": "foundation",
+    "owner": "ying"
+   },
+   "ibkrv2stg-specialist-observation-identity": {
+    "component": "identity",
+    "layer": "foundation",
+    "owner": "ying"
+   },
+   "ibkrv2stg-specialist-report-identity": {
+    "component": "identity",
+    "layer": "foundation",
+    "owner": "ying"
+   },
+   "ibkrv2stg-web-identity": {
+    "component": "identity",
+    "layer": "foundation"
+   },
+   "id-wr-agent": {
+    "component": "identity",
+    "layer": "foundation"
+   },
+   "id-wr-agent-jobs": {
+    "component": "identity",
+    "layer": "foundation"
+   },
+   "id-wr-agent-tools": {
+    "component": "identity",
+    "layer": "foundation"
+   },
+   "wealthryse-github-deploy": {
+    "component": "identity",
+    "layer": "foundation",
+    "owner": "ying"
+   }
+  },
+  "microsoft.operationalinsights/workspaces": {
+   "ibkrv2stg-logs": {
+    "component": "logging",
+    "layer": "foundation"
+   }
+  },
+  "microsoft.storage/storageaccounts": {
+   "ibkrv2stgauhecwc4itaoo": {
+    "component": "storage",
+    "dataLayer": "bronze+gold+ops",
+    "layer": "data"
+   }
+  }
+ },
+ "container_labels": {
+  "storage_account": "ibkrv2stgauhecwc4itaoo",
+  "metadata": {
+   "approved-reports": {
+    "dataLayer": "gold"
+   },
+   "bronze-market-data": {
+    "dataLayer": "bronze"
+   },
+   "ibkr-raw": {
+    "dataLayer": "bronze"
+   },
+   "input-snapshots": {
+    "dataLayer": "bronze"
+   },
+   "internal-reports": {
+    "dataLayer": "gold"
+   },
+   "onboarding-intake": {
+    "dataLayer": "bronze"
+   },
+   "ops-qa": {
+    "dataLayer": "ops"
+   },
+   "release-evidence": {
+    "dataLayer": "ops"
+   },
+   "release-sources": {
+    "dataLayer": "ops"
+   },
+   "report-drafts": {
+    "dataLayer": "gold"
+   },
+   "specialist-audit-checkpoints": {
+    "dataLayer": "ops"
+   },
+   "upgrade-g04-reports-20261010": {
+    "dataLayer": "ops"
+   }
+  }
+ }
+}

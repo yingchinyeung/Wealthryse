@@ -16,7 +16,7 @@ class OperationalFindingsDeploymentTests(unittest.TestCase):
         value=self.current()
         deployment.verify(value)
         self.assertEqual(value['properties']['actions']['actionGroups'],
-            [deployment.BASE+'Microsoft.Insights/actionGroups/ibkr-v11-daily-alerts'])
+            [deployment.BASE+'Microsoft.Insights/actionGroups/ibkrv2stg-alerts'])
         self.assertEqual(value['properties']['scopes'],
             [deployment.BASE+'Microsoft.OperationalInsights/workspaces/ibkrv2stg-logs'])
 

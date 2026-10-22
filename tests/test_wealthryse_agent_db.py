@@ -318,6 +318,60 @@ class AgentDatabaseTests(unittest.TestCase):
         self.assertTrue(risk["isError"])
         self.assertEqual(risk["structuredContent"]["error"]["code"], "not_enough_history")
 
+    def test_settled_dates_hold_back_a_kiwoom_accounts_provisional_sessions(self):
+        import psycopg
+
+        days = ("2026-03-25", "2026-03-26", "2026-03-27", "2026-03-30", "2026-03-31")
+        with psycopg.connect(_dsn(ADMIN_DSN, self.database, "agent_test_owner"), autocommit=True,
+                             options=f"-c app.tenant_id={TENANT}") as owner:
+            for account_id, currency in (("KTEST-US", "USD"), ("KTEST-KR", "KRW")):
+                owner.execute("INSERT INTO accounts(account_id, alias, base_currency, account_type, first_seen_at, "
+                              "last_seen_at, source_json, tenant_id) VALUES (%s, %s, %s, 'kiwoom', '2026-03-01', "
+                              "'2026-03-31', '{}', %s)", (account_id, account_id, currency, TENANT))
+                owner.execute("INSERT INTO platform_subjects(tenant_id, subject_id, subject_type, display_name, "
+                              "source_account_id, base_currency, reporting_currency, history_start_date, lifecycle_status) "
+                              "VALUES (%s, %s, 'physical_account', %s, %s, %s, %s, '2026-03-25', 'active')",
+                              (TENANT, account_id, account_id, account_id, currency, currency))
+                for n, day in enumerate(days):
+                    owner.execute("INSERT INTO nav_snapshots(account_id, snapshot_date, currency, asset_class, total_text, "
+                                  "row_sha256, last_seen_run_id) VALUES (%s, %s, %s, 'TOTAL', '1000', %s, 1)",
+                                  (account_id, day, currency, f"{account_id}-{n}"))
+            for account_id in ("UTEST1", "KTEST-US", "KTEST-KR"):
+                owner.execute("INSERT INTO agent.service_grants(tenant_id, job_name, subject_id, granted_by) "
+                              "VALUES (%s, 'risk_watch', %s, 'test')", (TENANT, account_id))
+            try:
+                def dates(account_id):
+                    result = self._call("get_settled_dates", {"account_id": account_id}, job="risk_watch")
+                    self.assertFalse(result.get("isError"), result)
+                    data = result["structuredContent"]["data"]
+                    return data["provisional_sessions"], data["settled_through"], data["certified"]
+
+                self.assertEqual(dates("UTEST1"), (0, "2026-03-31", {"view": False, "as_of_date": None, "build_id": None}))
+                self.assertEqual(dates("KTEST-US")[:2], (2, "2026-03-27"), "U.S. iStrategy: its latest two sessions settle")
+                self.assertEqual(dates("KTEST-KR")[:2], (1, "2026-03-30"), "Korea: the next day's run makes a day final")
+                # Only the scheduled jobs see it; website chat never does.
+                self.assertTrue(self._call("get_settled_dates", {"account_id": "UTEST1"}, user=OWNER).get("isError"))
+                # Medallion's per-account view of the newest published build, once installed.
+                owner.execute("CREATE VIEW agent.certified_latest AS SELECT 'UTEST1'::text AS subject_id, "
+                              "'b-7'::text AS build_id, DATE '2026-03-30' AS as_of_date")
+                owner.execute("GRANT SELECT ON agent.certified_latest TO agent_reader")
+                self.assertEqual(dates("UTEST1")[2], {"view": True, "as_of_date": "2026-03-30", "build_id": "b-7"})
+                self.assertEqual(dates("KTEST-US")[2], {"view": True, "as_of_date": None, "build_id": None})
+                # A view this role cannot read leaves the dates usable, on silver.
+                owner.execute("REVOKE SELECT ON agent.certified_latest FROM agent_reader")
+                self.assertEqual(dates("UTEST1")[:2], (0, "2026-03-31"))
+                self.assertFalse(dates("UTEST1")[2]["view"])
+                # The risk tools read as of an older day when asked (none before the account's first one).
+                for name in ("get_risk_outlook", "get_market_regimes"):
+                    result = self._call(name, {"account_id": "KTEST-US", "as_of": "2026-03-01"}, job="risk_watch")
+                    self.assertEqual(result["structuredContent"]["error"]["code"], "no_valuation", name)
+            finally:
+                owner.execute("DROP VIEW IF EXISTS agent.certified_latest")
+                owner.execute("DELETE FROM agent.service_grants WHERE job_name = 'risk_watch'")
+                owner.execute("DELETE FROM nav_snapshots WHERE account_id LIKE 'KTEST-%%'")
+                owner.execute("DELETE FROM platform_subjects WHERE subject_id LIKE 'KTEST-%%'")
+                owner.execute("DELETE FROM accounts WHERE account_id LIKE 'KTEST-%%'")
+
     # Store -------------------------------------------------------------------
 
     def test_store_conversations_and_inbox(self):
@@ -514,6 +568,47 @@ class AgentDatabaseTests(unittest.TestCase):
         self.assertEqual(main.tokens_used_today(), before)
         self.assertEqual(store.tokens_used_this_month(), 1000)
         self.assertEqual(store.team_status()["latest_job"]["status"], "succeeded")
+        connection.close()
+
+    def test_month_team_runs_go_into_the_task_record_and_onboarding_runs_do_not_overlap(self):
+        from wealthryse_agent.database import connect
+        from wealthryse_agent.month_team.store import MonthStore
+        from wealthryse_agent.store import Store
+        from wealthryse_agent.supervisor import team_record
+
+        connection = connect(self.writer_settings, search_path="agent")
+        store, team = Store(connection, TENANT), MonthStore(connection, TENANT)
+        run = team.run("UTEST2", "2026-03-31", "month")
+        team.add_step(run["month_run_id"], "data", "pass", "Data clean.", correlation_id="cid-records")
+        team.add_step(run["month_run_id"], "writer", "pass", "Drafted.", usage={"input_tokens": 80},
+                      correlation_id="cid-records")
+        team.add_step(run["month_run_id"], "reviewer", "objection", "One objection.", correlation_id="cid-records")
+        team.add_step(run["month_run_id"], "writer", "pass", "Another run.", correlation_id="cid-other")
+        team.update_run(run["month_run_id"], stage="words")
+        steps = store.month_team_steps("cid-records")
+        self.assertEqual([(s["subject_id"], s["agent_name"], s["outcome"], s["stage"]) for s in steps],
+                         [("UTEST2", "data", "pass", "words"), ("UTEST2", "writer", "pass", "words"),
+                          ("UTEST2", "reviewer", "objection", "words")])
+        self.assertTrue(team_record.record_month_team(store, "cid-records", live=False, mode="month",
+                                                      period="2026-03-31", counts={"words": 1},
+                                                      usage={"input_tokens": 80}))
+        rows = connection.execute("SELECT level, role, status, mode, source, subject_id, pinned_as_of::text AS d "
+                                  "FROM agent.tasks WHERE correlation_id = 'cid-records' ORDER BY level, role").fetchall()
+        connection.rollback()
+        self.assertEqual([(r["level"], r["role"], r["status"], r["subject_id"], r["d"]) for r in rows],
+                         [("checker", "month_end_reviewer", "rejected", "UTEST2", "2026-03-31"),
+                          ("lead", "month_end_coordinator", "done", None, None),
+                          ("specialist", "month_end_data", "done", "UTEST2", "2026-03-31"),
+                          ("specialist", "month_end_writer", "done", "UTEST2", "2026-03-31"),
+                          ("supervisor", "supervisor", "done", None, None)])
+        self.assertTrue(all((r["mode"], r["source"]) == ("watch", "job") for r in rows))
+        # The onboarding job skips while an earlier run is still going.
+        self.assertFalse(store.run_in_progress("onboarding", 60))
+        run_id = store.start_run("onboarding", "cid-onboarding")
+        self.assertTrue(store.run_in_progress("onboarding", 60))
+        self.assertFalse(store.run_in_progress("month_team", 60))
+        store.finish_run(run_id, status="succeeded", items=0, usage={})
+        self.assertFalse(store.run_in_progress("onboarding", 60))
         connection.close()
 
     def test_each_replay_round_checks_a_month_afresh_and_rounds_compare(self):

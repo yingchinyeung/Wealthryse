@@ -8,7 +8,8 @@ often a figure fell back to the old calculation, and what each kind of request c
 Answers the client analysis team gave in live mode are counted apart, in "live": how each was
 led, how often the checker objected, how many specialists did not finish, and what they cost.
 The event dispatcher's records are counted apart too, in "events": which jobs new data would
-have woken, how long before their fixed times, and in live mode what the runs wrote.
+have woken, how long before their fixed times, on which layer (silver or the certified build),
+and in live mode what the runs wrote. The month-end team's runs (source 'job') are in "teams".
 
     python -m wealthryse_agent.supervisor.report --from 2026-10-29 --to 2026-11-09
     python -m wealthryse_agent.supervisor.report --from 2026-10-29 --to 2026-11-09 --json
@@ -39,13 +40,26 @@ def _percentile(values: list[int], share: float) -> int | None:
 
 def summarise(roots: Iterable[dict[str, Any]]) -> dict[str, Any]:
     roots = list(roots)
-    chat = [r for r in roots if r.get("source", "chat") != "event"]
+    chat = [r for r in roots if r.get("source", "chat") not in ("event", "job")]
     watched = [r for r in chat if r.get("mode", "watch") == "watch"]
     summary = _watched(watched)
     summary["kiwoom"] = _kiwoom(watched)
     summary["live"] = _live([r for r in chat if r.get("mode") == "live"])
     summary["events"] = _events([r for r in roots if r.get("source") == "event"])
+    summary["teams"] = _teams([r for r in roots if r.get("source") == "job"])
     return summary
+
+
+def _teams(roots: list[dict[str, Any]]) -> dict[str, Any]:
+    """The month-end team's runs: how many, how they ended, and the stages its accounts reached."""
+    details = [r.get("detail") or {} for r in roots]
+    stages: Counter[str] = Counter()
+    for detail in details:
+        stages.update({str(k): int(v) for k, v in (detail.get("stages") or {}).items()})
+    return {"runs": len(roots), "by_job": dict(Counter(str(d.get("job")) for d in details)),
+            "outcomes": dict(Counter(r.get("status") for r in roots)), "stages": dict(stages),
+            "tokens": sum(int((r.get("usage") or {}).get("input_tokens", 0))
+                          + int((r.get("usage") or {}).get("output_tokens", 0)) for r in roots)}
 
 
 def _kiwoom(roots: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
@@ -80,6 +94,7 @@ def _events(roots: list[dict[str, Any]]) -> dict[str, Any]:
         "median_minutes_before_fixed_run": {job: _percentile(v, 0.5) for job, v in sorted(by_job.items())},
         "live": dict(Counter(r.get("status") for r in roots if r.get("mode") == "live")),
         "written": sum(int(d.get("written") or 0) for d in details),
+        "layer": dict(Counter(str(d.get("layer") or "silver") for d in details)),
     }
 
 
@@ -186,9 +201,18 @@ def render(summary: dict[str, Any], since: str, until: str) -> str:
                   + ", ".join(f"{k} {v}" for k, v in sorted(events["by_job"].items())) + "; median minutes before "
                   "the fixed time: " + ", ".join(f"{k} {v}" for k, v in events["median_minutes_before_fixed_run"].items())
                   + "."]
+        if events.get("layer"):
+            lines.append("Woken on: " + ", ".join(f"{k} {v}" for k, v in sorted(events["layer"].items())) + ".")
         if events["live"]:
             lines.append("Runs started by events: " + ", ".join(f"{k} {v}" for k, v in sorted(events["live"].items()))
                          + f"; {events['written']} inbox card(s) written.")
+    teams = summary.get("teams") or {}
+    if teams.get("runs"):
+        lines += ["",
+                  f"Month-end team runs: {teams['runs']}, "
+                  + ", ".join(f"{k} {v}" for k, v in sorted(teams["outcomes"].items()))
+                  + "; accounts by stage: " + (", ".join(f"{k} {v}" for k, v in sorted(teams["stages"].items()))
+                                               or "none") + f"; {teams['tokens']} tokens."]
     team = summary.get("live") or {}
     if team.get("requests"):
         m = team["requests"]

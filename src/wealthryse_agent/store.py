@@ -173,6 +173,28 @@ class Store:
         self._commit()
         return int(row["run_id"])
 
+    def run_in_progress(self, job_name: str, within_minutes: int) -> bool:
+        """Whether a run of this job started in the last ``within_minutes`` minutes and has not finished."""
+        row = self.db.execute(
+            "SELECT 1 FROM agent.runs WHERE tenant_id = ?::uuid AND job_name = ? AND status = 'running' "
+            "AND started_at > now() - make_interval(mins => ?::int) LIMIT 1",
+            (self.tenant_id, job_name, int(within_minutes)),
+        ).fetchone()
+        self.db.rollback()
+        return row is not None
+
+    def month_team_steps(self, correlation_id: str) -> list[dict[str, Any]]:
+        """The month-end team's steps written under one run's correlation id, oldest first, with each
+        account's current stage (for the supervisor's task record)."""
+        rows = self.db.execute(
+            "SELECT r.subject_id, r.period_end::text AS period_end, r.mode, r.stage, s.agent_name, s.outcome, s.usage "
+            "FROM agent.month_steps s JOIN agent.month_runs r ON r.month_run_id = s.month_run_id "
+            "WHERE r.tenant_id = ?::uuid AND s.correlation_id = ? ORDER BY s.step_id",
+            (self.tenant_id, correlation_id),
+        ).fetchall()
+        self.db.rollback()
+        return [_json_columns(dict(r), "usage") for r in rows]
+
     def finish_run(self, run_id: int, *, status: str, items: int, usage: dict[str, int], error_code: str | None = None) -> None:
         self.db.execute(
             "UPDATE agent.runs SET status = ?, completed_at = now(), items_written = ?, usage = ?::jsonb, error_code = ? "

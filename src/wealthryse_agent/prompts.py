@@ -98,6 +98,9 @@ sentences what is behind it: use get_risk_outlook and get_market_regimes for the
 get_holdings_changes from {from_date} to {to_date} for which holdings moved, and get_factor_exposures if \
 the market or a style factor explains it. Say plainly that these are models of past data, not forecasts. \
 Every figure comes from a tool. No advice, no recommendations."""
+# Added for a Kiwoom account, whose newest sessions are provisional: the watch read the risk picture as of an older day.
+RISK_ALERT_AS_OF = """ The newest days are not final yet, so read the risk picture as of {as_of}: pass as_of {as_of} \
+to get_risk_outlook and get_market_regimes."""
 
 LIVE_ALERT = """Account {account_id} moved enough today to alert the person who owns it: {trigger}. Explain \
 in three to five short sentences what moved it, using get_live_snapshot for today's live figures and biggest \

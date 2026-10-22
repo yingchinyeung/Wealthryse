@@ -393,7 +393,7 @@ acknowledges at approval 2. A clean review passes.
 
 **How the review is recorded.** The agent cannot write a case or a check:
 
-1. The `onboarding` job (`python -m wealthryse_agent.jobs onboarding`, hourly)
+1. The `onboarding` job (`python -m wealthryse_agent.jobs onboarding`, every 10 minutes)
    reads the waiting cases through the tool server's
    `list_onboarding_report_cases`. Only that job is offered this tool.
 2. It writes one row per case and set of reports to `agent.onboarding_reviews`.
@@ -416,7 +416,7 @@ acknowledges at approval 2. A clean review passes.
   from the case each time, with a digest. The case page shows it above the
   GO LIVE box (the onboarding thread's part).
 - **First-month watch** (`wealthryse_agent/onboarding_watch.py`, in the
-  hourly `onboarding` job, even when the model budget is used up). For each
+  `onboarding` job, even when the model budget is used up). For each
   case that went live and waits for its first month-end, it posts an inbox
   card once for: the first daily data and checks after go-live, five days
   without data, failed daily checks, the month-end team lacking access (with
@@ -425,7 +425,7 @@ acknowledges at approval 2. A clean review passes.
   `list_live_onboarding_cases` (`007_onboarding_watch.sql`).
 
 **Connection agent** (`wealthryse_agent/connection_watch.py`, in the same
-hourly `onboarding` job, also plain code). A new IBKR login is not contacted
+`onboarding` job, also plain code). A new IBKR login is not contacted
 until a check runs. For each login never checked, the agent queues its first
 check through `agent.queue_first_connection_check()`: the same one-attempt
 request as the "Check now" button, which the Flex discovery job
@@ -860,42 +860,92 @@ own changes nothing anyone sees.
 the team passed 67 of 70 (the three misses were modelling questions, fixed in routing and the
 modelling instructions since). **Every later deploy of `infra/agent-apps.bicep` must pass
 `supervisorMode=live` and `supervisorUsers=<the same id>`, or that deploy turns it off.**
-Everyone from Mon 23 Nov (`supervisorUsers=*`) if the evaluation run and the 9 Nov report
-hold up, with Ying's approval. **The undo is `AGENT_SUPERVISOR=watch`** (or `off`): chat goes
+Everyone from Fri 30 Oct (`supervisorUsers=*`) if the evaluation rerun on Wed 28 to Thu 29 Oct
+and the early shadow report (22 to 28 Oct) hold up, with Ying's approval. **The undo is `AGENT_SUPERVISOR=watch`** (or `off`): chat goes
 straight back to today's analyst.
+
+### Settled dates: no job writes from a provisional day
+
+A Kiwoom account's newest days are provisional: Korea's latest day until the next trading
+day's run, U.S. iStrategy's latest two sessions. The jobs that never redo a date would
+otherwise write a card from figures that later change. The tool server's job-only
+`get_settled_dates` (`tools.py`, offered to the holdings explainer, risk watch, weekly
+brief, month-end commentary and export packs jobs) returns each account's latest dates,
+its provisional sessions and `settled_through`, the newest date that is final; every
+other account's latest date is final. `settled_days.py` applies it the same way in the
+jobs and in the dispatcher:
+
+- The holdings explainer, weekly brief and export packs work up to the settled date.
+- Risk watch reads `get_risk_outlook` and `get_market_regimes` `as_of` the settled date
+  when it is older than the latest one; both tools now take an optional `as_of`.
+- The month-end commentary job's scheduled runs (the 2nd to the 7th) draft only accounts
+  whose month is final: valuations and holdings settled through the month's last business
+  day, the month-end team's own test. IBKR accounts draft on the 2nd as before; a Kiwoom
+  month waits for its last sessions to settle. On the 7th every account goes ahead, so no
+  month is left without a draft. How the job drafts is unchanged.
+  **The undo is `AGENT_MONTH_END_WAITS_FOR_DATA=off`** on `ibkrv2stg-agent-month-end`:
+  every account on every run, as before.
+- A tool server without the tool (an older release) answers through `get_data_freshness`
+  and the jobs behave as before.
+
+### Month-end team in the task record
+
+The month-end team keeps its own schedule (hourly on the 2nd to the 7th) and its logic.
+After each `month_team` run, with `AGENT_MONTH_TEAM_RECORD=on` (`monthTeamRecord=on` in
+`infra/agent-apps.bicep`), the supervisor writes one tree to `agent.tasks`
+(`supervisor/team_record.py`, source `job`): the supervisor, the month-end coordinator as
+the reporting team's lead, and one row for each team agent that acted on each account in
+that run, from the steps the team already writes (`agent.month_steps`). A reviewer's
+objection is recorded as rejected, a hold as needs input; the root carries the run's
+stages, accounts and tokens, and a stopped run is recorded as failed. Ids, names, outcomes
+and counts only. Recording never changes or stops the team, and does nothing until
+`agent.tasks` exists. The shadow report adds a line for team runs by stage and tokens.
+**The undo is `AGENT_MONTH_TEAM_RECORD=off`.**
 
 ### Event dispatcher: jobs wake when their data is in (off)
 
-The scheduled client analysis jobs run at fixed times whether or not that day's data is in.
-The dispatcher (`supervisor/dispatcher.py`, job `ibkrv2stg-agent-dispatcher`, every 5
-minutes, code only) asks the tool server, as each job and with that job's own accounts,
-what the job is waiting for:
+The scheduled jobs run at fixed times whether or not that day's data is in. The dispatcher
+(`supervisor/dispatcher.py`, job `ibkrv2stg-agent-dispatcher`, every 5 minutes, code only)
+asks the tool server, as each job and with that job's own accounts, what the job is
+waiting for, on settled dates:
 
-| Job | Wakes on (silver, through `get_data_freshness`) | Fixed time today |
+| Job | Wakes on | Fixed time today |
 |---|---|---|
-| holdings explainer | a new holdings date with no card yet | 00:30 UTC daily |
-| risk watch | a new valuation date | 01:15 UTC weekdays |
-| weekly brief | a finished week (its Friday is in, or the next week has started) with no brief yet | 01:30 UTC Saturdays |
+| holdings explainer | a new settled holdings date with no card yet | 00:30 UTC daily |
+| risk watch | a new settled valuation date | 01:15 UTC weekdays |
+| weekly brief | a finished week (its Friday settled, or the next week started) with no brief yet | 01:30 UTC Saturdays |
+| month-end commentary | the month final for that account (the 2nd to the 7th), with no draft yet | 02:00 UTC, 2nd to 7th |
+| export packs | a new settled valuation date (no model) | 01:45 UTC daily |
 
+- **The certified build.** Once Medallion's view `agent.certified_latest` exists, an
+  event also waits until the newest published certified build covers its data date, and
+  the record says it woke on the certified layer and which build. Until then it wakes on
+  silver, as recorded.
 - **`AGENT_DISPATCHER=watch`** records one tree per event in `agent.tasks` (source
-  `event`): supervisor, `event_dispatcher`, then the job, with the data date, the job's
-  next fixed time and how many minutes earlier the event came. Nothing runs.
+  `event`): supervisor, `event_dispatcher`, then the job, with the data date, the layer,
+  the job's next fixed time and how many minutes earlier the event came. Nothing runs.
 - **`live`** also runs the jobs named in `AGENT_DISPATCHER_JOBS` for that one account,
   through the same job code, tools and access as the scheduled run, within the daily
   token budget. The scheduled jobs stay as a backup: whichever comes first writes the
   inbox card and the other finds it and skips. An event is recorded, and run, once.
-- A run starts nothing new after four minutes, so it ends before the next run starts.
-- The shadow report counts events apart: by job, median minutes before the fixed time,
-  and, in live mode, the runs and the cards they wrote.
-- Held builds (a gate investigator) and finished month-end packages (the month-end
-  team) join once Medallion's contracted build view and the gate investigator's tools
-  exist, and the month-end team only after December's month-end, as decided.
+- A run starts no model job after two minutes and nothing after four, so it ends before
+  the next run starts.
+- The shadow report counts events apart: by job and layer, median minutes before the
+  fixed time, and, in live mode, the runs and the cards they wrote.
+- Not started by events: the month-end team (its own schedule and the task record above,
+  events after December's month-end, as decided), onboarding (every 10 minutes instead;
+  a run still going makes the next one skip), and held builds (a gate investigator, once
+  its tools exist).
 
-**Turning it on.** Not before the 1 to 7 Nov freeze ends. Planned: `deployDispatcher=true`
-with `dispatcherMode=watch` first, then from Tue 17 Nov `dispatcherMode=live` with
-`dispatcherJobs=holdings_explainer,risk_watch,weekly_brief`; the fixed schedules stay until
-Mon 30 Nov. Each step is a redeploy of `infra/agent-apps.bicep` with Ying's approval. The undo
-is `dispatcherMode=off` (or `watch`), or `deployDispatcher=false`, which removes the job.
+**Turning it on.** `deployDispatcher=true` with `dispatcherMode=watch` in Medallion's agent
+release on Wed 28 Oct, with Ying's approval. If the team evaluation and the early shadow
+report (22 to 28 Oct) hold up, Fri 30 Oct: `AGENT_DISPATCHER=live` and
+`AGENT_DISPATCHER_JOBS=holdings_explainer,risk_watch,weekly_brief,month_end_drafter,export_packs`,
+so October's month-end commentary starts from events (Ying's choice on 22 Oct); the fixed
+schedules stay as the backup. **Every later deploy of `infra/agent-apps.bicep` must pass
+`dispatcherMode` and `dispatcherJobs` with the same values, or that deploy sets them back.**
+The undo is `AGENT_DISPATCHER=watch` (or `off`), or `deployDispatcher=false`, which removes
+the job. No other changes from 1 to 7 Nov.
 
 ## Cost drivers
 
@@ -909,7 +959,7 @@ is `dispatcherMode=off` (or `watch`), or `deployDispatcher=false`, which removes
 - Two Container Apps that scale to zero, and three short jobs.
 - The month-end team, when deployed: an hourly job on six days a month, and
   its own monthly token budget on `wr-reports-apac`.
-- The onboarding agents, when deployed: an hourly job that calls the model
+- The onboarding agents, when deployed: a job every 10 minutes that calls the model
   only for new documents, a NAV break or new reports, with its own monthly budget
   (`onboardingTokenBudget`).
 - The operations agent, when deployed: a job every 5 minutes that calls the

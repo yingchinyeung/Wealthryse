@@ -3,9 +3,20 @@
     python -m wealthryse_agent.supervisor.dispatcher      # every 5 minutes, when deployed
 
 Each run asks the tool server, as each job and with that job's own accounts, what the job is
-waiting for: a new holdings date (holdings explainer), a new valuation date (risk watch) or a
-finished week (weekly brief). These come from the silver layer through the agent views, the same
-reads the jobs make themselves. Code only; it never calls a model to decide.
+waiting for: a new holdings date (holdings explainer), a new valuation date (risk watch, export
+packs), a finished week (weekly brief) or, on the 2nd to the 7th, a month whose data are final
+(the month-end commentary job). The dates come from the job-only get_settled_dates, the same read
+the jobs make themselves (settled_days.py):
+
+- A Kiwoom account's newest sessions are provisional (a Korean day until the next trading day's
+  official close, U.S. iStrategy's latest two sessions until they add up), so it wakes a job only
+  for its latest settled date.
+- Once Medallion's agent.certified_latest view is installed, a date wakes a job only when the
+  account's newest published certified build covers it (layer "certified"); a held build wakes
+  nothing and the job's fixed time stays the backup. Without the view, or for an account the
+  build does not cover, the silver date is used (layer "silver").
+
+Code only; it never calls a model to decide.
 
 ``AGENT_DISPATCHER=watch`` records in ``agent.tasks`` (source 'event') which job it would have
 started, for which account and data date, and how long before that job's fixed time. Nothing
@@ -14,9 +25,9 @@ through the same job code and access as their scheduled run; the scheduled jobs 
 backup, and whichever comes first writes the inbox card while the other finds it and skips.
 Off (the default, and any other value) does nothing at all.
 
-Held builds (the gate investigator) and finished month-end packages (the month-end team) join
-once Medallion's contracted build view and the gate investigator's tools exist, and the month-end
-team only after December's month-end, as decided.
+Held builds (the gate investigator) join once the gate investigator's tools exist, and the
+month-end team after December's month-end, as decided; until then it runs on its own schedule,
+with its runs in the task record (team_record.py).
 """
 from __future__ import annotations
 
@@ -30,6 +41,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
+from .. import settled_days
 from . import registry
 
 LOGGER = logging.getLogger("wealthryse_agent.supervisor.dispatcher")
@@ -41,20 +53,30 @@ SEEN_DAYS = 10
 # A run starts no new event after this long, so it ends before the next run starts; what it leaves
 # is not recorded yet, so the next run finds it again.
 RUN_SECONDS = 240
+# A job that calls a model takes a minute or two, so in live mode none starts after this long.
+MODEL_START_SECONDS = 120
+# The job's own limit (replicaTimeout in infra/agent-apps.bicep). A run that is still going, say on a slow
+# model answer, makes the next one skip, so the same event is never run twice at once.
+JOB_TIMEOUT_MINUTES = 15
 
 
 @dataclass(frozen=True)
 class Wake:
     job: str  # the scheduled job, and the job name the tool server knows it by
     event: str  # what wakes it
-    inbox_kind: str  # the card it writes, so a card already there means nothing to do
+    inbox_kind: str | None  # the card it writes, keyed by the event's period; None: keyed otherwise
     cron: str  # its fixed time today (UTC), from infra/agent-apps.bicep
+    model: bool = True  # whether a run calls a model (and so needs today's token budget)
 
 
 WAKES = (
     Wake("holdings_explainer", "new_holdings_date", "holdings_explainer", "30 0 * * *"),
-    Wake("risk_watch", "new_valuation_date", "risk_alert", "15 1 * * 1-5"),
+    Wake("risk_watch", "new_valuation_date", None, "15 1 * * 1-5"),
     Wake("weekly_brief", "week_closed", "weekly_brief", "30 1 * * 6"),
+    # Reporting: a month whose data are final starts that account's month-end commentary draft, and a new
+    # valuation date lets saved export packs whose period has closed post their card (no model).
+    Wake("month_end_drafter", "month_final", "month_end_draft", "0 2 2-7 * *"),
+    Wake("export_packs", "new_valuation_date", None, "45 1 * * *", model=False),
 )
 BY_JOB = {wake.job: wake for wake in WAKES}
 
@@ -63,8 +85,10 @@ BY_JOB = {wake.job: wake for wake in WAKES}
 class Event:
     wake: Wake
     account_id: str
-    data_date: str  # the holdings or valuation date the job will work on
-    period_key: str  # the job's own key for it (the date, or the ISO week)
+    data_date: str  # the holdings or valuation date the job will work on (a month's last day for month-end)
+    period_key: str  # the job's own key for it (the date, the ISO week or the month)
+    layer: str = "silver"  # silver, or certified when the account's published build covers the date
+    build_id: str | None = None
 
     @property
     def key(self) -> str:
@@ -87,22 +111,32 @@ def live_jobs(environ: Mapping[str, str] | None = None) -> frozenset[str]:
     return frozenset(named & set(BY_JOB))
 
 
+def _days(field: str, *, weekday: bool = False) -> set[int] | None:
+    """The values a cron day field allows (ranges and lists); None for "*"."""
+    if field == "*":
+        return None
+    values: set[int] = set()
+    for part in field.split(","):
+        first, _, last = part.partition("-")
+        values |= set(range(int(first), int(last or first) + 1))
+    return {v % 7 for v in values} if weekday else values
+
+
 def next_fixed_run(cron: str, after: datetime) -> datetime:
-    """The next time a "M H * * D" schedule (D: *, one day or a range; 0 is Sunday) fires after ``after``."""
-    minute, hour, _, _, dow = cron.split()
-    if dow == "*":
-        days = set(range(7))
-    elif "-" in dow:
-        first, last = (int(x) for x in dow.split("-"))
-        days = set(range(first, last + 1))
-    else:
-        days = {int(dow)}
+    """The next time a "M H DOM * DOW" schedule (one minute and hour; 0 is Sunday) fires after ``after``."""
+    minute, hour, dom, _, dow = cron.split()
+    month_days, week_days = _days(dom), _days(dow, weekday=True)
     candidate = after.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
     if candidate <= after:
         candidate += timedelta(days=1)
-    while candidate.isoweekday() % 7 not in days:
+    for _ in range(400):
+        in_month = month_days is None or candidate.day in month_days
+        in_week = week_days is None or candidate.isoweekday() % 7 in week_days
+        # As cron: when both day fields are restricted, either one matching is enough.
+        if (in_month or in_week) if (month_days is not None and week_days is not None) else (in_month and in_week):
+            return candidate
         candidate += timedelta(days=1)
-    return candidate
+    raise ValueError(f"no run time in a year for {cron!r}")
 
 
 def _iso_week(day: date) -> str:
@@ -112,12 +146,25 @@ def _iso_week(day: date) -> str:
 
 def pending(wake: Wake, account_id: str, freshness: Mapping[str, Any], *, today: date,
             inbox_exists: Callable[[str, str, str], bool]) -> Event | None:
-    """What the job is waiting for on this account, if anything, from the account's freshness."""
-    if wake.event == "new_valuation_date":
-        data_date = freshness.get("latest_valuation_date")
-    else:
-        data_date = freshness.get("latest_holdings_date")
+    """What the job is waiting for on this account, if anything, from the account's settled dates."""
+    certified = freshness.get("certified") or {}
+    if wake.event == "month_final":
+        if today.day not in settled_days.MONTH_END_DAYS:
+            return None
+        period_end = settled_days.month_end(today)
+        period = period_end.strftime("%Y-%m")
+        if not settled_days.month_final(freshness, period_end) or inbox_exists(wake.inbox_kind, account_id, period):
+            return None
+        layer = _layer(certified, settled_days.last_business_day(period_end).isoformat())
+        if layer is None:
+            return None
+        return Event(wake, account_id, period_end.isoformat(), period, *layer)
+    key = "latest_valuation_date" if wake.event == "new_valuation_date" else "latest_holdings_date"
+    data_date = settled_days.settled(freshness, key)
     if not data_date:
+        return None
+    layer = _layer(certified, data_date)
+    if layer is None:
         return None
     day = date.fromisoformat(str(data_date))
     if wake.event == "week_closed":
@@ -127,10 +174,23 @@ def pending(wake: Wake, account_id: str, freshness: Mapping[str, Any], *, today:
         period = _iso_week(day)
     else:
         period = day.isoformat()
-    # Risk alerts are keyed by their trigger, so only the dispatcher's own record says a date was handled.
-    if wake.event != "new_valuation_date" and inbox_exists(wake.inbox_kind, account_id, period):
+    # Risk alerts and export pack cards are keyed otherwise, so only the dispatcher's own record says a date
+    # was handled.
+    if wake.inbox_kind and inbox_exists(wake.inbox_kind, account_id, period):
         return None
-    return Event(wake, account_id, day.isoformat(), period)
+    return Event(wake, account_id, day.isoformat(), period, *layer)
+
+
+def _layer(certified: Mapping[str, Any], data_date: str) -> tuple[str, str | None] | None:
+    """Which layer an event wakes on: certified when the account's newest published build covers the date,
+    silver while Medallion's view is not there or has no build for the account, None to wait for the build."""
+    as_of = certified.get("as_of_date")
+    if not as_of:
+        return "silver", None
+    if str(as_of)[:10] < data_date:
+        return None  # the account's newest published build does not cover the date yet
+    build_id = certified.get("build_id")
+    return "certified", str(build_id) if build_id else None
 
 
 def tree(event: Event, *, mode_: str, detected_at: datetime, status: str = "shadow", written: int | None = None,
@@ -141,8 +201,9 @@ def tree(event: Event, *, mode_: str, detected_at: datetime, status: str = "shad
     root_id, lead_id = str(uuid.uuid4()), str(uuid.uuid4())
     common = {"root_id": root_id, "mode": mode_, "source": "event",
               "subject_id": event.account_id if len(event.account_id) <= 64 else None,
-              "correlation_id": event.key, "conversation_id": None, "pinned_as_of": event.data_date}
-    detail = {"event": event.wake.event, "job": event.wake.job, "layer": "silver", "period": event.period_key,
+              "correlation_id": event.key, "conversation_id": None, "pinned_as_of": event.data_date,
+              "build_ids": [event.build_id] if event.build_id else []}
+    detail = {"event": event.wake.event, "job": event.wake.job, "layer": event.layer, "period": event.period_key,
               "detected_at": detected_at.isoformat(timespec="seconds"),
               "fixed_run_at": fixed.isoformat(timespec="minutes"),
               "minutes_before_fixed_run": int((fixed - detected_at).total_seconds() // 60),
@@ -161,7 +222,10 @@ def tree(event: Event, *, mode_: str, detected_at: datetime, status: str = "shad
 
 def find_events(clients: Callable[[str], Any], *, today: date, inbox_exists: Callable[[str, str, str], bool],
                 seen: Iterable[str]) -> list[Event]:
-    """Every job's new events, each read as that job. ``clients(job)`` opens the job's tool client."""
+    """Every job's new events, each read as that job. ``clients(job)`` opens the job's tool client.
+
+    Each account's dates are read once, by the first job that has it.
+    """
     seen = set(seen)
     found: list[Event] = []
     freshness: dict[str, Mapping[str, Any]] = {}
@@ -172,7 +236,7 @@ def find_events(clients: Callable[[str], Any], *, today: date, inbox_exists: Cal
             for account_id in accounts:
                 if account_id not in freshness:
                     try:
-                        freshness[account_id] = client.call("get_data_freshness", {"account_id": account_id})["data"]
+                        freshness[account_id] = settled_days.read_dates(client.call, account_id)
                     except Exception:
                         LOGGER.warning("dispatcher could not read freshness for one account")
                         continue
@@ -205,12 +269,13 @@ def dispatch(store: Any, clients: Callable[[str], Any], *, mode_: str, jobs: fro
     counts["events"] = len(events)
     for event in events:
         detected = now()
-        if (detected - started).total_seconds() > RUN_SECONDS:
+        runs_model = mode_ == "live" and event.wake.job in jobs and event.wake.model
+        if (detected - started).total_seconds() > (MODEL_START_SECONDS if runs_model else RUN_SECONDS):
             counts["left_for_next_run"] = counts.get("left_for_next_run", 0) + 1
             continue
         status, written, usage, error_code = "shadow", None, None, None
         if mode_ == "live" and event.wake.job in jobs:
-            if not budget_left():
+            if event.wake.model and not budget_left():
                 counts["skipped_budget"] += 1
                 status, error_code = "blocked", "budget_exhausted"
             else:
@@ -236,12 +301,15 @@ def _run_job(store: Any, tools_for: Callable[[str], Any], agent_factory: Callabl
     """Run one job for one account, exactly as its scheduled run would, as that job."""
     from .. import jobs
 
-    job = {"holdings_explainer": jobs.holdings_explainer, "risk_watch": jobs.risk_watch,
-           "weekly_brief": jobs.weekly_brief}[event.wake.job]
     usage: dict[str, int] = {}
     tools = tools_for(event.wake.job)
     try:
-        written = job(store, tools, agent_factory(), [event.account_id], usage)
+        if event.wake.job == "export_packs":
+            written = jobs.export_packs(store, tools, [event.account_id])
+        else:
+            job = {"holdings_explainer": jobs.holdings_explainer, "risk_watch": jobs.risk_watch,
+                   "weekly_brief": jobs.weekly_brief, "month_end_drafter": jobs.month_end_drafter}[event.wake.job]
+            written = job(store, tools, agent_factory(), [event.account_id], usage)
     finally:
         tools.close()
     return written, usage
@@ -270,6 +338,9 @@ def main(argv: list[str] | None = None) -> int:
         return ToolClient(runtime.tool_server_url, tokens, job=job, correlation_id=correlation_id)
 
     store = Store(connect(db, search_path="agent"), db.tenant_id)
+    if store.run_in_progress("event_dispatcher", JOB_TIMEOUT_MINUTES):
+        LOGGER.info("the last dispatcher run is still going; skipping this one")
+        return 0
     run_id = store.start_run("event_dispatcher", correlation_id)
     usage: dict[str, int] = {}
 

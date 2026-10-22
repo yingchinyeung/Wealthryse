@@ -40,16 +40,18 @@ def download_prefix(connection: Any, tenant_id: str, subject_id: str) -> str | N
     """The reader-facing name a subject's downloads start with, or None to keep its own id.
 
     A Kiwoom account downloads as "Korea_Factsheet_<date>.pdf" (KRW) or "US_Factsheet_<date>.pdf" (USD),
-    so the account number stays out of the file name. The subject is found by broker prefix and base
-    currency, so no account number is in this code either.
+    so the account number stays out of the file name. The subject is found by broker prefix and reporting
+    currency, so no account number is in this code either. Reporting currency first: a Kiwoom U.S.
+    account is a Korean account whose broker record may say KRW, as kiwoom_us_account.is_usd_account knows.
     """
     if not subject_id.startswith("KIWOOM-"):
         return None
     row = connection.execute(
-        "SELECT base_currency FROM platform_subjects WHERE tenant_id = %s AND subject_id = %s",
+        "SELECT COALESCE(reporting_currency, base_currency) AS currency FROM platform_subjects "
+        "WHERE tenant_id = %s AND subject_id = %s",
         (tenant_id, subject_id),
     ).fetchone()
-    return KIWOOM_DOWNLOAD_PREFIXES.get(str(row["base_currency"] or "").upper()) if row is not None else None
+    return KIWOOM_DOWNLOAD_PREFIXES.get(str(row["currency"] or "").upper()) if row is not None else None
 
 
 def validate_period_end(value: str) -> str:

@@ -45,7 +45,7 @@ class _Subject:
 
     def execute(self, statement, parameters=()):
         self.statements.append(parameters)
-        row = None if self.currency is None else {"base_currency": self.currency}
+        row = None if self.currency is None else {"currency": self.currency}
         return type("Rows", (), {"fetchone": lambda _self: row})()
 
 

@@ -60,7 +60,7 @@ html:not(.nx-pinned) .nx-rail:not(.is-peek) .nx-group { height: 1px; margin: 10p
 html:not(.nx-pinned) .nx-rail:not(.is-peek) .nx-link[data-agent-inbox]:has(.nx-count)::after { position: absolute; top: 8px; left: 50%; width: 6px; height: 6px; margin-left: 6px; content: ""; background: #fff; border-radius: 50%; }
 html:not(.nx-pinned) .nx-top .nx-switch { display: flex; align-items: center; gap: 8px; flex: 0 1 240px; min-width: 0; margin: 0; padding: 6px 10px; }
 html:not(.nx-pinned) .nx-top .nx-switch small { display: none; }
-html:not(.nx-pinned) .nx-top .nx-switch b { width: 100%; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+html:not(.nx-pinned) .nx-top .nx-switch b { width: 100%; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* The open section's pages, as tabs above the content (the open rail lists them too). */
 .nx-subtabs { display: flex; gap: 22px; margin: 0 0 4px; overflow-x: auto; border-bottom: 1px solid var(--line); font-family: var(--font-mission); scrollbar-width: none; }
 .nx-subtabs a { flex: none; padding: 10px 0 9px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .14em; text-decoration: none; text-transform: uppercase; border-bottom: 2px solid transparent; margin-bottom: -1px; }

@@ -24,6 +24,7 @@ import re
 from html import escape
 from urllib.parse import quote
 
+from .web_next_pages import PAGES_CSS, PAGES_SCRIPT
 from .web_next_ui import NEXT_CSS, NEXT_SCRIPT
 
 COOKIE = "wr_design"
@@ -73,6 +74,18 @@ def may_choose(design: str, role: str | None) -> bool:
     return mode == "next" or role == "owner"
 
 
+def pages_setting() -> str:
+    """WEB_NEXT_PAGES: off (default), preview (owners only) or on, for the page-by-page redesign."""
+    value = os.environ.get("WEB_NEXT_PAGES", "off").strip().lower()
+    return value if value in ("off", "preview", "on") else "off"
+
+
+def pages_for(role: str | None) -> bool:
+    """Whether this person gets the page-by-page redesign (it needs the new design too)."""
+    mode = pages_setting()
+    return mode == "on" or (mode == "preview" and role == "owner")
+
+
 def safe_return_path(value: str | None) -> str:
     """Only paths on this site, so the switch can't be used to send people elsewhere."""
     if not value or not value.startswith("/") or value.startswith("//") or "\\" in value:
@@ -87,7 +100,7 @@ def _try_link(back: str) -> str:
 
 
 def transform(html: str, *, design: str, role: str | None, back: str, page_scripts: dict[str, str],
-              metric_anchors: dict[str, str]) -> str:
+              metric_anchors: dict[str, str], pages: bool | None = None) -> str:
     """Apply the chosen design to a rendered page."""
     if design != "next":
         if setting() == "preview" and role == "owner" and _SESSION in html:
@@ -104,11 +117,15 @@ def transform(html: str, *, design: str, role: str | None, back: str, page_scrip
         "canClassic": may_choose("classic", role),
         "metrics": metric_anchors,
     }
+    if pages is None:
+        pages = pages_for(role)
     head = (f'<style id="nx-css">{NEXT_CSS}</style>'
-            f'<script type="speculationrules">{SPECULATION_RULES}</script>')
+            + (f'<style id="nx-pages-css">{PAGES_CSS}</style>' if pages else '')
+            + f'<script type="speculationrules">{SPECULATION_RULES}</script>')
     marker = html.find("</head>")
     html = html[:marker] + head + html[marker:]
     body = ("<script>window.WR_NEXT=" + json.dumps(config).replace("</", "<\\/") + ";"
-            + NEXT_SCRIPT + "</script>")
+            + NEXT_SCRIPT + "</script>"
+            + (f"<script>{PAGES_SCRIPT}</script>" if pages else ""))
     marker = html.rfind("</body>")
     return html[:marker] + body + html[marker:]

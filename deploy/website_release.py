@@ -962,25 +962,30 @@ def pages():
 # Website design (src/ibkr_etl/web_next.py): classic, preview (owners can opt in) or next.
 DESIGN_SETTING = 'WEB_DESIGN'
 DESIGN_MODES = ('classic', 'preview', 'next')
+# The page-by-page redesign (web_next_pages) has its own switch: pages-off, pages-preview, pages-on.
+NEXT_PAGES_SETTING = 'WEB_NEXT_PAGES'
+NEXT_PAGES_MODES = ('pages-off', 'pages-preview', 'pages-on')
 
 
 def design():
-    """Set WEB_DESIGN on the website; leaves the image alone."""
+    """Set WEB_DESIGN (classic, preview, next) or WEB_NEXT_PAGES (pages-off, pages-preview, pages-on)
+    on the website; leaves the image alone."""
     mode = sys.argv[2]
-    if mode not in DESIGN_MODES:
-        raise SystemExit('Design must be classic, preview or next')
+    if mode not in DESIGN_MODES + NEXT_PAGES_MODES:
+        raise SystemExit('Design must be classic, preview, next, pages-off, pages-preview or pages-on')
+    setting, value = (NEXT_PAGES_SETTING, mode[len('pages-'):]) if mode in NEXT_PAGES_MODES else (DESIGN_SETTING, mode)
     app = az('containerapp', 'show', '-n', APP, '-g', RG)
     env = {e['name']: e.get('value') for e in app['properties']['template']['containers'][0].get('env', [])}
-    previous = env.get(DESIGN_SETTING) or 'classic'
-    print(DESIGN_SETTING, 'was', previous)
+    previous = env.get(setting) or ('off' if setting == NEXT_PAGES_SETTING else 'classic')
+    print(setting, 'was', previous)
     suffix = 'design-' + mode + '-' + str(int(time.time()))[-6:]
     az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
-       '--set-env-vars', DESIGN_SETTING + '=' + mode, parse=False)
-    STATE.write_text(json.dumps({'changed_files': [DESIGN_SETTING], 'revision': APP + '--' + suffix,
+       '--set-env-vars', setting + '=' + value, parse=False)
+    STATE.write_text(json.dumps({'changed_files': [setting], 'revision': APP + '--' + suffix,
                                  'fqdn': app['properties']['configuration']['ingress']['fqdn'],
                                  'secrets': secret_kinds(app),
-                                 'previous_design': previous}, indent=2))
-    print('Website design set to', mode)
+                                 'previous_design': previous, 'design_setting': setting}, indent=2))
+    print(setting, 'set to', value)
 
 
 def rollback():
@@ -988,8 +993,8 @@ def rollback():
     if 'previous_design' in state:
         suffix = 'design-rollback-' + str(int(time.time()))[-6:]
         az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
-           '--set-env-vars', DESIGN_SETTING + '=' + state['previous_design'], parse=False)
-        print('Website design set back to', state['previous_design'])
+           '--set-env-vars', state.get('design_setting', DESIGN_SETTING) + '=' + state['previous_design'], parse=False)
+        print(state.get('design_setting', DESIGN_SETTING), 'set back to', state['previous_design'])
         return
     if 'previous_pages' in state:
         suffix = 'pages-rollback-' + str(int(time.time()))[-6:]

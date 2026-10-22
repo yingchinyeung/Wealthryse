@@ -460,11 +460,36 @@ the plan that closes the gap.
 | IBKR live (TWS) | `bronze.live_*` | Not used for silver | Done. |
 | Kiwoom REST | None yet | `ibkr_etl.kiwoom_collector`, from the live answer | `bronze.kiwoom_responses` (migration 082, applied alone after the U8 record; first capture on the 23 Oct daily run). The collector stores every page first (`KIWOOM_BRONZE=true`, `ibkr_etl.kiwoom_bronze`). The conform step `ibkr_etl.kiwoom_conform` (`scripts/run_kiwoom_conform.py check --run-id N` or `--latest`) replays one bronze run's stored answers through the collector's own functions, never calling Kiwoom, and compares the rows with silver by the collector's keys. It is read-only and prints counts only (matched, differing, only in the rebuild, only in silver, missing answers, refusals replayed). Letting it write silver comes later. Each account's history is fetched again into bronze and silver rebuilt from it; any difference is kept as a restated version (U8) with a note. A past day is Kiwoom's daily balance (`ka01690`) with its account return for that day (`kt00016`, Kiwoom's own value of the holdings) and, when `ka01690` lists after-market prices, each stock's official KRX close, read as the next trading day's base price on the unadjusted daily chart (`ka10081`), so a day's close is known from the next trading day; all three are kept in bronze. Silver checks each Kiwoom day to the won: the positions add up to Kiwoom's holdings value, and the selling cost follows Kiwoom's per-stock rule. History fetches run outside 16:00–18:00 and 19:00–22:00 UTC, when `ka01690` answers with empty figures; the 08:00 UTC daily run is unaffected. Open quality exceptions hold that account's reports until the owner accepts them by name. |
 | Market data | `bronze-market-data` files since 18 Oct, best effort | The fetchers, from the live answer | Next, a fetch whose raw copy cannot be stored fails (`MARKET_DATA_RAW_REQUIRED` on the benchmark, risk-free, sector and crisis jobs), the rebuild check compares silver with what the stored files parse to, and the bronze file freshness checks turn on (`LAYER_FRESHNESS_BLOB_CHECKS`). Nothing raw exists before 18 Oct. When Yahoo's history reply for a benchmark ends before the session a subject needs (on 22 Oct 2026 Yahoo served Azure the 21 Oct bars with no close), benchmark-daily reads that one close from Yahoo's quote, stores the quote reply in `yahoo-benchmark-history` next to the history file, and records the row with the quote's own `source_reference` and `raw_sha256` plus a `benchmark_close_from_quote` warning. `BENCHMARK_QUOTE_FALLBACK=off` turns it off. |
-| One-off scripts | None | Hand-run backfills and cut-overs in `scripts/` | From 28 Oct only the named loaders' logins write silver, and a CI check refuses new code that writes silver anywhere else. |
+| One-off scripts | None | Hand-run backfills and cut-overs in `scripts/` | Only the named loaders' login writes silver (see [Silver write lock](#silver-write-lock-step-3)), and a CI check refuses new code that writes silver anywhere else. |
 
 The Kiwoom table keeps inquiry answers only. Token calls are never stored, and
 `request_key` holds the account number and query fields, never a key, secret, token or
 header. Like every bronze table, the website, renderers and agents never read it.
+
+## Silver write lock (step 3)
+
+Only the named loader jobs write silver. Three parts, each with its own undo:
+
+1. **Watch** (migration 083). A statement trigger on every silver table but the U8 history
+   notes each write by a login outside the `silver_loader` group in
+   `public.silver_write_watch`: the login, the table, the kind of write, the lineage run id
+   and the application name, never row values. It refuses nothing. The tables' owner
+   (migrations, the approved FX step) is not noted. Undo:
+   `infra/medallion/undo/083_silver_write_watch_undo.sql`.
+2. **Loader login.** With `DATABASE_LOADER_PASSWORD` (and `DATABASE_LOADER_ROLE`) set,
+   `bootstrap_postgres.py` keeps a loader login that is a member of the app login, so it may do
+   everything the app login does, and of `silver_loader`, which may write every silver table
+   and the public view over it. The loader jobs read their database URL from the
+   `database-loader-url` secret; every other job keeps `database-app-url`. Once they have
+   moved, the watch stays empty through a full daily cycle before the next part.
+3. **Lock.** Bootstrap with `SILVER_WRITE_LOCK=on` takes INSERT, UPDATE, DELETE and TRUNCATE
+   on silver (tables, their public views, and tables made later) from the app login, and
+   refuses to finish if any login other than the loader can still write silver. Reading is
+   unchanged. Every later bootstrap run must carry the setting; bootstrap without it gives the
+   app login its write rights back, which is the undo.
+
+`src/ibkr_etl/silver_writers.py` names the loader jobs and every file that writes silver,
+and `tests/test_silver_writers.py` fails on code that writes silver outside that register.
 
 ## Stages
 

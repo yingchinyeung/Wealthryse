@@ -14,6 +14,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from test_medallion_layers_db import NEEDS_LAYERS
+
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -46,9 +48,11 @@ class OnboardingTablesDatabaseTests(unittest.TestCase):
         self.bundle = dict(rollout.bundle(), web_role=WEB, approval_role=APPROVAL)
         self.database = "onboard_test_" + uuid.uuid4().hex[:8]
         self.bundle["database"] = self.database
-        # The medallion layer migrations (068 on) came after this rollout and move its tables; 082
-        # (Kiwoom's raw answers in bronze) came after it too and refers to its broker_connections.
+        # The medallion layer migrations (068 on) came after this rollout and move its tables, and
+        # NEEDS_LAYERS (074) runs only once they have; 082 (Kiwoom's raw answers in bronze) came
+        # after it too and refers to its broker_connections.
         later = {path.name for path in (ROOT / "migrations" / "postgres").glob("*_medallion_*.sql")}
+        later.update(NEEDS_LAYERS)
         later.add("082_kiwoom_bronze.sql")
         self.bundle["expected"] = {k: v for k, v in self.bundle["expected"].items() if k not in later}
         skipped = (set(self.bundle["targets"]) | set(self.bundle["held_back"]) | set(self.bundle["other_rollouts"])

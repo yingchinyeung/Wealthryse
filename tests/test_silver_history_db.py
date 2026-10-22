@@ -1,11 +1,11 @@
 """U8 "as known on" history end to end on a real PostgreSQL, as docs/MEDALLION_AS_KNOWN_ON.md runs it.
 
 Needs a disposable server: set AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI starts one). Skipped
-otherwise. Builds its own database with every migration, sets up the logins with
-scripts/bootstrap_postgres.py, and loads made-up statements and account-sync copies as the jobs
-do. Then, in order: the held migration under the next free number with --only-migration, the
-backfill (dry run, refusal, apply), the past read back, recording, the FX step, and the undo.
-Synthetic data only.
+otherwise. Builds its own database with every migration (074_silver_history.sql among them,
+recording off), sets up the logins with scripts/bootstrap_postgres.py, and loads made-up statements
+and account-sync copies as the jobs do. Then, in order: the history as 074 leaves it, the backfill
+(dry run, refusal, apply), the past read back, recording, the FX step (the held file under the next
+free number with --only-migration), and the undo. Synthetic data only.
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from test_as_known_on_draft_db import (
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
 DRAFTS = ROOT / "infra" / "medallion" / "drafts"
+UNDO = ROOT / "infra" / "medallion" / "undo"
 TENANT, OTHER_TENANT = layers.TENANT, layers.OTHER_TENANT
 ACCOUNT = "U9100001"  # v2's own statements
 SYNCED = "U9100002"  # account-sync's copies of v1.1
@@ -38,9 +39,10 @@ OTHER_ACCOUNT = "U9200001"  # another tenant
 APP, WEB, APPROVAL = "asof_test_app", "asof_test_web", "asof_test_approval"
 TRACKED = ("trades", "cash_transactions", "fx_transactions", "fx_rates", "nav_snapshots")
 ACCOUNT_IDS = re.compile(r"U9[12]\d{5}")
-# On its day each held file gets the next free number in migrations/postgres.
+# 074 is in migrations/postgres (it ran in production on 21 Oct 2026). On its day the held FX
+# file gets the next free number there.
 NEXT = max(int(path.name[:3]) for path in layers.MIGRATIONS.glob("*.sql")) + 1
-PART_A, PART_B = f"{NEXT:03d}_silver_history.sql", f"{NEXT + 1:03d}_fx_event_key.sql"
+PART_A, PART_B = "074_silver_history.sql", f"{NEXT:03d}_fx_event_key.sql"
 FX_LATER = dict(FX_FIRST, proceeds="128.50", realizedPL="0.50")
 
 S1 = statement(ACCOUNT, "20261014", "20261015", nav={"20261014": "100000.00", "20261015": "100500.00"},
@@ -62,14 +64,13 @@ OTHER = statement(OTHER_ACCOUNT, "20261014", "20261015", nav={"20261014": "30000
 def setUpModule():
     from ibkr_etl import db
 
-    # The held files as their day will number them; nothing else changes.
+    # The held FX file as its day will number it; nothing else changes.
     directory = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(directory.cleanup)
     migrations = Path(directory.name) / "postgres"
     migrations.mkdir()
     for path in layers.MIGRATIONS.glob("*.sql"):
         shutil.copy(path, migrations / path.name)
-    shutil.copy(DRAFTS / "u8_silver_history.sql", migrations / PART_A)
     shutil.copy(DRAFTS / "u8_fx_event_key.sql", migrations / PART_B)
     # CI's database job runs against the installed package: read the schema from this checkout.
     for name, value in (("POSTGRES_MIGRATIONS_DIR", migrations),
@@ -104,9 +105,9 @@ class SilverHistoryTests(unittest.TestCase):
                     admin.execute(f"DROP ROLE IF EXISTS {role}")
             applied = layers._build(cls.database)
             # The logins as today's bootstrap leaves them; it applies nothing.
-            cls._bootstrap("--only-migration", applied[-1], "--allow-pending", f"{PART_A},{PART_B}")
+            cls._bootstrap("--only-migration", applied[-1], "--allow-pending", PART_B)
             cls.app_url = layers._url(cls.database, APP)
-            # Before the migration: v2's loads and account-sync's imports, as production has them.
+            # Before the backfill, recording off: v2's loads and account-sync's imports, as production had them.
             export = v11_export(cls.root / "v11", [SYNCED_V11], "2026-10-16T00:00:00+00:00")
             first = account_snapshot(export, cls.copies / "c1.sqlite", SYNCED, "2026-10-01",
                                      "2026-10-16T00:00:00+00:00")
@@ -236,9 +237,7 @@ class SilverHistoryTests(unittest.TestCase):
 
     # --- in order ---
 
-    def test_1_the_migration_applies_alone_and_logins_only_read_the_history(self):
-        output = self._bootstrap("--only-migration", PART_A, "--allow-pending", PART_B)
-        self.assertIn(f"Migrations applied: {PART_A}.", output)
+    def test_1_the_migration_leaves_recording_off_and_logins_only_read_the_history(self):
         self.assertFalse(self._recording())
         self.assertEqual(self._history_rows(), 0)
         objects = [f"silver.{table}_history" for table in TRACKED] + ["public.silver_history_settings"]
@@ -267,7 +266,8 @@ class SilverHistoryTests(unittest.TestCase):
             self.assertFalse(set(granted) - {"SELECT"}, f"{role} can write {name}")
         self.assertEqual(before[(APP, "silver.trades_history")], ["SELECT"])
         # Bootstrap's schema-wide grants run again on every deployment; the history stays read-only.
-        self._bootstrap("--only-migration", PART_A, "--allow-pending", PART_B)
+        output = self._bootstrap("--only-migration", PART_A, "--allow-pending", PART_B)
+        self.assertIn("Migrations applied: none.", output)  # 074 is applied and recorded
         self.assertEqual(rights(), before)
         # Recording is off until the backfill: loads in between leave no history.
         self.runs["s3"] = self._load(S3)
@@ -388,11 +388,11 @@ class SilverHistoryTests(unittest.TestCase):
                                     "ORDER BY 1", ACCOUNT), [("128.50",), ("128.70",)])
         tables = self._state(accounts=(ACCOUNT, SYNCED, OTHER_ACCOUNT))
         with self.assertRaisesRegex(psycopg.Error, "u8_fx_event_key_undo"):
-            self._run_sql(DRAFTS / "u8_silver_history_undo.sql")
+            self._run_sql(UNDO / "074_silver_history_undo.sql")
         self._run_sql(DRAFTS / "u8_fx_event_key_undo.sql")
         with patch.dict(os.environ, {"IBKR_FX_EVENT_KEY": "true"}), self.assertRaisesRegex(RuntimeError, "event_key"):
             self._load(S5)
-        self._run_sql(DRAFTS / "u8_silver_history_undo.sql")
+        self._run_sql(UNDO / "074_silver_history_undo.sql")
         gone = [f"silver.{table}_history" for table in TRACKED] + ["public.silver_history_settings"]
         self.assertEqual(self._rows("SELECT count(to_regclass(name)) FROM unnest(%s::text[]) name", gone), [(0,)])
         self.assertEqual(self._state(accounts=(ACCOUNT, SYNCED, OTHER_ACCOUNT)), tables)

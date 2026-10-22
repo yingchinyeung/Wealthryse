@@ -1,7 +1,7 @@
 """Fill and check the "as known on" history of the silver IBKR tables (review item U8).
 
 docs/MEDALLION_AS_KNOWN_ON.md has the design. Run by hand only, first on a restored copy,
-after the held migration (infra/medallion/drafts/u8_silver_history.sql) has been applied:
+after migration 074 (migrations/postgres/074_silver_history.sql) has been applied:
 
   backfill      replay every kept raw file in the order it reached silver, compare the end
                 state with the live tables, and report counts. Dry run unless --apply, which
@@ -227,7 +227,7 @@ def cmd_backfill(args, url: str, tenants: list[str], work_dir: Path) -> int:
     started = time.monotonic()
     ordered, missing, loads, instruments, tables = _inputs(args, url, tenants, work_dir)
     if not tables:
-        raise history.HistoryError("no history tables: apply the held migration first")
+        raise history.HistoryError("no history tables: apply 074_silver_history.sql first")
     replay = history.Replay(work_dir / "replay", tables, instruments=instruments,
                             legacy_key_compat=args.legacy_key_compat)
     try:

@@ -230,15 +230,15 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         self.assertNotIn("unavailable", states)
         self.assertEqual(len([c for c in results if c.startswith("schema.")]), 43)
         self.assertEqual({c for c in states.get("fail", ()) if not c.startswith("value.")}, set())
-        # The corrections history (U8) is held: its checks wait for its migration. Held objects
-        # with no silver or gold contract (the U8 setting, the Kiwoom bronze table) have no checks.
+        # A held migration's tables skip their checks until it runs. The corrections history (U8) is
+        # migration 074 now, so the build made its tables and their checks run like any other table's.
         held = {c for c in states["skipped"] if "held migration" in str(results[c]["detail"].get("reason"))}
         self.assertEqual({results[c]["target"] for c in held}, {
             name for name in layer_quality.held_relations(CONTRACTS) if name.split(".", 1)[0] in {"silver", "gold"}})
-        self.assertIn("volume.silver.trades_history", held)
-        self.assertIn("schema.silver.trades_history", held)
+        self.assertEqual(results["volume.silver.trades_history"]["state"], "recorded")  # no earlier total
+        self.assertEqual(results["schema.silver.trades_history"]["state"], "pass")
         rls = {c for c in states["skipped"] - held if c.startswith("rule.")}
-        self.assertEqual(len(rls), 10)  # need an RLS bypass
+        self.assertEqual(len(rls), 15)  # need an RLS bypass (5 of them on the history tables)
         self.assertEqual(results["volume.gold.certified_figures"]["state"], "recorded")  # no earlier total
         self.assertEqual(results["schema.gold.certified_builds"]["state"], "pass")
         nav = results["volume.silver.nav_snapshots"]

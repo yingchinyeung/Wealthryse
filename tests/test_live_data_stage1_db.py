@@ -15,6 +15,8 @@ import unittest
 import uuid
 from pathlib import Path
 
+from test_medallion_layers_db import NEEDS_LAYERS
+
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -48,8 +50,10 @@ class Stage1PayloadDatabaseTests(unittest.TestCase):
         self.bundle = dict(rollout.bundle(), role=COLLECTOR, web_role=WEB)
         self.database = "stage1_test_" + uuid.uuid4().hex[:8]
         self.bundle["database"] = self.database
-        # The medallion layer migrations (068 on) came after this rollout and move its tables.
+        # The medallion layer migrations (068 on) came after this rollout and move its tables, and
+        # NEEDS_LAYERS (074) runs only once they have.
         later = {path.name for path in (ROOT / "migrations" / "postgres").glob("*_medallion_*.sql")}
+        later.update(NEEDS_LAYERS)
         self.bundle["expected"] = {k: v for k, v in self.bundle["expected"].items() if k not in later}
         self.verifier = rollout.scram_verifier(COLLECTOR_PASSWORD)
         with psycopg.connect(ADMIN_DSN, autocommit=True) as admin:

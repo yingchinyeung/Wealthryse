@@ -4,8 +4,8 @@ October"): the history migration as 074 with recording on, the read-only FX chec
 and the undo.
 
 Needs a disposable server: set AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI starts one). Skipped
-otherwise. The held files are numbered as their day will number them, unless migrations/postgres already
-has them. Synthetic data only.
+otherwise. 074 is in migrations/postgres (it ran in production on 21 Oct 2026). The held FX file is
+numbered as its day will number it, unless migrations/postgres already has it. Synthetic data only.
 """
 from __future__ import annotations
 
@@ -37,11 +37,10 @@ AMOUNTS = re.compile(r"\b(128|256|257|512|515)\.\d\d\b")
 def _held(name: str, draft: str) -> tuple[str, Path]:
     """The migration's name on its day, and its file: migrations/postgres's own once it has moved there."""
     moved = sorted(layers.MIGRATIONS.glob(f"*_{name}.sql"))
-    return (moved[0].name, moved[0]) if moved else (f"{'074' if name == 'silver_history' else '075'}_{name}.sql",
-                                                    DRAFTS / draft)
+    return (moved[0].name, moved[0]) if moved else (f"075_{name}.sql", DRAFTS / draft)
 
 
-HISTORY, HISTORY_FILE = _held("silver_history", "u8_silver_history.sql")
+HISTORY = "074_silver_history.sql"  # in migrations/postgres, so every build applies it
 FX_STEP, FX_STEP_FILE = _held("fx_event_key", "u8_fx_event_key.sql")
 
 FX_LATER = dict(FX_FIRST, proceeds="128.50", realizedPL="0.50")
@@ -71,7 +70,6 @@ def setUpModule():
     migrations.mkdir()
     for path in layers.MIGRATIONS.glob("*.sql"):
         shutil.copy(path, migrations / path.name)
-    shutil.copy(HISTORY_FILE, migrations / HISTORY)
     shutil.copy(FX_STEP_FILE, migrations / FX_STEP)
     for name, value in (("POSTGRES_MIGRATIONS_DIR", migrations),
                         ("SQLITE_MIGRATION", ROOT / "migrations" / "001_init.sql")):
@@ -99,7 +97,7 @@ class FxEventKeyTests(unittest.TestCase):
                 for role in (APP, WEB, APPROVAL):
                     admin.execute(f"DROP ROLE IF EXISTS {role}")
             applied = layers._build(cls.database)
-            cls.pending = [name for name in (HISTORY, FX_STEP) if name not in applied]
+            cls.pending = [name for name in (FX_STEP,) if name not in applied]
             cls._bootstrap("--only-migration", applied[-1], *cls._pending_except(None))
             cls.app_url = layers._url(cls.database, APP)
             # Today, with the setting off: the re-sent rows are second rows.
@@ -187,14 +185,9 @@ class FxEventKeyTests(unittest.TestCase):
     # --- in order ---
 
     def test_1_with_recording_on_the_check_counts_the_duplicates(self):
-        import psycopg
-
-        if HISTORY in self.pending:
-            # The FX migration refuses, changing nothing, before the history migration.
-            with self._owner() as owner, self.assertRaisesRegex(psycopg.Error, "needs the history migration"):
-                owner.execute(FX_STEP_FILE.read_text(encoding="utf-8"))
-            self.assertIn(f"Migrations applied: {HISTORY}.",
-                          self._bootstrap("--only-migration", HISTORY, *self._pending_except(HISTORY)))
+        # The build applied 074, so applying it again does nothing, as in production since 21 Oct.
+        self.assertIn("Migrations applied: none.",
+                      self._bootstrap("--only-migration", HISTORY, *self._pending_except(None)))
         self.assertEqual(self._fx(), [("1000", "128.60"), ("1000", "128.70"), ("2000", "257.40"),
                                       ("4000", "514.80"), ("4000", "515.00")])
         code, output, _ = self._tool("backfill", "--apply", "--accept-differences")

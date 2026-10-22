@@ -11450,11 +11450,11 @@ const shown=results.filter(r=>r.bc&&r.bc.available&&(r.bc.series||[]).length),mi
 note.textContent=missing.length?`No validated comparison for this date: ${{missing.join(', ')}}.`:'';
 if(!shown.length){{draw('#benchmark-chart',[],[],{{emptyMessage:'No validated comparison is available for this benchmark and date.'}});certifiedLine(chart,null);return}}
 // The first chosen comparison sets the portfolio line; each other benchmark starts where that line is on its first shared date.
-const base=shown[0].bc,rows=base.series.map(r=>({{date:r.date,portfolio:r.portfolio}})),byDate=new Map(rows.map(r=>[r.date,r])),lines=[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}}];
+const bc=shown[0].bc,rows=bc.series.map(r=>({{date:r.date,portfolio:r.portfolio}})),byDate=new Map(rows.map(r=>[r.date,r])),lines=[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}}];
 shown.forEach(({{meta,bc}},i)=>{{const key=`benchmark_${{i}}`,anchor=bc.series.find(r=>byDate.has(r.date)&&Number(r.portfolio)&&byDate.get(r.date).portfolio!=null);if(!anchor)return;const scale=Number(byDate.get(anchor.date).portfolio)/Number(anchor.portfolio);bc.series.forEach(r=>{{const row=byDate.get(r.date);if(row&&r.benchmark!=null)row[key]=Number(r.benchmark)*scale}});lines.push({{key,color:benchmarkColor(meta),label:meta.name}})}});
 rows.forEach(r=>lines.forEach(l=>{{if(!(l.key in r))r[l.key]=null}}));
 draw('#benchmark-chart',rows,lines,{{yLabel:'Rebased value',...(lines.length>2?{{niceYTicks:true}}:{{yTickStep:10}})}});
-certifiedLine(chart,lines.length===2?chartsFor(base.certified_charts,['series.portfolio_daily_return','series.benchmark_daily_return'],'Vs benchmark'):null)
+certifiedLine(chart,lines.length===2?chartsFor(bc.certified_charts,['series.portfolio_daily_return','series.benchmark_daily_return'],'Vs benchmark'):null)
 }};
 document.querySelector('#benchmark-chips')?.addEventListener('click',event=>{{const chip=event.target.closest('[data-benchmark-id]'),set=event.target.closest('[data-benchmark-set]');if(!chip&&!set)return;if(set){{const primary=benchmarks.find(x=>x.mapping_type==='primary')||benchmarks[0];chartBenchmarks=new Set(set.dataset.benchmarkSet==='all'?benchmarks.map(x=>x.benchmark_id):primary?[primary.benchmark_id]:[])}}else{{const id=chip.dataset.benchmarkId;if(chartBenchmarks.has(id)){{if(chartBenchmarks.size===1)return;chartBenchmarks.delete(id)}}else chartBenchmarks.add(id)}}renderBenchmarkChips();renderBenchmarkChart(document.querySelector('#asof-select').value).catch(()=>{{draw('#benchmark-chart',[],[],{{emptyMessage:'The benchmark comparison could not be loaded.'}})}})}});
 const renderBenchmark=async(id,meta,asOf)=>{{

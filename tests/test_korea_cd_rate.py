@@ -135,6 +135,39 @@ class MonthlyCdRateTests(unittest.TestCase):
         self.assertEqual(cd.parse_monthly_csv(FRED_CSV)[-1].rate_date, "2026-12-31")
         self.assertIn(cd.FRED_SERIES, urls[0])
 
+    def test_a_slow_fred_answer_is_retried_before_the_load_fails(self):
+        calls, waits = [], []
+
+        def flaky(url, timeout=30):
+            calls.append(timeout)
+            if len(calls) < 3:
+                raise TimeoutError("The read operation timed out")
+            return FRED_CSV
+
+        result = cd.refresh_monthly_cd_rates(database(), start_date=date(2026, 1, 1), end_date=date(2026, 10, 21),
+                                             get=flaky, sleep=waits.append)
+        self.assertEqual(result["observations_loaded"], 2)
+        self.assertEqual((len(calls), waits), (3, [5, 20]))
+
+        def down(url, timeout=30):
+            raise TimeoutError("The read operation timed out")
+
+        connection = database()
+        with self.assertRaises(TimeoutError):
+            cd.refresh_monthly_cd_rates(connection, start_date=date(2026, 1, 1), get=down, sleep=lambda _: None)
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM risk_free_rates").fetchone()[0], 0)
+
+    def test_a_wrong_file_is_not_retried(self):
+        calls = []
+
+        def wrong(url, timeout=30):
+            calls.append(url)
+            return b"DATE,IR3TCD01USM156N\n2026-06-01,5.1\n"
+
+        with self.assertRaises(RuntimeError):
+            cd.refresh_monthly_cd_rates(database(), start_date=date(2026, 1, 1), get=wrong, sleep=lambda _: None)
+        self.assertEqual(len(calls), 1)
+
     def test_another_series_or_a_bad_value_stops_the_load(self):
         with self.assertRaisesRegex(RuntimeError, "not IR3TCD01KRM156N"):
             cd.parse_monthly_csv(b"DATE,IR3TCD01USM156N\n2026-06-01,5.1\n")

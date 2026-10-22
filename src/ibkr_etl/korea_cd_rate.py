@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import urllib.parse
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -216,13 +217,31 @@ def parse_monthly_csv(body: bytes) -> list[CdObservation]:
     return [observations[day] for day in sorted(observations)]
 
 
+# FRED's CSV endpoint is sometimes slow to answer (a 45 s read timeout on 22 Oct), so the
+# fetch is tried a few times before the run reports the won rate as failed.
+FRED_TRIES = 3
+FRED_RETRY_SECONDS = (5, 20)
+
+
+def _fetch_fred(get: Callable[..., bytes], *, timeout: int, sleep: Callable[[float], None]) -> bytes:
+    for attempt in range(FRED_TRIES):
+        try:
+            return get(FRED_URL, timeout=timeout)
+        except OSError:  # timeouts, connection resets and HTTP errors (urllib's are OSErrors)
+            if attempt == FRED_TRIES - 1:
+                raise
+            sleep(FRED_RETRY_SECONDS[min(attempt, len(FRED_RETRY_SECONDS) - 1)])
+    raise AssertionError("unreachable")
+
+
 def refresh_monthly_cd_rates(connection: Any, *, start_date: date, end_date: date | None = None,
-                             timeout: int = 45, get: Callable[..., bytes] = _get) -> dict[str, Any]:
+                             timeout: int = 90, get: Callable[..., bytes] = _get,
+                             sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     """Idempotently load month-end won CD rates (OECD via FRED) into risk_free_rates."""
 
     end = end_date or date.today()
     requested_at = raw_capture.utc_now()
-    body = get(FRED_URL, timeout=timeout)
+    body = _fetch_fred(get, timeout=timeout, sleep=sleep)
     raw_capture.capture_http("oecd-kr-cd-3m", MONTHLY_PROVIDER, url=FRED_URL, body=body,
                              key=end.strftime("%Y%m%d"), extension="csv", requested_at=requested_at)
     observations = [o for o in parse_monthly_csv(body)

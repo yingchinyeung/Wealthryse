@@ -206,6 +206,25 @@ def is_postgres(connection: Any) -> bool:
     return getattr(connection, "backend", "sqlite") == "postgresql"
 
 
+_SERVER_KEEPALIVES = (
+    "-c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=6"
+)
+
+
+def _with_server_keepalives(database_url: str) -> str:
+    """Prepend server keepalives to the options the caller already set.
+
+    Passing options= replaces any from the URL or PGOPTIONS, so those are kept
+    and placed last, where a repeated setting wins.
+    """
+    from psycopg.conninfo import conninfo_to_dict
+
+    existing = conninfo_to_dict(database_url).get("options") or os.environ.get(
+        "PGOPTIONS", ""
+    )
+    return f"{_SERVER_KEEPALIVES} {existing}".strip()
+
+
 def connect(
     database_path: Path,
     database_url: str = "",
@@ -218,7 +237,19 @@ def connect(
             raise RuntimeError(
                 "PostgreSQL mode requires psycopg. Install the project with its dependencies."
             ) from error
-        raw = psycopg.connect(database_url, row_factory=_hybrid_row_factory)
+        # Keepalives on both ends notice a silently dead network path within
+        # about 90 s: the client stops waiting, and the server ends the session
+        # and releases its locks instead of holding them for many minutes.
+        raw = psycopg.connect(
+            database_url,
+            row_factory=_hybrid_row_factory,
+            connect_timeout=30,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=6,
+            options=_with_server_keepalives(database_url),
+        )
         connection = PostgresConnection(raw)
         connection.execute("SELECT set_config('app.tenant_id', ?, false)", (tenant_id,))
         connection.commit()

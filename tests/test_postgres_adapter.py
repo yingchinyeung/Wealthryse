@@ -52,6 +52,35 @@ class PostgresAdapterTests(unittest.TestCase):
         self.assertEqual(raw.calls[0][1], (1, 2))
         self.assertEqual(raw.calls[0][2], {"prepare": False})
 
+    def test_postgres_connections_detect_dead_network_paths(self) -> None:
+        from ibkr_etl import db
+
+        captured: list[dict] = []
+        raw = _FakeRawConnection()
+        raw.commit = lambda: None
+
+        def fake_connect(url, **kwargs):
+            captured.append(kwargs)
+            return raw
+
+        with patch("psycopg.connect", fake_connect), patch.dict(
+            os.environ, {"PGOPTIONS": "-c statement_timeout=120000"}
+        ):
+            db.connect(Path("unused.db"), "postgresql://example.invalid/ibkr")
+            db.connect(
+                Path("unused.db"),
+                "postgresql://example.invalid/ibkr?options=-c%20lock_timeout%3D5000",
+            )
+        first, second = captured
+        self.assertEqual(first["keepalives"], 1)
+        self.assertLessEqual(first["keepalives_idle"], 60)
+        self.assertIn("keepalives_interval", first)
+        self.assertIn("keepalives_count", first)
+        self.assertIn("connect_timeout", first)
+        self.assertTrue(first["options"].startswith("-c tcp_keepalives_idle=30"))
+        self.assertTrue(first["options"].endswith("-c statement_timeout=120000"))
+        self.assertTrue(second["options"].endswith("-c lock_timeout=5000"))
+
     def test_crisis_as_of_null_check_has_an_explicit_postgres_type(self) -> None:
         source = (
             Path(__file__).resolve().parents[1]

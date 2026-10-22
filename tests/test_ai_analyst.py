@@ -429,7 +429,8 @@ class AIAnalystPolicyTests(unittest.TestCase):
         self.assertIn("name: 'AZURE_CLIENT_ID'", web)
         self.assertIn("name: 'AI_ANALYST_ENABLED'", web)
         self.assertIn("name: 'AZURE_AI_PROCESSING_SCOPE'", web)
-        self.assertIn("param entraClientSecret string", web)
+        self.assertIn("param entraClientSecretName string", web)
+        self.assertNotIn("value: entraClientSecret", web)
         self.assertIn("name: 'microsoft-provider-authentication-secret'", web)
 
 

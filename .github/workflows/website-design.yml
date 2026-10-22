@@ -8,10 +8,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: classic, preview or next
+        description: classic, preview or next (whole design); pages-off, pages-preview or pages-on (page-by-page redesign)
         required: true
         type: choice
-        options: [preview, next, classic]
+        options: [preview, next, classic, pages-off, pages-preview, pages-on]
 
 permissions:
   contents: read

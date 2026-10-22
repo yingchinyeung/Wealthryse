@@ -84,6 +84,38 @@ class TransformTest(unittest.TestCase):
         self.assertLess(out.index("nx-css"), out.index("</head>"))
 
 
+    def test_page_redesign_is_off_by_default(self):
+        with mock.patch.dict(os.environ, {"WEB_DESIGN": "next"}, clear=True):
+            self.assertEqual(web_next.pages_setting(), "off")
+            self.assertFalse(web_next.pages_for("owner"))
+            out = web_next.transform(PAGE.format(s=""), design="next", role="owner", back="/",
+                                     page_scripts={}, metric_anchors={})
+        self.assertNotIn("nx-pages-css", out)
+        self.assertNotIn("wr-next-last", out)
+
+    def test_page_redesign_preview_is_owner_only(self):
+        with mock.patch.dict(os.environ, {"WEB_DESIGN": "next", "WEB_NEXT_PAGES": "preview"}):
+            self.assertTrue(web_next.pages_for("owner"))
+            self.assertFalse(web_next.pages_for("viewer"))
+            owner = web_next.transform(PAGE.format(s=""), design="next", role="owner", back="/",
+                                       page_scripts={}, metric_anchors={})
+            viewer = web_next.transform(PAGE.format(s=""), design="next", role="viewer", back="/",
+                                        page_scripts={}, metric_anchors={})
+        self.assertIn('<style id="nx-pages-css">', owner)
+        self.assertIn("wr-next-last", owner)
+        self.assertLess(owner.index("nx-pages-css"), owner.index("</head>"))
+        self.assertNotIn("nx-pages-css", viewer)
+
+    def test_page_redesign_on_is_for_everyone_but_needs_the_new_design(self):
+        with mock.patch.dict(os.environ, {"WEB_DESIGN": "classic", "WEB_NEXT_PAGES": "on"}):
+            self.assertTrue(web_next.pages_for("viewer"))
+            classic = web_next.transform(PAGE.format(s=""), design="classic", role="viewer", back="/",
+                                         page_scripts={}, metric_anchors={})
+        self.assertNotIn("nx-pages-css", classic)
+        with mock.patch.dict(os.environ, {"WEB_NEXT_PAGES": "sparkly"}):
+            self.assertEqual(web_next.pages_setting(), "off")
+
+
 class AppTest(unittest.TestCase):
     def setUp(self):
         patches = [

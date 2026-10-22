@@ -184,6 +184,58 @@ class SupervisorTasksDatabaseTests(unittest.TestCase):
                                           (rows[0]["task_id"],)).fetchone()["n"], 0)
         store.db.rollback()
 
+    def test_5_every_live_tree_the_team_writes_fits_the_table(self):
+        from test_supervisor_live import PlannerTests, _final, _Model, _team
+
+        store = self._store()
+        conversation = store.create_conversation(USER, "U1", "Synthetic")
+        cases = {
+            "fast_path": ("What is my volatility this year?", _Model()),
+            "planner": (PlannerTests.QUESTION, _Model(plan=PlannerTests.PLAN, fail=("risk",),
+                                                      writer=("Up 5.1% [T1]; the risk figures weren't available.",))),
+            "analyst": (PlannerTests.QUESTION, _Model(plan=[])),
+            "router": ("Write me a poem.", _Model(in_scope=False)),
+        }
+        for lead, (question, model) in cases.items():
+            team = _team(model)
+            final = _final(list(team.answer(question)))
+            rows = team.tree(outcome=final["type"], turn=final["turn"], conversation_id=conversation, elapsed_ms=1,
+                             pinned={"as_of": "2026-10-28", "source": "freshness", "lag_days": 0})
+            self.assertTrue(store.add_tasks(rows), lead)
+            saved = store.db.execute("SELECT mode, role, status FROM agent.tasks WHERE root_id = ?::uuid "
+                                     "ORDER BY level, role", (rows[0]["task_id"],)).fetchall()
+            store.db.rollback()
+            self.assertEqual({r["mode"] for r in saved}, {"live"}, lead)
+            self.assertIn(lead, {r["role"] for r in saved})
+        failed = store.db.execute("SELECT detail FROM agent.tasks WHERE mode = 'live' AND role = 'risk' "
+                                  "AND status = 'failed'").fetchall()
+        store.db.rollback()
+        self.assertEqual(len(failed), 1)
+
+    def test_6_the_dispatchers_records_fit_the_table_and_are_found_again(self):
+        from datetime import datetime, timezone
+
+        from wealthryse_agent.supervisor import dispatcher
+
+        store = self._store()
+        now = datetime(2026, 10, 29, 23, 10, tzinfo=timezone.utc)
+        for job, status, mode in (("holdings_explainer", "shadow", "watch"), ("risk_watch", "done", "live"),
+                                  ("weekly_brief", "blocked", "live"), ("risk_watch", "failed", "live")):
+            event = dispatcher.Event(dispatcher.BY_JOB[job], "U1", "2026-10-30", "2026-W44" if job == "weekly_brief"
+                                     else f"2026-10-{30 if status != 'failed' else 29}")
+            rows = dispatcher.tree(event, mode_=mode, detected_at=now, status=status,
+                                   written=1 if status == "done" else None,
+                                   usage={"input_tokens": 5, "output_tokens": 1} if status == "done" else None,
+                                   error_code="tool_error" if status == "failed" else None)
+            self.assertTrue(store.add_tasks(rows), (job, status))
+        self.assertEqual(store.event_keys(10), {"event:holdings_explainer:U1:2026-10-30",
+                                                "event:risk_watch:U1:2026-10-30", "event:weekly_brief:U1:2026-W44",
+                                                "event:risk_watch:U1:2026-10-29"})
+        roots = [r for r in store.task_roots("2000-01-01", "2999-01-01") if r["source"] == "event"]
+        self.assertEqual(len(roots), 4)
+        self.assertEqual({r["detail"]["minutes_before_fixed_run"] for r in roots if r["detail"]["job"] != "weekly_brief"},
+                         {80, 125})
+
 
 if __name__ == "__main__":
     unittest.main()

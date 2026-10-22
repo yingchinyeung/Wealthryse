@@ -16,19 +16,29 @@ _RULES = {
     "holdings_performance": re.compile(
         r"\b(hold(s|ing|ings)?|positions?|own|owned|allocat\w*|sectors?|weights?|returns?|perform\w*|ytd|mtd|qtd|"
         r"year[- ]to[- ]date|month[- ]to[- ]date|since inception|gains?|loss(es)?|profits?|p&l|pnl|benchmark\w*|"
-        r"outperform\w*|underperform\w*|nav|value(?! at risk)|worth|deposits?|deposited|withdraw\w*|cash|"
+        r"outperform\w*|underperform\w*|nav|value(?! at risk)(?!\s+(and|or)\s+momentum)(?!\s+(factor|stocks))|"
+        r"worth|deposits?|deposited|withdraw\w*|cash|"
         r"dividends?|inflows?|outflows?|contribut\w*|movers?|top \d+|biggest|largest|live|intraday|right now|"
         r"today'?s?|(this|last) (week|month|quarter|year)|how (did|have|has|is|are) (i|we|my \w+|the portfolio|"
-        r"the account|it) (do|done|doing|perform\w*|gone))\b", re.I),
+        r"the account|it) (do|done|doing|perform\w*|gone)|how much of (the|my|this|our) (account|portfolio) is|"
+        r"up[- ]to[- ]date|last updated|how recent|fresh(ness)?|stale)\b", re.I),
     "risk": re.compile(
         r"\b(risk(s|y|ier|iest)?|volatil\w*|drawdowns?|sharpe|sortino|calmar|beta|alpha|value at risk|c?var|"
         r"expected shortfall|downside|tracking error|correlat\w*|regimes?|garch|outlook|forecast\w*|"
-        r"factor exposures?|factors?|fama|information ratio)\b", re.I),
+        r"factor exposures?|factors?|fama|information ratio|exposed|exposures?|momentum|"
+        r"explained by the market|worr(y|ied|ying)|what could (i|we) lose|bad (day|week|month|quarter|year)|"
+        r"worst case|(\w+ )?(weeks?|months?) from now)\b", re.I),
     "modelling": re.compile(
         r"\b(what[- ]if|simulat\w*|projections?|project(ed)?|monte carlo|retire\w*|"
-        r"future value|in \d+ years|years from now|optimi[sz]\w*|efficient frontier|hypothetical\w*|"
+        r"future value|in (\d+|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty) years|"
+        r"years from now|optimi[sz]\w*|efficient frontier|hypothetical\w*|"
         r"stress[- ]?test\w*|crash\w*|shocks?|scenarios?|what would (my|the|happen)|"
-        r"if (the )?[\w&.-]+( [\w&.-]+)? (fell|falls|drops?|dropped|"
+        r"minimum[- ]variance|risk[- ]parity|(optimal|other|different|optimised|optimized) mix(es)?|"
+        r"carr(y|ies) the most risk|risk contributions?|risk budgets?|"
+        r"how long (could|would|will|can) (the|my|our) (money|savings|account|portfolio) last|"
+        r"where could (this|the|my|our) (account|portfolio) be|"
+        r"if (i|we) (add|withdraw|invest|contribute|put in|take out)\w*|"
+        r"if (the )?[\w&.-]+( [\w&.-]+)? (fell|falls?|drops?|dropped|"
         r"rises?|rose|crash\w*|doubles?|halves?))\b", re.I),
     "metrics_guide": re.compile(
         r"(\bwhat( is|'s| are| does) (a |an |the )?(sharpe|sortino|calmar|twr|mwr|irr|time[- ]weighted|"
@@ -39,14 +49,23 @@ _RULES = {
         re.I),
 }
 # Words that place a question with holdings and performance only when no modelling rule matched:
-# "project my value in 10 years" is a projection, not a valuation.
+# "project my value in 10 years" is a projection, not a valuation, and "if I withdraw 5,000 a month"
+# is an input to it, not a question about past withdrawals.
 _WEAK_HOLDINGS = re.compile(r"\b(value(?! at risk)|worth|today'?s?|portfolio|account|returns?|hold(s|ing|ings)?|"
-                            r"positions?|weights?|allocat\w*)\b", re.I)
-# A definition asked about no one's account ("what is a Sharpe ratio?") needs only the guide.
+                            r"positions?|weights?|allocat\w*|withdraw\w*|deposits?|deposited|contribut\w*|"
+                            r"cash)\b", re.I)
+# A definition asked about no one's account and no period ("what is a Sharpe ratio?") needs only the
+# guide; "what is the excess return since inception?" asks for the account's figure, not a definition.
 _PERSONAL = re.compile(r"\b(my|our|i|me|we|mine|ours|this account|this portfolio)\b", re.I)
-# Advice the analyst declines today; the live supervisor would send it to the same refusal.
-_ADVICE = re.compile(r"\b(should (i|we)|recommend\w*|advice|advise|what (should i|to) (buy|sell)|"
-                     r"tell me (what|which) to (buy|sell))\b", re.I)
+_PERIOD = re.compile(r"\b(since inception|ytd|mtd|qtd|year[- ]to[- ]date|month[- ]to[- ]date|today|right now|"
+                     r"(this|last|past) (week|month|quarter|year)|\d{4})\b", re.I)
+_DEFINITION = re.compile(r"\b(defin(e|ition|itions)|mean(s|ing)?|formula|methodology|calculated|computed|"
+                         r"worked out|measured|explain (the |this |that )?(metric|number|figure))\b", re.I)
+# Advice the analyst declines today; the live supervisor sends it to the same refusal.
+_ADVICE = re.compile(r"\b(should (i|we) (buy|sell|hold|keep|switch|rebalance|invest|move|add|trim|reduce|"
+                     r"increase|get out|exit|choose|pick)|recommend\w*|advice|advise|what (should i|to) (buy|sell)|"
+                     r"tell me (what|which) to (buy|sell)|rebalanc\w*|(buy|sell) [\w ,]{0,40} for me|"
+                     r"which (stock|share|fund)s? will)\b", re.I)
 
 
 @dataclass(frozen=True)
@@ -77,7 +96,14 @@ def route_chat(question: str) -> Route:
     if "modelling" in matched and "holdings_performance" in matched \
             and not _RULES["holdings_performance"].search(_WEAK_HOLDINGS.sub(" ", text)):
         matched = tuple(name for name in matched if name != "holdings_performance")
-    if "metrics_guide" in matched and not _PERSONAL.search(text):
+    if "holdings_performance" in matched and len(matched) > 1 \
+            and not _RULES["holdings_performance"].search(_PERIOD.sub(" ", text)):
+        # "my volatility this year": the period says when, not that the question is about returns.
+        matched = tuple(name for name in matched if name != "holdings_performance")
+    if "metrics_guide" in matched and not _DEFINITION.search(text) and len(matched) > 1 \
+            and (_PERSONAL.search(text) or _PERIOD.search(text)):
+        matched = tuple(name for name in matched if name != "metrics_guide")  # the account's figure
+    elif "metrics_guide" in matched and not _PERSONAL.search(text) and not _PERIOD.search(text):
         matched = ("metrics_guide",)
     return Route(team="client_analysis", specialists=matched, decided_by="rules" if matched else "router",
                  advice=bool(_ADVICE.search(text)))

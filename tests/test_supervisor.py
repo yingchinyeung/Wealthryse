@@ -203,11 +203,12 @@ class RecorderTests(unittest.TestCase):
 
 
 class ModeTests(unittest.TestCase):
-    def test_off_unless_exactly_watch(self):
+    def test_off_unless_exactly_watch_or_live(self):
         self.assertEqual(watch.mode({}), "off")
         self.assertEqual(watch.mode({"AGENT_SUPERVISOR": " Watch "}), "watch")
+        self.assertEqual(watch.mode({"AGENT_SUPERVISOR": "live"}), "live")
         self.assertEqual(watch.mode({"AGENT_SUPERVISOR": "on"}), "off")
-        self.assertEqual(watch.mode({"AGENT_SUPERVISOR": "live"}), "off")
+        self.assertEqual(watch.mode({"AGENT_SUPERVISOR": "Live!"}), "off")
 
 
 class _TaskStore:
@@ -588,6 +589,53 @@ class ReportTests(unittest.TestCase):
         self.assertIn("3 chat answers", text)
         self.assertIn("fast path 1 (33%)", text)
 
+    def test_live_answers_are_counted_apart(self):
+        watched = {"status": "done", "usage": {"input_tokens": 100, "output_tokens": 0, "tool_calls": 1},
+                   "detail": {"route": {"lead": "fast_path", "specialists": ["risk"]}, "agreement": "agree"}}
+        live_roots = [
+            {"mode": "live", "status": "done", "usage": {"input_tokens": 400, "output_tokens": 100, "tool_calls": 3},
+             "detail": {"route": {"lead": "planner", "specialists": ["risk", "modelling"]},
+                        "plan": ["risk", "modelling"], "used_specialists": ["risk"], "objections": 1,
+                        "revised": True, "elapsed_ms": 9000}},
+            {"mode": "live", "status": "done", "usage": {"input_tokens": 90, "output_tokens": 10, "tool_calls": 1},
+             "detail": {"route": {"lead": "fast_path", "specialists": ["risk"]}, "plan": ["risk"],
+                        "used_specialists": ["risk"], "elapsed_ms": 3000, "figure_warnings": 1}},
+        ]
+        summary = report.summarise([{**watched, "mode": "watch"}, *live_roots])
+        self.assertEqual(summary["requests"], 1, "the shadow comparison counts watched answers only")
+        self.assertEqual(summary["cost"]["mean_tokens_by_lead"], {"fast_path": 100})
+        team = summary["live"]
+        self.assertEqual((team["requests"], team["lead"]), (2, {"planner": 1, "fast_path": 1}))
+        self.assertEqual(team["checker"], {"objected": 1, "revised": 1})
+        self.assertEqual(team["specialists_not_finished"], 1)
+        self.assertEqual(team["cost"]["mean_tokens_by_lead"], {"planner": 500, "fast_path": 100})
+        self.assertEqual(team["figure_check_warnings"], 1)
+        text = report.render(summary, "2026-11-16", "2026-11-23")
+        self.assertIn("Live answers from the client analysis team: 2, done 2.", text)
+        self.assertIn("Checker objected to 1 (50%), rewritten 1", text)
+        self.assertNotIn("Live answers", report.render(report.summarise([watched]), "2026-10-29", "2026-10-30"))
+
+    def test_each_kiwoom_account_is_counted_apart(self):
+        def root(subject, lead, agreement_kind, status="done", **detail):
+            return {"mode": "watch", "status": status, "subject_id": subject, "usage": {},
+                    "detail": {"route": {"lead": lead}, "agreement": agreement_kind, **detail}}
+
+        roots = [root("KIWOOM-0000001111", "router", "undecided"),
+                 root("KIWOOM-0000001111", "fast_path", "agree", figure_warnings=2),
+                 root("KIWOOM-0000002222", "planner", "over", status="rejected"),
+                 root("U1234567", "fast_path", "agree")]
+        summary = report.summarise(roots)
+        self.assertEqual(summary["requests"], 4)
+        self.assertEqual(summary["kiwoom"], {
+            "KIWOOM-0000002222": {"requests": 1, "no_rule_matched": 0, "agree": 0, "figure_check_warnings": 0,
+                                  "rejected": 1},
+            "KIWOOM-0000001111": {"requests": 2, "no_rule_matched": 1, "agree": 1, "figure_check_warnings": 2,
+                                  "rejected": 0}})
+        text = report.render(summary, "2026-10-29", "2026-11-09")
+        self.assertIn("Kiwoom account ending 1111: 2 answers, no rule matched 1 (50%), agree 1 (50%)", text)
+        self.assertNotIn("0000001111", text, "the report shows only the last four digits")
+        self.assertNotIn("Kiwoom", report.render(report.summarise(roots[3:]), "2026-10-29", "2026-11-09"))
+
     def test_an_empty_period(self):
         summary = report.summarise([])
         self.assertEqual(summary["requests"], 0)
@@ -601,10 +649,12 @@ class ReportTests(unittest.TestCase):
 class BicepTests(unittest.TestCase):
     def test_the_supervisor_ships_off_and_only_on_the_chat_app(self):
         apps = (ROOT / "infra" / "agent-apps.bicep").read_text()
-        self.assertIn("@allowed(['off', 'watch'])\nparam supervisorMode string = 'off'", apps)
-        self.assertEqual(apps.count("AGENT_SUPERVISOR"), 1)
+        self.assertIn("@allowed(['off', 'watch', 'live'])\nparam supervisorMode string = 'off'", apps)
+        self.assertIn("param supervisorUsers string = ''", apps, "live mode names nobody by default")
+        self.assertEqual(apps.count("name: 'AGENT_SUPERVISOR"), 2)
         chat_app = apps[apps.index("resource agent 'Microsoft.App/containerApps"):apps.index("// Container Apps job names")]
         self.assertIn("{ name: 'AGENT_SUPERVISOR', value: supervisorMode }", chat_app)
+        self.assertIn("{ name: 'AGENT_SUPERVISOR_USERS', value: supervisorUsers }", chat_app)
 
 
 class MigrationTests(unittest.TestCase):

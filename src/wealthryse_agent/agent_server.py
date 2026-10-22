@@ -40,6 +40,7 @@ from . import calculator, guide_tools
 from ibkr_etl.metrics_guide import METRIC_ANCHORS
 from .runtime import Agent, AgentError
 from .store import Store
+from .supervisor import live as supervisor_live
 from .supervisor import watch as supervisor
 from .tool_client import ToolCallFailed, ToolClient
 
@@ -261,8 +262,9 @@ class Services:
         self._month_store: _LockedStore | None = None
         self._agent: Agent | None = None
         self.keepalive_seconds = KEEPALIVE_SECONDS
-        # The supervisor's watch-only recorder; it runs on a background thread (replaced in tests).
+        # The supervisor's recorders; they run on a background thread (replaced in tests).
         self.watch_chat: Callable[..., Any] = supervisor.watch_chat
+        self.record_live: Callable[..., Any] = supervisor_live.record_later
 
     def store(self) -> Store:
         with self._store_lock:
@@ -346,35 +348,53 @@ def create_app(services: Services) -> FastAPI:
             history = []
         store.add_message(conversation_id, "user", body.message.strip(), correlation_id=correlation_id)
 
-        instructions = ANALYST.format(account_id=body.account_id, today=date.today().isoformat()) \
-            + memory.prompt_block(store.memories(user))
-        # Watch-only: today's analyst answers as before; the supervisor only records what it would have done.
-        watching = supervisor.mode() == "watch"
+        remembered = memory.prompt_block(store.memories(user))
+        instructions = ANALYST.format(account_id=body.account_id, today=date.today().isoformat()) + remembered
+        # Live: the client analysis team answers the people named in AGENT_SUPERVISOR_USERS. Watch-only:
+        # today's analyst answers as before and the supervisor only records what it would have done.
+        live = supervisor_live.live_for(user)
+        watching = not live and supervisor.mode() in ("watch", "live")
 
         def events() -> Iterator[str]:
             yield _sse({"type": "start", "conversation_id": conversation_id, "correlation_id": correlation_id})
-            tools = guide_tools.GuideTools(services.tools_for(user, correlation_id))
+            team: supervisor_live.ClientTeam | None = None
+            tools = None if live else guide_tools.GuideTools(services.tools_for(user, correlation_id))
             recorder = supervisor.Recorder(tools) if watching else None
 
             def observe(outcome: str, turn: Any = None, error_code: str | None = None) -> None:
-                if not watching:
+                if not (watching or live):
                     return
+                elapsed_ms = int((time.monotonic() - started) * 1000)
                 try:
+                    if live:
+                        if team is None:
+                            return  # the team never started; there is nothing to record
+                        services.record_live(store=store, team=team, outcome=outcome, turn=turn,
+                                             conversation_id=conversation_id, elapsed_ms=elapsed_ms,
+                                             error_code=error_code)
+                        return
                     services.watch_chat(store=store, tools_for=services.tools_for, user=user,
                                         account_id=body.account_id, question=body.message,
                                         correlation_id=correlation_id, conversation_id=conversation_id,
                                         outcome=outcome, turn=turn, recorder=recorder, error_code=error_code,
-                                        elapsed_ms=int((time.monotonic() - started) * 1000))
+                                        elapsed_ms=elapsed_ms)
                 except Exception:
-                    LOGGER.warning("supervisor watch did not start", extra={"correlation_id": correlation_id})
+                    LOGGER.warning("supervisor record did not start", extra={"correlation_id": correlation_id})
 
             try:
                 agent = services.agent()
-                run = agent.run(question=body.message, account_id=body.account_id, tools=recorder or tools,
-                                history=history, instructions=instructions,
-                                reasoning_mode=agent.settings.chat_reasoning_mode)
+                mode = agent.settings.chat_reasoning_mode
+                if live:
+                    team = supervisor_live.ClientTeam(
+                        agent, services.tools_for, user=user, account_id=body.account_id,
+                        correlation_id=correlation_id, analyst_instructions=instructions, memory_block=remembered,
+                        reasoning_mode=mode)
+                    run = team.answer(body.message, history)
+                else:
+                    run = agent.run(question=body.message, account_id=body.account_id, tools=recorder or tools,
+                                    history=history, instructions=instructions, reasoning_mode=mode)
                 yield from _answers(run, store, user, conversation_id, correlation_id, remember=True,
-                                    on_turn=observe if watching else None)
+                                    on_turn=observe if (watching or live) else None)
             except AgentError as error:
                 store.add_message(conversation_id, "assistant", error.message, status="failed",
                                   correlation_id=correlation_id)
@@ -386,7 +406,8 @@ def create_app(services: Services) -> FastAPI:
                 yield _sse({"type": "error", "code": "internal_error",
                             "message": "Something went wrong. Nothing was saved as an answer."})
             finally:
-                tools.close()
+                if tools is not None:
+                    tools.close()
             yield _sse({"type": "done"})
 
         return StreamingResponse(events(), media_type="text/event-stream",

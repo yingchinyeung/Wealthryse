@@ -144,7 +144,7 @@ MEMBERS = (
     Member("reconciliation", "onboarding", "specialist", "draft", "reports", today="onboarding job"),
     Member("history_reviewer", "onboarding", "checker", "draft", "reports", today="onboarding job"),
     Member("first_month_watch", "onboarding", "specialist", "draft", "reports", today="onboarding job"),
-    # Data and operations: a dispatcher over the Medallion monitor tables (code, no model).
+    # Data and operations: the event dispatcher (supervisor/dispatcher.py; code, no model) wakes jobs on new data.
     Member("event_dispatcher", "operations", "lead", "answer", "none", ()),
     Member("data_quality", "operations", "specialist", "draft", "none", jobs=("data_quality",),
            today="data_quality job"),

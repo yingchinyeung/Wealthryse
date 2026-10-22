@@ -381,6 +381,16 @@ class Store:
         self._commit()
         return True
 
+    def event_keys(self, days: int) -> set[str]:
+        """The events the dispatcher recorded in the last ``days`` days (their correlation ids)."""
+        rows = self.db.execute(
+            "SELECT DISTINCT correlation_id FROM agent.tasks WHERE tenant_id = ?::uuid AND parent_id IS NULL "
+            "AND source = 'event' AND created_at >= now() - make_interval(days => ?::int) AND correlation_id IS NOT NULL",
+            (self.tenant_id, int(days)),
+        ).fetchall()
+        self.db.rollback()
+        return {str(r["correlation_id"]) for r in rows}
+
     def task_roots(self, since: str, until: str) -> list[dict[str, Any]]:
         """The supervisor rows (one per request) created in [since, until), UTC days, oldest first."""
         rows = self.db.execute(

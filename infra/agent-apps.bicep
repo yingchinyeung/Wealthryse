@@ -45,9 +45,18 @@ param chatTimeoutSeconds int = 210
 param chatMaxOutputTokens int = 32000
 param chatMaxToolCalls int = 16
 param retentionDays int = 90
-@description('The supervisor (docs/AGENTS.md). watch records beside each chat answer what it would have done, in agent.tasks; nobody sees a change. Needs migrations/agent/018 installed.')
-@allowed(['off', 'watch'])
+@description('The supervisor (docs/AGENTS.md). watch records beside each chat answer what it would have done, in agent.tasks; nobody sees a change. live: the client analysis team answers the people in supervisorUsers, and everyone else is watched. Needs migrations/agent/018 installed.')
+@allowed(['off', 'watch', 'live'])
 param supervisorMode string = 'off'
+@description('With supervisorMode live: the Entra object ids, comma-separated, whose chat the client analysis team answers; * for everyone. Empty: nobody.')
+param supervisorUsers string = ''
+@description('The event dispatcher\'s job (ibkrv2stg-agent-dispatcher, docs/AGENTS.md): every 5 minutes it checks what the holdings explainer, risk watch and weekly brief are waiting for. Off until approved; needs migrations/agent/018 installed.')
+param deployDispatcher bool = false
+@description('watch records in agent.tasks which job each new data date would have started; live also runs the jobs in dispatcherJobs. The scheduled jobs stay as a backup either way.')
+@allowed(['off', 'watch', 'live'])
+param dispatcherMode string = 'watch'
+@description('With dispatcherMode live: the jobs it may run, comma-separated (holdings_explainer, risk_watch, weekly_brief). Empty: none.')
+param dispatcherJobs string = ''
 
 param agentAppName string = 'ibkrv2stg-agent'
 param toolsAppName string = 'ibkrv2stg-agent-tools'
@@ -229,6 +238,7 @@ resource agent 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AGENT_MAX_OUTPUT_TOKENS', value: string(chatMaxOutputTokens) }
             { name: 'AGENT_MAX_TOOL_CALLS', value: string(chatMaxToolCalls) }
             { name: 'AGENT_SUPERVISOR', value: supervisorMode }
+            { name: 'AGENT_SUPERVISOR_USERS', value: supervisorUsers }
           ])
           resources: { cpu: json('0.5'), memory: '1Gi' }
           probes: probes
@@ -537,6 +547,51 @@ resource operationsJob 'Microsoft.App/jobs@2024-03-01' = if (deployOperations) {
             { name: 'AGENT_DB_USER', value: jobsIdentity.name }
           ])
           resources: { cpu: json('0.5'), memory: '1Gi' }
+        }
+      ]
+    }
+  }
+}
+
+// The event dispatcher: every 5 minutes it asks the tool server, as each scheduled job, whether
+// that job's data is in (a new holdings or valuation date, a finished week). In watch mode it only
+// records what it would start; in live mode it also runs the named jobs for that account, with
+// the jobs identity and each job's own access, as the job's scheduled run would.
+resource dispatcherJob 'Microsoft.App/jobs@2024-03-01' = if (deployDispatcher) {
+  name: 'ibkrv2stg-agent-dispatcher'
+  location: resourceGroup().location
+  tags: tags
+  dependsOn: [pulls, tools]
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: { '${jobsIdentity.id}': {} }
+  }
+  properties: {
+    environmentId: managedEnvironment.id
+    configuration: {
+      triggerType: 'Schedule'
+      replicaTimeout: 900
+      replicaRetryLimit: 0
+      scheduleTriggerConfig: {
+        cronExpression: '*/5 * * * *'
+        parallelism: 1
+        replicaCompletionCount: 1
+      }
+      registries: [{ server: registry.properties.loginServer, identity: jobsIdentity.id }]
+    }
+    template: {
+      containers: [
+        {
+          name: 'job'
+          image: image
+          command: ['python', '-m', 'wealthryse_agent.supervisor.dispatcher']
+          env: concat(commonEnv, modelEnv, [
+            { name: 'AZURE_CLIENT_ID', value: jobsIdentity.properties.clientId }
+            { name: 'AGENT_DB_USER', value: jobsIdentity.name }
+            { name: 'AGENT_DISPATCHER', value: dispatcherMode }
+            { name: 'AGENT_DISPATCHER_JOBS', value: dispatcherJobs }
+          ])
+          resources: { cpu: json('0.25'), memory: '0.5Gi' }
         }
       ]
     }

@@ -28,10 +28,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+# Korean units (만 10^4, 억 10^8, 조 10^12) carry no word boundary, since 원 or a particle can follow them.
 _NUMBER = re.compile(
-    r"(?<![\w.])(?P<sign>[-+−])?(?P<cur>[$€£¥]|HK\$|US\$)?\s?"
+    r"(?<![\w.])(?P<sign>[-+−])?(?P<cur>[$€£¥₩]|HK\$|US\$)?\s?"
     r"(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
-    r"\s?(?P<unit>%|bps|bp|k\b|m\b|bn\b|million\b|billion\b|thousand\b)?",
+    r"\s?(?P<unit>%|bps|bp|k\b|m\b|bn\b|million\b|billion\b|thousand\b|만|억|조)?",
     re.IGNORECASE,
 )
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
@@ -42,7 +43,8 @@ _FIGURE_ID = re.compile(r"F\d+")
 _ANY_CITATION = re.compile(r"\[[TF]\d+\]")
 _CLAUSE_END = re.compile(r"[.!?;](?=\s)|\n")
 _NAMED_NUMBER = re.compile(r"[A-Za-z].*\d|\d.*[A-Za-z]")
-_SCALE = {"k": 1e3, "thousand": 1e3, "m": 1e6, "million": 1e6, "bn": 1e9, "billion": 1e9}
+_SCALE = {"k": 1e3, "thousand": 1e3, "m": 1e6, "million": 1e6, "bn": 1e9, "billion": 1e9,
+          "만": 1e4, "억": 1e8, "조": 1e12}
 SMALL_COUNT_LIMIT = 10
 
 

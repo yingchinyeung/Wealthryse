@@ -151,6 +151,7 @@ from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS, THEME_TOGGLE_HTML, WEB_FONT_FILES, web_font_bytes
 from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
 from .web_ui import CERTIFIED_LINE_SCRIPT
+from . import web_next
 from .web_analytics_ui import (
     ANALYTICS_SCRIPT,
     CORRELATION_CARD,
@@ -403,6 +404,28 @@ async def security_audit_middleware(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def page_design_middleware(request: Request, call_next):
+    """Serve the classic design or WealthRyse Next, per the WEB_DESIGN switch (see web_next)."""
+    response = await call_next(request)
+    path = request.url.path
+    if (web_next.setting() == "classic" or request.method != "GET" or response.status_code != 200
+            or path.startswith(("/api/", "/assets/", "/agents/", "/design/", "/.auth"))
+            or not response.headers.get("content-type", "").startswith("text/html")):
+        return response
+    user = getattr(request.state, "portal_user", None) or {}
+    role = str(user.get("role") or "") or None
+    design = web_next.design_for(request.cookies.get(web_next.COOKIE), role)
+    if design == "classic" and not (web_next.setting() == "preview" and role == "owner"):
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    back = path + (f"?{request.url.query}" if request.url.query else "")
+    html = web_next.transform(body.decode("utf-8"), design=design, role=role, back=back,
+                              page_scripts={"home": HOME_SCRIPT}, metric_anchors=METRIC_ANCHORS)
+    headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+    return Response(html, status_code=response.status_code, headers=headers, media_type="text/html")
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, error: Exception) -> JSONResponse:
     """Return a stable JSON envelope without exposing database or server details."""
@@ -537,13 +560,16 @@ def _portable_database_connection(connection):
 
 
 def _authorized_user(request: Request) -> dict[str, object]:
+    user = None
     if AUTHORIZATION_MODE in {"hybrid", "database"}:
-        database_user = _database_authorized_user(request)
-        if database_user is not None:
-            return database_user
-        if AUTHORIZATION_MODE == "database":
+        user = _database_authorized_user(request)
+        if user is None and AUTHORIZATION_MODE == "database":
             raise HTTPException(status_code=403, detail="This account is not authorized")
-    return _legacy_authorized_user(request)
+    if user is None:
+        user = _legacy_authorized_user(request)
+    # Kept for the page-design switch (web_next), so it needs no second lookup.
+    request.state.portal_user = user
+    return user
 
 
 def _owner_user(request: Request) -> dict[str, object]:
@@ -5315,6 +5341,21 @@ def _platform_navigation(user: dict[str, object], *, active: str | None = None) 
         + "".join(link(key, label, href, "platform-menu-link") for key, label, href in operations)
         + "</div></details></nav>"
     )
+
+
+@app.get("/design/{choice}", include_in_schema=False)
+def choose_design(
+    choice: str,
+    back: str = "/",
+    user: dict[str, object] = Depends(_authorized_user),
+) -> RedirectResponse:
+    """Keep this person's choice of the classic design or WealthRyse Next in their browser."""
+    if not web_next.may_choose(choice, str(user.get("role") or "")):
+        raise HTTPException(status_code=404, detail="Not found")
+    response = RedirectResponse(url=web_next.safe_return_path(back), status_code=303)
+    response.set_cookie(web_next.COOKIE, choice, max_age=web_next.COOKIE_MAX_AGE, path="/",
+                        secure=True, httponly=True, samesite="lax")
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)

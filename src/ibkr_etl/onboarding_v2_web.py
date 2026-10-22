@@ -44,7 +44,8 @@ from .composition_tree import composite_tree, filtered_tree, tree_for_definition
 from .flex_recipe import RECIPE_STEPS
 from .market_data import ALPHA_WORLD_MARKET_INSTRUMENTS
 from . import onboarding_agents, yahoo_disclosure
-from .monthly_reports import REPORT_TYPES, MonthlyReportError, validate_period_end, validate_review_artifact
+from .monthly_reports import REPORT_TYPES, MonthlyReportError, download_prefix, validate_period_end, \
+    validate_review_artifact
 from .onboarding import FEATURE_KEYS
 from .onboarding_cases import (
     APPROVAL_LABELS,
@@ -603,7 +604,8 @@ def case_report(connection, tenant_id: str, case_id: str, generation_run_id: int
         raise OnboardingError("The report changed after it was listed; the next report run lists it again")
     label = "Factsheet" if artifact["report_type"] == "factsheet" else "Presentation"
     extension = REPORT_TYPES[artifact["report_type"]]["extension"]
-    return {**artifact, "file_name": f"{subject_id}_{label}_{period_end}{extension}"}
+    name = download_prefix(connection, tenant_id, subject_id) or subject_id
+    return {**artifact, "file_name": f"{name}_{label}_{period_end}{extension}"}
 
 
 def _go_live(connection, tenant_id: str, row: Mapping[str, Any], case: OnboardingCase, actor: str) -> None:

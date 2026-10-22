@@ -81,6 +81,7 @@ from .monthly_artifacts import MonthlyArtifactError, validate_factsheet_return_t
 from .monthly_reports import (
     MonthlyReportError,
     build_monthly_report_catalog,
+    download_prefix,
     validate_artifact,
     validate_period_end,
     validate_review_artifact,
@@ -4219,22 +4220,14 @@ def release_subject_monthly_reports(
 
 
 def _download_prefix(subject_id: str) -> str | None:
-    """The reader-facing download name of a subject whose stored file names carry its account number.
-
-    A Kiwoom account reporting in U.S. dollars downloads as "US_Factsheet_<date>.pdf". The account
-    number stays out of the name, and out of this code: the subject is found by broker and currency.
-    """
+    """Korea_ or US_ for a Kiwoom subject's downloads (monthly_reports.download_prefix), else None."""
     if not subject_id.startswith("KIWOOM-"):
         return None
     try:
         with _database() as connection:
-            row = connection.execute(
-                "SELECT base_currency FROM platform_subjects WHERE tenant_id = %s AND subject_id = %s",
-                (TENANT_ID, subject_id),
-            ).fetchone()
+            return download_prefix(connection, TENANT_ID, subject_id)
     except (PostgresError, RuntimeError):
         return None
-    return "US" if row is not None and str(row["base_currency"] or "").upper() == "USD" else None
 
 
 def _monthly_download_filename(

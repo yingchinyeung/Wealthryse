@@ -32,6 +32,26 @@ REPORT_TYPES = {
 REQUIRED_REPORT_TYPES = frozenset({"factsheet"})
 
 
+# Kiwoom subjects are stored under their account number; readers download them by market instead.
+KIWOOM_DOWNLOAD_PREFIXES = {"KRW": "Korea", "USD": "US"}
+
+
+def download_prefix(connection: Any, tenant_id: str, subject_id: str) -> str | None:
+    """The reader-facing name a subject's downloads start with, or None to keep its own id.
+
+    A Kiwoom account downloads as "Korea_Factsheet_<date>.pdf" (KRW) or "US_Factsheet_<date>.pdf" (USD),
+    so the account number stays out of the file name. The subject is found by broker prefix and base
+    currency, so no account number is in this code either.
+    """
+    if not subject_id.startswith("KIWOOM-"):
+        return None
+    row = connection.execute(
+        "SELECT base_currency FROM platform_subjects WHERE tenant_id = %s AND subject_id = %s",
+        (tenant_id, subject_id),
+    ).fetchone()
+    return KIWOOM_DOWNLOAD_PREFIXES.get(str(row["base_currency"] or "").upper()) if row is not None else None
+
+
 def validate_period_end(value: str) -> str:
     try:
         parsed = date.fromisoformat(value)

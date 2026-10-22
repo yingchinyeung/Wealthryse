@@ -81,6 +81,7 @@ from .monthly_artifacts import MonthlyArtifactError, validate_factsheet_return_t
 from .monthly_reports import (
     MonthlyReportError,
     build_monthly_report_catalog,
+    download_prefix,
     validate_artifact,
     validate_period_end,
     validate_review_artifact,
@@ -4218,12 +4219,24 @@ def release_subject_monthly_reports(
     }
 
 
+def _download_prefix(subject_id: str) -> str | None:
+    """Korea_ or US_ for a Kiwoom subject's downloads (monthly_reports.download_prefix), else None."""
+    if not subject_id.startswith("KIWOOM-"):
+        return None
+    try:
+        with _database() as connection:
+            return download_prefix(connection, TENANT_ID, subject_id)
+    except (PostgresError, RuntimeError):
+        return None
+
+
 def _monthly_download_filename(
-    artifact: dict[str, object], *, subject_id: str, period_end: str
+    artifact: dict[str, object], *, subject_id: str, period_end: str, prefix: str | None = None
 ) -> str:
-    """Keep content-addressed storage private; name MS and T downloads for readers."""
+    """Keep content-addressed storage private; name MS, T and prefixed downloads for readers."""
     prefixes = {"alpha-world-ms": "AlphaWorld_MS", "alpha-world-t": "AlphaWorld_T"}
-    if subject_id in prefixes:
+    prefix = prefixes.get(subject_id, prefix)
+    if prefix:
         period = validate_period_end(period_end)
         kind = str(artifact["report_type"])
         definitions = {
@@ -4233,7 +4246,7 @@ def _monthly_download_filename(
         if kind not in definitions:
             raise MonthlyReportError("Unsupported monthly report type")
         label, extension = definitions[kind]
-        return f"{prefixes[subject_id]}_{label}_{period}{extension}"
+        return f"{prefix}_{label}_{period}{extension}"
     name = PurePosixPath(str(artifact["filename"])).name
     # Stored files are content-addressed as "<sha256>-<name>" (twice once released);
     # readers get the plain name.
@@ -4305,7 +4318,7 @@ def _download_monthly_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end, prefix=_download_prefix(subject_id))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Subject-ID": subject_id,
@@ -4403,7 +4416,7 @@ def _download_monthly_review_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end, prefix=_download_prefix(subject_id))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Subject-ID": subject_id,
@@ -10706,7 +10719,7 @@ def download_onboarding_historical_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject, period_end=period_end, prefix=_download_prefix(subject))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Period-End": period_end,

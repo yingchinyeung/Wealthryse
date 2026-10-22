@@ -19,7 +19,11 @@ from ibkr_etl.db import (  # noqa: E402
     start_run,
 )
 from ibkr_etl import input_readiness, publish_gate  # noqa: E402
-from ibkr_etl.provisional_benchmark import NoBenchmarkContract, refresh_and_materialize  # noqa: E402
+from ibkr_etl.provisional_benchmark import (  # noqa: E402
+    BenchmarkNotCurrent,
+    NoBenchmarkContract,
+    refresh_and_materialize,
+)
 from ibkr_etl.crisis_replay import (  # noqa: E402
     refresh_composite_crisis_replay,
     refresh_crisis_replay,
@@ -264,6 +268,13 @@ def main() -> int:
                 connection.rollback()
                 held_back.append({"account_id": account_id, "reason": str(error)[:1000],
                                   "kind": "no_benchmark_contract"})
+                continue
+            except BenchmarkNotCurrent as error:
+                # The provider has not yet published the close this subject's NAV has
+                # reached. Its last good comparison stays; the other subjects carry on.
+                connection.rollback()
+                held_back.append({"account_id": account_id, "reason": str(error)[:1000],
+                                  "kind": "benchmark_not_current"})
                 continue
             _mark_wave0_benchmark_fx_reconciled(connection, result)
             # Crisis-period holdings and symbols may leave Azure only after the

@@ -1,4 +1,5 @@
-"""The daily benchmark job carries on past a subject that has no benchmark yet, and fails on anything else."""
+"""The daily benchmark job carries on past a subject that has no benchmark yet, or whose benchmark
+has not yet published the close its NAV has reached, and fails on anything else."""
 from __future__ import annotations
 
 import importlib.util
@@ -8,7 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from ibkr_etl import publish_gate
-from ibkr_etl.provisional_benchmark import NoBenchmarkContract, mapped_benchmarks
+from ibkr_etl.provisional_benchmark import BenchmarkNotCurrent, NoBenchmarkContract, mapped_benchmarks
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -65,6 +66,19 @@ class NoBenchmarkContractTests(unittest.TestCase):
         self.assertIn('"held_back_by_publish_gate"', success.call_args.kwargs["reconciliation_json"])
         self.assertIn('"no_benchmark_contract"', success.call_args.kwargs["reconciliation_json"])
         self.assertIn('"U1"', success.call_args.kwargs["reconciliation_json"])
+        failed.assert_not_called()
+
+    def test_a_benchmark_behind_the_nav_holds_only_that_subject(self):
+        code, error, success, failed = self._run(BenchmarkNotCurrent(
+            "GSPC comparison failed data-quality checks: freshness (Latest common observation "
+            "2026-10-20 does not match the required XNYS session 2026-10-21 (calendar).)"))
+        self.assertIsNone(error)
+        self.assertEqual(code, publish_gate.EXIT_REJECTED)
+        success.assert_called_once()
+        payload = success.call_args.kwargs["reconciliation_json"]
+        self.assertIn('"benchmark_not_current"', payload)
+        self.assertIn("2026-10-21", payload)
+        self.assertIn('"U1"', payload)
         failed.assert_not_called()
 
     def test_any_other_failure_still_fails_the_run(self):

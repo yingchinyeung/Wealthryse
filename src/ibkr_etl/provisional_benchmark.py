@@ -101,6 +101,13 @@ class NoBenchmarkContract(RuntimeError):
     """The subject has no active benchmark mapping, so there is nothing to compare it with."""
 
 
+class BenchmarkNotCurrent(RuntimeError):
+    """A contract benchmark's latest close does not line up with the session the subject's NAV has
+    reached (usually the provider has not published that close yet), and freshness is its only
+    failed check. Nothing for this subject is committed, so readers keep its last good comparison;
+    the daily job holds this subject and carries on with the others."""
+
+
 def mapped_benchmarks(connection: Any, account_id: str) -> tuple[BenchmarkSpec, ...]:
     """Load the approved account contract instead of assuming the pilot benchmark set."""
 
@@ -889,9 +896,8 @@ def _refresh_and_materialize(
             required_return_convention=spec.return_convention,
         )
         if result.quality_status == "fail":
-            failed_checks = ", ".join(
-                issue.check_id for issue in result.issues if issue.status == "fail"
-            )
+            failed = [issue for issue in result.issues if issue.status == "fail"]
+            failed_checks = ", ".join(issue.check_id for issue in failed)
             if spec.mapping_type == "comparison":
                 # A website comparison that fails its checks is left out; it never holds the subject.
                 summaries.append({
@@ -906,10 +912,18 @@ def _refresh_and_materialize(
                     "maximum_fx_age_days": None,
                 })
                 continue
-            raise RuntimeError(
+            message = (
                 f"{spec.benchmark_id} comparison failed data-quality checks: "
                 f"{failed_checks}"
             )
+            # Dates only: the freshness message names the observed and required sessions.
+            dates = " ".join(issue.message for issue in failed if issue.check_id == "freshness")
+            if dates:
+                message += f" ({dates})"
+            if failed and all(issue.check_id == "freshness" for issue in failed):
+                # Only this subject waits for the provider; the other subjects carry on.
+                raise BenchmarkNotCurrent(message)
+            raise RuntimeError(message)
         # Never overwrite the retained v1 USD MS results with HKD values.
         result = version_website_comparison(result)
         for row in result.rows:

@@ -36,11 +36,12 @@ class SwitchTest(unittest.TestCase):
             self.assertFalse(web_next.may_choose("next", "viewer"))
             self.assertTrue(web_next.may_choose("classic", "viewer"))
 
-    def test_next_is_for_everyone_who_has_not_gone_back(self):
+    def test_next_is_for_everyone_and_classic_is_retired(self):
         with setting("next"):
             self.assertEqual(web_next.design_for(None, "viewer"), "next")
-            self.assertEqual(web_next.design_for("classic", "viewer"), "classic")
+            self.assertEqual(web_next.design_for("classic", "owner"), "next")
             self.assertTrue(web_next.may_choose("next", "viewer"))
+            self.assertFalse(web_next.may_choose("classic", "owner"))
 
     def test_nothing_can_be_chosen_while_the_switch_is_classic(self):
         with setting("classic"):
@@ -123,14 +124,20 @@ class AppTest(unittest.TestCase):
             self.assertNotIn('data-design="next"', page)
             self.assertNotIn("Try the new design", page)
 
-    def test_everyone_gets_next_and_can_go_back(self):
+    def test_everyone_gets_next_with_no_way_back(self):
         with setting("next"):
             self.assertIn('data-design="next"', self.client.get("/metrics-guide", headers=VIEWER).text)
-            response = self.client.get("/design/classic?back=https://evil.example", headers=VIEWER,
+            self.assertEqual(self.client.get("/design/classic", headers=OWNER, follow_redirects=False).status_code, 404)
+            page = self.client.get("/metrics-guide", headers=OWNER, cookies={"wr_design": "classic"}).text
+            self.assertIn('data-design="next"', page)  # an old classic choice is ignored
+            self.assertIn('"canClassic": false', page)
+            response = self.client.get("/design/next?back=https://evil.example", headers=VIEWER,
                                        follow_redirects=False)
             self.assertEqual(response.headers["location"], "/")
-            page = self.client.get("/metrics-guide", headers=VIEWER, cookies={"wr_design": "classic"}).text
-            self.assertNotIn('data-design="next"', page)
+
+    def test_owner_can_go_back_during_the_preview(self):
+        with setting("preview"):
+            self.assertEqual(self.client.get("/design/classic", headers=OWNER, follow_redirects=False).status_code, 303)
 
     def test_api_answers_are_never_touched(self):
         with setting("next"), mock.patch.object(web, "_account_directory", return_value=[]):

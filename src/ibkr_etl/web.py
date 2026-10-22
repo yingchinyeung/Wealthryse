@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import PurePosixPath
-from typing import Literal, Mapping
+from typing import Any, Literal, Mapping
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
@@ -81,6 +81,7 @@ from .monthly_artifacts import MonthlyArtifactError, validate_factsheet_return_t
 from .monthly_reports import (
     MonthlyReportError,
     build_monthly_report_catalog,
+    download_prefix,
     validate_artifact,
     validate_period_end,
     validate_review_artifact,
@@ -4218,12 +4219,24 @@ def release_subject_monthly_reports(
     }
 
 
+def _download_prefix(subject_id: str) -> str | None:
+    """Korea_ or US_ for a Kiwoom subject's downloads (monthly_reports.download_prefix), else None."""
+    if not subject_id.startswith("KIWOOM-"):
+        return None
+    try:
+        with _database() as connection:
+            return download_prefix(connection, TENANT_ID, subject_id)
+    except (PostgresError, RuntimeError):
+        return None
+
+
 def _monthly_download_filename(
-    artifact: dict[str, object], *, subject_id: str, period_end: str
+    artifact: dict[str, object], *, subject_id: str, period_end: str, prefix: str | None = None
 ) -> str:
-    """Keep content-addressed storage private; name MS and T downloads for readers."""
+    """Keep content-addressed storage private; name MS, T and prefixed downloads for readers."""
     prefixes = {"alpha-world-ms": "AlphaWorld_MS", "alpha-world-t": "AlphaWorld_T"}
-    if subject_id in prefixes:
+    prefix = prefixes.get(subject_id, prefix)
+    if prefix:
         period = validate_period_end(period_end)
         kind = str(artifact["report_type"])
         definitions = {
@@ -4233,7 +4246,7 @@ def _monthly_download_filename(
         if kind not in definitions:
             raise MonthlyReportError("Unsupported monthly report type")
         label, extension = definitions[kind]
-        return f"{prefixes[subject_id]}_{label}_{period}{extension}"
+        return f"{prefix}_{label}_{period}{extension}"
     name = PurePosixPath(str(artifact["filename"])).name
     # Stored files are content-addressed as "<sha256>-<name>" (twice once released);
     # readers get the plain name.
@@ -4305,7 +4318,7 @@ def _download_monthly_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end, prefix=_download_prefix(subject_id))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Subject-ID": subject_id,
@@ -4403,7 +4416,7 @@ def _download_monthly_review_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end, prefix=_download_prefix(subject_id))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Subject-ID": subject_id,
@@ -4914,6 +4927,49 @@ def _benchmark_return_basis(return_convention: object) -> dict[str, str]:
     return {"return_basis": basis, "return_basis_label": label}
 
 
+def _catalog_comparison_benchmarks(connection: Any, account_id: str, mapped: list) -> list:
+    """Active catalog benchmarks outside the account's contract that the benchmark job has
+    compared it with (WEBSITE_ALL_BENCHMARKS). Website only: listed as 'comparison', after
+    the contract's own benchmarks, and only once comparison rows exist."""
+
+    primary = next((row for row in mapped if row["mapping_type"] == "primary"), mapped[0])
+    currency = str(primary["reporting_currency"])
+    return connection.execute(
+        """
+        SELECT b.benchmark_id, b.symbol, b.name, b.provider, b.currency,
+               b.return_convention, b.license_status, 'comparison' AS mapping_type,
+               NULL AS effective_from, %s AS reporting_currency,
+               (SELECT COUNT(*) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'official_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS observations,
+               (SELECT MAX(p.observation_date) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'official_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS latest_observation,
+               (SELECT COUNT(*) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'provisional_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS provisional_observations,
+               (SELECT MAX(p.observation_date) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'provisional_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS latest_provisional_observation
+        FROM benchmark_master b
+        WHERE b.tenant_id = %s AND b.active = true
+          AND NOT (b.benchmark_id = ANY(%s))
+          AND EXISTS (
+              SELECT 1 FROM performance_comparison_daily c
+              WHERE c.tenant_id = b.tenant_id AND c.subject_id = %s
+                AND c.benchmark_id = b.benchmark_id AND c.calculation_version = %s
+                AND c.reporting_currency = %s AND c.quality_status IN ('pass', 'warn'))
+        ORDER BY b.name
+        """,
+        (currency, TENANT_ID, [str(row["benchmark_id"]) for row in mapped], account_id,
+         website_comparison_version(account_id, currency), currency),
+    ).fetchall()
+
+
 @app.get("/api/portfolio/{account_id}/benchmark-status")
 def benchmark_status(
     account_id: str, user: dict[str, str] = Depends(_authorized_user)
@@ -4952,6 +5008,8 @@ def benchmark_status(
             """,
             (account_id,),
         ).fetchall()
+        if benchmarks:
+            benchmarks = [*benchmarks, *_catalog_comparison_benchmarks(connection, account_id, benchmarks)]
     if not benchmarks:
         return {
             "account_id": account_id,
@@ -5036,6 +5094,24 @@ def _benchmark_comparison(account_id: str, benchmark_id: str | None, requested_a
             ,
             (TENANT_ID, account_id, benchmark_id, benchmark_id),
         ).fetchone()
+        if benchmark is None and benchmark_id:
+            # A catalog benchmark outside the contract, compared in the account's reporting
+            # currency (WEBSITE_ALL_BENCHMARKS); rows exist only if the job built them.
+            benchmark = connection.execute(
+                """
+                SELECT b.benchmark_id, b.symbol, b.name, b.provider,
+                       b.license_status, b.return_convention, 'comparison' AS mapping_type,
+                       m.reporting_currency
+                FROM benchmark_master b
+                JOIN portfolio_benchmark_mapping m
+                  ON m.tenant_id = b.tenant_id AND m.subject_id = %s AND m.mapping_type = 'primary'
+                 AND m.effective_from <= CURRENT_DATE::text
+                 AND (m.effective_to IS NULL OR m.effective_to >= CURRENT_DATE::text)
+                WHERE b.tenant_id = %s AND b.benchmark_id = %s AND b.active = true
+                LIMIT 1
+                """,
+                (account_id, TENANT_ID, benchmark_id),
+            ).fetchone()
         if benchmark is None:
             records = []
         else:
@@ -10643,7 +10719,7 @@ def download_onboarding_historical_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject, period_end=period_end, prefix=_download_prefix(subject))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Period-End": period_end,
@@ -11322,7 +11398,7 @@ document.querySelector('#period-apply').addEventListener('click',()=>loadPerform
 const renderBenchmark=async(id,meta,asOf)=>{{
 const query=`benchmark_id=${{encodeURIComponent(id)}}&as_of=${{encodeURIComponent(asOf)}}`;
 const bc=await fetch(`/api/portfolio/${{account}}/benchmark-comparison?${{query}}`).then(json);
-document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':'Secondary'}} · ${{meta.return_basis_label||meta.return_convention}}`;
+document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':meta.mapping_type==='comparison'?'Comparison':'Secondary'}} · ${{meta.return_basis_label||meta.return_convention}}`;
 document.querySelector('#benchmark-legend').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.return_basis==='price_return'?'price return':meta.return_basis==='total_return'?'total return':meta.return_convention}}`;
 document.querySelector('#benchmark-note').textContent=meta.message+`${{meta.return_basis==='price_return'?' The benchmark is a price index: its returns exclude dividends, while portfolio returns include income, so the comparison favours the portfolio by the index dividend yield.':''}} Provider: ${{meta.provider||'—'}} · Convention: ${{meta.return_convention}} · License: ${{meta.license_status}} · Provisional observations: ${{meta.provisional_observations}} · Latest feed observation: ${{meta.latest_provisional_observation||'—'}}`;
 document.querySelector('#benchmark-metrics').innerHTML='';certifiedLine(document.querySelector('#benchmark-metrics'),null);
@@ -11437,7 +11513,7 @@ const admin=a.admin_actions,adminAction=document.querySelector('#admin-action'),
 adminPreview.addEventListener('click',async()=>{{adminPreview.disabled=true;adminExecute.disabled=true;adminConfirmation.disabled=true;document.querySelector('#admin-result').textContent='';const result=document.querySelector('#admin-preview-result');result.textContent='Creating an integrity-bound preview…';try{{currentApproval=await fetch('/api/admin/actions/preview',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action_type:adminAction.value}})}}).then(json);const p=currentApproval.preview;result.innerHTML=`<strong>${{esc(p.label)}}</strong><p>${{esc(p.description)}}</p><p>Target: <code>${{esc(p.target)}}</code> · Environment: <strong>${{esc(p.environment)}}</strong><br>Expires: ${{esc(currentApproval.expires_at)}}<br>Payload digest: <code>${{esc(currentApproval.action_payload_sha256)}}</code></p><p><strong>Will not allow:</strong> ${{p.does_not_allow.map(esc).join(', ')}}</p><p>Type exactly: <code>${{esc(currentApproval.confirmation_phrase)}}</code></p>`;adminConfirmation.value='';adminConfirmation.placeholder=currentApproval.confirmation_phrase;adminConfirmation.disabled=false;adminExecute.disabled=false}}catch(error){{currentApproval=null;result.textContent='Unable to create an approval preview.'}}finally{{adminPreview.disabled=!admin.enabled}}}});
 adminExecute.addEventListener('click',async()=>{{if(!currentApproval)return;adminExecute.disabled=true;adminPreview.disabled=true;const result=document.querySelector('#admin-result');result.textContent='Executing the single approved staging action…';try{{const response=await fetch(`/api/admin/actions/${{currentApproval.approval_id}}/approve`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action_payload_sha256:currentApproval.action_payload_sha256,confirmation:adminConfirmation.value}})}}).then(json);result.innerHTML=`<strong>Executed once.</strong> Action: ${{esc(response.action_type)}} · Approval ID: ${{esc(response.approval_id)}} · Correlation ID: ${{esc(response.correlation_id)}}`;currentApproval=null;adminConfirmation.value='';adminConfirmation.disabled=true}}catch(error){{result.textContent='Action was not executed. Check the exact approval phrase or create a new preview.';adminExecute.disabled=false}}finally{{adminPreview.disabled=!admin.enabled}}}});
 asOfSelect.innerHTML=d.dates.map(x=>`<option value="${{esc(x)}}">${{esc(asOfLabel(x))}}</option>`).join('');asOfSelect.value=storedAsOf(d.dates)||d.latest;showFreshness(d.latest);
-benchmarks=b.benchmarks||[];benchmarkSelect.innerHTML=benchmarks.map(x=>`<option value="${{esc(x.benchmark_id)}}">${{x.mapping_type==='primary'?'Primary':'Secondary'}} — ${{esc(x.name)}} (${{esc(x.symbol)}})</option>`).join('');
+benchmarks=b.benchmarks||[];benchmarkSelect.innerHTML=benchmarks.map(x=>`<option value="${{esc(x.benchmark_id)}}">${{x.mapping_type==='primary'?'Primary':x.mapping_type==='comparison'?'Comparison':'Secondary'}} — ${{esc(x.name)}} (${{esc(x.symbol)}})</option>`).join('');
 if(benchmarks.length){{const primary=benchmarks.find(x=>x.mapping_type==='primary')||benchmarks[0];benchmarkSelect.value=primary.benchmark_id;benchmarkSelect.addEventListener('change',()=>{{const selected=benchmarks.find(x=>x.benchmark_id===benchmarkSelect.value);renderBenchmark(selected.benchmark_id,selected,asOfSelect.value).catch(()=>{{document.querySelector('#benchmark-note').textContent='Unable to load this comparison.'}})}})}}else{{document.querySelector('#benchmark').textContent=b.failed?'Unavailable':'Not configured';if(b.failed)document.querySelector('#benchmark-note').textContent='The benchmark list could not be loaded. Refresh the page to try again.';benchmarkSelect.disabled=true}}
 asOfSelect.addEventListener('change',()=>(rememberAsOf(asOfSelect.value),renderAsOf(asOfSelect.value)).catch(error=>loadFailure(error,'The figures for this date could not be loaded. Pick another date or refresh the page.')));
 if(!previewMode){{const savedConversations=await refreshConversations(null);if(savedConversations.length)await openConversation(savedConversations[0].conversation_id);else{{updateChatHeader(null);emptyChat()}}}}else{{updateChatHeader(null);emptyChat()}}analysisRun.disabled=!a.ai_model.enabled;

@@ -88,6 +88,10 @@ class StressShockTests(unittest.TestCase):
     def test_markets_come_from_the_listing_exchange(self):
         self.assertEqual((_market("SEHK"), _market("nasdaq"), _market("XYZ")), ("hong kong", "united states", None))
 
+    def test_kiwoom_holdings_find_their_market(self):
+        # The Kiwoom collector stores Korean holdings as KRX, and a U.S. holding as US when Kiwoom names no exchange.
+        self.assertEqual((_market("KRX"), _market("KSE"), _market("US")), ("korea", "korea", "united states"))
+
     def test_shocks_are_checked(self):
         self.assertEqual(_shocks([{"kind": "all", "match": "", "change": -0.1}]),
                          [{"kind": "all", "match": "", "change": -0.1}])

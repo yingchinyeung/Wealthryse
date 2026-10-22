@@ -37,9 +37,10 @@ import json
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from .kiwoom_client import MAX_SELLING_COST_RATE, AccountValuation, CashMovement, Holding, KiwoomClient, \
     KiwoomError, UsValuation, kiwoom_selling_cost, reconcile_us_valuation, reconcile_valuation
@@ -62,6 +63,19 @@ HISTORY_STAGES = ("load_and_reconcile", "build_history")
 REFRESH_STAGES = ("first_month_end", "closed")
 # Past days filled per run, so one run stays well inside the daily job's time limit.
 HISTORY_DAYS_PER_RUN = 250
+SEOUL = ZoneInfo("Asia/Seoul")
+# KRX closes at 15:30; Kiwoom's prices are final a few minutes later.
+CLOSE_SETTLED = time(15, 40)
+
+
+def snapshot_day(now: datetime) -> date:
+    """The KRX trading day whose close Kiwoom's prices show at this moment (the daily run's ``today``)."""
+
+    local = now.astimezone(SEOUL)
+    day = local.date() if local.time() >= CLOSE_SETTLED else local.date() - timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
 
 
 def collector_enabled(environ: Mapping[str, str] | None = None) -> bool:

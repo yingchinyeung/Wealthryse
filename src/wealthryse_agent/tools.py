@@ -983,9 +983,11 @@ def list_live_onboarding_cases(connection, arguments: Mapping[str, Any]) -> dict
 _MARKETS = {
     "hong kong": {"SEHK", "HKFE"},
     "china": {"SEHKNTL", "SEHKSZSE", "SSE", "SZSE"},
-    "united states": {"NYSE", "NASDAQ", "ARCA", "AMEX", "BATS", "IEX", "PINK", "NMS", "ISLAND", "CBOE"},
+    # "US" is what a Kiwoom U.S. holding is stored with when Kiwoom names no exchange.
+    "united states": {"NYSE", "NASDAQ", "ARCA", "AMEX", "BATS", "IEX", "PINK", "NMS", "ISLAND", "CBOE", "US"},
     "japan": {"TSE", "TSEJ", "OSE.JPN"},
-    "korea": {"KSE", "KOSDAQ"},
+    # IBKR lists Korean stocks on KSE or KOSDAQ; the Kiwoom collector stores every Korean holding as KRX.
+    "korea": {"KSE", "KOSDAQ", "KRX"},
     "singapore": {"SGX"},
     "taiwan": {"TWSE", "TPEX"},
     "united kingdom": {"LSE", "LSEETF"},

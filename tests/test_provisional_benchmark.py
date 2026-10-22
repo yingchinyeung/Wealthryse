@@ -130,8 +130,25 @@ class ProvisionalBenchmarkTests(unittest.TestCase):
         rows, symbol = fetch_fx_to_reporting_yfinance('USD', 'KRW', start, end, KRWTicker)
         self.assertEqual((symbol, rows), ('KRW=X', [('2025-01-20',32.0),('2025-01-21',31.25)]))
 
+    def test_pair_without_usd_goes_through_usd_on_common_days(self) -> None:
+        quotes = {'TWD=X': [('2025-01-20', 32.0), ('2025-01-21', 31.25), ('2025-01-22', 31.0)],
+                  'HKD=X': [('2025-01-20', 7.8), ('2025-01-22', 7.75)]}
+        class Frame:
+            def __init__(self, rows): self.rows = rows
+            def iterrows(self):
+                for day, close in self.rows: yield _Index(day), {"Close": close}
+        class Ticker:
+            def __init__(self, symbol): self.symbol = symbol
+            def history(self, **kwargs): return Frame(quotes[self.symbol])
+        rows, symbol = fetch_fx_to_reporting_yfinance(
+            'TWD', 'HKD', datetime(2025,1,20).date(), datetime(2025,1,22).date(), Ticker)
+        self.assertEqual(symbol, 'TWD=X/HKD=X')
+        self.assertEqual([day for day, _ in rows], ['2025-01-20', '2025-01-22'])
+        self.assertAlmostEqual(rows[0][1], 7.8 / 32.0)
+        self.assertAlmostEqual(rows[1][1], 7.75 / 31.0)
+
     def test_fx_unsupported_cross_pair_and_identical_currency_fail_closed(self) -> None:
-        for pair in (('CNY','HKD'), ('USD','EUR'), ('HKD','HKD'), ('KRW','HKD'), ('USD','TWD')):
+        for pair in (('USD','EUR'), ('HKD','HKD'), ('USD','TWD'), ('HKD','TWD'), ('EUR','HKD')):
             with self.subTest(pair=pair), self.assertRaises((ValueError,RuntimeError)):
                 fetch_fx_to_reporting_yfinance(*pair, datetime(2025,1,20).date(),
                                                datetime(2025,1,21).date(), _FxTicker)

@@ -741,9 +741,21 @@ def _expected_subjects(session: Any, job: str | None, environ: Mapping[str, str]
     return [str(row["subject_id"]) for row in _rows(session, REGISTERED_SUBJECTS_SQL, {})]
 
 
+# Only comparisons with a benchmark the subject is mapped to are judged. The website-only
+# comparisons with the rest of the catalog (WEBSITE_ALL_BENCHMARKS) are best effort and never
+# hold back a version; nothing but the website's picker reads them.
+CONTRACT_BENCHMARKS_ONLY = (
+    "EXISTS (SELECT 1 FROM portfolio_benchmark_mapping AS contract"
+    f" WHERE contract.tenant_id = {COMPARISON}.tenant_id"
+    f" AND contract.subject_id = {COMPARISON}.subject_id"
+    f" AND contract.benchmark_id = {COMPARISON}.benchmark_id)")
+
+
 def _measure(session: Any, job: str | None, table: GoldTable, scope: Scope, *, rules: Mapping[str, Any],
              tenant_id: str, environ: Mapping[str, str], stop: Callable[[], bool]) -> dict[str, Any]:
     basis, condition, params = scope.condition(table)
+    if table.name == COMPARISON:
+        condition = f"({condition}) AND {CONTRACT_BENCHMARKS_ONLY}"
     build = f"(SELECT * FROM {table.name} WHERE {condition})"
     observation: dict[str, Any] = {"basis": basis, "checks": {}}
     observation["rows"] = int(_scalar(session, f"SELECT count(*) FROM {build} AS t", params) or 0)

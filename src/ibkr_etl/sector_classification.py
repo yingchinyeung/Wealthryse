@@ -64,6 +64,37 @@ VERIFIED_HISTORICAL_OVERRIDES: dict[str, dict[str, str]] = {
         "source_url": "https://infomemo.theocc.com/infomemos?number=59906",
         "evidence": "owner_approved_underlying_override:occ-memo-59906",
     },
+    # Two Kiwoom U.S. iStrategy holdings taken over after purchase.  Yahoo and
+    # Kiwoom no longer quote either ticker, so the daily job found no sector.
+    # Each keeps the Yahoo sector and industry it had while listed, the same
+    # ones its factsheets print (us_istrategy_securities.DELISTED), bound to the
+    # Kiwoom conid.
+    "US:DFS": {
+        "symbol": "DFS",
+        "lookup_symbol": "DFS",
+        "sector": "Financial Services",
+        "industry": "Credit Services",
+        "exchange": "NYQ",
+        "long_name": "Discover Financial Services",
+        "source_url": (
+            "https://www.sec.gov/Archives/edgar/data/927628/"
+            "000119312525122059/d934475dex991.htm"
+        ),
+        "evidence": "verified_historical_override:sec-capital-one-8k-2025-05-18",
+    },
+    "US:FYBR": {
+        "symbol": "FYBR",
+        "lookup_symbol": "FYBR",
+        "sector": "Communication Services",
+        "industry": "Telecom Services",
+        "exchange": "NMS",
+        "long_name": "Frontier Communications Parent, Inc.",
+        "source_url": (
+            "https://www.sec.gov/Archives/edgar/data/20520/"
+            "000114036126001612/ef20063382_8k.htm"
+        ),
+        "evidence": "verified_historical_override:sec-frontier-8k-2026-01-20",
+    },
 }
 
 

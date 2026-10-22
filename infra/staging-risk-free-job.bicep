@@ -17,6 +17,8 @@ var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [
   { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
   { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
   { name: 'AZURE_CLIENT_ID', value: jobIdentity.properties.clientId }
+  // A fetch whose raw copy cannot be stored fails (raw_capture required mode).
+  { name: 'MARKET_DATA_RAW_REQUIRED', value: 'true' }
 ]
 
 // Korea's won risk-free rate (Bank of Korea ECOS, CD 91-day). Empty (the default) keeps the

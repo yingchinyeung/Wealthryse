@@ -84,7 +84,10 @@ def _refresh_crisis_scenarios(connection) -> dict:
 def _mark_wave0_benchmark_fx_reconciled(connection, result: dict) -> None:
     if result.get("account_id") != "U16088606":
         return
-    benchmarks = list(result.get("benchmarks", []))
+    # The account's own contract benchmarks only. With WEBSITE_ALL_BENCHMARKS on, the result also
+    # lists the website-only catalog comparisons (mapping_type "comparison"), which are best effort
+    # and not part of the approved set, so they are left out of this check and its evidence.
+    benchmarks = [item for item in result.get("benchmarks", []) if item.get("mapping_type") != "comparison"]
     expected = {"TAIEX", "SHCOMP", "HSI"}
     received = {str(item.get("benchmark_id")) for item in benchmarks}
     if received != expected:
@@ -103,8 +106,8 @@ def _mark_wave0_benchmark_fx_reconciled(connection, result: dict) -> None:
         "provider": result.get("provider"),
         "reporting_currency": result.get("reporting_currency"),
         "requested_end_date": result.get("requested_end_date"),
-        "benchmark_observations": result.get("benchmark_observations"),
-        "comparison_rows": result.get("comparison_rows"),
+        "benchmark_observations": sum(int(item.get("benchmark_observations") or 0) for item in benchmarks),
+        "comparison_rows": sum(int(item.get("comparison_rows") or 0) for item in benchmarks),
         "benchmarks": [
             {
                 key: item.get(key)

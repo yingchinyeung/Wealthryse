@@ -86,11 +86,26 @@ Each batch is one migration:
     finds the existing blob, so nothing new is kept under the legal hold.
   - It is off unless the job sets `MARKET_DATA_RAW_CONTAINER` and
     `AZURE_STORAGE_ACCOUNT_URL`.
-  - It is fail-soft:
+  - By default it is fail-soft:
     - it uses managed identity only, with short timeouts and no retries;
     - every thread shares one time budget, which is a hard limit;
     - the first storage error or timeout turns capture off for the rest of the run,
       and the job carries on.
+  - With `MARKET_DATA_RAW_REQUIRED=true` the raw copy is part of the fetch:
+    - a response whose copy cannot be stored raises `RawCopyNotStored`, so its fetch
+      fails before anything is parsed and nothing from it reaches silver;
+    - each copy gets three tries (pauses of 1 and 3 seconds) with longer timeouts and no
+      time budget, and a file already there counts as kept;
+    - once one copy has failed every try, the rest of the run's fetches fail at once;
+    - without `MARKET_DATA_RAW_CONTAINER` and `AZURE_STORAGE_ACCOUNT_URL` every fetch
+      fails, so the setting only goes on jobs that have both.
+- **Rebuild check** (`src/ibkr_etl/market_data_rebuild.py`,
+  `scripts/check_market_data_rebuild.py`): read-only. It rebuilds the recent rows of
+  `silver.benchmark_prices` (each row names its raw file by `raw_sha256`) and of the U.S.
+  Treasury series in `silver.risk_free_rates` (the newest stored year file) with the jobs'
+  own parsers, and prints one `MARKET_DATA_REBUILD` line with counts: matched, differing
+  (by id and date, never values), missing from the file, and rows whose file was not
+  found. It exits 1 when a row differs (`--require-files` also fails on a missing file).
 - **Freshness checks** (`src/ibkr_etl/layer_freshness.py`):
   - The autonomous administrator runs explicit rules for each layer in one READ ONLY
     transaction, within a hard 15-second limit. By default it uses its own
@@ -444,7 +459,7 @@ the plan that closes the gap.
 | IBKR Flex | `ibkr-raw` files, `bronze.raw_reports`, `bronze.flex_rows` | The loader, from bronze (S5, 17 Oct) | Done. |
 | IBKR live (TWS) | `bronze.live_*` | Not used for silver | Done. |
 | Kiwoom REST | None yet | `ibkr_etl.kiwoom_collector`, from the live answer | `bronze.kiwoom_responses` (migration 082, applied alone after the U8 record; first capture on the 23 Oct daily run). The collector stores every page first (`KIWOOM_BRONZE=true`, `ibkr_etl.kiwoom_bronze`). The conform step `ibkr_etl.kiwoom_conform` (`scripts/run_kiwoom_conform.py check --run-id N` or `--latest`) replays one bronze run's stored answers through the collector's own functions, never calling Kiwoom, and compares the rows with silver by the collector's keys. It is read-only and prints counts only (matched, differing, only in the rebuild, only in silver, missing answers, refusals replayed). Letting it write silver comes later. Each account's history is fetched again into bronze and silver rebuilt from it; any difference is kept as a restated version (U8) with a note. A past day is Kiwoom's daily balance (`ka01690`) with its account return for that day (`kt00016`, Kiwoom's own value of the holdings) and, when `ka01690` lists after-market prices, each stock's official KRX close, read as the next trading day's base price on the unadjusted daily chart (`ka10081`), so a day's close is known from the next trading day; all three are kept in bronze. Silver checks each Kiwoom day to the won: the positions add up to Kiwoom's holdings value, and the selling cost follows Kiwoom's per-stock rule. History fetches run outside 16:00–18:00 and 19:00–22:00 UTC, when `ka01690` answers with empty figures; the 08:00 UTC daily run is unaffected. Open quality exceptions hold that account's reports until the owner accepts them by name. |
-| Market data | `bronze-market-data` files since 18 Oct, best effort | The fetchers, from the live answer | From 26 Oct a fetch whose raw copy cannot be stored fails, a rebuild check compares silver with what the stored files parse to, and the bronze file freshness checks turn on. Nothing raw exists before 18 Oct. When Yahoo's history reply for a benchmark ends before the session a subject needs (on 22 Oct 2026 Yahoo served Azure the 21 Oct bars with no close), benchmark-daily reads that one close from Yahoo's quote, stores the quote reply in `yahoo-benchmark-history` next to the history file, and records the row with the quote's own `source_reference` and `raw_sha256` plus a `benchmark_close_from_quote` warning. `BENCHMARK_QUOTE_FALLBACK=off` turns it off. |
+| Market data | `bronze-market-data` files since 18 Oct, best effort | The fetchers, from the live answer | Next, a fetch whose raw copy cannot be stored fails (`MARKET_DATA_RAW_REQUIRED` on the benchmark, risk-free, sector and crisis jobs), the rebuild check compares silver with what the stored files parse to, and the bronze file freshness checks turn on (`LAYER_FRESHNESS_BLOB_CHECKS`). Nothing raw exists before 18 Oct. When Yahoo's history reply for a benchmark ends before the session a subject needs (on 22 Oct 2026 Yahoo served Azure the 21 Oct bars with no close), benchmark-daily reads that one close from Yahoo's quote, stores the quote reply in `yahoo-benchmark-history` next to the history file, and records the row with the quote's own `source_reference` and `raw_sha256` plus a `benchmark_close_from_quote` warning. `BENCHMARK_QUOTE_FALLBACK=off` turns it off. |
 | One-off scripts | None | Hand-run backfills and cut-overs in `scripts/` | From 28 Oct only the named loaders' logins write silver, and a CI check refuses new code that writes silver anywhere else. |
 
 The Kiwoom table keeps inquiry answers only. Token calls are never stored, and

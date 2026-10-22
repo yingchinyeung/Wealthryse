@@ -3,13 +3,20 @@
 Each fetch hands over the provider response as received, before parsing. Capture is
 off unless MARKET_DATA_RAW_CONTAINER and AZURE_STORAGE_ACCOUNT_URL are both set.
 
-It is best effort and never raises into the job:
+By default it is best effort and never raises into the job:
 - storage calls use managed identity only, short timeouts and no retries;
 - each upload runs in a daemon thread that the caller waits on for a bounded time;
 - every thread draws on one time budget per process (MARKET_DATA_RAW_BUDGET_SECONDS),
   so the total time callers wait on capture never exceeds it;
 - the first storage error or timeout, or the budget running out, logs one warning and
   switches capture off for the rest of the process.
+
+With MARKET_DATA_RAW_REQUIRED on, the raw copy is part of the fetch: a response whose copy
+cannot be stored raises RawCopyNotStored out of the capture call, so the fetch that made it
+fails before anything is parsed. Each copy gets up to REQUIRED_ATTEMPTS tries with longer
+timeouts and no time budget; once one copy has failed every try, the rest of the process
+fails at once with the same reason. Required capture without MARKET_DATA_RAW_CONTAINER and
+AZURE_STORAGE_ACCOUNT_URL fails every fetch, so the setting only goes on jobs that have both.
 
 Blob names, written with overwrite=False (the container is under a legal hold):
 - <feed>/<yyyy>/<mm>/<dd>/<request-key>-<sha256 prefix>.<ext>, dated by the UTC request
@@ -42,6 +49,7 @@ LOGGER = logging.getLogger(__name__)
 CONTAINER_ENV = "MARKET_DATA_RAW_CONTAINER"
 ACCOUNT_URL_ENV = "AZURE_STORAGE_ACCOUNT_URL"
 BUDGET_ENV = "MARKET_DATA_RAW_BUDGET_SECONDS"
+REQUIRED_ENV = "MARKET_DATA_RAW_REQUIRED"
 EXECUTION_ENV = "CONTAINER_APP_JOB_EXECUTION_NAME"
 DEFAULT_BUDGET_SECONDS = 30.0
 CONNECTION_TIMEOUT_SECONDS = 3
@@ -53,6 +61,12 @@ SHA_PREFIX = 16
 MAX_KEY_LENGTH = 120
 MAX_METADATA_VALUE = 1024
 MAX_REMEMBERED_DIGESTS = 20000
+# Required capture: tries per copy, the pause before each retry, and storage timeouts.
+REQUIRED_ATTEMPTS = 3
+REQUIRED_RETRY_PAUSES = (1.0, 3.0)
+REQUIRED_CONNECTION_TIMEOUT_SECONDS = 5
+REQUIRED_READ_TIMEOUT_SECONDS = 20
+REQUIRED_WRITE_WAIT_SECONDS = float(REQUIRED_CONNECTION_TIMEOUT_SECONDS + REQUIRED_READ_TIMEOUT_SECONDS + 5)
 
 # Feed folders in bronze-market-data, one per provider dataset.
 FEEDS = frozenset({
@@ -80,8 +94,16 @@ _CONTENT_TYPES = {
 }
 
 
+class RawCopyNotStored(RuntimeError):
+    """A required raw copy could not be stored, so the fetch that made the response fails."""
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _flag(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def request_key(*parts: Any) -> str:
@@ -136,17 +158,22 @@ def _extension(content_type: str | None, default: str) -> str:
     return default
 
 
-def _default_uploader(account_url: str, container: str) -> Callable[..., str]:
+def _default_uploader(account_url: str, container: str, *,
+                      connection_timeout: float | None = None,
+                      read_timeout: float | None = None) -> Callable[..., str]:
     from .cloud_storage import best_effort_credential, container_client, upload_with_client
+
+    connection_timeout = CONNECTION_TIMEOUT_SECONDS if connection_timeout is None else connection_timeout
+    read_timeout = READ_TIMEOUT_SECONDS if read_timeout is None else read_timeout
 
     client = container_client(
         account_url,
         container,
         credential=best_effort_credential(
-            connection_timeout=CONNECTION_TIMEOUT_SECONDS, read_timeout=READ_TIMEOUT_SECONDS
+            connection_timeout=connection_timeout, read_timeout=read_timeout
         ),
-        connection_timeout=CONNECTION_TIMEOUT_SECONDS,
-        read_timeout=READ_TIMEOUT_SECONDS,
+        connection_timeout=connection_timeout,
+        read_timeout=read_timeout,
         retry_total=0,
     )
 
@@ -162,6 +189,13 @@ def _default_uploader(account_url: str, container: str) -> Callable[..., str]:
     return upload
 
 
+def _required_uploader(account_url: str, container: str) -> Callable[..., str]:
+    """The uploader for required capture: the same calls with longer timeouts."""
+    return _default_uploader(account_url, container,
+                             connection_timeout=REQUIRED_CONNECTION_TIMEOUT_SECONDS,
+                             read_timeout=REQUIRED_READ_TIMEOUT_SECONDS)
+
+
 def _already_exists(error: BaseException) -> bool:
     try:
         from azure.core.exceptions import ResourceExistsError
@@ -171,7 +205,8 @@ def _already_exists(error: BaseException) -> bool:
 
 
 class RawCapture:
-    """Writes raw provider responses; every public method swallows its own errors."""
+    """Writes raw provider responses. Best effort (the default): every public method swallows
+    its own errors. Required: a copy that cannot be stored raises RawCopyNotStored."""
 
     def __init__(
         self,
@@ -181,13 +216,24 @@ class RawCapture:
         budget_seconds: float = DEFAULT_BUDGET_SECONDS,
         uploader_factory: Callable[[str, str], Callable[..., str]] = _default_uploader,
         job_execution: str = "",
-        write_wait_seconds: float = WRITE_WAIT_SECONDS,
+        write_wait_seconds: float | None = None,
+        required: bool = False,
+        attempts: int = REQUIRED_ATTEMPTS,
+        retry_pauses: tuple[float, ...] = REQUIRED_RETRY_PAUSES,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.container = container.strip()
         self.account_url = account_url.strip()
         self.enabled = bool(self.container and self.account_url)
+        self.required = bool(required)
         self.budget_seconds = budget_seconds
+        if write_wait_seconds is None:
+            write_wait_seconds = REQUIRED_WRITE_WAIT_SECONDS if self.required else WRITE_WAIT_SECONDS
         self.write_wait_seconds = write_wait_seconds
+        self.attempts = max(1, int(attempts)) if self.required else 1
+        self.retry_pauses = tuple(retry_pauses)
+        self._sleep = sleep
+        self.failed_reason: str | None = None  # required: the copy that failed every try
         self.job_execution = job_execution
         self.job_run_id = ""
         self.disabled_reason: str | None = None
@@ -209,11 +255,17 @@ class RawCapture:
             budget = float(environ.get(BUDGET_ENV) or DEFAULT_BUDGET_SECONDS)
         except ValueError:
             budget = DEFAULT_BUDGET_SECONDS
+        required = _flag(environ.get(REQUIRED_ENV))
+        options: dict[str, Any] = {}
+        if required:
+            options["uploader_factory"] = _required_uploader
         return cls(
             container=environ.get(CONTAINER_ENV, ""),
             account_url=environ.get(ACCOUNT_URL_ENV, ""),
             budget_seconds=max(0.0, budget),
             job_execution=environ.get(EXECUTION_ENV, ""),
+            required=required,
+            **options,
         )
 
     # Public capture calls ------------------------------------------------------------
@@ -238,7 +290,7 @@ class RawCapture:
                 {"source_url": safe_url(url), "http_status": "" if status is None else status,
                  "content_format": "http-body"},
             )
-        except Exception as error:  # noqa: BLE001 - capture must never fail the fetch
+        except Exception as error:  # noqa: BLE001 - best effort: capture never fails the fetch
             self._item_failed(feed, error)
             return None
 
@@ -278,8 +330,11 @@ class RawCapture:
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
-            return {"container": self.container, **self.stats,
-                    "seconds": round(self._spent, 3), "disabled": self.disabled_reason}
+            summary = {"container": self.container, **self.stats,
+                       "seconds": round(self._spent, 3), "disabled": self.disabled_reason}
+            if self.required:
+                summary.update(required=True, failed_reason=self.failed_reason)
+            return summary
 
     def digest_of(self, name: str | None) -> str | None:
         """The full sha256 of a file this process stored under name, or None."""
@@ -291,7 +346,22 @@ class RawCapture:
     # Internals -----------------------------------------------------------------------
 
     def _open(self) -> bool:
-        """Cheap check before serialising: on, not switched off, budget left."""
+        """Cheap check before serialising: on, not switched off, budget left. Required
+        capture raises instead of skipping."""
+        if self.required:
+            if not self.enabled:
+                with self._lock:
+                    self.stats["failed"] += 1
+                raise RawCopyNotStored(
+                    f"raw market-data capture is required ({REQUIRED_ENV}) but {CONTAINER_ENV} "
+                    f"and {ACCOUNT_URL_ENV} are not both set")
+            with self._lock:
+                reason = self.failed_reason
+                if reason is not None:
+                    self.stats["failed"] += 1
+            if reason is not None:
+                raise RawCopyNotStored(f"an earlier raw copy in this run could not be stored ({reason})")
+            return True
         if not self.enabled:
             return False
         with self._lock:
@@ -301,7 +371,10 @@ class RawCapture:
             return False
 
     def _reserve(self) -> float:
-        """Claim up to one write's wait from the shared budget; 0 means skip this one."""
+        """Claim up to one write's wait from the shared budget; 0 means skip this one.
+        Required capture has no budget: every copy gets its full wait."""
+        if self.required:
+            return self.write_wait_seconds
         with self._lock:
             if self.disabled_reason is not None:
                 return 0.0
@@ -318,8 +391,10 @@ class RawCapture:
 
     def _release(self, claim: float, elapsed: float) -> None:
         with self._lock:
-            self._reserved = max(0.0, self._reserved - claim)
             self._spent += elapsed
+            if self.required:
+                return
+            self._reserved = max(0.0, self._reserved - claim)
             if self._spent >= self.budget_seconds:
                 self._disable("time budget of %g seconds used" % self.budget_seconds)
 
@@ -358,25 +433,40 @@ class RawCapture:
                 **{k: v for k, v in extra.items() if v not in (None, "")},
             }
             metadata = {k: _metadata_value(v) for k, v in metadata.items()}
-            try:
-                self._upload_within(claim - (time.monotonic() - started), name, content,
-                                    content_type=content_type, metadata=metadata)
-            except Exception as error:  # noqa: BLE001
-                exists = _already_exists(error)
+            last_error: BaseException | None = None
+            for attempt in range(self.attempts):
+                if attempt:
+                    pauses = self.retry_pauses or (0.0,)
+                    self._sleep(pauses[min(attempt - 1, len(pauses) - 1)])
+                wait = claim if self.required else claim - (time.monotonic() - started)
+                try:
+                    self._upload_within(wait, name, content, content_type=content_type, metadata=metadata)
+                except Exception as error:  # noqa: BLE001
+                    if _already_exists(error):
+                        with self._lock:
+                            self._names.add(name)
+                            self.stats["existing"] += 1
+                        return self._stored(**stored, outcome="existing")
+                    last_error = error
+                    continue
                 with self._lock:
-                    if exists:
-                        self._names.add(name)
-                        self.stats["existing"] += 1
-                    else:
-                        self.stats["failed"] += 1
-                        self._disable(f"{type(error).__name__}: {' '.join(str(error).split())[:200]}")
-                if exists:
-                    return self._stored(**stored, outcome="existing")
-                return None
+                    self._names.add(name)
+                    self.stats["written"] += 1
+                return self._stored(**stored, outcome="written")
+            reason = f"{type(last_error).__name__}: {' '.join(str(last_error).split())[:200]}"
             with self._lock:
-                self._names.add(name)
-                self.stats["written"] += 1
-            return self._stored(**stored, outcome="written")
+                self.stats["failed"] += 1
+                if not self.required:
+                    self._disable(reason)
+                elif self.failed_reason is None:
+                    self.failed_reason = reason
+                    LOGGER.error("A required raw market-data copy could not be stored, so this run's "
+                                 "market-data fetches fail: %s", reason)
+            if self.required:
+                raise RawCopyNotStored(
+                    f"the raw copy of a {feed} response could not be stored after {self.attempts} "
+                    f"tries ({reason})") from last_error
+            return None
         finally:
             self._release(claim, time.monotonic() - started)
 
@@ -425,6 +515,9 @@ class RawCapture:
             LOGGER.warning("Raw market-data capture is off for the rest of this run: %s", reason)
 
     def _item_failed(self, feed: str, error: Exception) -> None:
+        """Count a response that could not be captured. Required capture raises it on."""
+        if isinstance(error, RawCopyNotStored):
+            raise error  # already counted where it was raised
         try:
             with self._lock:
                 self.stats["failed"] += 1
@@ -435,6 +528,9 @@ class RawCapture:
                                feed, type(error).__name__)
         except Exception:  # noqa: BLE001
             pass
+        if self.required:
+            raise RawCopyNotStored(
+                f"the raw copy of a {feed} response could not be made ({type(error).__name__})") from error
 
 
 _OBSERVERS: list[Callable[[dict[str, Any]], None]] = []
@@ -475,7 +571,7 @@ def default() -> RawCapture:
         with _DEFAULT_LOCK:
             if _DEFAULT is None:
                 capture = RawCapture.from_environment()
-                if capture.enabled:
+                if capture.enabled or capture.required:
                     atexit.register(_report_at_exit, capture)
                 _DEFAULT = capture
     return _DEFAULT
@@ -491,7 +587,7 @@ def reset(capture: RawCapture | None = None) -> None:
 def _report_at_exit(capture: RawCapture) -> None:
     try:
         summary = capture.summary()
-        if any(summary[key] for key in capture.stats) or summary["disabled"]:
+        if any(summary[key] for key in capture.stats) or summary["disabled"] or summary.get("failed_reason"):
             sys.stderr.write("MARKET_DATA_RAW_CAPTURE " + json.dumps(summary, sort_keys=True) + "\n")
     except Exception:  # noqa: BLE001
         pass
@@ -515,6 +611,8 @@ def sha256_of(name: str | None) -> str | None:
 def capture_http(feed: str, provider: str, **kwargs: Any) -> str | None:
     try:
         return default().http(feed, provider, **kwargs)
+    except RawCopyNotStored:
+        raise
     except Exception:  # noqa: BLE001
         return None
 
@@ -522,6 +620,8 @@ def capture_http(feed: str, provider: str, **kwargs: Any) -> str | None:
 def capture_frame(feed: str, provider: str, **kwargs: Any) -> str | None:
     try:
         return default().frame(feed, provider, **kwargs)
+    except RawCopyNotStored:
+        raise
     except Exception:  # noqa: BLE001
         return None
 
@@ -529,5 +629,7 @@ def capture_frame(feed: str, provider: str, **kwargs: Any) -> str | None:
 def capture_document(feed: str, provider: str, **kwargs: Any) -> str | None:
     try:
         return default().document(feed, provider, **kwargs)
+    except RawCopyNotStored:
+        raise
     except Exception:  # noqa: BLE001
         return None

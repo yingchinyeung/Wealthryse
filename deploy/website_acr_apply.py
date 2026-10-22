@@ -24,6 +24,8 @@ def apply(release, src=SRC, files=HERE / 'files'):
     for name, want in sorted(release['touched'].items()):
         # Some live files were saved with Windows line endings; Python reads both.
         live = src / name
+        if name in release['imported'] and not live.is_file():
+            continue  # imported first and missing from the live image: added whole below (see first_imported)
         unix = hashlib.sha256(live.read_bytes().replace(b'\r\n', b'\n')).hexdigest() if live.is_file() else None
         if not {sha(live), unix} & {want['live'], want['new']}:
             drifted.append(name)
@@ -40,7 +42,7 @@ def apply(release, src=SRC, files=HERE / 'files'):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes((files / name).read_bytes())
             written.append(name)
-    # Unchanged files the reviewed website imports and the live one did not (see first_imported).
+    # Files the reviewed website imports and the live one did not (see first_imported).
     for name, digest in sorted(release['imported'].items()):
         if sha(src / name) != digest:
             (src / name).parent.mkdir(parents=True, exist_ok=True)

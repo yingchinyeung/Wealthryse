@@ -150,14 +150,16 @@ def website_modules(files):
 
 
 def first_imported(before, after):
-    """Unchanged files the reviewed website imports and the live one did not.
+    """Files the deployed commit has that the reviewed website imports and the live one did not.
 
-    The patch carries only files that changed, so such a file may be missing from
-    the live image, or be an older copy nothing there imported (run 25 on 14 Oct:
-    the reviewed web.py imports report_design_ui, which the live web.py never did).
-    The build adds these files whole.
+    The live image may lack such a file, or hold an older copy nothing there imported
+    (run 25 on 14 Oct: the reviewed web.py imports report_design_ui, which the live
+    web.py never did). The patch does not carry an unchanged one, and cannot patch a
+    changed one the live image lacks (certified_build.py, run 55 on 22 Oct), so the
+    build adds them whole. A changed one the live image has is patched as usual.
+    Files new in the repo are left to the patch, which creates them.
     """
-    return sorted(n for n in website_modules(after) - website_modules(before) if before.get(n) == after[n])
+    return sorted(n for n in website_modules(after) - website_modules(before) if n in before)
 
 
 def change_set(state, merged=None):

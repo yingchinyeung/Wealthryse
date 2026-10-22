@@ -363,7 +363,13 @@ def main():
         modules = config.get('website_modules')
         skipped = [n for n in touched if modules is not None and n not in modules and n not in live]
         result['not_website_files'] = skipped
-        touched = [n for n in touched if n not in skipped]
+        # A changed file the reviewed website imports for the first time that the live
+        # image lacks (certified_build.py, run 55 on 22 Oct) cannot be patched, so it is
+        # added whole with the first-imported files below, checked against its hash.
+        imported = config.get('imported') or {}
+        whole = [n for n in touched if n in imported and n not in live]
+        result['added_whole'] = whole
+        touched = [n for n in touched if n not in skipped and n not in whole]
         for name in touched:
             if name in already:
                 continue
@@ -380,7 +386,7 @@ def main():
         result['line_endings_normalised'] = normalised
         live = {**live, **{n: h for n, h in tree_hashes(package).items() if n in normalised}}
         patch_file = root / 'change.patch'
-        patch_file.write_bytes(without_files(gzip.decompress(base64.b64decode(config['patch'])), already + skipped))
+        patch_file.write_bytes(without_files(gzip.decompress(base64.b64decode(config['patch'])), already + skipped + whole))
         applied = subprocess.run(['patch', '-p1', '--forward', '--fuzz=0', '--no-backup-if-mismatch', '-i', str(patch_file)],
                                  capture_output=True, text=True, timeout=300, cwd=str(context))
         if applied.returncode:
@@ -392,14 +398,17 @@ def main():
                 raise ValueError('Patched ' + name + ' does not match the reviewed commit; nothing built')
         if any(patched.get(n) != live[n] for n in live if n not in touched):
             raise ValueError('The change altered files it should not have; nothing built')
-        # Files the reviewed website imports for the first time that did not change in
-        # the repo are not in the patch; the live image may lack them or hold a copy
-        # nothing imported, so they are added whole, exactly as reviewed.
+        # Files the reviewed website imports for the first time are not in the patch
+        # when unchanged, or when changed and missing from the live image; the live
+        # image may lack them or hold a copy nothing imported, so they are added
+        # whole, exactly as reviewed. A changed one the live image has was patched above.
         first = []
-        for name, data in sorted((config.get('imported') or {}).items()):
+        for name, data in sorted(imported.items()):
             content = gzip.decompress(base64.b64decode(data))
-            if name.startswith('/') or '..' in name.split('/') or not name.endswith('.py') or name in touched or hashlib.sha256(content).hexdigest() != wanted.get(name):
+            if name.startswith('/') or '..' in name.split('/') or not name.endswith('.py') or hashlib.sha256(content).hexdigest() != wanted.get(name):
                 raise ValueError('First-imported file ' + name + ' does not match the reviewed commit; nothing built')
+            if name in touched:
+                continue
             if patched.get(name) != wanted[name]:
                 (package / name).parent.mkdir(parents=True, exist_ok=True)
                 (package / name).write_bytes(content)

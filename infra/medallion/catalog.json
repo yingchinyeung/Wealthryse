@@ -1278,6 +1278,12 @@
    "target_schema": "public",
    "note": "Configuration: one row; recording turns the silver history triggers on (review item U8). Owner only."
   },
+  "public.silver_write_watch": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Medallion step 3: each write to a silver table by a login outside the silver_loader group (who, which table, what kind of write, run id, application name; never row values). Written only by the silver_write_watch trigger. Empty for a full daily cycle before SILVER_WRITE_LOCK=on."
+  },
   "public.kiwoom_responses": {
    "kind": "table",
    "layer": "bronze",

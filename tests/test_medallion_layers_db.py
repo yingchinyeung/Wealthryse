@@ -47,7 +47,7 @@ LAYER_FILES = sorted(path.name for path in MIGRATIONS.glob("*_medallion_*.sql"))
 LAYER_CREATORS = ("073_certified_figures.sql", "082_kiwoom_bronze.sql")
 # Later migrations that only run once 068 to 070 have created the layer schemas, so a build
 # without the layer migrations skips these too.
-NEEDS_LAYERS = ("074_silver_history.sql",)
+NEEDS_LAYERS = ("074_silver_history.sql", "083_silver_write_watch.sql")
 # Production's ledger has this version, applied outside the repository.
 OUTSIDE = ("067_hong_kong_china_external_market_data_approval.sql",)
 LAYERS = ("bronze", "silver", "gold")
@@ -311,8 +311,9 @@ class LayerViewTests(unittest.TestCase):
     def test_undo_moves_each_layer_back_and_the_batches_apply_again(self):
         undo = _script("medallion_layers").undo_sql
         with _connect(self.database) as owner:
-            # 074 adds its own objects to silver, so as in production its undo runs before the layers'.
-            for name in NEEDS_LAYERS:
+            # 074 and 083 add their own objects to silver, so as in production their undo runs before the
+            # layers', the latest first.
+            for name in reversed(NEEDS_LAYERS):
                 owner.execute((UNDO / name.replace(".sql", "_undo.sql")).read_text(encoding="utf-8"))
                 owner.commit()
             for layer in ("silver", "bronze", "gold"):  # the reverse of the batch order

@@ -11,8 +11,16 @@ rights. Everything here does nothing until a layer schema exists.
 
 The U8 history tables (silver.<table>_history) and their setting
 (public.silver_history_settings) are written only by their owner, through the
-history trigger. The schema-wide grants reach them too, so keep_history_read_only
-takes the write rights back. It does nothing until the U8 migration has run.
+history trigger, and so is the silver write watch (public.silver_write_watch,
+migration 083). The schema-wide grants reach them too, so keep_history_read_only
+takes the write rights back. It does nothing until those migrations have run.
+
+Silver write lock (medallion step 3, migration 083): the silver_loader group may
+write every silver table and the public view over it, and the loader login is a
+member of it. With SILVER_WRITE_LOCK=on, lock_silver_writes takes INSERT, UPDATE,
+DELETE and TRUNCATE on silver from the app login, so only the loader login (and
+the owner) can write silver. Bootstrap without it gives the app login its write
+rights back, which is the undo.
 """
 from __future__ import annotations
 
@@ -54,6 +62,22 @@ SELECT c.relname
  ORDER BY 1
 """
 WRITES = ("INSERT", "UPDATE", "DELETE", "TRUNCATE")
+LOADER_GROUP = "silver_loader"
+WATCH_TABLE = "public.silver_write_watch"
+
+# Every silver table and view but the U8 history, and the public view of the same name over each.
+SILVER_TARGETS_QUERY = """
+SELECT n.nspname, c.relname
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind IN ('r', 'p', 'v')
+   AND ((n.nspname = 'silver' AND right(c.relname, 8) <> '_history')
+        OR (n.nspname = 'public' AND c.relkind = 'v' AND EXISTS (
+            SELECT 1 FROM pg_class s
+             WHERE s.relnamespace = 'silver'::regnamespace AND s.relname = c.relname
+               AND s.relkind IN ('r', 'p', 'v') AND right(s.relname, 8) <> '_history')))
+ ORDER BY 1, 2
+"""
 
 
 def present_layers(connection) -> list[str]:
@@ -132,8 +156,9 @@ def history_objects(connection) -> list[tuple[str, str]]:
     if "silver" not in present_layers(connection):
         return []
     found = [("silver", row[0]) for row in connection.execute(HISTORY_QUERY).fetchall()]
-    if connection.execute("SELECT to_regclass('public.silver_history_settings')").fetchone()[0]:
-        found.append(("public", "silver_history_settings"))
+    for schema, name in (("public", "silver_history_settings"), tuple(WATCH_TABLE.split("."))):
+        if connection.execute("SELECT to_regclass(%s)", (f"{schema}.{name}",)).fetchone()[0]:
+            found.append((schema, name))
     return found
 
 
@@ -153,6 +178,64 @@ def history_write_rights(connection, roles: list[str]) -> list[str]:
     """Any write right a role still has on a history table or the setting, PUBLIC and memberships included."""
     found = []
     for schema, name in history_objects(connection):
+        for role in roles:
+            for privilege in WRITES:
+                if connection.execute("SELECT has_table_privilege(%s, %s, %s)",
+                                      (role, f'"{schema}"."{name}"', privilege)).fetchone()[0]:
+                    found.append(f"{role}: {privilege} on {schema}.{name}")
+    return found
+
+
+def loader_group_exists(connection) -> bool:
+    return connection.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (LOADER_GROUP,)).fetchone() is not None
+
+
+def silver_write_targets(connection) -> list[tuple[str, str]]:
+    """(schema, name) of every silver table and view but the U8 history, and of the public views over them."""
+    if "silver" not in present_layers(connection):
+        return []
+    return [(row[0], row[1]) for row in connection.execute(SILVER_TARGETS_QUERY).fetchall()]
+
+
+def grant_silver_loader(connection) -> int:
+    """The silver_loader group (migration 083) may read and write every silver table and its public view."""
+    from psycopg import sql
+
+    if not loader_group_exists(connection) or "silver" not in present_layers(connection):
+        return 0
+    group = sql.Identifier(LOADER_GROUP)
+    targets = silver_write_targets(connection)
+    connection.execute(sql.SQL("GRANT USAGE ON SCHEMA silver TO {}").format(group))
+    for schema, name in targets:
+        connection.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE {} TO {}").format(
+            sql.Identifier(schema, name), group))
+    connection.execute(sql.SQL("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA silver TO {}").format(group))
+    connection.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA silver "
+                               "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {}").format(group))
+    connection.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA silver "
+                               "GRANT USAGE, SELECT ON SEQUENCES TO {}").format(group))
+    return len(targets)
+
+
+def lock_silver_writes(connection, roles: list[str]) -> int:
+    """Take every write right on silver (tables, their public views, new tables) from these logins; reads stay."""
+    from psycopg import sql
+
+    targets = silver_write_targets(connection)
+    for role in roles:
+        for schema, name in targets:
+            connection.execute(sql.SQL("REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE {} FROM {}").format(
+                sql.Identifier(schema, name), sql.Identifier(role)))
+        connection.execute(sql.SQL("ALTER DEFAULT PRIVILEGES IN SCHEMA silver "
+                                   "REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLES FROM {}").format(
+            sql.Identifier(role)))
+    return len(targets)
+
+
+def silver_write_rights(connection, roles: list[str]) -> list[str]:
+    """Any write right a role has on silver or a public view over it, PUBLIC and memberships included."""
+    found = []
+    for schema, name in silver_write_targets(connection):
         for role in roles:
             for privilege in WRITES:
                 if connection.execute("SELECT has_table_privilege(%s, %s, %s)",

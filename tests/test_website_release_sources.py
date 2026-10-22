@@ -86,6 +86,15 @@ class FirstImportedTest(unittest.TestCase):
         # fresh.py is new, so the patch carries it; the other two did not change.
         self.assertEqual(release.first_imported(self.BEFORE, after), ["report_design_ui.py", "unused.py"])
 
+    def test_changed_modules_the_new_website_imports_first_are_added_too(self):
+        # Run 55 on 22 Oct: web.py imported certified_build.py for the first time and it had
+        # changed, but the live image never had it, so the patch could not apply to it.
+        before = {**self.BEFORE, "certified_build.py": b"VERSION = 1\n"}
+        after = {**before, "web.py": b"from .db import connect\nfrom . import certified_build, fresh\n",
+                 "certified_build.py": b"VERSION = 2\n", "fresh.py": b"x = 1\n"}
+        # fresh.py is new in the repo, so the patch creates it.
+        self.assertEqual(release.first_imported(before, after), ["certified_build.py"])
+
     def test_nothing_is_added_when_the_website_imports_nothing_new(self):
         after = {**self.BEFORE, "web.py": b"from .db import connect\nVALUE = 2\n"}
         self.assertEqual(release.first_imported(self.BEFORE, after), [])
@@ -93,6 +102,10 @@ class FirstImportedTest(unittest.TestCase):
     def test_the_build_adds_them_whole_and_checks_each_against_the_reviewed_hash(self):
         code = (ROOT / "deploy" / "website_overlay_build_remote.py").read_text()
         self.assertIn("hashlib.sha256(content).hexdigest() != wanted.get(name)", code)
+        # A changed one the live image lacks leaves the patch and is added whole; one it has is patched.
+        self.assertIn("whole = [n for n in touched if n in imported and n not in live]", code)
+        self.assertLess(code.index("whole = [n for n in touched"), code.index("is not where the change expects it"))
+        self.assertIn("if name in touched:\n                continue", code)
         self.assertLess(code.index("The change altered files it should not have"), code.index("result['first_imported']"))
         self.assertLess(code.index("result['first_imported']"), code.index("'import ibkr_etl.web'"))
 
@@ -138,12 +151,12 @@ class AlreadyLiveFilesTest(unittest.TestCase):
     def test_the_build_skips_files_already_as_reviewed(self):
         code = (ROOT / "deploy" / "website_overlay_build_remote.py").read_text()
         self.assertIn("already = [n for n in touched if n in live and live[n] == wanted.get(n)]", code)
-        self.assertIn("without_files(gzip.decompress(base64.b64decode(config['patch'])), already + skipped)", code)
+        self.assertIn("without_files(gzip.decompress(base64.b64decode(config['patch'])), already + skipped + whole)", code)
 
     def test_files_the_website_does_not_import_and_never_had_are_left_out(self):
         code = (ROOT / "deploy" / "website_overlay_build_remote.py").read_text()
         self.assertIn("skipped = [n for n in touched if modules is not None and n not in modules and n not in live]", code)
-        self.assertLess(code.index("touched = [n for n in touched if n not in skipped]"),
+        self.assertLess(code.index("touched = [n for n in touched if n not in skipped and n not in whole]"),
                         code.index("is not where the change expects it"))
         self.assertIn("'website_modules': sorted(website_modules(after))",
                       (ROOT / "deploy" / "website_release.py").read_text())

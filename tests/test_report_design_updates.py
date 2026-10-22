@@ -230,15 +230,14 @@ class DesignWorkerTests(unittest.TestCase):
             self.assertTrue(any("status='failed'" in c.args[0] for c in connection.execute.call_args_list))
 
     def test_future_design_not_activated_until_every_replacement_is_approved(self):
-        current=plan();pair={'factsheet':{'generation_run_id':1,'sha256':'e'*64},
-                            'presentation':{'generation_run_id':2,'sha256':'f'*64}}
+        # Decks are no longer built: each month's replacement is its factsheet alone.
+        current=plan();pair={'factsheet':{'generation_run_id':1,'sha256':'e'*64}}
         row={'plan_json':current,'plan_sha256':service.digest(current),'result_json':{'2026-09-30':pair},
             'subject_id':SUBJECT,'request_id':ID,'design_version':'design-v2'}
         for complete in (False,True):
             connection=Mock()
             connection.execute.return_value.fetchall.side_effect=[[row],
-                [{'generation_run_id':1,'artifact_sha256':'e'*64},{'generation_run_id':2,'artifact_sha256':'f'*64}]
-                if complete else [{'generation_run_id':1,'artifact_sha256':'e'*64}]]
+                [{'generation_run_id':1,'artifact_sha256':'e'*64}] if complete else []]
             connection.execute.return_value.fetchone.side_effect=[snapshots()[0],{'lifecycle_status':'active'},design()]
             with patch.dict(os.environ,{'REPORT_RENDERER_IMAGE_SHA256':IMAGE}), \
                  patch.object(worker,'verify_generated_pair',return_value=pair):

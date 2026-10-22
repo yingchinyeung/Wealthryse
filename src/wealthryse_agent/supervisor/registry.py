@@ -92,9 +92,14 @@ class Member:
     today: str = ""
 
 
+# Tools a specialist borrows from the one that owns them, to look something up before its own tools run:
+# run_what_if and run_stress_test take holdings by symbol, so "my largest holding" needs get_holdings first.
+BORROWED = {"modelling": ("get_holdings",)}
+
+
 def _client(name: str, *tools: str, today: str = "") -> Member:
     return Member(name, "client_analysis", "specialist", "answer", "analyst",
-                  tuple(tools) + SHARED_CLIENT_TOOLS, today=today)
+                  tuple(tools) + BORROWED.get(name, ()) + SHARED_CLIENT_TOOLS, today=today)
 
 
 MEMBERS = (
@@ -179,7 +184,7 @@ def owner(tool: str) -> str | None:
     if tool in SHARED_CLIENT_TOOLS or tool in SERVER_TOOLS:
         return None
     for name in CLIENT_SPECIALISTS:
-        if tool in (BY_NAME[name].tools or ()):
+        if tool in (BY_NAME[name].tools or ()) and tool not in BORROWED.get(name, ()):
             return name
     return None
 

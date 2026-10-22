@@ -5,8 +5,9 @@ WEB_DESIGN has three positions:
 * classic (the default): every page is served exactly as before.
 * preview: owners see a "Try the new design" link and can turn the new design on
   for their own browser. Everyone else keeps the classic design.
-* next: everyone gets the new design, and anyone can go back to the classic
-  design for their own browser.
+* next: everyone gets the new design. The classic design is retired: there is
+  no way back to it in the browser, and a saved classic choice is ignored.
+  Setting WEB_DESIGN=classic remains the site-wide rollback.
 
 The choice is kept in the wr_design cookie. The new design keeps the classic
 visual language (black and white, Barlow capitals, square corners, the same light
@@ -56,7 +57,7 @@ def design_for(cookie: str | None, role: str | None) -> str:
     """The design this person sees: "next" or "classic"."""
     mode = setting()
     if mode == "next":
-        return "classic" if cookie == "classic" else "next"
+        return "next"
     if mode == "preview" and role == "owner" and cookie == "next":
         return "next"
     return "classic"
@@ -68,7 +69,7 @@ def may_choose(design: str, role: str | None) -> bool:
     if design not in ("next", "classic") or mode == "classic":
         return False
     if design == "classic":
-        return True
+        return mode == "preview"
     return mode == "next" or role == "owner"
 
 

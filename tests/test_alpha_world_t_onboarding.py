@@ -58,6 +58,12 @@ class OnboardingTests(unittest.TestCase):
 
     def test_pass_is_t_scoped_and_never_activates_or_commits(self):self.run_acceptance()
     def test_stale_comparisons_never_pass(self):self.run_acceptance(stale=True)
+    def test_stored_check_reads_only_the_contract_benchmarks(self):
+        # Website-only comparison rows (WEBSITE_ALL_BENCHMARKS) have no mapping row.
+        connection=self.run_acceptance()
+        sql=connection.execute.call_args_list[2].args[0]
+        self.assertIn('FROM portfolio_benchmark_mapping m',sql)
+        self.assertIn('m.benchmark_id=c.benchmark_id',sql)
     def test_no_or_ambiguous_case_never_passes(self):
         for cases in (0,2):self.run_acceptance(cases=cases)
     def test_missing_check_fails(self):self.run_acceptance(updated=0)

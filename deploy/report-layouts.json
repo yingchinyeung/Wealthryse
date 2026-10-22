@@ -3,7 +3,7 @@
  "assurance_job": "ibkrv2stg-analyst-assurance",
  "assurance_image": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:80cc030ae751a0a8c122e930c3238ab16d2f49811de0dec360f04b9cf3e09ac5",
  "month_end_job": "ibkrv2stg-month-end-factsheet",
- "month_end_image": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:d1ef4cd91121210164c244802174ab1bde830e15ed2f016ae18b7fa702afe0f1",
+ "month_end_image": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:52b68ce6b2fec56dc6f31415aea187d7cf338c4f9c489a694a2587224d15d3e4",
  "subjects": {
   "U16088571": {
    "factsheet": "approved-august-2026-v9-full-portfolio-history",

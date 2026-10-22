@@ -35,8 +35,6 @@ IGNORED_PREFIXES = ('docs/', 'tests/', '.github/', 'infra/', 'deploy/', '.azured
                     # Agent services ship in their own image (Dockerfile.agent).
                     'src/wealthryse_agent/', 'migrations/agent/', 'Dockerfile.agent',
                     'scripts/install_agent_schema.py',
-                    # The live IBKR collector ships in its own image on the gateway VM.
-                    'Dockerfile.live-collector', 'requirements-live.lock',
                     # Repository metadata, not copied into any image.
                     'LICENSE')
 # Lines that put infra/medallion into the platform and agent images (#152). The website image is

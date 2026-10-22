@@ -71,9 +71,6 @@ jobs:
       # pushes nothing.
       - name: Build
         run: docker build -f Dockerfile.azure -t wealthryse-ingestion:ci .
-      # The read-only live collector that runs beside IB Gateway on the gateway VM.
-      - name: Build live collector
-        run: docker build -f Dockerfile.live-collector -t wealthryse-live-collector:ci .
 
   bicep:
     runs-on: ubuntu-latest

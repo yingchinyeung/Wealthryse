@@ -11,6 +11,13 @@ which compared v2's schedules with v1.1's daily job, were retired too: their
 jobs and Bicep files are gone. institutional-shadow's script and its table
 stay, because the website still shows the last reconciliation.
 
+**Update, 22 Oct 2026:** the TWS API gateway was retired at the owner's request.
+It was never deployed (no gateway VM existed in rg-ibkr-database-v11). Its
+Bicep file, VM deploy files, collector image and collector code are gone; the
+live_ tables, the ibkr_live_collector role and the website's live view (off)
+stay, with their writer in `live_store.py`. Market data from IBKR now comes
+through the Web API over OAuth (`docs/IBKR_OAUTH_MARKET_DATA.md`).
+
 ## How this list was made
 
 A module counts as "in use" if the live platform can reach it. That means it

@@ -1,4 +1,8 @@
-"""The website's read-only live view of IBKR data from the gateway VM.
+"""The website's read-only live view of IBKR data in the live_ tables (migration 063).
+
+The TWS gateway that was meant to fill those tables was retired before it was
+ever deployed (docs/LIVE_IBKR_DATA.md), so the view shows nothing until a new
+source writes them through live_store.LiveStore.
 
 Access follows the per-account ``live_view`` switch from migration 063:
 'preview' shows live data to owners and platform admins only, and 'active'
@@ -12,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Mapping
 
-from .live_collector import markets_open
+from .live_store import markets_open
 
 LIVE_FEATURE = "live_view"
 PREVIEW_ROLES = frozenset({"owner", "platform_admin"})

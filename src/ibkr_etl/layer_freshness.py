@@ -88,6 +88,7 @@ RULES: tuple[Rule, ...] = (
     _feed("bok-cd-91d", time(23, 30), required=False),  # only once BOK_ECOS_API_KEY is set
     _feed("oecd-kr-cd-3m", time(23, 30), required=False),
     _feed("yahoo-chart", time(9, 30), required=False),
+    _feed("ibkr-web-history", time(9, 30), required=False),  # once the IBKR OAuth source is switched on
     # Silver.
     Rule("silver.nav_snapshots", "silver", "public.nav_snapshots", AS_OF, time(9, 30),
          timedelta(days=4), query="SELECT MAX(snapshot_date) AS observed FROM nav_snapshots"),

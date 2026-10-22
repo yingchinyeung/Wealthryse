@@ -133,7 +133,7 @@ class LiveDataDatabaseTests(unittest.TestCase):
         import psycopg
 
         from ibkr_etl.db import PostgresConnection
-        from ibkr_etl.live_collector import LiveStore
+        from ibkr_etl.live_store import LiveStore
 
         def connect():
             connection = PostgresConnection(psycopg.connect(_dsn(self.database, COLLECTOR, tenant)))
@@ -184,7 +184,7 @@ class LiveDataDatabaseTests(unittest.TestCase):
     def test_store_connects_from_a_url_and_sets_the_tenant(self):
         from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
-        from ibkr_etl.live_collector import LiveStore
+        from ibkr_etl.live_store import LiveStore
 
         params = conninfo_to_dict(_dsn(self.database, COLLECTOR))
         params.pop("options")  # the store sets the tenant itself
@@ -199,7 +199,7 @@ class LiveDataDatabaseTests(unittest.TestCase):
         self.assertEqual(self._query(WEB, "SELECT tenant_id::text FROM live_gateway_status"), [(TENANT,)])
 
     def test_store_round_trip_through_the_views(self):
-        from ibkr_etl.live_collector import COLLECTOR_VERSION
+        from ibkr_etl.live_store import COLLECTOR_VERSION
 
         store = self._store()
         earlier = NOW - timedelta(minutes=1)

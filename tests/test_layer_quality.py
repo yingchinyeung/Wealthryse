@@ -183,8 +183,9 @@ class CatalogCoverageTests(unittest.TestCase):
         self.assertEqual(len(pass_plan.rules), 234)
         self.assertEqual(len({r.check_id for r in pass_plan.rules}), 234)
         self.assertEqual(sum(r.needs_rls_bypass for r in pass_plan.rules), 15)
-        self.assertIn("silver.nav_snapshots_history", pass_plan.held)
-        self.assertIn("public.silver_history_settings", pass_plan.held)
+        # U8's history is no longer held: migration 074 is in migrations/postgres.
+        self.assertNotIn("silver.nav_snapshots_history", pass_plan.held)
+        self.assertNotIn("public.silver_history_settings", pass_plan.held)
         self.assertEqual(layer_quality.rule_check_id("silver.nav_snapshots", "total_text_is_decimal"),
                          "rule.silver.nav_snapshots.total_text_is_decimal")
         gate = {"rule.silver.nav_snapshots.total_text_is_decimal"}
@@ -464,7 +465,8 @@ class HeldTableTests(unittest.TestCase):
     def test_a_held_table_is_skipped_until_its_migration_has_run(self):
         held = Volume("nav_snapshots_history", "silver", count_column="version_id", qualified=True, held=True)
         plain = Volume("accounts", "silver", count_column="account_id")
-        pass_plan = layer_quality.Plan(volumes=(held, plain))
+        # No table is held since 074 joined migrations/postgres, so the plan names one as before it had run.
+        pass_plan = layer_quality.Plan(volumes=(held, plain), held=frozenset({"silver.nav_snapshots_history"}))
         session = _Session(absent={"silver.nav_snapshots_history"})
         results = {r["check_id"]: r for r in layer_quality.measure_daily(
             session, pass_plan, now=_at(TUESDAY, 10, 30), results=[], time_budget_seconds=60)}
@@ -482,6 +484,7 @@ class HeldTableTests(unittest.TestCase):
     def test_held_schema_and_rule_checks_are_skipped_too(self):
         pass_plan = layer_quality.plan({layer_quality.CONTRACTS_DIR_ENV: str(CONTRACTS)})
         pass_plan.volumes = ()
+        pass_plan.held = frozenset({"silver.trades_history"})  # as before its migration (074) had run
         session = _Session(absent=pass_plan.held)
         with patch.object(layer_quality, "judge_schema", return_value={"check_id": "x", "state": "pass"}), \
                 patch("ibkr_etl.medallion_contracts.introspect", return_value={}):

@@ -210,12 +210,12 @@ VOLUMES: tuple[Volume, ...] = (
     Volume("risk_free_rates", "silver", "rate_date"),
     Volume("synthetic_portfolio_components", "silver", "snapshot_date"),
     Volume("trades", "silver", "trade_date", judged=False),
-    # Corrections history (U8): append-only, so the whole table must not shrink. Held until 9 Nov.
-    Volume("cash_transactions_history", "silver", count_column="version_id", qualified=True, held=True),
-    Volume("fx_rates_history", "silver", count_column="version_id", qualified=True, held=True),
-    Volume("fx_transactions_history", "silver", count_column="version_id", qualified=True, held=True),
-    Volume("nav_snapshots_history", "silver", count_column="version_id", qualified=True, held=True),
-    Volume("trades_history", "silver", count_column="version_id", qualified=True, held=True),
+    # Corrections history (U8, migration 074): append-only, so the whole table must not shrink.
+    Volume("cash_transactions_history", "silver", count_column="version_id", qualified=True),
+    Volume("fx_rates_history", "silver", count_column="version_id", qualified=True),
+    Volume("fx_transactions_history", "silver", count_column="version_id", qualified=True),
+    Volume("nav_snapshots_history", "silver", count_column="version_id", qualified=True),
+    Volume("trades_history", "silver", count_column="version_id", qualified=True),
     # Certified figures (U5): builds and figures are append-only, so neither may shrink.
     Volume("certified_builds", "gold", count_column="build_id"),
     Volume("certified_figures", "gold", count_column="build_id"),

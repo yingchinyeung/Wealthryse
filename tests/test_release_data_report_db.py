@@ -20,6 +20,8 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
+from test_medallion_layers_db import NEEDS_LAYERS
+
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "migrations" / "postgres"
@@ -82,7 +84,7 @@ def _build(database: str, *, layers: bool = True) -> None:
                       "applied_at TEXT NOT NULL)")
         owner.commit()
         for path in sorted(MIGRATIONS.glob("*.sql")):
-            if not layers and "_medallion_" in path.name:
+            if not layers and ("_medallion_" in path.name or path.name in NEEDS_LAYERS):
                 continue
             text = path.read_text(encoding="utf-8")
             try:

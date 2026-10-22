@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ibkr_etl import layer_freshness
+from test_medallion_layers_db import NEEDS_LAYERS
 
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
@@ -145,9 +146,10 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
             admin.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         with psycopg.connect(_dsn(cls.database, OWNER)) as owner:
             for path in sorted((ROOT / "migrations" / "postgres").glob("*.sql")):
-                if "_medallion_" in path.name:
+                if "_medallion_" in path.name or path.name in NEEDS_LAYERS:
                     # The approval login as it is before the layer moves, which bootstrap makes with
-                    # their grants (test_medallion_layers_db and the S3 runs cover the moves).
+                    # their grants (test_medallion_layers_db and the S3 runs cover the moves). 074
+                    # runs only after them.
                     continue
                 try:
                     owner.execute(path.read_text(encoding="utf-8"))

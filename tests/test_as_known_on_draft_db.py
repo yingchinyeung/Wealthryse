@@ -1,10 +1,11 @@
 """The U8 "as known on" proof on a real PostgreSQL: the worked example of docs/MEDALLION_AS_KNOWN_ON.md.
 
-The held migrations (infra/medallion/drafts/u8_silver_history.sql, then u8_fx_event_key.sql) are
-not in migrations/postgres, so nothing in production applies them. Needs a disposable server: set
-AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI starts one). Skipped otherwise. Builds its own
-database with every migration in order, applies the held files as the owner, then loads made-up
-Flex statements with today's loader (IBKR_FX_EVENT_KEY off). Synthetic data only.
+The history is migration 074_silver_history.sql (applied in production on 21 Oct 2026). The held FX
+step (infra/medallion/drafts/u8_fx_event_key.sql) is not in migrations/postgres, so nothing in
+production applies it. Needs a disposable server: set AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI
+starts one). Skipped otherwise. Builds its own database with every migration in order, applies the
+held file as the owner, then loads made-up Flex statements with today's loader (IBKR_FX_EVENT_KEY
+off). Synthetic data only.
 tests/test_silver_history_db.py covers the backfill, the checks, the FX step and the undo.
 """
 from __future__ import annotations
@@ -19,12 +20,12 @@ from unittest.mock import patch
 import test_medallion_layers_db as layers
 from ibkr_etl.config import Settings
 from ibkr_etl.loader import fx_event_identity, fx_event_key as event_key
+from ibkr_etl.medallion_layers import keep_history_read_only
 from ibkr_etl.service import ingest_content
 
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
-HELD = (ROOT / "infra" / "medallion" / "drafts" / "u8_silver_history.sql",
-        ROOT / "infra" / "medallion" / "drafts" / "u8_fx_event_key.sql")
+HELD = (ROOT / "infra" / "medallion" / "drafts" / "u8_fx_event_key.sql",)
 TENANT, OTHER_TENANT = layers.TENANT, layers.OTHER_TENANT
 ACCOUNT = "U9100001"
 QUIET_ACCOUNT = "U9100009"
@@ -94,11 +95,13 @@ class AsKnownOnDraftTests(unittest.TestCase):
                 if admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (READER,)).fetchone() is None:
                     admin.execute(f"CREATE ROLE {READER} LOGIN PASSWORD '{layers.PASSWORD}'")
             with layers._connect(cls.database) as owner:
-                # A job login as bootstrap would grant it, before the migration copies SELECT to the history.
+                # A job login as bootstrap would grant it. 074 ran in the build, so the history gets the
+                # schema-wide rights too, and bootstrap's keep_history_read_only leaves only SELECT.
                 owner.execute(f"GRANT USAGE ON SCHEMA silver, public TO {READER}")
-                for table in TRACKED + ("accounts",):
+                for table in TRACKED + ("accounts",) + tuple(f"{name}_history" for name in TRACKED):
                     owner.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON silver.{table} TO {READER}")
                 owner.execute(f"GRANT SELECT ON public.accounts TO {READER}")  # the account check reads it
+                keep_history_read_only(owner, [READER])
                 for path in HELD:
                     owner.execute(path.read_text(encoding="utf-8"))
                     owner.commit()

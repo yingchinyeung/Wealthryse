@@ -3,7 +3,7 @@
 The merge plan for rows account-sync kept under v1.1's key, the read-only FX check's counts, a
 second merge finding nothing, and the loader (IBKR_FX_EVENT_KEY on) once the merge has run: a
 re-send the next day never adds a second row. Synthetic data only. tests/test_fx_event_key_db.py
-runs the same on PostgreSQL with the held migrations as 074 and 075.
+runs the same on PostgreSQL with migration 074 and the held FX step as 075.
 """
 from __future__ import annotations
 

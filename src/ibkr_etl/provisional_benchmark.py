@@ -47,8 +47,58 @@ BENCHMARKS = (
 FX_TICKERS = {
     "CNY": "CNY=X",  # quoted as CNY per USD
     "HKD": "HKD=X",  # quoted as HKD per USD
+    "KRW": "KRW=X",  # quoted as KRW per USD
     "TWD": "TWD=X",  # quoted as TWD per USD
 }
+# Reporting currencies a USD benchmark may be converted into with the direct Yahoo quote.
+DIRECT_FROM_USD = {"HKD", "KRW"}
+
+
+WEBSITE_ALL_BENCHMARKS_ENV = "WEBSITE_ALL_BENCHMARKS"
+
+
+def website_all_benchmarks_enabled(environ: Any = None) -> bool:
+    """On: also compare every subject with each active catalog benchmark outside its contract,
+    for the website's picker only. Off (the default) leaves the job exactly as before."""
+
+    return str((environ if environ is not None else os.environ).get(
+        WEBSITE_ALL_BENCHMARKS_ENV, "")).strip().lower() == "on"
+
+
+def catalog_comparison_benchmarks(
+    connection: Any, specs: tuple[BenchmarkSpec, ...]
+) -> tuple[BenchmarkSpec, ...]:
+    """Active catalog benchmarks the contract leaves out, as best-effort 'comparison' specs in
+    the contract's reporting currency. They are never written to portfolio_benchmark_mapping,
+    so reports, factsheets, risk, certified figures and the agents never see them."""
+
+    mapped = {spec.benchmark_id for spec in specs}
+    reporting_currency = specs[0].reporting_currency
+    rows = connection.execute(
+        """
+        SELECT benchmark_id, symbol, name, currency, return_convention
+        FROM benchmark_master
+        WHERE active = true
+        ORDER BY benchmark_id
+        """
+    ).fetchall()
+    return tuple(
+        BenchmarkSpec(
+            benchmark_id=str(row["benchmark_id"]),
+            symbol=str(row["symbol"]),
+            name=str(row["name"]),
+            mapping_type="comparison",
+            currency=str(row["currency"]).upper(),
+            reporting_currency=reporting_currency,
+            return_convention=str(row["return_convention"]),
+        )
+        for row in rows
+        if str(row["benchmark_id"]) not in mapped
+    )
+
+
+class NoBenchmarkContract(RuntimeError):
+    """The subject has no active benchmark mapping, so there is nothing to compare it with."""
 
 
 def mapped_benchmarks(connection: Any, account_id: str) -> tuple[BenchmarkSpec, ...]:
@@ -69,7 +119,7 @@ def mapped_benchmarks(connection: Any, account_id: str) -> tuple[BenchmarkSpec, 
         (account_id,),
     ).fetchall()
     if not rows:
-        raise RuntimeError(f"No active benchmark contract is configured for {account_id}")
+        raise NoBenchmarkContract(f"No active benchmark contract is configured for {account_id}")
     specs = tuple(
         BenchmarkSpec(
             benchmark_id=str(row["benchmark_id"]),
@@ -227,6 +277,14 @@ def fetch_benchmark_yfinance(
     return observations
 
 
+def is_cross_pair(from_currency: str, reporting_currency: str) -> bool:
+    """A pair converted through USD: neither side is USD and both have a Yahoo quote."""
+
+    native, reporting = from_currency.upper(), reporting_currency.upper()
+    return (native != reporting and "USD" not in (native, reporting)
+            and native in FX_TICKERS and reporting in DIRECT_FROM_USD)
+
+
 def fetch_fx_to_reporting_yfinance(
     from_currency: str,
     reporting_currency: str,
@@ -236,21 +294,35 @@ def fetch_fx_to_reporting_yfinance(
 ) -> tuple[list[tuple[str, float]], str]:
     """Fetch native-currency-to-reporting-currency closes from Yahoo Finance.
 
-    Yahoo's ``TWD=X``/``CNY=X``/``HKD=X`` series are quoted as local
+    Yahoo's ``TWD=X``/``CNY=X``/``HKD=X``/``KRW=X`` series are quoted as local
     currency units per USD. Use the reciprocal for local -> USD, but use the
-    direct HKD=X quote for USD -> HKD. No additional cross pairs are approved.
+    direct HKD=X or KRW=X quote for USD -> HKD or USD -> KRW. A pair with no
+    USD side (for example TWD -> HKD) goes through USD: native -> USD times
+    USD -> reporting, on the days both quotes exist. No other pairs are approved.
     """
 
     native = from_currency.upper()
     reporting = reporting_currency.upper()
     if native == reporting:
         raise ValueError("FX retrieval is unnecessary for identical currencies")
-    direct_quote = native == "USD" and reporting == "HKD"
+    if is_cross_pair(native, reporting):
+        to_usd, native_symbol = fetch_fx_to_reporting_yfinance(
+            native, "USD", start_date, end_date, ticker_factory)
+        from_usd, reporting_symbol = fetch_fx_to_reporting_yfinance(
+            "USD", reporting, start_date, end_date, ticker_factory)
+        second_leg = dict(from_usd)
+        crossed = [(day, value * second_leg[day]) for day, value in to_usd if day in second_leg]
+        if not crossed:
+            raise RuntimeError(f"No common FX observation days for {native}/{reporting}")
+        if not all(math.isfinite(value) and value > 0 for _, value in crossed):
+            raise RuntimeError(f"Invalid FX observation for {native}/{reporting}")
+        return crossed, f"{native_symbol}/{reporting_symbol}"
+    direct_quote = native == "USD" and reporting in DIRECT_FROM_USD
     if not direct_quote and (reporting != "USD" or native not in FX_TICKERS):
         raise RuntimeError(
             f"No approved provisional FX ticker maps {native} to {reporting}"
         )
-    symbol = FX_TICKERS["HKD"] if direct_quote else FX_TICKERS[native]
+    symbol = FX_TICKERS[reporting] if direct_quote else FX_TICKERS[native]
     quote_currency = reporting if direct_quote else native
     direct = fetch_benchmark_yfinance(
         BenchmarkSpec(
@@ -326,6 +398,29 @@ def _store_reference_fx_rates(
         )
 
 
+# Accounts reporting in these currencies keep no FX of their own (a Kiwoom won account
+# holds only won), so the benchmark run also stores their currency against USD for the
+# USD views, such as Combined holdings. HKD subjects already have theirs.
+REPORTING_USD_FX = {"KRW"}
+
+
+def _store_reporting_usd_fx(connection: Any, reporting_currency: str, fx_by_currency: dict,
+                            start_date: date, end_date: date, ticker_factory: Callable[[str], Any] | None,
+                            fetched_at: str) -> dict[str, Any] | None:
+    """Best effort: a missing quote is reported and never holds back the comparison."""
+
+    if reporting_currency not in REPORTING_USD_FX or "USD" in fx_by_currency:
+        return None
+    try:
+        rates, symbol = fetch_fx_to_reporting_yfinance(
+            "USD", reporting_currency, start_date - timedelta(days=7), end_date, ticker_factory)
+    except Exception as error:  # noqa: BLE001 - reported in the run result
+        return {"status": "unavailable", "error": " ".join(str(error).split())[:300]}
+    _store_reference_fx_rates(connection, from_currency="USD", reporting_currency=reporting_currency,
+                              rates=rates, fetched_at=fetched_at)
+    return {"status": "stored", "symbol": symbol, "observations": len(rates)}
+
+
 def _account_contract(connection: Any, account_id: str) -> tuple[str, str, date]:
     row = connection.execute(
         """
@@ -371,6 +466,32 @@ def _portfolio_values(connection: Any, account_id: str, start_date: str,
 def _external_flows(
     connection: Any, account_id: str, *, subject_type: str | None = None
 ) -> dict[str, float]:
+    """Net external flows (deposits and withdrawals) per date, in the base currency.
+
+    The one flows reader every return figure uses. FLOWS_SOURCE chooses where a
+    physical account's flows come from (ibkr_etl.flows_source): off, the default,
+    reads bronze exactly as _bronze_external_flows does; fallback reads silver too
+    and uses it only when it equals bronze; on reads silver only. Portfolios read
+    their silver cash ledger in every mode.
+    """
+    from . import flows_source
+
+    selected = flows_source.selected_mode()
+    if selected == flows_source.OFF:
+        return _bronze_external_flows(connection, account_id, subject_type=subject_type)
+    return flows_source.external_flows(connection, account_id, subject_type=subject_type, selected=selected)
+
+
+def _bronze_external_flows(
+    connection: Any, account_id: str, *, subject_type: str | None = None,
+    records: list[tuple[str, str, str, float, float]] | None = None,
+) -> dict[str, float]:
+    """Today's reader: a physical account's flows from bronze flex_rows.
+
+    records, when given, receives one (source, date, currency, amount, base amount)
+    tuple for each row that is added up, for the comparison with silver. A cash
+    transaction's amount is in its currency; a transfer's is its base amount.
+    """
     if subject_type is None:
         subject = connection.execute(
             "SELECT subject_type FROM platform_subjects WHERE subject_id = ?",
@@ -428,6 +549,8 @@ def _external_flows(
                 amount = _convert(values.get("positionAmount"), rate)
         if amount is not None:
             flows[flow_date] += amount
+            if records is not None:
+                records.append(("transfer", flow_date, str(values.get("currency") or ""), amount, amount))
     # Bank deposits and withdrawals are reported as CashTransactions, not
     # Transfers. Older Flex files carry no `type`, so fall back to IBKR's
     # description. Consolidated copies (accountId "-") would double count.
@@ -451,6 +574,56 @@ def _external_flows(
         amount = _convert(values.get("amount"), rate)
         if amount is not None:
             flows[flow_date] += amount
+            if records is not None:
+                records.append(("cash", flow_date, str(values.get("currency") or ""),
+                                _number(values.get("amount")), amount))
+    if str(bases[account_id] or "").upper() in KIWOOM_FLOW_CURRENCIES and connection.execute(
+        "SELECT 1 FROM flex_rows WHERE account_id = ? LIMIT 1", (account_id,)
+    ).fetchone() is None and _is_kiwoom(connection, account_id):
+        for flow_date, amount in _kiwoom_flows(connection, account_id, converter, records=records).items():
+            flows[flow_date] += amount
+    return dict(flows)
+
+
+# A Kiwoom account has no Flex file: its deposits and withdrawals are the platform's own cash rows
+# (kiwoom_us_account.balance_gaps for a USD account). Korea's KRW account is left out until its own factsheet
+# check takes them in, so its figures do not move here.
+KIWOOM_FLOW_CURRENCIES = frozenset({"USD"})
+KIWOOM_FLOW_TYPES = ("DEPOSIT", "WITHDRAWAL")
+
+
+def _is_kiwoom(connection: Any, account_id: str) -> bool:
+    """Only a Kiwoom account reads silver cash rows, as flows_source.silver_external_flows does.
+
+    An IBKR account's flows come from its Flex file alone, wherever it is read from: the agents'
+    scoped views have flex_rows but no cash_transactions.
+    """
+    row = connection.execute("SELECT account_type FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
+    return row is not None and str(row["account_type"] or "") == "kiwoom"
+
+
+def _kiwoom_flows(connection: Any, account_id: str, converter: FxConverter, *,
+                  records: list[tuple[str, str, str, float, float]] | None = None) -> dict[str, float]:
+    """The account's DEPOSIT and WITHDRAWAL rows in silver cash_transactions, in the base currency.
+
+    Both flow readers call this (flows_source.silver_external_flows too), so FLOWS_SOURCE compares like
+    with like; records, when given, receives ("kiwoom", date, currency, amount, base amount) for each row.
+    """
+    flows: dict[str, float] = defaultdict(float)
+    for row in connection.execute(
+        "SELECT effective_date, amount_text, currency FROM cash_transactions "
+        "WHERE account_id = ? AND transaction_type IN (?, ?) ORDER BY effective_date",
+        (account_id, *KIWOOM_FLOW_TYPES),
+    ):
+        flow_date = str(row["effective_date"] or "")[:10]
+        if not flow_date:
+            continue
+        rate = converter.rate(account_id, row["currency"], flow_date)
+        amount = _convert(row["amount_text"], rate)
+        if amount is not None:
+            flows[flow_date] += amount
+            if records is not None:
+                records.append(("kiwoom", flow_date, str(row["currency"] or ""), _number(row["amount_text"]), amount))
     return dict(flows)
 
 
@@ -525,6 +698,8 @@ def _refresh_and_materialize(
         require_contract(connection,tenant_id=os.environ.get(
             'PORTFOLIO_TENANT_ID','00000000-0000-0000-0000-000000000001'))
         require_t_website_benchmarks(specs)
+    if website_all_benchmarks_enabled():
+        specs = specs + catalog_comparison_benchmarks(connection, specs)
     portfolio_values = _portfolio_values(connection, account_id, start_date.isoformat(), portfolio_currency)
     if not portfolio_values:
         raise RuntimeError(f"No portfolio NAV observations are available for {account_id}")
@@ -539,23 +714,37 @@ def _refresh_and_materialize(
                 captured=raw_files.setdefault(spec.benchmark_id, {}),
             )
         except Exception as error:
-            if spec.mapping_type == "primary" or account_id in ('alpha-world-ms','alpha-world-t'):
+            if spec.mapping_type != "comparison" and (
+                    spec.mapping_type == "primary" or account_id in ('alpha-world-ms','alpha-world-t')):
                 raise RuntimeError(
                     f"Required benchmark {spec.benchmark_id} is unavailable: {error}"
                 ) from error
             unavailable_by_id[spec.benchmark_id] = str(error)
     fx_by_currency: dict[str, list[tuple[str, float]]] = {}
     fx_symbols: dict[str, str] = {}
+    # Currencies the contract itself needs: fetched, stored and required exactly as before.
+    contract_currencies = {spec.currency for spec in specs if spec.mapping_type != "comparison"}
     for currency in sorted({spec.currency for spec in specs} - {reporting_currency}):
-        rates, symbol = fetch_fx_to_reporting_yfinance(
-            currency,
-            reporting_currency,
-            start_date - timedelta(days=7),
-            end_date,
-            ticker_factory,
-        )
+        try:
+            rates, symbol = fetch_fx_to_reporting_yfinance(
+                currency,
+                reporting_currency,
+                start_date - timedelta(days=7),
+                end_date,
+                ticker_factory,
+            )
+        except Exception as error:
+            if currency in contract_currencies:
+                raise
+            # Only website comparisons need this currency: they are skipped, the rest go on.
+            for spec in specs:
+                if spec.currency == currency:
+                    unavailable_by_id.setdefault(spec.benchmark_id, f"no FX to {reporting_currency}: {error}")
+            continue
         fx_by_currency[currency] = rates
         fx_symbols[currency] = symbol
+        if currency not in contract_currencies:
+            continue
         _store_reference_fx_rates(
             connection,
             from_currency=currency,
@@ -563,6 +752,10 @@ def _refresh_and_materialize(
             rates=rates,
             fetched_at=fetched_at,
         )
+    usd_fx = _store_reporting_usd_fx(
+        connection, reporting_currency,
+        {currency: rates for currency, rates in fx_by_currency.items() if currency in contract_currencies},
+        start_date, end_date, ticker_factory, fetched_at)
     summaries: list[dict[str, Any]] = []
     for spec in specs:
         if spec.benchmark_id in unavailable_by_id:
@@ -570,21 +763,22 @@ def _refresh_and_materialize(
                 f"{spec.name} ({spec.symbol}) is unavailable from {PROVIDER}: "
                 f"{unavailable_by_id[spec.benchmark_id]}"
             )
-            connection.execute(
-                """
-                INSERT INTO data_quality_results(
-                    run_type, run_reference, subject_id, check_id, status,
-                    observed_value, expected_value, message, checked_at
-                ) VALUES ('provisional-benchmark', ?, ?, ?, 'fail', NULL, NULL, ?, ?)
-                """,
-                (
-                    f"{spec.benchmark_id}:{fetched_at}",
-                    account_id,
-                    "benchmark_history_available",
-                    message,
-                    fetched_at,
-                ),
-            )
+            if spec.mapping_type != "comparison":
+                connection.execute(
+                    """
+                    INSERT INTO data_quality_results(
+                        run_type, run_reference, subject_id, check_id, status,
+                        observed_value, expected_value, message, checked_at
+                    ) VALUES ('provisional-benchmark', ?, ?, ?, 'fail', NULL, NULL, ?, ?)
+                    """,
+                    (
+                        f"{spec.benchmark_id}:{fetched_at}",
+                        account_id,
+                        "benchmark_history_available",
+                        message,
+                        fetched_at,
+                    ),
+                )
             summaries.append(
                 {
                     "benchmark_id": spec.benchmark_id,
@@ -698,6 +892,20 @@ def _refresh_and_materialize(
             failed_checks = ", ".join(
                 issue.check_id for issue in result.issues if issue.status == "fail"
             )
+            if spec.mapping_type == "comparison":
+                # A website comparison that fails its checks is left out; it never holds the subject.
+                summaries.append({
+                    "benchmark_id": spec.benchmark_id, "mapping_type": spec.mapping_type,
+                    "name": spec.name, "symbol": spec.symbol, "available": False,
+                    "native_currency": spec.currency, "reporting_currency": reporting_currency,
+                    "benchmark_observations": len(benchmark_levels), "comparison_rows": 0,
+                    "quality_status": "fail",
+                    "quality_issues": [issue.__dict__ for issue in result.issues],
+                    "metrics": {}, "raw_sha256": raw_digest,
+                    "fx_symbol": fx_symbols.get(spec.currency), "fx_observations_used": 0,
+                    "maximum_fx_age_days": None,
+                })
+                continue
             raise RuntimeError(
                 f"{spec.benchmark_id} comparison failed data-quality checks: "
                 f"{failed_checks}"
@@ -742,7 +950,7 @@ def _refresh_and_materialize(
                 ),
             )
         run_reference = f"{spec.benchmark_id}:{fetched_at}"
-        for issue in result.issues:
+        for issue in (result.issues if spec.mapping_type != "comparison" else ()):
             connection.execute(
                 """
                 INSERT INTO data_quality_results(
@@ -809,4 +1017,5 @@ def _refresh_and_materialize(
             else "fail"
         ),
         "benchmarks": summaries,
+        **({"reporting_usd_fx": usd_fx} if usd_fx else {}),
     }

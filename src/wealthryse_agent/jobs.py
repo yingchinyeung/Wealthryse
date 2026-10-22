@@ -50,8 +50,9 @@ from .auth import TokenSource
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings
 from .database import connect
 from .month_team.agents import BudgetExhausted
-from . import guide_tools
-from .prompts import GUIDE_CHECKER, GUIDE_KEEPER, HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_DRAFTER, RISK_ALERT, WEEKLY_BRIEF
+from . import certified_tools, guide_tools
+from .prompts import (GUIDE_CHECKER, GUIDE_KEEPER, HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_CERTIFIED, MONTH_END_DRAFTER,
+                      RISK_ALERT, WEEKLY_BRIEF)
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -100,14 +101,19 @@ def month_end_drafter(store: Store, tools: ToolClient, agent: Agent, accounts: l
     month_start = month_end.replace(day=1)
     period = month_end.strftime("%Y-%m")
     written = 0
+    allowed = ["get_performance", "compare_to_benchmark", "get_holdings_changes", "get_sector_allocation", "get_cash_flows"]
+    # AGENT_CERTIFIED_MONTH_END=on (here and on the tool server): the read tools too.
+    certified = certified_tools.month_end_enabled() and certified_tools.enabled()
+    if certified:
+        allowed += [certified_tools.GET, certified_tools.TRACE]
     for account_id in accounts:
         if store.inbox_exists("month_end_draft", account_id, period):
             continue
         task = MONTH_END_DRAFTER.format(account_id=account_id, month_end=month_end.isoformat(),
                                         month_start=month_start.isoformat())
-        answer, citations, used, ok = _run_agent(
-            agent, tools, account_id, task,
-            ["get_performance", "compare_to_benchmark", "get_holdings_changes", "get_sector_allocation", "get_cash_flows"])
+        if certified:
+            task += MONTH_END_CERTIFIED.format(account_id=account_id, month_end=month_end.isoformat())
+        answer, citations, used, ok = _run_agent(agent, tools, account_id, task, allowed)
         _sum_usage(usage, used)
         if ok and store.add_inbox(kind="month_end_draft", account_id=account_id, period_key=period,
                                   title=f"Draft commentary for {account_id}, {period}", body=answer,

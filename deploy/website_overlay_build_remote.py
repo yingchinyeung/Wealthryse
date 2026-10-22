@@ -138,6 +138,14 @@ def apply_replacements(package, replacements):
     return touched, elsewhere
 
 
+DESIGN_CHECK = ("from ibkr_etl.factsheet_spec import spec\n"
+                "ids = IDS\n"
+                "have = spec.built_in_designs()\n"
+                "assert set(ids) <= set(have), ('designs missing', sorted(set(ids) - set(have)))\n"
+                "for i in ids:\n"
+                "    spec.load_design(i)\n")
+
+
 class Captured(Exception):
     """Finished early (a capture or the assurance build); skip the website build."""
 
@@ -397,6 +405,19 @@ def main():
                 (package / name).write_bytes(content)
                 first.append(name)
         result['first_imported'] = first
+        # Built-in factsheet designs (data files the designer reads) are written whole,
+        # each checked against the reviewed commit's hash.
+        design_hashes, designs = config.get('design_hashes') or {}, []
+        for name, data in sorted((config.get('designs') or {}).items()):
+            content = gzip.decompress(base64.b64decode(data))
+            if not re.fullmatch(r'factsheet_spec/designs/[A-Za-z0-9_.-]+\.json', name) \
+                    or hashlib.sha256(content).hexdigest() != design_hashes.get(name):
+                raise ValueError('Design file ' + name + ' does not match the reviewed commit; nothing built')
+            if not (package / name).is_file() or (package / name).read_bytes() != content:
+                (package / name).parent.mkdir(parents=True, exist_ok=True)
+                (package / name).write_bytes(content)
+                designs.append(name)
+        result['designs_written'] = designs
         result['touched_files'] = touched
         removed = sorted(n for n in set(expected) - set(wanted) if n in live)
         # The live image has no "root" passwd entry and may have no shell, so
@@ -412,6 +433,10 @@ def main():
                  'USER ' + user,
                  'RUN ' + json.dumps([python, '-c', 'import ibkr_etl.web']),
                  'RUN ' + json.dumps([python, 'scripts/check_report_runtime.py'])]
+        if design_hashes:
+            # The installed website lists and loads every reviewed design.
+            ids = sorted(n[len('factsheet_spec/designs/'):-len('.json')] for n in design_hashes)
+            lines.append('RUN ' + json.dumps([python, '-c', DESIGN_CHECK.replace('IDS', repr(ids))]))
         result.update(runtime_user=user, python=python)
         (context / 'Dockerfile').write_text('\n'.join(lines) + '\n')
         run(client + ['build', '--network=none', '--pull=false', '-t', target, str(context)], 'website image build', timeout=1800, env=env)

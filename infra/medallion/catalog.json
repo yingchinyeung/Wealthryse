@@ -1033,6 +1033,12 @@
    "target_schema": "agent",
    "note": "Account-scoped facade the agents read. Reads bronze or ops data directly; should move to a silver or gold source."
   },
+  "agent.cash_transactions": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read (Kiwoom deposits and withdrawals only, amount as text)."
+  },
   "agent.certified_builds": {
    "kind": "view",
    "layer": "consumer",
@@ -1301,6 +1307,12 @@
    "target_schema": "public",
    "note": "Configuration: one row; recording turns the silver history triggers on (review item U8). Owner only.",
    "held": "infra/medallion/drafts/u8_silver_history.sql"
+  },
+  "public.kiwoom_responses": {
+   "kind": "table",
+   "layer": "bronze",
+   "target_schema": "bronze",
+   "note": "Kiwoom REST inquiry answers exactly as received, one row per page, with the request's account number and query fields. Append-only and restricted. ibkr_etl.kiwoom_conform rebuilds silver's Kiwoom rows from it and compares them with silver (read-only until its write mode). Never token calls, keys, secrets or tokens."
   }
  },
  "blob_containers": {
@@ -1308,19 +1320,19 @@
    "layer": "bronze",
    "declared_in": "infra/main.bicep",
    "holds": "Raw IBKR Flex XML from the v1.1 daily job, since Jan 2025. Under legal hold.",
-   "plan": "Copy into ibkr-raw under v11-archive/ with sha256 checks before v1.1 is retired."
+   "plan": "Deleted with v1.1 on 21 Oct 2026, after its contents were archived into v2 storage."
   },
   "ibkrv115rcc62xxqblay/analytics-reports": {
    "layer": "gold",
    "declared_in": "infra/main.bicep",
    "holds": "v1.1 outputs: latest analyst SQLite and manifest, HTML dashboard, reference_data.json.",
-   "plan": "Today it is v2's main daily feed. Retires when v2 pulls Flex itself into bronze."
+   "plan": "Deleted with v1.1 on 21 Oct 2026, after its contents were archived into v2 storage. v2 has pulled Flex itself into bronze since 17 Oct 2026."
   },
   "ibkrv115rcc62xxqblay/source-protection-probes": {
    "layer": "ops",
    "declared_in": null,
    "holds": "Immutability probes. Under legal hold.",
-   "plan": "Declare in Bicep; retires with v1.1."
+   "plan": "Deleted with v1.1 on 21 Oct 2026."
   },
   "ibkrv2stgauhecwc4itaoo/ibkr-raw": {
    "layer": "bronze",
@@ -1400,7 +1412,7 @@
    "layer": "gold",
    "declared_in": null,
    "referenced_only": true,
-   "holds": "Probably does not exist; derived-daily falls back to v1.1 analytics-reports.",
+   "holds": "Probably does not exist. Only REFERENCE_DATA_SOURCE=blob reads it; derived-daily has read silver tables since 17 Oct 2026.",
    "plan": "Remove the reference: read reference data from silver tables instead."
   }
  },
@@ -1503,39 +1515,6 @@
    "schedule": "see LIVE_STATE.md",
    "note": "Inline program, no Bicep."
   },
-  "ibkr-v11-bootstrap": {
-   "hops": [
-    "ops"
-   ],
-   "schedule": "manual",
-   "note": "Legacy schema setup."
-  },
-  "ibkr-v11-daily": {
-   "hops": [
-    "ingest",
-    "conform",
-    "analytics",
-    "publish"
-   ],
-   "schedule": "08:00 UTC",
-   "note": "Legacy. One job does every hop; its export is v2's main daily input."
-  },
-  "ibkr-v11-history-backfill": {
-   "hops": [
-    "ingest",
-    "conform"
-   ],
-   "schedule": "manual",
-   "note": "Legacy."
-  },
-  "ibkrv2stg-account-sync-daily": {
-   "hops": [
-    "ingest",
-    "conform"
-   ],
-   "schedule": "08:10 UTC",
-   "note": "Reads v1.1 gold (the export) into v2 bronze and silver. Inverted layering; retires with v1.1."
-  },
   "ibkrv2stg-agent": {
    "hops": [
     "serve"
@@ -1615,7 +1594,7 @@
     "conform"
    ],
    "schedule": "08:50 UTC",
-   "note": "Also reads reference_data.json from v1.1 analytics-reports. REFERENCE_DATA_SOURCE=database reads silver instrument_classifications and risk_free_rates instead."
+   "note": "Reads reference data from silver instrument_classifications and risk_free_rates (REFERENCE_DATA_SOURCE=database, since 17 Oct 2026), not from v1.1's analytics-reports."
   },
   "ibkrv2stg-flex-discovery": {
    "hops": [
@@ -1644,12 +1623,6 @@
    ],
    "schedule": "08:20 UTC",
    "note": "v2's own Flex pull into ibkr-raw, then the loader."
-  },
-  "ibkrv2stg-institutional-shadow": {
-   "hops": [
-    "ops"
-   ],
-   "schedule": "manual"
   },
   "ibkrv2stg-internal-release": {
    "hops": [

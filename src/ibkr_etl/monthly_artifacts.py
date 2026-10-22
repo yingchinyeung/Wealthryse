@@ -7,7 +7,7 @@ import math
 import random
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -339,6 +339,8 @@ def _factsheet_classification(
 
 
 def _company_name(holding: dict[str, Any]) -> str:
+    if holding.get("english_name"):
+        return str(holding["english_name"])
     symbol = str(holding.get("symbol") or "").upper()
     if symbol in FACTSHEET_COMPANY_NAMES:
         return FACTSHEET_COMPANY_NAMES[symbol]
@@ -352,6 +354,8 @@ def _specific_region(
 
     if holding.get("composite_sleeve"):
         return "Multi-asset"
+    if holding.get("factsheet_region"):
+        return str(holding["factsheet_region"])
 
     # USD-valued report snapshots retain native currency as listing evidence.
     # Reporting currency must not relabel Hong Kong or Taiwan holdings as US.
@@ -667,13 +671,17 @@ def _factsheet_sector_rows(
 
 
 def factsheet_inputs(
-    snapshot: dict[str, Any], *, reporting_currencies: Iterable[str] | None = None
+    snapshot: dict[str, Any], *, reporting_currencies: Iterable[str] | None = None,
+    securities: str | None = None,
 ) -> FactsheetInputs:
     """The validated values every account-design factsheet prints.
 
     ``reporting_currencies`` lets a design spec that is qualified for other
     currencies use the same builder; left out, the approved rule applies
     (HKD for Alpha World MS, USD for every other subject).
+    ``securities="us_istrategy"`` prints every holding with Yahoo's English
+    name, "United States" and the U.S. iStrategy sectors (us_istrategy_securities),
+    except in a synthetic preview snapshot, whose made-up tickers Yahoo cannot know.
     """
     required = {
         "period_end",
@@ -727,6 +735,33 @@ def factsheet_inputs(
         snapshot["sector_allocation"].get("classification_basis")
         == "composite sleeve type"
     )
+    # KRX holdings (Kiwoom) carry Korean names: print Yahoo's English name and map Yahoo's
+    # industry to the Korea iStrategy sectors, and stop on a code that has neither.
+    from .korea_securities import REGION as KOREA, KoreaSecurityError, is_krx, lookup as korea_lookup
+    for holding in holdings:
+        if not is_composite and is_krx(holding):
+            try:
+                name, sector, sub_sector = korea_lookup(
+                    holding, classifications.get(str(holding.get("conid") or "")))
+            except KoreaSecurityError as error:
+                raise MonthlyArtifactError(str(error)) from error
+            holding["english_name"] = name
+            classifications[str(holding.get("conid") or "")] = {
+                "symbol": holding.get("symbol"), "region": KOREA, "sector": sector, "sub_sector": sub_sector}
+    if securities == "us_istrategy" and not is_composite and not snapshot.get("synthetic_data"):
+        from .us_istrategy_securities import REGION as UNITED_STATES, UsIstrategySecurityError, lookup as us_lookup
+        for holding in holdings:
+            try:
+                name, sector, sub_sector = us_lookup(
+                    holding, classifications.get(str(holding.get("conid") or "")))
+            except UsIstrategySecurityError as error:
+                raise MonthlyArtifactError(str(error)) from error
+            holding["english_name"] = name
+            holding["factsheet_region"] = UNITED_STATES
+            classifications[str(holding.get("conid") or "")] = {
+                "symbol": holding.get("symbol"), "region": UNITED_STATES, "sector": sector, "sub_sector": sub_sector}
+    elif securities is not None and securities != "us_istrategy":
+        raise MonthlyArtifactError(f"Unknown factsheet securities: {securities}")
     if is_composite:
         for holding in holdings:
             component_type = str(holding.get("asset_category") or "").lower()
@@ -1108,6 +1143,33 @@ def _account_chart_month_ticks(start: date, end: date) -> tuple[date, ...]:
     return tuple(ticks)
 
 
+def _account_chart_date_labels(start: date, end: date) -> tuple[tuple[date, str], ...]:
+    """The account chart's dated gridlines and their labels.
+
+    The odd-month cadence leaves a history of a few weeks or months with one
+    label or none (Korea iStrategy's March and April 2025 factsheets, 20 October
+    2026). Such a history steps to every month, then to every Monday, so its
+    bottom axis is always dated.
+    """
+    ticks = _account_chart_month_ticks(start, end)
+    if len(ticks) < 2:
+        monthly = []
+        index = start.year * 12 + start.month  # the first of the month after start
+        while (tick := date(index // 12, index % 12 + 1, 1)) <= end:
+            monthly.append(tick)
+            index += 1
+        ticks = tuple(monthly)
+    if len(ticks) >= 2:
+        return tuple((tick, str(tick.year) if tick.month == 1 else tick.strftime("%b")) for tick in ticks)
+    mondays = []
+    day = start + timedelta(days=7 - start.weekday())
+    step = 7 if (end - start).days <= 42 else 14
+    while day <= end:
+        mondays.append(day)
+        day += timedelta(days=step)
+    return tuple((tick, f"{tick.day} {tick:%b}") for tick in mondays)
+
+
 def _draw_factsheet_page_two(
     c: canvas.Canvas, inputs: FactsheetInputs, page_width: float, page_height: float
 ) -> None:
@@ -1176,14 +1238,13 @@ def _draw_account_nav_chart(
     end_date = date.fromisoformat(normalized_nav[-1]["date"])
     start_ordinal = start_date.toordinal()
     ordinal_span = max(1, end_date.toordinal() - start_ordinal)
-    date_ticks = _account_chart_month_ticks(start_date, end_date)
+    date_ticks = _account_chart_date_labels(start_date, end_date)
     c.setFont("Helvetica", 6.5)
-    for tick_date in date_ticks:
+    for tick_date, label in date_ticks:
         x = x0 + width * (tick_date.toordinal() - start_ordinal) / ordinal_span
         c.setDash(2, 2)
         c.line(x, y0, x, y0 + height)
         c.setDash()
-        label = str(tick_date.year) if tick_date.month == 1 else tick_date.strftime("%b")
         c.saveState()
         c.translate(x - 2, y0 - 8)
         c.rotate(-45)

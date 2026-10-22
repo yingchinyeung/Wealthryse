@@ -1,0 +1,354 @@
+{
+ "spec_version": 1,
+ "design_id": "us-istrategy",
+ "title": "U.S. iStrategy",
+ "notes": "The U.S. iStrategy factsheet (a Kiwoom account holding US stocks). Its template is the two-page account layout, so this is the account design pinned to the U.S. template, measured against the completed 31 Aug 2026 factsheet. The designer starts a draft from it when that template is uploaded.",
+ "inputs": "us_istrategy",
+ "base": "template",
+ "template_sha256": "6c6fd9e2eab7bb4d629103506df89a074bd22792a10b652134c77fefb0ed9c7c",
+ "page_size": [
+  595.5,
+  842.25
+ ],
+ "currencies": [
+  "USD",
+  "KRW"
+ ],
+ "owner_text": {},
+ "pages": [
+  {
+   "layers": [
+    {
+     "kind": "overlay",
+     "id": "p1",
+     "ops": [
+      {
+       "id": "p1.date",
+       "op": "text",
+       "role": "date",
+       "x": 541.2,
+       "y": 783.36,
+       "align": "center",
+       "font": "Times-Bold",
+       "size": 10.0,
+       "color": "#ffffff",
+       "value": "{display_date}"
+      },
+      {
+       "id": "p1.top5",
+       "op": "table",
+       "role": "holdings",
+       "rows": "top_holdings",
+       "limit": 5,
+       "x": 27,
+       "top": 616.88,
+       "heading": {
+        "y": 625.0,
+        "font": "Helvetica-Bold",
+        "size": 7.5,
+        "color": "#121925",
+        "value": {
+         "choose": [
+          {
+           "when": "is_composite",
+           "value": "Top 5 Components"
+          },
+          {
+           "value": "Top 5 Products"
+          }
+         ]
+        }
+       },
+       "columns": [
+        {
+         "width": 112,
+         "align": "left",
+         "header_align": "center",
+         "header": "COMPANY",
+         "value": {
+          "field": "company_name"
+         }
+        },
+        {
+         "width": 34,
+         "align": "left",
+         "header_align": "center",
+         "header": "REGION",
+         "value": {
+          "field": "region"
+         }
+        },
+        {
+         "width": 57,
+         "align": "left",
+         "header_align": "center",
+         "header": "SECTOR",
+         "value": {
+          "field": "sector"
+         }
+        },
+        {
+         "width": 113,
+         "align": "left",
+         "header_align": "center",
+         "header": "SUB-SECTOR",
+         "value": {
+          "field": "sub_sector"
+         }
+        },
+        {
+         "width": 23,
+         "align": "right",
+         "header_align": "center",
+         "header": "%",
+         "value": {
+          "field": "weight",
+          "format": {
+           "kind": "percent",
+           "digits": 2
+          }
+         }
+        }
+       ],
+       "header_height": 10.4,
+       "body_height": 8.5,
+       "font_size": 4.7,
+       "padding": 4.0,
+       "overflow": "shrink"
+      },
+      {
+       "id": "p1.sectors",
+       "op": "table",
+       "role": "sectors",
+       "rows": "sectors",
+       "x": 27,
+       "top": 519.28,
+       "heading": {
+        "y": 537.0,
+        "font": "Helvetica-Bold",
+        "size": 7.5,
+        "color": "#121925",
+        "value": {
+         "choose": [
+          {
+           "when": "is_composite",
+           "value": "Component Allocation"
+          },
+          {
+           "value": "Sector Allocation"
+          }
+         ]
+        }
+       },
+       "columns": [
+        {
+         "width": 65,
+         "align": "left",
+         "header_align": "center",
+         "header": "REGION",
+         "value": {
+          "field": "region"
+         }
+        },
+        {
+         "width": 81,
+         "align": "left",
+         "header_align": "center",
+         "header": "SECTOR",
+         "value": {
+          "field": "sector"
+         }
+        },
+        {
+         "width": 143,
+         "align": "left",
+         "header_align": "center",
+         "header": "SUB-SECTOR",
+         "value": {
+          "field": "sub_sector"
+         }
+        },
+        {
+         "width": 50,
+         "align": "right",
+         "header_align": "center",
+         "header": "%",
+         "value": {
+          "field": "weight",
+          "format": {
+           "kind": "percent",
+           "digits": 2
+          }
+         }
+        }
+       ],
+       "total": [
+        "TOTAL",
+        "",
+        "",
+        "100.00%"
+       ],
+       "header_height": 10.4,
+       "body_height": 8.55,
+       "font_size": 4.7,
+       "overflow": "shrink"
+      },
+      {
+       "id": "p1.history",
+       "op": "table",
+       "role": "history",
+       "rows": "history_display",
+       "x": 27,
+       "top": 251.28,
+       "heading": {
+        "y": 269.03,
+        "font": "Helvetica-Bold",
+        "size": 7.8,
+        "color": "#121925",
+        "value": "{history_heading}"
+       },
+       "grow": {
+        "reference_rows": 21,
+        "max_top": 368.0,
+        "bottom": 50.28,
+        "min_body_height": 6.8,
+        "heading_gap": 17.75
+       },
+       "columns": [
+        {
+         "width": 68,
+         "align": "center",
+         "header_align": "center",
+         "header": "DATE",
+         "value": {
+          "field": "date"
+         }
+        },
+        {
+         "width": 68,
+         "align": "right",
+         "header_align": "center",
+         "header": "NORMALIZED NAV",
+         "value": {
+          "field": "normalized_nav"
+         }
+        },
+        {
+         "width": 102,
+         "align": "right",
+         "header_align": "center",
+         "header": "PERFORMANCE VS\nPREVIOUS MONTH",
+         "value": {
+          "field": "monthly_return"
+         }
+        },
+        {
+         "width": 101,
+         "align": "right",
+         "header_align": "center",
+         "header": "CUMULATIVE PERFORMANCE\nFR INITIAL DATE",
+         "value": {
+          "field": "cumulative_return"
+         }
+        }
+       ],
+       "header_height": 20.4,
+       "body_height": 8.6,
+       "font_size": 5.2,
+       "overflow": "shrink"
+      },
+      {
+       "id": "p1.trailing_return",
+       "op": "text",
+       "role": "kpi",
+       "x": 448.0,
+       "y": 473.0,
+       "align": "center",
+       "font": "Times-Bold",
+       "size": 10.0,
+       "color": "#121925",
+       "value": {
+        "bind": "trailing_twelve_month_return",
+        "format": {
+         "kind": "percent",
+         "digits": 2,
+         "suffix": " %",
+         "none": "N/A"
+        }
+       }
+      },
+      {
+       "id": "p1.period_date",
+       "op": "text",
+       "role": "date",
+       "x": 448.0,
+       "y": 270.96,
+       "align": "center",
+       "font": "Times-Bold",
+       "size": 10.0,
+       "color": "#121925",
+       "value": "{display_date}"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "layers": [
+    {
+     "kind": "overlay",
+     "id": "p2",
+     "ops": [
+      {
+       "id": "p2.date",
+       "op": "text",
+       "role": "date",
+       "x": 534.15,
+       "y": 823.04,
+       "align": "center",
+       "font": "Times-Bold",
+       "size": 10.0,
+       "color": "#ffffff",
+       "value": "{display_date}"
+      },
+      {
+       "id": "p2.title",
+       "op": "text",
+       "role": "title",
+       "x": 297.75,
+       "y": 768.5,
+       "align": "center",
+       "font": "Helvetica-Bold",
+       "size": 10.0,
+       "color": "#121925",
+       "value": "Historical Performance ({history_start_date|date_short} to {period_end|date_short})"
+      },
+      {
+       "id": "p2.nav_chart",
+       "op": "component",
+       "role": "chart",
+       "name": "account.nav_line_chart",
+       "box": [
+        77.2,
+        594.88,
+        413.2,
+        146.4
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "metadata": {
+  "/Title": "{subject_id} Factsheet - {period_end|date_long}",
+  "/Subject": "Generated from an immutable frozen reporting snapshot",
+  "/Author": "Sprout Asset Management (Asia) Limited",
+  "/LayoutFamily": "account-owner-template"
+ },
+ "validators": [
+  {
+   "name": "monthly_artifacts.account_layout"
+  }
+ ]
+}

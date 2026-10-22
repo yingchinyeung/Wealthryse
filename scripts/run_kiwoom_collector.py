@@ -15,9 +15,8 @@ import os
 import sys
 import urllib.parse
 import urllib.request
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -26,23 +25,11 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from ibkr_etl import lineage  # noqa: E402
 from ibkr_etl.db import DEFAULT_TENANT_ID, connect  # noqa: E402
+from ibkr_etl.kiwoom_bronze import KiwoomBronze  # noqa: E402
 from ibkr_etl.kiwoom_client import KiwoomClient  # noqa: E402
-from ibkr_etl.kiwoom_collector import SECRET_PREFIX, Target, collector_enabled, run  # noqa: E402
+from ibkr_etl.kiwoom_collector import SECRET_PREFIX, Target, collector_enabled, run, snapshot_day  # noqa: E402
 
 VAULT_SCOPE = "https://vault.azure.net/.default"
-SEOUL = ZoneInfo("Asia/Seoul")
-# KRX closes at 15:30; Kiwoom's prices are final a few minutes later.
-CLOSE_SETTLED = time(15, 40)
-
-
-def snapshot_day(now: datetime) -> date:
-    """The KRX trading day whose close Kiwoom's prices show at this moment."""
-
-    local = now.astimezone(SEOUL)
-    day = local.date() if local.time() >= CLOSE_SETTLED else local.date() - timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= timedelta(days=1)
-    return day
 
 
 def _required(name: str) -> str:
@@ -101,17 +88,27 @@ def _collect() -> int:
         return KiwoomClient(environment=target.environment, app_key=keys["app_key"], app_secret=keys["app_secret"])
 
     now = datetime.now(timezone.utc)
-    connection = connect(Path("/tmp/unused.sqlite3"), _required("DATABASE_URL"), tenant_id)
+    database_url = _required("DATABASE_URL")
+    connection = connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id)
+    # Off unless KIWOOM_BRONZE=true; writes through its own connection so it never holds up the load.
+    bronze = KiwoomBronze.from_environment(lambda: connect(Path("/tmp/unused.sqlite3"), database_url, tenant_id),
+                                           tenant_id)
     try:
         results = run(connection, tenant_id, client_for=client_for, today=snapshot_day(now), now=now,
-                      include_us=include_us)
+                      include_us=include_us, bronze=bronze)
     finally:
         connection.close()
+        if bronze is not None:
+            bronze.close()
     record = lineage.current()
     for table in ("position_snapshots", "cash_snapshots", "nav_snapshots", "fx_rates", "trades", "cash_transactions"):
         rows = sum(int((item.get("rows") or {}).get(table, 0)) for item in results)
         if rows:
             record.output(f"silver.{table}", rows=rows, source="kiwoom_rest")
+    if bronze is not None:
+        if bronze.stats["written"]:
+            record.input("bronze.kiwoom_responses", rows=bronze.stats["written"], source="kiwoom_rest")
+        print(json.dumps({"kiwoom_bronze": bronze.summary()}))
     print(json.dumps({"status": "ran", "accounts": results}, default=str))
     return 0
 

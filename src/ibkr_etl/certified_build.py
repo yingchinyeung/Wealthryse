@@ -21,13 +21,18 @@ page asked for an older date finds either that date's figures or none (and shows
 The checks:
 
 - rules: drawdowns at most zero, win rates and shares of months between 0 and 1, correlation
-  between -1 and 1 (the contract rules of gold.certified_figures);
+  between -1 and 1, RSI between 0 and 100, volatility not below zero (the contract rules of
+  gold.certified_figures);
 - same inputs, same answer: a figure that changes while its input fingerprint and
   calculation version are the same holds the build;
 - the page agrees: for each subject's newest date, the page handlers are called again on
   their own connections and must give the same figures;
 - readers: a page that fails for a reason the website would also show (an HTTP error) is
   counted; any other error holds the build.
+
+The charts (page "charts", ibkr_etl.certified_charts) are read only when CERTIFIED_FIGURES_CHARTS
+is fallback or on, or --page charts names them; in fallback a chart problem leaves the chart rows
+out and never holds the build.
 """
 from __future__ import annotations
 
@@ -62,9 +67,10 @@ BUILD_USER = {"email": "certified-figures-build", "object_id": "certified-figure
 DRAWDOWNS = frozenset({
     "risk.expected_max_drawdown_1y", "risk.actual_max_drawdown_1y", "risk.tail_max_drawdown_1y",
     "risk.crisis_max_drawdown_2008", "risk.maximum_drawdown", "risk.crisis_scenario_max_drawdown",
-    "stats.maximum_drawdown", "stats.current_drawdown"})
+    "stats.maximum_drawdown", "stats.current_drawdown", "table.drawdown_episodes"})
 SHARES = frozenset({"risk.win_rate", "benchmark.relative_win_rate", "stats.positive_months"})
-CORRELATIONS = frozenset({"benchmark.correlation"})
+CORRELATIONS = frozenset({"benchmark.correlation", "series.rolling_correlation_126d", "matrix.holdings_correlation"})
+BOUNDS = {"indicator.rsi_14": (0.0, 100.0), "series.rolling_volatility_63d": (0.0, math.inf)}
 COMPARED = ("value", "value_text", "unit", "currency", "status", "reason", "detail", "period_start", "period_end",
             "observations")
 KEY = ("subject_id", "figure_id", "period", "item", "benchmark_id", "as_of_date")
@@ -252,6 +258,71 @@ def _call(handler: Callable, *args: Any, **kwargs: Any) -> dict:
         raise PageUnavailable(f"{error.status_code}: {error.detail}") from None
 
 
+class _Reads:
+    """Every row a page handler reads, in the order it reads them: the input fingerprint of a page
+    whose engine reads its own tables (Attribution). The order counts, because the engine adds
+    up in that order."""
+
+    def __init__(self) -> None:
+        self._sha = hashlib.sha256()
+        self.queries = 0
+
+    def add(self, query: Any, params: Any, rows: list) -> None:
+        self.queries += 1
+        plain = [dict(row) if isinstance(row, Mapping) else list(row) if isinstance(row, (list, tuple)) else row
+                 for row in rows]
+        self._sha.update(_canonical([str(query), params, plain]).encode("utf-8") + b"\n")
+
+    def hexdigest(self) -> str:
+        return self._sha.hexdigest()
+
+    @contextlib.contextmanager
+    def around(self, web) -> Iterator[None]:
+        """Record the reads of the handlers called inside, on whatever connections they use."""
+        original = web._database
+
+        @contextlib.contextmanager
+        def database():
+            with original() as connection:
+                yield _RecordingConnection(connection, self)
+
+        web._database = database
+        try:
+            yield
+        finally:
+            web._database = original
+
+
+class _RecordingConnection:
+    def __init__(self, connection, reads: _Reads):
+        self._connection, self._reads = connection, reads
+
+    def execute(self, query, params=None, *args, **kwargs):
+        cursor = self._connection.execute(query, params, *args, **kwargs)
+        rows = cursor.fetchall() if cursor.description is not None else []
+        self._reads.add(query, params, rows)
+        return _RecordedCursor(rows, cursor.description, cursor.rowcount)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+class _RecordedCursor:
+    def __init__(self, rows: list, description: Any, rowcount: int):
+        self._rows, self.description, self.rowcount = list(rows), description, rowcount
+
+    def fetchone(self):
+        return self._rows.pop(0) if self._rows else None
+
+    def fetchall(self):
+        rows, self._rows = self._rows, []
+        return rows
+
+    def __iter__(self):
+        while self._rows:
+            yield self._rows.pop(0)
+
+
 class Pages:
     """The page payloads for one subject and date, each called once and only when needed."""
 
@@ -305,6 +376,15 @@ class Pages:
     def risk_details(self) -> dict:
         return self._get("risk_details", lambda: _call(self.web.risk_analytics_details, self.subject.id,
                                                        as_of=self.as_of))
+
+    def attribution(self, month: str) -> tuple[dict, str]:
+        """Performance › Attribution for one month, and sha256 of every row its handler read."""
+        def make():
+            reads = _Reads()
+            with reads.around(self.web):
+                payload = _call(self.web.monthly_attribution_view, self.subject.id, month=month, as_of=self.as_of)
+            return payload, reads.hexdigest()
+        return self._get(f"attribution:{month}", make)
 
     def nav_inputs(self) -> str:
         """sha256 of the NAV series and external flows through the as-of date, as the handlers read them."""
@@ -722,6 +802,48 @@ def risk_statistics_rows(pages: Pages) -> list[Row]:
     return rows
 
 
+ATTRIBUTION_TOTALS = (("attribution.portfolio_return", "portfolio_monthly_return"),
+                      ("attribution.holdings_contribution", "equity_contribution"),
+                      ("attribution.residual_contribution", "residual_contribution"))
+
+
+def attribution_rows(pages: Pages) -> list[Row]:
+    """Performance › Attribution: the as-of date's month, from the page's own handler (the monthly
+    reports' engine). The page works a month out to its calendar end whatever the as-of date, so
+    a month is read only on its last date and, for the month in progress, on the newest date.
+    The composites keep today's figures: their engine adds the sleeves in set order, which
+    changes from one run to the next, so its totals can move in the last digit with the same
+    inputs and would hold the build."""
+    subject, as_of = pages.subject, pages.as_of
+    month = as_of[:7]
+    later = [day for day in subject.dates if day > as_of]
+    if subject.kind == "composite_portfolio" or (later and later[0][:7] == month):
+        return []
+    payload, inputs = pages.attribution(month)
+    if payload.get("available") and "position_coverage" not in payload:
+        return []  # a composite's answer
+    period = f"month_{month}"
+    common = {"inputs": inputs, "source_table": "silver.subject_position_series",
+              "source_key": {"subject_id": subject.id, "month": month, "as_of_date": as_of},
+              "source_version": payload.get("method_version"), "period": period}
+    if not payload.get("available"):
+        reason = str(payload.get("message") or "") or "Contribution to return is unavailable for this month."
+        return [_row(subject, figure_id, as_of, None, reason=reason, **common) for figure_id, _ in ATTRIBUTION_TOTALS]
+    span = {"period_start": payload.get("period_start"), "period_end": payload.get("period_end"),
+            "observations": payload.get("daily_observations")}
+    detail = {"quality_status": payload.get("quality_status")}
+    rows = [_row(subject, figure_id, as_of, payload.get(name), detail=detail, **span, **common)
+            for figure_id, name in ATTRIBUTION_TOTALS]
+    for entry in payload.get("security_contributions") or []:
+        rows.append(_row(subject, "attribution.holding_contribution", as_of, entry.get("contribution"),
+                         item=str(entry["conid"]), detail={"symbol": entry.get("symbol"), "sector": entry.get("sector")},
+                         **span, **common))
+    for entry in payload.get("sector_contributions") or []:
+        rows.append(_row(subject, "attribution.sector_contribution", as_of, entry.get("contribution"),
+                         item=str(entry["sector"]), **span, **common))
+    return rows
+
+
 READERS: dict[str, tuple[Callable[[Pages], list[Row]], ...]] = {
     "overview": (overview_rows,),
     "holdings": (holdings_rows, sector_rows),
@@ -730,6 +852,7 @@ READERS: dict[str, tuple[Callable[[Pages], list[Row]], ...]] = {
     "risk-snapshot": (risk_snapshot_rows,),
     "risk-statistics": (risk_statistics_rows,),
     "combined-holdings": (),  # the Holdings page's records, added up when read
+    "attribution": (attribution_rows,),
 }
 
 
@@ -742,16 +865,34 @@ def page_rows(web, subject: Subject, as_of: str, pages: Iterable[str], *, today_
     payloads = Pages(web, subject, as_of)
     rows: list[Row] = []
     for page in pages:
-        for reader in READERS[page]:
+        for reader in _readers(page):
             try:
                 rows += reader(payloads)
             except PageUnavailable:
                 if notes is not None:
                     notes.setdefault("page_unavailable", {}).setdefault(page, 0)
                     notes["page_unavailable"][page] += 1
+            except Exception as error:  # a chart reader's error is counted; the charts' mode decides
+                if page in READERS or notes is None:
+                    raise
+                kinds = notes.setdefault("chart_errors", {}).setdefault(reader.__name__, {})
+                kinds[type(error).__name__] = kinds.get(type(error).__name__, 0) + 1
         if page == "overview" and today_hk is not None:
             rows += freshness_row(payloads, today_hk)
     return rows
+
+
+def _readers(page: str) -> tuple[Callable[[Pages], list[Row]], ...]:
+    if page in READERS:
+        return READERS[page]
+    return _charts().READERS[page]
+
+
+def _charts():
+    """ibkr_etl.certified_charts, imported when a run reads the charts (it imports this module)."""
+    from . import certified_charts
+
+    return certified_charts
 
 
 # The data contract versions of the silver tables whose values are copied unchanged (the
@@ -785,6 +926,8 @@ def rule_failures(rows: Iterable[Row]) -> list[str]:
             failures.append(row.figure_id)
         elif row.figure_id in CORRELATIONS and abs(row.value) > 1 + 1e-12:
             failures.append(row.figure_id)
+        elif row.figure_id in BOUNDS and not BOUNDS[row.figure_id][0] <= row.value <= BOUNDS[row.figure_id][1]:
+            failures.append(row.figure_id)
     return failures
 
 
@@ -810,7 +953,8 @@ def page_disagreements(web, subject: Subject, as_of: str, pages: Iterable[str], 
                        today_hk: date) -> list[str]:
     """Call the handlers again, each on its own connections as the website does, and compare."""
     with own_connections(web):
-        again = {row.key: row.compared() for row in page_rows(web, subject, as_of, pages, today_hk=today_hk)}
+        again = {row.key: row.compared() for row in page_rows(web, subject, as_of, pages, today_hk=today_hk,
+                                                              notes={})}
     built = {row.key: row.compared() for row in rows if row.subject_id == subject.id and row.as_of_date == as_of}
     return sorted({key[1] for key in set(again) | set(built) if again.get(key) != built.get(key)})
 
@@ -943,7 +1087,7 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
     gate = gate_mode()
     begun = clock()
     web = web or load_web()
-    pages = [page for page in (pages or cf.pages()) if page in READERS]
+    pages, charts_mode = _charts().run_pages(pages, READERS)
     started = now or datetime.now(timezone.utc)
     today_hk = hong_kong_today(started)
     with shared_web_database(web, database_url):
@@ -962,6 +1106,8 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
             connection.rollback()
             published_dates: dict[str, set[str]] = {}
             for key in published:
+                if charts_mode and pages == [_charts().PAGE] and key[1] not in _charts().FIGURES:
+                    continue  # a run of the charts alone fills in the charts' own history
                 published_dates.setdefault(key[0], set()).add(key[5])
             plan = work_plan(found, published_dates, backfill=backfill)
             # Each subject's pages are asked again on its newest date right after that date is read, so
@@ -1001,6 +1147,7 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 if read.get(subject.id) and subject.id not in checked:
                     check(subject, max(read[subject.id]))
             result = compare(rows, published)
+            charts = _charts().settle(charts_mode, rows, result, disagreements, notes, errors) if charts_mode else None
             to_write = result["new"] + result["changed"]
             failures = rule_failures(to_write)
             verdict = gate_verdict(mode=gate, database_url=database_url, tenant_id=str(web.TENANT_ID),
@@ -1019,6 +1166,8 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 # publish_gate.check's verdict on the source jobs (gate_verdict); None when the setting is off.
                 "publish_gate": verdict,
             }
+            if charts is not None:
+                checks["charts"] = charts
             outcomes = {"contract_rules": not failures, "same_inputs_same_answer": not result["violations"],
                         "pages_agree": not disagreements, "pages_read": not errors}
             if gate == "binding":
@@ -1044,6 +1193,8 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
                 out(f"Publish gate ({gate}, since {verdict['since'][:16]}Z): {verdict['verdict']}; "
                     + ", ".join(f"{job} {result['verdict']} ({result['reasons_total']} reasons)"
                                 for job, result in verdict["jobs"].items()) + ".")
+            if charts is not None:
+                out(_charts().summary_line(charts))
             for line in errors[:20]:
                 out(f"  read error {line}")
             for who, figure_ids in sorted(disagreements.items()):   # figure ids only, no figures

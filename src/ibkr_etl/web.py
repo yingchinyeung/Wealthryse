@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import PurePosixPath
-from typing import Literal, Mapping
+from typing import Any, Literal, Mapping
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
@@ -81,6 +81,7 @@ from .monthly_artifacts import MonthlyArtifactError, validate_factsheet_return_t
 from .monthly_reports import (
     MonthlyReportError,
     build_monthly_report_catalog,
+    download_prefix,
     validate_artifact,
     validate_period_end,
     validate_review_artifact,
@@ -91,7 +92,7 @@ from .performance_periods import (
     flow_statement,
     performance_periods as calculate_performance_periods,
 )
-from . import certified_pages, input_readiness, report_design_updates
+from . import certified_charts, certified_pages, input_readiness, report_design_updates
 from .report_design_ui import controls as report_design_controls, SCRIPT as REPORT_DESIGN_SCRIPT
 from .internal_release import InternalReleaseError
 from .risk_snapshots import RISK_ANALYTICS_VERSION, decoded_payload, snapshot_read_status
@@ -144,7 +145,7 @@ from .authorization import (
     subject_access_levels,
 )
 from .metrics_guide import METRIC_ANCHORS, METRICS_GUIDE_SCRIPT, render_metrics_guide
-from . import onboarding_v2_web
+from . import onboarding_v2_web, yahoo_disclosure
 from .broker_connections import onboarding_v2_enabled
 from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS, THEME_TOGGLE_HTML, WEB_FONT_FILES, web_font_bytes
@@ -242,23 +243,9 @@ ONBOARDING_REPORT_JOB_NAME = os.environ.get(
 ONBOARDING_ANALYTICS_JOB_NAME = os.environ.get(
     "ONBOARDING_ANALYTICS_JOB_NAME", "ibkrv2stg-onboard-analytics"
 ).strip()
-YAHOO_ONBOARDING_DISCLOSURE_VERSION = "yahoo-ticker-disclosure-v1"
-YAHOO_ONBOARDING_SCOPE = {
-    "data": ["current_ticker_symbols", "historical_ticker_symbols"],
-    "destination": "Yahoo Finance via yfinance",
-    "excluded": [
-        "raw_ibkr_files",
-        "ibkr_account_identifiers",
-        "flex_credentials",
-        "database_credentials",
-        "personal_information",
-    ],
-    "purposes": [
-        "provisional_sector_classification",
-        "crisis_period_price_retrieval",
-    ],
-}
-YAHOO_ONBOARDING_SCOPE_SHA256 = sha256_text(canonical_json(YAHOO_ONBOARDING_SCOPE))
+YAHOO_ONBOARDING_DISCLOSURE_VERSION = yahoo_disclosure.VERSION
+YAHOO_ONBOARDING_SCOPE = yahoo_disclosure.SCOPE
+YAHOO_ONBOARDING_SCOPE_SHA256 = yahoo_disclosure.SCOPE_SHA256
 COMPANY_LOGO_DATA_URI = (
     "data:image/png;base64,"
     "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"
@@ -334,6 +321,17 @@ SECURITY_HEADERS = {
         "form-action 'self'"
     ),
 }
+# A PDF the portal serves may be shown in a frame on the portal's own pages (the
+# factsheet designer's preview); every other response still refuses all framing.
+PDF_FRAME_ANCESTORS = "frame-ancestors 'self'"
+
+
+def security_headers_for(content_type: str | None) -> dict[str, str]:
+    headers = dict(SECURITY_HEADERS)
+    if (content_type or "").split(";")[0].strip().lower() == "application/pdf":
+        headers["Content-Security-Policy"] = headers["Content-Security-Policy"].replace(
+            "frame-ancestors 'none'", PDF_FRAME_ANCESTORS)
+    return headers
 
 
 def _identity_digest(value: str) -> str | None:
@@ -400,7 +398,7 @@ async def security_audit_middleware(request: Request, call_next):
         "SECURITY_AUDIT %s", json.dumps(event, sort_keys=True, separators=(",", ":"))
     )
     response.headers["X-Correlation-ID"] = request.state.correlation_id
-    for name, value in SECURITY_HEADERS.items():
+    for name, value in security_headers_for(response.headers.get("content-type")).items():
         response.headers[name] = value
     return response
 
@@ -1243,10 +1241,12 @@ def _portfolio_access_context(
 def _certified(endpoint: str, account_id: str, requested_as_of: str | None, build) -> dict:
     """The page's answer from build(as_of); with CERTIFIED_FIGURES_PAGES unset, exactly today's.
 
-    Call only after the account check has passed (certified_pages explains the modes).
+    Call only after the account check has passed (certified_pages explains the modes; the
+    charts on the answer follow the page key charts, certified_charts).
     """
-    return certified_pages.serve(endpoint, tenant_id=TENANT_ID, subject_id=account_id,
-                                 requested_as_of=requested_as_of, build=build)
+    payload = certified_pages.serve(endpoint, tenant_id=TENANT_ID, subject_id=account_id,
+                                    requested_as_of=requested_as_of, build=build)
+    return certified_charts.serve(endpoint, payload, tenant_id=TENANT_ID, subject_id=account_id)
 
 
 def _authorized_subject_ids(
@@ -1635,14 +1635,20 @@ def monthly_attribution_view(
     user: dict[str, str] = Depends(_authorized_user),
 ) -> dict:
     """Contribution to return by holding and sector for one calendar month."""
-    from .monthly_reporting_analytics import build_monthly_reporting_analytics
-
     access = _portfolio_access_context(account_id, user)
     requested_as_of = _parse_as_of(as_of)
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month or ""):
         raise HTTPException(status_code=400, detail="Month must be YYYY-MM")
     if requested_as_of and month > requested_as_of[:7]:
         raise HTTPException(status_code=400, detail="Month is after the as-of date")
+    # The month is worked out to its calendar end whatever the as-of date, as before.
+    return _certified("attribution", account_id, requested_as_of,
+                      lambda day: _monthly_attribution(account_id, access, month))
+
+
+def _monthly_attribution(account_id: str, access: dict, month: str) -> dict:
+    from .monthly_reporting_analytics import build_monthly_reporting_analytics
+
     year, number = int(month[:4]), int(month[5:])
     next_month = date(year + number // 12, number % 12 + 1, 1)
     period_end = (next_month - timedelta(days=1)).isoformat()
@@ -1763,11 +1769,11 @@ def holdings_correlation_view(
         except (TypeError, ValueError):
             continue
         prices.setdefault(str(row["conid"]), {})[str(row["snapshot_date"])] = value
-    return {
+    return certified_charts.serve("holdings-correlation", {
         "account_id": account_id,
         "snapshot_date": snapshot,
         **calculate_holdings_correlation(prices, labels),
-    }
+    }, tenant_id=TENANT_ID, subject_id=account_id)
 
 
 @app.get("/api/portfolio/{account_id}/flows")
@@ -1859,6 +1865,50 @@ def _holdings_fx_account(connection, subject_id: str, subject_type: str) -> str 
     return str(definition["source_account_id"]) if definition and definition["source_account_id"] else None
 
 
+# A market reference rate stands in only within this many days before the snapshot.
+REFERENCE_FX_MAX_AGE_DAYS = 4
+
+
+def _reference_fx_fallback(connection, rows: list[dict], fx_rows, *, reporting_currency: str,
+                           snapshot_date: str) -> dict:
+    """Market reference FX for currency pairs the account's own FX history lacks.
+
+    An account converts with its own dated FX history. A Kiwoom won account keeps no FX
+    (it holds only won), so to show it in another currency, such as USD in Combined
+    holdings, the validated reference rate (Yahoo close in reference_fx_rates) is used
+    instead, dated within REFERENCE_FX_MAX_AGE_DAYS of the snapshot. Pairs the account
+    has any history for are never replaced.
+    """
+    target = str(reporting_currency or "").upper()
+    own = {(str(r["from_currency"]).upper(), str(r["to_currency"]).upper()) for r in fx_rows}
+    natives = sorted({str(r.get("currency") or "").upper() for r in rows} - {target, ""})
+    missing = [n for n in natives if (n, target) not in own and (target, n) not in own]
+    if not missing or len(target) != 3:
+        return {"rows": [], "pairs": []}
+    earliest = (date.fromisoformat(snapshot_date[:10])
+                - timedelta(days=REFERENCE_FX_MAX_AGE_DAYS)).isoformat()
+    found: dict[tuple[str, str, str], dict] = {}
+    pairs: set[str] = set()
+    for native in missing:
+        for row in connection.execute(
+            """
+            SELECT rate_date, from_currency, to_currency, rate, provider
+            FROM reference_fx_rates
+            WHERE tenant_id = %s AND from_currency = %s AND to_currency = %s
+              AND rate_date >= %s AND rate_date <= %s
+              AND quality_status IN ('pass', 'warn')
+            ORDER BY rate_date, provider
+            """,
+            (TENANT_ID, native, target, earliest, snapshot_date[:10]),
+        ).fetchall():
+            key = (native, target, str(row["rate_date"])[:10])
+            # One observation a day (the first provider), so the dated lookup is never ambiguous.
+            found.setdefault(key, {"rate_date": key[2], "from_currency": native, "to_currency": target,
+                                   "rate_text": str(row["rate"])})
+            pairs.add(f"{native}/{target}")
+    return {"rows": [found[key] for key in sorted(found)], "pairs": sorted(pairs)}
+
+
 def _enrich_subject_holdings(
     connection,
     subject_id: str,
@@ -1888,6 +1938,9 @@ def _enrich_subject_holdings(
             """,
             (fx_account, snapshot_date),
         ).fetchall()
+    reference_pairs = _reference_fx_fallback(
+        connection, rows, fx_rows, reporting_currency=reporting_currency, snapshot_date=snapshot_date)
+    fx_rows = [*fx_rows, *reference_pairs["rows"]]
     nav_total = None
     if nav_currency is not None:
         nav = connection.execute(
@@ -1907,6 +1960,7 @@ def _enrich_subject_holdings(
         fx_unavailable_reason=None if fx_account is not None else "fx_source_unavailable",
     )
     view["fx_account_id"] = fx_account
+    view["fx_reference_pairs"] = reference_pairs["pairs"]
     return view
 
 
@@ -3856,7 +3910,7 @@ def _monthly_release_candidate(connection, subject_id: str, period_end: str, *, 
     runs = connection.execute(
         """
         SELECT generation_run_id, snapshot_id, report_type, status,
-               output_reference, output_sha256
+               output_reference, output_sha256, template_version
         FROM report_generation_runs
         WHERE tenant_id = %s AND snapshot_id = %s
           AND report_type IN ('factsheet', 'presentation')
@@ -4165,12 +4219,24 @@ def release_subject_monthly_reports(
     }
 
 
+def _download_prefix(subject_id: str) -> str | None:
+    """Korea_ or US_ for a Kiwoom subject's downloads (monthly_reports.download_prefix), else None."""
+    if not subject_id.startswith("KIWOOM-"):
+        return None
+    try:
+        with _database() as connection:
+            return download_prefix(connection, TENANT_ID, subject_id)
+    except (PostgresError, RuntimeError):
+        return None
+
+
 def _monthly_download_filename(
-    artifact: dict[str, object], *, subject_id: str, period_end: str
+    artifact: dict[str, object], *, subject_id: str, period_end: str, prefix: str | None = None
 ) -> str:
-    """Keep content-addressed storage private; name MS and T downloads for readers."""
+    """Keep content-addressed storage private; name MS, T and prefixed downloads for readers."""
     prefixes = {"alpha-world-ms": "AlphaWorld_MS", "alpha-world-t": "AlphaWorld_T"}
-    if subject_id in prefixes:
+    prefix = prefixes.get(subject_id, prefix)
+    if prefix:
         period = validate_period_end(period_end)
         kind = str(artifact["report_type"])
         definitions = {
@@ -4180,7 +4246,7 @@ def _monthly_download_filename(
         if kind not in definitions:
             raise MonthlyReportError("Unsupported monthly report type")
         label, extension = definitions[kind]
-        return f"{prefixes[subject_id]}_{label}_{period}{extension}"
+        return f"{prefix}_{label}_{period}{extension}"
     name = PurePosixPath(str(artifact["filename"])).name
     # Stored files are content-addressed as "<sha256>-<name>" (twice once released);
     # readers get the plain name.
@@ -4252,7 +4318,7 @@ def _download_monthly_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end, prefix=_download_prefix(subject_id))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Subject-ID": subject_id,
@@ -4350,7 +4416,7 @@ def _download_monthly_review_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject_id, period_end=period_end, prefix=_download_prefix(subject_id))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Subject-ID": subject_id,
@@ -4861,6 +4927,49 @@ def _benchmark_return_basis(return_convention: object) -> dict[str, str]:
     return {"return_basis": basis, "return_basis_label": label}
 
 
+def _catalog_comparison_benchmarks(connection: Any, account_id: str, mapped: list) -> list:
+    """Active catalog benchmarks outside the account's contract that the benchmark job has
+    compared it with (WEBSITE_ALL_BENCHMARKS). Website only: listed as 'comparison', after
+    the contract's own benchmarks, and only once comparison rows exist."""
+
+    primary = next((row for row in mapped if row["mapping_type"] == "primary"), mapped[0])
+    currency = str(primary["reporting_currency"])
+    return connection.execute(
+        """
+        SELECT b.benchmark_id, b.symbol, b.name, b.provider, b.currency,
+               b.return_convention, b.license_status, 'comparison' AS mapping_type,
+               NULL AS effective_from, %s AS reporting_currency,
+               (SELECT COUNT(*) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'official_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS observations,
+               (SELECT MAX(p.observation_date) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'official_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS latest_observation,
+               (SELECT COUNT(*) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'provisional_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS provisional_observations,
+               (SELECT MAX(p.observation_date) FROM benchmark_prices p
+                WHERE p.benchmark_id = b.benchmark_id
+                  AND p.observation_status = 'provisional_close'
+                  AND p.quality_status IN ('pass', 'warn')) AS latest_provisional_observation
+        FROM benchmark_master b
+        WHERE b.tenant_id = %s AND b.active = true
+          AND NOT (b.benchmark_id = ANY(%s))
+          AND EXISTS (
+              SELECT 1 FROM performance_comparison_daily c
+              WHERE c.tenant_id = b.tenant_id AND c.subject_id = %s
+                AND c.benchmark_id = b.benchmark_id AND c.calculation_version = %s
+                AND c.reporting_currency = %s AND c.quality_status IN ('pass', 'warn'))
+        ORDER BY b.name
+        """,
+        (currency, TENANT_ID, [str(row["benchmark_id"]) for row in mapped], account_id,
+         website_comparison_version(account_id, currency), currency),
+    ).fetchall()
+
+
 @app.get("/api/portfolio/{account_id}/benchmark-status")
 def benchmark_status(
     account_id: str, user: dict[str, str] = Depends(_authorized_user)
@@ -4899,6 +5008,8 @@ def benchmark_status(
             """,
             (account_id,),
         ).fetchall()
+        if benchmarks:
+            benchmarks = [*benchmarks, *_catalog_comparison_benchmarks(connection, account_id, benchmarks)]
     if not benchmarks:
         return {
             "account_id": account_id,
@@ -4983,6 +5094,24 @@ def _benchmark_comparison(account_id: str, benchmark_id: str | None, requested_a
             ,
             (TENANT_ID, account_id, benchmark_id, benchmark_id),
         ).fetchone()
+        if benchmark is None and benchmark_id:
+            # A catalog benchmark outside the contract, compared in the account's reporting
+            # currency (WEBSITE_ALL_BENCHMARKS); rows exist only if the job built them.
+            benchmark = connection.execute(
+                """
+                SELECT b.benchmark_id, b.symbol, b.name, b.provider,
+                       b.license_status, b.return_convention, 'comparison' AS mapping_type,
+                       m.reporting_currency
+                FROM benchmark_master b
+                JOIN portfolio_benchmark_mapping m
+                  ON m.tenant_id = b.tenant_id AND m.subject_id = %s AND m.mapping_type = 'primary'
+                 AND m.effective_from <= CURRENT_DATE::text
+                 AND (m.effective_to IS NULL OR m.effective_to >= CURRENT_DATE::text)
+                WHERE b.tenant_id = %s AND b.benchmark_id = %s AND b.active = true
+                LIMIT 1
+                """,
+                (account_id, TENANT_ID, benchmark_id),
+            ).fetchone()
         if benchmark is None:
             records = []
         else:
@@ -5247,7 +5376,7 @@ const loadCombined=()=>{
     document.querySelector('#combined-accounts').innerHTML=data.accounts.map(item=>`<div class="status-item"><span class="label">${esc(item.display_name)}</span><strong>${esc(item.snapshot_date||'No snapshot')}</strong><span class="muted">${esc(item.holdings_count)} holdings${item.fx_missing_conids.length?` · ${esc(item.fx_missing_conids.length)} without FX`:''}</span></div>`).join('');
     document.querySelector('#combined-holdings').innerHTML=data.holdings.map(x=>`<tr><td>${esc(x.symbol||x.conid)}</td><td>${esc(x.description||'')}</td><td>${esc(x.sector||'')}</td><td><details><summary>${esc(x.account_count)}</summary>${x.accounts.map(a=>`<div class="muted">${esc(a.display_name)}: ${fmt(a.quantity_text)} · ${a.fx_missing?'FX unavailable':esc(fmt(a.reporting_market_value_text))}</div>`).join('')}</details></td><td>${fmt(x.quantity_text)}</td><td>${money(x.reporting_market_value_text)}${x.incomplete?' <span class="muted" title="At least one account has no usable FX rate for this holding">(partial)</span>':''}</td><td>${money(x.reporting_cost_basis_text)}</td><td>${toned(money(x.reporting_unrealized_pnl_text),x.reporting_unrealized_pnl_text)}</td><td>${toned(pct(x.unrealized_pnl_pct),x.unrealized_pnl_pct)}</td><td data-sort="${x.weight??''}">${pct(x.weight)}</td></tr>`).join('')||'<tr><td colspan="10">No holdings are available for your accounts on or before this date.</td></tr>';
     certifiedLine(document.querySelector('#combined-holdings'),data.certified);
-    document.querySelector('#combined-note').textContent=`${data.accounts.length} physical account(s) combined in ${data.currency}. Filtered and composite portfolios are excluded because they are built from these accounts. Each account uses its own latest snapshot and dated FX history. Weights are shares of gross combined holdings value (cash excluded).${data.incomplete?' Some holdings have no usable FX rate; their values are partial.':''}${data.skipped_accounts.length?` ${data.skipped_accounts.length} account(s) could not be included.`:''}`;
+    document.querySelector('#combined-note').textContent=`${data.accounts.length} physical account(s) combined in ${data.currency}. Filtered and composite portfolios are excluded because they are built from these accounts. Each account uses its own latest snapshot and dated FX history, or a market reference rate where it keeps none. Weights are shares of gross combined holdings value (cash excluded).${data.incomplete?' Some holdings have no usable FX rate; their values are partial.':''}${data.skipped_accounts.length?` ${data.skipped_accounts.length} account(s) could not be included.`:''}`;
   }).catch(error=>{document.querySelector('#combined-note').textContent=`Combined holdings are unavailable: ${error.message}`;document.querySelector('#combined-holdings').innerHTML=''});
 };
 combinedForm.addEventListener('submit',event=>{event.preventDefault();loadCombined()});
@@ -10590,7 +10719,7 @@ def download_onboarding_historical_report(
         media_type=str(artifact["media_type"]),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject, period_end=period_end)}"'
+                f'attachment; filename="{_monthly_download_filename(artifact, subject_id=subject, period_end=period_end, prefix=_download_prefix(subject))}"'
             ),
             "X-Content-SHA256": digest,
             "X-Report-Period-End": period_end,
@@ -11269,17 +11398,18 @@ document.querySelector('#period-apply').addEventListener('click',()=>loadPerform
 const renderBenchmark=async(id,meta,asOf)=>{{
 const query=`benchmark_id=${{encodeURIComponent(id)}}&as_of=${{encodeURIComponent(asOf)}}`;
 const bc=await fetch(`/api/portfolio/${{account}}/benchmark-comparison?${{query}}`).then(json);
-document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':'Secondary'}} · ${{meta.return_basis_label||meta.return_convention}}`;
+document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':meta.mapping_type==='comparison'?'Comparison':'Secondary'}} · ${{meta.return_basis_label||meta.return_convention}}`;
 document.querySelector('#benchmark-legend').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.return_basis==='price_return'?'price return':meta.return_basis==='total_return'?'total return':meta.return_convention}}`;
 document.querySelector('#benchmark-note').textContent=meta.message+`${{meta.return_basis==='price_return'?' The benchmark is a price index: its returns exclude dividends, while portfolio returns include income, so the comparison favours the portfolio by the index dividend yield.':''}} Provider: ${{meta.provider||'—'}} · Convention: ${{meta.return_convention}} · License: ${{meta.license_status}} · Provisional observations: ${{meta.provisional_observations}} · Latest feed observation: ${{meta.latest_provisional_observation||'—'}}`;
 document.querySelector('#benchmark-metrics').innerHTML='';certifiedLine(document.querySelector('#benchmark-metrics'),null);
-draw('#benchmark-chart',[],[],{{emptyMessage:bc.available?'':'No validated comparison is available for this benchmark and date.'}});renderRollingBenchmark(null);
+draw('#benchmark-chart',[],[],{{emptyMessage:bc.available?'':'No validated comparison is available for this benchmark and date.'}});certifiedLine(document.querySelector('#benchmark-chart'),null);renderRollingBenchmark(null);
 if(bc.available){{
 const m=bc.metrics,items=[['Portfolio total return',pct(m.portfolio_total_return)],['Benchmark total return',pct(m.benchmark_total_return),bc.benchmark_return_basis==='price_return'?'Benchmark price return (excludes dividends)':undefined],['Excess total return',pct(m.excess_total_return),bc.benchmark_return_basis==='price_return'?'Excess return vs price index':undefined],['Tracking error',pct(m.tracking_error)],['Information ratio',m.information_ratio==null?'—':fmt(m.information_ratio)],['Beta',m.beta==null?'—':fmt(m.beta)],['Correlation',m.correlation==null?'—':fmt(m.correlation)],['Relative win rate',pct(m.relative_win_rate)]];
 document.querySelector('#benchmark-note').textContent+=` Aligned comparison: ${{m.period_start}} through ${{m.period_end}} · Reporting currency: ${{bc.reporting_currency}} · ${{m.observations}} common-date observations. Rebased to 100 at the first common observation; unmatched market dates are not filled.`;
 document.querySelector('#benchmark-metrics').innerHTML=items.map(metricCard).join('');certifiedLine(document.querySelector('#benchmark-metrics'),bc.certified);
 renderRollingBenchmark(bc);
-draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}})
+draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}});
+certifiedLine(document.querySelector('#benchmark-chart'),chartsFor(bc.certified_charts,['series.portfolio_daily_return','series.benchmark_daily_return'],'Vs benchmark'))
 }}
 }};
 {RISK_DISPLAY_SCRIPT}
@@ -11383,7 +11513,7 @@ const admin=a.admin_actions,adminAction=document.querySelector('#admin-action'),
 adminPreview.addEventListener('click',async()=>{{adminPreview.disabled=true;adminExecute.disabled=true;adminConfirmation.disabled=true;document.querySelector('#admin-result').textContent='';const result=document.querySelector('#admin-preview-result');result.textContent='Creating an integrity-bound preview…';try{{currentApproval=await fetch('/api/admin/actions/preview',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action_type:adminAction.value}})}}).then(json);const p=currentApproval.preview;result.innerHTML=`<strong>${{esc(p.label)}}</strong><p>${{esc(p.description)}}</p><p>Target: <code>${{esc(p.target)}}</code> · Environment: <strong>${{esc(p.environment)}}</strong><br>Expires: ${{esc(currentApproval.expires_at)}}<br>Payload digest: <code>${{esc(currentApproval.action_payload_sha256)}}</code></p><p><strong>Will not allow:</strong> ${{p.does_not_allow.map(esc).join(', ')}}</p><p>Type exactly: <code>${{esc(currentApproval.confirmation_phrase)}}</code></p>`;adminConfirmation.value='';adminConfirmation.placeholder=currentApproval.confirmation_phrase;adminConfirmation.disabled=false;adminExecute.disabled=false}}catch(error){{currentApproval=null;result.textContent='Unable to create an approval preview.'}}finally{{adminPreview.disabled=!admin.enabled}}}});
 adminExecute.addEventListener('click',async()=>{{if(!currentApproval)return;adminExecute.disabled=true;adminPreview.disabled=true;const result=document.querySelector('#admin-result');result.textContent='Executing the single approved staging action…';try{{const response=await fetch(`/api/admin/actions/${{currentApproval.approval_id}}/approve`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action_payload_sha256:currentApproval.action_payload_sha256,confirmation:adminConfirmation.value}})}}).then(json);result.innerHTML=`<strong>Executed once.</strong> Action: ${{esc(response.action_type)}} · Approval ID: ${{esc(response.approval_id)}} · Correlation ID: ${{esc(response.correlation_id)}}`;currentApproval=null;adminConfirmation.value='';adminConfirmation.disabled=true}}catch(error){{result.textContent='Action was not executed. Check the exact approval phrase or create a new preview.';adminExecute.disabled=false}}finally{{adminPreview.disabled=!admin.enabled}}}});
 asOfSelect.innerHTML=d.dates.map(x=>`<option value="${{esc(x)}}">${{esc(asOfLabel(x))}}</option>`).join('');asOfSelect.value=storedAsOf(d.dates)||d.latest;showFreshness(d.latest);
-benchmarks=b.benchmarks||[];benchmarkSelect.innerHTML=benchmarks.map(x=>`<option value="${{esc(x.benchmark_id)}}">${{x.mapping_type==='primary'?'Primary':'Secondary'}} — ${{esc(x.name)}} (${{esc(x.symbol)}})</option>`).join('');
+benchmarks=b.benchmarks||[];benchmarkSelect.innerHTML=benchmarks.map(x=>`<option value="${{esc(x.benchmark_id)}}">${{x.mapping_type==='primary'?'Primary':x.mapping_type==='comparison'?'Comparison':'Secondary'}} — ${{esc(x.name)}} (${{esc(x.symbol)}})</option>`).join('');
 if(benchmarks.length){{const primary=benchmarks.find(x=>x.mapping_type==='primary')||benchmarks[0];benchmarkSelect.value=primary.benchmark_id;benchmarkSelect.addEventListener('change',()=>{{const selected=benchmarks.find(x=>x.benchmark_id===benchmarkSelect.value);renderBenchmark(selected.benchmark_id,selected,asOfSelect.value).catch(()=>{{document.querySelector('#benchmark-note').textContent='Unable to load this comparison.'}})}})}}else{{document.querySelector('#benchmark').textContent=b.failed?'Unavailable':'Not configured';if(b.failed)document.querySelector('#benchmark-note').textContent='The benchmark list could not be loaded. Refresh the page to try again.';benchmarkSelect.disabled=true}}
 asOfSelect.addEventListener('change',()=>(rememberAsOf(asOfSelect.value),renderAsOf(asOfSelect.value)).catch(error=>loadFailure(error,'The figures for this date could not be loaded. Pick another date or refresh the page.')));
 if(!previewMode){{const savedConversations=await refreshConversations(null);if(savedConversations.length)await openConversation(savedConversations[0].conversation_id);else{{updateChatHeader(null);emptyChat()}}}}else{{updateChatHeader(null);emptyChat()}}analysisRun.disabled=!a.ai_model.enabled;

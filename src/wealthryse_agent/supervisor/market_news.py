@@ -284,7 +284,7 @@ def checked_events(item: Item, answer: Mapping[str, Any]) -> list[dict[str, Any]
 # The store ----------------------------------------------------------------------------------
 
 class MarketNewsStore:
-    """agent.market_news_items, market_events and market_news_requests (migrations/agent/019)."""
+    """agent.market_news_items, market_events and market_news_requests (migrations/agent/021)."""
 
     def __init__(self, connection: Any, tenant_id: str) -> None:
         self.db = connection

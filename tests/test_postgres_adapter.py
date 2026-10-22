@@ -298,37 +298,6 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("refresh_crisis_replay", script)
         self.assertIn("crisis_replay_observations", script)
 
-    def test_daily_account_sync_is_bounded_multi_account_digest_pinned_and_no_retry(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        template = (
-            root / "infra" / "staging-daily-account-sync.bicep"
-        ).read_text(encoding="utf-8")
-        role = (
-            root / "infra" / "staging-production-export-reader.bicep"
-        ).read_text(encoding="utf-8")
-        script = (
-            root / "scripts" / "sync_daily_pilot_account.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn("cronExpression: '10 8 * * *'", template)
-        self.assertIn("param scheduleEnabled bool = true", template)
-        self.assertIn("triggerType: scheduleEnabled ? 'Schedule' : 'Manual'", template)
-        self.assertIn("replicaRetryLimit: 0", template)
-        self.assertIn("parallelism: 1", template)
-        self.assertIn("ibkr-platform@${imageDigest}", template)
-        self.assertIn("sourceScope: 'physical-account-wave-0'", template)
-        self.assertIn("account_id: 'U16088571'", template)
-        self.assertIn("account_id: 'U16088606'", template)
-        self.assertIn("ACCOUNT_SYNC_TARGETS_JSON", template)
-        self.assertIn("ONBOARDING_WAVE0_ACCOUNT_ID", template)
-        self.assertIn("Storage/storageAccounts/blobServices/containers", role)
-        self.assertIn("storageBlobReaderRoleId", role)
-        self.assertIn("build_pilot_snapshot", script)
-        self.assertIn("validate_production_export_manifest", script)
-        self.assertIn("parse_account_sync_targets", script)
-        self.assertIn("register_source_discoveries", script)
-        self.assertNotIn("FLEX_TOKEN", template)
-        self.assertNotIn("ibkr-flex", template.lower())
-
     def test_treasury_risk_free_job_is_staging_only_and_has_no_retry(self) -> None:
         root = Path(__file__).resolve().parents[1]
         template = (root / "infra" / "staging-risk-free-job.bicep").read_text(
@@ -416,8 +385,9 @@ class SecurityDefinitionTests(unittest.TestCase):
         self.assertIn("idx_burn_in_one_running_window", migration)
         self.assertIn("cronExpression: '15 9 * * *'", template)
         self.assertIn("replicaRetryLimit: 0", template)
-        # v1.1's pull stopped on 17 Oct 2026; its own alert stays with v1.1.
+        # v1.1's pull and account-sync stopped on 17 Oct 2026; v1.1 was deleted on 21 Oct.
         self.assertNotIn("  'ibkr-v11-daily'\n", template)
+        self.assertNotIn("ibkrv2stg-account-sync-daily", template)
         self.assertIn("ibkrv2stg-institutional-daily", template)
         self.assertIn("param actionGroupName string = 'ibkrv2stg-alerts'", template)
         self.assertIn("ibkrv2stg-autonomous-admin", template)

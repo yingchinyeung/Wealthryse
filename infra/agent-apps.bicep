@@ -57,14 +57,14 @@ param deployDispatcher bool = false
 param dispatcherMode string = 'watch'
 @description('With dispatcherMode live: the jobs it may run, comma-separated (holdings_explainer, risk_watch, weekly_brief). Empty: none.')
 param dispatcherJobs string = ''
-@description('The market news watch\'s job (ibkrv2stg-agent-market-news, docs/AGENTS.md): hourly it reads world stock market news and keeps the market changes it can confirm. Off until approved; needs migrations/agent/019 installed and the APAC report deployment.')
+@description('The market news watch\'s job (ibkrv2stg-agent-market-news, docs/AGENTS.md): hourly it reads world stock market news and keeps the market changes it can confirm. Off until approved; needs migrations/agent/021 installed and the APAC report deployment.')
 param deployMarketNews bool = false
 @description('watch keeps news items and confirmed market changes and records each run in agent.tasks; live also posts one owner-only inbox card per new change.')
 @allowed(['off', 'watch', 'live'])
 param marketNewsMode string = 'watch'
 @description('Monthly token cap for the market news watch.')
 param marketNewsTokenBudget int = 2000000
-@description('on shows get_market_events to the agents (the onboarding NAV check, incident diagnosis and chat). Needs migrations/agent/019 installed.')
+@description('on shows get_market_events to the agents (the onboarding NAV check, incident diagnosis and chat). Needs migrations/agent/021 installed.')
 @allowed(['off', 'on'])
 param marketEvents string = 'off'
 
@@ -167,7 +167,7 @@ var probes = [
 resource tools 'Microsoft.App/containerApps@2024-03-01' = {
   name: toolsAppName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls]
   identity: {
     type: 'UserAssigned'
@@ -213,7 +213,7 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
 resource agent 'Microsoft.App/containerApps@2024-03-01' = {
   name: agentAppName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls]
   identity: {
     type: 'UserAssigned'
@@ -292,7 +292,7 @@ var jobs = [
 resource agentJobs 'Microsoft.App/jobs@2024-03-01' = [for j in jobs: {
   name: j.name
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls, tools]
   identity: {
     type: 'UserAssigned'
@@ -373,7 +373,7 @@ resource onboardingIntakeReader 'Microsoft.Authorization/roleAssignments@2022-04
 resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
   name: 'ibkrv2stg-agent-month-team'
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls, tools, monthTeamReader]
   identity: {
     type: 'UserAssigned'
@@ -428,7 +428,7 @@ resource monthTeamJob 'Microsoft.App/jobs@2024-03-01' = if (deployMonthTeam) {
 resource onboardingJob 'Microsoft.App/jobs@2024-03-01' = if (deployOnboarding && deployMonthTeam) {
   name: 'ibkrv2stg-agent-onboarding'
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'serve' })
   dependsOn: [pulls, tools, monthTeamReader, onboardingIntakeReader]
   identity: {
     type: 'UserAssigned'
@@ -515,7 +515,7 @@ var opsGithubEnv = empty(opsGithubTokenSecretUri) ? [] : [
 resource operationsJob 'Microsoft.App/jobs@2024-03-01' = if (deployOperations) {
   name: 'ibkrv2stg-agent-ops'
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'ops' })
   dependsOn: [pulls, tools, opsReader, opsLogReader]
   identity: {
     type: 'UserAssigned'

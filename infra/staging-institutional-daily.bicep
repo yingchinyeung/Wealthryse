@@ -79,7 +79,7 @@ resource blobContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = 
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', hop: 'ingest+conform', owner: 'ying' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

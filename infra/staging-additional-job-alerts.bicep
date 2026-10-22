@@ -15,6 +15,7 @@ resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' existing = {
 resource alerts 'Microsoft.Insights/metricAlerts@2018-03-01' = [for jobName in jobNames: {
   name: '${jobName}-failed-execution'
   location: 'global'
+  tags: { layer: 'ops', component: 'alerts', owner: 'ying' }
   properties: {
     description: 'Portfolio platform job failed; inspect the execution and its correlated logs.'
     severity: 1

@@ -76,6 +76,11 @@ get_performance and compare_to_benchmark with as_of {month_end}, get_holdings_ch
 {month_start} to {month_end}, and get_sector_allocation. Neutral factual tone, no advice, no \
 forecasts. This is a draft for a person to review."""
 
+# Added to MONTH_END_DRAFTER when AGENT_CERTIFIED_MONTH_END=on.
+MONTH_END_CERTIFIED = """ For every figure get_certified_figures serves (ask by page, e.g. page overview, for \
+account {account_id} with as_of {month_end}), quote the certified figure and cite it by its ref, e.g. [F1]; \
+trace_figure says where one came from."""
+
 WEEKLY_BRIEF = """Write account {account_id}'s weekly brief for the week from {from_date} to {to_date}, for the \
 person who owns it, to read on the website. Four to eight short sentences in plain language: how the \
 account's value and return moved over the week and against its benchmark, the two or three holdings \

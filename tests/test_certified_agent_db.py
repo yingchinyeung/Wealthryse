@@ -184,6 +184,29 @@ class CertifiedAgentViewTests(unittest.TestCase):
         figure(published, "UTEST1", "overview.twr", 0.1626, "ratio", period="ytd")
         figure(published, "UTEST1", "overview.twr", 0.0123, "ratio", period="mtd")
         figure(published, "UTEST2", "overview.nav", 55000.0, "money", currency="USD")
+        # Batch 4 and 5 kinds for the second account: a month's Attribution on its last date
+        # (per_period_item), a series one point a date, and RSI per holding, each with its detail.
+        attribution_and_charts = [
+            ("attribution.portfolio_return", "month_2026-02", "", "2026-02-27", 0.021, {}),
+            ("attribution.holding_contribution", "month_2026-02", "756733", "2026-02-27", 0.015,
+             {"symbol": "SYN", "sector": "Technology"}),
+            ("attribution.sector_contribution", "month_2026-02", "Technology", "2026-02-27", 0.015, {}),
+            ("attribution.portfolio_return", "month_2026-03", "", "2026-03-31", -0.004, {}),
+            ("attribution.holding_contribution", "month_2026-03", "756733", "2026-03-31", -0.003,
+             {"symbol": "SYN", "sector": "Technology"}),
+            ("series.rolling_volatility_63d", "", "", "2026-02-27", 0.15, {}),
+            ("series.rolling_volatility_63d", "", "", "2026-03-31", 0.16, {}),
+            ("indicator.rsi_14", "", "756733", "2026-03-31", 61.5, {"signal": "neutral", "observations": 20})]
+        for figure_id, period, item, day, value, detail in attribution_and_charts:
+            entry = register.figure(figure_id)
+            owner.execute(
+                "INSERT INTO gold.certified_figures(build_id, subject_id, figure_id, period, item, as_of_date, "
+                "value, unit, status, detail, period_start, period_end, observations, definition_id, "
+                "definition_version, calculation_version, input_sha256, source_table, source_key) VALUES "
+                "(%s, 'UTEST2', %s, %s, %s, %s, %s, %s, 'ok', %s::jsonb, '2026-01-02', %s, 20, %s, %s, 'test-v1', "
+                "%s, 'silver.subject_position_series', '{}')",
+                (published, figure_id, period, item, day, value, entry.unit, json.dumps(detail), day,
+                 entry.definition_id, entry.definition_version, "d" * 64))
         publish(published)
         held = build("2026-04-02T09:00:00Z")
         figure(held, "UTEST1", "overview.nav", 99999.0, "money", currency="USD")
@@ -332,6 +355,47 @@ class CertifiedAgentViewTests(unittest.TestCase):
             missing = self._call("trace_figure", {"account_id": "UTEST2", "figure_id": "risk.sharpe_ratio"},
                                  user=OWNER)["structuredContent"]
             self.assertEqual(missing["error"]["code"], "no_certified_figures")
+
+    def test_attribution_and_the_charts_through_the_tool_server(self):
+        """Batch 4 and 5 pages for the agents: a past month's Attribution is found on its last date
+        (per_period_item: period and item), a chart's series point and table rows on their date, the
+        row's detail with them, and the refusal names the tools that still answer a page not on."""
+        pages = {**ON, "CERTIFIED_FIGURES_PAGES": "overview=on,attribution=on,charts=on"}
+        with mock.patch.dict(os.environ, pages):
+            february = self._call("get_certified_figures", {"account_id": "UTEST2", "page": "attribution",
+                                                            "period": "month_2026-02"}, user=OWNER)["structuredContent"]
+            self.assertEqual(february["as_of"], "2026-02-27")
+            self.assertEqual(sorted((f["figure_id"], f["period_key"], f.get("item"), f["value"])
+                                    for f in february["figures"]),
+                             [("attribution.holding_contribution", "month_2026-02", "756733", 0.015),
+                              ("attribution.portfolio_return", "month_2026-02", None, 0.021),
+                              ("attribution.sector_contribution", "month_2026-02", "Technology", 0.015)])
+            holding = next(f for f in february["figures"] if f["figure_id"] == "attribution.holding_contribution")
+            self.assertEqual(holding["detail"], {"symbol": "SYN", "sector": "Technology"})
+            newest = self._call("get_certified_figures", {"account_id": "UTEST2", "page": "attribution"},
+                                user=OWNER)["structuredContent"]
+            self.assertEqual(newest["as_of"], "2026-03-31")
+            self.assertEqual({f["period_key"] for f in newest["figures"]}, {"month_2026-03"})
+            traced = self._call("trace_figure", {"account_id": "UTEST2", "figure_id": "attribution.holding_contribution",
+                                                 "period": "month_2026-02", "item": "756733"},
+                                user=OWNER)["structuredContent"]
+            self.assertEqual((traced["as_of"], traced["data"]["build"]["build_id"]), ("2026-02-27", self.published_build))
+            charts = self._call("get_certified_figures", {"account_id": "UTEST2", "page": "charts"},
+                                user=OWNER)["structuredContent"]
+            self.assertEqual(charts["as_of"], "2026-03-31")
+            self.assertEqual({(f["figure_id"], f.get("item")): f["value"] for f in charts["figures"]},
+                             {("series.rolling_volatility_63d", None): 0.16, ("indicator.rsi_14", "756733"): 61.5})
+            rsi = next(f for f in charts["figures"] if f["figure_id"] == "indicator.rsi_14")
+            self.assertEqual(rsi["detail"], {"signal": "neutral", "observations": 20})
+            earlier = self._call("get_certified_figures", {"account_id": "UTEST2", "figures": [
+                "series.rolling_volatility_63d"], "as_of": "2026-03-01"}, user=OWNER)["structuredContent"]
+            self.assertEqual([(f["as_of_date"], f["value"]) for f in earlier["figures"]], [("2026-02-27", 0.15)])
+        with mock.patch.dict(os.environ, {**ON, "CERTIFIED_FIGURES_PAGES": "overview=on,charts=shadow"}):
+            for page, words in (("attribution", "get_holdings_changes"), ("charts", "get_nav_history")):
+                refused = self._call("get_certified_figures", {"account_id": "UTEST2", "page": page},
+                                     user=OWNER)["structuredContent"]
+                self.assertEqual(refused["error"]["code"], "page_not_moved")
+                self.assertIn(words, refused["error"]["message"])
 
 
 if __name__ == "__main__":

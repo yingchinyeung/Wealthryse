@@ -55,6 +55,12 @@ class MarketCalendarTests(unittest.TestCase):
         data["benchmarks"][0]["benchmark_usable_date"] = "2026-07-10"
         self.assertEqual(check_benchmark_dates(data)["checks"][0]["state"], "unexpected_non_session")
 
+    def test_us_etf_benchmarks_follow_nyse_and_kospi_stays_unmapped(self):
+        for benchmark in ("EWH", "EWT", "SPY", "XLK"):
+            self.assertEqual(benchmark_session_on_or_before(benchmark, date(2026, 11, 26)), date(2026, 11, 25))
+        with self.assertRaises(CalendarCoverageError):
+            benchmark_session_on_or_before("KS200", date(2026, 10, 16))
+
     def test_half_days_are_sessions(self):
         for market in ("XHKG", "XNYS", "XNAS"):
             self.assertTrue(CALENDARS[market].is_session(date(2026,12,24)))

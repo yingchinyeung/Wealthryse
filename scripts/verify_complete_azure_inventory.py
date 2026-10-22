@@ -12,7 +12,7 @@ from pathlib import Path
 from audit_azure_runtime import az, RG
 from deploy_metadata_monitor import request, BASE, SUB
 from ibkr_etl.azure_inventory import read_collection
-from ibkr_etl.schedule_monitor import DAILY_V1, DAILY_V2, HEARTBEATS
+from ibkr_etl.schedule_monitor import DAILY_V2, HEARTBEATS
 from run_specialist_gateway_read_verification import retain
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,10 +67,8 @@ def main():
             references.append({'resource': row['name'], 'targets': found})
     rule_by_name = {r['name']: r for r in rules}
     coverage = {}
-    for daily, rule in ((DAILY_V1, 'ibkr-v11-daily-schedule-watchdog'),
-                        (DAILY_V2, 'ibkr-v2-daily-schedule-watchdog')):
-        for name, offset, runtime in daily:
-            coverage[name] = (f'{offset % 60} {offset // 60} * * *', runtime * 60, rule)
+    for name, offset, runtime in DAILY_V2:
+        coverage[name] = (f'{offset % 60} {offset // 60} * * *', runtime * 60, 'ibkr-v2-daily-schedule-watchdog')
     for name in HEARTBEATS:
         coverage[name] = ('*/5 * * * *', None, 'ibkr-v2-background-heartbeat-watchdog')
     coverage['ibkrv2stg-metadata-monitor'] = ('7,37 * * * *', 180, 'ibkr-v2-metadata-monitor-watchdog')

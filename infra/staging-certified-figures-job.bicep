@@ -44,7 +44,8 @@ resource jobIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-3
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  // The Medallion tags (docs/MEDALLION_ARCHITECTURE.md); hop is the catalog's hops for this job.
+  tags: union(tags, { layer: 'apps', component: 'daily-pipeline', hop: 'analytics+quality-gate' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {

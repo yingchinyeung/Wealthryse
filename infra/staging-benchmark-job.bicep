@@ -9,6 +9,9 @@ param imageDigest string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
 param benchmarkAccountIds string = ''
 param benchmarkStartDate string = '2025-01-20'
+@description('on: also compare every subject with each active catalog benchmark outside its contract, for the website picker only')
+@allowed([ 'off', 'on' ])
+param websiteAllBenchmarks string = 'off'
 // S2 raw market-data capture, on since 18 Oct 2026: the default matches the live job.
 // The job's identity (ingestionIdentity in staging.bicep) holds Storage Blob Data
 // Contributor on bronze-market-data. Empty switches capture off and drops these settings.
@@ -46,7 +49,7 @@ resource jobIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-3
 resource job 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'apps', component: 'daily-pipeline', hop: 'ingest+conform+analytics' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -91,6 +94,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'BENCHMARK_ACCOUNT_IDS', value: benchmarkAccountIds }
             { name: 'BENCHMARK_START_DATE', value: benchmarkStartDate }
+            { name: 'WEBSITE_ALL_BENCHMARKS', value: websiteAllBenchmarks }
             { name: 'DEPLOYMENT_ENVIRONMENT', value: 'internal-production' }
             { name: 'ALLOW_UNLICENSED_BENCHMARK', value: 'true' }
             // The app login cannot create tables, so the job must not try migrations

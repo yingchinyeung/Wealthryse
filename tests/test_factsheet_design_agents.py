@@ -199,6 +199,67 @@ class BuilderLoopTests(Files):
         self.assertEqual(result.checker["objections"], ["The date looks too small."])
 
 
+class MeasuredDesignTests(Files):
+    def _measured(self, currency="KRW"):
+        import hashlib
+        spec = copy.deepcopy(builder.build(self.template, self.example, None, design_id="m", title="M",
+                                           currency=currency).spec)
+        spec.update(design_id="measured", title="Measured", currencies=[currency], notes="measured by hand",
+                    template_sha256=hashlib.sha256(Path(self.template).read_bytes()).hexdigest())
+        return spec
+
+    def test_a_template_with_a_measured_design_starts_from_it_with_no_repair_rounds(self):
+        measured = self._measured()
+        agent = FakeAgent(steps=[{"edits": [_edit("delete", "anything")], "notes": ""}])
+        with mock.patch.object(builder, "built_in_designs", return_value=["measured"]), \
+                mock.patch.object(builder, "load_design", return_value=copy.deepcopy(measured)):
+            result = builder.build(self.template, self.example, None, design_id="kiwoom-1", title="Korea iStrategy",
+                                   currency="KRW", agent=agent)
+        self.assertEqual(result.spec["design_id"], "kiwoom-1")
+        self.assertEqual(result.spec["title"], "Korea iStrategy")
+        self.assertEqual(result.spec["notes"], "measured by hand")
+        self.assertEqual(result.questions, [])
+        self.assertIsNone(result.rounds[-1].comparison)
+        self.assertEqual([kind for kind, _ in agent.facts], ["check"])  # never asked to repair it
+        self.assertIsNotNone(result.preview_pdf)
+
+    def test_another_currency_or_template_is_read_as_before(self):
+        measured = self._measured("KRW")
+        with mock.patch.object(builder, "built_in_designs", return_value=["measured"]), \
+                mock.patch.object(builder, "load_design", return_value=copy.deepcopy(measured)):
+            self.assertIsNone(builder.measured_design(self.template, "USD"))
+            self.assertIsNotNone(builder.measured_design(self.template, "KRW"))
+            self.assertIsNone(builder.measured_design(self.example, "KRW"))
+
+    def test_the_korea_design_is_the_account_design_pinned_to_its_template_in_krw(self):
+        from ibkr_etl.factsheet_spec.spec import load_design
+        korea, account = load_design("korea-istrategy"), load_design("account-owner-template")
+        self.assertEqual(korea["currencies"], ["KRW"])
+        self.assertEqual(korea["template_sha256"],
+                         "c286de93ca667ba1acc9d8d29647a8b4f9725a2d2235a45f27928b647542e780")
+        self.assertEqual(korea["pages"], account["pages"])
+
+    def test_the_us_design_is_the_account_design_pinned_to_its_template(self):
+        from ibkr_etl.factsheet_spec.spec import load_design
+        us, account = load_design("us-istrategy"), load_design("account-owner-template")
+        self.assertEqual(us["currencies"], ["USD", "KRW"])
+        self.assertEqual(us["template_sha256"],
+                         "6c6fd9e2eab7bb4d629103506df89a074bd22792a10b652134c77fefb0ed9c7c")
+        self.assertEqual(us["pages"], account["pages"])
+
+    def test_an_empty_overlay_renders(self):
+        from ibkr_etl.factsheet_spec import stress
+        from ibkr_etl.factsheet_spec.engine import render_preview
+        spec = self._measured("USD")
+        for page in spec["pages"]:
+            for layer in page["layers"]:
+                if layer["kind"] == "overlay":
+                    layer["ops"] = []
+        pdf, result = render_preview(spec, stress.snapshot(currency="USD"), template_path=self.template)
+        self.assertIsNone(result.get("error"))
+        self.assertTrue(pdf)
+
+
 class EditorTests(Files):
     def setUp(self):
         super().setUp()

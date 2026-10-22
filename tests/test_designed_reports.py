@@ -46,6 +46,49 @@ class MonthTests(unittest.TestCase):
             self.assertEqual(dr.month_ready(answers, "broker_account", "U1234567", "2025-01-31"), ready, day)
             self.assertIn("asset_class = 'TOTAL'", answers.statements[0][0])
 
+    def test_a_kiwoom_month_waits_for_the_official_close(self):
+        # The month's last row carries after-market prices until the history pass rewrites it.
+        for final, later, ready in (([{"run_type": "kiwoom_rest_history"}], "2025-02-03", True),
+                                    ([], "2025-02-03", False),
+                                    ([{"run_type": "kiwoom_rest_history"}], None, False)):
+            answers = _Answers(position_snapshots=[{"day": "2025-01-30"}], ingestion_runs=final,
+                               nav_snapshots=[{"day": later}])
+            self.assertEqual(dr.month_ready(answers, "broker_account", "K1", "2025-01-31", "kiwoom_rest"), ready)
+            self.assertEqual(answers.statements[1][1], ("K1", "2025-01-30", "kiwoom_rest_history", "kiwoom_rest_us_history"))
+            self.assertIn("r.run_id = n.last_seen_run_id", answers.statements[1][0])
+            if final:
+                self.assertEqual(answers.statements[2][1], ("K1", "2025-01-31"))
+        answers = _Answers(position_snapshots=[{"day": "2025-01-31"}], ingestion_runs=[], nav_snapshots=[{"day": None}])
+        self.assertTrue(dr.month_ready(answers, "broker_account", "U1", "2025-01-31", "ibkr_flex"))
+        self.assertEqual(len(answers.statements), 1)
+        answers = _Answers(position_snapshots=[{"day": "2025-01-20"}], ingestion_runs=[{"run_type": "kiwoom_rest_history"}],
+                           nav_snapshots=[{"day": "2025-02-03"}])
+        self.assertFalse(dr.month_ready(answers, "broker_account", "K1", "2025-01-31", "kiwoom_rest"))
+
+    def test_a_kiwoom_us_month_waits_until_its_last_day_adds_up(self):
+        # Kiwoom's U.S. daily total for its latest sessions is provisional (20 Oct 2026 read 43,235.18 the
+        # next morning; the closes add up to 43,743.75), and the history pass stores it all the same.
+        class Answers:
+            def __init__(self, stock, held, positions=2):
+                self.stock, self.held, self.positions = stock, held, positions
+
+            def execute(self, statement, parameters=()):
+                if "GROUP BY n.snapshot_date" in statement:  # kiwoom_us_account.us_days_stored
+                    return _Rows([{"snapshot_date": "2026-10-30", "stock_text": self.stock,
+                                   "positions": self.positions, "held": self.held}])
+                if "MIN(n.snapshot_date)" in statement:
+                    return _Rows([{"day": "2026-11-02"}])
+                if "r.run_type" in statement:
+                    return _Rows([{"run_type": "kiwoom_rest_us_history"}])
+                return _Rows([{"day": "2026-10-30"}])
+
+        def ready(answers):
+            return dr.month_ready(answers, "broker_account", "KIWOOM-US", "2026-10-31", "kiwoom_rest")
+
+        self.assertFalse(ready(Answers("43235.18", "43743.75")))  # provisional: the closes do not add up
+        self.assertTrue(ready(Answers("43743.75", "43743.75")))
+        self.assertTrue(ready(Answers("43743.75", "43743.76")))  # within a cent a position
+
     def test_a_filtered_portfolio_reads_its_own_positions_and_nav(self):
         answers = _Answers(derived_portfolio_positions=[{"day": "2025-01-30"}])
         self.assertTrue(dr.month_ready(answers, "filtered_portfolio", "hk-only", "2025-01-31"))

@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.gold.performance_comparison_daily
 name: performance_comparison_daily
-version: 1.1.0
+version: 1.2.0
 status: active
 domain: gold
 dataProduct: portfolio-medallion
@@ -12,7 +12,10 @@ description:
     risk analytics read it.'
   usage: 'Read the calculation_version the reader expects: benchmark-comparison-v1, or benchmark-comparison-v2-ms-hkd
     and benchmark-comparison-v2-t-hkd for the two HKD website subjects. Rows of other versions are kept, not overwritten.'
-  limitations: A comparison that fails its quality checks is not stored. Provisional Yahoo benchmark levels.
+  limitations: 'A comparison that fails its quality checks is not stored. Provisional Yahoo benchmark levels. Rows
+    for a benchmark with no portfolio_benchmark_mapping row for the subject are website-only comparison rows
+    (WEBSITE_ALL_BENCHMARKS): best effort, not judged by the publish gate, and read only by the website''s benchmark
+    picker.'
 tags:
 - gold
 - derived

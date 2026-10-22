@@ -473,14 +473,16 @@ class SettingTests(unittest.TestCase):
         self.assertEqual(pages.page_modes({SETTING: "holdings=on,combined-holdings=on"})["combined-holdings"], "on")
 
     def test_every_page_and_figure_is_read_somewhere(self):
+        from ibkr_etl import certified_charts as charts
+
         read = {figure_id for spec in pages.ENDPOINTS.values() for group in spec.groups
                 for figure_id in group.figure_ids}
+        read |= {figure_id for _, shown in charts.ENDPOINTS.values() for figure_id in shown}  # the charts
         register = set(pages.register.figures())
         self.assertLessEqual(read, register)
-        # The rebased levels stay in their gold table and chart; data freshness is worked out
-        # in the browser from the newest NAV date, as today.
-        self.assertEqual(register - read, {"benchmark.rebased_level", "overview.data_freshness"})
-        governed = {group.page for spec in pages.ENDPOINTS.values() for group in spec.groups}
+        # Data freshness is worked out in the browser from the newest NAV date, as today.
+        self.assertEqual(register - read, {"overview.data_freshness"})
+        governed = {group.page for spec in pages.ENDPOINTS.values() for group in spec.groups} | {charts.PAGE}
         self.assertEqual(governed, set(pages.register.page_modes("")))
 
     def test_figures_follow_the_page_that_owns_them(self):

@@ -71,7 +71,7 @@ def role_match(actual,wanted):
 def verify_roles(identity):
     principal=identity['properties']['principalId'];wanted=roles(principal)
     actual=az('role','assignment','list','--assignee-object-id',principal,'--all','--include-inherited','--fill-principal-name','false')
-    if len(actual)!=4 or {x['id'].lower() for x in actual}!={x['path'].lower() for x in wanted}:raise ValueError('Dedicated identity has unexpected grants')
+    if len(actual)!=len(wanted) or {x['id'].lower() for x in actual}!={x['path'].lower() for x in wanted}:raise ValueError('Dedicated identity has unexpected grants')
     for role in wanted:
         if not role_match(request('GET',role['path']+'?api-version=2022-04-01'),role):raise ValueError('Role scope differs')
 
@@ -155,7 +155,7 @@ def main(stage):
             save(OUT,'role-'+str(index)+'-intent',role);ack=request('PUT',path,data=role['body'])
             if not role_match(ack,role):raise ValueError('Role creation differs')
             save(OUT,'role-'+str(index)+'-ack',{'id':ack['id'],'scope':role['scope']})
-        verify_roles(identity);print('Three vault metadata grants and one registry pull grant verified');return
+        verify_roles(identity);print(str(len(monitor.VAULTS))+' vault metadata grants and one registry pull grant verified');return
     verify_roles(identity)
     if stage=='job':
         if request('GET',JOBPATH+API,missing=True) is not None or (OUT/'job-intent.json').exists():raise ValueError('Reconcile existing job')
@@ -179,11 +179,11 @@ def main(stage):
         rows=az('monitor','log-analytics','query','-w','5264a124-10cd-45f6-93a5-6d65c37e9bfb','--analytics-query',query)
         if len(rows)!=1:print('Awaiting monitor log ingestion');return
         result=json.loads(rows[0]['Result'])
-        if run['properties']['status']!='Succeeded' or result.get('kind')!='complete' or result.get('schema')!=monitor.SCHEMA or result.get('version')!=monitor.VERSION or result.get('vault_count')!=3 or {v['vault'] for v in result['vaults']}!=set(monitor.VAULTS) or result.get('errors') or any(result.get(k)!=0 for k in ('secret_values_read','secret_values_changed','expiry_changes','permissions_changed')):
+        if run['properties']['status']!='Succeeded' or result.get('kind')!='complete' or result.get('schema')!=monitor.SCHEMA or result.get('version')!=monitor.VERSION or result.get('vault_count')!=len(monitor.VAULTS) or {v['vault'] for v in result['vaults']}!=set(monitor.VAULTS) or result.get('errors') or any(result.get(k)!=0 for k in ('secret_values_read','secret_values_changed','expiry_changes','permissions_changed')):
             if not (OUT/'execution-failure.json').exists():save(OUT,'execution-failure',{'execution':name,'result':result})
             raise ValueError('Metadata collection failed; do not enable schedule')
         if not (OUT/'runtime-verified.json').exists():save(OUT,'runtime-verified',{'passed':True,'execution':name,'image':IMAGE,'result':result,'payload_sha256':plan['source_sha256'],'other_workloads_unchanged':True})
-        print(json.dumps({'passed':True,'vaults':3,'listed':sum(v['listed'] for v in result['vaults']),'findings':result['finding_count'],'values_read':0}));return
+        print(json.dumps({'passed':True,'vaults':len(monitor.VAULTS),'listed':sum(v['listed'] for v in result['vaults']),'findings':result['finding_count'],'values_read':0}));return
     if stage=='schedule':
         proof=protected(OUT/'runtime-verified.json')
         if proof.get('passed') is not True or proof['payload_sha256']!=plan['source_sha256']:raise ValueError('Accepted metadata-only runtime required')

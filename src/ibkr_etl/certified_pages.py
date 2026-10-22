@@ -2,7 +2,7 @@
 
 docs/MEDALLION_CERTIFIED_FIGURES.md explains the layer. One setting,
 CERTIFIED_FIGURES_PAGES (for example "overview=on,holdings=on,performance=shadow"),
-puts each of the seven pages in one of three modes. A page not listed is off.
+puts each of the register's nine pages in one of three modes. A page not listed is off.
 
 - off: today's behaviour exactly. serve() only calls the page's own builder: no query,
   no log line.
@@ -313,6 +313,32 @@ def _account_records_slots(payload: Mapping) -> list[Slot]:
     return slots
 
 
+ATTRIBUTION_TOTALS = (("attribution.portfolio_return", "portfolio_monthly_return"),
+                      ("attribution.holdings_contribution", "equity_contribution"),
+                      ("attribution.residual_contribution", "residual_contribution"))
+ATTRIBUTION_FIGURES = tuple(figure_id for figure_id, _ in ATTRIBUTION_TOTALS) + (
+    "attribution.holding_contribution", "attribution.sector_contribution")
+
+
+def _attribution_period(payload: Mapping) -> str:
+    return f"month_{payload.get('month')}"
+
+
+def _attribution_slots(payload: Mapping) -> list[Slot]:
+    # The composites' answer has no position coverage: their attribution is not certified.
+    if not payload.get("available") or "position_coverage" not in payload:
+        return []
+    period = _attribution_period(payload)
+    slots = [Slot(_key(figure_id, period), payload, name, "float") for figure_id, name in ATTRIBUTION_TOTALS]
+    for row in payload.get("security_contributions") or []:
+        slots.append(Slot(_key("attribution.holding_contribution", period, row.get("conid")), row,
+                          "contribution", "float"))
+    for row in payload.get("sector_contributions") or []:
+        slots.append(Slot(_key("attribution.sector_contribution", period, row.get("sector")), row,
+                          "contribution", "float"))
+    return slots
+
+
 @dataclass(frozen=True)
 class Group:
     page: str
@@ -330,6 +356,11 @@ class Endpoint:
     # Figures a page shows only some of (top and bottom 5): certified rows it does not
     # show are not counted as extra.
     partial: frozenset[str] = frozenset()
+    # The one period an answer shows (Attribution: one month), read on its own.
+    period: Callable[[Mapping], str] | None = None
+    # True when the answer cannot be rebuilt for an earlier date: figures that are behind are
+    # then never shown (logged as behind, and today's answer kept).
+    exact: bool = False
 
 
 OVERVIEW_SUMMARY = ("overview.as_of", "overview.nav", "overview.positions",
@@ -377,6 +408,12 @@ ENDPOINTS: dict[str, Endpoint] = {
         (Group("combined-holdings", ("holdings.quantity", "holdings.market_value", "holdings.cost_basis",
                                      "holdings.unrealized_pnl")),),
         _account_records_slots, lambda payload: _day(payload.get("snapshot_date"))),
+    # The page works the month out to its calendar end whatever the as-of date, so it shows only
+    # the month's own figures, certified on the month's last date (or the newest date).
+    "attribution": Endpoint(
+        (Group("attribution", ATTRIBUTION_FIGURES),), _attribution_slots,
+        lambda payload: _day(payload.get("period_end")) if payload.get("available") else None,
+        period=_attribution_period, exact=True),
 }
 
 
@@ -426,15 +463,32 @@ WHERE tenant_id = %(tenant)s AND subject_id = %(subject)s
         AND figure_id = ANY(%(figures)s) AND benchmark_id = ANY(%(benchmarks)s)
         AND (%(as_of)s::date IS NULL OR as_of_date <= %(as_of)s::date))
 """
+# The same, for one period only (Attribution keeps each month's figures apart).
+READ_PERIOD_SQL = f"""
+SELECT figure_id, period, item, benchmark_id, as_of_date, value, value_text, unit, status,
+       build_id, published_at
+FROM {VIEW}
+WHERE tenant_id = %(tenant)s AND subject_id = %(subject)s AND period = %(period)s
+  AND figure_id = ANY(%(figures)s) AND benchmark_id = ANY(%(benchmarks)s)
+  AND as_of_date = (
+      SELECT MAX(as_of_date) FROM {VIEW}
+      WHERE tenant_id = %(tenant)s AND subject_id = %(subject)s AND period = %(period)s
+        AND figure_id = ANY(%(figures)s) AND benchmark_id = ANY(%(benchmarks)s)
+        AND (%(as_of)s::date IS NULL OR as_of_date <= %(as_of)s::date))
+"""
 
 
 def read_certified(connection, *, tenant_id: str, subject_id: str, figure_ids: Iterable[str],
-                   as_of: str | None = None, benchmark_id: str = "") -> Certified | None:
-    """The newest published figures on or before ``as_of``; None when there are none."""
-    rows = connection.execute(READ_SQL, {
+                   as_of: str | None = None, benchmark_id: str = "", period: str | None = None) -> Certified | None:
+    """The newest published figures on or before ``as_of`` (of one period, when given); None when
+    there are none."""
+    parameters = {
         "tenant": tenant_id, "subject": subject_id, "figures": list(figure_ids),
         "benchmarks": ["", benchmark_id] if benchmark_id else [""], "as_of": as_of,
-    }).fetchall()
+    }
+    if period is not None:
+        parameters["period"] = period
+    rows = connection.execute(READ_SQL if period is None else READ_PERIOD_SQL, parameters).fetchall()
     if not rows:
         return None
     certified = Certified(as_of=_day(rows[0]["as_of_date"]))
@@ -473,10 +527,11 @@ def _connect(tenant_id: str):
 
 
 def _read_groups(groups: list[Group], *, tenant_id: str, subject_id: str, as_of: str | None,
-                 benchmark_id: str) -> dict[str, Certified | None]:
+                 benchmark_id: str, period: str | None = None) -> dict[str, Certified | None]:
     with _connect(tenant_id) as connection:
         return {group.page: read_certified(connection, tenant_id=tenant_id, subject_id=subject_id,
-                                           figure_ids=group.figure_ids, as_of=as_of, benchmark_id=benchmark_id)
+                                           figure_ids=group.figure_ids, as_of=as_of, benchmark_id=benchmark_id,
+                                           **({"period": period} if period is not None else {}))
                 for group in groups}
 
 
@@ -602,10 +657,11 @@ def _with_certified(endpoint: str, spec: Endpoint, groups: list[tuple[Group, str
         return payload
     latest = spec.effective(payload)
     benchmark_id = spec.benchmark(payload) if spec.benchmark else ""
+    period = {"period": spec.period(payload)} if spec.period else {}
     started = time.perf_counter()
     try:
         reads = _read_groups([group for group, _ in groups], tenant_id=tenant_id, subject_id=subject_id,
-                             as_of=requested_as_of, benchmark_id=benchmark_id)
+                             as_of=requested_as_of, benchmark_id=benchmark_id, **period)
     except Exception as error:  # a slow, missing or failing view: today's figures
         read_ms = round((time.perf_counter() - started) * 1000, 1)
         for group, mode in groups:
@@ -620,7 +676,7 @@ def _with_certified(endpoint: str, spec: Endpoint, groups: list[tuple[Group, str
             _log(endpoint, group.page, mode, "none", compared=0, read_ms=read_ms)
         elif latest and certified.as_of < latest:
             behind = register.freshness(certified.as_of, latest)["business_days_behind"]
-            if mode == "shadow":
+            if mode == "shadow" or spec.exact:
                 _log(endpoint, group.page, mode, "behind", business_days_behind=behind, read_ms=read_ms)
             else:
                 used.append((group, certified))

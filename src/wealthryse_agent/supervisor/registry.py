@@ -26,7 +26,7 @@ DEPLOYMENTS = ("analyst", "reports", "none")
 #   staging  onboarding cases, loaded per case before an account goes live
 #   monitor  import runs, the administrator's runs and incidents, broker login checks
 #   code     no database: the Metrics guide and the calculator
-#   external public market news the market news watch confirmed (migrations/agent/019); no client data
+#   external public market news the market news watch confirmed (migrations/agent/021); no client data
 LAYERS = ("gold", "silver", "bronze", "staging", "monitor", "code", "external")
 TOOL_LAYERS = {
     "list_accounts": "silver",

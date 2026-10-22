@@ -178,7 +178,7 @@ resource exactRevisionRecoveryAssignment 'Microsoft.Authorization/roleAssignment
 resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
   name: jobName
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ops', component: 'monitoring', hop: 'ops' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -256,7 +256,7 @@ resource supervisor 'Microsoft.App/jobs@2024-03-01' = {
 resource monthlyAuthorityReview 'Microsoft.App/jobs@2024-03-01' = {
   name: reviewJobName
   location: resourceGroup().location
-  tags: union(tags, { purpose: 'monthly-authority-review' })
+  tags: union(union(tags, { purpose: 'monthly-authority-review' }), { layer: 'ops', component: 'monitoring', hop: 'ops' })
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -314,7 +314,7 @@ resource monthlyAuthorityReview 'Microsoft.App/jobs@2024-03-01' = {
 resource supervisorFailureAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   name: '${jobName}-failed-execution'
   location: 'global'
-  tags: tags
+  tags: union(tags, { layer: 'ops', component: 'alerts' })
   properties: {
     description: 'Controlled-autonomy alert: the five-minute administrator supervisor failed.'
     severity: 1
@@ -351,7 +351,7 @@ resource supervisorFailureAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
 resource monthlyReviewFailureAlert 'Microsoft.Insights/metricAlerts@2018-03-01' = {
   name: '${reviewJobName}-failed-execution'
   location: 'global'
-  tags: union(tags, { purpose: 'monthly-authority-review' })
+  tags: union(union(tags, { purpose: 'monthly-authority-review' }), { layer: 'ops', component: 'alerts' })
   properties: {
     description: 'Controlled-autonomy alert: the monthly owner-authority review job failed.'
     severity: 1

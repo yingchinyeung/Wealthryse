@@ -242,3 +242,82 @@ class ReportingSnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Cursor:
+    def __init__(self, rows): self.rows = rows
+    def fetchone(self): return self.rows[0] if self.rows else None
+    def fetchall(self): return self.rows
+
+
+class _NewOnboardingConnection:
+    """A Kiwoom account from new onboarding: no benchmark mapping."""
+
+    def __init__(self, *, onboarded=True, mappings=()):
+        self.onboarded, self.mappings = onboarded, list(mappings)
+
+    def execute(self, sql, params=()):
+        if "to_regclass('public.broker_onboarding_cases')" in sql:
+            return _Cursor([("broker_onboarding_cases",)])
+        if "FROM portfolio_benchmark_mapping" in sql:
+            return _Cursor(self.mappings)
+        if "FROM broker_onboarding_cases" in sql:
+            return _Cursor([(1,)] if self.onboarded else [])
+        raise AssertionError(sql)
+
+
+class NoBenchmarkCollectionTests(unittest.TestCase):
+    def _collect(self, connection):
+        from unittest import mock
+        from ibkr_etl import reporting_snapshot as rs
+        calls = []
+
+        def tool(connection, context, name, arguments):
+            calls.append((name, arguments.get("benchmark_id")))
+            if name == "get_risk_metrics" and not connection.mappings:
+                return _result({"metrics": {"observations": 0}, "benchmark_id": None, "crisis_replay": None},
+                               quality="fail")
+            return _result({"name": name}, as_of="2026-08-31")
+
+        with mock.patch.object(rs, "execute_tool", tool), \
+                mock.patch.object(rs, "build_monthly_reporting_analytics", lambda *a, **k: {"available": True}), \
+                mock.patch("ibkr_etl.reporting_currency_holdings.normalize_collected_report_holdings",
+                           lambda connection, subject, currency, results: results):
+            results = rs._collect_tool_results(connection, tenant_id="t", subject_id="KIWOOM-5057355911",
+                                               period_end="2026-08-31", reporting_currency="KRW")
+        return results, calls
+
+    def test_a_new_onboarding_account_without_benchmarks_is_collected_with_no_comparison(self):
+        results, calls = self._collect(_NewOnboardingConnection())
+        self.assertNotIn("compare_with_benchmarks", [name for name, _ in calls])
+        for name in ("primary_benchmark", "secondary_benchmark"):
+            self.assertFalse(results[name]["data"]["available"])
+            self.assertFalse(results[name]["data"]["publication_allowed"])
+            self.assertEqual(results[name]["data"]["series"], [])
+        self.assertEqual(results["risk"]["quality_status"], "warn")
+        self.assertIn("benchmark", results["risk"]["data"]["reason"])
+
+    def test_any_other_account_without_benchmarks_is_still_refused(self):
+        with self.assertRaisesRegex(ReportingSnapshotError, "benchmark must be configured"):
+            self._collect(_NewOnboardingConnection(onboarded=False))
+
+    def test_configured_benchmarks_are_still_compared(self):
+        mappings = [{"benchmark_id": "KS11", "mapping_type": "primary"},
+                    {"benchmark_id": "KS200", "mapping_type": "secondary"}]
+        results, calls = self._collect(_NewOnboardingConnection(mappings=mappings))
+        self.assertEqual([b for name, b in calls if name == "compare_with_benchmarks"], ["KS11", "KS200"])
+
+    def test_a_new_onboarding_account_with_one_primary_benchmark_is_compared_with_it(self):
+        mappings = [{"benchmark_id": "GSPC", "mapping_type": "primary"}]
+        results, calls = self._collect(_NewOnboardingConnection(mappings=mappings))
+        self.assertEqual([b for name, b in calls if name == "compare_with_benchmarks"], ["GSPC"])
+        self.assertEqual(results["primary_benchmark"]["data"], {"name": "compare_with_benchmarks"})
+        secondary = results["secondary_benchmark"]["data"]
+        self.assertFalse(secondary["available"])
+        self.assertFalse(secondary["publication_allowed"])
+        self.assertIn("secondary", secondary["reason"])
+
+    def test_any_other_account_with_one_benchmark_is_still_refused(self):
+        mappings = [{"benchmark_id": "GSPC", "mapping_type": "primary"}]
+        with self.assertRaisesRegex(ReportingSnapshotError, "benchmark must be configured"):
+            self._collect(_NewOnboardingConnection(onboarded=False, mappings=mappings))

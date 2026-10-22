@@ -24,7 +24,7 @@ from ibkr_etl.reporting_currency_holdings import normalize_collected_report_hold
 from ibkr_etl.sector_classification import YAHOO_PROVIDER, aggregate_sector_allocation
 from ibkr_etl.subject_read_contract import ACTIVE_NAV_CURRENCY_SQL, synthetic_exposure
 
-from . import certified_tools
+from . import certified_fallback, certified_tools
 
 
 class ToolError(Exception):
@@ -357,7 +357,7 @@ def get_performance(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
             "twr", "twr_annualized", "irr_annualized", "net_flows", "issues")
     periods = [{k: p.get(k) for k in keep} for p in result["periods"]]
     custom = {k: result["custom"].get(k) for k in keep} if result.get("custom") else None
-    return {
+    answer = {
         "as_of": result["effective_as_of"],
         "data": {"currency": _reporting_currency(subject), "inception_date": result["inception_date"],
                  "latest_nav": _float(nav[-1][1]) if nav else None, "periods": periods, "custom_period": custom,
@@ -366,6 +366,8 @@ def get_performance(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
         "citations": [_citation("subject_nav_series", account_id, through=as_of)]
                      + ([_citation("external_flows", account_id, through=as_of)] if flows is not None else []),
     }
+    return certified_fallback.apply(connection, "get_performance", account_id, answer,
+                                    lambda: certified_fallback.performance_slots(answer))
 
 
 def _benchmark_level(connection, benchmark_id: str, day: str) -> tuple[str, float] | None:
@@ -433,7 +435,7 @@ def compare_to_benchmark(connection, arguments: Mapping[str, Any]) -> dict[str, 
                      "excess_return": (p["twr"] - bench) if bench is not None else None,
                      "benchmark_dates": [first[0], last[0]] if first and last else None,
                      "note": None if bench is not None else "No benchmark level within a week of the period dates."})
-    return {
+    answer = {
         "as_of": as_of,
         "data": {"currency": currency, "benchmark": {"id": mapping["benchmark_id"], "name": mapping["name"],
                  "symbol": mapping["symbol"], "role": mapping["mapping_type"]}, "periods": rows,
@@ -441,6 +443,9 @@ def compare_to_benchmark(connection, arguments: Mapping[str, Any]) -> dict[str, 
         "citations": [_citation("subject_nav_series", account_id, through=as_of),
                       _citation("benchmark_prices", None, benchmark_id=mapping["benchmark_id"], through=as_of)],
     }
+    return certified_fallback.apply(connection, "compare_to_benchmark", account_id, answer,
+                                    lambda: certified_fallback.benchmark_period_slots(answer, periods),
+                                    certified_fallback.refresh_excess)
 
 
 def get_sector_allocation(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -450,7 +455,7 @@ def get_sector_allocation(connection, arguments: Mapping[str, Any]) -> dict[str,
     snapshot, _, sector, composite = _valued_holdings(connection, subject, as_of)
     if snapshot is None:
         raise ToolError("no_holdings", "No holdings are recorded on or before that date.", 404)
-    return {
+    answer = {
         "as_of": snapshot,
         "data": {"currency": _reporting_currency(subject), "holdings_date": snapshot,
                  "allocation": sector.get("allocation", []),
@@ -462,6 +467,8 @@ def get_sector_allocation(connection, arguments: Mapping[str, Any]) -> dict[str,
         "citations": [_citation("subject_position_series", account_id, date=snapshot),
                       _citation("instrument_classifications", None, provider=YAHOO_PROVIDER)],
     }
+    return certified_fallback.apply(connection, "get_sector_allocation", account_id, answer,
+                                    lambda: certified_fallback.sector_slots(answer, as_of, composite))
 
 
 def get_cash_flows(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
@@ -657,7 +664,7 @@ def get_nav_history(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
             "benchmark_cumulative_return": (level / base_level - 1.0) if level else None,
         })
         previous = d
-    return {
+    answer = {
         "as_of": end,
         "data": {"currency": _reporting_currency(subject), "from_date": dates[0], "to_date": end, "frequency": frequency,
                  "benchmark": {"id": mapping["benchmark_id"], "name": mapping["name"]} if mapping else None,
@@ -667,6 +674,8 @@ def get_nav_history(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
         "citations": [_citation("subject_nav_series", account_id, from_date=dates[0], to_date=end)]
                      + ([_citation("benchmark_prices", None, benchmark_id=mapping["benchmark_id"], through=end)] if mapping else []),
     }
+    return certified_fallback.apply(connection, "get_nav_history", account_id, answer,
+                                    lambda: certified_fallback.nav_history_slots(answer, dates[0] == next(iter(nav))))
 
 
 def _stats(values: list[float]) -> tuple[float, float]:
@@ -739,7 +748,10 @@ def get_risk_metrics(connection, arguments: Mapping[str, Any]) -> dict[str, Any]
             bench["note"] = "Too few matching benchmark prices for beta, correlation or tracking error."
         data["benchmark"] = bench
         citations.append(_citation("benchmark_prices", None, benchmark_id=mapping["benchmark_id"], through=dates[-1]))
-    return {"as_of": dates[-1], "data": data, "citations": citations}
+    answer = {"as_of": dates[-1], "data": data, "citations": citations}
+    return certified_fallback.apply(connection, "get_risk_metrics", account_id, answer,
+                                    lambda: certified_fallback.risk_slots(answer, dates[0] == next(iter(nav))),
+                                    certified_fallback.refresh_risk)
 
 
 # Month-end package (the scheduled month-end team only) -------------------------
@@ -822,7 +834,10 @@ def list_month_end_packages(connection, arguments: Mapping[str, Any]) -> dict[st
 
 
 def list_onboarding_report_cases(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
-    """Composite cases in stage 3 whose historical reports are rendered, with the files to review."""
+    """Stage 3 cases whose historical reports are rendered, with the files to review.
+
+    A composite in the Alpha World MS or T design (report_style set), or any case in its owner's own design
+    (report_style null, such as a Kiwoom account); agent.onboarding_report_cases decides which (019)."""
     rows = connection.execute(
         "SELECT case_id::text AS case_id, subject_id, display_name, description, report_style, reporting_currency, "
         "history_start_date, reports_evidence_json, reports_checked_at FROM onboarding_report_cases ORDER BY case_id"
@@ -968,9 +983,11 @@ def list_live_onboarding_cases(connection, arguments: Mapping[str, Any]) -> dict
 _MARKETS = {
     "hong kong": {"SEHK", "HKFE"},
     "china": {"SEHKNTL", "SEHKSZSE", "SSE", "SZSE"},
-    "united states": {"NYSE", "NASDAQ", "ARCA", "AMEX", "BATS", "IEX", "PINK", "NMS", "ISLAND", "CBOE"},
+    # "US" is what a Kiwoom U.S. holding is stored with when Kiwoom names no exchange.
+    "united states": {"NYSE", "NASDAQ", "ARCA", "AMEX", "BATS", "IEX", "PINK", "NMS", "ISLAND", "CBOE", "US"},
     "japan": {"TSE", "TSEJ", "OSE.JPN"},
-    "korea": {"KSE", "KOSDAQ"},
+    # IBKR lists Korean stocks on KSE or KOSDAQ; the Kiwoom collector stores every Korean holding as KRX.
+    "korea": {"KSE", "KOSDAQ", "KRX"},
     "singapore": {"SGX"},
     "taiwan": {"TWSE", "TPEX"},
     "united kingdom": {"LSE", "LSEETF"},
@@ -1656,7 +1673,7 @@ TOOLS: tuple[ToolSpec, ...] = (
              get_month_end_snapshot, only_jobs=MONTH_TEAM),
     ToolSpec("list_month_end_packages", "Every month with a built month-end package, and each file's status.",
              _schema({"account_id": _ACCOUNT}, ["account_id"]), list_month_end_packages, only_jobs=MONTH_TEAM),
-    ToolSpec("list_onboarding_report_cases", "Composite onboarding cases whose historical reports are rendered and "
+    ToolSpec("list_onboarding_report_cases", "Onboarding cases whose historical reports are rendered and "
              "waiting for the agent review, with each report's month, file, hash and private storage path.",
              _schema({}, []), list_onboarding_report_cases, False, only_jobs=ONBOARDING),
     ToolSpec("list_onboarding_intake_cases", "Onboarding cases waiting for approval 1 (the account terms), with "

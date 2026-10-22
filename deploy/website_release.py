@@ -11,7 +11,7 @@ Steps, each a subcommand so the workflow can show and stop at each one:
                    the assurance job itself is not changed
 State passes between steps in release-state.json.
 """
-import ast, base64, difflib, gzip, hashlib, json, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
+import ast, base64, difflib, gzip, hashlib, itertools, json, secrets, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -495,8 +495,45 @@ def acr_build():
     print('Built', state['pushed_image'])
 
 
+# Run Commands on the build VM, one at a time and each under a name of its own. Twice on
+# 22 Oct (Deploy website runs 56 and 57) the second read of build detail re-created
+# website-detail-0 a minute after the first one was deleted, while the capture before it
+# was still being removed; it never finished and the VM stayed in Updating until it was
+# restarted from the serial console. So no name is reused within a release, and each Run
+# Command is removed, and the removal waited for, before the next one starts.
+RUN_TAG = secrets.token_hex(3)
+_run_serial = itertools.count(1)
+REMOVE_WAIT = 900
+# A Run Command whose removal never finished. Nothing more is run on the VM after one.
+_not_removed = []
+
+
+def run_command_name(name):
+    return f'{name}-{RUN_TAG}-{next(_run_serial)}'
+
+
+def remove_run_command(url):
+    """Delete a Run Command and wait until Azure no longer has it; False if it is still there."""
+    for _ in range(2):
+        deleted = subprocess.run(['az', 'rest', '--method', 'delete', '--url', url], capture_output=True, text=True)
+        if deleted.returncode == 0 or 'NotFound' in deleted.stderr:
+            break
+        time.sleep(10)
+    deadline = time.time() + REMOVE_WAIT
+    while time.time() < deadline:
+        got = subprocess.run(['az', 'rest', '--method', 'get', '--url', url], capture_output=True, text=True)
+        if got.returncode != 0 and ('NotFound' in got.stderr or 'Not Found' in got.stderr):
+            return True
+        time.sleep(10)
+    return False
+
+
 def vm_run(base, name, script, location, timeout):
     """Run a script on the build VM through Run Command and return its instance view."""
+    if _not_removed:
+        raise SystemExit(f'Not running {name} on the build VM: Run Command {_not_removed[0]} was never removed, '
+                         'so the VM may be stuck. Check it before the next release.')
+    name = run_command_name(name)
     url = base + name + '?api-version=2024-07-01'
     body = Path('run-command.json')
     body.write_text(json.dumps({'location': location, 'properties': {
@@ -512,7 +549,13 @@ def vm_run(base, name, script, location, timeout):
                 raise SystemExit('Run Command did not finish in time')
             time.sleep(10)
     finally:
-        subprocess.run(['az', 'rest', '--method', 'delete', '--url', url], capture_output=True)
+        if not remove_run_command(url):
+            _not_removed.append(name)
+            message = (f'Run Command {name} was not removed within {REMOVE_WAIT // 60} minutes, so the build VM may be '
+                       'stuck; nothing more is run on it in this release')
+            if sys.exc_info()[0] is None:
+                raise SystemExit(message)
+            print(message)
 
 
 def read_detail(base, location, path, size):
@@ -527,7 +570,8 @@ def read_detail(base, location, path, size):
             view = vm_run(base, f'website-detail-{offset // 4000}', f"tail -c +{offset + 1} {path} | head -c 4000", location, 900)
             encoded += (view.get('output') or '').strip()
     finally:
-        vm_run(base, 'website-detail-cleanup', 'rm -f ' + path, location, 900)
+        if not _not_removed:
+            vm_run(base, 'website-detail-cleanup', 'rm -f ' + path, location, 900)
     if len(encoded) != size:
         raise SystemExit(f'Read {len(encoded)} of {size} bytes of build detail')
     return encoded

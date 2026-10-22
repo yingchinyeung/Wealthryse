@@ -137,6 +137,17 @@ class CertifiedBuildTests(unittest.TestCase):
         self.assertEqual(build.freshness_row(build.Pages(None, subject, "2026-10-15"), date(2026, 10, 19)), [])
 
 
+    def test_the_comparison_fingerprint_holds_every_column_the_page_reads(self):
+        # The Vs benchmark metrics come from the returns and the rebased series as well as the levels,
+        # so a fingerprint of the levels alone let a restated return look like a changed answer.
+        source = (ROOT / "src" / "ibkr_etl" / "web.py").read_text(encoding="utf-8")
+        handler = source[source.index("def _benchmark_comparison("):]
+        handler = handler[:handler.index("\ndef ")]
+        found = re.search(r"SELECT (observation_date.*?)\s+FROM performance_comparison_daily", handler, re.S)
+        self.assertIsNotNone(found)
+        read = tuple(name.strip() for name in found.group(1).split(","))
+        self.assertEqual(read, build.COMPARISON_COLUMNS)
+
 class GateTests(unittest.TestCase):
     """The publish gate's verdict for the build: asked per source job, stored, binding only when set."""
 

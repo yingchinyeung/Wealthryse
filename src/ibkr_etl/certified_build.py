@@ -74,6 +74,10 @@ BOUNDS = {"indicator.rsi_14": (0.0, 100.0), "series.rolling_volatility_63d": (0.
 COMPARED = ("value", "value_text", "unit", "currency", "status", "reason", "detail", "period_start", "period_end",
             "observations")
 KEY = ("subject_id", "figure_id", "period", "item", "benchmark_id", "as_of_date")
+# The columns of performance_comparison_daily the Vs benchmark page reads (web._benchmark_comparison).
+COMPARISON_COLUMNS = ("observation_date", "portfolio_value", "benchmark_level", "normalized_portfolio",
+                      "normalized_benchmark", "portfolio_return", "benchmark_return", "excess_return",
+                      "quality_status")
 
 
 @dataclass
@@ -687,16 +691,17 @@ def performance_rows(pages: Pages) -> list[Row]:
     benchmark = comparison["benchmark"]
     benchmark_id = str(benchmark["benchmark_id"])
     version = str(comparison.get("calculation_version"))
+    # The fingerprint is every column of every row the page reads: the metrics come from the daily
+    # returns and the rebased series, not only the levels, so a restated return is a new input.
     with pages.web._database() as connection:
-        levels = connection.execute(
-            "SELECT observation_date, portfolio_value, benchmark_level FROM performance_comparison_daily "
+        records = connection.execute(
+            "SELECT " + ", ".join(COMPARISON_COLUMNS) + " FROM performance_comparison_daily "
             "WHERE tenant_id = %s AND subject_id = %s AND benchmark_id = %s AND calculation_version = %s "
             "AND reporting_currency = %s AND quality_status IN ('pass', 'warn') AND observation_date <= %s "
             "ORDER BY observation_date",
             (pages.web.TENANT_ID, subject.id, benchmark_id, version, comparison.get("reporting_currency"), as_of),
         ).fetchall()
-    inputs = sha256([[str(r["observation_date"]), str(r["portfolio_value"]), str(r["benchmark_level"])]
-                     for r in levels])
+    inputs = sha256([[str(record[name]) for name in COMPARISON_COLUMNS] for record in records])
     key = {"subject_id": subject.id, "benchmark_id": benchmark_id, "observation_date": str(series[-1]["date"]),
            "calculation_version": version}
     common = {"inputs": inputs, "source_table": "gold.performance_comparison_daily", "source_key": key,

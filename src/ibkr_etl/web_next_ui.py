@@ -10,7 +10,7 @@ pages call and never computes a new figure.
 """
 
 NEXT_CSS = r"""
-:root { --nx-rail: 248px; --nx-top: 60px; --nx-bar-bg: #000; --nx-bar-ink: #fff; --nx-bar-muted: rgba(255, 255, 255, .62); --nx-bar-line: rgba(255, 255, 255, .12); --nx-cert: #0f7060; }
+:root { --nx-rail: 64px; --nx-rail-open: 248px; --nx-rail-mini: 64px; --nx-top: 60px; --nx-bar-bg: #000; --nx-bar-ink: #fff; --nx-bar-muted: rgba(255, 255, 255, .62); --nx-bar-line: rgba(255, 255, 255, .12); --nx-cert: #0f7060; }
 @media screen { :root { --nx-cert: #6fd3ae; } }
 @view-transition { navigation: auto; }
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: .16s; }
@@ -42,6 +42,33 @@ html[data-design="next"] .breadcrumbs, html[data-design="next"] .account-sticky 
 .nx-sub a { padding: 6px 20px 6px 49px; color: rgba(255, 255, 255, .55); font-size: 11px; font-weight: 600; letter-spacing: .12em; text-decoration: none; text-transform: uppercase; }
 .nx-sub a:hover, .nx-sub a:focus-visible { color: #fff; outline: none; }
 .nx-sub a[aria-current="page"] { color: #fff; box-shadow: inset 2px 0 0 #fff; }
+/* Mini rail: icons only, opens over the page on hover or focus, or stays open when pinned. */
+html.nx-pinned { --nx-rail: var(--nx-rail-open); }
+.nx-rail { width: var(--nx-rail); overflow-x: hidden; transition: width .16s ease, box-shadow .16s ease; }
+.nx-rail.is-peek { width: var(--nx-rail-open); box-shadow: 18px 0 40px rgba(0, 0, 0, .45); }
+.nx-link span, .nx-brand span, .nx-group, .nx-sub a, .nx-rail-foot { white-space: nowrap; }
+.nx-rail-pin { display: flex; align-items: center; gap: 12px; min-height: 38px; margin-top: auto; padding: 7px 20px; color: var(--nx-bar-muted); background: transparent; border: 0; border-top: 1px solid var(--nx-bar-line); cursor: pointer; font: inherit; font-size: 11px; font-weight: 600; letter-spacing: .14em; text-align: left; text-transform: uppercase; }
+.nx-rail-pin:hover, .nx-rail-pin:focus-visible { color: #fff; outline: none; background: rgba(255, 255, 255, .05); }
+.nx-rail-pin svg { flex: none; width: 17px; height: 17px; stroke: currentColor; fill: none; stroke-width: 1.6; transition: transform .16s ease; }
+html.nx-pinned .nx-rail-pin svg { transform: scaleX(-1); }
+.nx-rail-pin kbd { margin-left: auto; padding: 0 5px; color: var(--nx-bar-muted); border: 1px solid var(--nx-bar-line); font: inherit; font-size: 10px; }
+.nx-rail-pin + .nx-rail-foot { margin-top: 0; }
+html:not(.nx-pinned) .nx-rail:not(.is-peek) :is(.nx-brand span, .nx-link span, .nx-sub, .nx-rail-foot, .nx-switch, .nx-rail-pin span, .nx-rail-pin kbd, .nx-link .nx-count) { display: none; }
+html:not(.nx-pinned) .nx-rail:not(.is-peek) .nx-brand { justify-content: center; padding: 0; }
+html:not(.nx-pinned) .nx-rail:not(.is-peek) :is(.nx-link, .nx-rail-pin) { justify-content: center; padding-left: 0; padding-right: 0; }
+html:not(.nx-pinned) .nx-rail:not(.is-peek) .nx-group { height: 1px; margin: 10px 16px; padding: 0; overflow: hidden; font-size: 0; background: var(--nx-bar-line); }
+html:not(.nx-pinned) .nx-rail:not(.is-peek) .nx-link[data-agent-inbox]:has(.nx-count)::after { position: absolute; top: 8px; left: 50%; width: 6px; height: 6px; margin-left: 6px; content: ""; background: #fff; border-radius: 50%; }
+html:not(.nx-pinned) .nx-top .nx-switch { display: flex; align-items: center; gap: 8px; flex: 0 1 240px; min-width: 0; margin: 0; padding: 6px 10px; }
+html:not(.nx-pinned) .nx-top .nx-switch small { display: none; }
+html:not(.nx-pinned) .nx-top .nx-switch b { width: 100%; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+/* The open section's pages, as tabs above the content (the open rail lists them too). */
+.nx-subtabs { display: flex; gap: 22px; margin: 0 0 4px; overflow-x: auto; border-bottom: 1px solid var(--line); font-family: var(--font-mission); scrollbar-width: none; }
+.nx-subtabs a { flex: none; padding: 10px 0 9px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .14em; text-decoration: none; text-transform: uppercase; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.nx-subtabs a:hover, .nx-subtabs a:focus-visible { color: var(--ink); outline: none; }
+.nx-subtabs a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--ink); }
+@media (min-width: 1024px) { html.nx-pinned .nx-subtabs { display: none; } }
+@media (max-width: 1023px) { .nx-subtabs { display: none; } }
+@media (prefers-reduced-motion: reduce) { .nx-rail, .nx-rail-pin svg { transition: none; } }
 .nx-rail-foot { margin-top: auto; padding: 14px 20px 0; border-top: 1px solid var(--nx-bar-line); color: var(--nx-bar-muted); font-size: 11px; letter-spacing: .06em; overflow-wrap: anywhere; }
 .nx-top { position: fixed; top: 0; right: 0; left: var(--nx-rail); z-index: 50; height: var(--nx-top); display: flex; align-items: center; gap: 14px; padding: 0 28px; color: var(--nx-bar-ink); background: rgba(0, 0, 0, .96); border-bottom: 1px solid var(--nx-bar-line); font-family: var(--font-mission); view-transition-name: nx-top; }
 .nx-top .nx-brand, .nx-top .nx-switch { display: none; padding: 0; }
@@ -227,7 +254,7 @@ const ICON={
  'combined-holdings':'<path d="M12 4l9 5-9 5-9-5z"/><path d="M3 14l9 5 9-5"/>','agent-inbox':'<path d="M4 13l3-8h10l3 8v6H4z"/><path d="M4 13h5l1 2h4l1-2h5"/>','metrics-guide':'<path d="M5 4h11a3 3 0 013 3v13H8a3 3 0 01-3-3z"/><path d="M5 17a3 3 0 013-3h11"/>',
  'system-health':'<path d="M3 12h4l2-5 4 10 2-5h6"/>',connections:'<path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 01-10 0zM12 16v5"/>','account-onboarding':'<circle cx="10" cy="8" r="4"/><path d="M3 20c0-4 3-6 7-6M17 13v6M14 16h6"/>',
  'month-end':'<rect x="4" y="5" width="16" height="15"/><path d="M4 10h16M9 3v4M15 3v4"/>',administration:'<circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/>',
- search:'<circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/>',more:'<path d="M4 7h16M4 12h16M4 17h16"/>',back:'<path d="M15 5l-7 7 7 7"/>'};
+ search:'<circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/>',more:'<path d="M4 7h16M4 12h16M4 17h16"/>',back:'<path d="M15 5l-7 7 7 7"/>',pin:'<path d="M6 7l5 5-5 5M12 7l5 5-5 5"/>'};
 const icon=k=>`<svg viewBox="0 0 24 24" aria-hidden="true">${ICON[k]||ICON.overview}</svg>`;
 const keyOf=href=>{const p=String(href||'').split(/[?#]/)[0];if(p==='/')return 'home';if(/connections$/.test(p))return 'connections';return p.split('/').filter(Boolean).pop()||'home'};
 
@@ -279,7 +306,20 @@ const railNav=()=>{
 };
 const switchButton=()=>account?`<button class="nx-switch" type="button" data-nx-switch aria-haspopup="dialog"><small>Account</small><b>${esc(account.name)}</b></button>`:'';
 const rail=d.createElement('aside');rail.className='nx-rail';rail.setAttribute('aria-label','Site');
-rail.innerHTML=`<a class="nx-brand" href="/" aria-label="WealthRyse accounts home">${logo?`<img src="${logo.getAttribute('src')}" alt="">`:''}<span>WealthRyse</span></a>${switchButton()}${railNav()}<div class="nx-rail-foot">${esc(who.email)}${who.role?' · '+esc(who.role):''}</div>`;
+rail.innerHTML=`<a class="nx-brand" href="/" aria-label="WealthRyse accounts home">${logo?`<img src="${logo.getAttribute('src')}" alt="">`:''}<span>WealthRyse</span></a>${switchButton()}${railNav()}<button class="nx-rail-pin" type="button" data-nx-pin aria-pressed="false">${icon('pin')}<span>Keep menu open</span><kbd>[</kbd></button><div class="nx-rail-foot">${esc(who.email)}${who.role?' · '+esc(who.role):''}</div>`;
+// The rail stays a slim strip of icons unless pinned. Pointing at it or tabbing into it opens it over the page.
+const railPin=$('[data-nx-pin]',rail);
+const setPinned=on=>{d.documentElement.classList.toggle('nx-pinned',on);rail.classList.remove('is-peek');railPin.setAttribute('aria-pressed',String(on));
+  railPin.title=on?'Collapse the menu ([)':'Keep the menu open ([)';$('span',railPin).textContent=on?'Collapse menu':'Keep menu open';store.set('wr-next-rail',on?'pinned':'mini')};
+setPinned(store.get('wr-next-rail','mini')==='pinned');
+railPin.addEventListener('click',()=>setPinned(!d.documentElement.classList.contains('nx-pinned')));
+let peekTimer;
+const peek=on=>{clearTimeout(peekTimer);if(d.documentElement.classList.contains('nx-pinned'))return;peekTimer=setTimeout(()=>rail.classList.toggle('is-peek',on),on?140:220)};
+rail.addEventListener('mouseenter',()=>peek(true));rail.addEventListener('mouseleave',()=>peek(false));
+rail.addEventListener('focusin',()=>{clearTimeout(peekTimer);if(!d.documentElement.classList.contains('nx-pinned'))rail.classList.add('is-peek')});
+rail.addEventListener('focusout',e=>{if(!rail.contains(e.relatedTarget))rail.classList.remove('is-peek')});
+rail.addEventListener('keydown',e=>{if(e.key==='Escape'&&rail.classList.contains('is-peek')){rail.classList.remove('is-peek');d.activeElement.blur()}});
+$$('.nx-link',rail).forEach(a=>{if(!a.title)a.title=a.textContent.trim()});
 
 // The top bar.
 const top=d.createElement('div');top.className='nx-top';
@@ -323,6 +363,10 @@ const updateStatus=()=>{if(!freshness||!freshness.textContent.trim())return;
   status.textContent='As of '+text+cert;status.className='nx-status '+(freshness.classList.contains('stale')?'stale':freshness.classList.contains('late')?'late':'');status.hidden=false};
 if(freshness){new MutationObserver(updateStatus).observe(freshness,{attributes:true,childList:true,subtree:true});const grid=$('#portfolio-grid');if(grid)new MutationObserver(()=>{clearTimeout(updateStatus.t);updateStatus.t=setTimeout(updateStatus,150)}).observe(grid,{childList:true,subtree:true});updateStatus();freshness.hidden=true;new MutationObserver(()=>{if(!freshness.hidden)freshness.hidden=true}).observe(freshness,{attributes:true,attributeFilter:['hidden']})}
 status.addEventListener('click',()=>{const s=$('#asof-select');if(s){s.scrollIntoView({block:'center'});s.focus()}});
+
+// The open section's pages as tabs above the content.
+if(account){const open=sections.find(s=>s.active);const sticky=$('.account-sticky');
+  if(open&&open.parts.length>1&&sticky)sticky.insertAdjacentHTML('afterbegin',`<nav class="nx-subtabs" aria-label="${esc(open.label)} pages">${open.parts.map(p=>`<a href="${esc(p.href)}"${p.current?' aria-current="page"':''}>${esc(p.label)}</a>`).join('')}</nav>`)}
 
 // Account header: the name leads, then the IBKR number, currency and start date.
 if(account){const h1=$('.account-hero h1'),sub=$('.account-hero-copy > .muted');if(h1)h1.textContent=account.name;
@@ -417,7 +461,8 @@ const openPalette=()=>{if($('.nx-palette'))return;closePop();closeMenu();
   dlg.addEventListener('click',e=>{if(e.target===dlg)dlg.close()});dlg.addEventListener('close',()=>dlg.remove());render()};
 $$('[data-nx-search]').forEach(b=>b.addEventListener('click',openPalette));
 d.addEventListener('keydown',e=>{const typing=e.target.closest&&e.target.closest('input,textarea,select,[contenteditable="true"]');
-  if((e.key==='k'||e.key==='K')&&(e.metaKey||e.ctrlKey)){e.preventDefault();openPalette()}else if(e.key==='/'&&!typing&&!e.metaKey&&!e.ctrlKey){e.preventDefault();openPalette()}});
+  if((e.key==='k'||e.key==='K')&&(e.metaKey||e.ctrlKey)){e.preventDefault();openPalette()}else if(e.key==='/'&&!typing&&!e.metaKey&&!e.ctrlKey){e.preventDefault();openPalette()}
+  else if(e.key==='['&&!typing&&!e.metaKey&&!e.ctrlKey&&!e.altKey&&railPin.offsetParent){e.preventDefault();setPinned(!d.documentElement.classList.contains('nx-pinned'))}});
 
 // Home briefing.
 const accountsGrid=$('main > .accounts');

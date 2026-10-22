@@ -510,6 +510,33 @@ class BenchmarkHolidayTests(_BuildDatabase):
         self.assertEqual(source_key["observation_date"], days[-21])
 
 
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class RestatedComparisonTests(_BuildDatabase):
+    """The comparison job restates a day's portfolio return while the values stay the same, as a
+    corrected flow does: the Vs benchmark figures move with a new fingerprint and publish."""
+
+    def test_a_restated_return_is_a_new_input_not_a_changed_answer(self):
+        code, lines = self._run()
+        self.assertEqual(code, 0, lines)
+        last = LAST.isoformat()
+        before = self._value("benchmark.beta", last, benchmark_id="SYNIDX")
+        with layers._connect(self.database) as owner:
+            owner.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+            owner.execute("UPDATE performance_comparison_daily SET portfolio_return = portfolio_return + 0.01, "
+                          "excess_return = excess_return + 0.01 WHERE subject_id = %s AND observation_date::text = %s",
+                          (SUBJECT, last))
+            owner.commit()
+        code, lines = self._run()
+        self.assertEqual(code, 0, lines)
+        _, status, reason, checks = self._builds()[-1]
+        self.assertEqual((status, reason), ("published", None), checks)
+        self.assertEqual(checks["same_inputs_new_answer_count"], 0, checks)
+        self.assertGreater(checks["changed"], 0, checks)
+        comparison = self.web.benchmark_comparison(SUBJECT, as_of=last, user=build.BUILD_USER)
+        after = self._value("benchmark.beta", last, benchmark_id="SYNIDX")
+        self.assertNotEqual(after, before)
+        self.assertEqual(after, comparison["metrics"]["beta"])
+
 def _gate(states: dict[str, str]):
     def check(job, *, since, environ, now):
         state = states.get(job, "pass")

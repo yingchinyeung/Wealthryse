@@ -256,12 +256,13 @@ def prepare():
     if subprocess.run(['git', 'merge-base', '--is-ancestor', deployed, head], cwd=ROOT).returncode:
         raise SystemExit(f'Live website commit {deployed} is not in this branch history')
     changed = [p for p in git('diff', '--name-only', deployed, head).split() if p]
-    # Scripts (Node report renderers and Python job/operator scripts) are run by
-    # the reporting jobs or by hand, never by the website, and this path only
-    # overlays src/ibkr_etl on live anyway, so they keep their live versions.
-    skipped = [p for p in changed if p.startswith('scripts/') and p.endswith(('.mjs', '.py'))]
+    # Scripts (Node report renderers, Python job/operator scripts and the PowerShell
+    # deployment scripts operators run on their own machine) are run by the
+    # reporting jobs or by hand, never by the website, and this path only overlays
+    # src/ibkr_etl on live anyway, so they keep their live versions.
+    skipped = [p for p in changed if p.startswith('scripts/') and p.endswith(('.mjs', '.py', '.ps1'))]
     if skipped:
-        print('Not part of the website release (reporting scripts):\n  ' + '\n  '.join(skipped))
+        print('Not part of the website release (scripts run by jobs or by hand):\n  ' + '\n  '.join(skipped))
     # Database migrations are applied by the bootstrap job, never by this release.
     migrations = [p for p in changed if p.startswith('migrations/postgres/')]
     if migrations:

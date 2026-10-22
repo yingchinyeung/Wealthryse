@@ -35,3 +35,31 @@ Targeted suite: 175 tests and 49 subtests passed, including design planning, exa
 Executable DOM checks passed for request creation, historical preview, explicit consent, queueing, safe description text and rejection of a stale in-flight preview. This is not a substitute for browser visual acceptance.
 
 No live Azure write, email, account activation, commercial release or source-data mutation was performed.
+
+## Real PostgreSQL qualification (12 October 2026)
+
+`tests/test_report_design_postgres.py` now runs the workflow on a real,
+disposable PostgreSQL 16 schema built with `scripts/build_disposable_qa_schema.py`
+and the unmodified `scripts/bootstrap_postgres.py`. It passed (5 tests, 4
+subtests) and covers:
+
+- the website approval role cannot register, edit, activate or delete designs;
+- row-level security hides and blocks rows across tenants;
+- registration is create-only and cannot be rebound;
+- request, preview, queue, worker regeneration, per-month owner approval with
+  supersession of old downloads, and activation only after the last month is
+  approved; old files stay archived;
+- a newer frozen input after consent fails the run without releasing anything;
+- the database itself refuses a second live request for the same account.
+
+The renderer is stubbed, so this does not replace the image qualification,
+historical visual review or staging browser checks listed above.
+
+`infra/staging-report-design-worker-job.bicep` defines the dedicated worker job
+(every 30 minutes, 2-hour replica timeout, disabled by default). It is not
+deployed.
+
+Finding: the migrations cannot rebuild an empty server. Early seed migrations
+need the tenant row before `initialize()` inserts it, and migration 027 needs
+existing subjects. The QA harness seeds both; a production rebuild from code
+alone would fail the same way and should be considered in recovery planning.

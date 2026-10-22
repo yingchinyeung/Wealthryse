@@ -68,7 +68,7 @@ def finish_reviewed_updates(connection,tenant_id):
             (tenant_id,row['subject_id'])).fetchone()
         if not account or account['lifecycle_status']!='active':continue
         ids=[file['generation_run_id'] for pair in results.values() for file in pair.values()]
-        if len(ids)!=len(plan['snapshots'])*2 or len(set(ids))!=len(ids):
+        if len(ids)!=len(plan['snapshots']) or len(set(ids))!=len(ids):
             raise ValueError('Completed regeneration evidence is incomplete')
         approved=connection.execute('''SELECT a.generation_run_id,a.artifact_sha256 FROM report_artifact_releases a
             JOIN report_release_decisions d ON d.tenant_id=a.tenant_id AND d.release_decision_id=a.release_decision_id

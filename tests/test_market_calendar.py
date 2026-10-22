@@ -3,7 +3,7 @@ from datetime import date, datetime
 
 from ibkr_etl.market_calendar import (CALENDARS, EMERGENCY_CLOSURES, EmergencyClosure,
     CalendarCoverageError, apply_emergency_closures, benchmark_session_on_or_before,
-    expected_benchmark_date, check_benchmark_dates)
+    expected_benchmark_date, check_benchmark_dates, calendar_coverage)
 
 
 class MarketCalendarTests(unittest.TestCase):
@@ -120,6 +120,16 @@ class MarketCalendarTests(unittest.TestCase):
         self.assertEqual(benchmark_session_on_or_before('GSPC',date(2027,7,5)),date(2027,7,2))
         for market in ('XNAS','XSHG','XTAI'):
             with self.assertRaises(CalendarCoverageError):CALENDARS[market].is_session(date(2027,1,4))
+
+    def test_coverage_renewal_is_flagged_before_uncovered_year(self):
+        states = {r["market"]:r["state"] for r in calendar_coverage(date(2026,10,12))}
+        self.assertEqual(states, {"XHKG":"covered", "XNYS":"covered", "XNAS":"renewal_due",
+                                  "XSHG":"renewal_due", "XTAI":"renewal_due"})
+        states = {r["market"]:r["state"] for r in calendar_coverage(date(2027,1,1))}
+        self.assertEqual(states["XTAI"], "expired")
+        self.assertEqual(states["XNYS"], "covered")
+        result = check_benchmark_dates(self.evidence())
+        self.assertEqual({r["market"]:r["state"] for r in result["calendar_coverage"]}["XNAS"], "renewal_due")
 
     def test_hibor_calendar_not_changed_by_exchange_emergency(self):
         from ibkr_etl.market_calendar import HK_BANK_CALENDAR

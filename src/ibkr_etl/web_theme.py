@@ -655,6 +655,12 @@ ACCOUNT_THEME_CSS = COMMON_THEME_CSS + r"""
 canvas { display: block; width: 100%; height: 320px; }
 .legend { display: flex; gap: 20px; margin-top: 11px; color: var(--muted-strong); font-size: 12px; }
 .swatch { display: inline-block; width: 20px; height: 4px; margin: 0 7px 2px 0; border-radius: 99px; }
+.benchmark-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.benchmark-chip { display: inline-flex; align-items: center; padding: 5px 10px; color: var(--muted-strong); background: transparent; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; font: inherit; font-size: 12px; font-weight: 650; opacity: .55; }
+.benchmark-chip[aria-pressed="true"] { color: var(--ink); opacity: 1; border-color: var(--muted-strong); }
+.benchmark-chip:hover { opacity: 1; }
+.benchmark-chip-actions { display: inline-flex; gap: 6px; }
+.benchmark-chart-note:empty { display: none; }
 .portfolio { background: var(--chart-portfolio); }
 .index { background: var(--chart-benchmark); }
 .chart-tooltip { display: none; position: absolute; z-index: 2; min-width: 190px; padding: 10px 12px; color: #f8fafc; background: rgba(8, 12, 20, .93); border: 1px solid rgba(255, 255, 255, .14); border-radius: 12px; box-shadow: 0 16px 38px rgba(0, 0, 0, .25); font-size: 12px; line-height: 1.55; pointer-events: none; backdrop-filter: blur(14px); }

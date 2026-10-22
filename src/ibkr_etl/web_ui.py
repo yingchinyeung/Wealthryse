@@ -154,7 +154,13 @@ const rangeSeries=(id,series,options)=>{
   const start=series.length?rangeStart(chartRanges.get(id)||'all',series[series.length-1].date):null;if(!start)return series;
   const shown=series.filter(x=>x.date>=start);if(shown.length<2)return series;
   if(options.yLabel!=='Rebased value')return shown;
-  const first=shown[0];return shown.map(row=>Object.fromEntries(Object.entries(row).map(([k,v])=>[k,k!=='date'&&Number.isFinite(Number(v))&&Number(first[k])?100*Number(v)/Number(first[k]):v])));
+  // Each line is rebased to 100 at the window's first date. A line that starts later
+  // starts where the portfolio line is on that date, so the lines stay comparable.
+  const ok=v=>v!=null&&Number.isFinite(Number(v))&&Number(v)!==0,factor={};
+  Object.keys(shown[0]).filter(k=>k!=='date').forEach(k=>{const at=shown.find(row=>ok(row[k]));if(!at)return;
+    if(at===shown[0])factor[k]=100/Number(at[k]);
+    else if(k!=='portfolio'&&ok(shown[0].portfolio)&&ok(at.portfolio))factor[k]=100*Number(at.portfolio)/Number(shown[0].portfolio)/Number(at[k]);});
+  return shown.map(row=>Object.fromEntries(Object.entries(row).map(([k,v])=>[k,k in factor&&v!=null&&Number.isFinite(Number(v))?factor[k]*Number(v):v])));
 };
 document.querySelectorAll('.range-buttons').forEach(group=>group.addEventListener('click',event=>{
   const button=event.target.closest('button[data-range]');if(!button)return;const id=group.dataset.chart;chartRanges.set(id,button.dataset.range);

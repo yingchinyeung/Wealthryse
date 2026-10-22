@@ -128,6 +128,16 @@ class TransformTest(unittest.TestCase):
         self.assertNotIn("nx-perf-css", viewer)
         self.assertLess(owner.index("nx-perf-css"), owner.index("</head>"))
 
+    def test_page_redesign_phase_3_adds_modelling(self):
+        page = PAGE.format(s="")
+        with mock.patch.dict(os.environ, {"WEB_DESIGN": "next", "WEB_NEXT_PAGES": "2/3"}):
+            owner = web_next.transform(page, design="next", role="owner", back="/", page_scripts={}, metric_anchors={})
+            viewer = web_next.transform(page, design="next", role="viewer", back="/", page_scripts={}, metric_anchors={})
+        self.assertIn("nx-model-css", owner)
+        self.assertIn("wr-next-scenarios", owner)
+        self.assertIn("nx-perf-css", viewer)
+        self.assertNotIn("nx-model-css", viewer)
+
     def test_page_redesign_phase_values(self):
         cases = {"off": (0, 0), "preview": (0, 1), "on": (1, 1), "2": (2, 2), "0/2": (0, 2),
                  "2/1": (2, 2), "99": (web_next.PAGES_PHASES, web_next.PAGES_PHASES), "x/2": (0, 0)}

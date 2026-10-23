@@ -966,20 +966,58 @@ def page_disagreements(web, subject: Subject, as_of: str, pages: Iterable[str], 
 
 # -- reading and writing the tables ---------------------------------------------------------------
 
-def published_rows(connection, subject_ids: list[str]) -> dict[tuple, dict]:
+PUBLISHED_COLUMNS = ("SELECT subject_id, figure_id, period, item, benchmark_id, as_of_date::text AS as_of_date, "
+                     + ", ".join(COMPARED) + ", input_sha256, calculation_version, "
+                     "period_start::text AS period_start_text, period_end::text AS period_end_text "
+                     "FROM gold.v_certified_figures ")
+
+
+def published_rows(connection, subject_ids: list[str],
+                   on_dates: Mapping[str, Iterable[str]] | None = None) -> dict[tuple, dict]:
+    """The published rows by key. With on_dates ({subject id: dates}), only those subjects' rows on
+    those dates: the whole history (the charts add about 30,000 rows a subject) does not fit in
+    the job's memory, and a run compares only the dates it read."""
     if not subject_ids:
         return {}
-    cursor = connection.execute(
-        "SELECT subject_id, figure_id, period, item, benchmark_id, as_of_date::text AS as_of_date, "
-        + ", ".join(COMPARED) + ", input_sha256, calculation_version, period_start::text AS period_start_text, "
-        "period_end::text AS period_end_text FROM gold.v_certified_figures WHERE subject_id = ANY(%s)",
-        (subject_ids,))
-    names = [column.name for column in cursor.description]
+    if on_dates is None:
+        queries = [(PUBLISHED_COLUMNS + "WHERE subject_id = ANY(%s)", (list(subject_ids),))]
+    else:
+        queries = [(PUBLISHED_COLUMNS + "WHERE subject_id = %s AND as_of_date = ANY(%s::date[])",
+                    (subject_id, sorted(set(on_dates.get(subject_id, ())))))
+                   for subject_id in subject_ids if on_dates.get(subject_id)]
     found = {}
-    for values in cursor.fetchall():
-        row = dict(zip(names, values))
-        row["period_start"], row["period_end"] = row.pop("period_start_text"), row.pop("period_end_text")
-        found[tuple(str(row[name]) for name in KEY)] = row
+    for sql, params in queries:
+        cursor = connection.execute(sql, params)
+        names = [column.name for column in cursor.description]
+        for values in cursor:
+            row = dict(zip(names, values))
+            row["period_start"], row["period_end"] = row.pop("period_start_text"), row.pop("period_end_text")
+            found[tuple(str(row[name]) for name in KEY)] = row
+    return found
+
+
+def published_dates(connection, subject_ids: list[str],
+                    figure_ids: Iterable[str] | None = None) -> dict[str, set[str]]:
+    """Each subject's dates with published figures (of these figures only, when given): what the
+    plan needs, without loading the rows."""
+    if not subject_ids:
+        return {}
+    sql = "SELECT DISTINCT subject_id, as_of_date::text FROM gold.v_certified_figures WHERE subject_id = ANY(%s)"
+    params: list[Any] = [list(subject_ids)]
+    if figure_ids is not None:
+        sql += " AND figure_id = ANY(%s)"
+        params.append(sorted(figure_ids))
+    found: dict[str, set[str]] = {}
+    for subject_id, as_of_date in connection.execute(sql, params):
+        found.setdefault(str(subject_id), set()).add(str(as_of_date))
+    return found
+
+
+def dates_read(rows: Iterable[Row]) -> dict[str, set[str]]:
+    """The subject dates these rows are for: the published rows a run compares against."""
+    found: dict[str, set[str]] = {}
+    for row in rows:
+        found.setdefault(row.subject_id, set()).add(row.as_of_date)
     return found
 
 
@@ -1107,17 +1145,15 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
         with psycopg.connect(database_url, options=f"-c app.tenant_id={web.TENANT_ID}") as connection:
             if on_connect is not None:
                 on_connect(connection)
-            published = published_rows(connection, [subject.id for subject in found])
+            # A run of the charts alone fills in the charts' own history, so only their dates count.
+            charts_only = bool(charts_mode) and pages == [_charts().PAGE]
+            dates_published = published_dates(connection, [subject.id for subject in found],
+                                              figure_ids=_charts().FIGURES if charts_only else None)
             connection.rollback()
-            published_dates: dict[str, set[str]] = {}
-            for key in published:
-                if charts_mode and pages == [_charts().PAGE] and key[1] not in _charts().FIGURES:
-                    continue  # a run of the charts alone fills in the charts' own history
-                published_dates.setdefault(key[0], set()).add(key[5])
-            plan = work_plan(found, published_dates, backfill=backfill)
+            plan = work_plan(found, dates_published, backfill=backfill)
             # Each subject's pages are asked again on its newest date right after that date is read, so
             # a figure that moves with the clock reads the same both times.
-            newest_due = {subject.id: max(due_dates(subject, published_dates.get(subject.id, ())), default=None)
+            newest_due = {subject.id: max(due_dates(subject, dates_published.get(subject.id, ())), default=None)
                           for subject in found}
             notes: dict = {}
             rows: list[Row] = []
@@ -1151,6 +1187,9 @@ def run(*, database_url: str, backfill: bool = False, dry_run: bool = False, onl
             for subject in found:   # the time limit came before a subject's newest date
                 if read.get(subject.id) and subject.id not in checked:
                     check(subject, max(read[subject.id]))
+            # The published rows only for the dates read: comparing needs no more.
+            published = published_rows(connection, [subject.id for subject in found], on_dates=dates_read(rows))
+            connection.rollback()
             result = compare(rows, published)
             charts = _charts().settle(charts_mode, rows, result, disagreements, notes, errors) if charts_mode else None
             to_write = result["new"] + result["changed"]

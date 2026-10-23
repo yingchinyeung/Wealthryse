@@ -1,7 +1,7 @@
 {
- "note": "Layout names the deployed assurance job expects (main-a5c212f, rehearsed 23 Oct, run ibkrv2stg-analyst-assurance-5i17zht) and the deployed month-end job renders. If a renderer layout name changes, rebuild and test the assurance image, then update this file in the same PR.",
+ "note": "Layout names the deployed assurance job expects (main-1c5bfb3, rehearsed 23 Oct, run ibkrv2stg-analyst-assurance-kiz4r8g) and the deployed month-end job renders. If a renderer layout name changes, rebuild and test the assurance image, then update this file in the same PR.",
  "assurance_job": "ibkrv2stg-analyst-assurance",
- "assurance_image": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:8200066479fc0a1cee0a1d8108845a9d33c3a1f779e938278efbf194deb2890a",
+ "assurance_image": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:fed1a0f6d67f3abf3d6185dd0f534580f6f9fcf88516eee885d5f1953019db6d",
  "month_end_job": "ibkrv2stg-month-end-factsheet",
  "month_end_image": "ibkrv2stgauhecwc4itaoo.azurecr.io/ibkr-platform@sha256:52b68ce6b2fec56dc6f31415aea187d7cf338c4f9c489a694a2587224d15d3e4",
  "subjects": {

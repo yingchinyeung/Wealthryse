@@ -1579,13 +1579,6 @@
    ],
    "schedule": "every 5 minutes"
   },
-  "ibkrv2stg-ibkr-gateway (VM)": {
-   "hops": [
-    "ingest"
-   ],
-   "schedule": "streaming",
-   "note": "Writes live_* tables directly."
-  },
   "ibkrv2stg-import-u16088571": {
    "hops": [
     "conform"

@@ -226,7 +226,7 @@ def live_triggers(snapshot: dict[str, Any], account_move: float = LIVE_ACCOUNT_M
 def live_market(store: Store, tools: ToolClient, agent: Agent, accounts: list[str], usage: dict,
                 now: datetime | None = None) -> int:
     """Alert, once a day per rule, on big live moves of accounts whose live view is on, with an explanation."""
-    from ibkr_etl.live_collector import markets_open
+    from ibkr_etl.live_store import markets_open
 
     now = now or datetime.now(timezone.utc)
     if not markets_open(now):

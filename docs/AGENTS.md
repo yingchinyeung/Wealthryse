@@ -589,7 +589,8 @@ website view.
   today has alerts for that account.
 
 **Turning it on** (each step needs Ying's typed approval naming the resources):
-PR 58's gateway VM and collector first, per `docs/LIVE_IBKR_DATA.md`; then
+a source for the live_ tables first (the TWS gateway from PR 58 was retired
+on 22 Oct 2026 before it ran; see `docs/LIVE_IBKR_DATA.md`); then
 rerun `scripts/install_agent_schema.py` (applies `010_live_market.sql`), rebuild
 the agent and platform images, deploy `infra/agent-apps.bicep`, and grant
 accounts to the job with `--grant live_market=<account>` (or `=all`).

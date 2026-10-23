@@ -1,6 +1,6 @@
-"""Explicit grants for the live collector's database role.
+"""Explicit grants for the ibkr_live_collector database role (created in stage 1).
 
-The collector on the gateway VM may write the seven live_ tables from
+Whatever writes the live data through live_store.LiveStore may write the seven live_ tables from
 migration 063 and nothing else: no other table, no view, no function beyond the
 tenant setting, and no default privileges. The website reads the same tables
 through its existing read-only role.

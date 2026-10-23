@@ -133,6 +133,12 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
     imports for its newest run date (`institutional_work_items`). They must all have
     succeeded and must cover yesterday, because the pull asks IBKR for data up to
     yesterday;
+    institutional-daily's newest run in the lineage records can only delay. It loads the
+    Kiwoom accounts after the IBKR work items, so the work items can all have succeeded
+    while those accounts' NAV is still coming in (22 Oct: benchmark-daily started before
+    the U.S. Kiwoom account was loaded, and its risk figures were blocked). Its steps are
+    separate processes, each with its own run, so a run that ended in the last 120
+    seconds also holds, until the next step's START shows;
   - benchmarks and FX: the newest finished benchmark run in `ingestion_runs`. The
     newest sector-classification run in the lineage records (below) can only delay;
   - derived: each subject's newest calculation in derived-daily's newest execution
@@ -150,8 +156,8 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
   go through `workflow_dates`, as a persisted date policy would. If the shadow ledger
   ever has rows for the cycle (`daily:<date>`, subject `daily-cycle`), they must agree
   too. Today it has none: migrations 054 and 060 are held back in production.
-- **Lineage records as start and finish.** With `LINEAGE_RECORDING=true`, risk-snapshots,
-  sector-classification and month-end-factsheet leave a START row in `lineage_events`
+- **Lineage records as start and finish.** With `LINEAGE_RECORDING=true`, institutional-daily,
+  risk-snapshots, sector-classification and month-end-factsheet leave a START row in `lineage_events`
   (migration 071) and one COMPLETE, FAIL or ABORT row when they end. For each of them
   the check reads the newest run:
   - a START with no end, younger than the job's `replicaTimeout`, means still running.
@@ -171,11 +177,13 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
     Risk is then judged by its snapshots alone, as before, and reports are not checked
     (assurance is then judged by the steps before reports).
 
-  Sectors are a soft dependency. A sector run still running holds up the jobs after it
-  only within the wait. One that failed, crashed or never ended, or that ended after a
-  step that reads it, goes in `notes`, never in `reasons`: yesterday's sector
-  classifications are good enough for a day. The decision says in `notes` whenever a
-  record was not used, and notes never make the inputs not ready.
+  Sectors and institutional-daily's account loads are soft dependencies. A run of
+  either that is still running holds up the jobs after it only within the wait. One
+  that failed, crashed or never ended, or a sector run that ended after a step that
+  reads it, goes in `notes`, never in `reasons`: yesterday's sector classifications are
+  good enough for a day, and a failed account load is judged by the work items and each
+  subject's own checks. The decision says in `notes` whenever a record was not used,
+  and notes never make the inputs not ready.
 - **How it runs.** One READ ONLY session with short timeouts
   (`layer_freshness.open_read_only`), within a hard 10-second limit, using the job's own
   `DATABASE_URL` (`INPUT_READINESS_DATABASE_URL` overrides it; that login needs SELECT on
@@ -205,7 +213,7 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
 
   | Job | Starts (UTC) | `replicaTimeout` | Waits for | Wait | Recheck | Left for the job |
   |---|---|---|---|---|---|---|
-  | benchmark-daily | 08:30 | 1200 s | pull (08:20) | 300 s | 30 s | at least 840 s |
+  | benchmark-daily | 08:30 | 1200 s | pull and account loads (08:20, done about 08:34) | 600 s | 30 s | at least 570 s |
   | sector-classification | 08:45 | 1800 s | pull | 600 s | 60 s | at least 1110 s |
   | derived-daily | 08:50 | 3600 s | pull, benchmark, sectors | 900 s | 60 s | at least 2610 s |
   | risk-snapshots | 08:55 | 3600 s | derived, benchmark, sectors | 900 s | 60 s | at least 2610 s |
@@ -225,7 +233,7 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
   exactly, or Azure refuses it, the job starts as configured and the web log says so.
 - **Switching it on** is a separate approved step: add `INPUT_READINESS_MODE` (and for
   enforce the wait settings) to the seven job definitions, with `LINEAGE_RECORDING=true`
-  on risk-snapshots, sector-classification and month-end-factsheet, on an image built
+  on institutional-daily, risk-snapshots, sector-classification and month-end-factsheet, on an image built
   from a `main` that has this code. To read the results:
   `ContainerAppConsoleLogs_CL | where Log_s startswith 'INPUT_READINESS '`. Explain
   every "not ready". The evidence queries are judged on synthetic data only so far.

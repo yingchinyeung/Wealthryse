@@ -25,6 +25,7 @@ from ibkr_etl.layer_quality import (
     VOLUMES,
     Volume,
     judge_nav_moves,
+    judge_nav_rebuild,
     judge_positions,
     judge_volume,
     readiness,
@@ -322,6 +323,54 @@ class ValueTests(unittest.TestCase):
         result = judge_positions([onboarding, weekends])
         self.assertEqual((result["state"], result["detail"]["subjects_learning"]), ("learning", 2))
         self.assertGreaterEqual(MIN_VALUE_HISTORY, 10)
+
+
+    def test_the_nav_rebuilt_from_silver_against_the_brokers_total(self):
+        def account(account_id, *, total="1000", cash=None, base="USD", day="2026-10-16"):
+            return {
+                "nav": [{"account_id": account_id, "snapshot_date": day, "currency": base, "base_currency": base,
+                         "total_text": total, "cash_text": "200", "stock_text": "800", "accruals_text": "0"}],
+                "positions": [{"account_id": account_id, "conid": "1", "currency": "HKD", "quantity_text": "100",
+                               "mark_price_text": "8", "market_value_text": "800"}],
+                "cash": cash if cash is not None else [
+                    {"account_id": account_id, "currency": "USD", "ending_cash_text": "100",
+                     "fx_rate_to_base_text": None},
+                    {"account_id": account_id, "currency": "HKD", "ending_cash_text": "800",
+                     "fx_rate_to_base_text": "0.125"}],
+                "fx_rates": [{"account_id": account_id, "from_currency": "HKD", "to_currency": "USD",
+                              "rate_text": "0.125"}]}
+
+        def merged(*accounts):
+            return {part: [row for item in accounts for row in item[part]]
+                    for part in ("nav", "positions", "cash", "fx_rates")}
+
+        # Positions 800 HKD at 0.125 = 100, cash 100 USD + 800 HKD = 200: 300 against a total of 300.
+        clean = account("U9100001", total="300")
+        # Cash sent only as IBKR's base-currency total, a margin loan: 100 - 150 = -50 against -50.
+        loan = account("U9100002", total="-50", cash=[
+            {"account_id": "U9100002", "currency": "BASE_SUMMARY", "ending_cash_text": "-150",
+             "fx_rate_to_base_text": None}])
+        result = judge_nav_rebuild(merged(clean, loan), today=date(2026, 10, 17))
+        self.assertEqual((result["state"], result["observed"], result["detail"]["subjects_checked"]), ("pass", 0, 2))
+        self.assertEqual(result["detail"]["cash_sources"], {"currencies": 1, "base_summary": 1})
+        # One cent off reconciles; two cents is a break, reported in basis points, never as an amount.
+        self.assertEqual(judge_nav_rebuild(merged(account("U9100001", total="300.01")))["state"], "pass")
+        broken = judge_nav_rebuild(merged(clean, account("U9100003", total="300.03")))
+        self.assertEqual((broken["state"], broken["severity"], broken["observed"]), ("fail", "warning", 1))
+        failed, = broken["detail"]["failed"]
+        self.assertEqual((failed["subject"], failed["gap_bp"], failed["cash_source"]), ("***003", -1.0, "currencies"))
+        self.assertNotIn("300", json.dumps(broken))
+        self.assertNotIn("U9100003", json.dumps(broken))
+        # A missing FX rate leaves that cash out, and says which currency.
+        no_rate = account("U9100004", total="300")
+        no_rate["cash"][1]["fx_rate_to_base_text"] = None
+        no_rate["fx_rates"] = []
+        missing, = judge_nav_rebuild(merged(no_rate))["detail"]["failed"]
+        self.assertEqual(missing["missing_fx"], ["HKD"])
+        # An account with no NAV for over a week is not judged; with no accounts the check is learning.
+        stale = judge_nav_rebuild(merged(clean), today=date(2026, 10, 24))
+        self.assertEqual((stale["state"], stale["detail"]["subjects_stale"]), ("learning", 1))
+        self.assertEqual(judge_nav_rebuild({})["state"], "learning")
 
 
 class ReadinessTests(unittest.TestCase):

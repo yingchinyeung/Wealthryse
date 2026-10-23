@@ -254,8 +254,14 @@ finds stops a job or holds back publication. Only the publish gate does that.
       the typical count for the same kind of day (both markets open, Hong Kong only or
       New York only);
     - each table's live schema against its data contract;
-    - two value checks: a NAV move of more than 10% between a subject's two newest
-      dates, and positions dropping to zero;
+    - three value checks: a NAV move of more than 10% between a subject's two newest
+      dates, positions dropping to zero, and the NAV rebuild (`value.nav_rebuild`):
+      each broker account's positions, cash and FX in silver, plus IBKR's accruals, on
+      its newest date with cash, must add up to IBKR's own total within one cent
+      (`src/ibkr_etl/nav_rebuild.py`, which the onboarding reconciliation agent also
+      uses). When the Cash Report has no per-currency rows, its base-currency total
+      (`BASE_SUMMARY`) is the account's cash. A break is reported in basis points of the
+      total, never as an amount;
     - the contract quality rules, apart from any the publish gate already ran that day.
 - **Avoiding false alarms.**
   - A count is judged only once there are 10 earlier days of the same kind. It fails
@@ -269,6 +275,10 @@ finds stops a job or holds back publication. Only the publish gate does that.
   - Positions to zero applies only to subjects that held positions on at least 80% of
     their NAV dates. It is reported once, on the day positions drop to zero.
   - A NAV move is a warning: it can be a deposit or a withdrawal.
+  - A NAV rebuild break is a warning while the check is new. Once it has a month of
+    clean history it becomes an error (`NAV_REBUILD_SEVERITY`). The platform's NAV is
+    IBKR's own total, so a break means the silver positions, cash or FX do not add up
+    to it, not that the NAV shown is wrong.
 - **History.** One row per result in `quality_check_results` (migration 072): readiness,
   freshness, counts, schema, value and rule results. The table is append-only and kept
   per tenant. A table rather than Log Analytics, because the weekly report reads 13 weeks

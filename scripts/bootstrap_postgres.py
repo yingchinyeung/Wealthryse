@@ -387,7 +387,9 @@ def main(argv: list[str] | None = None) -> int:
                     "report_generation_runs, report_release_decisions, "
                     "report_artifact_releases, "
                     "subject_nav_series, subject_position_series, "
-                    "subject_cash_balance_series, subject_cash_activity_series TO {}"
+                    "subject_cash_balance_series, subject_cash_activity_series, "
+                    # The layer quality NAV rebuild (value.nav_rebuild) reads cash and FX with positions.
+                    "cash_snapshots, fx_rates TO {}"
                 ).format(sql.Identifier(approval_role))
             )
             connection.execute(

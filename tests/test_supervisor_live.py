@@ -549,7 +549,10 @@ class RoutingEvaluationTests(unittest.TestCase):
         self.assertEqual(registry.owner("get_holdings"), "holdings_performance")
         text = " ".join(prompts.specialist("modelling", account_id="U1", today="2026-10-22", writes_answer=True).split())
         self.assertIn("Use get_holdings to find a holding by size or name", text)
-        self.assertIn("pass its weights to run_what_if, which reports both side by side", text)
+        self.assertIn("pass the new weights to run_what_if, which reports both side by side", text)
+        # model-06 on 23 Oct: optimise_portfolio's weights are shares of the sleeve, so converting them
+        # one calculation per holding ran out of steps; run_what_if replays the mix by name instead.
+        self.assertIn("call run_what_if with mix set to its name", text)
         self.assertIn("each holding's share of the risk", prompts.planner(account_id="U1", today="2026-10-22",
                                                                           suggested=["modelling"]))
 

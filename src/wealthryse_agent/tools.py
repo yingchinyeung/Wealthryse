@@ -1376,14 +1376,48 @@ def _weight_changes(value: Any, held: list[dict[str, Any]]) -> dict[str, float]:
     return changes
 
 
+# The mixes optimise_portfolio reports, which run_what_if can replay by name.
+OPTIMISED_MIXES = ("minimum_variance", "risk_parity", "maximum_sharpe")
+
+
+def _mix_weights(current: Mapping[str, float], held: list[dict[str, Any]], matrix: Mapping[str, Any], mix: str,
+                 cap: float) -> dict[str, float]:
+    """An optimise_portfolio mix as fractions of NAV.
+
+    optimise_portfolio's weights are shares of the holdings it optimised (sleeve_weight of NAV), so each
+    becomes its share of that same sleeve; cash and the holdings it left out keep their weights.
+    """
+    from ibkr_etl.modelling import optimise
+
+    labels = {h["conid"]: {"symbol": h["symbol"], "description": h["description"]} for h in held}
+    result = optimise(current, labels, matrix, risk_free=0.0, cap=cap)
+    return {h["conid"]: h[f"{mix}_weight"] * result["sleeve_weight"] for h in result["holdings"]}
+
+
 def run_what_if(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
     """Risk and return of current holdings against hypothetical weights, over the same year of prices."""
     from ibkr_etl.modelling import ModellingInputError, what_if
 
     account_id = str(arguments["account_id"])
+    mix = arguments.get("mix")
+    if mix is not None and arguments.get("changes") is not None:
+        raise ToolError("invalid_arguments", "Give either changes or a mix, not both.", 400)
+    if mix is not None and mix not in OPTIMISED_MIXES:
+        raise ToolError("invalid_arguments", "mix must be " + ", ".join(OPTIMISED_MIXES[:-1]) + " or "
+                        + OPTIMISED_MIXES[-1] + ".", 400)
     subject, snapshot, held, _, matrix = _model_holdings(connection, account_id)
     current = {h["conid"]: h["weight"] for h in held}
-    proposed = {**current, **_weight_changes(arguments.get("changes"), held)}
+    if mix is None:
+        if arguments.get("changes") is None:
+            raise ToolError("invalid_arguments", "Give changes (1 to 25 holdings) or a mix.", 400)
+        changes = _weight_changes(arguments.get("changes"), held)
+    else:
+        try:
+            changes = _mix_weights(current, held, matrix, mix,
+                                   _number_argument(arguments, "max_weight", 0.01, 1.0) or 0.25)
+        except ModellingInputError as error:
+            raise _model_error(error) from error
+    proposed = {**current, **changes}
     mapping, benchmark = _model_benchmark(connection, subject, snapshot, matrix["dates"])
     try:
         result = what_if(current, proposed, matrix, risk_free=0.0, benchmark=benchmark or None)
@@ -1398,6 +1432,7 @@ def run_what_if(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
                  "holdings": [{"symbol": h["symbol"], "current_weight": h["weight"],
                                "proposed_weight": proposed[h["conid"]],
                                "modelled": h["conid"] in matrix["returns"]} for h in holdings[:40]],
+                 "mix": mix,
                  "current": result["current"], "proposed": result["proposed"], "difference": result["difference"],
                  "benchmark": {"id": mapping["benchmark_id"], "name": mapping["name"]} if mapping else None,
                  "not_modelled": [h["symbol"] for h in holdings if h["conid"] not in matrix["returns"]],
@@ -1751,14 +1786,19 @@ TOOLS: tuple[ToolSpec, ...] = (
                      ["account_id"]), project_wealth),
     ToolSpec("run_what_if", "Compare the risk and return of the current holdings with hypothetical weights for some "
              "of them, over the same year of daily prices: return, volatility, Sharpe, VaR, expected tail loss, "
-             "maximum drawdown, worst month and beta. Weights are fractions of NAV; holdings not listed keep their "
-             "weight and the rest is cash. Hypothetical, not a recommendation.",
+             "maximum drawdown, worst month and beta. Give either changes (weights are fractions of NAV; holdings "
+             "not listed keep their weight and the rest is cash) or mix, to replay a mix from optimise_portfolio "
+             "as it is. Hypothetical, not a recommendation.",
              _schema({"account_id": _ACCOUNT, "changes": {
                  "type": "array", "minItems": 1, "maxItems": 25, "items": {
                      "type": "object", "additionalProperties": False, "required": ["symbol", "weight"],
                      "properties": {"symbol": {"type": "string", "description": "a current holding's symbol"},
-                                    "weight": {"type": "number", "description": "fraction of NAV, 0 removes it"}}}}},
-                     ["account_id", "changes"]), run_what_if),
+                                    "weight": {"type": "number", "description": "fraction of NAV, 0 removes it"}}}},
+                      "mix": {"type": "string", "enum": list(OPTIMISED_MIXES), "description": "instead of changes: "
+                              "an optimise_portfolio mix, converted to fractions of NAV here"},
+                      "max_weight": {"type": "number", "description": "with mix: the same cap per holding as "
+                                     "optimise_portfolio, default 0.25"}},
+                     ["account_id"]), run_what_if),
     ToolSpec("optimise_portfolio", "Each holding's share of the portfolio's risk next to its weight, and three "
              "alternative mixes of the same holdings: minimum variance, risk parity and maximum Sharpe, with their "
              "expected return, volatility and Sharpe. Illustrative, not a recommendation.",

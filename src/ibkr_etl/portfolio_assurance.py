@@ -136,8 +136,14 @@ def evaluate_portfolio_assurance(
     report_rows: Sequence[Mapping[str, Any]] = (),
     *,
     subject_id: str | None = None,
+    approved_versions: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Reconcile data and analytics deterministically; the model cannot change this result."""
+    """Reconcile data and analytics deterministically; the model cannot change this result.
+
+    approved_versions names the exact report version a subject's own approved
+    design produces (see approved_report_versions); a kind it names must match
+    that version exactly instead of a built-in layout.
+    """
 
     result_subjects = {
         str(result.get("subject_id") or "").strip()
@@ -293,7 +299,10 @@ def evaluate_portfolio_assurance(
         }
         for kind, row in pair.items():
             version = str((row or {}).get("template_version") or "")
-            if f"layout:{expected[kind]}" not in version:
+            if approved_versions and kind in approved_versions:
+                if version != approved_versions[kind]:
+                    findings.append(_finding(f"reports.{period}.{kind}.layout", "error", f"The {kind} does not use the subject's approved design.", template_version=version, expected_version=approved_versions[kind]))
+            elif f"layout:{expected[kind]}" not in version:
                 findings.append(_finding(f"reports.{period}.{kind}.layout", "error", f"The {kind} does not use the approved subject-specific layout.", template_version=version, expected_layout=expected[kind]))
             if not (row or {}).get("output_reference") or not (row or {}).get("output_sha256"):
                 findings.append(_finding(f"reports.{period}.{kind}.integrity", "error", f"The {kind} is missing its immutable artifact reference or SHA-256."))
@@ -314,6 +323,7 @@ def evaluate_portfolio_assurance(
         "approved_report_layouts": {
             "factsheet": factsheet_layout_version(subject_id),
             "presentation": presentation_content_contract_version(subject_id),
+            **dict(approved_versions or {}),
         },
     }
 
@@ -430,6 +440,31 @@ def collect_assurance_inputs(
         ).fetchall()
     ]
     return results, rows
+
+
+def approved_report_versions(connection, tenant_id: str, subject_id: str) -> dict[str, str] | None:
+    """The factsheet version a live onboarded subject's approved design produces.
+
+    Subjects onboarded with their own design (no built-in report style) render
+    their factsheets as "spec:<sha256>" of the design approved with the
+    historical reports, so assurance checks that exact version. Other subjects
+    return None and keep the built-in layout check.
+    """
+
+    from .designed_reports import DesignedReportError, approved_design
+    from .onboarding_month_end import live_cases
+
+    for case in live_cases(connection, tenant_id):
+        if case["target_subject_id"] != subject_id:
+            continue
+        if case.get("report_style"):
+            return None
+        try:
+            design = approved_design(connection, tenant_id, case["case_id"], subject_id)
+        except DesignedReportError:
+            return None
+        return {"factsheet": f"spec:{design['spec_sha256']}"}
+    return None
 
 
 def assurance_date() -> str:

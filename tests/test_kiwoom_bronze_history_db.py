@@ -33,8 +33,9 @@ SNAPSHOTS = ("position_snapshots", "cash_snapshots", "nav_snapshots")
 LATER = NOW + timedelta(hours=2)  # 19:20 in Seoul the same day: the same KRX and U.S. days as the load
 
 
-@skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
-class KiwoomBronzeHistoryTests(_MigratedDatabase):
+class TwoKiwoomAccounts(_MigratedDatabase):
+    """A KRW and a USD Kiwoom account loaded by the collector before bronze capture existed (no tests here)."""
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -111,6 +112,15 @@ class KiwoomBronzeHistoryTests(_MigratedDatabase):
         self.db.rollback()
         return found
 
+    def _bronze_runs(self) -> int:
+        count = self.db.execute("SELECT count(*) AS n FROM ingestion_runs WHERE run_type = 'kiwoom_rest_bronze'"
+                                ).fetchone()["n"]
+        self.db.rollback()
+        return int(count)
+
+
+@skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class KiwoomBronzeHistoryTests(TwoKiwoomAccounts):
     def _ask(self, **options):
         from ibkr_etl.kiwoom_bronze import KiwoomBronze
         from ibkr_etl.kiwoom_bronze_history import run
@@ -136,12 +146,6 @@ class KiwoomBronzeHistoryTests(_MigratedDatabase):
             return check_run(self.db, run_id)
         finally:
             self.db.rollback()
-
-    def _bronze_runs(self) -> int:
-        count = self.db.execute("SELECT count(*) AS n FROM ingestion_runs WHERE run_type = 'kiwoom_rest_bronze'"
-                                ).fetchone()["n"]
-        self.db.rollback()
-        return int(count)
 
     def test_past_days_go_to_bronze_and_rebuild_as_silver_holds_them(self):
         before = self._silver()

@@ -70,7 +70,7 @@ html:not(.nx-pinned) .nx-top .nx-switch b { width: 100%; font-size: 13px; overfl
 @media (max-width: 1023px) { .nx-subtabs { display: none; } }
 @media (prefers-reduced-motion: reduce) { .nx-rail, .nx-rail-pin svg { transition: none; } }
 .nx-rail-foot { margin-top: auto; padding: 14px 20px 0; border-top: 1px solid var(--nx-bar-line); color: var(--nx-bar-muted); font-size: 11px; letter-spacing: .06em; overflow-wrap: anywhere; }
-.nx-top { position: fixed; top: 0; right: 0; left: var(--nx-rail); z-index: 50; height: var(--nx-top); display: flex; align-items: center; gap: 14px; padding: 0 28px; color: var(--nx-bar-ink); background: rgba(0, 0, 0, .96); border-bottom: 1px solid var(--nx-bar-line); font-family: var(--font-mission); view-transition-name: nx-top; }
+.nx-top { position: fixed; top: 0; right: 0; left: var(--nx-rail); z-index: 50; height: var(--nx-top); display: flex; align-items: center; gap: 14px; padding: 0 28px; color: var(--nx-bar-ink); background: #000; border-bottom: 1px solid var(--nx-bar-line); font-family: var(--font-mission); view-transition-name: nx-top; }
 .nx-top .nx-brand, .nx-top .nx-switch { display: none; padding: 0; }
 .nx-search { flex: 1 1 auto; max-width: 460px; display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 0 12px; color: var(--nx-bar-muted); background: transparent; border: 1px solid var(--nx-bar-line); border-radius: 0; cursor: pointer; font: inherit; font-size: 13px; text-align: left; }
 .nx-search:hover, .nx-search:focus-visible { color: #fff; border-color: rgba(255, 255, 255, .5); outline: none; }

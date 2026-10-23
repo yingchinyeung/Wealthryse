@@ -44,6 +44,7 @@ def _row(completed_at, *, through=None, planned=1, succeeded=None, failed=0):
 
 RISK_JOB, SECTOR_JOB = "ibkrv2stg-risk-snapshots", "ibkrv2stg-sector-classification"
 REPORTS_JOB = "ibkrv2stg-month-end-factsheet"
+LOADS_JOB = "ibkrv2stg-institutional-daily"
 
 
 def _run(started, ended=None, *, end=None, exit_code=None, error=None):
@@ -53,7 +54,7 @@ def _run(started, ended=None, *, end=None, exit_code=None, error=None):
 
 
 def _with_runs(evidence, **runs):
-    names = {"risk": RISK_JOB, "sectors": SECTOR_JOB, "reports": REPORTS_JOB}
+    names = {"risk": RISK_JOB, "sectors": SECTOR_JOB, "reports": REPORTS_JOB, "loads": LOADS_JOB}
     return {**evidence, readiness.LINEAGE_KEY: {"runs": {names[key]: run for key, run in runs.items()}}}
 
 
@@ -331,9 +332,61 @@ class SectorRunTests(unittest.TestCase):
             self.assertTrue(any(note.startswith("benchmarks_fx: ibkrv2stg-sector-classification")
                                 and note.endswith("sectors not checked") for note in decision["notes"]))
 
-    def test_stages_that_do_not_read_benchmarks_read_no_lineage(self):
-        decision = readiness.decide("benchmarks_fx", healthy(), now=NOW)
+    def test_stages_that_do_not_read_benchmarks_read_no_sector_lineage(self):
+        loads = _run("2026-10-19T08:15:00+00:00", "2026-10-19T08:34:00+00:00")
+        decision = readiness.decide("benchmarks_fx", _with_runs(healthy(), loads=loads), now=NOW)
         self.assertEqual(decision["notes"], [])
+
+
+class AccountLoadTests(unittest.TestCase):
+    """institutional-daily loads the Kiwoom accounts after the IBKR work items, so its
+    open run holds benchmark-daily and everything after it, but never fails them."""
+    at = datetime(2026, 10, 19, 8, 31, tzinfo=timezone.utc)
+
+    def test_an_open_institutional_run_holds_the_stages_after_reconciliation(self):
+        evidence = _with_runs(healthy(), loads=_run("2026-10-19T08:15:00+00:00"))
+        evidence["benchmarks_fx"] = _row("2026-10-18T08:33:00+00:00")
+        decision = readiness.decide("benchmarks_fx", evidence, now=self.at)
+        self.assertFalse(decision["ready"])
+        self.assertIn("reconciliation: ibkrv2stg-institutional-daily is still running "
+                      "(started 2026-10-19T08:15:00+00:00)", decision["reasons"])
+        self.assertEqual(readiness.open_runs(decision), [LOADS_JOB])
+        for stage in ("derived", "risk"):
+            with self.subTest(stage=stage):
+                held = readiness.decide(stage, _with_runs(healthy(), loads=_run("2026-10-19T08:15:00+00:00")),
+                                        now=NOW)
+                self.assertFalse(held["ready"])
+
+    def test_after_the_wait_an_open_run_is_only_a_note(self):
+        evidence = _with_runs(healthy(), loads=_run("2026-10-19T08:15:00+00:00"))
+        decision = readiness.decide("benchmarks_fx", evidence, now=self.at, hold_open_runs=False)
+        self.assertEqual((decision["ready"], decision["reasons"]), (True, []))
+        self.assertIn("reconciliation: ibkrv2stg-institutional-daily still running after the wait (started "
+                      "2026-10-19T08:15:00+00:00); loads not checked", decision["notes"])
+
+    def test_a_run_that_just_ended_holds_for_the_next_step(self):
+        # The IBKR worker's run ended 30 seconds ago; the Kiwoom loads' START may follow.
+        evidence = _with_runs(healthy(), loads=_run("2026-10-19T08:15:00+00:00", "2026-10-19T08:30:30+00:00"))
+        decision = readiness.decide("benchmarks_fx", evidence, now=self.at)
+        self.assertFalse(decision["ready"])
+        self.assertIn("reconciliation: ibkrv2stg-institutional-daily ended at 2026-10-19T08:30:30+00:00; "
+                      "waiting 120 seconds for its next step", decision["reasons"])
+        self.assertEqual(readiness.open_runs(decision), [LOADS_JOB])
+        later = readiness.decide("benchmarks_fx", evidence, now=self.at + timedelta(seconds=91))
+        self.assertEqual((later["ready"], later["reasons"]), (True, []))
+        final = readiness.decide("benchmarks_fx", evidence, now=self.at, hold_open_runs=False)
+        self.assertEqual((final["ready"], final["reasons"]), (True, []))
+
+    def test_a_finished_or_failed_run_never_stops_anything(self):
+        finished = _run("2026-10-19T08:15:00+00:00", "2026-10-19T08:29:00+00:00")
+        crashed = _run("2026-10-19T08:15:00+00:00", "2026-10-19T08:29:00+00:00", end="FAIL", error="RuntimeError")
+        for run in (finished, crashed):
+            with self.subTest(end=run["end_type"]):
+                decision = readiness.decide("benchmarks_fx", _with_runs(healthy(), loads=run), now=self.at)
+                self.assertEqual((decision["ready"], decision["reasons"]), (True, []))
+        decision = readiness.decide("benchmarks_fx", _with_runs(healthy(), loads=crashed), now=self.at)
+        self.assertIn("reconciliation: ibkrv2stg-institutional-daily did not finish (RuntimeError); loads not checked",
+                      decision["notes"])
 
 
 class OpenRunTests(unittest.TestCase):
@@ -400,7 +453,8 @@ class ReportsRunTests(unittest.TestCase):
 class LineageSettingsTests(unittest.TestCase):
     BICEP = {SECTOR_JOB: "infra/staging-sector-classification-job.bicep",
              RISK_JOB: "infra/staging-risk-snapshot-job.bicep",
-             REPORTS_JOB: "infra/staging-month-end-factsheet-job.bicep"}
+             REPORTS_JOB: "infra/staging-month-end-factsheet-job.bicep",
+             LOADS_JOB: "infra/staging-institutional-daily.bicep"}
 
     def test_each_time_limit_is_the_jobs_replica_timeout(self):
         for stage, jobs in readiness.LINEAGE_JOBS.items():

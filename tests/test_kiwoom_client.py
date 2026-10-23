@@ -21,6 +21,7 @@ from ibkr_etl.kiwoom_client import (
     krx_code,
     reconcile_us_valuation,
     reconcile_valuation,
+    selling_cost_rule_gap,
 )
 from ibkr_etl.security_master import SecurityIdentifier
 
@@ -333,10 +334,65 @@ class KiwoomPastDayTests(unittest.TestCase):
         self.assertEqual(kiwoom_selling_cost(Decimal("1932850"), date(2026, 10, 19)), Decimal("4145"))
         self.assertEqual(kiwoom_selling_cost(Decimal("17878000"), date(2026, 10, 19)), Decimal("38436"))
 
-    def test_the_account_return_must_hold_the_same_cash(self) -> None:
-        fake = FakeKiwoom({"ka01690": [DAY_BALANCE], "kt00016": [dict(DAY_DETAIL, entr_to="000000001000500")]})
-        with self.assertRaisesRegex(KiwoomError, "kt00016 cash"):
+    # A day with a buy not yet settled at the close: the account's first day, 100 shares bought for
+    # 7,000,000 KRW plus a 1,050 fee. ka01690 counts the buy on the trade date; kt00016 only once it
+    # settles two trading days later, so it still has the cash and no holdings.
+    UNSETTLED = dict(DAY_DETAIL, entr_fr="0", entr_to="000000008001050", scrt_evlt_amt_fr="0", scrt_evlt_amt_to="0",
+                     tot_amt_to="000000008001050")
+
+    def test_a_day_with_trades_not_yet_settled_is_ka01690s_alone(self) -> None:
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, day_stk_asst="000000007988450")],
+                           "kt00016": [self.UNSETTLED]})
+        valuation = _client(fake).balance_on(date(2025, 6, 2))
+        self.assertEqual((valuation.deposit, valuation.estimated_assets), (Decimal("1000000"), Decimal("7988450")))
+        self.assertEqual([(h.code, h.quantity, h.market_value) for h in valuation.holdings],
+                         [("005930", Decimal("100"), Decimal("7000000"))])
+        # kt00016's value of the holdings (nothing yet) is not used; the listed holdings add up.
+        self.assertEqual((valuation.securities_value, valuation.valued_holdings, valuation.price_basis_gap),
+                         (None, Decimal("7000000"), Decimal("0")))
+        self.assertEqual(valuation.selling_cost, kiwoom_selling_cost(Decimal("7000000"), date(2025, 6, 2)))
+        self.assertEqual((valuation.unsettled_trades, valuation.repriced_at_close), (True, False))
+        self.assertNotIn("ka10081", [headers.get("api-id") for _, headers, _ in fake.requests])
+        self.assertEqual(reconcile_valuation(valuation)["status"], "pass")
+
+    def test_a_day_with_trades_not_yet_settled_is_priced_at_the_close_when_that_adds_up(self) -> None:
+        # From 14 Sep 2026 ka01690 lists the after-market price (70,000); Kiwoom's total is at the close (71,000).
+        total = 1000000 + 7100000 - 15260
+        chart = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20260915", "cur_prc": "72000", "pred_pre": "+1000"},
+                                                             {"dt": "20260914", "cur_prc": "70000", "pred_pre": "0"}]}
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20260914", day_stk_asst=f"{total:015d}")],
+                           "kt00016": [self.UNSETTLED], "ka10081": [chart]})
+        valuation = _client(fake).balance_on(date(2026, 9, 14))
+        self.assertEqual([(h.price, h.market_value) for h in valuation.holdings],
+                         [(Decimal("71000"), Decimal("7100000"))])
+        self.assertEqual((valuation.securities_value, valuation.unsettled_trades, valuation.repriced_at_close),
+                         (None, True, True))
+        self.assertEqual(valuation.selling_cost, Decimal("15260"))
+
+    def test_a_day_with_trades_not_yet_settled_must_add_up_to_the_won(self) -> None:
+        # Two won more than the per-stock rule allows for one holding; the close adds up no better.
+        chart = {"return_code": 0, "stk_dt_pole_chart_qry": [{"dt": "20250603", "cur_prc": "70500", "pred_pre": "+500"},
+                                                             {"dt": "20250602", "cur_prc": "70000", "pred_pre": "0"}]}
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, day_stk_asst="000000007988448")],
+                           "kt00016": [self.UNSETTLED], "ka10081": [chart]})
+        with self.assertRaisesRegex(KiwoomError, "do not add up") as raised:
             _client(fake).balance_on(date(2025, 6, 2))
+        # The message names the day and the reason, never an amount.
+        for amount in ("1,000,000", "1000000", "8,001,050", "8001050", "7,988,448", "7988448"):
+            self.assertNotIn(amount, str(raised.exception))
+
+    def test_an_unsettled_day_with_no_close_yet_fails(self) -> None:
+        fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, day_stk_asst="000000007988448")],
+                           "kt00016": [self.UNSETTLED],
+                           "ka10081": [{"return_code": 0, "stk_dt_pole_chart_qry": []}]})
+        with self.assertRaisesRegex(KiwoomError, "not yet settled"):
+            _client(fake).balance_on(date(2025, 6, 2))
+
+    def test_the_history_checks_selling_cost_rule_allows_a_won_a_holding(self) -> None:
+        values = [Decimal("7000000"), Decimal("1932850")]
+        rule = kiwoom_selling_cost(values[0], date(2026, 10, 19)) + kiwoom_selling_cost(values[1], date(2026, 10, 19))
+        self.assertEqual(selling_cost_rule_gap(values, rule + 2, date(2026, 10, 19)), Decimal("2"))
+        self.assertEqual(selling_cost_rule_gap([], Decimal("0"), date(2026, 10, 19)), Decimal("0"))
 
     def test_a_closed_day_is_none(self) -> None:
         fake = FakeKiwoom({"ka01690": [dict(DAY_BALANCE, dt="20250530")]})

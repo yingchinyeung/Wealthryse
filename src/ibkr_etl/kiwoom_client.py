@@ -28,7 +28,7 @@ import urllib.request
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 from .security_master import SecurityIdentifier
 
@@ -222,6 +222,16 @@ def kiwoom_selling_cost(market_value: Decimal, day: date) -> Decimal:
     return tax + _floor(market_value * SELLING_FEE_RATE, 10)
 
 
+def selling_cost_rule_gap(values: Sequence[Decimal], cost: Decimal, day: date) -> Decimal:
+    """A selling cost less Kiwoom's per-stock cost of selling holdings of these values (kiwoom_selling_cost).
+
+    The cost follows Kiwoom's rule when this is at most 1 KRW a holding: the history check
+    (kiwoom_collector) holds every stored day to it, and balance_on a day with trades not yet settled.
+    """
+
+    return cost - sum((kiwoom_selling_cost(value, day) for value in values), Decimal("0"))
+
+
 @dataclass(frozen=True)
 class AccountValuation:
     account_name: str
@@ -237,6 +247,9 @@ class AccountValuation:
     securities_value: Decimal | None = None
     # True when ka01690 listed after-market prices and the holdings were repriced at the close.
     repriced_at_close: bool = False
+    # True on a past day with trades not yet settled at the close: kt00016 counts a trade only once
+    # it settles, so its figures were not used and the day is ka01690's alone (see balance_on).
+    unsettled_trades: bool = False
 
     @property
     def holdings_value(self) -> Decimal:
@@ -526,6 +539,13 @@ class KiwoomClient:
         plus cash, after its estimated selling costs. Kiwoom's value of the
         holdings is read from the day's account return (kt00016): from 14 Sep
         2026 it can differ from the holdings at the closing prices ka01690 lists.
+
+        kt00016 counts a trade only once it settles, two trading days later
+        (kt00015 dates a trade by its settlement too), while ka01690 counts it
+        on the trade date. On a day with trades not yet settled at the close the
+        two give different cash, and kt00016's value of the holdings leaves out
+        what was bought and keeps what was sold. That day is ka01690's alone
+        (see _unsettled_day).
         """
 
         pages = self.inquire("ka01690", {"qry_dt": _yyyymmdd(day)})
@@ -555,10 +575,9 @@ class KiwoomClient:
         deposit = kiwoom_number(_field(first, "dbst_bal"))
         total = kiwoom_number(_field(first, "day_stk_asst"))
         detail = self.inquire("kt00016", {"fr_dt": _yyyymmdd(day), "to_dt": _yyyymmdd(day)})[0]
-        detail_cash = kiwoom_number(_field(detail, "entr_to"))
-        if detail_cash != deposit:
-            raise KiwoomError(f"kt00016 cash {detail_cash:,} differs from ka01690 cash {deposit:,} on {day.isoformat()}")
         held = tuple(holding for holding in holdings if holding.quantity)
+        if kiwoom_number(_field(detail, "entr_to")) != deposit:
+            return self._unsettled_day(held, deposit, total, day)
         repriced = False
         securities_value = kiwoom_number(_field(detail, "scrt_evlt_amt_to"))
         if sum((item.market_value for item in held), Decimal("0")) != securities_value:
@@ -591,6 +610,40 @@ class KiwoomClient:
             pages = self.inquire("ka10081", {"stk_cd": code, "base_dt": today, "upd_stkpc_tp": "0"}, max_pages=1)
             closes = self._closes[code] = chart_closes(pages)
         return closes.get(_yyyymmdd(day))
+
+    def _unsettled_day(self, held: tuple[Holding, ...], deposit: Decimal, total: Decimal,
+                       day: date) -> AccountValuation:
+        """A past day with trades not yet settled at the close, from ka01690 alone.
+
+        kt00016's figures are on a settled basis that day, so its value of the
+        holdings is not used. ka01690's holdings are kept when they, its cash and
+        Kiwoom's per-stock selling cost add up to its total, within 1 KRW a
+        holding: the rule the history check holds every stored day to. If the
+        listed prices do not add up (after-market prices, from 14 Sep 2026), the
+        holdings at the official close are kept if they do. Otherwise the day
+        fails, naming no amount.
+        """
+
+        def adds_up(items: tuple[Holding, ...]) -> bool:
+            values = [item.market_value for item in items]
+            cost = sum(values, Decimal("0")) + deposit - total
+            return abs(selling_cost_rule_gap(values, cost, day)) <= len(values)
+
+        repriced = False
+        if not adds_up(held):
+            closed = self._at_official_close(held, day)
+            if closed is None or not adds_up(closed):
+                raise KiwoomError(f"ka01690 holdings and cash do not add up to its total after Kiwoom's selling cost "
+                                  f"on {day.isoformat()}, a day with trades not yet settled (kt00016 cash differs)")
+            held, repriced = closed, True
+        return AccountValuation(
+            account_name="",
+            deposit=deposit,
+            estimated_assets=total,
+            holdings=held,
+            repriced_at_close=repriced,
+            unsettled_trades=True,
+        )
 
     def _at_official_close(self, holdings: tuple[Holding, ...], day: date) -> tuple[Holding, ...] | None:
         repriced: list[Holding] = []

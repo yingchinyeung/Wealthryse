@@ -197,6 +197,33 @@ class KiwoomBronzeHistoryTests(TwoKiwoomAccounts):
         self.assertTrue(all(item["status"] in ("out of time", "nothing to ask") for item in results), results)
         self.assertEqual(self._bronze_runs(), runs)
 
+    def test_the_days_of_a_run_that_failed_are_asked_again(self):
+        # Runs after test_past_days_go_to_bronze_and_rebuild_as_silver_holds_them (name order): every past day
+        # is in bronze. A run that fails part-way, as one stopped by a day the client could not value, may hold
+        # a day's first answers but not the rest, so its days count as not held.
+        self._ask()
+        rows = self.db.execute(
+            "SELECT k.run_id, count(DISTINCT k.request_key->>'qry_dt') AS days FROM bronze.kiwoom_responses k "
+            "WHERE k.api_id = 'ka01690' AND k.request_key->>'account' = ? GROUP BY k.run_id ORDER BY days DESC",
+            (ACCOUNT,)).fetchall()
+        run_id, days = int(rows[0]["run_id"]), int(rows[0]["days"])
+        self.db.execute("UPDATE ingestion_runs SET status = 'failed' WHERE run_id = ?", (run_id,))
+        self.db.commit()
+        try:
+            results, _ = self._ask()
+            self.assertEqual([(item["market"], item["status"], item["days_asked"]) for item in results],
+                             [("KRW", "asked", days), ("USD", "nothing to ask", 0)])
+            checked = self._check(results[0]["run_id"])
+            self.assertEqual(checked["parts"], {"movements": "rebuilt", "history": "rebuilt"})
+            self.assertEqual(checked["history_days"]["replayed"], days)
+            self.assertTrue(checked["clean"], checked)
+            results, _ = self._ask()
+            self.assertEqual([item["status"] for item in results], ["nothing to ask", "nothing to ask"])
+        finally:
+            self.db.rollback()
+            self.db.execute("UPDATE ingestion_runs SET status = 'success' WHERE run_id = ?", (run_id,))
+            self.db.commit()
+
     def test_the_script_refuses_without_bronze_capture(self):
         spec = importlib.util.spec_from_file_location("run_kiwoom_bronze_history",
                                                       ROOT / "scripts" / "run_kiwoom_bronze_history.py")

@@ -75,8 +75,12 @@ class ContractFileTests(unittest.TestCase):
                 self.assertEqual(mc.custom(contract.get("customProperties"), "source"), entry["source"])
 
     def test_freshness_promise_matches_layer_freshness(self):
-        rules = {rule.target.split(".", 1)[1]: rule for rule in layer_freshness.RULES
-                 if rule.layer in mc.LAYERS}
+        # A table's first rule is its freshness promise (scripts/medallion_contracts.py _sla); a later
+        # rule on the same table, such as one Kiwoom account's NAV date, is an extra check.
+        rules: dict = {}
+        for rule in layer_freshness.RULES:
+            if rule.layer in mc.LAYERS:
+                rules.setdefault(rule.target.split(".", 1)[1], rule)
         for path, contract in self.contracts.items():
             with self.subTest(path=path.name):
                 rule = rules.get(path.stem)

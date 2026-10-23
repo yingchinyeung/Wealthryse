@@ -180,9 +180,9 @@ class CatalogCoverageTests(unittest.TestCase):
         pass_plan = layer_quality.plan({layer_quality.CONTRACTS_DIR_ENV: str(CONTRACTS)})
         self.assertIsNone(pass_plan.contracts_error)
         self.assertEqual(len(pass_plan.contracts), 43)
-        self.assertEqual(len(pass_plan.rules), 234)
-        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 234)
-        self.assertEqual(sum(r.needs_rls_bypass for r in pass_plan.rules), 15)
+        self.assertEqual(len(pass_plan.rules), 240)
+        self.assertEqual(len({r.check_id for r in pass_plan.rules}), 240)
+        self.assertEqual(sum(r.needs_rls_bypass for r in pass_plan.rules), 21)
         # U8's history is no longer held: migration 074 is in migrations/postgres.
         self.assertNotIn("silver.nav_snapshots_history", pass_plan.held)
         self.assertNotIn("public.silver_history_settings", pass_plan.held)

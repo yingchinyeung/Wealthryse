@@ -2,21 +2,29 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.cash_transactions
 name: cash_transactions
-version: 1.0.1
+version: 1.1.0
 status: active
 domain: silver
 dataProduct: portfolio-medallion
 description:
-  purpose: 'Cash transactions per account from the Flex statements: deposits and withdrawals, dividends, interest,
-    fees and the rest of IBKR''s cash activity.'
-  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
-    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
-    item U8's history is switched on, every version is also kept in silver.cash_transactions_history, and silver.cash_transactions_as_known(at)
-    returns this table as it stood at any moment. Flows are classified downstream (derived_portfolio, the benchmark
-    comparison), not here.
+  purpose: 'Cash transactions per account from the Flex statements, or for a Kiwoom account from Kiwoom''s movement
+    list: deposits and withdrawals, dividends, interest, fees and the rest of the cash activity.'
+  limitations: 'Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks
+    the account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once
+    review item U8''s history is switched on, every version is also kept in silver.cash_transactions_history, and
+    silver.cash_transactions_as_known(at) returns this table as it stood at any moment. Flows are classified downstream
+    (derived_portfolio, the benchmark comparison), not here. Kiwoom accounts (ibkr_etl.kiwoom_collector for Korea,
+    ibkr_etl.kiwoom_us_account for the U.S. account): transaction_type is the platform''s own kind (such as DEPOSIT,
+    WITHDRAWAL, DIVIDEND, INTEREST, TAX, FEE, FX_EXCHANGE or CORPORATE_ACTION_CASH), amount_text carries the cash
+    direction (an exchange keeps Kiwoom''s own sign), and source_key is a sha256 of the movement. Kiwoom leaves
+    money paid into or out of the U.S. account out of its U.S. movement list, so the U.S. account''s DEPOSIT and
+    WITHDRAWAL rows are read from jumps in Kiwoom''s own USD cash after each movement (kiwoom_us_account.balance_gaps),
+    dated with the movement that shows the jump. A Kiwoom row''s row_sha256 is the sha256 of the row as written,
+    not of a Flex row.'
 tags:
 - silver
 - ibkr
+- kiwoom
 schema:
 - name: cash_transactions
   physicalName: silver.cash_transactions
@@ -116,7 +124,8 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
-    description: IBKR cash transaction type, such as Deposits/Withdrawals or Dividends.
+    description: IBKR cash transaction type, such as Deposits/Withdrawals or Dividends. For a Kiwoom account, the
+      platform's own kind, such as DEPOSIT or DIVIDEND.
   - name: description
     physicalType: text
     logicalType: string
@@ -198,6 +207,19 @@ schema:
     mustBe: 0
     severity: warning
     dimension: consistency
+  - name: kiwoom_flow_direction
+    description: A Kiwoom deposit, dividend, interest or corporate action cash row is never negative, and a withdrawal,
+      tax or fee row never positive (kiwoom_collector.movement_rows, kiwoom_us_account.us_movement_rows and balance_gaps).
+      Returns read deposits and withdrawals as flows, so a sign error would move a return. Run with a role that
+      bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.cash_transactions n WHERE EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id
+      = n.account_id AND a.account_type = 'kiwoom') AND ((n.transaction_type IN ('DEPOSIT', 'DIVIDEND', 'INTEREST',
+      'CORPORATE_ACTION_CASH') AND n.amount_text::numeric < 0) OR (n.transaction_type IN ('WITHDRAWAL', 'TAX', 'FEE')
+      AND n.amount_text::numeric > 0))
+    mustBe: 0
+    severity: warning
+    dimension: accuracy
 team:
 - username: portfolio-platform
   role: owner
@@ -219,4 +241,8 @@ customProperties:
 - property: producers
   value:
   - ibkr_etl.loader
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
+  - ibkr_etl.kiwoom_us_account
 contractCreatedTs: '2026-10-18T00:00:00Z'

@@ -238,7 +238,8 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         self.assertEqual(results["volume.silver.trades_history"]["state"], "recorded")  # no earlier total
         self.assertEqual(results["schema.silver.trades_history"]["state"], "pass")
         rls = {c for c in states["skipped"] - held if c.startswith("rule.")}
-        self.assertEqual(len(rls), 15)  # need an RLS bypass (5 of them on the history tables)
+        # need an RLS bypass (5 of them on the history tables, 8 the Kiwoom account rules)
+        self.assertEqual(len(rls), 21)
         self.assertEqual(results["volume.gold.certified_figures"]["state"], "recorded")  # no earlier total
         self.assertEqual(results["schema.gold.certified_builds"]["state"], "pass")
         nav = results["volume.silver.nav_snapshots"]
@@ -318,9 +319,14 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         self.assertEqual(targets["silver.checks"]["status"], "missed")  # positions dropped to zero
         self.assertEqual(targets["silver.ready"]["week"]["unmeasured"], 4)  # 12-14 and 16 Oct: no history
         failed = {f["check_id"]: f for f in weekly["failed_checks"]}
-        self.assertEqual(set(failed), {"value.nav_move", "value.positions_to_zero"})
+        # This synthetic data has no Kiwoom account, so the reported-only Kiwoom NAV date is missing:
+        # a warning in the weekly report, never an error against a target.
+        self.assertEqual(set(failed), {"value.nav_move", "value.positions_to_zero", "silver.nav_snapshots.kiwoom"})
+        self.assertEqual(failed["silver.nav_snapshots.kiwoom"]["severity"], "warning")
         self.assertEqual(failed["value.positions_to_zero"]["table"], "silver.subject_position_series")
-        self.assertEqual(weekly["unavailable_checks"]["count"], len(unreadable))
+        # The contract rules the approval login cannot read, and bronze's Kiwoom answers, which it cannot
+        # read yet either (a reported-only freshness check).
+        self.assertEqual(weekly["unavailable_checks"]["count"], len(unreadable) + 1)
         text = layer_quality.render(weekly)
         self.assertIn("silver ready by 09:00 UTC on 99% of business days: MET", text)
         self.assertNotIn("***", text)

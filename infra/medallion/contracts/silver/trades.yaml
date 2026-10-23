@@ -2,20 +2,28 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.trades
 name: trades
-version: 1.0.1
+version: 1.1.0
 status: active
 domain: silver
 dataProduct: portfolio-medallion
 description:
-  purpose: 'Trade executions per account from the Flex statements: quantity, price, proceeds, commission, net cash
-    and realised P&L.'
-  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
-    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
-    item U8's history is switched on, every version is also kept in silver.trades_history, and silver.trades_as_known(at)
-    returns this table as it stood at any moment.
+  purpose: 'Trade executions per account from the Flex statements, or for a Kiwoom account from Kiwoom''s movement
+    list: quantity, price, proceeds, commission, net cash and realised P&L.'
+  limitations: 'Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks
+    the account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once
+    review item U8''s history is switched on, every version is also kept in silver.trades_history, and silver.trades_as_known(at)
+    returns this table as it stood at any moment. Kiwoom accounts (ibkr_etl.kiwoom_collector for Korea, ibkr_etl.kiwoom_us_account
+    for the U.S. account): one row per share movement in Kiwoom''s list (kt00015 for Korea, ust21100 for the U.S.
+    account), with source_key and trade_id a sha256 of the movement and its occurrence that day, conid the platform
+    security key, buy_sell BUY, SELL, TRANSFER_IN or TRANSFER_OUT (Korea) or BUY, SELL, CORPORATE_ACTION_IN or CORPORATE_ACTION_OUT
+    (U.S.), quantity negative for shares out, and proceeds and net cash Kiwoom''s amount signed by the cash direction
+    (zero for a U.S. corporate action; a Korea transfer keeps Kiwoom''s own amount). No commission or realised P&L:
+    Kiwoom''s fees and taxes are separate cash_transactions rows. A Kiwoom row''s row_sha256 is the sha256 of the
+    row as written, not of a Flex row.'
 tags:
 - silver
 - ibkr
+- kiwoom
 schema:
 - name: trades
   physicalName: silver.trades
@@ -123,7 +131,8 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
-    description: BUY or SELL as IBKR sends it.
+    description: 'BUY or SELL as IBKR sends it. For a Kiwoom account, the movement''s kind: BUY, SELL, TRANSFER_IN,
+      TRANSFER_OUT, CORPORATE_ACTION_IN or CORPORATE_ACTION_OUT.'
   - name: quantity_text
     physicalType: text
     logicalType: string
@@ -304,6 +313,19 @@ schema:
     mustBe: 0
     severity: warning
     dimension: consistency
+  - name: kiwoom_share_direction
+    description: A Kiwoom trade has one of the six kinds the collectors write, and its quantity is never negative
+      for shares in or positive for shares out (kiwoom_collector.movement_rows, kiwoom_us_account.us_movement_rows).
+      Run with a role that bypasses row-level security.
+    type: sql
+    query: SELECT COUNT(*) FROM silver.trades n WHERE EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id
+      = n.account_id AND a.account_type = 'kiwoom') AND (n.buy_sell NOT IN ('BUY', 'SELL', 'TRANSFER_IN', 'TRANSFER_OUT',
+      'CORPORATE_ACTION_IN', 'CORPORATE_ACTION_OUT') OR (n.buy_sell IN ('BUY', 'TRANSFER_IN', 'CORPORATE_ACTION_IN')
+      AND n.quantity_text::numeric < 0) OR (n.buy_sell IN ('SELL', 'TRANSFER_OUT', 'CORPORATE_ACTION_OUT') AND n.quantity_text::numeric
+      > 0))
+    mustBe: 0
+    severity: warning
+    dimension: conformity
 team:
 - username: portfolio-platform
   role: owner
@@ -327,4 +349,8 @@ customProperties:
 - property: producers
   value:
   - ibkr_etl.loader
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
+  - ibkr_etl.kiwoom_us_account
 contractCreatedTs: '2026-10-18T00:00:00Z'

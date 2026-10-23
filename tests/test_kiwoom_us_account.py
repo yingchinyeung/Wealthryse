@@ -106,6 +106,16 @@ class LabelTests(unittest.TestCase):
         cash = {(row["transaction_type"], row["amount_text"]) for row in moved["cash_transactions"]}
         self.assertEqual(cash, {("DIVIDEND", "4.25"), ("CORPORATE_ACTION_CASH", "15.14")})
 
+    def test_the_website_sees_english_labels_not_kiwoom_korean(self):
+        moved, _ = us_movement_rows(ACCOUNT, [*MOVES, *LIVE], Securities(known={}))
+        texts = [row["description"] for row in moved["cash_transactions"]]
+        texts += [row["order_reference"] for row in moved["trades"] if row["order_reference"]]
+        self.assertTrue(texts)
+        self.assertTrue(all(text.isascii() for text in texts), texts)
+        labels = {(row["transaction_type"], row["description"]) for row in moved["cash_transactions"]}
+        self.assertIn(("DIVIDEND", "Dividend"), labels)
+        self.assertIn(("CORPORATE_ACTION_CASH", "Corporate action cash"), labels)
+
 
 class RowAndCheckTests(unittest.TestCase):
     def test_rows_are_in_usd_and_add_up_to_kiwoom_total(self):

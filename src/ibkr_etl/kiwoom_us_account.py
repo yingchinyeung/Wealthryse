@@ -237,6 +237,7 @@ def us_movement_rows(account_id: str, movements: Iterable[CashMovement],
     """U.S. trades, corporate actions and cash movements as platform rows, and the labels not read."""
 
     from .kiwoom_collector import _sha  # one source-key rule for every Kiwoom account
+    from .kiwoom_english import movement_description
 
     trades, cash, unknown = [], [], []
     seen: dict[tuple, int] = {}
@@ -264,13 +265,16 @@ def us_movement_rows(account_id: str, movements: Iterable[CashMovement],
                                      if movement.quantity and movement.amount else None),
                 "proceeds_text": _text(amount), "commission_text": None, "commission_currency": movement.currency,
                 "net_cash_text": _text(amount), "realized_pnl_text": None, "currency": movement.currency,
-                "order_reference": movement.description[:200] or None, "model_code": "",
+                "order_reference": None, "model_code": "",
             })
         else:
             cash.append({
                 "account_id": account_id, "source_key": source_key, "transaction_id": source_key,
                 "event_datetime": movement.trade_date, "model_code": "", "effective_date": movement.trade_date,
-                "settle_date": None, "transaction_type": kind, "description": movement.description[:500] or kind,
+                "settle_date": None, "transaction_type": kind,
+                # Kiwoom's own label is Korean (외화배당금입금); the website shows this English one. No ticker in
+                # it, so no ticker can read as a deposit or fee word to the cash-flow checks; conid names the stock.
+                "description": movement_description(kind),
                 "amount_text": _text(amount), "currency": movement.currency, "conid": key,
             })
     for gap in balance_gaps(movements):

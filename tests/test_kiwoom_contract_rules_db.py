@@ -9,7 +9,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from test_medallion_layers_db import ADMIN_DSN, OWNER, _build, _connect, _drop
+from test_medallion_layers_db import ADMIN_DSN, _build, _connect, _drop
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACTS = ROOT / "infra" / "medallion" / "contracts"

@@ -2,16 +2,21 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.accounts
 name: accounts
-version: 1.0.0
+version: 1.0.1
 status: active
 domain: silver
 dataProduct: portfolio-medallion
 description:
-  purpose: One row per IBKR account seen in a Flex statement, with the tenant it belongs to. The account-level Flex
-    tables are isolated by tenant through this table.
+  purpose: 'One row per broker account: each IBKR account seen in a Flex statement, and each Kiwoom account the
+    platform loads, with the tenant it belongs to. The account-level tables are isolated by tenant through this
+    table.'
+  limitations: A Kiwoom account has account_type 'kiwoom', no ib_entity, and base_currency KRW (a Korea account,
+    ibkr_etl.kiwoom_collector) or USD (the U.S. account, ibkr_etl.kiwoom_us_account, whose source_json names the
+    US market).
 tags:
 - silver
 - ibkr
+- kiwoom
 schema:
 - name: accounts
   physicalName: silver.accounts
@@ -45,7 +50,7 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
-    description: Account base currency from the statement.
+    description: Account base currency from the statement; for a Kiwoom account, KRW or USD (see limitations).
   - name: account_type
     physicalType: text
     logicalType: string
@@ -54,7 +59,7 @@ schema:
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
-    description: Account type from the statement.
+    description: Account type from the statement; 'kiwoom' for a Kiwoom account.
   - name: ib_entity
     physicalType: text
     logicalType: string
@@ -146,4 +151,8 @@ customProperties:
 - property: producers
   value:
   - ibkr_etl.loader
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
+  - ibkr_etl.kiwoom_us_account
 contractCreatedTs: '2026-10-18T00:00:00Z'

@@ -2,19 +2,22 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.fx_rates
 name: fx_rates
-version: 1.0.1
+version: 1.0.2
 status: active
 domain: silver
 dataProduct: portfolio-medallion
 description:
   purpose: FX conversion rates per account and statement date from the Flex statements.
-  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
-    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
-    item U8's history is switched on, every version is also kept in silver.fx_rates_history, and silver.fx_rates_as_known(at)
-    returns this table as it stood at any moment.
+  limitations: 'Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks
+    the account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once
+    review item U8''s history is switched on, every version is also kept in silver.fx_rates_history, and silver.fx_rates_as_known(at)
+    returns this table as it stood at any moment. Kiwoom accounts: a Korea account''s row converts each foreign
+    currency it holds into KRW at Kiwoom''s rate for the day; the U.S. Kiwoom account''s row converts KRW into USD
+    at one over Kiwoom''s KRW per USD rate, to 12 decimal places.'
 tags:
 - silver
 - ibkr
+- kiwoom
 schema:
 - name: fx_rates
   physicalName: silver.fx_rates
@@ -154,4 +157,8 @@ customProperties:
 - property: producers
   value:
   - ibkr_etl.loader
+- property: additionalProducers
+  value:
+  - ibkr_etl.kiwoom_collector
+  - ibkr_etl.kiwoom_us_account
 contractCreatedTs: '2026-10-18T00:00:00Z'

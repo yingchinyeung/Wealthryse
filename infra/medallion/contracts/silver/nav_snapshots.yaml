@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.nav_snapshots
 name: nav_snapshots
-version: 1.0.3
+version: 1.1.0
 status: active
 domain: silver
 dataProduct: portfolio-medallion
@@ -10,23 +10,30 @@ description:
   purpose: Net asset value per account and statement date, in total and by asset class, from the Flex NAV and equity
     summary sections, or for a Kiwoom account from Kiwoom's account answers. The source of every account NAV the
     platform reports.
-  limitations: Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks the
-    account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once review
-    item U8's history is switched on, every version is also kept in silver.nav_snapshots_history, and silver.nav_snapshots_as_known(at)
+  limitations: 'Amounts are decimal text, cast on read. Isolated by account (the account_isolation policy looks
+    the account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of each row. Once
+    review item U8''s history is switched on, every version is also kept in silver.nav_snapshots_history, and silver.nav_snapshots_as_known(at)
     returns this table as it stood at any moment. Kiwoom accounts (written by ibkr_etl.kiwoom_collector) have one
-    KRW TOTAL row per day. total_text is Kiwoom's own total (kt00004 prsm_dpst_aset_amt today, ka01690 day_stk_asst
-    for a past day), which is after Kiwoom's estimated tax and fee for selling every holding, plus any US holdings
-    and deposits at Kiwoom's rate to KRW. stock_text is Kiwoom's own value of the holdings (the holdings kt00004
+    KRW TOTAL row per day. total_text is Kiwoom''s own total (kt00004 prsm_dpst_aset_amt today, ka01690 day_stk_asst
+    for a past day), which is after Kiwoom''s estimated tax and fee for selling every holding, plus any US holdings
+    and deposits at Kiwoom''s rate to KRW. stock_text is Kiwoom''s own value of the holdings (the holdings kt00004
     lists today; kt00016 scrt_evlt_amt_to for a past day, whose entr_to must equal dbst_bal), which is the holdings
-    at the official KRX close, so the account's positions add up to it to the won. cash_text is the deposit (d2_entra
-    today, dbst_bal for a past day) plus any US deposits, and accruals_text Kiwoom's selling cost as a negative
+    at the official KRX close, so the account''s positions add up to it to the won. cash_text is the deposit (d2_entra
+    today, dbst_bal for a past day) plus any US deposits, and accruals_text Kiwoom''s selling cost as a negative
     amount, worked out per stock (see kiwoom_selling_cost_rule), so stock + cash + accruals = total. Reports use
-    total_text as the account's NAV (decided 19 Oct 2026). The daily run (08:00 UTC, 17:00 KST, inside KRX's after-market)
-    writes today's row at the prices Kiwoom lists then; the next run's history pass writes the day again at the
+    total_text as the account''s NAV (decided 19 Oct 2026). The daily run (08:00 UTC, 17:00 KST, inside KRX''s after-market)
+    writes today''s row at the prices Kiwoom lists then; the next run''s history pass writes the day again at the
     official close. A Kiwoom row is final once a kiwoom_rest_history run has written it (last_seen_run_id), so a
-    month-end is final after the next trading day's run, and month-end reports render after it (ibkr_etl.designed_reports.month_ready
-    checks the month-end row's run). A Kiwoom row's row_sha256 is the sha256 of the row as written, not of a Flex
-    row.
+    month-end is final after the next trading day''s run, and month-end reports render after it (ibkr_etl.designed_reports.month_ready
+    checks the month-end row''s run). A Kiwoom row''s row_sha256 is the sha256 of the row as written, not of a Flex
+    row. The U.S. Kiwoom account (written by ibkr_etl.kiwoom_us_account; its silver.accounts base currency is USD
+    and it holds U.S. stocks only) has one USD TOTAL row per closed U.S. trading day, from Kiwoom''s daily answer
+    for that day (ust21132): stock_text is Kiwoom''s securities value, cash_text the USD deposit plus any won cash
+    at Kiwoom''s rate, total_text their sum and accruals_text 0, since Kiwoom''s U.S. total has no selling cost.
+    Its positions are rebuilt from the movements at each stock''s close and add up to stock_text to the cent a position
+    (rule kiwoom_usd_positions_add_up_to_stock). Kiwoom''s figure for the latest two sessions is provisional: those
+    days are asked for again on each run until they add up. The freshness check silver.nav_snapshots.kiwoom watches
+    each Kiwoom account''s newest TOTAL row, so one account falling behind shows even while others load.'
 tags:
 - silver
 - ibkr
@@ -281,6 +288,57 @@ schema:
     mustBe: 0
     severity: warning
     dimension: accuracy
+  - name: kiwoom_total_adds_up
+    description: 'Every Kiwoom TOTAL row: stock_text + cash_text + accruals_text is total_text, to 1 KRW on a KRW
+      row (ibkr_etl.kiwoom_collector.history_issues) and to the cent on a USD row (ibkr_etl.kiwoom_us_account.us_rows).
+      A Korea day stored on an earlier basis fails until it is collected again. Run with a role that bypasses row-level
+      security.'
+    type: sql
+    query: SELECT COUNT(*) FROM silver.nav_snapshots n WHERE n.asset_class = 'TOTAL' AND EXISTS (SELECT 1 FROM silver.accounts
+      a WHERE a.account_id = n.account_id AND a.account_type = 'kiwoom') AND abs(COALESCE(n.total_text, '0')::numeric
+      - COALESCE(n.cash_text, '0')::numeric - COALESCE(n.stock_text, '0')::numeric - COALESCE(n.accruals_text, '0')::numeric)
+      > CASE WHEN n.currency = 'KRW' THEN 1 ELSE 0.01 END
+    mustBe: 0
+    severity: warning
+    dimension: accuracy
+  - name: kiwoom_nav_in_account_currency
+    description: 'A Kiwoom account''s rows are in its own currency (silver.accounts.base_currency: KRW for a Korea
+      account, USD for the U.S. account), so one account''s NAV is never read in two currencies. Run with a role
+      that bypasses row-level security.'
+    type: sql
+    query: SELECT COUNT(*) FROM silver.nav_snapshots n JOIN silver.accounts a ON a.account_id = n.account_id WHERE
+      a.account_type = 'kiwoom' AND (a.base_currency IS NULL OR n.currency <> a.base_currency)
+    mustBe: 0
+    severity: warning
+    dimension: consistency
+  - name: kiwoom_usd_positions_add_up_to_stock
+    description: 'The U.S. Kiwoom account''s USD TOTAL row (a Kiwoom account whose base currency is USD): that day''s
+      positions add up to stock_text to the cent a position (ibkr_etl.kiwoom_us_account.us_days_stored). The account''s
+      two newest days are left out: Kiwoom''s figure for its latest sessions is provisional and is asked for again
+      on each run. Run with a role that bypasses row-level security.'
+    type: sql
+    query: SELECT COUNT(*) FROM silver.nav_snapshots n CROSS JOIN LATERAL (SELECT COUNT(*) AS held, COALESCE(SUM(p.market_value_text::numeric),
+      0) AS value FROM silver.position_snapshots p WHERE p.account_id = n.account_id AND p.snapshot_date = n.snapshot_date)
+      h WHERE n.asset_class = 'TOTAL' AND n.currency = 'USD' AND EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id
+      = n.account_id AND a.account_type = 'kiwoom' AND a.base_currency = 'USD') AND n.snapshot_date < (SELECT d.snapshot_date
+      FROM silver.nav_snapshots d WHERE d.account_id = n.account_id AND d.asset_class = 'TOTAL' ORDER BY d.snapshot_date
+      DESC OFFSET 1 LIMIT 1) AND abs(h.value - COALESCE(n.stock_text, '0')::numeric) > 0.01 * GREATEST(1, h.held)
+    mustBe: 0
+    severity: warning
+    dimension: accuracy
+  - name: kiwoom_usd_cash_matches_cash_rows
+    description: 'The U.S. Kiwoom account''s USD TOTAL row (a Kiwoom account whose base currency is USD): cash_text
+      is that day''s silver.cash_snapshots rows at their rate into USD, to the cent (ibkr_etl.kiwoom_us_account.us_rows
+      writes both). Run with a role that bypasses row-level security.'
+    type: sql
+    query: SELECT COUNT(*) FROM silver.nav_snapshots n WHERE n.asset_class = 'TOTAL' AND n.currency = 'USD' AND
+      EXISTS (SELECT 1 FROM silver.accounts a WHERE a.account_id = n.account_id AND a.account_type = 'kiwoom' AND
+      a.base_currency = 'USD') AND abs(COALESCE((SELECT SUM(c.ending_cash_text::numeric * c.fx_rate_to_base_text::numeric)
+      FROM silver.cash_snapshots c WHERE c.account_id = n.account_id AND c.snapshot_date = n.snapshot_date), 0)
+      - COALESCE(n.cash_text, '0')::numeric) > 0.01
+    mustBe: 0
+    severity: warning
+    dimension: consistency
 slaDefaultElement: nav_snapshots.snapshot_date
 slaProperties:
 - property: frequency
@@ -333,4 +391,5 @@ customProperties:
 - property: additionalProducers
   value:
   - ibkr_etl.kiwoom_collector
+  - ibkr_etl.kiwoom_us_account
 contractCreatedTs: '2026-10-18T00:00:00Z'

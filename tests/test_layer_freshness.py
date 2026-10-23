@@ -45,7 +45,9 @@ def _fresh_world(now: datetime) -> dict:
     return {
         "bronze.raw_reports": (cycle - timedelta(minutes=29)).isoformat(),
         "bronze.flex_rows": (cycle - timedelta(minutes=28)).isoformat(),
+        "bronze.kiwoom_responses": (cycle - timedelta(minutes=6)).isoformat(),
         "silver.nav_snapshots": (today - timedelta(days=1)).isoformat(),
+        "silver.nav_snapshots.kiwoom": (today - timedelta(days=1)).isoformat(),
         "silver.position_snapshots": (today - timedelta(days=1)).isoformat(),
         "silver.benchmark_prices": cycle.isoformat(),
         "silver.market_data_prices": (today - timedelta(days=1)).isoformat(),
@@ -177,12 +179,29 @@ class RuleCatalogTests(unittest.TestCase):
         self.assertEqual(feeds, set(raw_capture.FEEDS) - {"yahoo-crisis-history"})
         self.assertEqual({rule.feed for rule in RULES if rule.feed and rule.required},
                          {"yahoo-benchmark-history", "treasury-par-yield"})
-        for target in ("public.raw_reports", "public.flex_rows", "public.nav_snapshots",
+        for target in ("public.raw_reports", "public.flex_rows", "public.kiwoom_responses", "public.nav_snapshots",
                        "public.position_snapshots", "public.market_data_prices", "public.benchmark_prices",
                        "public.risk_free_rates", "public.risk_analytics_snapshots",
                        "public.performance_comparison_daily", "public.crisis_scenario_results",
                        "public.crisis_replay_daily"):
             self.assertIn(target, {rule.target for rule in RULES})
+
+    def test_kiwoom_checks_are_reported_until_switched_to_required(self):
+        # Kiwoom's answers in bronze, and each Kiwoom account's newest NAV in silver. Both are reported
+        # only: the administrator's login cannot read bronze.kiwoom_responses yet.
+        bronze, silver = RULE["bronze.kiwoom_responses"], RULE["silver.nav_snapshots.kiwoom"]
+        self.assertEqual((bronze.layer, bronze.measure, bronze.required), ("bronze", LOADED, False))
+        self.assertEqual((silver.layer, silver.measure, silver.required), ("silver", AS_OF, False))
+        # A refused call is stored in bronze too, but only an answered page counts as fresh data.
+        self.assertIn("http_status = 200 AND COALESCE(return_code, 0) = 0", bronze.query)
+        # The stalest Kiwoom account decides, so one account falling behind shows.
+        self.assertTrue(silver.query.startswith("SELECT MIN(latest) AS observed"))
+        self.assertIn("a.account_type = 'kiwoom'", silver.query)
+        # The table's freshness promise in its contract stays the account-wide rule.
+        self.assertEqual(next(r for r in RULES if r.target == "public.nav_snapshots").check_id,
+                         "silver.nav_snapshots")
+        stale = evaluate(silver, "2026-10-09", now=AFTER_CYCLE)
+        self.assertEqual((stale["state"], stale["late"]), ("late", False))
 
     def test_blob_checks_have_their_own_switch_off_by_default(self):
         self.assertFalse(layer_freshness.blob_checks_enabled({}))

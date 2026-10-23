@@ -40,6 +40,7 @@ from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping, Sequence
 
+from ibkr_etl import nav_rebuild
 from ibkr_etl.security_master import (SecurityConflict, SecurityIdentifier, SecurityMaster, ibkr_identifiers,
                                       new_security_key)
 
@@ -242,63 +243,23 @@ def securities_check(overview: Mapping[str, Any]) -> tuple[dict[str, Any], list[
 # 4. NAV ----------------------------------------------------------------------------
 
 
-def _fx(currency: str, base: str, day: Mapping[str, Any]) -> Decimal | None:
-    if currency == base:
-        return Decimal(1)
-    for row in day["cash"]:
-        if row.get("currency") == currency and (rate := _decimal(row.get("fx_rate_to_base_text"))):
-            return rate
-    for row in day["fx_rates"]:
-        rate = _decimal(row.get("rate_text"))
-        if not rate:
-            continue
-        if (row.get("from_currency"), row.get("to_currency")) == (currency, base):
-            return rate
-        if (row.get("from_currency"), row.get("to_currency")) == (base, currency):
-            return Decimal(1) / rate
-    return None
-
-
 def rebuild(day: Mapping[str, Any], base: str, settings: ReconcileSettings) -> dict[str, Any] | None:
-    """One day's rebuilt NAV against IBKR's, with the facts that could explain a gap. None when IBKR gave no NAV."""
+    """One day's rebuilt NAV against IBKR's, with the facts that could explain a gap. None when IBKR gave no NAV.
+
+    The arithmetic is ibkr_etl.nav_rebuild, the same as the daily quality check: when IBKR's Cash Report has
+    no per-currency rows, its base-currency total is the account's cash."""
     total = next((r for r in day["nav"] if r.get("asset_class") == "TOTAL"), None)
-    broker = _decimal(total and total.get("total_text"))
-    if broker is None:
+    if total is None or _decimal(total.get("total_text")) is None:
         return None
     base = str(total.get("currency") or base) if _CURRENCY.match(str(total.get("currency") or "")) else base
-    missing_fx: set[str] = set()
-    missing_price: list[dict[str, Any]] = []
-    positions = Decimal(0)
-    for row in day["positions"]:
-        quantity, value = _decimal(row.get("quantity_text")), _decimal(row.get("market_value_text"))
-        if not quantity:
-            continue
-        price = _decimal(row.get("mark_price_text"))
-        if value is None or not price:
-            missing_price.append({"conid": row["conid"], "quantity": str(quantity)})
-            continue
-        rate = _fx(str(row.get("currency") or base), base, day)
-        if rate is None:
-            missing_fx.add(str(row.get("currency")))
-            continue
-        positions += value * rate
-    cash = Decimal(0)
-    for row in day["cash"]:
-        currency, amount = str(row.get("currency") or ""), _decimal(row.get("ending_cash_text"))
-        if not _CURRENCY.match(currency) or amount is None:  # skips IBKR's BASE_SUMMARY row
-            continue
-        rate = _fx(currency, base, day)
-        if rate is None:
-            missing_fx.add(currency)
-            continue
-        cash += amount * rate
-    accruals = _decimal(total.get("accruals_text")) or Decimal(0)
-    rebuilt = positions + cash + accruals
-    gap = rebuilt - broker
+    found = nav_rebuild.rebuild(total, day["positions"], day["cash"], day["fx_rates"], base)
+    if found is None:
+        return None
+    broker, rebuilt, gap = found["broker_nav"], found["rebuilt_nav"], found["gap"]
+    positions, cash, accruals = found["positions_value"], found["cash_value"], found["accruals"]
+    missing_fx, missing_price = set(found["missing_fx"]), found["missing_price"]
     tolerance = max(Decimal(1), abs(broker) * settings.tolerance_bp / Decimal(10000))
-    broker_positions = sum((_decimal(total.get(k)) or Decimal(0)
-                            for k in ("stock_text", "options_text", "futures_text", "bonds_text")), Decimal(0))
-    broker_cash = _decimal(total.get("cash_text"))
+    broker_positions, broker_cash = found["broker_positions_value"], found["broker_cash"]
     side = None
     if abs(gap) > tolerance:
         position_gap = positions - broker_positions
@@ -314,7 +275,7 @@ def rebuild(day: Mapping[str, Any], base: str, settings: ReconcileSettings) -> d
     settlements = []
     for row in day["activity"]:
         amount = _decimal(row.get("amount_text"))
-        rate = _fx(str(row.get("currency") or base), base, day)
+        rate = nav_rebuild.fx_rate(str(row.get("currency") or base), base, day["cash"], day["fx_rates"])
         if amount is not None and rate is not None and abs(abs(amount * rate) - abs(gap)) <= tolerance:
             settlements.append(row)
     pct = (gap / broker * 100) if broker else Decimal(0)

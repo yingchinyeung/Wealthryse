@@ -153,6 +153,22 @@ def _sum_decimal_attributes(attributes: dict[str, str], *fields: str) -> str | N
     return format(sum(present, Decimal("0")), "f") if present else None
 
 
+NAV_PARTS = (
+    "cash", "stock", "options", "bonds", "commodities",
+    "cfdUnrealizedPl", "forexCfdUnrealizedPl", "cgtWithholdingAccruals",
+    "dividendAccruals", "interestAccruals", "marginFinancingChargeAccruals",
+)
+
+
+def nav_total(attributes: Mapping[str, str], record_type: str) -> str | None:
+    """The NAV total stored for a statement row: IBKR's total field, else, for an
+    EquitySummaryByReportDate row without one (as some Flex queries send it), the sum of its parts."""
+    total = decimal_text(pick(attributes, "total", "endingValue", "netLiquidationValue", "nav"))
+    if total is None and "equitysummarybyreportdate" in record_type.lower():
+        total = _sum_decimal_attributes(dict(attributes), *NAV_PARTS)
+    return total
+
+
 def _upsert_account(connection: sqlite3.Connection, row: FlexRow) -> None:
     attrs = row.attributes
     now = utc_now_iso()
@@ -399,14 +415,7 @@ def _upsert_nav(connection: sqlite3.Connection, row: FlexRow, run_id: int) -> No
         "cfdUnrealizedPl", "forexCfdUnrealizedPl", "cgtWithholdingAccruals",
         "dividendAccruals", "interestAccruals", "marginFinancingChargeAccruals",
     )
-    total = decimal_text(pick(a, "total", "endingValue", "netLiquidationValue", "nav"))
-    if total is None and "equitysummarybyreportdate" in row.record_type.lower():
-        total = _sum_decimal_attributes(
-            a,
-            "cash", "stock", "options", "bonds", "commodities",
-            "cfdUnrealizedPl", "forexCfdUnrealizedPl", "cgtWithholdingAccruals",
-            "dividendAccruals", "interestAccruals", "marginFinancingChargeAccruals",
-        )
+    total = nav_total(a, row.record_type)
     connection.execute(
         """
         INSERT INTO nav_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

@@ -601,7 +601,9 @@ over the same agent views:
 
 - `project_wealth`: a Monte Carlo projection with contributions, withdrawals, a target and a return assumption.
 - `run_what_if`: compares current holdings against hypothetical weights given by symbol (current holdings
-  only, with no new tickers).
+  only, with no new tickers), or against one of `optimise_portfolio`'s mixes named in `mix`. The mix's
+  weights are shares of the holdings optimised, so the tool converts them to fractions of NAV itself;
+  the model never copies them over one by one.
 - `optimise_portfolio`: gives each holding's share of risk, plus minimum-variance, risk-parity and
   maximum-Sharpe mixes. It flags `risk_concentrated_in` for any holding carrying at least 10% of the risk
   and more than 1.25 times its weight.

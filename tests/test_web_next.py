@@ -148,6 +148,15 @@ class TransformTest(unittest.TestCase):
         self.assertIn("nx-model-css", viewer)
         self.assertNotIn("nx-hold-css", viewer)
 
+    def test_page_redesign_phase_5_adds_guide_and_operations(self):
+        page = PAGE.format(s="")
+        with mock.patch.dict(os.environ, {"WEB_DESIGN": "next", "WEB_NEXT_PAGES": "4/5"}):
+            owner = web_next.transform(page, design="next", role="owner", back="/", page_scripts={}, metric_anchors={})
+            viewer = web_next.transform(page, design="next", role="viewer", back="/", page_scripts={}, metric_anchors={})
+        self.assertIn("nx-ops-css", owner)
+        self.assertIn("nx-hold-css", viewer)
+        self.assertNotIn("nx-ops-css", viewer)
+
     def test_page_redesign_phase_values(self):
         cases = {"off": (0, 0), "preview": (0, 1), "on": (1, 1), "2": (2, 2), "0/2": (0, 2),
                  "2/1": (2, 2), "99": (web_next.PAGES_PHASES, web_next.PAGES_PHASES), "x/2": (0, 0)}

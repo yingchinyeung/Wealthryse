@@ -27,6 +27,7 @@ from urllib.parse import quote
 from .web_next_pages import PAGES_CSS, PAGES_SCRIPT
 from .web_next_hold import HOLD_CSS, HOLD_SCRIPT
 from .web_next_model import MODEL_CSS, MODEL_SCRIPT
+from .web_next_ops import OPS_CSS, OPS_SCRIPT
 from .web_next_perf import PERF_CSS, PERF_SCRIPT
 from .web_next_ui import NEXT_CSS, NEXT_SCRIPT
 
@@ -78,7 +79,7 @@ def may_choose(design: str, role: str | None) -> bool:
 
 
 # Phases of the page-by-page redesign built so far. Each one is released on its own.
-PAGES_PHASES = 4
+PAGES_PHASES = 5
 _PAGES_WORDS = {"off": (0, 0), "preview": (0, 1), "on": (1, 1)}
 
 
@@ -153,6 +154,7 @@ def transform(html: str, *, design: str, role: str | None, back: str, page_scrip
             + (f'<style id="nx-perf-css">{PERF_CSS}</style>' if level >= 2 else '')
             + (f'<style id="nx-model-css">{MODEL_CSS}</style>' if level >= 3 else '')
             + (f'<style id="nx-hold-css">{HOLD_CSS}</style>' if level >= 4 else '')
+            + (f'<style id="nx-ops-css">{OPS_CSS}</style>' if level >= 5 else '')
             + f'<script type="speculationrules">{SPECULATION_RULES}</script>')
     marker = html.find("</head>")
     html = html[:marker] + head + html[marker:]
@@ -161,6 +163,7 @@ def transform(html: str, *, design: str, role: str | None, back: str, page_scrip
             + (f"<script>{PAGES_SCRIPT}</script>" if level >= 1 else "")
             + (f"<script>{PERF_SCRIPT}</script>" if level >= 2 else "")
             + (f"<script>{MODEL_SCRIPT}</script>" if level >= 3 else "")
-            + (f"<script>{HOLD_SCRIPT}</script>" if level >= 4 else ""))
+            + (f"<script>{HOLD_SCRIPT}</script>" if level >= 4 else "")
+            + (f"<script>{OPS_SCRIPT}</script>" if level >= 5 else ""))
     marker = html.rfind("</body>")
     return html[:marker] + body + html[marker:]

@@ -152,6 +152,8 @@ const marks=id=>{const c=$(id);if(!c||!charts)return;const box=c.parentElement;$
   const line=s.lines[0],has=v=>v!=null&&Number.isFinite(Number(v)),pts=s.series.map((r,i)=>({i,v:has(r[line.key])?Number(r[line.key]):null,date:r.date})).filter(p=>p.v!==null);if(pts.length<3)return;
   const values=s.lines.flatMap(l=>s.series.filter(r=>has(r[l.key])).map(r=>Number(r[l.key])));const b=chartBounds(values,s.options||{});if(!(b.hi>b.lo))return;
   const cw=c.clientWidth,ch=c.clientHeight,ml=100,mr=22,mt=18,mb=48,w=cw-ml-mr,h=ch-mt-mb,ox=c.offsetLeft,oy=c.offsetTop;
+  // A hidden chart has no size yet; its marks are drawn once it is shown (see the size watcher below).
+  if(w<80||h<40||c.offsetParent!==box.offsetParent&&c.offsetParent!==box)return;
   const at=p=>({x:ox+ml+p.i*w/Math.max(1,s.series.length-1),y:oy+mt+(b.hi-p.v)*h/(b.hi-b.lo)});
   const hi=pts.reduce((a,p)=>p.v>a.v?p:a),lo=pts.reduce((a,p)=>p.v<a.v?p:a),unit=(s.options||{}).unit||'',dd=/drawdown/i.test(id);
   const put=(p,cls,label)=>{const q=at(p),el=d.createElement('div');el.className='nx-mark '+cls;el.style.left=q.x+'px';if(q.x>ox+cw-90)el.classList.add('end');else if(q.x<ox+ml+60)el.classList.add('start');el.style.top=q.y+'px';el.innerHTML=label;box.appendChild(el)};
@@ -162,7 +164,8 @@ if(charts){
   const set=charts.set.bind(charts);charts.set=(k,v)=>{set(k,v);queue(k);return charts};[...charts.keys()].forEach(queue);
   addEventListener('resize',()=>{clearTimeout(queue.r);queue.r=setTimeout(()=>ids.forEach(marks),150)});
   const hover=new Map();
-  const wire=c=>{if(c.dataset.nxChart!==undefined)return;c.dataset.nxChart='';const id='#'+c.id;c.tabIndex=0;c.setAttribute('role','img');
+  const sized=typeof ResizeObserver==='function'?new ResizeObserver(es=>es.forEach(e=>{const id='#'+e.target.id;if(charts.has(id))queue(id)})):null;
+  const wire=c=>{if(c.dataset.nxChart!==undefined)return;c.dataset.nxChart='';const id='#'+c.id;if(sized)sized.observe(c);c.tabIndex=0;c.setAttribute('role','img');
     c.setAttribute('aria-label',(c.getAttribute('aria-label')||'Chart')+'. Use the left and right arrow keys to read values.');
     const len=()=>{const s=charts.get(id);return s&&s.series?s.series.length:0};
     const show=i=>{const n=len();if(!n)return;i=Math.max(0,Math.min(n-1,i));hover.set(id,i);renderChart(id,i)};

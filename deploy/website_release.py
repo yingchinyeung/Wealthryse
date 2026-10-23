@@ -11,7 +11,7 @@ Steps, each a subcommand so the workflow can show and stop at each one:
                    the assurance job itself is not changed
 State passes between steps in release-state.json.
 """
-import ast, base64, difflib, gzip, hashlib, itertools, json, secrets, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
+import ast, base64, difflib, gzip, hashlib, itertools, json, re, secrets, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -965,6 +965,27 @@ DESIGN_MODES = ('classic', 'preview', 'next')
 # The page-by-page redesign (web_next_pages) has its own switch: pages-off, pages-preview, pages-on.
 NEXT_PAGES_SETTING = 'WEB_NEXT_PAGES'
 NEXT_PAGES_MODES = ('pages-off', 'pages-preview', 'pages-on')
+NEXT_PAGES_WORDS = {'off': 0, 'preview': 0, 'on': 1}
+
+
+def next_pages_value(mode, previous, latest):
+    """The WEB_NEXT_PAGES value for a mode. Each phase of the page-by-page redesign goes to
+    owners first: pages-preview keeps everyone on the phases they have and gives owners the
+    latest; pages-on gives everyone the latest; pages-off turns it all off."""
+    if mode == 'pages-off':
+        return 'off'
+    if mode == 'pages-on':
+        return str(latest)
+    text = str(previous or 'off').strip().lower()
+    match = re.fullmatch(r'(\d+)(?:/\d+)?', text)
+    live = min(int(match.group(1)), latest) if match else NEXT_PAGES_WORDS.get(text, 0)
+    return str(latest) if live >= latest else f'{live}/{latest}'
+
+
+def next_pages_latest():
+    """How many phases the code in this checkout has (PAGES_PHASES in web_next.py)."""
+    source = (ROOT / 'src' / 'ibkr_etl' / 'web_next.py').read_text(encoding='utf-8')
+    return int(re.search(r'^PAGES_PHASES = (\d+)$', source, re.MULTILINE).group(1))
 
 
 def design():
@@ -973,10 +994,11 @@ def design():
     mode = sys.argv[2]
     if mode not in DESIGN_MODES + NEXT_PAGES_MODES:
         raise SystemExit('Design must be classic, preview, next, pages-off, pages-preview or pages-on')
-    setting, value = (NEXT_PAGES_SETTING, mode[len('pages-'):]) if mode in NEXT_PAGES_MODES else (DESIGN_SETTING, mode)
+    setting = NEXT_PAGES_SETTING if mode in NEXT_PAGES_MODES else DESIGN_SETTING
     app = az('containerapp', 'show', '-n', APP, '-g', RG)
     env = {e['name']: e.get('value') for e in app['properties']['template']['containers'][0].get('env', [])}
     previous = env.get(setting) or ('off' if setting == NEXT_PAGES_SETTING else 'classic')
+    value = next_pages_value(mode, previous, next_pages_latest()) if setting == NEXT_PAGES_SETTING else mode
     print(setting, 'was', previous)
     suffix = 'design-' + mode + '-' + str(int(time.time()))[-6:]
     az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,

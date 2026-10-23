@@ -25,6 +25,10 @@ from html import escape
 from urllib.parse import quote
 
 from .web_next_pages import PAGES_CSS, PAGES_SCRIPT
+from .web_next_hold import HOLD_CSS, HOLD_SCRIPT
+from .web_next_model import MODEL_CSS, MODEL_SCRIPT
+from .web_next_ops import OPS_CSS, OPS_SCRIPT
+from .web_next_perf import PERF_CSS, PERF_SCRIPT
 from .web_next_ui import NEXT_CSS, NEXT_SCRIPT
 
 COOKIE = "wr_design"
@@ -74,16 +78,43 @@ def may_choose(design: str, role: str | None) -> bool:
     return mode == "next" or role == "owner"
 
 
-def pages_setting() -> str:
-    """WEB_NEXT_PAGES: off (default), preview (owners only) or on, for the page-by-page redesign."""
+# Phases of the page-by-page redesign built so far. Each one is released on its own.
+PAGES_PHASES = 5
+_PAGES_WORDS = {"off": (0, 0), "preview": (0, 1), "on": (1, 1)}
+
+
+def pages_levels() -> tuple[int, int]:
+    """WEB_NEXT_PAGES as (phases for everyone, phases for owners).
+
+    off, preview and on are the phase 1 settings. "1/2" gives everyone phase 1 and
+    owners phases 1 and 2; "2" gives everyone phases 1 and 2. Anything else is off.
+    """
     value = os.environ.get("WEB_NEXT_PAGES", "off").strip().lower()
-    return value if value in ("off", "preview", "on") else "off"
+    if value in _PAGES_WORDS:
+        return _PAGES_WORDS[value]
+    match = re.fullmatch(r"(\d+)(?:/(\d+))?", value)
+    if not match:
+        return 0, 0
+    live = min(int(match.group(1)), PAGES_PHASES)
+    owners = min(max(int(match.group(2) or live), live), PAGES_PHASES)
+    return live, owners
+
+
+def pages_setting() -> str:
+    """WEB_NEXT_PAGES in words: off, preview (owners only) or on (everyone has something)."""
+    live, owners = pages_levels()
+    return "on" if live else "preview" if owners else "off"
+
+
+def pages_level(role: str | None) -> int:
+    """How many phases of the page-by-page redesign this person gets (it needs the new design too)."""
+    live, owners = pages_levels()
+    return owners if role == "owner" else live
 
 
 def pages_for(role: str | None) -> bool:
-    """Whether this person gets the page-by-page redesign (it needs the new design too)."""
-    mode = pages_setting()
-    return mode == "on" or (mode == "preview" and role == "owner")
+    """Whether this person gets any of the page-by-page redesign."""
+    return pages_level(role) >= 1
 
 
 def safe_return_path(value: str | None) -> str:
@@ -100,7 +131,7 @@ def _try_link(back: str) -> str:
 
 
 def transform(html: str, *, design: str, role: str | None, back: str, page_scripts: dict[str, str],
-              metric_anchors: dict[str, str], pages: bool | None = None) -> str:
+              metric_anchors: dict[str, str], pages: bool | int | None = None) -> str:
     """Apply the chosen design to a rendered page."""
     if design != "next":
         if setting() == "preview" and role == "owner" and _SESSION in html:
@@ -117,15 +148,22 @@ def transform(html: str, *, design: str, role: str | None, back: str, page_scrip
         "canClassic": may_choose("classic", role),
         "metrics": metric_anchors,
     }
-    if pages is None:
-        pages = pages_for(role)
+    level = pages_level(role) if pages is None else PAGES_PHASES if pages is True else int(pages or 0)
     head = (f'<style id="nx-css">{NEXT_CSS}</style>'
-            + (f'<style id="nx-pages-css">{PAGES_CSS}</style>' if pages else '')
+            + (f'<style id="nx-pages-css">{PAGES_CSS}</style>' if level >= 1 else '')
+            + (f'<style id="nx-perf-css">{PERF_CSS}</style>' if level >= 2 else '')
+            + (f'<style id="nx-model-css">{MODEL_CSS}</style>' if level >= 3 else '')
+            + (f'<style id="nx-hold-css">{HOLD_CSS}</style>' if level >= 4 else '')
+            + (f'<style id="nx-ops-css">{OPS_CSS}</style>' if level >= 5 else '')
             + f'<script type="speculationrules">{SPECULATION_RULES}</script>')
     marker = html.find("</head>")
     html = html[:marker] + head + html[marker:]
     body = ("<script>window.WR_NEXT=" + json.dumps(config).replace("</", "<\\/") + ";"
             + NEXT_SCRIPT + "</script>"
-            + (f"<script>{PAGES_SCRIPT}</script>" if pages else ""))
+            + (f"<script>{PAGES_SCRIPT}</script>" if level >= 1 else "")
+            + (f"<script>{PERF_SCRIPT}</script>" if level >= 2 else "")
+            + (f"<script>{MODEL_SCRIPT}</script>" if level >= 3 else "")
+            + (f"<script>{HOLD_SCRIPT}</script>" if level >= 4 else "")
+            + (f"<script>{OPS_SCRIPT}</script>" if level >= 5 else ""))
     marker = html.rfind("</body>")
     return html[:marker] + body + html[marker:]

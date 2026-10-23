@@ -341,6 +341,32 @@ class CertifiedBuildTests(_BuildDatabase):
         self.assertIn("Nothing changed, so no build is written.", lines)
         self.assertEqual(len(self._builds()), 1)
 
+    def test_4b_a_run_loads_the_published_rows_only_for_the_dates_it_reads(self):
+        # The whole history does not fit in the job's memory once the charts are stored (23 Oct
+        # 2026: killed at 2 GiB), so a run asks for the dates first and the rows of the dates read.
+        everything = self._published()
+        calls, real = [], build.published_rows
+
+        def recorded(connection, subject_ids, on_dates=None):
+            calls.append(on_dates)
+            return real(connection, subject_ids, on_dates=on_dates)
+
+        with patch.object(build, "published_rows", recorded):
+            code, lines = self._run()
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing changed, so no build is written.", lines)
+        self.assertEqual(len(calls), 1)
+        due = set(_business_days(FIRST, LAST)[-build.RECHECK_DATES:])
+        self.assertEqual(calls[0], {SUBJECT: due})
+        with layers._connect(self.database, WEB) as web:
+            dates = build.published_dates(web, [SUBJECT])
+            some = build.published_rows(web, [SUBJECT], on_dates={SUBJECT: [LAST.isoformat()]})
+            self.assertEqual(build.published_rows(web, [SUBJECT], on_dates={}), {})
+            self.assertEqual(build.published_dates(web, [SUBJECT], figure_ids=["no.such_figure"]), {})
+        self.assertEqual(dates, {SUBJECT: {key[5] for key in everything}})
+        self.assertEqual(some, {key: row for key, row in everything.items() if key[5] == LAST.isoformat()})
+        self.assertTrue(some)
+
     def test_5_a_changed_answer_from_the_same_inputs_holds_the_build(self):
         before = self._value("stats.sortino_ratio", LAST.isoformat())
         original = self.web.portfolio_analytics_view

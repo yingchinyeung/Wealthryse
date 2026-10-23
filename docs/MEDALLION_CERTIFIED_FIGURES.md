@@ -387,6 +387,11 @@ today's figures as it does now. The history fills in over the first few runs; `-
 reads every older date again, newest first, and a backfill that stops at its time limit starts
 again from the newest date, so give it `--minutes` long enough for the dates it must reach.
 
+**What a run holds in memory.** A run plans from the dates that have published figures, then
+loads the published rows only for the dates it read, to compare. It never loads the whole
+history: once the charts' history was stored (about 190,000 rows, 23 Oct 2026), loading every
+published row went past the job's 2 GiB and both daily runs were stopped.
+
 The check that the pages give the same figures on their own connections runs for each account
 or portfolio right after its newest date is read, so the two reads are moments apart.
 On a day the benchmark's market was shut (the 18 Oct rehearsal found two such days in the

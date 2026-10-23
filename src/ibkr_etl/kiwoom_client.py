@@ -75,6 +75,11 @@ class KiwoomUnknownStock(KiwoomError):
     """Kiwoom has no such stock on that exchange (its code 1903), e.g. one delisted after a merger."""
 
 
+class CaptureFailed(RuntimeError):
+    """Raised by a required capture (kiwoom_bronze with KIWOOM_BRONZE_REQUIRED=true) when a page could not be
+    stored: the call fails before its answer is used. Not a KiwoomError, so no refusal handling catches it."""
+
+
 # Kiwoom answered Python's default user agent with a bare HTTP 400; the fixed-address probe
 # that got a token sent this one, as the platform's other HTTP clients do.
 USER_AGENT = "IBKR-Portfolio-Analytics/2.1"
@@ -361,7 +366,10 @@ class KiwoomClient:
         return f"KiwoomClient(environment={self.environment!r})"
 
     def set_capture(self, capture: Capture | None) -> None:
-        """Hand every inquiry page, refusals included, to ``capture`` (the bronze writer). Never token calls."""
+        """Hand every inquiry page, refusals included, to ``capture`` (the bronze writer). Never token calls.
+
+        A capture fault never fails the call, except CaptureFailed, which a required capture raises.
+        """
 
         self._capture = capture
 
@@ -406,7 +414,8 @@ class KiwoomClient:
 
     def _hand_over(self, api_id: str, body: Mapping[str, object], page_no: int, requested_at: datetime,
                    status: int, headers: Mapping[str, str], payload: object) -> None:
-        # Bronze is best effort: nothing here may stop or change the inquiry.
+        # Bronze never changes the inquiry. Best effort, it never stops it either; a required capture stops it
+        # with CaptureFailed when the page could not be stored, before the answer is used.
         try:
             raw = getattr(payload, "raw", None)
             if not isinstance(raw, (bytes, bytearray)):
@@ -425,7 +434,9 @@ class KiwoomClient:
                 requested_at=requested_at, received_at=max(requested_at, datetime.now(timezone.utc)),
                 http_status=int(status), return_code=return_code, body=bytes(raw),
             ))
-        except Exception:  # noqa: BLE001 - a capture fault never fails the call
+        except CaptureFailed:
+            raise
+        except Exception:  # noqa: BLE001 - any other capture fault never fails the call
             pass
 
     def _bearer(self) -> str:

@@ -806,6 +806,8 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
     """Collect every Kiwoom account. One account's failure never stops the others.
 
     ``bronze`` (kiwoom_bronze.KiwoomBronze, only when KIWOOM_BRONZE=true) stores every inquiry page as received.
+    Required (KIWOOM_BRONZE_REQUIRED=true), a page it cannot store fails that account: its silver writes not yet
+    committed roll back, as for any other failure. Each account's result names its bronze run (``bronze_run_id``).
     """
 
     results = []
@@ -875,4 +877,6 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
             if capture is not None:
                 # This account's own result: none when the run was cut short (a BaseException).
                 capture.finish(len(results) > before and results[-1].get("status") != "failed")
+                if len(results) > before:
+                    results[-1]["bronze_run_id"] = capture.run_id
     return results

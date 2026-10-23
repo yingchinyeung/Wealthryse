@@ -77,7 +77,8 @@ class KiwoomUnknownStock(KiwoomError):
 
 class CaptureFailed(RuntimeError):
     """Raised by a required capture (kiwoom_bronze with KIWOOM_BRONZE_REQUIRED=true) when a page could not be
-    stored: the call fails before its answer is used. Not a KiwoomError, so no refusal handling catches it."""
+    stored, or, with silver from bronze, read back: the call fails before any answer is used. Not a KiwoomError,
+    so no refusal handling catches it."""
 
 
 # Kiwoom answered Python's default user agent with a bare HTTP 400; the fixed-address probe
@@ -138,7 +139,23 @@ class Answer:
     body: bytes
 
 
-Capture = Callable[[Answer], None]
+# Returns None, or, for a client set to take its pages from bronze, the page as bronze stored it.
+Capture = Callable[[Answer], "Answer | None"]
+
+
+def stored_payload(body: bytes) -> object:
+    """A stored body as the live transport hands it to the client: parsed, with the exact bytes in ``raw``.
+
+    The conform replay and a client that takes its pages from bronze both read stored pages through this.
+    """
+
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        # As _urllib_transport reads a refusal that is not JSON; it never hands over a 200 that is not.
+        text = " ".join(body.decode("utf-8", "replace").split())[:150]
+        payload = {"return_msg": f"non-JSON answer: {text}" if text else ""}
+    return RawAnswer(payload, body) if isinstance(payload, Mapping) else payload
 
 
 def kiwoom_number(value: object, *, unsigned: bool = False) -> Decimal:
@@ -374,17 +391,24 @@ class KiwoomClient:
         self._token_expires: datetime | None = None
         self._closes: dict[str, dict[str, Decimal]] = {}
         self._capture: Capture | None = None
+        self._from_bronze = False
 
     def __repr__(self) -> str:
         return f"KiwoomClient(environment={self.environment!r})"
 
-    def set_capture(self, capture: Capture | None) -> None:
+    def set_capture(self, capture: Capture | None, *, from_bronze: bool = False) -> None:
         """Hand every inquiry page, refusals included, to ``capture`` (the bronze writer). Never token calls.
 
         A capture fault never fails the call, except CaptureFailed, which a required capture raises.
+
+        ``from_bronze`` (KIWOOM_SILVER_FROM_BRONZE=true): the capture hands back each page as bronze stored it,
+        and the call goes on with that page's status, paging headers and body instead of the answer received,
+        so everything the collector writes to silver is computed from bronze's copy. A page the capture does not
+        hand back fails the call with CaptureFailed; the answer received is never used in its place.
         """
 
         self._capture = capture
+        self._from_bronze = bool(from_bronze) and capture is not None
 
     def _post(self, path: str, headers: Mapping[str, str], body: Mapping[str, object], *,
               page_no: int = 1):
@@ -413,7 +437,13 @@ class KiwoomClient:
                 self._sleep(TRANSPORT_RETRY_SECONDS * (attempt + 1))
                 self._last_call = self._clock()
         if path in INQUIRY_APIS.values() and self._capture is not None:
-            self._hand_over(call, body, page_no, requested_at, status, response_headers, payload)
+            stored = self._hand_over(call, body, page_no, requested_at, status, response_headers, payload)
+            if self._from_bronze:
+                if not isinstance(stored, Answer) or stored.api_id != call or stored.page_no != page_no:
+                    raise CaptureFailed("The Kiwoom page was not read back from bronze, so its answer is not used")
+                status, payload = stored.http_status, stored_payload(stored.body)
+                response_headers = {name: value for name, value in (("cont-yn", stored.cont_yn),
+                                                                     ("next-key", stored.next_key)) if value}
         if not isinstance(payload, Mapping):
             raise KiwoomError(f"Kiwoom returned a non-JSON answer (HTTP {status})")
         code = payload.get("return_code", 0)
@@ -426,9 +456,10 @@ class KiwoomClient:
         return response_headers, payload
 
     def _hand_over(self, api_id: str, body: Mapping[str, object], page_no: int, requested_at: datetime,
-                   status: int, headers: Mapping[str, str], payload: object) -> None:
+                   status: int, headers: Mapping[str, str], payload: object) -> Answer | None:
         # Bronze never changes the inquiry. Best effort, it never stops it either; a required capture stops it
-        # with CaptureFailed when the page could not be stored, before the answer is used.
+        # with CaptureFailed when the page could not be stored, before the answer is used. Returns what the
+        # capture hands back: the stored page, for a client that takes its pages from bronze.
         try:
             raw = getattr(payload, "raw", None)
             if not isinstance(raw, (bytes, bytearray)):
@@ -440,7 +471,7 @@ class KiwoomClient:
                 return_code = None
             lowered = {str(k).lower(): v for k, v in (headers or {}).items()}
             cont = str(lowered.get("cont-yn") or "").strip().upper() or None
-            self._capture(Answer(
+            return self._capture(Answer(
                 api_id=api_id, request=dict(body), page_no=page_no,
                 cont_yn=cont if cont in ("Y", "N") else None,
                 next_key=(str(lowered.get("next-key") or "").strip() or None),
@@ -449,8 +480,8 @@ class KiwoomClient:
             ))
         except CaptureFailed:
             raise
-        except Exception:  # noqa: BLE001 - any other capture fault never fails the call
-            pass
+        except Exception:  # noqa: BLE001 - any other capture fault never fails the call (from bronze: see _post)
+            return None
 
     def _bearer(self) -> str:
         now = self._clock()

@@ -813,6 +813,8 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
     ``bronze`` (kiwoom_bronze.KiwoomBronze, only when KIWOOM_BRONZE=true) stores every inquiry page as received.
     Required (KIWOOM_BRONZE_REQUIRED=true), a page it cannot store fails that account: its silver writes not yet
     committed roll back, as for any other failure. Each account's result names its bronze run (``bronze_run_id``).
+    With silver from bronze (KIWOOM_SILVER_FROM_BRONZE=true) every page the account's silver rows are computed
+    from is the page as bronze stored it, read back by the capture; the result then says ``silver_from`` bronze.
     """
 
     results = []
@@ -826,7 +828,10 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
             client = client_for(target)
             capture = bronze.for_target(target) if bronze is not None else None
             if capture is not None:
-                client.set_capture(capture)
+                from_bronze = bool(getattr(capture, "read_back", False))
+                client.set_capture(capture, from_bronze=from_bronze)
+                if from_bronze:
+                    result["silver_from"] = "bronze.kiwoom_responses"
             if target.case_id is None or target.stage not in LOADING_STAGES or target.history_start is None:
                 # Not being onboarded: a connection check only, so the account is never copied in unasked.
                 valuation = client.valuation()

@@ -18,6 +18,14 @@ run cannot be opened) raises BronzeNotStored out of the capture, so the call fai
 used and that account's silver rows are not written (the collector rolls them back and fails the
 account). Once one write has failed every try, every later capture in the process fails at once.
 
+With KIWOOM_SILVER_FROM_BRONZE=true as well (it needs both switches above), silver is written from bronze:
+each page is read back from bronze.kiwoom_responses in the same transaction that stores it, and the client
+carries on with that stored page (its status, paging headers and body) instead of the answer it received
+(KiwoomClient.set_capture(..., from_bronze=True)). Every silver row the collector writes is then computed by
+its own functions from bronze's copy, as kiwoom_conform's replay computes it. A page this call stored must read
+back exactly as received; a request asked twice in one run reads back its first answer, as the replay does. A
+page that cannot be read back fails its call, like one that cannot be stored.
+
 Nothing here logs a body, a request_key or an account number: only counts.
 """
 from __future__ import annotations
@@ -36,6 +44,7 @@ LOGGER = logging.getLogger(__name__)
 
 ENABLED_ENV = "KIWOOM_BRONZE"
 REQUIRED_ENV = "KIWOOM_BRONZE_REQUIRED"
+SILVER_ENV = "KIWOOM_SILVER_FROM_BRONZE"
 REQUIRED_ATTEMPTS = 3
 REQUIRED_RETRY_PAUSES = (1.0, 3.0)
 RUN_TYPE = "kiwoom_rest_bronze"
@@ -63,6 +72,14 @@ def required(environ: Mapping[str, str] | None = None) -> bool:
     return str(environ.get(REQUIRED_ENV, "")).strip().lower() == "true"
 
 
+def silver_from_bronze(environ: Mapping[str, str] | None = None) -> bool:
+    """KIWOOM_SILVER_FROM_BRONZE=true: silver is computed from the pages as bronze stored them (needs
+    KIWOOM_BRONZE=true and KIWOOM_BRONZE_REQUIRED=true)."""
+
+    environ = os.environ if environ is None else environ
+    return str(environ.get(SILVER_ENV, "")).strip().lower() == "true"
+
+
 def request_key(account: str, request: Mapping[str, object]) -> dict[str, str]:
     """The account number and the request's query fields; refuses anything that looks like a credential."""
 
@@ -80,20 +97,26 @@ class KiwoomBronze:
 
     def __init__(self, connect: Callable[[], Any], tenant_id: str, *,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc), required: bool = False,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 read_back: bool = False, sleep: Callable[[float], None] = time.sleep) -> None:
+        if read_back and not required:
+            raise ValueError(f"{SILVER_ENV}=true needs {REQUIRED_ENV}=true")
         self._connect = connect
         self._connection: Any = None
         self.tenant_id = tenant_id
         self._clock = clock
         self._sleep = sleep
         self.required = bool(required)
+        # Silver from bronze: each capture hands back the page as stored, and the client uses that page.
+        self.read_back = bool(read_back)
         self.enabled = True
-        self.stats = {"runs": 0, "written": 0, "repeated": 0, "failed": 0, "skipped": 0}
+        self.stats = {"runs": 0, "written": 0, "repeated": 0, "read_back": 0, "failed": 0, "skipped": 0}
 
     @classmethod
     def from_environment(cls, connect: Callable[[], Any], tenant_id: str,
                          environ: Mapping[str, str] | None = None) -> "KiwoomBronze | None":
-        return cls(connect, tenant_id, required=required(environ)) if enabled(environ) else None
+        if not enabled(environ):
+            return None
+        return cls(connect, tenant_id, required=required(environ), read_back=silver_from_bronze(environ))
 
     def for_target(self, target: Any) -> "TargetCapture | None":
         """Opens the account's ingestion_runs row; None (capture skipped) once bronze is off.
@@ -125,7 +148,8 @@ class KiwoomBronze:
         return TargetCapture(self, run_id, str(target.connection_id), str(target.broker_account_id))
 
     def summary(self) -> dict[str, int | bool]:
-        return {"enabled": self.enabled, "required": self.required, **self.stats}
+        return {"enabled": self.enabled, "required": self.required, "silver_from_bronze": self.read_back,
+                **self.stats}
 
     def _refuse(self, reason: str) -> None:
         if self.required:
@@ -182,7 +206,10 @@ class KiwoomBronze:
 
 
 class TargetCapture:
-    """The capture callback for one account; ``finish`` closes its ingestion_runs row."""
+    """The capture callback for one account; ``finish`` closes its ingestion_runs row.
+
+    With ``read_back`` (silver from bronze) it hands back each page as bronze stored it.
+    """
 
     def __init__(self, bronze: KiwoomBronze, run_id: int, connection_id: str, account: str) -> None:
         self._bronze = bronze
@@ -192,12 +219,16 @@ class TargetCapture:
         self._digests: list[str] = []
         self._pages: set[tuple[str, str, int]] = set()
 
-    def __call__(self, answer: Answer) -> None:
+    @property
+    def read_back(self) -> bool:
+        return self._bronze.read_back
+
+    def __call__(self, answer: Answer) -> Answer | None:
         bronze = self._bronze
         if not bronze.enabled:
             bronze.stats["skipped"] += 1
             bronze._refuse("Kiwoom bronze capture is off after an earlier failure")
-            return
+            return None
         try:
             if answer.api_id not in INQUIRY_APIS or not _API_ID.match(answer.api_id):
                 raise ValueError("only Kiwoom inquiry answers go into bronze")
@@ -206,7 +237,7 @@ class TargetCapture:
             key = json.dumps(request_key(self._account, answer.request), sort_keys=True, ensure_ascii=False)
             digest = hashlib.sha256(answer.body).hexdigest()
 
-            def insert(connection: Any) -> Any:
+            def insert(connection: Any) -> tuple[int, Any]:
                 # The same request asked twice in one run keeps its first answer (the page key is unique per run).
                 cursor = connection.execute(
                     f"INSERT INTO {TABLE} (run_id, tenant_id, connection_id, api_id, request_key, page_no, "
@@ -217,22 +248,58 @@ class TargetCapture:
                      answer.cont_yn, (answer.next_key or None) and answer.next_key[:200], answer.requested_at,
                      answer.received_at, answer.http_status, answer.return_code, answer.body, digest),
                 )
+                rowcount = getattr(cursor, "rowcount", 1)
+                stored = None
+                if bronze.read_back:
+                    # In the same transaction: this call's row, or the run's first answer to the same request.
+                    stored = connection.execute(
+                        f"SELECT cont_yn, next_key, requested_at, received_at, http_status, return_code, body, "
+                        f"body_sha256 FROM {TABLE} WHERE run_id = ? AND api_id = ? "
+                        "AND request_key = CAST(? AS JSONB) AND page_no = ?",
+                        (self.run_id, answer.api_id, key, answer.page_no),
+                    ).fetchone()
                 connection.commit()
-                return cursor
+                return rowcount, stored
 
-            inserted, attempt = bronze._write(insert)
+            (inserted, row), attempt = bronze._write(insert)
+            # A retry may find the page its earlier try stored before the commit was lost: that is this page.
+            page = (answer.api_id, key, answer.page_no)
+            repeated = inserted == 0 and (attempt == 0 or page in self._pages)
+            stored = self._stored(answer, row, digest, repeated) if bronze.read_back else None
         except Exception as error:  # noqa: BLE001 - best effort, bronze never fails the daily run
             bronze._failed(error)
             bronze._refuse(f"a Kiwoom answer could not be stored in bronze ({type(error).__name__})")
-            return
-        # A retry may find the page its earlier try stored before the commit was lost: that is this page.
-        page = (answer.api_id, key, answer.page_no)
-        if getattr(inserted, "rowcount", 1) == 0 and (attempt == 0 or page in self._pages):
+            return None
+        if stored is not None:
+            bronze.stats["read_back"] += 1
+        if repeated:
             bronze.stats["repeated"] += 1
-            return
+            return stored
         self._pages.add(page)
         self._digests.append(digest)
         bronze.stats["written"] += 1
+        return stored
+
+    @staticmethod
+    def _stored(answer: Answer, row: Any, digest: str, repeated: bool) -> Answer:
+        """The page as bronze holds it. A page this call stored must hold exactly what was received."""
+
+        if row is None:
+            raise LookupError("the stored Kiwoom page did not read back")
+        body = bytes(row["body"])
+        if hashlib.sha256(body).hexdigest() != row["body_sha256"]:
+            raise ValueError("a stored Kiwoom page does not match its sha256")
+        stored = Answer(
+            api_id=answer.api_id, request=answer.request, page_no=answer.page_no,
+            cont_yn=row["cont_yn"] or None, next_key=row["next_key"] or None,
+            requested_at=row["requested_at"], received_at=row["received_at"],
+            http_status=int(row["http_status"]), return_code=row["return_code"], body=body,
+        )
+        if not repeated and (stored.body != answer.body or stored.http_status != answer.http_status
+                             or stored.cont_yn != answer.cont_yn or stored.next_key != (answer.next_key or None)):
+            # A next-key longer than bronze keeps (200 characters) lands here: paging from it would differ.
+            raise ValueError("a Kiwoom page did not read back from bronze as it was received")
+        return stored
 
     def finish(self, ok: bool) -> None:
         """Marks the run success or failed, with the page count and the sha256 over the pages' sha256s."""

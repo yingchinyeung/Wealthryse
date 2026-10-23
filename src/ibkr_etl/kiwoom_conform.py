@@ -1,12 +1,12 @@
-"""Kiwoom conform, read-only for now: rebuild one bronze run's silver rows from its stored answers and compare.
+"""Kiwoom conform, read-only: rebuild one bronze run's silver rows from its stored answers and compare.
 
-The collector (kiwoom_collector, and kiwoom_us_account for a USD account) still writes Kiwoom's silver rows
-from the live answer. With KIWOOM_BRONZE=true it first stores every inquiry page it receives in
-bronze.kiwoom_responses (kiwoom_bronze), under one ingestion_runs row per account per collector run. This
-module replays one such run: a KiwoomClient whose transport answers only from the stored pages
-(``ReplayTransport``), driven by the collector's own functions, gives back the rows that run wrote, and they
-are compared with silver by the collector's keys. Nothing is written and Kiwoom is never called. A later
-change lets it write silver.
+The collector (kiwoom_collector, and kiwoom_us_account for a USD account) writes Kiwoom's silver rows. With
+KIWOOM_BRONZE=true it first stores every inquiry page it receives in bronze.kiwoom_responses (kiwoom_bronze),
+under one ingestion_runs row per account per collector run; with KIWOOM_SILVER_FROM_BRONZE=true as well it
+computes silver from each page as read back from bronze, never from the answer it received. This module
+replays one such run: a KiwoomClient whose transport answers only from the stored pages (``ReplayTransport``),
+driven by the collector's own functions, gives back the rows that run wrote, and they are compared with silver
+by the collector's keys. Nothing is written and Kiwoom is never called.
 
 The replay does what the run did:
 
@@ -63,8 +63,8 @@ from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from .kiwoom_bronze import RUN_TYPE, TABLE, request_key
-from .kiwoom_client import INQUIRY_APIS, REVOKE_PATH, TOKEN_PATH, KiwoomClient, KiwoomError, RawAnswer, \
-    UsValuation
+from .kiwoom_client import INQUIRY_APIS, REVOKE_PATH, TOKEN_PATH, KiwoomClient, KiwoomError, UsValuation, \
+    stored_payload
 from .kiwoom_collector import _KEYS, SEOUL, Securities, collect, known_identifiers, platform_account_id, \
     snapshot_day, snapshot_rows, windows
 from .kiwoom_us_account import UsHistoryPositions, collect_past_day, collect_today, position_gap, \
@@ -116,13 +116,7 @@ class StoredPage:
     def answer(self) -> object:
         """The body as the live transport handed it to the client: parsed, with the exact bytes in ``raw``."""
 
-        try:
-            payload = json.loads(self.body)
-        except ValueError:
-            # As _urllib_transport reads a refusal that is not JSON; it never hands over a 200 that is not.
-            text = " ".join(self.body.decode("utf-8", "replace").split())[:150]
-            payload = {"return_msg": f"non-JSON answer: {text}" if text else ""}
-        return RawAnswer(payload, self.body) if isinstance(payload, Mapping) else payload
+        return stored_payload(self.body)
 
     @property
     def refusal(self) -> bool:

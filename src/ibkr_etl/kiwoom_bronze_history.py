@@ -8,8 +8,8 @@ kiwoom_conform replays): the account's movement list and today's answers, then e
 
 It writes nothing to silver. The account's own reads go through a read-only session; only the bronze
 recorder writes, through its own connection, one kiwoom_rest_bronze run per account. Days already
-answered in bronze are skipped, so a run picks up where the last one stopped. kiwoom_conform.check_run
-rebuilds each run's silver rows from what it stored and compares them with silver.
+answered in a bronze run that finished are skipped, so a run picks up where the last one stopped.
+kiwoom_conform.check_run rebuilds each run's silver rows from what it stored and compares them with silver.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Callable
 
-from .kiwoom_bronze import TABLE
+from .kiwoom_bronze import RUN_TYPE, TABLE
 from .kiwoom_client import KiwoomClient
 from .kiwoom_collector import (LOADING_STAGES, SEOUL, Target, collect, known_identifiers, platform_account_id,
                                snapshot_day, targets, windows)
@@ -63,12 +63,18 @@ def silver_days(connection, account_id: str, market: Market) -> list[date]:
 
 
 def bronze_days(connection, broker_account_id: str, market: Market) -> set[date]:
-    """The days whose answer bronze already holds for the account (answered pages only)."""
+    """The days whose answer bronze already holds for the account, from runs that finished (answered pages only).
+
+    A run that failed part-way can hold a day's first answer without the rest: a day the client could not
+    value stops the account after its ka01690 and kt00016 answers, before that day's U.S. balances. Its days
+    are asked again.
+    """
 
     rows = connection.execute(
-        f"SELECT DISTINCT request_key->>? FROM {TABLE} WHERE api_id = ? AND request_key->>'account' = ? "
-        "AND http_status = 200 AND COALESCE(return_code, 0) = 0",
-        (market.day_field, market.api_id, broker_account_id)).fetchall()
+        f"SELECT DISTINCT k.request_key->>? FROM {TABLE} k JOIN ingestion_runs r ON r.run_id = k.run_id "
+        "WHERE r.run_type = ? AND r.status = 'success' AND k.api_id = ? AND k.request_key->>'account' = ? "
+        "AND k.http_status = 200 AND COALESCE(k.return_code, 0) = 0",
+        (market.day_field, RUN_TYPE, market.api_id, broker_account_id)).fetchall()
     found = set()
     for row in rows:
         text = str(row[0] or "")

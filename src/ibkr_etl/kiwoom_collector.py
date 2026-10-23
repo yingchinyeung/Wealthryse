@@ -43,7 +43,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from .kiwoom_client import MAX_SELLING_COST_RATE, AccountValuation, CashMovement, Holding, KiwoomClient, \
-    KiwoomError, UsValuation, kiwoom_selling_cost, reconcile_us_valuation, reconcile_valuation
+    KiwoomError, UsValuation, reconcile_us_valuation, reconcile_valuation, selling_cost_rule_gap
 from .kiwoom_english import apply_english_names, movement_description
 from .security_master import SecurityIdentifier, new_security_key
 
@@ -549,10 +549,9 @@ def _position_issues(row, positions: list[tuple[str, Decimal]]) -> list[dict[str
     stock = _number(row["stock_text"])
     if len(krw) == len(positions) and held != stock:
         issues.append({"date": day.isoformat(), "check": "holdings", "gap": _text(held - stock)})
-    expected = sum((kiwoom_selling_cost(value, day) for value in krw), Decimal("0"))
-    cost = -_number(row["accruals_text"])
-    if abs(expected - cost) > len(krw):
-        issues.append({"date": day.isoformat(), "check": "selling_cost_rule", "gap": _text(cost - expected)})
+    gap = selling_cost_rule_gap(krw, -_number(row["accruals_text"]), day)
+    if abs(gap) > len(krw):
+        issues.append({"date": day.isoformat(), "check": "selling_cost_rule", "gap": _text(gap)})
     return issues
 
 
@@ -626,6 +625,7 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
     closed: list[date] = []
     price_basis: list[dict[str, str]] = []
     repriced: list[str] = []
+    unsettled: list[str] = []
     written: list[dict[str, list[dict[str, Any]]]] = []
     for day in batch:
         valuation = client.balance_on(day)
@@ -638,6 +638,8 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
         loaded.append(day)
         if valuation.repriced_at_close:
             repriced.append(day.isoformat())
+        if valuation.unsettled_trades:
+            unsettled.append(day.isoformat())
         if valuation.price_basis_gap:
             price_basis.append({"date": day.isoformat(), "kiwoom_holdings_value": _text(valuation.valued_holdings),
                                 "at_prices_held": _text(valuation.holdings_value),
@@ -665,7 +667,10 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
         "days_left": len(remaining), "gap_days": len({gap["date"] for gap in gaps}), "gaps": gaps[:20],
         "cash_basis": "trade date (ka01690 dbst_bal); Kiwoom's estimated selling cost kept as accruals",
         "holdings_basis": "Kiwoom's own value of the holdings (kt00016 scrt_evlt_amt_to); positions at the "
-                          "official KRX close (ka10081) when ka01690 lists after-market prices",
+                          "official KRX close (ka10081) when ka01690 lists after-market prices; on a day with "
+                          "trades not yet settled, ka01690's holdings when they add up to its total after "
+                          "Kiwoom's per-stock selling cost (kt00016 counts trades once settled)",
+        "unsettled_trade_days_this_run": unsettled[:40],
         "price_basis_days_this_run": len(price_basis), "price_basis": price_basis[:30],
         "priced_at_official_close_this_run": repriced[:40],
         "us_cash_basis": "settled" if include_us else "not collected",

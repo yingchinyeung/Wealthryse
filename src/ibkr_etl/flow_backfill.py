@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .db import connect, initialize, start_run
-from .loader import load_report
+from .loader import load_report, nav_total
 from .parser import ParsedReport, parse_flex_xml
 # Bronze's reader whatever FLOWS_SOURCE says: the plan is about the bronze rows it would add.
 from .provisional_benchmark import _bronze_external_flows, _is_external_cash_transaction
@@ -256,12 +256,14 @@ def registry_accounts(live: Any, tenant_id: str) -> list[str]:
 
 
 def _equity_totals(rows: Iterable[Any]) -> dict[str, set[Decimal]]:
-    """IBKR's daily totals by date from EquitySummaryByReportDateInBase rows' data_json."""
+    """IBKR's daily totals by date from EquitySummaryByReportDateInBase rows' data_json, by the loader's
+    rule: the total field, else the sum of its parts (the v1.1 query sends no total field)."""
 
     totals: dict[str, set[Decimal]] = {}
     for row in rows:
-        values = {str(k).lower(): v for k, v in _json(row["data_json"] if isinstance(row, Mapping) else row[0]).items()}
-        day, total = _iso_day(values.get("reportdate")), decimal_text(str(values.get("total") or ""))
+        values = {str(k): str(v) for k, v in _json(row["data_json"] if isinstance(row, Mapping) else row[0]).items()}
+        lowered = {k.lower(): v for k, v in values.items()}
+        day, total = _iso_day(lowered.get("reportdate")), nav_total(values, "EquitySummaryByReportDateInBase")
         if day and total is not None:
             totals.setdefault(day, set()).add(Decimal(total))
     return totals

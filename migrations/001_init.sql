@@ -141,6 +141,32 @@ CREATE TABLE IF NOT EXISTS cash_transactions (
 CREATE INDEX IF NOT EXISTS idx_cash_transactions_date
     ON cash_transactions(effective_date);
 
+-- IBKR's Transfers section, as the PostgreSQL migration 084_silver_transfers.sql keeps it.
+CREATE TABLE IF NOT EXISTS transfers (
+    account_id TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    flex_account_id TEXT,
+    transaction_id TEXT,
+    transfer_date TEXT,
+    report_date TEXT,
+    asset_category TEXT,
+    transfer_type TEXT,
+    direction TEXT,
+    description TEXT,
+    conid TEXT,
+    currency TEXT,
+    quantity_text TEXT,
+    cash_transfer_text TEXT,
+    position_amount_text TEXT,
+    position_amount_in_base_text TEXT,
+    row_sha256 TEXT NOT NULL,
+    last_seen_run_id INTEGER NOT NULL REFERENCES ingestion_runs(run_id),
+    PRIMARY KEY(account_id, source_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transfers_date
+    ON transfers(transfer_date);
+
 CREATE TABLE IF NOT EXISTS corporate_actions (
     account_id TEXT NOT NULL,
     source_key TEXT NOT NULL,

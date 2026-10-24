@@ -78,10 +78,19 @@ LOOPS = (ast.For, ast.AsyncFor, ast.While)
 
 
 def migration_relations() -> tuple[str, ...]:
-    """The `moved` array of migration 070: the 29 relations in the silver schema."""
+    """The relations in the silver schema: the `moved` array of migration 070 (29), and the table each
+    later migration creates and moves into silver as 070 did (its `layer` constant 'silver', its `rel`
+    the table: 084 transfers)."""
     text = MIGRATION.read_text(encoding="utf-8")
     block = re.search(r"\bmoved\s+CONSTANT\s+text\[\]\s*:=\s*ARRAY\[(.*?)\];", text, re.S)
-    return tuple(re.findall(r"'([a-z_][a-z0-9_]*)'", block.group(1)))
+    moved = re.findall(r"'([a-z_][a-z0-9_]*)'", block.group(1))
+    for path in sorted(MIGRATION.parent.glob("*.sql")):
+        if path.name <= MIGRATION.name:
+            continue
+        later = path.read_text(encoding="utf-8")
+        if re.search(r"\blayer\s+CONSTANT\s+text\s*:=\s*'silver'", later):
+            moved += re.findall(r"\brel\s+CONSTANT\s+text\s*:=\s*'([a-z_][a-z0-9_]*)'", later)
+    return tuple(moved)
 
 
 SILVER = frozenset(migration_relations())
@@ -877,9 +886,10 @@ def _runs(entry) -> tuple[str, ...]:
 
 class SilverRelationsTest(unittest.TestCase):
 
-    def test_the_register_lists_the_29_relations_of_migration_070(self):
+    def test_the_register_lists_the_relations_of_migration_070_and_later_silver_tables(self):
         moved = migration_relations()
-        self.assertEqual(len(moved), 29)
+        self.assertEqual(len(moved), 30)
+        self.assertEqual(moved[29:], ("transfers",))
         self.assertEqual(len(set(register.SILVER_RELATIONS)), len(register.SILVER_RELATIONS), "duplicates")
         self.assertEqual(sorted(register.SILVER_RELATIONS), sorted(moved))
 

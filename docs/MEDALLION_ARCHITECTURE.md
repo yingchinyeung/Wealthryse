@@ -429,16 +429,38 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
     `FLOWS_SOURCE {"dates_differing":1,"decision":"bronze","kinds":{"transfers_not_in_silver":1},"mode":"fallback","reason":"silver_differs","subject":"u…01"}`
     (`reason` is `silver_differs` or `silver_unreadable`; counts and masked subjects only). To
     read them: `ContainerAppConsoleLogs_CL | where Log_s startswith 'FLOWS_SOURCE '`.
-  - `on`: silver only. Not before two clean month-ends in `fallback`, and not before the
-    Transfers section has a silver table (below).
+  - `on`: silver only. Not before two clean month-ends in `fallback`. Without
+    `silver.transfers` it reads bronze and logs `no_silver_transfers`, so a transfer is never
+    left out.
 - **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to
   `silver.cash_transactions` in the same loop, under the parser's key. The daily 14-day
   re-send updates the same row in both; a correction under the same key overwrites both; a
   correction under a new key (no IBKR transaction id) adds a row to both. With
   `IBKR_FLEX_LEGACY_KEY_COMPAT` silver keeps v1.1's key, so the comparison matches rows by
-  content, never by key. Two gaps keep bronze in `fallback`: silver has no table for the
-  Transfers section (the loader writes it to `flex_rows` only), and it cannot tell a
-  consolidated copy (`accountId` "-") from the account's own row, which bronze skips.
+  content, never by key. The Transfers section has its own table, `silver.transfers`
+  (migration 084, below). Where `fallback` still keeps bronze: a date whose transfer silver
+  does not hold yet (`transfers_not_in_silver`, before the fill) or holds differently
+  (`transfer_differs`), and a consolidated copy of a cash transaction (`accountId` "-"), which
+  silver cannot tell from the account's own row and bronze skips.
+- **`silver.transfers` (084).** One row per Transfers record under the parser's key and
+  digest, beside its `flex_rows` row; dates as ISO text, amounts as decimal text, and IBKR's
+  own `accountId` in `flex_account_id` ("-" on a consolidated copy, which bronze reads and so
+  does silver). Created in public and moved into silver with a view left in public, isolated
+  by account and watched (083) like the other silver tables. `bootstrap_postgres.py
+  --only-migration 084_silver_transfers.sql` applies it alone, with the same
+  `SILVER_WRITE_LOCK` setting as the bootstrap before it, so the grants and the lock cover
+  it. Once it exists, the loader (an image with 084's loader) writes each Transfers record
+  there and to `flex_rows` in the same loop; a database or image without it keeps Transfers
+  in `flex_rows` only, as before. The records loaded before that come from bronze:
+  `python -m ibkr_etl.flows_source fill-transfers` counts, in a READ ONLY session, what silver
+  lacks (`inserted`, `updated`, `unchanged`, `only_in_silver`, never a value); with `--apply`,
+  run as the loader login (the silver write lock lets no other login write), it writes them
+  with the loader's own function and commits once per tenant. Running it again changes
+  nothing. Silver reads a transfer by bronze's rules: its date, else its report date; a CASH
+  transfer's `cashTransfer` converted with the account's IBKR FX rate; any other transfer's
+  `positionAmountInBase`, else its `positionAmount` converted. Undo:
+  `infra/medallion/undo/084_silver_transfers_undo.sql` after `FLOWS_SOURCE` is off; bronze
+  keeps every record.
 - **Leave the agent tool server unset** until the agent schema has a view over silver flows:
   its login reads only the `agent` views, so `fallback` there always logs
   `silver_unreadable` and keeps bronze (the failed read is inside a savepoint). Removing
@@ -448,14 +470,16 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   `python -m ibkr_etl.flows_source compare --database-url "<copy URL>" --tenant <tenant id>`
   reads every subject over all history in READ ONLY transactions and prints counts: subjects,
   accounts, matching, differing, errors, the kinds of difference (subjects and dates each),
-  and notes that explain them (`bronze_transfer_rows`, `bronze_consolidated_copies`,
-  `silver_rows_sharing_a_transaction_id`). It must show no errors, and every differing
+  and notes that explain them (`bronze_transfer_rows`, `silver_transfer_rows`,
+  `bronze_consolidated_copies`, `silver_rows_sharing_a_transaction_id`). It must show no errors, and every differing
   account explained by its notes, for example an account-sync account whose bronze flows were
   never backfilled (`only_in_silver`). Matching accounts are the ones `fallback` reads from
   silver; the others keep bronze and log one line on every read.
-- **Before `on`:** two clean month-ends in `fallback`; a silver table for Transfers (a
-  migration, the loader writing it, and a fill from `flex_rows`), or proof that no account
-  has Transfers rows; and the agent view above.
+- **Order of the switch-on:** 084 applied; the loader jobs on an image with 084's loader;
+  `fill-transfers --apply`; `compare` showing every account matching, or each difference
+  explained; then `fallback` on the website, the certified build, derived-daily and the
+  monthly and month-end jobs.
+- **Before `on`:** two clean month-ends in `fallback`, and the agent view above.
 
 ## Release data report
 

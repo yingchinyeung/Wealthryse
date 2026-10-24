@@ -44,7 +44,7 @@ HELD_BACK = ("054_shadow_workflow_evidence.sql", "055_fx_evidence_versions.sql",
 LAYER_FILES = sorted(path.name for path in MIGRATIONS.glob("*_medallion_*.sql"))
 # Later migrations that create new layer objects and move them into their layer as 068 does,
 # so undoing a layer moves them back to public and running them again moves them in again.
-LAYER_CREATORS = ("073_certified_figures.sql", "082_kiwoom_bronze.sql")
+LAYER_CREATORS = ("073_certified_figures.sql", "082_kiwoom_bronze.sql", "084_silver_transfers.sql")
 # Later migrations that only run once 068 to 070 have created the layer schemas, so a build
 # without the layer migrations skips these too.
 NEEDS_LAYERS = ("074_silver_history.sql", "083_silver_write_watch.sql")

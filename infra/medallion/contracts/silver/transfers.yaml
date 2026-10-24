@@ -1,0 +1,208 @@
+apiVersion: v3.0.2
+kind: DataContract
+id: wealthryse.silver.transfers
+name: transfers
+version: 1.0.0
+status: active
+domain: silver
+dataProduct: portfolio-medallion
+description:
+  purpose: IBKR's Transfers section, one row per record under the parser's key and digest, beside its flex_rows
+    row (migration 084). Read with silver cash_transactions as deposits and withdrawals when FLOWS_SOURCE is fallback
+    or on. Filled from bronze by python -m ibkr_etl.flows_source fill-transfers.
+  limitations: Dates are ISO text and amounts decimal text, cast on read. Isolated by account (the account_isolation
+    policy looks the account up in silver.accounts), not by a tenant_id column. Keeps only the latest version of
+    each record, as flex_rows does. A consolidated copy (IBKR's accountId "-") is filed under the statement's account
+    and kept, as bronze keeps it; flows_source reads every row of the account, as the bronze reader does. Which
+    transfers are external flows is decided downstream (flows_source), not here.
+tags:
+- silver
+- ibkr
+schema:
+- name: transfers
+  physicalName: silver.transfers
+  physicalType: table
+  logicalType: object
+  description: IBKR Transfers records per account, as the loader writes them with their flex_rows row. Read as deposits
+    and withdrawals.
+  dataGranularityDescription: One row per account_id and source_key.
+  properties:
+  - name: account_id
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 1
+    classification: restricted
+    description: 'IBKR account number the parser files the record under. Restricted: never shown or logged in full.'
+  - name: source_key
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: true
+    primaryKeyPosition: 2
+    classification: internal
+    description: Stable key of the statement row (parser._source_key), the same as its flex_rows row.
+  - name: flex_account_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR's own accountId on the record; "-" on a consolidated copy filed under the statement's account.
+  - name: transaction_id
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR transactionID.
+  - name: transfer_date
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR date of the transfer, as ISO text.
+  - name: report_date
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR reportDate, as ISO text; the flow date when the record has no date.
+  - name: asset_category
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'IBKR assetCategory: CASH for money, otherwise the kind of security moved.'
+  - name: transfer_type
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR type, such as INTERNAL or ACATS.
+  - name: direction
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: 'IBKR direction: IN or OUT.'
+  - name: description
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR description.
+  - name: conid
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: IBKR contract id of the security moved.
+  - name: currency
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Currency of the amounts.
+  - name: quantity_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Quantity moved, decimal text.
+  - name: cash_transfer_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Money moved, in currency, decimal text (a CASH transfer).
+  - name: position_amount_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Value of the securities moved, in currency, decimal text.
+  - name: position_amount_in_base_text
+    physicalType: text
+    logicalType: string
+    required: false
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: confidential-financial
+    description: Value of the securities moved in the account's base currency, decimal text.
+  - name: row_sha256
+    physicalType: text
+    logicalType: string
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: sha256 of the Flex row, the same as its flex_rows row.
+  - name: last_seen_run_id
+    physicalType: bigint
+    logicalType: integer
+    required: true
+    unique: false
+    primaryKey: false
+    primaryKeyPosition: -1
+    classification: internal
+    description: Ingestion run that last wrote the record.
+team:
+- username: portfolio-platform
+  role: owner
+customProperties:
+- property: source
+  value: ibkr
+- property: catalogNote
+  value: IBKR's Transfers section, one row per record under the parser's key and digest, beside its flex_rows row
+    (migration 084). Read with silver cash_transactions as deposits and withdrawals when FLOWS_SOURCE is fallback
+    or on. Filled from bronze by python -m ibkr_etl.flows_source fill-transfers.
+- property: consumers
+  value:
+  - ibkr_etl.flows_source
+- property: producers
+  value:
+  - ibkr_etl.loader
+contractCreatedTs: '2026-10-18T00:00:00Z'

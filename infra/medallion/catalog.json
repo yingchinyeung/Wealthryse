@@ -1284,6 +1284,13 @@
    "target_schema": "public",
    "note": "Medallion step 3: each write to a silver table by a login outside the silver_loader group (who, which table, what kind of write, run id, application name; never row values). Written only by the silver_write_watch trigger. Empty for a full daily cycle before SILVER_WRITE_LOCK=on."
   },
+  "public.transfers": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "IBKR's Transfers section, one row per record under the parser's key and digest, beside its flex_rows row (migration 084). Read with silver cash_transactions as deposits and withdrawals when FLOWS_SOURCE is fallback or on. Filled from bronze by python -m ibkr_etl.flows_source fill-transfers.",
+   "source": "ibkr"
+  },
   "public.kiwoom_responses": {
    "kind": "table",
    "layer": "bronze",

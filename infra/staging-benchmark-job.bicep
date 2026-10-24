@@ -103,6 +103,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             // The app login cannot create tables, so the job must not try migrations
             // (live since 18 Oct 2026, as on the institutional daily job).
             { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
+            // Crisis prices from silver (S7, live since 24 Oct 2026): every close and FX quote is fetched
+            // into silver first and the crisis maths reads silver only.
+            { name: 'CRISIS_PRICES_SOURCE', value: 'silver' }
           ], rawMarketDataEnv)
           resources: {
             cpu: json('0.5')

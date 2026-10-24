@@ -46,7 +46,10 @@ class CrisisScenariosJobTests(unittest.TestCase):
         self.assertIn("args: ['scripts/refresh_crisis_scenarios.py']", template)
         self.assertIn("{ name: 'CRISIS_SCENARIOS_ENABLED', value: 'true' }", template)
         self.assertIn("ibkr-platform@${imageDigest}", template)
-        self.assertIn("secrets/database-app-url", template)
+        # The loader login and silver prices, live since 24 Oct 2026 (the silver write lock).
+        self.assertIn("secrets/database-loader-url", template)
+        self.assertNotIn("database-app-url", template)
+        self.assertIn("{ name: 'CRISIS_PRICES_SOURCE', value: 'silver' }", template)
 
 
 if __name__ == "__main__":

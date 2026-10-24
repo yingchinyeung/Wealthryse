@@ -93,6 +93,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'AZURE_CLIENT_ID', value: identity.properties.clientId }
             { name: 'ALLOW_UNLICENSED_BENCHMARK', value: 'true' }
             { name: 'IBKR_RUN_MIGRATIONS', value: 'false' }
+            // Crisis prices from silver (S7, live since 24 Oct 2026): every close and FX quote is fetched
+            // into silver first and the crisis maths reads silver only.
+            { name: 'CRISIS_PRICES_SOURCE', value: 'silver' }
           ]
           resources: {
             cpu: json('0.5')

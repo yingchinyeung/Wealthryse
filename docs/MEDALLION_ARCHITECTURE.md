@@ -42,8 +42,9 @@ applied. Each stage is approved separately (see "Stages" below).
   `infra/medallion/applied-tags.json` records what was added on 17 Oct 2026. A Bicep file
   that deploys one of those resources sets the same tags with `union(tags, {...})`, so a
   redeploy keeps them. `tests/test_bicep_medallion_tags.py` checks this. A new resource
-  in a Bicep file gets its three tags in the same PR. The resource group's audit rule
-  (Azure Policy, "Medallion rule") reports any resource without them.
+  in a Bicep file gets its three tags in the same PR. The resource group's tag rule
+  (Azure Policy, "Medallion rule") refuses a new or changed resource without them (see
+  [Tag rule](#tag-rule-step-4)).
 
 ## Adding a table, view or container
 
@@ -515,6 +516,29 @@ Only the named loader jobs write silver. Three parts, each with its own undo:
 
 `src/ibkr_etl/silver_writers.py` names the loader jobs and every file that writes silver,
 and `tests/test_silver_writers.py` fails on code that writes silver outside that register.
+
+## Tag rule (step 4)
+
+Three Azure Policy assignments on the resource group, `medallion-tag-layer`,
+`medallion-tag-component` and `medallion-tag-owner`, each the built-in "Require a tag on
+resources" for one tag. They reported only (`DoNotEnforce`) from 19 Oct 2026.
+
+- **Enforced since 24 Oct 2026 01:11 UTC.** Azure refuses to create or change a resource in
+  the group when the result would lack `layer`, `component` or `owner`. The error is
+  `RequestDisallowedByPolicy`, it names the rule, and its message says which tag to add.
+- **Exclusions.** Each rule excludes by resource ID the resources that lacked its tag at that
+  moment: 71 of 175 lacked `layer` and `component`, 27 lacked `owner`. They are mostly network
+  resources, the Container Apps environment, alert rules and a workbook whose release checks
+  compare their tags exactly, Smart Detection, trial leftovers and `ibkrv2stg-agent-dispatcher`
+  (its Bicep now carries the tags). They can be changed as before. Tagging one and dropping
+  it from the exclusions is a later step for its owner.
+- **Not affected:** job starts and executions, data in the database or storage, Key Vault
+  secrets, role assignments and storage containers. The rule is Indexed, so it checks only
+  resource types that carry tags and a location.
+- **Checked** by validation only: an untagged throwaway identity was refused and a tagged one
+  accepted, and neither was created.
+- **Undo:** the three rules back on `DoNotEnforce` with no exclusions, as saved before the
+  switch, by the administrator's script with `-Mode undo`.
 
 ## Stages
 

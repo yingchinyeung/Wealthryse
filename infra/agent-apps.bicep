@@ -566,7 +566,7 @@ resource operationsJob 'Microsoft.App/jobs@2024-03-01' = if (deployOperations) {
 resource dispatcherJob 'Microsoft.App/jobs@2024-03-01' = if (deployDispatcher) {
   name: 'ibkrv2stg-agent-dispatcher'
   location: resourceGroup().location
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'agents', hop: 'ops' })
   dependsOn: [pulls, tools]
   identity: {
     type: 'UserAssigned'

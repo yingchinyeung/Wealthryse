@@ -1503,6 +1503,13 @@
    ],
    "schedule": "app"
   },
+  "ibkrv2stg-agent-dispatcher": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "every 5 minutes, see infra/agent-apps.bicep",
+   "note": "Starts the scheduled agent jobs once their data is in and final."
+  },
   "ibkrv2stg-analyst-assurance": {
    "hops": [
     "quality-gate"

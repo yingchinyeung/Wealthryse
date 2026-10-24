@@ -234,7 +234,7 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         for check_id, result in results.items():
             states.setdefault(result["state"], set()).add(check_id)
         self.assertNotIn("unavailable", states)
-        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 43)
+        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 44)
         self.assertEqual({c for c in states.get("fail", ()) if not c.startswith("value.")}, set())
         # A held migration's tables skip their checks until it runs. The corrections history (U8) is
         # migration 074 now, so the build made its tables and their checks run like any other table's.

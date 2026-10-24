@@ -65,22 +65,42 @@ schema:
     description: IBKR transactionID.
   - name: transfer_date
     physicalType: text
-    logicalType: string
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
     required: false
     unique: false
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
     description: IBKR date of the transfer, as ISO text.
+    quality:
+    - name: transfer_date_is_iso_date
+      description: transfer_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.transfers WHERE transfer_date IS NOT NULL AND transfer_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
   - name: report_date
     physicalType: text
-    logicalType: string
+    logicalType: date
+    logicalTypeOptions:
+      format: yyyy-MM-dd
     required: false
     unique: false
     primaryKey: false
     primaryKeyPosition: -1
     classification: confidential-financial
     description: IBKR reportDate, as ISO text; the flow date when the record has no date.
+    quality:
+    - name: report_date_is_iso_date
+      description: report_date is an ISO date (yyyy-MM-dd) when present.
+      type: sql
+      query: SELECT COUNT(*) FROM silver.transfers WHERE report_date IS NOT NULL AND report_date !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+      mustBe: 0
+      severity: error
+      dimension: conformity
   - name: asset_category
     physicalType: text
     logicalType: string

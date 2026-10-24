@@ -5,11 +5,8 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Callable, Iterable, Mapping
 
-from . import publish_gate, raw_capture
-from .provisional_benchmark import (
-    convert_levels_to_reporting_currency,
-    fetch_fx_to_reporting_yfinance,
-)
+from . import crisis_prices, publish_gate, raw_capture
+from .provisional_benchmark import convert_levels_to_reporting_currency
 from .sector_classification import candidate_symbols
 from .util import utc_now_iso
 from .crisis_identity_policy import apply_identity_proxy
@@ -352,8 +349,12 @@ def refresh_composite_crisis_replay(
     price_cache: dict[str, dict[str, float]] | None = None,
     persisted_price_symbols: set[str] | None = None,
     component_stack: tuple[str, ...] = (),
+    source: Any = None,
 ) -> dict[str, Any]:
-    """Replay an approved fixed-unit composite through the crisis window."""
+    """Replay an approved fixed-unit composite through the crisis window.
+
+    Its own prices are SPY, the Hang Seng and HKD FX. With CRISIS_PRICES_SOURCE=silver they are
+    fetched into silver first and read back from there; sleeves do the same for theirs."""
 
     if account_id in component_stack:
         lineage = " -> ".join((*component_stack, account_id))
@@ -382,6 +383,21 @@ def refresh_composite_crisis_replay(
         (account_id, latest),
     ).fetchall()
     cache = price_cache if price_cache is not None else {}
+    lookback_start = CRISIS_START - timedelta(days=CRISIS_OPENING_LOOKBACK_DAYS)
+    hedged = any(str(row["component_id"]) == "hang-seng-price-index" for row in rows)
+    if source is None and crisis_prices.mode() == "silver":
+        fetched = crisis_prices.Yahoo(ticker_factory, keep=True)
+
+        def walk() -> None:
+            fetched.adjusted("SPY", CRISIS_START, CRISIS_END, "USD")
+            if hedged:
+                fetched.adjusted("^HSI", lookback_start, CRISIS_END, "HKD")
+                fetched.fx("HKD", "USD", lookback_start, CRISIS_END)
+        step = crisis_prices.fetch_into_silver(connection, fetched, walk, writer="crisis_replay")
+        source = crisis_prices.Silver(connection, fetched)
+        crisis_prices.log(step, source)
+    elif source is None:
+        source = crisis_prices.Yahoo(ticker_factory)
 
     def prices(
         symbol: str,
@@ -397,14 +413,8 @@ def refresh_composite_crisis_replay(
             )
         )
         if current is None or needs_opening_lookback:
-            fetched = fetch_adjusted_history(
-                symbol,
-                ticker_factory,
-                start_date=start_date,
-                end_date=CRISIS_END,
-                capture_feed=RAW_FEED,
-            )
-            cache[symbol] = {**fetched, **(current or {})}
+            answer = source.adjusted(symbol, start_date, CRISIS_END, "HKD" if symbol == "^HSI" else "USD")
+            cache[symbol] = {**answer, **(current or {})}
         return cache[symbol]
 
     spy = prices("SPY")
@@ -489,13 +499,8 @@ def refresh_composite_crisis_replay(
             }
         elif component_id == "hang-seng-price-index":
             source_symbol = "^HSI"
-            lookback_start = CRISIS_START - timedelta(
-                days=CRISIS_OPENING_LOOKBACK_DAYS
-            )
             native = prices(source_symbol, start_date=lookback_start)
-            fx_rows, _ = fetch_fx_to_reporting_yfinance(
-                "HKD", "USD", lookback_start, CRISIS_END, ticker_factory
-            )
+            fx_rows, _ = source.fx("HKD", "USD", lookback_start, CRISIS_END)
             series = convert_crisis_prices_to_usd(native, "HKD", fx_rows)
         elif component_id == "spy-settlement":
             source_symbol = "SPY"
@@ -695,14 +700,16 @@ def _krw_components(
     holdings: Iterable[Mapping[str, Any]],
     ticker_factory: Callable[[str], Any] | None,
     cache: dict[str, dict[str, float]],
+    source: Any = None,
 ) -> tuple[list[ReplayComponent], dict[str, dict[str, float]], list[str]]:
     start = CRISIS_START - timedelta(days=CRISIS_OPENING_LOOKBACK_DAYS)
+    source = source if source is not None else crisis_prices.Yahoo(ticker_factory)
 
     def load(symbol: str, *, lookback: bool) -> dict[str, float]:
         key = f"{symbol}@lookback" if lookback else symbol
         if key not in cache:
-            cache[key] = fetch_adjusted_history(
-                symbol, ticker_factory, start_date=start if lookback else CRISIS_START, capture_feed=RAW_FEED)
+            cache[key] = source.adjusted(symbol, start if lookback else CRISIS_START, CRISIS_END,
+                                         "USD" if symbol == "SPY" else "KRW")
         return cache[key]
 
     spy = load("SPY", lookback=False)
@@ -768,7 +775,13 @@ def refresh_crisis_replay(
     price_cache: dict[str, dict[str, float]] | None = None,
     persisted_price_symbols: set[str] | None = None,
     reporting_currency: str | None = None,
+    source: Any = None,
 ) -> dict[str, Any]:
+    """Replay one account's or portfolio's holdings through the 2008 window and store it.
+
+    With CRISIS_PRICES_SOURCE=silver (and no source given) the component prices are first fetched
+    into silver, then the replay is built from silver alone."""
+
     requested = _iso_date(holdings_as_of)
     latest = resolve_holdings_as_of(
         connection, account_id=account_id, as_of=requested
@@ -810,13 +823,27 @@ def refresh_crisis_replay(
         _subject_reporting_currency(connection, account_id, sqlite)
         if any(str(row["currency"] or "").strip().upper() == "KRW" for row in holdings) else "USD"
     )).upper()
-    if reporting == "KRW":
-        components, fetched, calendar = _krw_components(holdings, ticker_factory, cache)
-    else:
-        components, fetched, calendar = _usd_components(
+
+    def build(prices_source: Any, prices_cache: dict[str, dict[str, float]]):
+        if reporting == "KRW":
+            return _krw_components(holdings, ticker_factory, prices_cache, prices_source)
+        return _usd_components(
             connection, account_id=account_id, latest=latest, holdings=holdings,
-            ticker_factory=ticker_factory, cache=cache,
+            ticker_factory=ticker_factory, cache=prices_cache, source=prices_source,
         )
+
+    if source is None and crisis_prices.mode() == "silver":
+        answers = crisis_prices.Yahoo(ticker_factory, keep=True)
+        # A copy of the shared cache: what it already holds was read from silver and needs no fetch,
+        # and today's answers must not reach the cache except through silver.
+        step = crisis_prices.fetch_into_silver(connection, answers, lambda: build(answers, dict(cache)),
+                                               writer="crisis_replay")
+        source = crisis_prices.Silver(connection, answers)
+        components, fetched, calendar = build(source, cache)
+        crisis_prices.log(step, source)
+    else:
+        components, fetched, calendar = build(
+            source if source is not None else crisis_prices.Yahoo(ticker_factory), cache)
     result = _store_replay(
         connection, account_id=account_id, requested=requested, latest=latest,
         components=components, prices=fetched, calendar=calendar, portfolio_nav=portfolio_nav,
@@ -836,12 +863,14 @@ def _usd_components(
     holdings: Iterable[Mapping[str, Any]],
     ticker_factory: Callable[[str], Any] | None,
     cache: dict[str, dict[str, float]],
+    source: Any = None,
 ) -> tuple[list[ReplayComponent], dict[str, dict[str, float]], list[str]]:
     fx_cache: dict[str, list[tuple[str, float]]] = {}
+    source = source if source is not None else crisis_prices.Yahoo(ticker_factory)
 
-    def load_prices(symbol: str) -> dict[str, float]:
+    def load_prices(symbol: str, currency: str = "USD") -> dict[str, float]:
         if symbol not in cache:
-            cache[symbol] = fetch_adjusted_history(symbol, ticker_factory, capture_feed=RAW_FEED)
+            cache[symbol] = source.adjusted(symbol, CRISIS_START, CRISIS_END, currency)
         return cache[symbol]
 
     def prices_in_usd(symbol: str, currency: str) -> dict[str, float]:
@@ -854,17 +883,11 @@ def _usd_components(
         """
 
         native = currency.upper()
-        series = load_prices(symbol)
+        series = load_prices(symbol, native)
         if native == "USD":
             return convert_crisis_prices_to_usd(series, native)
         if native not in fx_cache:
-            fx_cache[native], _ = fetch_fx_to_reporting_yfinance(
-                native,
-                "USD",
-                CRISIS_START,
-                CRISIS_END,
-                ticker_factory,
-            )
+            fx_cache[native], _ = source.fx(native, "USD", CRISIS_START, CRISIS_END)
         return convert_crisis_prices_to_usd(series, native, fx_cache[native])
 
     spy = load_prices("SPY")

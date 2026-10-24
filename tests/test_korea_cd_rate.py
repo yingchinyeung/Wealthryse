@@ -116,6 +116,60 @@ class RiskSnapshotRateTests(unittest.TestCase):
 FRED_CSV = b"observation_date,IR3TCD01KRM156N\n2026-06-01,2.61\n2026-07-01,.\n2026-08-01,2.55\n2026-12-01,2.50\n"
 
 
+def fred_only(fake):
+    """The OECD unreachable (as from Azure on some days), so the load falls back to FRED."""
+
+    def get(url, timeout=30):
+        if "sdmx.oecd.org" in url:
+            raise TimeoutError("OECD did not answer")
+        return fake(url, timeout=timeout)
+    return get
+
+
+OECD_CSV = ("DATAFLOW,REF_AREA,FREQ,MEASURE,UNIT_MEASURE,TIME_PERIOD,OBS_VALUE\n"
+            "OECD.SDD.STES:DSD_STES@DF_FINMARK(4.0),KOR,M,IR3TIB,PA,2026-08,2.55\n"
+            "OECD.SDD.STES:DSD_STES@DF_FINMARK(4.0),KOR,M,IR3TIB,PA,2026-06,2.61\n"
+            "OECD.SDD.STES:DSD_STES@DF_FINMARK(4.0),KOR,M,IR3TIB,PA,2026-07,\n").encode()
+
+
+class OecdCdRateTests(unittest.TestCase):
+    def test_the_oecd_is_asked_first_and_fred_is_not_called(self):
+        urls = []
+
+        def get(url, timeout=30):
+            urls.append(url)
+            return OECD_CSV
+
+        connection = database()
+        result = cd.refresh_monthly_cd_rates(connection, start_date=date(2026, 1, 1), end_date=date(2026, 10, 21),
+                                             get=get, sleep=lambda _: None)
+        self.assertEqual((result["source"], result["observations_loaded"]), ("oecd-sdmx", 2))
+        self.assertNotIn("oecd_error", result)
+        self.assertEqual(len(urls), 1)
+        self.assertIn("/OECD.SDD.STES,DSD_STES@DF_FINMARK,4.0/KOR.M.IR3TIB.PA", urls[0])
+        self.assertIn("startPeriod=2026-01", urls[0])
+        rows = [tuple(r) for r in connection.execute(
+            "SELECT rate_date, series_id, annual_rate, provider FROM risk_free_rates ORDER BY rate_date")]
+        self.assertEqual([r[:3] for r in rows], [("2026-06-30", "OECD-KR-CD-3M", 0.0261),
+                                                ("2026-08-31", "OECD-KR-CD-3M", 0.0255)])
+        self.assertTrue(rows[0][3].startswith("OECD SDMX"))
+
+    def test_an_oecd_failure_falls_back_to_fred_and_is_reported(self):
+        result = cd.refresh_monthly_cd_rates(database(), start_date=date(2026, 1, 1), end_date=date(2026, 10, 21),
+                                             get=fred_only(lambda url, timeout=30: FRED_CSV), sleep=lambda _: None)
+        self.assertEqual((result["source"], result["observations_loaded"]), ("fred", 2))
+        self.assertIn("TimeoutError", result["oecd_error"])
+
+    def test_another_country_or_measure_and_conflicts_are_refused(self):
+        for bad in (OECD_CSV.replace(b",KOR,", b",USA,"), OECD_CSV.replace(b"IR3TIB", b"IRLT")):
+            with self.subTest(), self.assertRaises(RuntimeError):
+                cd.parse_oecd_csv(bad)
+        with self.assertRaisesRegex(ValueError, "Conflicting"):
+            cd.parse_oecd_csv(OECD_CSV + b"x,KOR,M,IR3TIB,PA,2026-08,2.60\n")
+        with self.assertRaisesRegex(RuntimeError, "not SDMX-CSV"):
+            cd.parse_oecd_csv(b"<html>maintenance</html>")
+
+
 class MonthlyCdRateTests(unittest.TestCase):
     def test_each_month_is_stored_on_its_last_day_and_gaps_are_skipped(self):
         urls = []
@@ -126,7 +180,7 @@ class MonthlyCdRateTests(unittest.TestCase):
 
         connection = database()
         result = cd.refresh_monthly_cd_rates(connection, start_date=date(2026, 1, 1), end_date=date(2026, 10, 21),
-                                             get=get)
+                                             get=fred_only(get))
         self.assertEqual(result["observations_loaded"], 2)   # December is after the end date
         rows = [tuple(r) for r in connection.execute(
             "SELECT rate_date, series_id, currency, annual_rate FROM risk_free_rates ORDER BY rate_date")]
@@ -145,7 +199,7 @@ class MonthlyCdRateTests(unittest.TestCase):
             return FRED_CSV
 
         result = cd.refresh_monthly_cd_rates(database(), start_date=date(2026, 1, 1), end_date=date(2026, 10, 21),
-                                             get=flaky, sleep=waits.append)
+                                             get=fred_only(flaky), sleep=waits.append)
         self.assertEqual(result["observations_loaded"], 2)
         self.assertEqual((len(calls), waits), (3, [5, 20]))
 
@@ -154,7 +208,8 @@ class MonthlyCdRateTests(unittest.TestCase):
 
         connection = database()
         with self.assertRaises(TimeoutError):
-            cd.refresh_monthly_cd_rates(connection, start_date=date(2026, 1, 1), get=down, sleep=lambda _: None)
+            cd.refresh_monthly_cd_rates(connection, start_date=date(2026, 1, 1), get=fred_only(down),
+                                        sleep=lambda _: None)
         self.assertEqual(connection.execute("SELECT COUNT(*) FROM risk_free_rates").fetchone()[0], 0)
 
     def test_a_wrong_file_is_not_retried(self):
@@ -165,7 +220,8 @@ class MonthlyCdRateTests(unittest.TestCase):
             return b"DATE,IR3TCD01USM156N\n2026-06-01,5.1\n"
 
         with self.assertRaises(RuntimeError):
-            cd.refresh_monthly_cd_rates(database(), start_date=date(2026, 1, 1), get=wrong, sleep=lambda _: None)
+            cd.refresh_monthly_cd_rates(database(), start_date=date(2026, 1, 1), get=fred_only(wrong),
+                                        sleep=lambda _: None)
         self.assertEqual(len(calls), 1)
 
     def test_another_series_or_a_bad_value_stops_the_load(self):

@@ -27,7 +27,8 @@ resource applicationVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
 }
 resource databaseSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
   parent: applicationVault
-  name: 'database-app-url'
+  // The loader login (Medallion step 3): only the loader jobs may write silver.
+  name: 'database-loader-url'
 }
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
   name: storageAccountName

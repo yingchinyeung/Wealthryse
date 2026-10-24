@@ -8,6 +8,12 @@ param identityResourceId string
 param imageTag string
 param tenantId string = '00000000-0000-0000-0000-000000000001'
 param tenantName string = 'WealthRyse staging pilot'
+// Medallion step 3: the loader login, the only runtime login that may write silver once the lock is on.
+param loaderRole string = 'ibkr_stg_loader'
+// on: bootstrap takes the right to write silver from the app login. A bootstrap run without it gives the
+// right back, so this stays as the live job carries it.
+@allowed(['off', 'on'])
+param silverWriteLock string = 'off'
 
 var tags = {
   application: 'ibkr-portfolio-platform'
@@ -78,6 +84,16 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           keyVaultUrl: '${vault.properties.vaultUri}secrets/database-approval-password'
           identity: jobIdentity.id
         }
+        {
+          name: 'database-loader-password'
+          keyVaultUrl: '${vault.properties.vaultUri}secrets/database-loader-password'
+          identity: jobIdentity.id
+        }
+        {
+          name: 'database-loader-url'
+          keyVaultUrl: '${vault.properties.vaultUri}secrets/database-loader-url'
+          identity: jobIdentity.id
+        }
       ]
     }
     template: {
@@ -87,7 +103,7 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
           image: '${registry.properties.loginServer}/ibkr-platform:${imageTag}'
           command: ['python']
           args: ['scripts/bootstrap_postgres.py']
-          env: [
+          env: concat([
             { name: 'DATABASE_ADMIN_URL', secretRef: 'database-admin-url' }
             { name: 'DATABASE_APP_PASSWORD', secretRef: 'database-app-password' }
             { name: 'DATABASE_APP_ROLE', value: 'ibkr_stg_app' }
@@ -97,7 +113,9 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
             { name: 'DATABASE_APPROVAL_ROLE', value: 'ibkr_stg_approval' }
             { name: 'PORTFOLIO_TENANT_ID', value: tenantId }
             { name: 'PORTFOLIO_TENANT_NAME', value: tenantName }
-          ]
+            { name: 'DATABASE_LOADER_PASSWORD', secretRef: 'database-loader-password' }
+            { name: 'DATABASE_LOADER_ROLE', value: loaderRole }
+          ], silverWriteLock == 'on' ? [ { name: 'SILVER_WRITE_LOCK', value: 'on' } ] : [])
           resources: {
             cpu: json('0.5')
             memory: '1Gi'

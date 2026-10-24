@@ -60,7 +60,8 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
       secrets: [
         {
           name: 'database-url'
-          keyVaultUrl: '${vault.properties.vaultUri}secrets/database-app-url'
+          // The loader login (Medallion step 3): only the loader jobs may write silver.
+          keyVaultUrl: '${vault.properties.vaultUri}secrets/database-loader-url'
           identity: jobIdentity.id
         }
       ]

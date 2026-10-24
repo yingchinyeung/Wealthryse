@@ -387,7 +387,7 @@ def overlay_build(state, merged=None):
         'design_hashes': {n: hashlib.sha256(d).hexdigest() for n, d in designs.items()},
     }
     command = remote_script(config)
-    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    vm = build_vm()
     started = vm.get('powerState') != 'VM running'
     if started:
         print('Starting the build VM')
@@ -506,6 +506,22 @@ _run_serial = itertools.count(1)
 REMOVE_WAIT = 900
 # A Run Command whose removal never finished. Nothing more is run on the VM after one.
 _not_removed = []
+# The tag rule refuses any new resource without these tags, Run Commands included, so each
+# one carries the build VM's own.
+RUN_COMMAND_TAGS = ('layer', 'component', 'owner')
+_vm_tags = {}
+
+
+def build_vm():
+    """The build VM as `az vm show -d` gives it; also notes the tags its Run Commands will carry."""
+    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    tags = {k: str((vm.get('tags') or {}).get(k) or '') for k in RUN_COMMAND_TAGS}
+    if not all(tags.values()):
+        raise SystemExit('The build VM lacks its layer, component or owner tag, so the tag rule would refuse its '
+                         'Run Commands. Nothing was run on it.')
+    _vm_tags.clear()
+    _vm_tags.update(tags)
+    return vm
 
 
 def run_command_name(name):
@@ -533,10 +549,12 @@ def vm_run(base, name, script, location, timeout):
     if _not_removed:
         raise SystemExit(f'Not running {name} on the build VM: Run Command {_not_removed[0]} was never removed, '
                          'so the VM may be stuck. Check it before the next release.')
+    if not _vm_tags:
+        raise SystemExit(f'Not running {name} on the build VM: its tags were not read, so the tag rule would refuse it.')
     name = run_command_name(name)
     url = base + name + '?api-version=2024-07-01'
     body = Path('run-command.json')
-    body.write_text(json.dumps({'location': location, 'properties': {
+    body.write_text(json.dumps({'location': location, 'tags': dict(_vm_tags), 'properties': {
         'source': {'script': script}, 'asyncExecution': True, 'timeoutInSeconds': timeout, 'treatFailureAsDeploymentFailure': False}}))
     try:
         az('rest', '--method', 'put', '--url', url, '--body', '@' + str(body), parse=False)
@@ -592,7 +610,7 @@ def remote_script(config):
 
 def read_only_on_vm(config, run_name):
     """Run a read-only capture or inventory on the build VM; return its result and detail."""
-    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    vm = build_vm()
     started = vm.get('powerState') != 'VM running'
     if started:
         az('vm', 'start', '-g', RG, '-n', VM, parse=False)
@@ -747,7 +765,7 @@ def assurance_build():
     code = code.replace(marker, 'CONFIG = json.loads(' + repr(json.dumps(assurance_config(head))) + ')')
     command = "cat > /tmp/wealthryse-website-build.py <<'WEALTHRYSE_EOF'\n" + code + "\nWEALTHRYSE_EOF\n" \
               "unshare --mount --propagation private python3 /tmp/wealthryse-website-build.py; status=$?; rm -f /tmp/wealthryse-website-build.py; exit $status"
-    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    vm = build_vm()
     started = vm.get('powerState') != 'VM running'
     if started:
         az('vm', 'start', '-g', RG, '-n', VM, parse=False)

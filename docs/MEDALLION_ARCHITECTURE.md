@@ -566,6 +566,11 @@ resources" for one tag. They reported only (`DoNotEnforce`) from 19 Oct 2026.
 - **Not affected:** job starts and executions, data in the database or storage, Key Vault
   secrets, role assignments and storage containers. The rule is Indexed, so it checks only
   resource types that carry tags and a location.
+- **Run Commands on the build VM** are resources too, so each one the image builds and
+  `deploy/website_release.py` create carries the VM's own `layer`, `component` and `owner`,
+  and nothing is run when the VM lacks one. The first image build after the switch was
+  refused for this (24 Oct 2026 02:30 UTC) and changed nothing. `az vm run-command invoke`
+  is an action, not a resource, and is not checked.
 - **Checked** by validation only: an untagged throwaway identity was refused and a tagged one
   accepted, and neither was created.
 - **Undo:** the three rules back on `DoNotEnforce` with no exclusions, as saved before the

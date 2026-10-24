@@ -41,6 +41,14 @@ class AgentAppsBicepTest(unittest.TestCase):
         self.assertIn("{ name: 'AGENT_CHAT_REASONING_MODE', value: chatReasoningMode }", agent)
         self.assertIn("param modelCapacity int = 100", foundation)
 
+    def test_flows_source_is_set_on_the_tool_server_only_and_off_unless_a_deploy_asks(self):
+        apps = BICEP.read_text()
+        self.assertIn("@allowed(['off', 'fallback', 'on'])\nparam flowsSource string = 'off'", apps)
+        self.assertEqual(apps.count("'FLOWS_SOURCE'"), 1)
+        tools = apps[apps.index("resource tools 'Microsoft.App/containerApps"):apps.index("resource agent 'Microsoft.App")]
+        # Left out entirely when off, so a deploy without the setting changes nothing on the app.
+        self.assertIn("flowsSource == 'off' ? [] : [{ name: 'FLOWS_SOURCE', value: flowsSource }]", tools)
+
     def test_month_team_is_off_until_approved_and_stays_in_the_apac_data_zone(self):
         apps = BICEP.read_text()
         self.assertIn("param deployMonthTeam bool = false", apps)

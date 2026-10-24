@@ -1024,7 +1024,7 @@
    "kind": "view",
    "layer": "consumer",
    "target_schema": "agent",
-   "note": "Account-scoped facade the agents read (Kiwoom deposits and withdrawals only, amount as text)."
+   "note": "Account-scoped facade the agents read: from silver cash_transactions, the rows that can be a deposit or withdrawal (Kiwoom DEPOSIT and WITHDRAWAL, IBKR deposits and withdrawals), amount as text. Read by the flow reader with FLOWS_SOURCE (agent 020, widened by 022)."
   },
   "agent.certified_builds": {
    "kind": "view",
@@ -1037,6 +1037,12 @@
    "layer": "consumer",
    "target_schema": "agent",
    "note": "Account-scoped facade the agents read (U5): the published certified figures, from gold.v_certified_figures."
+  },
+  "agent.certified_latest": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read (gold): each account's newest as-of date covered by a published certified build, and that build. Dates and ids only; the event dispatcher waits on it (agent 021)."
   },
   "agent.derived_portfolio_cash_ledger": {
    "kind": "view",
@@ -1241,6 +1247,12 @@
    "layer": "consumer",
    "target_schema": "agent",
    "note": "Account-scoped facade the agents read."
+  },
+  "agent.transfers": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read: IBKR Transfers records from silver.transfers, the columns the flow reader uses with FLOWS_SOURCE (agent 022)."
   },
   "silver.cash_transactions_history": {
    "kind": "table",

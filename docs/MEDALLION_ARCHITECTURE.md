@@ -487,10 +487,20 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   `positionAmountInBase`, else its `positionAmount` converted. Undo:
   `infra/medallion/undo/084_silver_transfers_undo.sql` after `FLOWS_SOURCE` is off; bronze
   keeps every record.
-- **Leave the agent tool server unset** until the agent schema has a view over silver flows:
-  its login reads only the `agent` views, so `fallback` there always logs
-  `silver_unreadable` and keeps bronze (the failed read is inside a savepoint). Removing
-  `agent.flex_rows` comes after that.
+- **The agent tool server** reads only the `agent` views, so it needs
+  `migrations/agent/022_silver_flows.sql` before `fallback` means anything there; without it
+  every call logs `silver_unreadable` and keeps bronze (the failed read is inside a
+  savepoint). 022 widens `agent.cash_transactions` (020's Kiwoom rows) to the rows of the
+  accounts in scope that can be a deposit or withdrawal, with the four columns the silver
+  reader also selects, and adds `agent.transfers` over `silver.transfers` (skipped until 084
+  is applied). `provisional_benchmark._is_external_cash_transaction` still decides each
+  row; dividends, fees and trades stay out of both views. With the setting off nothing
+  reads the new part. `infra/agent-apps.bicep` sets it on the tool server alone
+  (`flowsSource`, default `off`, which leaves the variable out). The order: 022 installed
+  (`install_agent_schema.py --existing-logins`, a dry run first), the tool server on an
+  agent image with `flows_source` from main 397d77a or later (earlier images read no
+  transfers from silver), then `flowsSource=fallback`. Removing `agent.flex_rows` comes
+  after `on`.
 - **Undo:** remove the setting. Nothing is written anywhere.
 - **Before switching on, on a restored copy:**
   `python -m ibkr_etl.flows_source compare --database-url "<copy URL>" --tenant <tenant id>`
@@ -505,7 +515,8 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   `fill-transfers --apply`; `compare` showing every account matching, or each difference
   explained; then `fallback` on the website, the certified build, derived-daily and the
   monthly and month-end jobs.
-- **Before `on`:** two clean month-ends in `fallback`, and the agent view above.
+- **Before `on`:** two clean month-ends in `fallback`, and the agent views above installed with the tool
+  server on `fallback` through both.
 
 ## Crisis prices from silver (S6): `CRISIS_PRICES_SOURCE`
 

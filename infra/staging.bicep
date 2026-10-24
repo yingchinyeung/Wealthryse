@@ -124,7 +124,7 @@ resource privateDnsLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2
 resource managedEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: environmentName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'container-apps' })
   properties: {
     appLogsConfiguration: {
       destination: 'log-analytics'

@@ -626,8 +626,11 @@ resources" for one tag. They reported only (`DoNotEnforce`) from 19 Oct 2026.
   moment: 71 of 175 lacked `layer` and `component`, 27 lacked `owner`. They are mostly network
   resources, the Container Apps environment, alert rules and a workbook whose release checks
   compare their tags exactly, Smart Detection, trial leftovers and `ibkrv2stg-agent-dispatcher`
-  (its Bicep now carries the tags). They can be changed as before. Tagging one and dropping
-  it from the exclusions is a later step for its owner.
+  (its Bicep now carries the tags). They can be changed as before. On 24 Oct 2026 between
+  04:41 and 05:10 UTC, 69 of them were given their missing tags (Merge only, nothing
+  overwritten) and dropped from the exclusions: the 21 monitors and identities, then the 48
+  network resources agreed with their owner. Left excluded: the Container Apps environment and
+  the build VM's sign-in extension.
 - **Exact tag checks.** The code that checks a whole tag map (the metadata monitor's release,
   the cost workbook, the operational and secret-metadata findings alerts and the secret-metadata
   job and identity) accepts each resource either as before or with exactly the extra tags that
@@ -638,7 +641,10 @@ resources" for one tag. They reported only (`DoNotEnforce`) from 19 Oct 2026.
   link) and `infra/agent-foundation.bicep` (the agents' private endpoint, its three DNS zones
   and links) set `layer: 'foundation'` and `component: 'network'` on top of their `tags`, and
   the Foundry account and project `layer: 'ai'` and `component: 'ai-models'`, so a redeploy
-  keeps the tags those resources carry and the rule accepts it.
+  keeps the tags those resources carry and the rule accepts it. The Container Apps environment
+  in `infra/staging.bicep` sets `layer: 'foundation'` and `component: 'container-apps'`. The
+  build VM's sign-in extension (`AADSSHLoginForLinux`, made by a script, not Bicep) carries the
+  VM's own `layer: 'ops'` and `component: 'build-vm'`.
 - **Not affected:** job starts and executions, data in the database or storage, Key Vault
   secrets, role assignments and storage containers. The rule is Indexed, so it checks only
   resource types that carry tags and a location.

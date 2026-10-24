@@ -448,6 +448,13 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   and the month-end factsheet), with no image changed. A read-only comparison just before found
   every account equal in silver and bronze, so no figure changed. The onboarding analytics and
   render jobs and the report snapshot job stay unset until they run an image with the switch.
+  `silver.transfers` (084) since 02:56 UTC the same day: applied alone, filled from bronze (no
+  Transfers rows yet, so nothing to copy), and compared again, 4 of 4 accounts matching.
+  `ibkrv2stg-institutional-daily` runs main-397d77a, so its daily load writes IBKR transfers to
+  silver as well as bronze. The readers keep their older images, which read no transfers from
+  silver, so until each runs 397d77a or later `fallback` keeps bronze, with one log line, for
+  any account that has a transfer. `ibkrv2stg-flex-discovery` still writes transfers to bronze
+  only, which `fallback` reads as `transfers_not_in_silver`.
   `on` waits for two clean month-ends (31 Oct and 30 Nov), images with the month-end check on
   every reader, and the alert deployed.
 - **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to

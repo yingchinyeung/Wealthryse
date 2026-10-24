@@ -14,7 +14,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +29,8 @@ OTHER = "U9300002"
 FIRST = date(2026, 9, 1)
 DAYS = 40
 LOOKBACK = 14
+# Outside the month-end check, so that on reads silver only (MonthEndCheckTests sets its own).
+MID_MONTH = datetime(2026, 10, 15, 4, 0, tzinfo=timezone.utc)
 
 
 def _d(day: date) -> str:
@@ -152,6 +154,12 @@ class FlowsSourceTestCase(unittest.TestCase):
         emitter = patch.object(flows_source, "emit", self.lines.append)
         emitter.start()
         self.addCleanup(emitter.stop)
+        self.at(MID_MONTH)
+
+    def at(self, moment: datetime) -> None:
+        clock = patch.object(flows_source, "_now", return_value=moment)
+        clock.start()
+        self.addCleanup(clock.stop)
 
     def flows(self, mode: str, account=ACCOUNT, subject_type="physical_account") -> dict[str, float]:
         with patch.dict(os.environ, {"FLOWS_SOURCE": mode}):
@@ -376,6 +384,76 @@ class DifferenceTests(FlowsSourceTestCase):
         on = self.flows("on")
         self.assertNotIn((FIRST + timedelta(days=17)).isoformat(), on)
         self.assertEqual(self.lines, [])
+
+
+class MonthEndCheckTests(FlowsSourceTestCase):
+    """On days 1 to 7 of a Hong Kong month, on compares with bronze as fallback does."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.load(daily_statements(ACCOUNT, cash=standard_cash(), days=25))
+        self.expected = self.bronze()
+
+    def test_the_window_is_days_one_to_seven_in_hong_kong(self):
+        cases = [
+            (datetime(2026, 10, 31, 15, 59, tzinfo=timezone.utc), False),  # 31 Oct 23:59 in Hong Kong
+            (datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc), True),    # 1 Nov 00:00 in Hong Kong
+            (datetime(2026, 11, 7, 15, 59, tzinfo=timezone.utc), True),    # 7 Nov 23:59
+            (datetime(2026, 11, 7, 16, 0, tzinfo=timezone.utc), False),    # 8 Nov 00:00
+            (datetime(2026, 12, 1, 9, 0), True),                           # no zone: read as UTC
+            (MID_MONTH, False),
+        ]
+        for moment, inside in cases:
+            self.assertIs(flows_source.month_end_window(moment), inside, moment)
+
+    def test_on_uses_silver_at_a_month_end_when_it_equals_bronze(self):
+        self.at(datetime(2026, 11, 2, 1, 0, tzinfo=timezone.utc))
+        with patch.object(provisional_benchmark, "_bronze_external_flows",
+                          wraps=provisional_benchmark._bronze_external_flows) as bronze:
+            self.assertEqual(self.flows("on"), self.expected)
+        bronze.assert_called_once()
+        self.assertEqual(self.lines, [])
+
+    def test_on_keeps_bronze_at_a_month_end_when_silver_differs(self):
+        self.db.connection.execute("DELETE FROM cash_transactions WHERE transaction_id = 'D4'")
+        self.at(datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))
+        self.assertEqual(self.flows("on"), self.expected)
+        self.assertEqual(self.logged(), [{"dates_differing": 1, "decision": "bronze", "guard": "month_end",
+                                          "kinds": {"only_in_bronze": 1}, "mode": "on",
+                                          "reason": "silver_differs", "subject": "u…01"}])
+        self.assert_no_values_or_ids()
+
+    def test_on_keeps_bronze_at_a_month_end_when_silver_is_unreadable(self):
+        self.db.connection.execute("ALTER TABLE cash_transactions RENAME TO cash_transactions_elsewhere")
+        self.at(datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(self.flows("on"), self.expected)
+        self.assertEqual(self.logged(), [{"decision": "bronze", "error": "OperationalError", "guard": "month_end",
+                                          "mode": "on", "reason": "silver_unreadable", "subject": "u…01"}])
+
+    def test_on_shows_silver_after_the_month_end(self):
+        self.db.connection.execute("DELETE FROM cash_transactions WHERE transaction_id = 'D4'")
+        self.at(datetime(2026, 11, 8, 1, 0, tzinfo=timezone.utc))
+        with patch.object(provisional_benchmark, "_bronze_external_flows",
+                          side_effect=AssertionError("bronze read")):
+            on = self.flows("on")
+        self.assertNotIn((FIRST + timedelta(days=17)).isoformat(), on)
+        self.assertEqual(self.lines, [])
+
+    def test_fallback_lines_carry_no_guard(self):
+        self.db.connection.execute("DELETE FROM cash_transactions WHERE transaction_id = 'D4'")
+        for moment in (datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc), MID_MONTH):
+            self.lines.clear()
+            self.at(moment)
+            self.assertEqual(self.flows("fallback"), self.expected)
+            self.assertNotIn("guard", self.logged()[0])
+
+    def test_portfolios_are_untouched_at_a_month_end(self):
+        self.at(datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))
+        with patch.object(flows_source, "silver_external_flows", side_effect=AssertionError("silver read")):
+            for subject_type in sorted(flows_source.DERIVED_TYPES):
+                with patch.object(provisional_benchmark, "_bronze_external_flows", return_value={}) as ledger:
+                    self.flows("on", subject_type=subject_type)
+                ledger.assert_called_once()
 
 
 class TransferTests(FlowsSourceTestCase):

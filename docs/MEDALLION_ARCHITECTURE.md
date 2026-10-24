@@ -429,16 +429,27 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
     `FLOWS_SOURCE {"dates_differing":1,"decision":"bronze","kinds":{"transfers_not_in_silver":1},"mode":"fallback","reason":"silver_differs","subject":"u…01"}`
     (`reason` is `silver_differs` or `silver_unreadable`; counts and masked subjects only). To
     read them: `ContainerAppConsoleLogs_CL | where Log_s startswith 'FLOWS_SOURCE '`.
-  - `on`: silver only. Not before two clean month-ends in `fallback`. Without
-    `silver.transfers` it reads bronze and logs `no_silver_transfers`, so a transfer is never
-    left out.
+  - `on`: silver only, except in the month-end check below. Not before two clean month-ends
+    in `fallback`. Without `silver.transfers` it reads bronze and logs `no_silver_transfers`,
+    so a transfer is never left out.
+- **The month-end check.** On days 1 to 7 of each month in Hong Kong, when the month just
+  closed is reported and frozen, `on` reads bronze beside silver and keeps bronze wherever the
+  two differ, exactly as `fallback` does, and its lines add `"guard":"month_end"`. So a
+  difference found at a month-end goes into no frozen figure. The jobs that freeze a month's
+  figures (the certified build, the month-end factsheet and the report snapshot) stay on
+  `fallback` whatever the others run, which also covers a month reported after the 7th.
+- **The alert.** `infra/staging-flows-source-alert.bicep` deploys
+  `ibkrv2stg-flows-source-kept-bronze`, a log alert to `ibkrv2stg-alerts` on any
+  `FLOWS_SOURCE` line where a reader kept bronze, by job or app and reason, checked every 15
+  minutes. It shows no subject or value. In `fallback` it is how a difference is noticed the
+  day it shows, and two clean month-ends means no alert across each.
 - **Live:** `fallback` since 24 Oct 2026 02:19 UTC on the website and the five jobs that build
   return figures (the certified build, derived-daily, benchmark-daily, crisis-scenarios-daily
   and the month-end factsheet), with no image changed. A read-only comparison just before found
   every account equal in silver and bronze, so no figure changed. The onboarding analytics and
   render jobs and the report snapshot job stay unset until they run an image with the switch.
-  `on` waits for two clean month-ends (31 Oct and 30 Nov) and a check before each month-end
-  build that falls back to bronze for any account whose silver differs.
+  `on` waits for two clean month-ends (31 Oct and 30 Nov), images with the month-end check on
+  every reader, and the alert deployed.
 - **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to
   `silver.cash_transactions` in the same loop, under the parser's key. The daily 14-day
   re-send updates the same row in both; a correction under the same key overwrites both; a

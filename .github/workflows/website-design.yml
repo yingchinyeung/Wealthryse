@@ -1,0 +1,46 @@
+name: Website design setting
+
+# Manual: sets WEB_DESIGN on ibkrv2stg-web. classic is today's design, preview lets
+# owners try WealthRyse Next in their own browser, next gives it to everyone (each
+# person can go back to classic). The image is left as it is. Rolls back to the
+# previous setting if checks fail.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: classic, preview or next (whole design); pages-off, pages-preview or pages-on (page-by-page redesign)
+        required: true
+        type: choice
+        options: [preview, next, classic, pages-off, pages-preview, pages-on]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-website
+  cancel-in-progress: false
+
+jobs:
+  design:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AZURE_CLIENT_ID: 17708c85-b855-4209-81dd-a613a91315d3
+      AZURE_TENANT_ID: 0578a50b-a7a1-40a4-905b-8b20dba84124
+      AZURE_SUBSCRIPTION_ID: 3956e821-cee4-403f-8708-e84e2ed490eb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      - name: Set the design
+        run: python deploy/website_release.py design "${{ inputs.mode }}"
+      - name: Check health and sign-in
+        run: python deploy/website_release.py verify
+      - name: Roll back if the change or checks failed
+        if: failure() && hashFiles('release-state.json') != ''
+        run: python deploy/website_release.py rollback

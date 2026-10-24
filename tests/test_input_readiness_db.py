@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ibkr_etl import input_readiness as readiness
+from test_medallion_layers_db import NEEDS_LAYERS
 
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
@@ -131,7 +132,7 @@ class _ReadinessDatabase(unittest.TestCase):
             admin.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         with psycopg.connect(_dsn(cls.database, OWNER)) as owner:
             for path in sorted((ROOT / "migrations" / "postgres").glob("*.sql")):
-                if "_medallion_" in path.name or path.name in cls.SKIPPED:
+                if "_medallion_" in path.name or path.name in NEEDS_LAYERS or path.name in cls.SKIPPED:
                     continue  # the layer moves keep these names working (test_medallion_layers_db)
                 try:
                     owner.execute(path.read_text(encoding="utf-8"))

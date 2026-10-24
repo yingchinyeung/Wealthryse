@@ -14,8 +14,11 @@ from BOK_ECOS_API_KEY and is never written to a log or a raw capture.
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
+import time
 import urllib.parse
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -188,6 +191,66 @@ MONTHLY_TENOR = "3-month"
 MONTHLY_PROVIDER = f"OECD Main Economic Indicators via FRED ({FRED_SERIES}, Korea 3-month CD, monthly average)"
 
 
+def _month_end_observation(month: date, value: str, label: str) -> CdObservation:
+    following = date(month.year + (month.month == 12), month.month % 12 + 1, 1)
+    rate_date = date.fromordinal(following.toordinal() - 1).isoformat()
+    annual_rate = round(float(value) / 100.0, 8)
+    if not math.isfinite(annual_rate) or not 0.0 <= annual_rate <= 0.30:
+        raise ValueError(f"Korea CD rate is outside the validation range for {label}")
+    return CdObservation(rate_date, annual_rate)
+
+
+# The OECD's own keyless SDMX API, FRED's source for the series above. FRED's CSV endpoint
+# timed out from Azure on 22 and 23 Oct even with retries, so the OECD is asked first and
+# FRED is kept as the fallback. Korea's short-term rate in this table is the 91-day CD
+# (measure IR3TIB, "3-month interbank or equivalent", percent a year, monthly average).
+OECD_DATAFLOW = "OECD.SDD.STES,DSD_STES@DF_FINMARK,4.0"
+OECD_KEY = "KOR.M.IR3TIB.PA....."
+OECD_MEASURE = "IR3TIB"
+OECD_PROVIDER = "OECD SDMX (DF_FINMARK IR3TIB, Korea 3-month CD, monthly average)"
+
+
+def oecd_url(start: date) -> str:
+    return (f"https://sdmx.oecd.org/public/rest/data/{OECD_DATAFLOW}/{OECD_KEY}"
+            f"?startPeriod={start:%Y-%m}&dimensionAtObservation=AllDimensions&format=csvfile")
+
+
+def parse_oecd_csv(body: bytes) -> list[CdObservation]:
+    """Month-end dated won CD rates from the OECD's SDMX-CSV answer, validated."""
+
+    reader = csv.DictReader(io.StringIO(body.decode("utf-8-sig")))
+    fields = set(reader.fieldnames or ())
+    if not {"TIME_PERIOD", "OBS_VALUE"} <= fields:
+        raise RuntimeError(f"OECD answer is not SDMX-CSV: columns {sorted(fields)[:12]}")
+    expected = {"REF_AREA": "KOR", "FREQ": "M", "MEASURE": OECD_MEASURE}
+    observations: dict[str, CdObservation] = {}
+    for row in reader:
+        for column, value in expected.items():
+            if column in fields and (row.get(column) or "").strip() != value:
+                raise RuntimeError(f"OECD returned {column}={row.get(column)!r}, not {value}")
+        value = (row.get("OBS_VALUE") or "").strip()
+        if not value:
+            continue
+        period = (row.get("TIME_PERIOD") or "").strip()
+        month = datetime.strptime(period, "%Y-%m").date()
+        observation = _month_end_observation(month, value, period)
+        if observations.get(observation.rate_date, observation) != observation:
+            raise ValueError(f"Conflicting OECD Korea CD rates for {period}")
+        observations[observation.rate_date] = observation
+    if not observations:
+        raise RuntimeError("OECD returned no Korea CD observations")
+    return [observations[day] for day in sorted(observations)]
+
+
+def _fetch_oecd(get: Callable[..., bytes], start: date, *, timeout: int) -> tuple[str, bytes, list[CdObservation]]:
+    url = oecd_url(start)
+    requested_at = raw_capture.utc_now()
+    body = get(url, timeout=timeout)
+    raw_capture.capture_http("oecd-kr-cd-3m", OECD_PROVIDER, url=url, body=body,
+                             key=f"oecd-{date.today():%Y%m%d}", extension="csv", requested_at=requested_at)
+    return url, body, parse_oecd_csv(body)
+
+
 def parse_monthly_csv(body: bytes) -> list[CdObservation]:
     """Month-end dated won CD rates from FRED's CSV, validated and in date order."""
 
@@ -205,28 +268,49 @@ def parse_monthly_csv(body: bytes) -> list[CdObservation]:
         month = date.fromisoformat(day_text)
         if month.day != 1:
             raise RuntimeError(f"FRED monthly observation not dated on the 1st: {day_text}")
-        following = date(month.year + (month.month == 12), month.month % 12 + 1, 1)
-        rate_date = date.fromordinal(following.toordinal() - 1).isoformat()
-        annual_rate = round(float(value) / 100.0, 8)
-        if not math.isfinite(annual_rate) or not 0.0 <= annual_rate <= 0.30:
-            raise ValueError(f"Korea CD rate is outside the validation range for {day_text}")
-        observations[rate_date] = CdObservation(rate_date, annual_rate)
+        observation = _month_end_observation(month, value, day_text)
+        observations[observation.rate_date] = observation
     if not observations:
         raise RuntimeError(f"FRED {FRED_SERIES} has no observations")
     return [observations[day] for day in sorted(observations)]
 
 
+# FRED's CSV endpoint is sometimes slow to answer (a 45 s read timeout on 22 Oct), so the
+# fetch is tried a few times before the run reports the won rate as failed.
+FRED_TRIES = 3
+FRED_RETRY_SECONDS = (5, 20)
+
+
+def _fetch_fred(get: Callable[..., bytes], *, timeout: int, sleep: Callable[[float], None]) -> bytes:
+    for attempt in range(FRED_TRIES):
+        try:
+            return get(FRED_URL, timeout=timeout)
+        except OSError:  # timeouts, connection resets and HTTP errors (urllib's are OSErrors)
+            if attempt == FRED_TRIES - 1:
+                raise
+            sleep(FRED_RETRY_SECONDS[min(attempt, len(FRED_RETRY_SECONDS) - 1)])
+    raise AssertionError("unreachable")
+
+
 def refresh_monthly_cd_rates(connection: Any, *, start_date: date, end_date: date | None = None,
-                             timeout: int = 45, get: Callable[..., bytes] = _get) -> dict[str, Any]:
-    """Idempotently load month-end won CD rates (OECD via FRED) into risk_free_rates."""
+                             timeout: int = 90, get: Callable[..., bytes] = _get,
+                             sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+    """Idempotently load month-end won CD rates into risk_free_rates: OECD first, then FRED."""
 
     end = end_date or date.today()
-    requested_at = raw_capture.utc_now()
-    body = get(FRED_URL, timeout=timeout)
-    raw_capture.capture_http("oecd-kr-cd-3m", MONTHLY_PROVIDER, url=FRED_URL, body=body,
-                             key=end.strftime("%Y%m%d"), extension="csv", requested_at=requested_at)
-    observations = [o for o in parse_monthly_csv(body)
-                    if start_date.isoformat() <= o.rate_date <= end.isoformat()]
+    oecd_error = None
+    try:
+        _, _, parsed = _fetch_oecd(get, start_date, timeout=timeout)
+        source, provider = "oecd-sdmx", OECD_PROVIDER
+    except Exception as error:  # noqa: BLE001 - FRED is tried next and the error is reported
+        oecd_error = f"{type(error).__name__}: {' '.join(str(error).split())[:200]}"
+        requested_at = raw_capture.utc_now()
+        body = _fetch_fred(get, timeout=timeout, sleep=sleep)
+        raw_capture.capture_http("oecd-kr-cd-3m", MONTHLY_PROVIDER, url=FRED_URL, body=body,
+                                 key=end.strftime("%Y%m%d"), extension="csv", requested_at=requested_at)
+        parsed = parse_monthly_csv(body)
+        source, provider = "fred", MONTHLY_PROVIDER
+    observations = [o for o in parsed if start_date.isoformat() <= o.rate_date <= end.isoformat()]
     if not observations:
         raise RuntimeError("No Korea CD monthly rates fall within the requested period")
     fetched_at = utc_now_iso()
@@ -248,7 +332,7 @@ def refresh_monthly_cd_rates(connection: Any, *, start_date: date, end_date: dat
                     quality_status = excluded.quality_status
                 """,
                 (observation.rate_date, MONTHLY_SERIES_ID, CURRENCY, MONTHLY_TENOR, observation.annual_rate,
-                 MONTHLY_PROVIDER, fetched_at),
+                 provider, fetched_at),
             )
         connection.commit()
     except Exception:
@@ -258,7 +342,9 @@ def refresh_monthly_cd_rates(connection: Any, *, start_date: date, end_date: dat
     return {
         "series_id": MONTHLY_SERIES_ID,
         "currency": CURRENCY,
-        "provider": MONTHLY_PROVIDER,
+        "provider": provider,
+        "source": source,
+        **({"oecd_error": oecd_error} if oecd_error else {}),
         "requested_start": start_date.isoformat(),
         "requested_end": end.isoformat(),
         "observations_loaded": len(observations),

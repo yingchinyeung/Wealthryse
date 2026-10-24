@@ -16,8 +16,9 @@ project_wealth for where the account's value could go (with contributions, withd
 run_what_if to compare a different weight for current holdings with today's mix, optimise_portfolio for \
 how much of the risk each holding carries and how lower-risk or risk-balanced mixes compare, and \
 get_factor_exposures for what drives returns (market, size, value, quality, momentum). For example, \
-optimise_portfolio, then run_what_if with the minimum-variance weights, to show what that mix would have \
-changed.
+optimise_portfolio, then run_what_if with mix set to minimum_variance, to show what that mix would have \
+changed; optimise_portfolio's weights are shares of the holdings optimised, not of NAV, so never pass them \
+to run_what_if one by one.
 - For forward-looking risk ("how worried should I be?", "what could I lose?"), investigate before answering: \
 get_risk_outlook for the volatility forecast, VaR, its backtest and drawdown odds; get_market_regimes for \
 the current regime, the odds of a switch and the scored outlook; and run_factor_stress on the factors the \
@@ -98,6 +99,9 @@ sentences what is behind it: use get_risk_outlook and get_market_regimes for the
 get_holdings_changes from {from_date} to {to_date} for which holdings moved, and get_factor_exposures if \
 the market or a style factor explains it. Say plainly that these are models of past data, not forecasts. \
 Every figure comes from a tool. No advice, no recommendations."""
+# Added for a Kiwoom account, whose newest sessions are provisional: the watch read the risk picture as of an older day.
+RISK_ALERT_AS_OF = """ The newest days are not final yet, so read the risk picture as of {as_of}: pass as_of {as_of} \
+to get_risk_outlook and get_market_regimes."""
 
 LIVE_ALERT = """Account {account_id} moved enough today to alert the person who owns it: {trigger}. Explain \
 in three to five short sentences what moved it, using get_live_snapshot for today's live figures and biggest \

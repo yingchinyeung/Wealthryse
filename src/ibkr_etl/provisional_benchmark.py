@@ -7,7 +7,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from bisect import bisect_right
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
@@ -16,6 +16,7 @@ from .benchmark_analytics import (
     BenchmarkContract,
     build_comparison,
 )
+from .market_calendar import BENCHMARK_MARKETS, CALENDARS, benchmark_session_on_or_before
 from .report import FxConverter, _convert, _flex_date, _number
 from .util import canonical_json, sha256_text, utc_now_iso
 from .website_benchmarks import require_ms_website_benchmarks, version_website_comparison
@@ -99,6 +100,13 @@ def catalog_comparison_benchmarks(
 
 class NoBenchmarkContract(RuntimeError):
     """The subject has no active benchmark mapping, so there is nothing to compare it with."""
+
+
+class BenchmarkNotCurrent(RuntimeError):
+    """A contract benchmark's latest close does not line up with the session the subject's NAV has
+    reached (usually the provider has not published that close yet), and freshness is its only
+    failed check. Nothing for this subject is committed, so readers keep its last good comparison;
+    the daily job holds this subject and carries on with the others."""
 
 
 def mapped_benchmarks(connection: Any, account_id: str) -> tuple[BenchmarkSpec, ...]:
@@ -277,6 +285,131 @@ def fetch_benchmark_yfinance(
     return observations
 
 
+QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+QUOTE_FALLBACK_ENV = "BENCHMARK_QUOTE_FALLBACK"
+# Regular-session close in the exchange's own time, for a quote still on the session it names.
+SESSION_CLOSE = {"XNYS": time(16, 0), "XNAS": time(16, 0), "XHKG": time(16, 0),
+                 "XSHG": time(15, 0), "XTAI": time(13, 30)}
+HALF_DAY_CLOSE = {"XNYS": time(13, 0), "XNAS": time(13, 0), "XHKG": time(12, 0)}
+# A quote close more than this far from the previous history close is not used.
+QUOTE_MAX_MOVE = 0.25
+_QUOTE_CLOSES: dict[tuple[str, str], dict[str, Any] | None] = {}
+
+
+def quote_fallback_enabled(environ: Any = None) -> bool:
+    """On by default; BENCHMARK_QUOTE_FALLBACK=off leaves a missing close missing, as before."""
+
+    return str((environ if environ is not None else os.environ).get(
+        QUOTE_FALLBACK_ENV, "")).strip().lower() != "off"
+
+
+def yahoo_quote(symbol: str) -> tuple[bytes, int | None]:
+    """Yahoo's quote reply for one symbol, through yfinance's own session and crumb."""
+
+    from yfinance import data as yfdata
+
+    response = yfdata.YfData().get(QUOTE_URL, params={"symbols": symbol}, timeout=30)
+    return bytes(response.content), getattr(response, "status_code", None)
+
+
+def _next_session(market: str, day: date) -> date:
+    calendar = CALENDARS[market]
+    following = day + timedelta(days=1)
+    for _ in range(15):
+        if calendar.is_session(following):
+            return following
+        following += timedelta(days=1)
+    raise ValueError(f"No {market} session within 15 days after {day}")
+
+
+def close_from_quote(
+    spec: BenchmarkSpec,
+    session: date,
+    received: list[tuple[str, float]],
+    quote_fetcher: Callable[[str], tuple[bytes, int | None]],
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """A finished session's close from Yahoo's quote, for when the history reply has the session
+    without a close (Yahoo served Azure a 21 Oct 2026 bar with no close while other networks had it).
+
+    The quote names one session only: its regular price once that session has closed, or its
+    previous close once the next session has started. Anything else (another day, another currency,
+    an unmapped benchmark, a move of more than 25% from the last history close) returns None, and the
+    subject waits for Yahoo exactly as before. The raw reply goes to bronze next to the history file.
+    """
+
+    market = BENCHMARK_MARKETS.get(spec.benchmark_id)
+    if market is None or market not in SESSION_CLOSE:
+        return None
+    cache_key = (spec.symbol, session.isoformat())
+    if cache_key in _QUOTE_CLOSES:
+        return _QUOTE_CLOSES[cache_key]
+    zone = ZoneInfo(CALENDARS[market].timezone)
+    current = (now or raw_capture.utc_now()).astimezone(zone)
+    earlier = [level for day, level in received if day < session.isoformat()]
+    if session >= current.date() or not earlier:
+        return None
+    _QUOTE_CLOSES[cache_key] = None  # one try per symbol and session in a run, even if it fails
+    requested_at = raw_capture.utc_now()
+    body, status = quote_fetcher(spec.symbol)
+    blob = raw_capture.capture_http(
+        "yahoo-benchmark-history", PROVIDER, url=f"{QUOTE_URL}?symbols={spec.symbol}", body=body,
+        key=raw_capture.request_key(spec.symbol, "quote", session.isoformat()), status=status,
+        extension="json", requested_at=requested_at,
+    )
+    result = None
+    rows = ((json.loads(body).get("quoteResponse") or {}).get("result")) or []
+    row = next((item for item in rows if str(item.get("symbol")) == spec.symbol), None)
+    stamp = (row or {}).get("regularMarketTime")
+    currency = str((row or {}).get("currency") or spec.currency).upper()
+    if row is not None and stamp and currency == spec.currency.upper():
+        market_time = datetime.fromtimestamp(int(stamp), tz=timezone.utc).astimezone(zone)
+        field = None
+        if market_time.date() == session:
+            closes_at = (HALF_DAY_CLOSE.get(market, SESSION_CLOSE[market])
+                         if session in CALENDARS[market].half_days else SESSION_CLOSE[market])
+            if market_time.time() >= closes_at:
+                field = "regularMarketPrice"
+        elif market_time.date() > session and _next_session(market, session) == market_time.date():
+            field = "regularMarketPreviousClose"
+        value = row.get(field) if field else None
+        level = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+        if (level is not None and math.isfinite(level) and level > 0
+                and 1 - QUOTE_MAX_MOVE <= level / earlier[-1] <= 1 / (1 - QUOTE_MAX_MOVE)):
+            digest = raw_capture.sha256_of(blob) or sha256_text(body.decode("utf-8", "replace"))
+            result = {"date": session.isoformat(), "level": level, "field": field,
+                      "blob": blob, "sha256": digest,
+                      "source_reference": f"yfinance:quote({spec.symbol}):{field}"}
+    _QUOTE_CLOSES[cache_key] = result
+    return result
+
+
+def fill_missing_session(
+    spec: BenchmarkSpec,
+    received: list[tuple[str, float]],
+    expected_as_of: date,
+    quote_fetcher: Callable[[str], tuple[bytes, int | None]] | None,
+    now: datetime | None = None,
+) -> tuple[list[tuple[str, float]], dict[str, Any] | None]:
+    """received plus the required session's close from the quote, when the history leaves it out."""
+
+    if quote_fetcher is None or not received or spec.benchmark_id not in BENCHMARK_MARKETS:
+        return received, None
+    try:
+        session = benchmark_session_on_or_before(spec.benchmark_id, expected_as_of)
+        if any(day == session.isoformat() for day, _ in received):
+            return received, None
+        filled = close_from_quote(spec, session, received, quote_fetcher, now=now)
+    except Exception as error:  # noqa: BLE001 - the fallback never fails the job
+        print(f"benchmark quote fallback: {spec.benchmark_id} not used ({type(error).__name__})", flush=True)
+        return received, None
+    if filled is None:
+        print(f"benchmark quote fallback: {spec.benchmark_id} {session.isoformat()} not available", flush=True)
+        return received, None
+    print(f"benchmark quote fallback: {spec.benchmark_id} {filled['date']} from {filled['field']}", flush=True)
+    return sorted(received + [(filled["date"], filled["level"])]), filled
+
+
 def is_cross_pair(from_currency: str, reporting_currency: str) -> bool:
     """A pair converted through USD: neither side is USD and both have a Yahoo quote."""
 
@@ -291,6 +424,7 @@ def fetch_fx_to_reporting_yfinance(
     start_date: date,
     end_date: date,
     ticker_factory: Callable[[str], Any] | None = None,
+    fetch: Callable[..., list[tuple[str, float]]] | None = None,
 ) -> tuple[list[tuple[str, float]], str]:
     """Fetch native-currency-to-reporting-currency closes from Yahoo Finance.
 
@@ -299,6 +433,9 @@ def fetch_fx_to_reporting_yfinance(
     direct HKD=X or KRW=X quote for USD -> HKD or USD -> KRW. A pair with no
     USD side (for example TWD -> HKD) goes through USD: native -> USD times
     USD -> reporting, on the days both quotes exist. No other pairs are approved.
+
+    fetch, when given, answers in place of fetch_benchmark_yfinance (same arguments and
+    result): the crisis replays pass one that reads the quotes from silver instead.
     """
 
     native = from_currency.upper()
@@ -307,9 +444,9 @@ def fetch_fx_to_reporting_yfinance(
         raise ValueError("FX retrieval is unnecessary for identical currencies")
     if is_cross_pair(native, reporting):
         to_usd, native_symbol = fetch_fx_to_reporting_yfinance(
-            native, "USD", start_date, end_date, ticker_factory)
+            native, "USD", start_date, end_date, ticker_factory, fetch)
         from_usd, reporting_symbol = fetch_fx_to_reporting_yfinance(
-            "USD", reporting, start_date, end_date, ticker_factory)
+            "USD", reporting, start_date, end_date, ticker_factory, fetch)
         second_leg = dict(from_usd)
         crossed = [(day, value * second_leg[day]) for day, value in to_usd if day in second_leg]
         if not crossed:
@@ -324,7 +461,7 @@ def fetch_fx_to_reporting_yfinance(
         )
     symbol = FX_TICKERS[reporting] if direct_quote else FX_TICKERS[native]
     quote_currency = reporting if direct_quote else native
-    direct = fetch_benchmark_yfinance(
+    direct = (fetch or fetch_benchmark_yfinance)(
         BenchmarkSpec(
             benchmark_id=f"USD{quote_currency}",
             symbol=symbol,
@@ -593,10 +730,10 @@ KIWOOM_FLOW_TYPES = ("DEPOSIT", "WITHDRAWAL")
 
 
 def _is_kiwoom(connection: Any, account_id: str) -> bool:
-    """Only a Kiwoom account reads silver cash rows, as flows_source.silver_external_flows does.
+    """Only a Kiwoom account reads silver cash rows here, as flows_source.silver_external_flows does.
 
-    An IBKR account's flows come from its Flex file alone, wherever it is read from: the agents'
-    scoped views have flex_rows but no cash_transactions.
+    An IBKR account's bronze flows come from its Flex file alone, wherever it is read from (the agents'
+    agent.flex_rows too); flows_source reads its silver rows.
     """
     row = connection.execute("SELECT account_type FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
     return row is not None and str(row["account_type"] or "") == "kiwoom"
@@ -647,9 +784,10 @@ def refresh_and_materialize(
     start_date: date = date(2025, 1, 20),
     end_date: date | None = None,
     ticker_factory: Callable[[str], Any] | None = None,
+    quote_fetcher: Callable[[str], tuple[bytes, int | None]] | None = None,
 ) -> dict[str, Any]:
     options = dict(account_id=account_id, start_date=start_date,
-                   end_date=end_date, ticker_factory=ticker_factory)
+                   end_date=end_date, ticker_factory=ticker_factory, quote_fetcher=quote_fetcher)
     if account_id not in ('alpha-world-ms','alpha-world-t'):
         return _refresh_and_materialize(connection, **options)
     # Keep the caller's run record, but never commit a partial MS benchmark pair.
@@ -673,9 +811,12 @@ def _refresh_and_materialize(
     start_date: date,
     end_date: date | None,
     ticker_factory: Callable[[str], Any] | None,
+    quote_fetcher: Callable[[str], tuple[bytes, int | None]] | None = None,
     commit: bool = True,
 ) -> dict[str, Any]:
     end_date = end_date or last_completed_us_close()
+    if quote_fetcher is None and ticker_factory is None and quote_fallback_enabled():
+        quote_fetcher = yahoo_quote
     fetched_at = utc_now_iso()
     portfolio_currency, reporting_currency, contract_start = _account_contract(
         connection, account_id
@@ -707,12 +848,21 @@ def _refresh_and_materialize(
     received_by_id: dict[str, list[tuple[str, float]]] = {}
     unavailable_by_id: dict[str, str] = {}
     raw_files: dict[str, dict[str, Any]] = {}
+    from_quote: dict[str, dict[str, Any]] = {}
+    expected_as_of = min(end_date, date.fromisoformat(max(portfolio_values)))
     for spec in specs:
         try:
-            received_by_id[spec.benchmark_id] = fetch_benchmark_yfinance(
-                spec, start_date, end_date, ticker_factory,
-                captured=raw_files.setdefault(spec.benchmark_id, {}),
+            received_by_id[spec.benchmark_id], filled = fill_missing_session(
+                spec,
+                fetch_benchmark_yfinance(
+                    spec, start_date, end_date, ticker_factory,
+                    captured=raw_files.setdefault(spec.benchmark_id, {}),
+                ),
+                expected_as_of,
+                quote_fetcher,
             )
+            if filled is not None:
+                from_quote[spec.benchmark_id] = filled
         except Exception as error:
             if spec.mapping_type != "comparison" and (
                     spec.mapping_type == "primary" or account_id in ('alpha-world-ms','alpha-world-t')):
@@ -829,7 +979,25 @@ def _refresh_and_materialize(
                 spec.benchmark_id,
             ),
         )
+        filled = from_quote.get(spec.benchmark_id)
+        if filled is not None and spec.mapping_type != "comparison":
+            connection.execute(
+                """
+                INSERT INTO data_quality_results(
+                    run_type, run_reference, subject_id, check_id, status,
+                    observed_value, expected_value, message, checked_at
+                ) VALUES ('provisional-benchmark', ?, ?, 'benchmark_close_from_quote', 'warn', NULL, NULL, ?, ?)
+                """,
+                (
+                    f"{spec.benchmark_id}:{fetched_at}",
+                    account_id,
+                    f"Yahoo's history reply had no {filled['date']} close for {spec.symbol}; "
+                    f"it came from the quote's {filled['field']}.",
+                    fetched_at,
+                ),
+            )
         for observation_date, level in received:
+            from_the_quote = filled is not None and observation_date == filled["date"]
             connection.execute(
                 """
                 INSERT INTO benchmark_prices(
@@ -852,10 +1020,10 @@ def _refresh_and_materialize(
                     spec.currency,
                     OBSERVATION_STATUS,
                     PROVIDER,
-                    source_reference,
+                    filled["source_reference"] if from_the_quote else source_reference,
                     None,
                     fetched_at,
-                    raw_digest,
+                    filled["sha256"] if from_the_quote else raw_digest,
                 ),
             )
         fx_audit: list[dict[str, Any]] = []
@@ -889,9 +1057,8 @@ def _refresh_and_materialize(
             required_return_convention=spec.return_convention,
         )
         if result.quality_status == "fail":
-            failed_checks = ", ".join(
-                issue.check_id for issue in result.issues if issue.status == "fail"
-            )
+            failed = [issue for issue in result.issues if issue.status == "fail"]
+            failed_checks = ", ".join(issue.check_id for issue in failed)
             if spec.mapping_type == "comparison":
                 # A website comparison that fails its checks is left out; it never holds the subject.
                 summaries.append({
@@ -906,10 +1073,18 @@ def _refresh_and_materialize(
                     "maximum_fx_age_days": None,
                 })
                 continue
-            raise RuntimeError(
+            message = (
                 f"{spec.benchmark_id} comparison failed data-quality checks: "
                 f"{failed_checks}"
             )
+            # Dates only: the freshness message names the observed and required sessions.
+            dates = " ".join(issue.message for issue in failed if issue.check_id == "freshness")
+            if dates:
+                message += f" ({dates})"
+            if failed and all(issue.check_id == "freshness" for issue in failed):
+                # Only this subject waits for the provider; the other subjects carry on.
+                raise BenchmarkNotCurrent(message)
+            raise RuntimeError(message)
         # Never overwrite the retained v1 USD MS results with HKD values.
         result = version_website_comparison(result)
         for row in result.rows:

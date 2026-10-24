@@ -176,6 +176,19 @@ class NavigationAndChartTests(unittest.TestCase):
                                             account_id="U16088571", section="holdings")
         self.assertNotIn('id="account-switcher"', page)
 
+    def test_benchmark_chart_can_show_every_benchmark(self):
+        page = web._render_account_page({"email": "o@example.com", "role": "owner"},
+                                        account_id="U16088571", section="performance")
+        # Toggles for every listed benchmark, with Show all and Primary only.
+        self.assertIn('id="benchmark-chips"', page)
+        self.assertIn('data-benchmark-set="all"', page)
+        self.assertIn('data-benchmark-set="primary"', page)
+        self.assertIn("chartBenchmarks=new Set([primary.benchmark_id]);renderBenchmarkChips();", page)
+        # A later benchmark starts where the portfolio line is, and gaps are not drawn at zero.
+        self.assertIn("const scale=Number(byDate.get(anchor.date).portfolio)/Number(anchor.portfolio)", page)
+        self.assertIn("if(!has(row[line.key]))return;", page)
+        self.assertIn("factor[k]=100*Number(at.portfolio)/Number(shown[0].portfolio)/Number(at[k])", page)
+
     def test_charts_are_sharp_and_have_period_buttons(self):
         for source in (web._render_account_page({"email": "o@example.com", "role": "owner"},
                                                 account_id="U16088571", section="performance"),

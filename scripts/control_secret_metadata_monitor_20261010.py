@@ -15,6 +15,7 @@ from retire_upgrade_additional_diagnostics_20261010 import current_resources,bin
 from deploy_ms_presentation_worker_release import settings_invariant
 from rehearse_ms_worker_image_rollback import restore_protected
 from audit_azure_runtime import az
+from ibkr_etl import medallion_tags
 
 ROOT=Path(__file__).resolve().parents[1]
 OUT=ROOT/'.work/platform-upgrade-20261010-stage22/secret-metadata-v1'
@@ -94,7 +95,8 @@ def body(identity,scheduled=False):
 
 def verify_job(job,identity,scheduled=False):
     wanted=body(identity,scheduled);p=job['properties'];w=wanted['properties'];conf=p['configuration'];wc=w['configuration']
-    if job['id'].lower()!=JOBPATH.lower() or job['tags']!=TAGS or job['identity']['type']!='UserAssigned' or set(x.lower() for x in job['identity']['userAssignedIdentities'])!={IDENTITY.lower()}:raise ValueError('Job identity/ownership differs')
+    # The Medallion tags (layer, component, hop) may be missing still, or there with exactly their values.
+    if job['id'].lower()!=JOBPATH.lower() or not medallion_tags.same_tags(JOB,job['tags'],TAGS) or job['identity']['type']!='UserAssigned' or set(x.lower() for x in job['identity']['userAssignedIdentities'])!={IDENTITY.lower()}:raise ValueError('Job identity/ownership differs')
     for key in ('environmentId','workloadProfileName'):
         if str(p[key]).lower()!=str(w[key]).lower():raise ValueError('Environment differs')
     for key in ('triggerType','replicaTimeout','replicaRetryLimit','registries','secrets','scheduleTriggerConfig' if scheduled else 'manualTriggerConfig'):
@@ -144,7 +146,7 @@ def main(stage):
         identity=request('PUT',IDENTITY+'?api-version=2023-01-31',data=definition)
         save(OUT,'identity-ack',{'id':identity['id'],'principalId':identity['properties']['principalId'],'clientId':identity['properties']['clientId']})
         print('Created dedicated identity; no secret permissions yet');return
-    if identity is None or identity['tags']!=TAGS or identity['location'].replace(' ','').lower()!='eastasia':raise ValueError('Dedicated identity unavailable')
+    if identity is None or not medallion_tags.same_tags('ibkrv2stg-secret-metadata-identity',identity['tags'],TAGS) or identity['location'].replace(' ','').lower()!='eastasia':raise ValueError('Dedicated identity unavailable')
     if stage=='roles':
         for index,role in enumerate(roles(identity['properties']['principalId'])):
             path=role['path']+'?api-version=2022-04-01';live=request('GET',path,missing=True)

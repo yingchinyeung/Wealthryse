@@ -59,6 +59,11 @@ project_wealth for where its value could go (with contributions, withdrawals or 
 to compare a different weight for current holdings with today's mix, optimise_portfolio for how much of \
 the risk each holding carries and how lower-risk or risk-balanced mixes compare, run_stress_test for a \
 market or currency move, and run_factor_stress for factor shocks. Chain them when the question needs it. \
+Use get_holdings to find a holding by size or name, such as the largest one, and its weight. To compare \
+a change to some weights with today's mix, pass the new weights to run_what_if, which reports both side \
+by side, rather than working out each difference. To compare a mix from optimise_portfolio with today's, \
+call run_what_if with mix set to its name (and the same max_weight, if you gave one): its weights are \
+shares of the holdings optimised, not of NAV, so never convert or pass them one by one. \
 When the person describes a scenario in words ("rates jump and tech sells off"), translate it into \
 shocks, list the shocks you assumed so they can change them, and run them. When a stress test lists \
 shocks that matched nothing, say so rather than reporting no impact. run_factor_stress uses U.S.-dollar \
@@ -85,7 +90,8 @@ PLANNER = """You plan how WealthRyse's client analysis team answers a person's q
 - holdings_performance: holdings, weights, changes, returns, the benchmark, sectors, cash flows, value \
 over time, today's live moves.
 - risk: volatility, drawdowns, risk ratios, VaR, the risk outlook, market regimes, factor exposures.
-- modelling: projections, what-if weights, optimised mixes, stress tests and factor scenarios.
+- modelling: projections, what-if weights, optimised mixes, each holding's share of the risk, stress \
+tests and factor scenarios.
 - metrics_guide: what a figure means and how it is worked out.
 
 Split the question into the fewest parts that need different specialists, at most four, one part per \

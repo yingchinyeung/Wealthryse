@@ -16,6 +16,7 @@ from ibkr_etl.agent_tools import AgentToolContext  # noqa: E402
 from ibkr_etl.db import connect  # noqa: E402
 from ibkr_etl.portfolio_assurance import (  # noqa: E402
     AssuranceModelConfig,
+    approved_report_versions,
     assurance_date,
     collect_assurance_inputs,
     completed_at,
@@ -61,7 +62,10 @@ def main() -> int:
             connection, context, subject_id=subject_id
         )
         deterministic = evaluate_portfolio_assurance(
-            tool_results, report_rows, subject_id=subject_id
+            tool_results,
+            report_rows,
+            subject_id=subject_id,
+            approved_versions=approved_report_versions(connection, tenant_id, subject_id),
         )
         model_review = generate_assurance_review(deterministic, model_config)
         result = {

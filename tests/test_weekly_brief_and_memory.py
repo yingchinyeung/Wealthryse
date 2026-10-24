@@ -6,15 +6,24 @@ import unittest
 from wealthryse_agent import memory
 from wealthryse_agent.jobs import weekly_brief
 from wealthryse_agent.runtime import ANSWER_SCHEMA, Turn
+from wealthryse_agent.tool_client import ToolCallFailed
 
 
 class FakeTools:
-    def __init__(self, latest):
-        self.latest = latest
+    """An older tool server (no get_settled_dates) unless ``settled`` gives each account's settled date."""
+
+    def __init__(self, latest, settled=None):
+        self.latest, self.settled = latest, settled
 
     def call(self, name, arguments):
+        account_id = arguments["account_id"]
+        if name == "get_settled_dates":
+            if self.settled is None:
+                raise ToolCallFailed("unknown_tool", "No such tool.")
+            return {"data": {"latest_holdings_date": self.latest.get(account_id),
+                             "settled_through": self.settled.get(account_id)}}
         assert name == "get_data_freshness"
-        return {"data": {"latest_holdings_date": self.latest.get(arguments["account_id"])}}
+        return {"data": {"latest_holdings_date": self.latest.get(account_id)}}
 
 
 class FakeAgent:
@@ -54,6 +63,14 @@ class WeeklyBriefTests(unittest.TestCase):
         self.assertNotIn("get_holdings", call["allowed_tools"])  # the week's changes, not the full list
         self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 2})
         self.assertEqual(weekly_brief(store, tools, agent, ["U1"], {}), 0)  # same week: already written
+
+    def test_a_kiwoom_brief_ends_on_its_latest_settled_day(self):
+        store, agent = FakeStore(), FakeAgent()
+        tools = FakeTools({"K1": "2026-10-16", "U1": "2026-10-16"}, settled={"K1": "2026-10-14", "U1": "2026-10-16"})
+        self.assertEqual(weekly_brief(store, tools, agent, ["K1", "U1"], {}), 2)
+        self.assertEqual(store.items[("weekly_brief", "K1", "2026-W42")][0], "Your week to 2026-10-14")
+        self.assertIn("from 2026-10-07 to 2026-10-14", agent.calls[0]["question"])
+        self.assertEqual(store.items[("weekly_brief", "U1", "2026-W42")][0], "Your week to 2026-10-16")
 
     def test_a_brief_that_fails_the_figure_check_is_not_posted(self):
         store = FakeStore()

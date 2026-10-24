@@ -520,6 +520,70 @@ def get_data_freshness(connection, arguments: Mapping[str, Any]) -> dict[str, An
     }
 
 
+# A Kiwoom account's newest stored sessions are provisional until a later run rewrites them: a Korean day
+# has after-market prices until the next trading day's history pass stores the official close (#168), and a
+# U.S. iStrategy day's total is read again until its positions add up, for the latest
+# kiwoom_us_account.US_SETTLING_SESSIONS sessions (#192). Jobs that never redo a date wait for them.
+KIWOOM_ACCOUNT_TYPE = "kiwoom"
+
+
+def _provisional_sessions(connection, account_id: str) -> int:
+    """How many of the account's newest stored sessions a later run may still rewrite; 0 for other accounts."""
+    row = connection.execute("SELECT account_type, base_currency FROM accounts WHERE account_id = ?",
+                             (account_id,)).fetchone()
+    if row is None or str(row["account_type"] or "").lower() != KIWOOM_ACCOUNT_TYPE:
+        return 0
+    if str(row["base_currency"] or "").upper() == "USD":
+        from ibkr_etl.kiwoom_us_account import US_SETTLING_SESSIONS
+
+        return max(1, int(US_SETTLING_SESSIONS))
+    return 1
+
+
+def _certified_latest(connection, account_id: str) -> dict[str, Any]:
+    """The account's newest published certified build and its as-of date, from Medallion's
+    agent.certified_latest view (subject_id, build_id, as_of_date). {"view": False} until it is installed;
+    a view this caller cannot read counts as not there, so the dispatcher stays on silver dates."""
+    present = connection.execute("SELECT to_regclass('agent.certified_latest') IS NOT NULL AS present").fetchone()
+    if not present["present"]:
+        return {"view": False, "as_of_date": None, "build_id": None}
+    connection.execute("SAVEPOINT certified_latest")
+    try:
+        row = connection.execute("SELECT build_id, as_of_date FROM agent.certified_latest WHERE subject_id = ? "
+                                 "ORDER BY as_of_date DESC LIMIT 1", (account_id,)).fetchone()
+    except Exception:
+        connection.execute("ROLLBACK TO SAVEPOINT certified_latest")
+        return {"view": False, "as_of_date": None, "build_id": None, "unreadable": True}
+    connection.execute("RELEASE SAVEPOINT certified_latest")
+    if row is None or row["as_of_date"] is None:
+        return {"view": True, "as_of_date": None, "build_id": None}
+    return {"view": True, "as_of_date": str(row["as_of_date"])[:10], "build_id": str(row["build_id"])}
+
+
+def get_settled_dates(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """For the scheduled jobs and the event dispatcher: the freshness dates, the latest valuation date whose
+    values are final, and the newest published certified as-of date."""
+    account_id = str(arguments["account_id"])
+    fresh = get_data_freshness(connection, arguments)
+    data = fresh["data"]
+    provisional = _provisional_sessions(connection, account_id)
+    settled = data["latest_valuation_date"]
+    if provisional and settled:
+        rows = connection.execute(
+            f"SELECT DISTINCT snapshot_date AS d FROM subject_nav_series WHERE subject_id = ? "
+            f"AND currency = {ACTIVE_NAV_CURRENCY_SQL} ORDER BY 1 DESC LIMIT ?", (account_id, provisional + 1),
+        ).fetchall()
+        settled = str(rows[provisional]["d"])[:10] if len(rows) > provisional else None
+    return {
+        "as_of": fresh["as_of"],
+        "data": {"latest_valuation_date": data["latest_valuation_date"],
+                 "latest_holdings_date": data["latest_holdings_date"],
+                 "provisional_sessions": provisional, "settled_through": settled,
+                 "certified": _certified_latest(connection, account_id), "checked_on": data["checked_on"]},
+        "citations": fresh["citations"],
+    }
+
+
 # Time series and risk ---------------------------------------------------------
 
 MAX_SERIES_POINTS = 400
@@ -1312,14 +1376,48 @@ def _weight_changes(value: Any, held: list[dict[str, Any]]) -> dict[str, float]:
     return changes
 
 
+# The mixes optimise_portfolio reports, which run_what_if can replay by name.
+OPTIMISED_MIXES = ("minimum_variance", "risk_parity", "maximum_sharpe")
+
+
+def _mix_weights(current: Mapping[str, float], held: list[dict[str, Any]], matrix: Mapping[str, Any], mix: str,
+                 cap: float) -> dict[str, float]:
+    """An optimise_portfolio mix as fractions of NAV.
+
+    optimise_portfolio's weights are shares of the holdings it optimised (sleeve_weight of NAV), so each
+    becomes its share of that same sleeve; cash and the holdings it left out keep their weights.
+    """
+    from ibkr_etl.modelling import optimise
+
+    labels = {h["conid"]: {"symbol": h["symbol"], "description": h["description"]} for h in held}
+    result = optimise(current, labels, matrix, risk_free=0.0, cap=cap)
+    return {h["conid"]: h[f"{mix}_weight"] * result["sleeve_weight"] for h in result["holdings"]}
+
+
 def run_what_if(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
     """Risk and return of current holdings against hypothetical weights, over the same year of prices."""
     from ibkr_etl.modelling import ModellingInputError, what_if
 
     account_id = str(arguments["account_id"])
+    mix = arguments.get("mix")
+    if mix is not None and arguments.get("changes") is not None:
+        raise ToolError("invalid_arguments", "Give either changes or a mix, not both.", 400)
+    if mix is not None and mix not in OPTIMISED_MIXES:
+        raise ToolError("invalid_arguments", "mix must be " + ", ".join(OPTIMISED_MIXES[:-1]) + " or "
+                        + OPTIMISED_MIXES[-1] + ".", 400)
     subject, snapshot, held, _, matrix = _model_holdings(connection, account_id)
     current = {h["conid"]: h["weight"] for h in held}
-    proposed = {**current, **_weight_changes(arguments.get("changes"), held)}
+    if mix is None:
+        if arguments.get("changes") is None:
+            raise ToolError("invalid_arguments", "Give changes (1 to 25 holdings) or a mix.", 400)
+        changes = _weight_changes(arguments.get("changes"), held)
+    else:
+        try:
+            changes = _mix_weights(current, held, matrix, mix,
+                                   _number_argument(arguments, "max_weight", 0.01, 1.0) or 0.25)
+        except ModellingInputError as error:
+            raise _model_error(error) from error
+    proposed = {**current, **changes}
     mapping, benchmark = _model_benchmark(connection, subject, snapshot, matrix["dates"])
     try:
         result = what_if(current, proposed, matrix, risk_free=0.0, benchmark=benchmark or None)
@@ -1334,6 +1432,7 @@ def run_what_if(connection, arguments: Mapping[str, Any]) -> dict[str, Any]:
                  "holdings": [{"symbol": h["symbol"], "current_weight": h["weight"],
                                "proposed_weight": proposed[h["conid"]],
                                "modelled": h["conid"] in matrix["returns"]} for h in holdings[:40]],
+                 "mix": mix,
                  "current": result["current"], "proposed": result["proposed"], "difference": result["difference"],
                  "benchmark": {"id": mapping["benchmark_id"], "name": mapping["name"]} if mapping else None,
                  "not_modelled": [h["symbol"] for h in holdings if h["conid"] not in matrix["returns"]],
@@ -1422,9 +1521,10 @@ def get_factor_exposures(connection, arguments: Mapping[str, Any]) -> dict[str, 
     }
 
 
-def _account_returns(connection, account_id: str) -> tuple[Mapping[str, Any], str, dict[str, float], list[tuple[str, float]]]:
+def _account_returns(connection, account_id: str, as_of: str | None = None
+                     ) -> tuple[Mapping[str, Any], str, dict[str, float], list[tuple[str, float]]]:
     subject = _subject(connection, account_id)
-    end = _latest_nav_date(connection, account_id, None)
+    end = _latest_nav_date(connection, account_id, as_of)
     nav, flows = _series_inputs(connection, subject, end)
     return subject, end, nav, daily_returns(nav, flows, _window(nav, None, end))
 
@@ -1435,7 +1535,8 @@ def get_risk_outlook(connection, arguments: Mapping[str, Any]) -> dict[str, Any]
     from ibkr_etl.modelling import ModellingInputError
 
     account_id = str(arguments["account_id"])
-    subject, end, nav, returns = _account_returns(connection, account_id)
+    as_of = _day(arguments["as_of"], "as_of") if arguments.get("as_of") else None
+    subject, end, nav, returns = _account_returns(connection, account_id, as_of)
     try:
         forecast = risk_forecasting.volatility_forecast(returns)
         values = [r for _, r in returns]
@@ -1479,7 +1580,8 @@ def get_market_regimes(connection, arguments: Mapping[str, Any]) -> dict[str, An
     from ibkr_etl.modelling import ModellingInputError
 
     account_id = str(arguments["account_id"])
-    subject, end, nav, returns = _account_returns(connection, account_id)
+    as_of = _day(arguments["as_of"], "as_of") if arguments.get("as_of") else None
+    subject, end, nav, returns = _account_returns(connection, account_id, as_of)
     try:
         result = risk_forecasting.regime_outlook(returns)
     except ModellingInputError as error:
@@ -1630,6 +1732,8 @@ MONTH_TEAM = frozenset({"month_team"})
 GUIDE_CHECK = frozenset({"guide_check"})
 ONBOARDING = frozenset({"onboarding"})
 OPERATIONS = frozenset({"operations"})
+# The jobs that never redo a date, and the event dispatcher that wakes them as each of them.
+SETTLED_DATES_JOBS = frozenset({"holdings_explainer", "risk_watch", "weekly_brief", "month_end_drafter", "export_packs"})
 _DATE = {"type": "string", "description": "YYYY-MM-DD"}
 _AS_OF = {"type": "string", "description": "YYYY-MM-DD; omit for the latest valuation"}
 
@@ -1654,6 +1758,10 @@ TOOLS: tuple[ToolSpec, ...] = (
              get_cash_flows),
     ToolSpec("get_data_freshness", "How recent the account's valuation, holdings, benchmark and import data are.",
              _schema({"account_id": _ACCOUNT}, ["account_id"]), get_data_freshness),
+    ToolSpec("get_settled_dates", "For the scheduled jobs: the latest valuation and holdings dates, the latest "
+             "valuation date whose values are final (a Kiwoom account's newest sessions are provisional until a later "
+             "run rewrites them), and the newest published certified as-of date.",
+             _schema({"account_id": _ACCOUNT}, ["account_id"]), get_settled_dates, only_jobs=SETTLED_DATES_JOBS),
     ToolSpec("get_nav_history", "Account value and cumulative time-weighted return over time, with the benchmark's "
              "cumulative return, for charts. Up to 400 points; long periods are thinned to weekly or monthly.",
              _schema({"account_id": _ACCOUNT, "from_date": {**_DATE, "description": "YYYY-MM-DD; omit for inception"},
@@ -1718,14 +1826,19 @@ TOOLS: tuple[ToolSpec, ...] = (
                      ["account_id"]), project_wealth),
     ToolSpec("run_what_if", "Compare the risk and return of the current holdings with hypothetical weights for some "
              "of them, over the same year of daily prices: return, volatility, Sharpe, VaR, expected tail loss, "
-             "maximum drawdown, worst month and beta. Weights are fractions of NAV; holdings not listed keep their "
-             "weight and the rest is cash. Hypothetical, not a recommendation.",
+             "maximum drawdown, worst month and beta. Give either changes (weights are fractions of NAV; holdings "
+             "not listed keep their weight and the rest is cash) or mix, to replay a mix from optimise_portfolio "
+             "as it is. Hypothetical, not a recommendation.",
              _schema({"account_id": _ACCOUNT, "changes": {
                  "type": "array", "minItems": 1, "maxItems": 25, "items": {
                      "type": "object", "additionalProperties": False, "required": ["symbol", "weight"],
                      "properties": {"symbol": {"type": "string", "description": "a current holding's symbol"},
-                                    "weight": {"type": "number", "description": "fraction of NAV, 0 removes it"}}}}},
-                     ["account_id", "changes"]), run_what_if),
+                                    "weight": {"type": "number", "description": "fraction of NAV, 0 removes it"}}}},
+                      "mix": {"type": "string", "enum": list(OPTIMISED_MIXES), "description": "instead of changes: "
+                              "an optimise_portfolio mix, converted to fractions of NAV here"},
+                      "max_weight": {"type": "number", "description": "with mix: the same cap per holding as "
+                                     "optimise_portfolio, default 0.25"}},
+                     ["account_id"]), run_what_if),
     ToolSpec("optimise_portfolio", "Each holding's share of the portfolio's risk next to its weight, and three "
              "alternative mixes of the same holdings: minimum variance, risk parity and maximum Sharpe, with their "
              "expected return, volatility and Sharpe. Illustrative, not a recommendation.",
@@ -1739,11 +1852,11 @@ TOOLS: tuple[ToolSpec, ...] = (
     ToolSpec("get_risk_outlook", "Forward-looking risk: a GARCH volatility forecast against the long-run level, "
              "one-day and one-month VaR and expected tail loss at 95% and 99%, a backtest of how often past losses "
              "broke the VaR line, whether the latest day did, and the chance of a 10%, 20% or 30% fall within a year.",
-             _schema({"account_id": _ACCOUNT}, ["account_id"]), get_risk_outlook),
+             _schema({"account_id": _ACCOUNT, "as_of": _AS_OF}, ["account_id"]), get_risk_outlook),
     ToolSpec("get_market_regimes", "The account's calm, normal and stressed regimes from its own returns: which one "
              "it is in now and a week ago, the odds of switching, a 1 to 3 month range for its value, and a score "
              "of how well past ranges and their direction held up. Hypothetical, not a forecast.",
-             _schema({"account_id": _ACCOUNT}, ["account_id"]), get_market_regimes),
+             _schema({"account_id": _ACCOUNT, "as_of": _AS_OF}, ["account_id"]), get_market_regimes),
     ToolSpec("run_factor_stress", "Move of the account implied by its Fama-French factor betas for a one-off shock: "
              "a preset scenario, or custom changes to the market (Mkt-RF), size (SMB), value (HML), profitability "
              "(RMW), investment (CMA) and momentum (MOM) factors. Use it to model a scenario the person describes "

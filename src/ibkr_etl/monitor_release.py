@@ -10,6 +10,8 @@ import hashlib
 import json
 import re
 
+from . import medallion_tags
+
 SUB = '3956e821-cee4-403f-8708-e84e2ed490eb'
 BASE = '/subscriptions/'+SUB+'/resourceGroups/rg-ibkr-database-v11/providers/'
 JOB = 'ibkrv2stg-metadata-monitor'
@@ -80,10 +82,11 @@ def validate_baseline(job):
         or container.get('env')!=[{'name':'PORTFOLIO_TENANT_ID','value':'00000000-0000-0000-0000-000000000001'},
                                  {'name':'DATABASE_URL','secretRef':'monitor-url'}]):
         raise ValueError('Container, resources and tenant credentials must remain exact')
-    tags=job.get('tags',{})
+    # The Medallion tags (layer, component, hop) may be there too, with exactly their values.
+    tags=medallion_tags.without_medallion(JOB,job.get('tags',{}))
     wanted={'application':'ibkr-portfolio-platform','purpose':'metadata-shadow-monitor',
             'owner':'portfolio-platform','mode':'shadow'}
-    if any(tags.get(k)!=v for k,v in wanted.items()) or set(tags)!=set(wanted)|{'payloadSha256'}:
+    if tags is None or any(tags.get(k)!=v for k,v in wanted.items()) or set(tags)!=set(wanted)|{'payloadSha256'}:
         raise ValueError('Reviewed monitor ownership and scope required')
     source=decode_bundle(container['args'])
     if tags['payloadSha256']!=hashlib.sha256(source).hexdigest():

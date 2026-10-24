@@ -30,6 +30,7 @@ from unittest.mock import patch
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = ROOT / "migrations" / "postgres"
+UNDO = ROOT / "infra" / "medallion" / "undo"
 TENANT = "00000000-0000-0000-0000-000000000001"
 OTHER_TENANT = "00000000-0000-0000-0000-000000000002"
 ACCOUNTS = {TENANT: "U9100001", OTHER_TENANT: "U9200001"}
@@ -43,7 +44,10 @@ HELD_BACK = ("054_shadow_workflow_evidence.sql", "055_fx_evidence_versions.sql",
 LAYER_FILES = sorted(path.name for path in MIGRATIONS.glob("*_medallion_*.sql"))
 # Later migrations that create new layer objects and move them into their layer as 068 does,
 # so undoing a layer moves them back to public and running them again moves them in again.
-LAYER_CREATORS = ("073_certified_figures.sql", "082_kiwoom_bronze.sql")
+LAYER_CREATORS = ("073_certified_figures.sql", "082_kiwoom_bronze.sql", "084_silver_transfers.sql")
+# Later migrations that only run once 068 to 070 have created the layer schemas, so a build
+# without the layer migrations skips these too.
+NEEDS_LAYERS = ("074_silver_history.sql", "083_silver_write_watch.sql")
 # Production's ledger has this version, applied outside the repository.
 OUTSIDE = ("067_hong_kong_china_external_market_data_approval.sql",)
 LAYERS = ("bronze", "silver", "gold")
@@ -106,6 +110,12 @@ def _catalog() -> dict[str, str]:
     entries = json.loads((ROOT / "infra" / "medallion" / "catalog.json").read_text(encoding="utf-8"))["postgres"]
     return {key.split(".", 1)[1]: value["layer"] for key, value in entries.items()
             if key.startswith("public.") and value["layer"] in LAYERS}
+
+
+def _made_in_layer() -> set[tuple[str, str]]:
+    """(layer, name) for every catalog table a migration makes in its layer (074's history)."""
+    entries = json.loads((ROOT / "infra" / "medallion" / "catalog.json").read_text(encoding="utf-8"))["postgres"]
+    return {tuple(key.split(".", 1)) for key, value in entries.items() if key.split(".", 1)[0] in LAYERS}
 
 
 def _build(database: str, *, skip=(), stop_before_layers=False, before_layers=None) -> list[str]:
@@ -215,10 +225,11 @@ class LayerViewTests(unittest.TestCase):
             cls.after_layers = _layout(owner)
         if LAYER_FILES and any(path.name > LAYER_FILES[-1] for path in MIGRATIONS.glob("*.sql")):
             # Undoing the layers keeps what later migrations changed on layer tables (071 adds
-            # lineage_run_id), so the expected result has every migration but the layer moves.
+            # lineage_run_id), so the expected result has every migration but the layer moves and
+            # NEEDS_LAYERS, which the undo test takes out first.
             unlayered = cls.database + "_unlayered"
             try:
-                _build(unlayered, skip=LAYER_FILES)
+                _build(unlayered, skip=(*LAYER_FILES, *NEEDS_LAYERS))
                 with _connect(unlayered) as owner:
                     cls.before_layers = _layout(owner)
             finally:
@@ -236,6 +247,10 @@ class LayerViewTests(unittest.TestCase):
                 "LEFT JOIN pg_class v ON v.relname = c.relname AND v.relnamespace = 'public'::regnamespace "
                 "WHERE n.nspname IN ('bronze', 'silver', 'gold') AND c.relkind IN ('r', 'p', 'v') ORDER BY 1, 2"
             ).fetchall()
+            # Tables a migration makes in their layer never were in public, so they have no view there.
+            native = [row for row in rows if (row[0], row[1]) in _made_in_layer()]
+            self.assertEqual([row[4] for row in native], [None] * len(native))
+            rows = [row for row in rows if row not in native]
             self.assertEqual(len(rows), len([n for n, layer in _catalog().items()
                                               if layer in {r[0] for r in rows}]))
             columns = ("SELECT attname, format_type(atttypid, atttypmod), attacl::text FROM pg_attribute "
@@ -296,6 +311,11 @@ class LayerViewTests(unittest.TestCase):
     def test_undo_moves_each_layer_back_and_the_batches_apply_again(self):
         undo = _script("medallion_layers").undo_sql
         with _connect(self.database) as owner:
+            # 074 and 083 add their own objects to silver, so as in production their undo runs before the
+            # layers', the latest first.
+            for name in reversed(NEEDS_LAYERS):
+                owner.execute((UNDO / name.replace(".sql", "_undo.sql")).read_text(encoding="utf-8"))
+                owner.commit()
             for layer in ("silver", "bronze", "gold"):  # the reverse of the batch order
                 owner.execute(undo(layer))
                 owner.commit()
@@ -305,7 +325,7 @@ class LayerViewTests(unittest.TestCase):
             for layer in ("silver", "bronze", "gold"):
                 owner.execute(undo(layer))  # nothing left to undo
                 owner.commit()
-            for name in [*LAYER_FILES, *LAYER_CREATORS]:
+            for name in sorted([*LAYER_FILES, *LAYER_CREATORS, *NEEDS_LAYERS]):  # in migration order
                 owner.execute((MIGRATIONS / name).read_text(encoding="utf-8"))
                 owner.commit()
             self.assertEqual(_layout(owner), self.after_layers)

@@ -47,7 +47,7 @@ NAV_DAYS = [d.isoformat() for d in (date(2025, 1, 2) + timedelta(days=n) for n i
 
 
 def day(on: str, *, usd_value="1000", hkd_value="5000", usd_cash="100", hkd_cash="2000", accruals="12",
-        total=None, mark="10", fx="7.8", actions=(), activity=()):
+        total=None, mark="10", fx="7.8", actions=(), activity=(), summary_only=False):
     positions = (float(usd_value) * float(fx)) + float(hkd_value)
     cash = float(usd_cash) * float(fx) + float(hkd_cash)
     broker_total = total if total is not None else f"{positions + cash + float(accruals):.2f}"
@@ -59,9 +59,12 @@ def day(on: str, *, usd_value="1000", hkd_value="5000", usd_cash="100", hkd_cash
                            "market_value_text": usd_value},
                           {"conid": "1001", "currency": "HKD", "quantity_text": "500", "mark_price_text": "10",
                            "market_value_text": hkd_value}],
-            "cash": [{"currency": "BASE_SUMMARY", "ending_cash_text": "99999", "fx_rate_to_base_text": "1"},
-                     {"currency": "HKD", "ending_cash_text": hkd_cash, "fx_rate_to_base_text": "1"},
-                     {"currency": "USD", "ending_cash_text": usd_cash, "fx_rate_to_base_text": fx}],
+            # Some Flex queries send only the Cash Report's base-currency total, with no row per currency.
+            "cash": ([{"currency": "BASE_SUMMARY", "ending_cash_text": f"{cash:.2f}", "fx_rate_to_base_text": None}]
+                     if summary_only else
+                     [{"currency": "BASE_SUMMARY", "ending_cash_text": "99999", "fx_rate_to_base_text": "1"},
+                      {"currency": "HKD", "ending_cash_text": hkd_cash, "fx_rate_to_base_text": "1"},
+                      {"currency": "USD", "ending_cash_text": usd_cash, "fx_rate_to_base_text": fx}]),
             "fx_rates": [], "corporate_actions": list(actions), "activity": list(activity)}
 
 
@@ -136,6 +139,35 @@ class CheckTests(unittest.TestCase):
                          ("1001", [{"scheme": "ibkr_conid", "identifier": "1001"}]))
         self.assertIn("1 of 2 securities are already in the security master. 1 are new",
                       result.checks["securities_mapped"]["message"])
+
+    def test_cash_sent_only_as_the_base_currency_total_reconciles(self):
+        # The position in USD then takes IBKR's rate from the statement's rates, as there is no USD cash row.
+        rates = {"fx_rates": [{"from_currency": "USD", "to_currency": "HKD", "rate_text": "7.8"}]}
+        account = Account(**{on: {"summary_only": True} for on in NAV_DAYS})
+        original = account.call
+
+        def call(name, arguments):
+            answer = original(name, arguments)
+            if name == "get_onboarding_broker_day":
+                answer["data"].update(rates)
+            return answer
+        account.call = call
+        result, responses = reconcile(account)
+        self.assertEqual(result.checks["nav_reconciled"]["status"], "pass", result.checks["nav_reconciled"]["message"])
+        self.assertEqual(responses.calls, [])
+        # A day with a negative balance (a margin loan) sent only as the total also reconciles.
+        on = NAV_DAYS[-1]
+        loan = Account(**{on: {"summary_only": True, "usd_cash": "-900"}})
+        loan_call = loan.call
+
+        def with_rates(name, arguments):
+            answer = loan_call(name, arguments)
+            if name == "get_onboarding_broker_day":
+                answer["data"].update(rates)
+            return answer
+        loan.call = with_rates
+        result, _ = reconcile(loan)
+        self.assertEqual(result.checks["nav_reconciled"]["status"], "pass", result.checks["nav_reconciled"]["message"])
 
     def test_old_holdings_warn(self):
         result, _ = reconcile(Account(), today=date(2025, 3, 10))

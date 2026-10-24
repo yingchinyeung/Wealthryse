@@ -21,7 +21,7 @@ import json
 import re
 import uuid
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Iterable, Literal, Mapping
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
@@ -52,6 +52,7 @@ from .onboarding_cases import (
     APPROVALS,
     CHECK_LABELS,
     DERIVED_SOURCE_KINDS,
+    MAX_OPEN_CASES,
     PRE_LIVE_STAGES,
     SOURCE_LABELS,
     STAGE_LABELS,
@@ -71,6 +72,7 @@ from .onboarding_cases import (
     terms_digest,
 )
 from .report_profiles import STYLES as REPORT_STYLES, ReportProfileError, build_profile, check_style
+from . import onboarding_worker
 from .subject_activation import activate_subject
 from .subject_onboarding import configuration_sha256, dependencies_for_definition
 
@@ -210,7 +212,16 @@ def _account_terms(row: Mapping[str, Any]) -> dict[str, object]:
         if kind == "composite_portfolio":
             terms["report_style"] = row.get("report_style")
         return terms
-    return {"broker": str(row["broker"]), "broker_account_id": str(row["broker_account_id"]), **common}
+    terms = {"broker": str(row["broker"]), "broker_account_id": str(row["broker_account_id"]), **common}
+    # Asked for since migration 085; a case started before keeps the terms (and digest) it had.
+    benchmarks = row.get("benchmarks_json")
+    if benchmarks:
+        benchmarks = json.loads(benchmarks) if isinstance(benchmarks, str) else dict(benchmarks)
+        terms["benchmarks"] = {"primary": str(benchmarks["primary"]),
+                               "secondary": [str(item) for item in benchmarks.get("secondary") or []]}
+    if row.get("kiwoom_include_us") is not None:
+        terms["kiwoom_us_account"] = bool(row["kiwoom_include_us"])
+    return terms
 
 
 def _definition_summary(definition: Mapping[str, Any]) -> list[dict[str, str]]:
@@ -276,8 +287,14 @@ def _already_onboarded(connection, tenant_id: str, broker: str, account_id: str)
 
 
 def start_case(connection, tenant_id: str, *, connection_id: str, broker_account_id: str, display_name: str,
-               reporting_currency: str, history_start_date: date, actor: str | None, today: date) -> dict:
-    """Open a case for one discovered account. One account at a time."""
+               reporting_currency: str, history_start_date: date, actor: str | None, today: date,
+               benchmarks: Mapping[str, Any] | None = None, include_us: bool | None = None) -> dict:
+    """Open a case for one discovered account. Up to MAX_OPEN_CASES at a time.
+
+    ``benchmarks`` ({"primary": id, "secondary": [ids]}) are the account's benchmarks, written to
+    portfolio_benchmark_mapping at approval 1; ``include_us`` says whether a Kiwoom account's U.S.
+    holdings are read too (None leaves it to the collector's setting).
+    """
 
     source = connection.execute(
         "SELECT connection_id, broker, status FROM broker_connections WHERE tenant_id = %s AND connection_id = %s",
@@ -309,15 +326,22 @@ def start_case(connection, tenant_id: str, *, connection_id: str, broker_account
                       target_subject_id=subject_id)
     if _already_onboarded(connection, tenant_id, broker, account_id):
         raise OnboardingError("This account is already on the platform")
+    picked = _benchmark_terms(connection, tenant_id, benchmarks) if benchmarks else None
+    if include_us is not None and broker != "kiwoom_rest":
+        raise OnboardingError("Only a Kiwoom account has a U.S. account to read", 400)
 
     case_id = str(uuid.uuid4())
+    # The columns of migration 085 only when the form used them, so an older database still takes a case.
+    extra = {"benchmarks_json": _json(picked) if picked else None, "kiwoom_include_us": include_us}
+    extra = {key: value for key, value in extra.items() if value is not None}
     connection.execute(
         "INSERT INTO broker_onboarding_cases (case_id, tenant_id, source_kind, connection_id, broker, "
         "broker_account_id, target_subject_id, display_name, reporting_currency, history_start_date, stage, "
-        "status, created_by_identity_sha256) "
-        "VALUES (%s, %s, 'broker_account', %s, %s, %s, %s, %s, %s, %s, 'request', 'platform_working', %s)",
+        "status, created_by_identity_sha256" + "".join(f", {key}" for key in extra) + ") "
+        "VALUES (%s, %s, 'broker_account', %s, %s, %s, %s, %s, %s, %s, 'request', 'platform_working', %s"
+        + "".join(", %s::jsonb" if key == "benchmarks_json" else ", %s" for key in extra) + ")",
         (case_id, tenant_id, connection_id, broker, account_id, subject_id, name, currency, history_start_date,
-         actor),
+         actor, *extra.values()),
     )
     _event(connection, tenant_id, case_id, "created", "request", "request", actor,
            {"broker": broker, "connection_id": str(connection_id)})
@@ -342,6 +366,8 @@ def start_case(connection, tenant_id: str, *, connection_id: str, broker_account
 
 
 def _assert_can_start(connection, tenant_id: str, **candidate: str | None) -> None:
+    # Two cases started at the same moment must not both see room for one more.
+    connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"broker-onboarding-start:{tenant_id}",))
     open_rows = connection.execute(
         "SELECT case_id, source_kind, broker, broker_account_id, target_subject_id, stage, status "
         "FROM broker_onboarding_cases WHERE tenant_id = %s AND status <> 'cancelled' FOR UPDATE",
@@ -351,6 +377,69 @@ def _assert_can_start(connection, tenant_id: str, **candidate: str | None) -> No
         assert_can_start(open_cases=[_case_from_rows(row, (), ()) for row in open_rows], **candidate)
     except ValueError as error:
         raise OnboardingError(str(error)) from error
+
+
+def benchmark_choices(connection, tenant_id: str) -> list[dict[str, str]]:
+    """The active benchmarks an account can be compared with, for the start form."""
+
+    return [{"benchmark_id": str(row["benchmark_id"]), "name": str(row["name"]), "currency": str(row["currency"])}
+            for row in connection.execute(
+                "SELECT benchmark_id, name, currency FROM benchmark_master WHERE tenant_id = %s AND active "
+                "ORDER BY name, benchmark_id", (tenant_id,)).fetchall()]
+
+
+def _benchmark_terms(connection, tenant_id: str, benchmarks: Mapping[str, Any]) -> dict[str, Any]:
+    primary = str(benchmarks.get("primary") or "").strip()
+    secondary = list(dict.fromkeys(str(item).strip() for item in benchmarks.get("secondary") or [] if str(item).strip()))
+    if not primary:
+        raise OnboardingError("Choose the main benchmark", 400)
+    if primary in secondary:
+        raise OnboardingError("The main benchmark cannot also be a second benchmark", 400)
+    if len(secondary) > 4:
+        raise OnboardingError("Choose at most four other benchmarks", 400)
+    known = {item["benchmark_id"] for item in benchmark_choices(connection, tenant_id)}
+    unknown = [item for item in [primary, *secondary] if item not in known]
+    if unknown:
+        raise OnboardingError("Not an active benchmark: " + ", ".join(unknown), 400)
+    return {"primary": primary, "secondary": secondary}
+
+
+def set_case_terms(connection, tenant_id: str, case_id: str, *, benchmarks: Mapping[str, Any] | None,
+                   include_us: bool | None, actor: str | None) -> dict:
+    """Change the benchmarks or the Kiwoom U.S. choice before the account terms are approved."""
+
+    row, _checks, approvals, case = _load_case(connection, tenant_id, case_id, lock=True)
+    if case.source_kind != "broker_account":
+        raise OnboardingError("A portfolio's benchmarks come from its definition")
+    if case.cancelled or "account_terms" in case.approvals:
+        raise OnboardingError("The account terms are already approved; these can no longer change")
+    if include_us is not None and case.broker != "kiwoom_rest":
+        raise OnboardingError("Only a Kiwoom account has a U.S. account to read", 400)
+    picked = _benchmark_terms(connection, tenant_id, benchmarks) if benchmarks else None
+    connection.execute(
+        "UPDATE broker_onboarding_cases SET benchmarks_json = %s::jsonb, kiwoom_include_us = %s, updated_at = now() "
+        "WHERE tenant_id = %s AND case_id = %s",
+        (_json(picked) if picked else None, include_us, tenant_id, case_id),
+    )
+    return {"case_id": case_id, "benchmarks": picked, "kiwoom_us_account": include_us}
+
+
+def _map_benchmarks(connection, tenant_id: str, terms: Mapping[str, Any]) -> None:
+    """Approval 1: the account's benchmarks, from its history start, as the earlier wizard writes them."""
+
+    picked = terms.get("benchmarks")
+    if not picked:
+        return
+    for mapping_type, benchmark_id in [("primary", picked["primary"]),
+                                       *[("secondary", item) for item in picked["secondary"]]]:
+        connection.execute(
+            "INSERT INTO portfolio_benchmark_mapping (tenant_id, subject_id, benchmark_id, mapping_type, "
+            "effective_from, effective_to, reporting_currency, created_at) VALUES (%s, %s, %s, %s, %s, NULL, %s, %s) "
+            "ON CONFLICT (tenant_id, subject_id, benchmark_id, effective_from) DO UPDATE SET "
+            "mapping_type = EXCLUDED.mapping_type, effective_to = NULL, reporting_currency = EXCLUDED.reporting_currency",
+            (tenant_id, terms["subject_id"], benchmark_id, mapping_type, str(terms["history_start_date"]),
+             terms["reporting_currency"], datetime.now(timezone.utc).isoformat()),
+        )
 
 
 def _sleeve_states(connection, tenant_id: str, definition: Mapping[str, Any]) -> tuple[list[str], list[str]]:
@@ -639,9 +728,16 @@ def _go_live(connection, tenant_id: str, row: Mapping[str, Any], case: Onboardin
 
 
 def approve_case(connection, tenant_id: str, case_id: str, *, approval: str, terms_sha256: str,
-                 acknowledge_warnings: Iterable[str], confirmation: str | None, actor: str) -> dict:
+                 acknowledge_warnings: Iterable[str], confirmation: str | None, actor: str,
+                 viewers: Iterable[str] = ()) -> dict:
+    """Record one of the owner's three approvals. At go-live, ``viewers`` (Entra object IDs of active
+    viewers) are given read access to the account in the same transaction."""
+
     if approval not in APPROVALS:
         raise OnboardingError("Unknown approval", 404)
+    viewers = sorted({str(item).strip().lower() for item in viewers if str(item).strip()})
+    if viewers and approval != "go_live":
+        raise OnboardingError("Viewers are given access when the account goes live", 400)
     row, checks, approvals, case = _load_case(connection, tenant_id, case_id, lock=True)
     terms = _approval_terms(row, checks, approvals, approval)
     if terms_digest(terms) != terms_sha256:
@@ -665,8 +761,11 @@ def approve_case(connection, tenant_id: str, case_id: str, *, approval: str, ter
         _register_derived_subject(connection, tenant_id, row, terms, actor)
     elif approval == "account_terms":
         _register_subject(connection, tenant_id, row, terms)
+        _map_benchmarks(connection, tenant_id, terms)
     elif approval == "go_live":
         _go_live(connection, tenant_id, row, case, actor)
+        detail["viewers_given_access"] = _grant_viewers(connection, tenant_id, str(row["subject_id"]), viewers,
+                                                        actor)
     connection.execute(
         "INSERT INTO broker_onboarding_approvals (tenant_id, case_id, approval_kind, terms_json, terms_sha256, "
         "approved_by_identity_sha256) VALUES (%s, %s, %s, %s::jsonb, %s, %s)",
@@ -677,7 +776,62 @@ def approve_case(connection, tenant_id: str, case_id: str, *, approval: str, ter
     result = {"case_id": case_id, "stage": case.stage, "status": case_status(case)}
     if approval == "go_live":
         result["next_page"] = f"/accounts/{row['subject_id']}/overview"
+        result["viewers_given_access"] = detail.get("viewers_given_access", 0)
     return result
+
+
+def viewer_choices(connection, tenant_id: str, subject_id: str | None = None) -> list[dict[str, Any]]:
+    """Active viewers (an active, effective viewer role), and whether each already reads the account."""
+
+    rows = connection.execute(
+        "SELECT u.entra_object_id, u.email, u.display_name, "
+        "EXISTS (SELECT 1 FROM user_account_access a WHERE a.tenant_id = u.tenant_id "
+        "AND a.entra_object_id = u.entra_object_id AND a.subject_id = %s) AS has_access "
+        "FROM app_users u WHERE u.tenant_id = %s AND u.status = 'active' AND EXISTS ("
+        "SELECT 1 FROM app_user_roles r WHERE r.tenant_id = u.tenant_id AND lower(r.entra_object_id) = "
+        "lower(u.entra_object_id) AND r.role_name = 'viewer' AND r.role_status = 'active' "
+        "AND r.effective_from <= now() AND (r.effective_to IS NULL OR r.effective_to >= now())) "
+        "ORDER BY lower(coalesce(u.display_name, u.email))",
+        (subject_id or "", tenant_id),
+    ).fetchall()
+    return [{"object_id": str(row["entra_object_id"]).lower(), "name": str(row["display_name"] or row["email"]),
+             "email": str(row["email"]), "has_access": bool(row["has_access"])} for row in rows]
+
+
+def _grant_viewers(connection, tenant_id: str, subject_id: str, viewers: list[str], actor: str) -> int:
+    """Read access for the ticked viewers; never a higher level, and an existing grant is left as it is."""
+
+    if not viewers:
+        return 0
+    allowed = connection.execute(
+        "SELECT has_table_privilege(current_user, 'public.user_account_access', 'INSERT') AS allowed").fetchone()
+    if not allowed or not allowed["allowed"]:
+        raise OnboardingError("The website cannot give viewers access yet; go live without ticking viewers, "
+                              "or ask for the website's login to be allowed to add read access", 503)
+    known = {item["object_id"]: item for item in viewer_choices(connection, tenant_id, subject_id)}
+    unknown = [item for item in viewers if item not in known]
+    if unknown:
+        raise OnboardingError("Only active viewers can be given access; reload the page", 400)
+    stamp = datetime.now(timezone.utc).isoformat()
+    added = 0
+    for object_id in viewers:
+        if known[object_id]["has_access"]:
+            continue
+        connection.execute(
+            "INSERT INTO user_account_access (tenant_id, entra_object_id, subject_id, access_level, granted_at, "
+            "granted_by) SELECT %s, u.entra_object_id, %s, 'read', %s, %s FROM app_users u "
+            "WHERE u.tenant_id = %s AND lower(u.entra_object_id) = %s "
+            "ON CONFLICT (tenant_id, entra_object_id, subject_id) DO NOTHING",
+            (tenant_id, subject_id, stamp, actor, tenant_id, object_id),
+        )
+        added += 1
+    connection.execute(
+        "INSERT INTO audit_events (tenant_id, occurred_at, actor_type, actor_id, event_type, subject_id, outcome, "
+        "details_json) VALUES (%s, %s, 'user', %s, 'viewer_read_access_granted', %s, 'succeeded', %s)",
+        (tenant_id, stamp, actor, subject_id, _json({"grants": added, "channel": "broker_onboarding_v2_go_live",
+                                                      "access_level": "read"})),
+    )
+    return added
 
 
 def _register_subject(connection, tenant_id: str, row: Mapping[str, Any], terms: Mapping[str, object]) -> None:
@@ -802,7 +956,7 @@ def cancel_case(connection, tenant_id: str, case_id: str, *, reason: str, actor:
     return {"case_id": case_id, "status": "cancelled"}
 
 
-def case_detail(connection, tenant_id: str, case_id: str) -> dict:
+def case_detail(connection, tenant_id: str, case_id: str, *, now: datetime | None = None) -> dict:
     row, checks, approvals, case = _load_case(connection, tenant_id, case_id)
     by_id = {str(item["check_id"]): item for item in checks}
     account_display = _display(case)
@@ -863,6 +1017,14 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
         "documents_open": onboarding_agents.agents_enabled() and onboarding_agents.documents_open(row, approvals),
         "readiness": onboarding_agents.case_readiness(connection, tenant_id, case.case_id, awaiting),
     }
+    detail["history"] = _history_coverage(by_id.get("history_built"))
+    detail["benchmarks"] = _benchmark_view(connection, tenant_id, terms.get("benchmarks"))
+    detail["kiwoom_us_account"] = terms.get("kiwoom_us_account")
+    detail["terms_open"] = case.source_kind == "broker_account" and not case.cancelled \
+        and "account_terms" not in case.approvals
+    detail["benchmark_choices"] = benchmark_choices(connection, tenant_id) if detail["terms_open"] else []
+    detail["viewers"] = (viewer_choices(connection, tenant_id, str(row["subject_id"]))
+                         if awaiting == "go_live" and row["subject_id"] else [])
     # Last, as it reads another feature's table: a failed read leaves only this part unavailable.
     design = _factsheet_design(connection, tenant_id, row, case)
     detail["factsheet_design"] = design
@@ -871,7 +1033,197 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
         detail["next_owner_action"] = "Approve sending this account's ticker symbols to Yahoo, below."
     if design and design.get("owner_action") and detail["next_owner_action"] is None:
         detail["next_owner_action"] = design["owner_action"]
+    # The worker's run records come with migration 085; before it the panel says so and nothing else changes.
+    detail["platform_work"] = _platform_work(connection, tenant_id, row, checks, case, external, now=now)
     return detail
+
+
+def _history_coverage(check: Mapping[str, Any] | None) -> dict | None:
+    """The history_built check in figures for the case page: days loaded, left and not reconciling."""
+
+    if check is None:
+        return None
+    evidence = _evidence(check)
+    return {
+        "status": str(check["status"]),
+        "message": str(check["message"]),
+        "from": evidence.get("from"),
+        "to": evidence.get("to"),
+        "days_with_history": evidence.get("days_with_history"),
+        "days_left": evidence.get("days_left"),
+        "gap_days": evidence.get("gap_days"),
+        "gaps": list(evidence.get("gaps") or [])[:10],
+        "checked_at": str(check.get("checked_at") or ""),
+    }
+
+
+def _benchmark_view(connection, tenant_id: str, picked: Mapping[str, Any] | None) -> dict | None:
+    if not picked:
+        return None
+    names = {item["benchmark_id"]: item["name"] for item in benchmark_choices(connection, tenant_id)}
+    return {"primary": {"benchmark_id": picked["primary"], "name": names.get(picked["primary"], picked["primary"])},
+            "secondary": [{"benchmark_id": item, "name": names.get(item, item)} for item in picked["secondary"]]}
+
+
+def _worker_case(row: Mapping[str, Any], checks: Iterable[Mapping[str, Any]], case: OnboardingCase,
+                 external: Mapping[str, Any] | None, runs: list[Mapping[str, Any]], *,
+                 requested: bool = False) -> onboarding_worker.Case:
+    return onboarding_worker.Case(
+        case_id=case.case_id, source_kind=case.source_kind, broker=case.broker, stage=case.stage,
+        subject_id=str(row["subject_id"]) if row.get("subject_id") else None,
+        history_start_date=str(row["history_start_date"])[:10],
+        checks={str(item["check_id"]): str(item["status"]) for item in checks},
+        yahoo_approved=bool(external and external.get("approved")),
+        last_steps=onboarding_worker.last_steps_from(runs, case.case_id), requested=requested)
+
+
+def _run_view(run: Mapping[str, Any]) -> dict[str, Any]:
+    steps = run.get("steps_json") or []
+    steps = json.loads(steps) if isinstance(steps, str) else list(steps)
+    return {
+        "run_id": str(run["run_id"]),
+        "trigger": str(run["trigger"]),
+        "status": str(run["status"]),
+        "message": str(run.get("message") or ""),
+        "requested_at": str(run.get("requested_at") or ""),
+        "finished_at": str(run["finished_at"]) if run.get("finished_at") else None,
+        "steps": [{"label": onboarding_worker.STEP_LABELS.get(str(item.get("step")), str(item.get("step"))),
+                   "outcome": str(item.get("outcome") or ""), "detail": str(item.get("detail") or "")[:300]}
+                  for item in steps if isinstance(item, Mapping) and item.get("step")],
+    }
+
+
+def _platform_work(connection, tenant_id: str, row: Mapping[str, Any], checks: Iterable[Mapping[str, Any]],
+                   case: OnboardingCase, external: Mapping[str, Any] | None, *,
+                   now: datetime | None = None) -> dict | None:
+    """What the onboarding worker did for this case lately and does next, for the Platform work panel."""
+
+    if case.cancelled or case.stage not in PRE_LIVE_STAGES:
+        return None
+    now = now or datetime.now(timezone.utc)
+    try:
+        runs = connection.execute(
+            "SELECT run_id, trigger, status, message, steps_json, requested_at, finished_at "
+            "FROM onboarding_worker_runs WHERE tenant_id = %s AND (case_id = %s OR (case_id IS NULL "
+            "AND steps_json::text LIKE %s)) ORDER BY requested_at DESC LIMIT 8",
+            (tenant_id, case.case_id, f"%{case.case_id}%"),
+        ).fetchall()
+    except Exception:  # migration 085 not applied yet: the rest of the page stays as it was
+        return {"unavailable": True}
+    runs = [dict(item) for item in runs]
+    waiting = next((item for item in runs if item["status"] in ("requested", "running")), None)
+    next_steps = onboarding_worker.plan(_worker_case(row, checks, case, external, runs, requested=True), now=now)
+    return {
+        "unavailable": False,
+        "waiting": _run_view(waiting) if waiting else None,
+        "runs": [_run_view(item) for item in runs if item is not waiting][:5],
+        "next_scheduled": onboarding_worker.next_scheduled(now).isoformat(),
+        "window_note": onboarding_worker.window_note(now),
+        "run_now_does": [onboarding_worker.STEP_LABELS[step] for step in next_steps],
+        "built_in_designs": _built_in_designs(row, case),
+    }
+
+
+def _built_in_designs(row: Mapping[str, Any], case: OnboardingCase) -> list[dict[str, str]]:
+    """Designs the platform ships with the owner's exact template, in this case's currency."""
+
+    if case.stage != "build_history" or row.get("report_style") or not row.get("subject_id"):
+        return []
+    from importlib import resources
+
+    from .factsheet_spec.spec import load_design
+
+    found = []
+    try:
+        entries = sorted(resources.files("ibkr_etl.factsheet_spec").joinpath("templates").iterdir(),
+                         key=lambda item: item.name)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    for entry in entries:
+        if not entry.name.endswith(".pdf"):
+            continue
+        design_id = entry.name[:-4]
+        try:
+            design = load_design(design_id)
+        except Exception:  # a template without a design is not offered
+            continue
+        if str(row["reporting_currency"]) in design.get("currencies", []) and design.get("template_sha256"):
+            found.append({"design_id": design_id, "title": str(design.get("title") or design_id)})
+    return found
+
+
+def request_worker_run(connection, tenant_id: str, *, actor: str | None, case_id: str | None = None,
+                       connection_id: str | None = None, asks: Iterable[Mapping[str, Any]] = ()) -> dict:
+    """Run now (a case) or Check now (a Kiwoom connection): a request the next worker run takes.
+
+    A request already waiting for the same case or connection is joined, not repeated.
+    """
+
+    if case_id:
+        _, _, _, case = _load_case(connection, tenant_id, case_id, lock=True)
+        if case.cancelled or case.stage not in PRE_LIVE_STAGES:
+            raise OnboardingError("This case is past go-live; the daily jobs keep it up to date")
+        waiting = connection.execute(
+            "SELECT run_id, steps_json FROM onboarding_worker_runs WHERE tenant_id = %s AND case_id = %s "
+            "AND status IN ('requested', 'running') LIMIT 1", (tenant_id, case_id)).fetchone()
+        trigger = "run_now"
+    else:
+        source = connection.execute(
+            "SELECT broker, status FROM broker_connections WHERE tenant_id = %s AND connection_id = %s FOR UPDATE",
+            (tenant_id, connection_id)).fetchone()
+        if source is None:
+            raise OnboardingError("Broker connection not found", 404)
+        if source["broker"] != "kiwoom_rest":
+            raise OnboardingError("IBKR connections are checked by the Flex check")
+        if source["status"] in {"suspended", "retired"}:
+            raise OnboardingError("This connection is paused; renew or replace it first")
+        waiting = connection.execute(
+            "SELECT run_id, steps_json FROM onboarding_worker_runs WHERE tenant_id = %s AND connection_id = %s "
+            "AND case_id IS NULL AND status IN ('requested', 'running') LIMIT 1",
+            (tenant_id, connection_id)).fetchone()
+        trigger = "check_connection"
+    asks = [dict(item) for item in asks]
+    if waiting is not None:
+        if asks:
+            known = waiting["steps_json"] or []
+            known = json.loads(known) if isinstance(known, str) else list(known)
+            connection.execute(
+                "UPDATE onboarding_worker_runs SET steps_json = %s::jsonb WHERE tenant_id = %s AND run_id = %s "
+                "AND status = 'requested'", (_json([*known, *asks]), tenant_id, waiting["run_id"]))
+        return {"run_id": str(waiting["run_id"]), "status": "already_waiting"}
+    run_id = str(uuid.uuid4())
+    connection.execute(
+        "INSERT INTO onboarding_worker_runs (run_id, tenant_id, case_id, connection_id, trigger, status, "
+        "requested_by_identity_sha256, steps_json) VALUES (%s, %s, %s, %s, %s, 'requested', %s, %s::jsonb)",
+        (run_id, tenant_id, case_id, connection_id, trigger, actor, _json(asks)),
+    )
+    return {"run_id": run_id, "status": "requested"}
+
+
+def note_worker_start(connection, tenant_id: str, run_id: str, reference: str | None, error: str | None) -> None:
+    """Keep the job execution's name, or why it could not be started (the schedule still takes the request)."""
+
+    connection.execute(
+        "UPDATE onboarding_worker_runs SET execution_reference = %s, message = coalesce(message, %s) "
+        "WHERE tenant_id = %s AND run_id = %s",
+        ((reference or "")[:400] or None, error, tenant_id, run_id),
+    )
+
+
+def archive_design_draft(connection, tenant_id: str, case_id: str, draft_id: str) -> dict:
+    """Hide an unsubmitted factsheet draft from the designer's lists; its versions are kept."""
+
+    row, _, _, case = _load_case(connection, tenant_id, case_id, lock=True)
+    if case.cancelled or case.stage not in PRE_LIVE_STAGES or not row.get("subject_id"):
+        raise OnboardingError("Drafts are tidied while the case is before go-live")
+    changed = connection.execute(
+        "UPDATE factsheet_design_drafts SET status = 'archived', updated_at = %s WHERE tenant_id = %s "
+        "AND draft_id = %s AND subject_id = %s AND status IN ('review', 'failed') RETURNING draft_id",
+        (datetime.now(timezone.utc).isoformat(), tenant_id, draft_id, row["subject_id"]),
+    ).fetchone()
+    if changed is None:
+        raise OnboardingError("Only a draft of this account that is not submitted can be archived", 404)
+    return {"draft_id": draft_id, "status": "archived"}
 
 
 EXTERNAL_DATA_MESSAGE = (
@@ -964,14 +1316,14 @@ def _factsheet_design(connection, tenant_id: str, row: Mapping[str, Any], case: 
         return step
     try:
         designs = connection.execute(
-            "SELECT title, status, current_version, updated_at FROM factsheet_design_drafts "
+            "SELECT draft_id, title, status, current_version, updated_at FROM factsheet_design_drafts "
             "WHERE tenant_id = %s AND subject_id = %s AND status <> 'archived' ORDER BY updated_at DESC LIMIT 10",
             (tenant_id, subject_id),
         ).fetchall()
     except Exception:  # the designer's tables are another feature's; never break the case page for them
         return {**step, "unavailable": True}
-    step["designs"] = [{"title": str(d["title"]), "status": str(d["status"]), "version": int(d["current_version"]),
-                        "updated_at": str(d["updated_at"])} for d in designs]
+    step["designs"] = [{"draft_id": str(d.get("draft_id") or ""), "title": str(d["title"]), "status": str(d["status"]),
+                        "version": int(d["current_version"]), "updated_at": str(d["updated_at"])} for d in designs]
     step["submitted"] = next((d for d in step["designs"] if d["status"] == "submitted"), None)
     if step["submitted"] is None and case.checks.get("reports_rendered") != "pass":
         step["owner_action"] = ("Design the factsheet: open the factsheet designer, upload the template, "
@@ -1249,6 +1601,13 @@ def _health(row: Mapping[str, Any], *, today: date, platform_ip: str | None) -> 
                              ip_lock=ip_lock_state(locked, platform_ip))
 
 
+def _last_check_message(value: Any) -> str | None:
+    if not value:
+        return None
+    value = json.loads(value) if isinstance(value, str) else dict(value)
+    return str(value.get("message") or "")[:300] or None
+
+
 def connections_overview(connection, tenant_id: str, *, today: date, platform_ip: str | None) -> dict:
     rows = connection.execute(
         "SELECT c.*, f.status AS flex_status, "
@@ -1274,6 +1633,13 @@ def connections_overview(connection, tenant_id: str, *, today: date, platform_ip
             "health": health,
             "health_label": HEALTH_LABELS[health],
             "flex_source_id": str(row["flex_source_id"]) if row.get("flex_source_id") else None,
+            # Where the key is: its Key Vault secret's name and fingerprint, never the key.
+            "key_vault_secret": str(row["key_vault_secret_name"]),
+            "key_fingerprint": str(row["credential_fingerprint"]),
+            "key_stored_at": str(row["created_at"]) if row.get("created_at") else None,
+            "last_checked_at": str(row["last_checked_at"]) if row.get("last_checked_at") else None,
+            "last_check_message": _last_check_message(row.get("last_check_json")),
+            "can_check_now": row["broker"] == "kiwoom_rest" and row["status"] not in {"suspended", "retired"},
         })
     tracked = {item["connection_id"] for item in connections}
     untracked = [
@@ -1361,8 +1727,13 @@ def onboarding_overview(connection, tenant_id: str, *, today: date, platform_ip:
             (tenant_id,),
         ).fetchall()
     ]
-    starting_allowed = not any(item["stage_number"] <= 3 for item in cases)
-    return {"cases": cases, "available": available, "live": live, "can_start": starting_allowed}
+    open_count = sum(1 for item in cases if item["stage_number"] <= 3)
+    try:
+        benchmarks = benchmark_choices(connection, tenant_id)
+    except Exception:  # the benchmark list is another feature's; the start form then asks for none
+        benchmarks = []
+    return {"cases": cases, "available": available, "live": live, "can_start": open_count < MAX_OPEN_CASES,
+            "open_cases": open_count, "max_open_cases": MAX_OPEN_CASES, "benchmarks": benchmarks}
 
 
 def register_connection(connection, tenant_id: str, *, record, stored_fingerprint: str, query_id: str | None,
@@ -1438,6 +1809,28 @@ class StartCaseRequest(BaseModel):
     display_name: str = Field(min_length=3, max_length=160)
     reporting_currency: str = Field(pattern=r"^[A-Za-z]{3}$")
     history_start_date: date
+    primary_benchmark_id: str | None = Field(default=None, max_length=80)
+    secondary_benchmark_ids: list[str] = Field(default_factory=list, max_length=4)
+    kiwoom_include_us: bool | None = None
+
+    def benchmarks(self) -> dict[str, Any] | None:
+        if not self.primary_benchmark_id:
+            return None
+        return {"primary": self.primary_benchmark_id, "secondary": self.secondary_benchmark_ids}
+
+
+class CaseTermsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    primary_benchmark_id: str | None = Field(default=None, max_length=80)
+    secondary_benchmark_ids: list[str] = Field(default_factory=list, max_length=4)
+    kiwoom_include_us: bool | None = None
+
+
+class BuiltInDesignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    design_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,63}$")
 
 
 class ApproveCaseRequest(BaseModel):
@@ -1446,6 +1839,7 @@ class ApproveCaseRequest(BaseModel):
     terms_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     acknowledge_warnings: list[str] = Field(default_factory=list, max_length=20)
     confirmation: str | None = Field(default=None, max_length=120)
+    viewers: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ExternalDataRequest(BaseModel):
@@ -1539,6 +1933,7 @@ def install(
     list_documents: Callable[[str, str], list[dict]] | None = None,
     intake_container: str = onboarding_agents.INTAKE_CONTAINER,
     ask_case: Callable[[], Callable[[dict[str, Any]], Iterable[bytes]] | None] = lambda: None,
+    start_worker: Callable[[], str] | None = None,
 ) -> None:
     """Add the new onboarding routes. Each answers 404 while the switch is off.
 
@@ -1549,6 +1944,8 @@ def install(
     container without overwriting, and list_documents(container, prefix) lists what is there; both are used
     only while ONBOARDING_AGENTS_ENABLED is on. ask_case() gives the function that streams the agent
     service's answer to an owner's question about a case, or None when that service is not configured.
+    start_worker() starts one execution of the onboarding worker job and returns its name (Run now,
+    Check now); without it, or when Azure refuses, the request waits for the worker's next scheduled run.
     """
 
     def switched_on() -> None:
@@ -1646,10 +2043,73 @@ def install(
 
     @app.post("/api/onboarding-v2/cases")
     def start(body: StartCaseRequest, user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
-        return run(write_database, lambda c: start_case(
+        started = run(write_database, lambda c: start_case(
             c, tenant_id, connection_id=str(body.connection_id), broker_account_id=body.broker_account_id,
             display_name=body.display_name, reporting_currency=body.reporting_currency,
-            history_start_date=body.history_start_date, actor=actor(user), today=today()))
+            history_start_date=body.history_start_date, actor=actor(user), today=today(),
+            benchmarks=body.benchmarks(), include_us=body.kiwoom_include_us))
+        # The worker's first run checks the account at once instead of the next morning.
+        try:
+            started["worker"] = queue_worker(user, case_id=started["case_id"])
+        except Exception:  # noqa: BLE001 - the case is started either way; the schedule or the daily job takes it
+            started["worker"] = {"status": "not_queued"}
+        return started
+
+    def queue_worker(user: Mapping[str, Any], *, case_id: str | None = None, connection_id: str | None = None,
+                     asks: Iterable[Mapping[str, Any]] = ()) -> dict:
+        """Write the request, then start the worker job; a refused start leaves it for the schedule."""
+
+        from psycopg.errors import UndefinedTable
+
+        try:
+            request = run(write_database, lambda c: request_worker_run(
+                c, tenant_id, actor=actor(user), case_id=case_id, connection_id=connection_id, asks=asks))
+        except UndefinedTable as error:  # migration 085 not applied yet
+            raise HTTPException(status_code=503, detail="The onboarding worker is not set up yet") from error
+        reference, problem = None, None
+        if request["status"] == "requested":
+            try:
+                if start_worker is None:
+                    raise RuntimeError("not configured")
+                reference = start_worker()
+            except Exception:  # the schedule takes the request within 20 minutes
+                problem = "The worker could not be started now; its next scheduled run takes this."
+            run(write_database, lambda c: note_worker_start(c, tenant_id, request["run_id"], reference, problem) or {})
+        now = datetime.now(timezone.utc)
+        return {**request, "started": reference is not None, "message": problem,
+                "next_scheduled": onboarding_worker.next_scheduled(now).isoformat(),
+                "window_note": onboarding_worker.window_note(now)}
+
+    @app.post("/api/onboarding-v2/cases/{case_id}/run-now")
+    def run_now(case_id: uuid.UUID, user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
+        return queue_worker(user, case_id=str(case_id))
+
+    @app.post("/api/onboarding-v2/cases/{case_id}/built-in-design")
+    def built_in_design(case_id: uuid.UUID, body: BuiltInDesignRequest, user: dict[str, Any] = Depends(v2_owner)) -> dict:
+        def offered(connection) -> dict:
+            row, _, _, case = _load_case(connection, tenant_id, str(case_id))
+            if body.design_id not in {item["design_id"] for item in _built_in_designs(row, case)}:
+                raise OnboardingError("This design is not offered for this account", 404)
+            return {}
+
+        run(read_database, offered)
+        return queue_worker(user, case_id=str(case_id),
+                            asks=[{"ask": "built_in_design", "design_id": body.design_id}])
+
+    @app.post("/api/onboarding-v2/cases/{case_id}/terms")
+    def case_terms(case_id: uuid.UUID, body: CaseTermsRequest, user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
+        picked = ({"primary": body.primary_benchmark_id, "secondary": body.secondary_benchmark_ids}
+                  if body.primary_benchmark_id else None)
+        return run(write_database, lambda c: set_case_terms(c, tenant_id, str(case_id), benchmarks=picked,
+                                                            include_us=body.kiwoom_include_us, actor=actor(user)))
+
+    @app.post("/api/onboarding-v2/cases/{case_id}/designs/{draft_id}/archive")
+    def archive_draft(case_id: uuid.UUID, draft_id: uuid.UUID, user: dict[str, Any] = Depends(v2_owner)) -> dict:
+        return run(write_database, lambda c: archive_design_draft(c, tenant_id, str(case_id), str(draft_id)))
+
+    @app.post("/api/broker-connections/{connection_id}/check")
+    def check_connection(connection_id: uuid.UUID, user: dict[str, Any] = Depends(v2_onboarding_user)) -> dict:
+        return queue_worker(user, connection_id=str(connection_id))
 
     @app.post("/api/onboarding-v2/cases/{case_id}/external-market-data")
     def external_data_route(case_id: uuid.UUID, body: ExternalDataRequest,
@@ -1664,7 +2124,7 @@ def install(
         return run(write_database, lambda c: approve_case(
             c, tenant_id, str(case_id), approval=approval, terms_sha256=body.terms_sha256,
             acknowledge_warnings=body.acknowledge_warnings, confirmation=body.confirmation,
-            actor=actor(user) or ""))
+            actor=actor(user) or "", viewers=body.viewers))
 
     @app.get("/api/onboarding-v2/cases/{case_id}/reports/{generation_run_id}")
     def case_report_file(case_id: uuid.UUID, generation_run_id: int,
@@ -1809,7 +2269,8 @@ def install(
 
 # Pages ---------------------------------------------------------------------
 
-ONBOARDING_DESCRIPTION = "Pick one account at a time. Nothing is imported or shown to viewers until you start its case."
+ONBOARDING_DESCRIPTION = ("Pick up to three accounts at a time. Nothing is imported or shown to viewers until you "
+                          "start its case.")
 CASE_DESCRIPTION = "One account or portfolio, four stages, three decisions from you."
 CONNECTIONS_DESCRIPTION = "One connection per broker login. Keys go straight to Key Vault and are never shown again."
 
@@ -1828,6 +2289,9 @@ CASE_CONTENT = """<div class="page-view active" data-section="account-onboarding
 <div class="card wide"><div class="label" id="case-kicker">Loading…</div><h2 id="case-title"></h2><div id="case-next" class="muted"></div><div id="case-progress" class="status-row"></div></div>
 <div class="card wide" id="case-portfolio" hidden><div class="label">The portfolio</div><p id="case-description"></p><p class="muted" id="case-report-style" hidden></p><div id="case-tree" style="max-width:760px;margin-top:14px;overflow-x:auto"></div></div>
 <div class="card wide"><div class="label">Checks for this stage</div><div id="case-checks" class="onboarding-checks"></div></div>
+<div class="card wide" id="case-work" hidden><div class="label">Platform work</div><p class="muted">The onboarding worker does the platform's part of this case every 20 minutes: loading the account, building its history, looking up names and sectors, rendering the historical reports and recording the agent review. Run now starts it at once.</p><div id="case-work-body"></div><div id="case-work-result" class="muted" role="status" aria-live="polite"></div></div>
+<div class="card wide" id="case-history" hidden><div class="label">History</div><div id="case-history-body"></div></div>
+<div class="card wide" id="case-terms-edit" hidden><div class="label">Benchmarks and account options</div><p class="muted">Part of the account terms you approve in approval 1. They can change until then.</p><form id="case-terms-form"><div id="case-terms-fields" class="status-row"></div><div class="actions"><button class="button" type="submit">Save</button></div><div class="muted" role="status"></div></form></div>
 <div class="card wide" id="case-external" hidden><div class="label">Yahoo Finance</div><div id="case-external-body"></div><div id="case-external-result" class="muted" role="status" aria-live="polite"></div></div>
 <div class="card wide" id="case-design" hidden><div class="label">Factsheet design</div><p class="muted">The monthly factsheets use the design you make from your template in the factsheet designer. Upload the template and, if you have one, a completed example. The design agents draft it, you review it and ask for changes in plain words, then submit it. The historical factsheets are rendered from the submitted design for approval 2.</p><div id="case-design-body"></div></div>
 <div class="card wide" id="case-proposals" hidden><div class="label">Proposed security master entries</div><p class="muted">Securities in this account that the security master does not have yet, as the agent proposes them. Nothing is added until you approve the account terms.</p><div id="case-proposal-list"></div></div>
@@ -1838,6 +2302,7 @@ CASE_CONTENT = """<div class="page-view active" data-section="account-onboarding
 </div>"""
 
 CONNECTIONS_CONTENT = """<div class="page-view active" data-section="broker-connections">
+<div class="card wide" id="bc-address"><div class="label">The platform's fixed address</div><p class="muted">Every call to a broker comes from this one internet address. Register it in the broker's API settings (Kiwoom: the IP registration of its REST API page) before you save the keys here.</p><div class="actions"><strong id="bc-address-ip" style="font-size:1.3em">Not configured</strong><button class="button" type="button" id="bc-address-copy" hidden>Copy</button></div></div>
 <div class="card wide"><div class="label">Connections</div><div id="bc-list"><div class="muted">Loading…</div></div><div id="bc-existing"></div></div>
 <div class="card wide"><div class="label">Add a connection</div>
 <form id="bc-form" autocomplete="off"><div class="status-row">
@@ -1871,12 +2336,15 @@ document.addEventListener('click',e=>document.querySelectorAll('details.platform
 ONBOARDING_SCRIPT = "<script>\n(()=>{" + _COMMON_SCRIPT + r"""
 const load=()=>fetch('/api/onboarding-v2/overview').then(json).then(data=>{
   document.querySelector('#v2-cases').innerHTML=data.cases.length?data.cases.map(c=>{const [text,cls]=statusPill[c.status]||[c.status,''];return row(c.display_name,`${c.broker_label} · ${c.account} · Stage ${c.stage_number} of 4: ${c.stage_label}`,pill(text,cls)+`<a class="button" href="/account-onboarding/cases/${encodeURIComponent(c.case_id)}">Open case</a>`)}).join(''):'<p class="muted">No account is being onboarded.</p>';
-  document.querySelector('#v2-available').innerHTML=data.available.length?data.available.map((a,i)=>row(`${a.broker_label.split(' ')[0]} account ${a.account}${a.account_name?' · '+a.account_name:''}`,`${a.connection_name}${a.base_currency?' · '+a.base_currency:''}`,data.can_start?`<button class="button" type="button" data-pick="${i}">Add account</button>`:pill('Finish the current case first','blocked'))).join(''):'<p class="muted">No new accounts found yet. Add or check a connection on the Broker connections page.</p>';
+  benchmarks=data.benchmarks||[];
+  document.querySelector('#v2-available').innerHTML=(data.max_open_cases?`<p class="muted">${esc(data.open_cases)} of ${esc(data.max_open_cases)} cases open.</p>`:'')+(data.available.length?data.available.map((a,i)=>row(`${a.broker_label.split(' ')[0]} account ${a.account}${a.account_name?' · '+a.account_name:''}`,`${a.connection_name}${a.base_currency?' · '+a.base_currency:''}`,data.can_start?`<button class="button" type="button" data-pick="${i}">Add account</button>`:pill(`${data.max_open_cases||1} cases are open; finish one first`,'blocked'))).join(''):'<p class="muted">No new accounts found yet. Add or check a connection on the Broker connections page.</p>');
   document.querySelector('#v2-live').innerHTML=data.live.map(s=>`<div class="status-item"><div class="label">${esc(s.subject_id)}</div><strong>${esc(s.display_name)}</strong></div>`).join('')||'<div class="muted">None yet.</div>';
   document.querySelectorAll('[data-pick]').forEach(button=>button.addEventListener('click',()=>pick(data.available[Number(button.dataset.pick)])));
 }).catch(error=>{document.querySelector('#v2-cases').innerHTML=`<div class="warning">This page could not load: ${esc(error.message)}</div>`});
-const pick=a=>{const box=document.querySelector('#v2-start');box.hidden=false;box.innerHTML=`<form id="v2-start-form" class="onboarding-row" style="display:block"><strong>Add ${esc(a.broker_label)} account ${esc(a.account)}</strong><div class="status-row"><label class="status-item"><span class="label">Display name</span><input type="text" name="display_name" required minlength="3" maxlength="160" value="${esc(a.account_name||a.account)}"></label><label class="status-item"><span class="label">Reporting currency</span><input type="text" name="reporting_currency" required pattern="[A-Za-z]{3}" maxlength="3" value="${esc(a.base_currency||(a.broker==='kiwoom_rest'?'KRW':'USD'))}"></label><label class="status-item"><span class="label">History from</span><input type="date" name="history_start_date" required></label></div><div class="actions"><button class="button" type="submit">Start this case</button></div><div class="muted" role="status"></div></form>`;
-  const form=box.querySelector('form');form.addEventListener('submit',async event=>{event.preventDefault();const values=new FormData(form),note=form.querySelector('[role=status]'),button=form.querySelector('button');button.disabled=true;note.textContent='Starting the case…';try{const result=await post('/api/onboarding-v2/cases',{connection_id:a.connection_id,broker_account_id:a.broker_account_id,display_name:values.get('display_name'),reporting_currency:String(values.get('reporting_currency')).toUpperCase(),history_start_date:values.get('history_start_date')});window.location.href=result.next_page}catch(error){note.textContent=`Not started: ${error.message}`;button.disabled=false}});box.scrollIntoView({behavior:'smooth',block:'nearest'})};
+let benchmarks=[];
+const benchmarkFields=(primary,secondary)=>benchmarks.length?`<label class="status-item"><span class="label">Main benchmark</span><select name="primary_benchmark_id"><option value="">None yet</option>${benchmarks.map(b=>`<option value="${esc(b.benchmark_id)}"${b.benchmark_id===primary?' selected':''}>${esc(b.name)} (${esc(b.currency)})</option>`).join('')}</select></label><label class="status-item"><span class="label">Other benchmarks (up to 4)</span><select name="secondary_benchmark_ids" multiple size="4">${benchmarks.map(b=>`<option value="${esc(b.benchmark_id)}"${(secondary||[]).includes(b.benchmark_id)?' selected':''}>${esc(b.name)} (${esc(b.currency)})</option>`).join('')}</select></label>`:'';
+const pick=a=>{const box=document.querySelector('#v2-start');box.hidden=false;const kiwoom=a.broker==='kiwoom_rest';box.innerHTML=`<form id="v2-start-form" class="onboarding-row" style="display:block"><strong>Add ${esc(a.broker_label)} account ${esc(a.account)}</strong><div class="status-row"><label class="status-item"><span class="label">Display name</span><input type="text" name="display_name" required minlength="3" maxlength="160" value="${esc(a.account_name||a.account)}"></label><label class="status-item"><span class="label">Reporting currency</span><input type="text" name="reporting_currency" required pattern="[A-Za-z]{3}" maxlength="3" value="${esc(a.base_currency||(kiwoom?'KRW':'USD'))}"></label><label class="status-item"><span class="label">History from</span><input type="date" name="history_start_date" required></label>${benchmarkFields('',[])}</div>${kiwoom?`<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="kiwoom_include_us" checked> <span>Also read this account's U.S. stocks and dollar cash (Kiwoom's U.S. account). Untick for an account with Korean stocks only.</span></label>`:''}<div class="actions"><button class="button" type="submit">Start this case</button></div><div class="muted" role="status"></div></form>`;
+  const form=box.querySelector('form');form.addEventListener('submit',async event=>{event.preventDefault();const values=new FormData(form),note=form.querySelector('[role=status]'),button=form.querySelector('button');button.disabled=true;note.textContent='Starting the case…';const body={connection_id:a.connection_id,broker_account_id:a.broker_account_id,display_name:values.get('display_name'),reporting_currency:String(values.get('reporting_currency')).toUpperCase(),history_start_date:values.get('history_start_date')};if(values.get('primary_benchmark_id')){body.primary_benchmark_id=values.get('primary_benchmark_id');body.secondary_benchmark_ids=values.getAll('secondary_benchmark_ids').filter(x=>x!==body.primary_benchmark_id)}if(kiwoom)body.kiwoom_include_us=form.querySelector('[name=kiwoom_include_us]').checked;try{const result=await post('/api/onboarding-v2/cases',body);window.location.href=result.next_page}catch(error){note.textContent=`Not started: ${error.message}`;button.disabled=false}});box.scrollIntoView({behavior:'smooth',block:'nearest'})};
 load();
 })();
 </script>"""
@@ -1895,12 +2363,16 @@ const renderDraft=(c,d)=>{const box=document.querySelector('#case-term-draft');c
   const source=s=>`${esc(s.document)} p.${esc(s.page)}: “${esc(s.quote)}”`;
   box.innerHTML=`<div class="onboarding-row" style="display:block;margin-top:14px"><strong>Terms drafted by the agent from the client's documents</strong> ${pill(text,cls)}<p class="muted">${esc(d.summary)} Compare them with the terms below before you approve; the agent does not change the case.</p>${terms.map(t=>`<div class="status-item" style="min-width:0;margin-top:8px"><div class="label">${esc(t.label)}${t.status==='conflict'?' · documents disagree':''}</div><strong>${esc(t.status==='conflict'?(t.values||[]).join(' / '):t.value)}</strong><details><summary>Sources</summary>${(t.sources||[]).map(s=>`<div class="muted">${source(s)}</div>`).join('')}</details></div>`).join('')}${(d.findings||[]).length?`<div class="warning" style="margin-top:10px">${d.findings.map(f=>`<div>${esc(f.message)}</div>`).join('')}</div>`:''}<div class="muted">Read from ${esc((d.documents||[]).map(x=>x.document).join(', ')||'no documents')} · drafted ${esc(d.drafted_at)}</div></div>`};
 const designState={review:['In review',''],failed:['Needs changes','blocked'],submitted:['Submitted','active']};
+let mayApprove=false,work=null;
 const renderDesign=d=>{const card=document.querySelector('#case-design');card.hidden=!d;if(!d)return;const body=document.querySelector('#case-design-body');
   if(!d.open){body.innerHTML='<p class="muted">The designer opens once you approve the account terms.</p>';return}
   if(d.unavailable){body.innerHTML='<div class="warning">The designs could not be listed. Open the designer to see them.</div>'}
-  else body.innerHTML=(d.designs.length?d.designs.map(x=>{const [text,cls]=designState[x.status]||[x.status,''];return row(x.title,`version ${x.version} · ${x.updated_at}`,pill(text,cls))}).join(''):'<p class="muted">No design yet.</p>')
+  else body.innerHTML=(d.designs.length?d.designs.map(x=>{const [text,cls]=designState[x.status]||[x.status,''];return row(x.title,`version ${x.version} · ${x.updated_at}`,pill(text,cls)+(mayApprove&&x.status!=='submitted'&&x.draft_id?`<button class="button" type="button" data-archive="${esc(x.draft_id)}">Archive draft</button>`:''))}).join(''):'<p class="muted">No design yet.</p>')
     +(d.submitted?`<p class="muted">The historical factsheets are rendered from ${esc(d.submitted.title)}. Until you approve them, submitting a newer design renders them again.</p>`:'');
-  body.innerHTML+=`<div class="actions"><a class="button" href="${esc(d.designer_page)}">${d.designs.length?'Open the factsheet designer':'Design the factsheet'}</a></div>`};
+  const builtIn=(work&&work.built_in_designs)||[];
+  body.innerHTML+=`<div class="actions"><a class="button" href="${esc(d.designer_page)}">${d.designs.length?'Open the factsheet designer':'Design the factsheet'}</a>${mayApprove?builtIn.map(b=>`<button class="button" type="button" data-builtin="${esc(b.design_id)}">Use the built-in ${esc(b.title)} design</button>`).join(''):''}</div>${builtIn.length&&mayApprove?'<p class="muted">The platform ships the built-in designs measured from the owner\'s own template. Choosing one submits it as the designer would; the reports are then rendered from it.</p>':''}`;
+  body.querySelectorAll('[data-archive]').forEach(b=>b.addEventListener('click',async()=>{b.disabled=true;try{await post(`/api/onboarding-v2/cases/${caseId}/designs/${encodeURIComponent(b.dataset.archive)}/archive`,{});load()}catch(error){b.disabled=false;b.textContent=`Not archived: ${error.message}`}}));
+  body.querySelectorAll('[data-builtin]').forEach(b=>b.addEventListener('click',async()=>{b.disabled=true;b.textContent='Submitting…';try{const r=await post(`/api/onboarding-v2/cases/${caseId}/built-in-design`,{design_id:b.dataset.builtin});b.textContent=r.started?'Submitted to the worker; reports follow':'Queued for the next worker run';load()}catch(error){b.disabled=false;b.textContent=`Not submitted: ${error.message}`}}))};
 const renderExternal=(c,x)=>{const card=document.querySelector('#case-external'),body=document.querySelector('#case-external-body');card.hidden=!x;if(!x)return;
   if(x.approved){body.innerHTML=`<div class="onboarding-check pass"><strong>You approved sending this account's ticker symbols to Yahoo</strong><span>Approved ${esc(x.approved_at)}. The sector job looks up names and sectors on its next run.</span></div>`;return}
   const can=c.may_approve&&x.open;
@@ -1934,7 +2406,30 @@ document.querySelector('#case-ask-form').addEventListener('submit',async event=>
           else if(e.type==='error'){answered=true;out.textContent=e.message}}}}
     if(!answered)out.textContent='No answer came back. Try again.'}
   catch(error){out.textContent=`Not answered: ${error.message}`}finally{button.disabled=false}});
+const runState={requested:['Waiting to start',''],running:['Running',''],done:['Done','active'],failed:['Failed','blocked'],skipped:['Skipped','']};
+const when=t=>t?new Date(t).toLocaleString():'';
+const renderWork=w=>{const card=document.querySelector('#case-work'),body=document.querySelector('#case-work-body');card.hidden=!w;if(!w)return;
+  if(w.unavailable){body.innerHTML='<div class="warning">The onboarding worker is not set up yet. The daily jobs still move this case on overnight.</div>';return}
+  const waiting=w.waiting?`<div class="onboarding-check pending"><strong>${esc((runState[w.waiting.status]||[w.waiting.status])[0])}</strong><span>Asked ${esc(when(w.waiting.requested_at))}.${w.waiting.message?' '+esc(w.waiting.message):''}</span></div>`:'';
+  const does=w.run_now_does.length?`Run now does: ${esc(w.run_now_does.join(', '))}.`:'Nothing is waiting on the platform right now; Run now checks again.';
+  const runs=w.runs.length?w.runs.map(r=>{const [text,cls]=runState[r.status]||[r.status,''];return `<div class="onboarding-row" style="display:block"><strong>${esc(r.trigger==='schedule'?'Scheduled run':r.trigger==='run_now'?'Run now':'Connection check')}</strong> ${pill(text,cls)} <span class="muted">${esc(when(r.finished_at||r.requested_at))}</span><div class="muted">${esc(r.message)}</div>${r.steps.length?`<ul style="margin:6px 0 0 18px">${r.steps.map(x=>`<li>${esc(x.label)}: ${esc(x.outcome)}${x.detail?' · '+esc(x.detail):''}</li>`).join('')}</ul>`:''}</div>`}).join(''):'<p class="muted">No run yet.</p>';
+  body.innerHTML=`${w.window_note?`<div class="warning">${esc(w.window_note)}</div>`:''}${waiting}<p class="muted">${does} Next scheduled run ${esc(when(w.next_scheduled))}.</p><div class="actions"><button id="case-run-now" class="button" type="button"${w.waiting?' disabled':''}>Run now</button></div><h3>Recent runs</h3>${runs}`;
+  const button=body.querySelector('#case-run-now'),note=document.querySelector('#case-work-result');
+  button.addEventListener('click',async()=>{button.disabled=true;note.textContent='Asking the worker…';try{const r=await post(`/api/onboarding-v2/cases/${caseId}/run-now`,{});note.textContent=r.status==='already_waiting'?'A run is already waiting; it covers this.':r.started?'Started. This page shows the result when it finishes.':(r.message||'Queued for the next scheduled run.');setTimeout(load,1500)}catch(error){note.textContent=`Not started: ${error.message}`;button.disabled=false}})};
+const renderHistory=h=>{const card=document.querySelector('#case-history');card.hidden=!h;if(!h)return;const [text,cls]={pass:['Complete','active'],warn:['Complete, with days to check',''],pending:['Filling',''],fail:['Failed','blocked']}[h.status]||[h.status,''];
+  const facts=[['From',h.from],['To',h.to],['Trading days loaded',h.days_with_history],['Days still to fill',h.days_left],['Days that do not reconcile',h.gap_days]].filter(([,v])=>v!==undefined&&v!==null);
+  document.querySelector('#case-history-body').innerHTML=`${pill(text,cls)}<p>${esc(h.message)}</p><div class="status-row">${facts.map(([k,v])=>`<div class="status-item"><div class="label">${esc(k)}</div><strong>${esc(v)}</strong></div>`).join('')}</div>${h.gaps.length?`<details style="margin-top:10px"><summary>Days to check</summary><ul style="margin:6px 0 0 18px">${h.gaps.map(g=>`<li>${esc(g.date)} · ${esc(g.check)}${g.gap?' · '+esc(g.gap):''}</li>`).join('')}</ul></details>`:''}<div class="muted">Checked ${esc(when(h.checked_at))}</div>`};
+const renderTerms=c=>{const card=document.querySelector('#case-terms-edit');const open=c.terms_open&&(c.benchmark_choices||[]).length+(c.broker==='kiwoom_rest'?1:0)>0;card.hidden=!open;if(!open)return;
+  benchmarks=c.benchmark_choices||[];const b=c.benchmarks||{};
+  document.querySelector('#case-terms-fields').innerHTML=benchmarkFields(b.primary?b.primary.benchmark_id:'',(b.secondary||[]).map(x=>x.benchmark_id))+(c.broker==='kiwoom_rest'?`<label class="status-item"><span class="label">Kiwoom U.S. account</span><select name="kiwoom_include_us"><option value=""${c.kiwoom_us_account===null||c.kiwoom_us_account===undefined?' selected':''}>Platform default</option><option value="true"${c.kiwoom_us_account===true?' selected':''}>Read U.S. stocks and dollar cash too</option><option value="false"${c.kiwoom_us_account===false?' selected':''}>Korean stocks only</option></select></label>`:'')};
+let benchmarks=[];
+const benchmarkFields=(primary,secondary)=>benchmarks.length?`<label class="status-item"><span class="label">Main benchmark</span><select name="primary_benchmark_id"><option value="">None</option>${benchmarks.map(b=>`<option value="${esc(b.benchmark_id)}"${b.benchmark_id===primary?' selected':''}>${esc(b.name)} (${esc(b.currency)})</option>`).join('')}</select></label><label class="status-item"><span class="label">Other benchmarks (up to 4)</span><select name="secondary_benchmark_ids" multiple size="4">${benchmarks.map(b=>`<option value="${esc(b.benchmark_id)}"${(secondary||[]).includes(b.benchmark_id)?' selected':''}>${esc(b.name)} (${esc(b.currency)})</option>`).join('')}</select></label>`:'';
+document.querySelector('#case-terms-form').addEventListener('submit',async event=>{event.preventDefault();const f=event.currentTarget,values=new FormData(f),note=f.querySelector('[role=status]');const body={};if(values.get('primary_benchmark_id')){body.primary_benchmark_id=values.get('primary_benchmark_id');body.secondary_benchmark_ids=values.getAll('secondary_benchmark_ids').filter(x=>x!==body.primary_benchmark_id)}const us=values.get('kiwoom_include_us');if(us)body.kiwoom_include_us=us==='true';note.textContent='Saving…';try{await post(`/api/onboarding-v2/cases/${caseId}/terms`,body);note.textContent='Saved. Review the account terms below before you approve them.';load()}catch(error){note.textContent=`Not saved: ${error.message}`}});
 const render=c=>{
+  mayApprove=!!c.may_approve;work=c.platform_work;
+  renderWork(c.platform_work);
+  renderHistory(c.history);
+  renderTerms(c);
   document.querySelector('#case-ask').hidden=!c.may_ask;
   document.querySelector('#case-kicker').textContent=`Stage ${c.stage_number} of 4 · ${c.broker_label} · ${c.reporting_currency} reporting`;
   document.querySelector('#case-title').textContent=`${c.display_name} (${c.account})`;
@@ -1960,11 +2455,11 @@ const render=c=>{
     form.innerHTML=`<form id="reports-form"><h3>Approve the historical reports</h3><p class="muted">Open each month's reports. Nothing is shown to viewers until you go live.</p>${reports}${acks()}<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="reviewed" required> <span>I opened and reviewed these reports.</span></label><div class="actions"><button class="button" type="submit">Approve historical reports</button></div></form>`;
     form.querySelector('form').addEventListener('submit',async event=>{event.preventDefault();const f=event.currentTarget,button=f.querySelector('button');button.disabled=true;result.textContent='Recording your approval…';try{await post(`/api/onboarding-v2/cases/${caseId}/approvals/historical_reports`,{terms_sha256:c.awaiting_terms_sha256,acknowledge_warnings:acked(f)});result.textContent='Approved.';load()}catch(error){result.textContent=`Not approved: ${error.message}`;button.disabled=false}})}
   else if(c.may_approve&&c.awaiting_approval==='go_live'){
-    form.innerHTML=`<form id="live-form"><h3>Go live</h3><p class="muted">Going live shows ${esc(c.display_name)} to the viewers you give access to and starts its daily updates and month-end reports.</p><div class="actions"><a class="button" href="${esc(c.preview_page)}" target="_blank" rel="noopener">Preview it on the website</a></div>${acks()}<label style="display:block;margin-top:16px"><span class="label">Type ${esc(c.go_live_phrase)} to confirm</span><input type="text" name="confirmation" autocomplete="off" spellcheck="false" style="display:block;width:100%;max-width:440px;min-width:0"></label><div class="actions"><button class="button" type="submit" disabled>Go live</button></div></form>`;
+    form.innerHTML=`<form id="live-form"><h3>Go live</h3><p class="muted">Going live shows ${esc(c.display_name)} to the viewers you give access to and starts its daily updates and month-end reports.</p><div class="actions"><a class="button" href="${esc(c.preview_page)}" target="_blank" rel="noopener">Preview it on the website</a></div>${(c.viewers||[]).length?`<fieldset style="margin-top:14px;border:0;padding:0"><legend class="label">Viewers who can see it</legend>${c.viewers.map(v=>`<label style="display:flex;gap:10px;margin-top:6px"><input type="checkbox" name="viewer" value="${esc(v.object_id)}"${v.has_access?' checked disabled':''}> <span>${esc(v.name)} <span class="muted">${esc(v.email)}${v.has_access?' · already has access':''}</span></span></label>`).join('')}<p class="muted">Ticked viewers get read access when it goes live. You can leave everyone unticked and add access later.</p></fieldset>`:''}${acks()}<label style="display:block;margin-top:16px"><span class="label">Type ${esc(c.go_live_phrase)} to confirm</span><input type="text" name="confirmation" autocomplete="off" spellcheck="false" style="display:block;width:100%;max-width:440px;min-width:0"></label><div class="actions"><button class="button" type="submit" disabled>Go live</button></div></form>`;
     const f=form.querySelector('form'),input=f.querySelector('input[name=confirmation]'),button=f.querySelector('button[type=submit]');
     input.addEventListener('input',()=>{button.disabled=input.value.trim()!==c.go_live_phrase});
-    f.addEventListener('submit',async event=>{event.preventDefault();button.disabled=true;result.textContent='Going live…';try{const done=await post(`/api/onboarding-v2/cases/${caseId}/approvals/go_live`,{terms_sha256:c.awaiting_terms_sha256,acknowledge_warnings:acked(f),confirmation:input.value.trim()});result.textContent='Live. Opening its page…';window.location.href=done.next_page}catch(error){result.textContent=`Not live: ${error.message}`;button.disabled=false}})}
-  else if(ready){const t=c.account_terms,derived=c.source_kind!=='broker_account',warns=c.checks.filter(k=>k.status==='warn'),facts=[[derived?'Portfolio ID':'Account',c.account],['Display name',t.display_name],['Reporting currency',t.reporting_currency],['History from',t.history_start_date],...(c.definition_summary||[]).map(r=>[r.label,r.value])];form.innerHTML=`<form id="terms-form"><h3>${derived?'Approve the portfolio definition':'Approve the account terms'}</h3><div class="status-row">${facts.map(([k,v])=>`<div class="status-item"><div class="label">${esc(k)}</div><strong>${esc(v)}</strong></div>`).join('')}</div>${warns.map(k=>`<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="ack" value="${esc(k.check_id)}" required> <span>I have read the warning on ${esc(k.label)}.</span></label>`).join('')}<div class="actions"><button class="button" type="submit">${derived?'Approve definition and terms':'Approve account terms'}</button></div></form>`;
+    f.addEventListener('submit',async event=>{event.preventDefault();button.disabled=true;result.textContent='Going live…';try{const done=await post(`/api/onboarding-v2/cases/${caseId}/approvals/go_live`,{terms_sha256:c.awaiting_terms_sha256,acknowledge_warnings:acked(f),confirmation:input.value.trim(),viewers:[...f.querySelectorAll('input[name=viewer]:checked:not(:disabled)')].map(x=>x.value)});result.textContent='Live. Opening its page…';window.location.href=done.next_page}catch(error){result.textContent=`Not live: ${error.message}`;button.disabled=false}})}
+  else if(ready){const t=c.account_terms,derived=c.source_kind!=='broker_account',warns=c.checks.filter(k=>k.status==='warn'),facts=[[derived?'Portfolio ID':'Account',c.account],['Display name',t.display_name],['Reporting currency',t.reporting_currency],['History from',t.history_start_date],...(c.definition_summary||[]).map(r=>[r.label,r.value]),...(c.benchmarks?[['Benchmarks',[c.benchmarks.primary.name,...c.benchmarks.secondary.map(x=>x.name)].join(', ')]]:[]),...(c.kiwoom_us_account===true||c.kiwoom_us_account===false?[['Kiwoom U.S. account',c.kiwoom_us_account?'Read too':'Not read']]:[])];form.innerHTML=`<form id="terms-form"><h3>${derived?'Approve the portfolio definition':'Approve the account terms'}</h3><div class="status-row">${facts.map(([k,v])=>`<div class="status-item"><div class="label">${esc(k)}</div><strong>${esc(v)}</strong></div>`).join('')}</div>${warns.map(k=>`<label style="display:flex;gap:10px;margin-top:12px"><input type="checkbox" name="ack" value="${esc(k.check_id)}" required> <span>I have read the warning on ${esc(k.label)}.</span></label>`).join('')}<div class="actions"><button class="button" type="submit">${derived?'Approve definition and terms':'Approve account terms'}</button></div></form>`;
     form.querySelector('form').addEventListener('submit',async event=>{event.preventDefault();const button=event.currentTarget.querySelector('button');button.disabled=true;result.textContent='Recording your approval…';try{await post(`/api/onboarding-v2/cases/${caseId}/approvals/account_terms`,{terms_sha256:c.account_terms_sha256,acknowledge_warnings:[...event.currentTarget.querySelectorAll('input[name=ack]:checked')].map(x=>x.value)});result.textContent='Approved.';load()}catch(error){result.textContent=`Not approved: ${error.message}`;button.disabled=false}})}
   else form.innerHTML='';
   document.querySelector('#case-cancel-card').hidden=!(c.can_cancel&&c.may_approve);
@@ -1980,11 +2475,14 @@ const form=document.querySelector('#bc-form'),status=document.querySelector('#bc
 const healthClass={healthy:'active',renew_soon:'blocked',expired:'blocked',failing:'blocked',not_checked:'',suspended:'blocked'};
 const reportState={queued:['Check queued',''],found_accounts:['Accounts found','active'],failed:['Check failed','blocked'],blocked:['Check blocked','blocked'],stuck:['Check stuck','blocked'],waiting:['Waiting','']};
 const agentReport=r=>{if(!r)return '';const [text,cls]=reportState[r.state]||[r.state,''];return `<div class="onboarding-row" style="display:block;margin:-6px 0 10px 16px"><span class="label">Checked by agent</span> ${pill(text,cls)} <strong>${esc(r.title)}</strong><div class="muted">${esc(r.body)}</div>${r.owner_steps.length?`<ol style="margin:6px 0 0 18px">${r.owner_steps.map(s=>`<li>${esc(s)}</li>`).join('')}</ol>`:''}<div class="muted">${esc(r.reported_at)}</div></div>`};
+const keyLine=c=>`<div class="muted" style="margin:-6px 0 10px 16px">Key stored in Key Vault as ${esc(c.key_vault_secret)} (fingerprint ${esc(c.key_fingerprint)})${c.key_stored_at?', saved '+esc(new Date(c.key_stored_at).toLocaleString()):''}.${c.last_checked_at?` Last checked ${esc(new Date(c.last_checked_at).toLocaleString())}${c.last_check_message?': '+esc(c.last_check_message):''}.`:' Not checked yet.'}</div>`;
 const lockText={locked:'locked to the platform address',not_locked:'not IP-locked',mismatch:'locked to a different address',unknown_platform_ip:'IP lock recorded'};
 const showFields=()=>form.querySelectorAll('[data-broker]').forEach(node=>{node.hidden=node.dataset.broker!==broker.value});
 broker.addEventListener('change',showFields);showFields();
 const load=()=>fetch('/api/broker-connections').then(json).then(data=>{
-  document.querySelector('#bc-list').innerHTML=data.connections.length?data.connections.map(c=>row(`${c.broker_label} · ${c.display_name}`,[c.environment==='mock'?'Mock environment':null,c.expires_on?`expires ${c.expires_on}`:null,lockText[c.ip_lock]].filter(Boolean).join(' · '),pill(c.health_label,healthClass[c.health])+(c.flex_source_id?`<button class="button" type="button" data-check="${esc(c.flex_source_id)}">Check now</button>`:''))+agentReport((data.agent_reports||{})[c.connection_id])).join(''):'<p class="muted">No connections yet.</p>';
+  document.querySelector('#bc-list').innerHTML=data.connections.length?data.connections.map(c=>row(`${c.broker_label} · ${c.display_name}`,[c.environment==='mock'?'Mock environment':null,c.expires_on?`expires ${c.expires_on}`:null,lockText[c.ip_lock]].filter(Boolean).join(' · '),pill(c.health_label,healthClass[c.health])+(c.flex_source_id?`<button class="button" type="button" data-check="${esc(c.flex_source_id)}">Check now</button>`:'')+(c.can_check_now?`<button class="button" type="button" data-kiwoom-check="${esc(c.connection_id)}">Check now</button>`:''))+keyLine(c)+agentReport((data.agent_reports||{})[c.connection_id])).join(''):'<p class="muted">No connections yet.</p>';
+  const address=document.querySelector('#bc-address-ip'),copy=document.querySelector('#bc-address-copy');if(data.platform_ip){address.textContent=data.platform_ip;copy.hidden=false;copy.onclick=()=>navigator.clipboard&&navigator.clipboard.writeText(data.platform_ip).then(()=>{copy.textContent='Copied'})}
+  document.querySelectorAll('[data-kiwoom-check]').forEach(b=>b.addEventListener('click',async()=>{b.disabled=true;b.textContent='Checking…';try{const r=await post(`/api/broker-connections/${encodeURIComponent(b.dataset.kiwoomCheck)}/check`,{});b.textContent=r.started?'Check started':r.status==='already_waiting'?'Check already waiting':'Check queued';setTimeout(load,60000)}catch(error){b.textContent='Not checked';b.title=error.message;b.disabled=false}}));
   document.querySelector('#bc-existing').innerHTML=data.existing_ibkr_logins.length?`<h3>IBKR logins already on the platform</h3><p class="muted">Add each token's expiry date so the platform can warn you before it lapses. The token itself stays where it is.</p>`+data.existing_ibkr_logins.map(l=>`<form class="onboarding-row" data-track="${esc(l.credential_id)}"><div><strong>${esc(l.display_name)}</strong></div><div class="actions"><input type="date" name="expires_on" required aria-label="Token expiry"><button class="button" type="submit">Track this login</button></div></form>`).join(''):'';
   document.querySelector('#bc-recipe-steps').innerHTML=data.recipe_steps.map(s=>`<li>${esc(s)}</li>`).join('');
   const ip=document.querySelector('#bc-ip');if(data.platform_ip){ip.value=data.platform_ip;ip.placeholder=data.platform_ip}

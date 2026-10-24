@@ -20,6 +20,7 @@ from unittest.mock import patch
 import test_medallion_layers_db as layers
 from test_publish_gate_db import ADMIN_DSN, END, SESSIONS, START, SUBJECT, TENANT, Frame, _seed
 from ibkr_etl import lineage, provisional_benchmark
+from ibkr_etl.benchmark_analytics import QualityIssue
 from ibkr_etl import publish_gate as gate
 from ibkr_etl.db import connect
 
@@ -37,6 +38,19 @@ class Ticker:
             return Frame([(day.isoformat(), 30.0) for day in SESSIONS])
         base = 100 + sum(map(ord, self.symbol)) % 50
         return Frame([(day.isoformat(), base * (1 + 0.0004 * index)) for index, day in enumerate(SESSIONS)])
+
+
+def _late(symbol):
+    """A provider whose history for one symbol stops a session before the NAV does."""
+
+    class Late(Ticker):
+        def history(self, **request):
+            frame = super().history(**request)
+            if self.symbol == symbol:
+                frame = Frame(frame.rows[:-1])
+            return frame
+
+    return Late
 
 
 @unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
@@ -64,7 +78,7 @@ class WebsiteAllBenchmarksTests(unittest.TestCase):
                           "data_quality_results"):
                 owner.execute(f"DELETE FROM {table}")
 
-    def _write(self, flag, mode="off", break_it=None):
+    def _write(self, flag, mode="off", break_it=None, ticker=None):
         job = connect(Path("/tmp/unused.sqlite3"), self.url, TENANT)
         environment = {"PORTFOLIO_TENANT_ID": TENANT, gate.MODE_ENV: mode,
                        provisional_benchmark.WEBSITE_ALL_BENCHMARKS_ENV: flag}
@@ -80,7 +94,7 @@ class WebsiteAllBenchmarksTests(unittest.TestCase):
                     patch.object(provisional_benchmark, "utc_now_iso",
                                  lambda: datetime.now(timezone.utc).isoformat()):
                 return provisional_benchmark.refresh_and_materialize(
-                    job, account_id=SUBJECT, start_date=START, end_date=END, ticker_factory=Ticker)
+                    job, account_id=SUBJECT, start_date=START, end_date=END, ticker_factory=ticker or Ticker)
         finally:
             job.close()
 
@@ -156,6 +170,43 @@ class WebsiteAllBenchmarksTests(unittest.TestCase):
         with self.assertRaises(gate.BuildHeldBack):
             self._write("on", mode="enforce", break_it=break_gspc)
         self.assertEqual(self._compared(), set())
+
+    def test_a_contract_benchmark_behind_the_nav_raises_benchmark_not_current(self):
+        # The provider has no close yet for the NAV's last session (as Yahoo's index history on
+        # 22 Oct 2026, which had no 21 Oct close): only freshness fails, nothing is written, and
+        # the message names both sessions.
+        for flag in ("", "on"):
+            with self.subTest(flag=flag):
+                with self.assertRaises(provisional_benchmark.BenchmarkNotCurrent) as caught:
+                    self._write(flag, ticker=_late("^GSPC"))
+                message = str(caught.exception)
+                self.assertIn("GSPC comparison failed data-quality checks: freshness", message)
+                self.assertIn(SESSIONS[-2].isoformat(), message)
+                self.assertIn(SESSIONS[-1].isoformat(), message)
+                self.assertEqual(self._compared(), set())
+
+    def test_a_late_comparison_benchmark_is_still_only_skipped(self):
+        result = self._write("on", ticker=_late("EWH"))
+        by_id = {item["benchmark_id"]: item for item in result["benchmarks"]}
+        self.assertFalse(by_id["EWH"]["available"])
+        self.assertIn("GSPC", self._compared())
+        self.assertNotIn("EWH", self._compared())
+
+    def test_freshness_with_any_other_failed_check_still_fails_the_job(self):
+        original = provisional_benchmark.build_comparison
+
+        def with_another_failure(**kwargs):
+            result = original(**kwargs)
+            if result.benchmark_id != "GSPC":
+                return result
+            extra = QualityIssue("common_dates", "fail", "made up for the test")
+            return dataclasses.replace(result, quality_status="fail", issues=result.issues + (extra,))
+
+        with patch.object(provisional_benchmark, "build_comparison", with_another_failure), \
+                self.assertRaises(RuntimeError) as caught:
+            self._write("", ticker=_late("^GSPC"))
+        self.assertNotIsInstance(caught.exception, provisional_benchmark.BenchmarkNotCurrent)
+        self.assertIn("freshness, common_dates", str(caught.exception))
 
     def test_website_lists_compared_catalog_benchmarks_after_the_contract(self):
         from psycopg.rows import dict_row

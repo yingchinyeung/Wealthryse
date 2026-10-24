@@ -644,6 +644,21 @@ class ModellingToolTests(unittest.TestCase):
         with self.assertRaises(ToolError):
             self._run("run_what_if", {"changes": [{"symbol": "AAA", "weight": -0.1}]})
 
+    def test_what_if_replays_an_optimised_mix_by_name(self):
+        optimised = self._run("optimise_portfolio", {"max_weight": 0.6})["data"]
+        data = self._run("run_what_if", {"mix": "minimum_variance", "max_weight": 0.6})["data"]
+        self.assertEqual(data["mix"], "minimum_variance")
+        proposed = {h["symbol"]: h["proposed_weight"] for h in data["holdings"]}
+        for row in optimised["holdings"]:
+            self.assertAlmostEqual(proposed[row["symbol"]], row["minimum_variance_weight"] * optimised["sleeve_weight"])
+        self.assertAlmostEqual(data["proposed"]["cash_weight"], data["current"]["cash_weight"])  # same sleeve
+        self.assertLess(data["proposed"]["annual_volatility"], data["current"]["annual_volatility"])
+        self.assertIsNone(self._run("run_what_if", {"changes": [{"symbol": "AAA", "weight": 0.25}]})["data"]["mix"])
+        for arguments in ({"mix": "minimum_variance", "changes": [{"symbol": "AAA", "weight": 0.25}]},
+                          {"mix": "lowest_risk"}, {}):
+            with self.assertRaises(ToolError):
+                self._run("run_what_if", arguments)
+
     def test_optimise_flags_risk_concentration(self):
         data = self._run("optimise_portfolio", {"max_weight": 0.6})["data"]
         self.assertEqual(data["maximum_weight"], 0.6)

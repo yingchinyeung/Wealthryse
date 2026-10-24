@@ -17,12 +17,17 @@ from ibkr_etl.db import connect, initialize, transaction  # noqa: E402
 from ibkr_etl.evidence_acl import quarantine_evidence_objects  # noqa: E402
 from ibkr_etl.layer_quality import COUNT_COLUMNS, HISTORY_TABLE  # noqa: E402
 from ibkr_etl.medallion_layers import (  # noqa: E402
+    LOADER_GROUP,
+    grant_silver_loader,
     history_write_rights,
     keep_history_read_only,
+    loader_group_exists,
+    lock_silver_writes,
     mirror_privileges,
     mismatches,
     present_layers,
     runtime_search_path,
+    silver_write_rights,
 )
 from ibkr_etl.reference_subject_rename import (  # noqa: E402
     reconcile_china_hong_kong_display_name,
@@ -45,6 +50,14 @@ WEB_LAYER_STATEMENTS = (
     "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} TO {role}",
     "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT ON TABLES TO {role}",
     "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}",
+)
+# What the website's write login (the approval role) needs for self-service onboarding (085), by the
+# table that must exist first. tests/test_onboarding_worker_db.py runs the website's writes with exactly these.
+APPROVAL_ONBOARDING_GRANTS = (
+    ("public.onboarding_worker_runs", "GRANT SELECT, INSERT, UPDATE ON TABLE onboarding_worker_runs TO {}"),
+    ("public.onboarding_worker_runs",
+     "GRANT SELECT (tenant_id, entra_object_id, email, display_name, status) ON TABLE app_users TO {}"),
+    ("public.onboarding_worker_runs", "GRANT SELECT, INSERT ON TABLE user_account_access TO {}"),
 )
 # The approval login gets nothing schema-wide. Its named grants below reach the
 # public views, and mirror_privileges copies them onto the tables behind them.
@@ -124,6 +137,15 @@ def main(argv: list[str] | None = None) -> int:
     web_role = os.environ.get("DATABASE_WEB_ROLE", "ibkr_web")
     approval_password = os.environ.get("DATABASE_APPROVAL_PASSWORD", "")
     approval_role = os.environ.get("DATABASE_APPROVAL_ROLE", "ibkr_approval")
+    # Medallion step 3: the loader login, the only runtime login that may write silver once
+    # SILVER_WRITE_LOCK=on. Without the setting the app login keeps its write rights (the undo).
+    loader_password = os.environ.get("DATABASE_LOADER_PASSWORD", "")
+    loader_role = os.environ.get("DATABASE_LOADER_ROLE", "ibkr_loader")
+    silver_lock = os.environ.get("SILVER_WRITE_LOCK", "off").strip().lower() or "off"
+    if silver_lock not in ("on", "off"):
+        raise RuntimeError("SILVER_WRITE_LOCK must be on or off")
+    if silver_lock == "on" and not loader_password:
+        raise RuntimeError("SILVER_WRITE_LOCK=on needs the loader login (DATABASE_LOADER_PASSWORD)")
     if not admin_url.startswith(("postgres://", "postgresql://")):
         raise RuntimeError("DATABASE_ADMIN_URL must be a PostgreSQL connection URL")
     if len(app_password) < 12:
@@ -228,6 +250,10 @@ def main(argv: list[str] | None = None) -> int:
         layers = present_layers(connection)  # empty until migration 068 has run
         managed_roles = [app_role]
         _layer_statements(connection, APP_LAYER_STATEMENTS, layers, app_role)
+        # The loader group writes silver (nothing until migration 083). It is granted before the
+        # approval login, whose rights are taken and given again on every run, so a second run
+        # leaves each table's rights exactly as the first did.
+        silver_objects = grant_silver_loader(connection) if layers else 0
 
         if web_password:
             if len(web_password) < 12:
@@ -369,7 +395,9 @@ def main(argv: list[str] | None = None) -> int:
                     "report_generation_runs, report_release_decisions, "
                     "report_artifact_releases, "
                     "subject_nav_series, subject_position_series, "
-                    "subject_cash_balance_series, subject_cash_activity_series TO {}"
+                    "subject_cash_balance_series, subject_cash_activity_series, "
+                    # The layer quality NAV rebuild (value.nav_rebuild) reads cash and FX with positions.
+                    "cash_snapshots, fx_rates TO {}"
                 ).format(sql.Identifier(approval_role))
             )
             connection.execute(
@@ -393,6 +421,12 @@ def main(argv: list[str] | None = None) -> int:
             connection.execute(sql.SQL(
                 "GRANT SELECT, INSERT ON TABLE broker_onboarding_events TO {}"
             ).format(sql.Identifier(approval_role)))
+            # Self-service onboarding (085): Run now and Check now write the worker's run requests, and
+            # the go-live form gives the ticked viewers read access (only adds rows; never changes or
+            # removes one).
+            for table, statement in APPROVAL_ONBOARDING_GRANTS:
+                if connection.execute("SELECT to_regclass(%s)", (table,)).fetchone()[0]:
+                    connection.execute(sql.SQL(statement).format(sql.Identifier(approval_role)))
             connection.execute(sql.SQL(
                 "GRANT SELECT ON TABLE qualified_report_designs, active_report_designs TO {}"
             ).format(sql.Identifier(approval_role)))
@@ -524,21 +558,52 @@ def main(argv: list[str] | None = None) -> int:
                     "The approval role reference-market privileges are not least-privilege compliant"
                 )
 
+        if loader_password:
+            if len(loader_password) < 20:
+                raise RuntimeError("DATABASE_LOADER_PASSWORD must contain at least 20 characters")
+            if not loader_group_exists(connection):
+                raise RuntimeError(f"The {LOADER_GROUP} group is missing: apply migration 083 first")
+            loader_exists = connection.execute(
+                "SELECT 1 FROM pg_roles WHERE rolname = %s", (loader_role,)
+            ).fetchone()
+            if loader_exists is None:
+                connection.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(loader_role)))
+            connection.execute(sql.SQL("ALTER ROLE {} PASSWORD {}").format(
+                sql.Identifier(loader_role), sql.Literal(loader_password)))
+            connection.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+                sql.Identifier(connection.info.dbname), sql.Identifier(loader_role)))
+            # Everything the app login may do, and through the group, write silver.
+            connection.execute(sql.SQL("GRANT {} TO {}").format(sql.Identifier(app_role), sql.Identifier(loader_role)))
+            connection.execute(sql.SQL("GRANT {} TO {}").format(
+                sql.Identifier(LOADER_GROUP), sql.Identifier(loader_role)))
+            managed_roles.append(loader_role)
+
         quarantine_evidence_objects(connection)
 
         if layers:
             # The FX evidence tables are in bronze once migration 069 has run.
             for layer in layers:
                 quarantine_evidence_objects(connection, schema=layer)
-            mirror_privileges(connection, managed_roles)
-            problems = mismatches(connection, managed_roles)
+            # With the lock on, only the loader group writes silver: the app login no longer does.
+            checked_roles = managed_roles + ([LOADER_GROUP] if loader_group_exists(connection) else [])
+            if silver_lock == "on":
+                if not silver_objects:
+                    raise RuntimeError("SILVER_WRITE_LOCK=on needs migration 083 and the silver layer")
+                lock_silver_writes(connection, [app_role])
+            mirror_privileges(connection, checked_roles)
+            problems = mismatches(connection, checked_roles)
             if problems:
                 raise RuntimeError("Layer table rights differ from their public views: " + "; ".join(problems))
-            # The U8 history is written only through its trigger (nothing until that migration).
-            keep_history_read_only(connection, managed_roles)
-            problems = history_write_rights(connection, managed_roles)
+            # The U8 history and the silver write watch are written only through their triggers
+            # (nothing until those migrations).
+            keep_history_read_only(connection, checked_roles)
+            problems = history_write_rights(connection, checked_roles)
             if problems:
-                raise RuntimeError("A login can still write the silver history: " + "; ".join(problems))
+                raise RuntimeError("A login can still write the silver history or its watch: " + "; ".join(problems))
+            if silver_lock == "on":
+                problems = silver_write_rights(connection, [role for role in managed_roles if role != loader_role])
+                if problems:
+                    raise RuntimeError("A login other than the loader can still write silver: " + "; ".join(problems))
             # Runtime logins find the layer tables first. This migration login keeps
             # public first, and apply_postgres_migrations sets it for its own transaction.
             for role in managed_roles:
@@ -552,6 +617,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.only_migration or layers:
         print(f"Migrations applied: {', '.join(applied) or 'none'}. "
               f"Layer schemas: {', '.join(layers) or 'none'}.")
+    if silver_objects:
+        print(f"Silver writes: {LOADER_GROUP} on {silver_objects} objects; "
+              f"loader login {'set' if loader_password else 'not set'}; "
+              f"app login {'locked out' if silver_lock == 'on' else 'still writes (SILVER_WRITE_LOCK off)'}.")
     return 0
 
 

@@ -1,9 +1,15 @@
 # "As known on" history for IBKR corrections (U8): design for approval
 
-Status: design, 18 Oct 2026, for Ying to approve. Nothing here is switched on. The draft
-SQL (`infra/medallion/drafts/u8_silver_history.sql`) is not a migration, and nothing in
-production applies it. It runs only in a database test on made-up data
-(`tests/test_as_known_on_draft_db.py`). Work starts from 8 Nov, after month-end.
+Status: design, 18 Oct 2026, for Ying to approve; "The FX step in October" below has the
+October dates. The history SQL is now `migrations/postgres/074_silver_history.sql`, applied
+in production by itself on 21 Oct 2026 (`bootstrap_postgres.py --only-migration`) and then
+backfilled with recording turned on (`deploy/applied-migrations.json` has the record). Its
+header still says "HELD MIGRATION. Not in migrations/postgres": the header predates the move,
+and the file stays exactly as applied because the migration ledger pins its sha256. Its undo
+is `infra/medallion/undo/074_silver_history_undo.sql`; unlike 082's, it leaves 074's row in
+`schema_migrations`, so remove that row too if 074 is to run again. The FX step
+(`infra/medallion/drafts/u8_fx_event_key.sql`) is still held. Both run in database tests on
+made-up data (`tests/test_as_known_on_draft_db.py`, `tests/test_silver_history_db.py`).
 
 ## Summary
 
@@ -334,9 +340,9 @@ One migration adds, for the first-wave tables:
 - the setting `public.silver_history_settings.recording`, which starts off.
 
 With the setting off, the trigger does nothing, so applying the migration changes nothing.
-Like the layer migrations, it stays off `main` until its day, and it is applied by
-itself (`bootstrap_postgres.py --only-migration`). The draft in
-`infra/medallion/drafts/u8_silver_history.sql` is what it will look like.
+Like the layer migrations, it was applied by itself (`bootstrap_postgres.py
+--only-migration`), on 21 Oct 2026. It is `migrations/postgres/074_silver_history.sql`; its
+header was written while it was held in `infra/medallion/drafts/` and predates the move.
 
 ### Filling the history from bronze
 

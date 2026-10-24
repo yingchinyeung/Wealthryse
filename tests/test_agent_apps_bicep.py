@@ -41,6 +41,14 @@ class AgentAppsBicepTest(unittest.TestCase):
         self.assertIn("{ name: 'AGENT_CHAT_REASONING_MODE', value: chatReasoningMode }", agent)
         self.assertIn("param modelCapacity int = 100", foundation)
 
+    def test_flows_source_is_set_on_the_tool_server_only_and_off_unless_a_deploy_asks(self):
+        apps = BICEP.read_text()
+        self.assertIn("@allowed(['off', 'fallback', 'on'])\nparam flowsSource string = 'off'", apps)
+        self.assertEqual(apps.count("'FLOWS_SOURCE'"), 1)
+        tools = apps[apps.index("resource tools 'Microsoft.App/containerApps"):apps.index("resource agent 'Microsoft.App")]
+        # Left out entirely when off, so a deploy without the setting changes nothing on the app.
+        self.assertIn("flowsSource == 'off' ? [] : [{ name: 'FLOWS_SOURCE', value: flowsSource }]", tools)
+
     def test_month_team_is_off_until_approved_and_stays_in_the_apac_data_zone(self):
         apps = BICEP.read_text()
         self.assertIn("param deployMonthTeam bool = false", apps)
@@ -68,6 +76,10 @@ class AgentAppsBicepTest(unittest.TestCase):
         self.assertIn("{ name: 'AGENT_MODEL_PROCESSING_SCOPE', value: 'apac-data-zone' }", job)
         self.assertIn("value: reportModelDeployment", job)
         self.assertIn("args: ['onboarding']", job)
+        # Every 10 minutes; a run still going skips the next start, for as long as a run may last.
+        self.assertIn("cronExpression: '*/10 * * * *'", job)
+        timeout = int(re.search(r"replicaTimeout: (\d+)", job).group(1))
+        self.assertIn("ONBOARDING_RUN_MINUTES = %d" % (timeout // 60), (BICEP.parents[1] / "src" / "wealthryse_agent" / "jobs.py").read_text())
         # The intake agent reads the case documents: read-only, on the intake container only, and only with the job.
         reader = apps[apps.index("resource onboardingIntakeReader"):apps.index("resource monthTeamJob")]
         self.assertIn("= if (deployOnboarding && deployMonthTeam)", reader.splitlines()[0])

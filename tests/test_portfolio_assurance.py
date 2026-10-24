@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest import mock
 
 from ibkr_etl.portfolio_assurance import (
     APPROVED_FACTSHEET_LAYOUT,
     APPROVED_PRESENTATION_LAYOUT,
     AssuranceModelConfig,
+    approved_report_versions,
     evaluate_portfolio_assurance,
     generate_assurance_review,
 )
@@ -202,6 +204,41 @@ class PortfolioAssuranceTests(unittest.TestCase):
             result["approved_report_layouts"]["factsheet"],
             factsheet_layout_version(subject_id),
         )
+
+    def test_designed_subject_factsheet_matches_its_approved_design(self) -> None:
+        subject_id = "KIWOOM-TEST"
+        results = _results()
+        for row in results:
+            row["subject_id"] = subject_id
+        rows = _report_rows()[:1]
+        rows[0]["template_version"] = "spec:" + "c" * 64
+        approved = {"factsheet": "spec:" + "c" * 64}
+        result = evaluate_portfolio_assurance(results, rows, subject_id=subject_id, approved_versions=approved)
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["approved_report_layouts"]["factsheet"], approved["factsheet"])
+        # Without its design the built-in layout check still applies and fails.
+        unknown = evaluate_portfolio_assurance(results, rows, subject_id=subject_id)
+        self.assertIn("reports.2026-09-30.factsheet.layout", {row["check_id"] for row in unknown["findings"]})
+        rows[0]["template_version"] = "spec:" + "d" * 64
+        drifted = evaluate_portfolio_assurance(results, rows, subject_id=subject_id, approved_versions=approved)
+        self.assertEqual(drifted["status"], "fail")
+        self.assertIn("reports.2026-09-30.factsheet.layout", {row["check_id"] for row in drifted["findings"]})
+
+    def test_approved_report_versions_reads_the_live_case_design(self) -> None:
+        from ibkr_etl.designed_reports import DesignedReportError
+
+        cases = [
+            {"case_id": "c1", "target_subject_id": "KIWOOM-A", "report_style": None},
+            {"case_id": "c2", "target_subject_id": "STYLED", "report_style": "composite"},
+        ]
+        with mock.patch("ibkr_etl.onboarding_month_end.live_cases", return_value=cases), mock.patch(
+                "ibkr_etl.designed_reports.approved_design", return_value={"spec_sha256": "e" * 64}) as design:
+            self.assertEqual(approved_report_versions(object(), "t", "KIWOOM-A"), {"factsheet": "spec:" + "e" * 64})
+            design.assert_called_once()
+            self.assertIsNone(approved_report_versions(object(), "t", "STYLED"))
+            self.assertIsNone(approved_report_versions(object(), "t", "U16088571"))
+            design.side_effect = DesignedReportError("missing")
+            self.assertIsNone(approved_report_versions(object(), "t", "KIWOOM-A"))
 
     def test_registry_subject_mismatch_fails_closed(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "do not match"):

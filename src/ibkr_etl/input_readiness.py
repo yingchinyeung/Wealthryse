@@ -141,6 +141,9 @@ LEDGER_READABLE_SQL = ("SELECT has_table_privilege(to_regclass('workflow_stage_e
 # key is a second job the stage also needs. A run with no end after its replicaTimeout was
 # stopped or lost its end record, and is not used.
 LINEAGE_JOBS: dict[str, tuple[tuple[str, str, int], ...]] = {
+    # institutional-daily loads the Kiwoom accounts after the IBKR work items its table
+    # evidence counts, so its run is still open while those accounts' NAV comes in.
+    "reconciliation": (("loads", "ibkrv2stg-institutional-daily", 3000),),
     "benchmarks_fx": (("sectors", "ibkrv2stg-sector-classification", 1800),),
     "risk": (("run", "ibkrv2stg-risk-snapshots", 3600),),
     "reports": (("run", "ibkrv2stg-month-end-factsheet", 3600),),
@@ -149,8 +152,14 @@ LINEAGE_JOBS: dict[str, tuple[tuple[str, str, int], ...]] = {
 # they are not checked, and the policy goes on to check the stages before them.
 LINEAGE_ONLY = frozenset({"reports"})
 # Second jobs that can delay a stage but never fail it: yesterday's sector
-# classifications are good enough for a day.
-SOFT_KEYS = frozenset({"sectors"})
+# classifications are good enough for a day, and a failed account load is judged by the
+# work items and each subject's own checks.
+SOFT_KEYS = frozenset({"sectors", "loads"})
+# Jobs that run their steps as separate processes, each with its own lineage run: a run
+# that ended this recently may be followed by the next step's START, so within the wait
+# it holds like an open run. institutional-daily starts the Kiwoom loads seconds after
+# the IBKR worker ends.
+SETTLE_SECONDS = {"loads": 120}
 LINEAGE_KEY = "lineage"  # where observe() puts the lineage runs among the observations
 LINEAGE_NAMESPACE = "wealthryse"  # lineage.NAMESPACE
 LINEAGE_READABLE_SQL = ("SELECT has_table_privilege(to_regclass('public.lineage_events'), 'SELECT') "
@@ -348,6 +357,10 @@ def _runs(name: str, lineage: Mapping[str, Any] | None, *, now: datetime,
         if found[key]["state"] == "running" and not hold_open_runs:
             found[key].update(state="not_used",
                               why=f"still running after the wait (started {found[key]['started_at']})")
+        settle = SETTLE_SECONDS.get(key)
+        if (settle and hold_open_runs and found[key]["state"] in ("finished", "failed")
+                and _instant(found[key]["ended_at"]) > now.astimezone(timezone.utc) - timedelta(seconds=settle)):
+            found[key].update(state="running", settling=settle)
     return found
 
 
@@ -421,7 +434,12 @@ def decide(stage: str, observations: Mapping[str, Mapping[str, Any]], *, now: da
             detail[key] = run
             job, state = run["job"], run["state"]
             failed = f"did not finish ({run.get('error') or run.get('end')})"
-            if state == "running":
+            if state == "running" and run.get("settling"):
+                extra.append(f"{name}: {job} ended at {run['ended_at']}; waiting {run['settling']} seconds "
+                             "for its next step")
+                if detail.get("status") == "succeeded":
+                    detail.update(state="in_progress", status="running")
+            elif state == "running":
                 extra.append(f"{name}: {job} is still running (started {run['started_at']})")
                 if detail.get("status") == "succeeded":
                     detail.update(state="in_progress", status="running")

@@ -18,19 +18,26 @@ import json
 import sqlite3
 from collections import Counter
 from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .db import connect, initialize, start_run
-from .loader import load_report
+from .loader import load_report, nav_total
 from .parser import ParsedReport, parse_flex_xml
 # Bronze's reader whatever FLOWS_SOURCE says: the plan is about the bronze rows it would add.
 from .provisional_benchmark import _bronze_external_flows, _is_external_cash_transaction
 from .switch_dry_run import Statement, order_statements
-from .util import canonical_json, sha256_bytes, utc_now_iso
+from .util import canonical_json, decimal_text, sha256_bytes, utc_now_iso
 
 SECTIONS = ("Transfers", "CashTransactions")
 RUN_TYPE = "v11-archive-flow-backfill"
+# The sections behind each day's NAV: IBKR's own total and the positions and cash it is made of.
+# Loading them into bronze lets every silver NAV day be traced to the IBKR record it came from. No
+# figure reads them from bronze (the flow and ChangeInNAV readers read other sections), so no
+# number on any page changes.
+NAV_SECTIONS = ("EquitySummaryInBase", "OpenPositions", "CashReport")
+NAV_RUN_TYPE = "v11-archive-nav-evidence-backfill"
 # Rows the flow reader needs besides the two sections: base currency and FX.
 SUPPORT_TYPES = {"flexstatement", "accountinformation", "conversionrate", "fxrate", "currencyconversionrate"}
 
@@ -39,14 +46,15 @@ class BackfillError(RuntimeError):
     pass
 
 
-def _wanted(report: ParsedReport, accounts: set[str]) -> ParsedReport:
+def _wanted(report: ParsedReport, accounts: set[str], sections: tuple[str, ...] = SECTIONS) -> ParsedReport:
     rows = [row for row in report.rows if row.account_id in accounts
-            and (row.section in SECTIONS or row.record_type.lower() in SUPPORT_TYPES)]
+            and (row.section in sections or row.record_type.lower() in SUPPORT_TYPES)]
     return replace(report, rows=rows)
 
 
 def load_candidates(statements: Iterable[Statement], content: Callable[[Statement], bytes], *,
-                    accounts: Iterable[str], work_dir: Path) -> Path:
+                    accounts: Iterable[str], work_dir: Path, sections: tuple[str, ...] = SECTIONS,
+                    run_type: str = RUN_TYPE) -> Path:
     """Load the needed rows of every statement, oldest first, into a temporary SQLite."""
 
     wanted = set(accounts)
@@ -59,10 +67,10 @@ def load_candidates(statements: Iterable[Statement], content: Callable[[Statemen
             raw = content(statement)
             if sha256_bytes(raw) != statement.sha256:
                 raise BackfillError(f"Statement {statement.name} changed while being read")
-            report = _wanted(parse_flex_xml(raw), wanted)
+            report = _wanted(parse_flex_xml(raw), wanted, sections)
             if not report.rows:
                 continue
-            run_id = start_run(connection, RUN_TYPE, statement.from_date, statement.to_date)
+            run_id = start_run(connection, run_type, statement.from_date, statement.to_date)
             load_report(connection, report, run_id, legacy_key_compat=False)
             connection.commit()
     finally:
@@ -70,20 +78,21 @@ def load_candidates(statements: Iterable[Statement], content: Callable[[Statemen
     return path
 
 
-def _candidate_rows(candidates: sqlite3.Connection, account_id: str) -> list[dict[str, Any]]:
+def _candidate_rows(candidates: sqlite3.Connection, account_id: str,
+                    sections: tuple[str, ...] = SECTIONS) -> list[dict[str, Any]]:
     return [dict(row) for row in candidates.execute(
         f"SELECT account_id, section, record_type, source_key, report_date, conid, currency, row_sha256, data_json "
-        f"FROM flex_rows WHERE account_id = ? AND section IN ({', '.join('?' for _ in SECTIONS)}) "
+        f"FROM flex_rows WHERE account_id = ? AND section IN ({', '.join('?' for _ in sections)}) "
         "ORDER BY section, record_type, source_key",
-        (account_id, *SECTIONS),
+        (account_id, *sections),
     )]
 
 
-def _existing(live: Any, tenant_id: str, account_id: str) -> dict[tuple, str]:
+def _existing(live: Any, tenant_id: str, account_id: str, sections: tuple[str, ...] = SECTIONS) -> dict[tuple, str]:
     rows = live.execute(
         "SELECT section, record_type, source_key, row_sha256 FROM flex_rows "
         "WHERE tenant_id = %s AND account_id = %s AND section = ANY(%s)",
-        (tenant_id, account_id, list(SECTIONS)),
+        (tenant_id, account_id, list(sections)),
     ).fetchall()
     return {(row[0], row[1], row[2]): row[3] for row in rows}
 
@@ -96,7 +105,7 @@ def _frozen_periods(live: Any, tenant_id: str, account_id: str) -> list[str]:
 
 
 def plan(candidates_path: Path, *, accounts: Iterable[str], live: Any = None,
-         tenant_id: str = "") -> dict[str, Any]:
+         tenant_id: str = "", sections: tuple[str, ...] = SECTIONS) -> dict[str, Any]:
     """What applying would insert, and which flows that adds."""
 
     connection = sqlite3.connect(candidates_path)
@@ -104,8 +113,8 @@ def plan(candidates_path: Path, *, accounts: Iterable[str], live: Any = None,
     result: dict[str, Any] = {"accounts": {}}
     try:
         for account_id in sorted(set(accounts)):
-            rows = _candidate_rows(connection, account_id)
-            existing = _existing(live, tenant_id, account_id) if live is not None else {}
+            rows = _candidate_rows(connection, account_id, sections)
+            existing = _existing(live, tenant_id, account_id, sections) if live is not None else {}
             new, same, different = [], 0, 0
             for row in rows:
                 key = (row["section"], row["record_type"], row["source_key"])
@@ -170,7 +179,7 @@ def without_rows(planned: dict[str, Any]) -> dict[str, Any]:
 
 
 def apply(live: Any, planned: dict[str, Any], *, tenant_id: str, accept_flow_changes: bool = False,
-          requested: tuple[str | None, str | None] = (None, None)) -> dict[str, Any]:
+          requested: tuple[str | None, str | None] = (None, None), run_type: str = RUN_TYPE) -> dict[str, Any]:
     """Insert the planned new rows in one transaction. `live` is a psycopg connection."""
 
     if planned["flows_added"] and not accept_flow_changes:
@@ -193,7 +202,7 @@ def apply(live: Any, planned: dict[str, Any], *, tenant_id: str, accept_flow_cha
     run_id = live.execute(
         "INSERT INTO ingestion_runs(run_type, requested_from, requested_to, started_at, status) "
         "VALUES (%s, %s, %s, %s, 'running') RETURNING run_id",
-        (RUN_TYPE, requested[0], requested[1], utc_now_iso()),
+        (run_type, requested[0], requested[1], utc_now_iso()),
     ).fetchone()[0]
     inserted = 0
     for row in rows:
@@ -244,3 +253,60 @@ def registry_accounts(live: Any, tenant_id: str) -> list[str]:
         (tenant_id,),
     ).fetchall()
     return [str(row[0]) for row in rows]
+
+
+def _equity_totals(rows: Iterable[Any]) -> dict[str, set[Decimal]]:
+    """IBKR's daily totals by date from EquitySummaryByReportDateInBase rows' data_json, by the loader's
+    rule: the total field, else the sum of its parts (the v1.1 query sends no total field)."""
+
+    totals: dict[str, set[Decimal]] = {}
+    for row in rows:
+        values = {str(k): str(v) for k, v in _json(row["data_json"] if isinstance(row, Mapping) else row[0]).items()}
+        lowered = {k.lower(): v for k, v in values.items()}
+        day, total = _iso_day(lowered.get("reportdate")), nav_total(values, "EquitySummaryByReportDateInBase")
+        if day and total is not None:
+            totals.setdefault(day, set()).add(Decimal(total))
+    return totals
+
+
+def _iso_day(value: Any) -> str | None:
+    text = str(value or "").replace("-", "").strip()[:8]
+    return f"{text[:4]}-{text[4:6]}-{text[6:8]}" if len(text) == 8 and text.isdigit() else None
+
+
+def nav_trace(planned: dict[str, Any], live: Any, *, tenant_id: str) -> dict[str, Any]:
+    """Whether each silver NAV day has IBKR's own total in bronze, before and after the backfill.
+
+    Counts only: a silver day is traced when a bronze EquitySummaryByReportDateInBase row for that date
+    carries the same total, differs when bronze has the date with only other totals, and is untraced when
+    bronze has no row for it."""
+
+    result: dict[str, Any] = {}
+    for account_id, item in sorted(planned["accounts"].items()):
+        base = live.execute("SELECT base_currency FROM accounts WHERE account_id = %s",
+                            (account_id,)).fetchone()
+        base = base[0] if base else None
+        silver: dict[str, Decimal] = {}
+        for day, currency, total in live.execute(
+                "SELECT snapshot_date, currency, total_text FROM nav_snapshots WHERE account_id = %s "
+                "AND UPPER(asset_class) IN ('TOTAL', 'ALL', '')", (account_id,)).fetchall():
+            iso, value = _iso_day(day), decimal_text(str(total or ""))
+            if iso and value is not None and (not base or currency == base):
+                silver[iso] = Decimal(value)
+        before = _equity_totals(live.execute(
+            "SELECT data_json FROM flex_rows WHERE tenant_id = %s AND account_id = %s "
+            "AND lower(record_type) LIKE %s", (tenant_id, account_id, "%equitysummarybyreportdate%")).fetchall())
+        after = {day: set(values) for day, values in before.items()}
+        for day, values in _equity_totals(row for row in item["rows"]
+                                          if "equitysummarybyreportdate" in row["record_type"].lower()).items():
+            after.setdefault(day, set()).update(values)
+
+        def counts(bronze: dict[str, set[Decimal]]) -> dict[str, Any]:
+            traced = [d for d, v in silver.items() if v in bronze.get(d, ())]
+            differs = sorted(d for d, v in silver.items() if d in bronze and v not in bronze[d])
+            missing = sorted(d for d in silver if d not in bronze)
+            return {"traced": len(traced), "differs": len(differs), "untraced": len(missing),
+                    "differing_dates": differs[:20], "first_untraced": missing[:5], "last_untraced": missing[-5:]}
+
+        result[account_id] = {"silver_days": len(silver), "before": counts(before), "after": counts(after)}
+    return result

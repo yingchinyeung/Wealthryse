@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.cash_snapshots
 name: cash_snapshots
-version: 1.0.1
+version: 1.0.2
 status: active
 domain: silver
 dataProduct: portfolio-medallion
@@ -15,7 +15,10 @@ description:
     row has the D+2 deposit (kt00004 d2_entra) as ending cash and the deposit (entr) as settled cash. A past day''s
     KRW row has the deposit (ka01690 dbst_bal) as both, since it already moves on the trade date. Each US currency
     row has that currency''s deposit (fx_entr: ust21120 today, ust21132 for a past day) and Kiwoom''s rate to KRW.
-    A Kiwoom row''s row_sha256 is the sha256 of the row as written, not of a Flex row.'
+    A Kiwoom row''s row_sha256 is the sha256 of the row as written, not of a Flex row. The U.S. Kiwoom account (ibkr_etl.kiwoom_us_account)
+    has a USD row per closed U.S. trading day with Kiwoom''s USD deposit for the day (ust21132) as ending and settled
+    cash and a rate of 1, and a KRW row when Kiwoom''s answer gives won cash, at the rate into USD (one over Kiwoom''s
+    KRW per USD rate). Together they make the USD TOTAL row''s cash_text (nav_snapshots rule kiwoom_usd_cash_matches_cash_rows).'
 tags:
 - silver
 - ibkr
@@ -178,4 +181,5 @@ customProperties:
 - property: additionalProducers
   value:
   - ibkr_etl.kiwoom_collector
+  - ibkr_etl.kiwoom_us_account
 contractCreatedTs: '2026-10-18T00:00:00Z'

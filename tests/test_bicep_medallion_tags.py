@@ -40,6 +40,8 @@ MAPPING = [
     ("agent-foundation.bicep", "agentIdentity", "id-wr-agent"),
     ("agent-foundation.bicep", "toolsIdentity", "id-wr-agent-tools"),
     ("agent-foundation.bicep", "jobsIdentity", "id-wr-agent-jobs"),
+    ("agent-foundation.bicep", "foundry", "wr-agents-sea"),
+    ("agent-foundation.bicep", "project", "wr-agents-sea/wealthryse-agents"),
     ("staging.bicep", "workspace", "ibkrv2stg-logs"),
     ("staging.bicep", "registry", "ibkrv2stgauhecwc4itaoo"),
     ("staging.bicep", "storage", "ibkrv2stgauhecwc4itaoo"),
@@ -105,8 +107,25 @@ MAPPING = [
 # (Bicep file, resource symbolic name, live name, layer, component); hop comes from the catalog.
 PLANNED = [
     ("staging-certified-figures-job.bicep", "job", "ibkrv2stg-certified-figures", "apps", "daily-pipeline"),
+    ("agent-apps.bicep", "dispatcherJob", "ibkrv2stg-agent-dispatcher", "ai", "agents"),
+    ("staging-onboarding-worker-job.bicep", "job", "ibkrv2stg-onboard-worker", "data", "onboarding"),
 ]
 CATALOG_JOBS = json.loads((INFRA / "medallion" / "catalog.json").read_text(encoding="utf-8"))["jobs"]
+
+# Resources S4a left untagged that the tag line of 24 Oct 2026 tags, deployed by these files:
+# (Bicep file, resource symbolic name, layer, component). The tag line writes the same values.
+TAGGED_LATER = [
+    ("platform-schedule-watchdogs.bicep", "alerts", "ops", "alerts"),
+    # The network resources the tag rule excluded until they were tagged on 24 Oct 2026.
+    ("staging.bicep", "vnet", "foundation", "network"),
+    ("staging.bicep", "privateDnsZone", "foundation", "network"),
+    ("staging.bicep", "privateDnsLink", "foundation", "network"),
+    ("agent-foundation.bicep", "privateEndpoint", "foundation", "network"),
+    ("agent-foundation.bicep", "zones", "foundation", "network"),
+    ("agent-foundation.bicep", "zoneLinks", "foundation", "network"),
+    # The Container Apps environment, the last resource with Bicep that the rule excluded.
+    ("staging.bicep", "managedEnvironment", "foundation", "container-apps"),
+]
 
 # In a tags expression: a `key: 'value'` pair, a lookup such as `medallionAlertTags[jobName]`,
 # or the file's own `tags` object. Read left to right, a later key wins, as in union().
@@ -250,6 +269,13 @@ class BicepMedallionTagsTest(unittest.TestCase):
                 self.assertTrue(deployed.get("owner"))
                 self.assertIn(layer, LAYERS)
                 self.assertEqual(deployed.get("hop"), "+".join(CATALOG_JOBS[live]["hops"]))
+
+    def test_resources_tagged_later_carry_layer_component_and_owner(self):
+        for file, symbol, layer, component in TAGGED_LATER:
+            with self.subTest(file=file, symbol=symbol):
+                deployed = evaluate(file, symbol, "", with_base=True)
+                self.assertEqual((deployed.get("layer"), deployed.get("component")), (layer, component))
+                self.assertTrue(deployed.get("owner"))
 
     def test_the_table_lists_each_resource_once(self):
         self.assertEqual(len(MAPPING), len(set(MAPPING)))

@@ -28,13 +28,17 @@ def regimes(**overrides):
 
 
 class FakeTools:
-    def __init__(self, risk, regime, fail=()):
-        self.risk, self.regime, self.fail, self.calls = risk, regime, fail, []
+    def __init__(self, risk, regime, fail=(), dates=None):
+        self.risk, self.regime, self.fail, self.calls, self.arguments = risk, regime, fail, [], []
+        self.dates = dates or {"latest_valuation_date": "2026-10-14", "settled_through": "2026-10-14"}
 
     def call(self, name, arguments):
         self.calls.append(name)
+        self.arguments.append((name, dict(arguments)))
         if name in self.fail:
             raise ToolCallFailed("not_enough_history", "Too short.")
+        if name == "get_settled_dates":
+            return {"data": dict(self.dates)}
         return {"data": dict(self.risk if name == "get_risk_outlook" else self.regime)}
 
 
@@ -115,6 +119,35 @@ class RiskWatchJobTests(unittest.TestCase):
         self.assertIn("could not be checked", body)
         self.assertEqual(risk_watch(FakeStore(), FakeTools(outlook(), regimes(), fail=("get_risk_outlook",)),
                                     FakeAgent(), ["U1"], {}, today=date(2026, 10, 15)), 0)
+
+    def test_an_account_with_provisional_sessions_is_read_as_of_its_settled_day(self):
+        # U.S. iStrategy: the latest two sessions are provisional, so the watch reads the risk picture as of the
+        # third latest, and the explanation is asked for that day too.
+        store, agent = FakeStore(), FakeAgent()
+        tools = FakeTools(outlook(window_end="2026-10-12", volatility_vs_long_run=2.0), regimes(),
+                          dates={"latest_valuation_date": "2026-10-14", "settled_through": "2026-10-12"})
+        self.assertEqual(risk_watch(store, tools, agent, ["U1"], {}, today=date(2026, 10, 15)), 2)
+        calls = dict(tools.arguments[:3])
+        self.assertEqual(calls["get_risk_outlook"], {"account_id": "U1", "as_of": "2026-10-12"})
+        self.assertEqual(calls["get_market_regimes"], {"account_id": "U1", "as_of": "2026-10-12"})
+        self.assertIn("pass as_of 2026-10-12 to get_risk_outlook", agent.calls[0]["question"])
+
+    def test_no_settled_day_yet_is_nothing_to_watch_and_an_older_tool_server_still_works(self):
+        tools = FakeTools(outlook(), regimes(), dates={"latest_valuation_date": "2026-10-14", "settled_through": None})
+        self.assertEqual(risk_watch(FakeStore(), tools, FakeAgent(), ["U1"], {}, today=date(2026, 10, 15)), 0)
+        self.assertNotIn("get_risk_outlook", tools.calls)
+
+        class OlderServer(FakeTools):
+            def call(self, name, arguments):
+                if name == "get_settled_dates":
+                    raise ToolCallFailed("unknown_tool", "No such tool.")
+                if name == "get_data_freshness":
+                    return {"data": {"latest_valuation_date": "2026-10-14"}}
+                return super().call(name, arguments)
+
+        older = OlderServer(outlook(volatility_vs_long_run=2.0), regimes())
+        self.assertEqual(risk_watch(FakeStore(), older, FakeAgent(), ["U1"], {}, today=date(2026, 10, 15)), 2)
+        self.assertIn(("get_risk_outlook", {"account_id": "U1"}), older.arguments, "the call it made before")
 
 
 if __name__ == "__main__":

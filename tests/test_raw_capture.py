@@ -678,3 +678,157 @@ class HistoryNamingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Flaky(_Uploads):
+    """Fails the first `failures` uploads, then works."""
+
+    def __init__(self, failures: int, error: Exception | None = None):
+        super().__init__()
+        self.failures = failures
+        self.failure = error or ConnectionError("storage blinked")
+
+    def upload(self, name, content, *, content_type, metadata):
+        self.calls.append({"name": name, "content": content, "content_type": content_type,
+                           "metadata": metadata})
+        if len(self.calls) <= self.failures:
+            raise self.failure
+        return ACCOUNT_URL + "/bronze-market-data/" + name
+
+
+class RequiredCaptureTests(unittest.TestCase):
+    """MARKET_DATA_RAW_REQUIRED: a response whose raw copy cannot be stored fails its fetch."""
+
+    def tearDown(self):
+        raw_capture.reset()
+
+    def _required(self, uploads, **options):
+        self.pauses = []
+        options.setdefault("sleep", self.pauses.append)
+        return _capture(uploads, required=True, **options)
+
+    def test_the_setting_turns_it_on_with_the_longer_timeouts(self):
+        environment = {"MARKET_DATA_RAW_CONTAINER": "bronze-market-data",
+                       "AZURE_STORAGE_ACCOUNT_URL": ACCOUNT_URL}
+        self.assertFalse(RawCapture.from_environment(environment).required)
+        for value in ("true", "on", "1", "yes"):
+            capture = RawCapture.from_environment({**environment, "MARKET_DATA_RAW_REQUIRED": value})
+            self.assertTrue(capture.required)
+            self.assertIs(capture._uploader_factory, raw_capture._required_uploader)
+            self.assertEqual(capture.attempts, raw_capture.REQUIRED_ATTEMPTS)
+            self.assertEqual(capture.write_wait_seconds, raw_capture.REQUIRED_WRITE_WAIT_SECONDS)
+        self.assertFalse(RawCapture.from_environment({**environment, "MARKET_DATA_RAW_REQUIRED": "off"}).required)
+        self.assertEqual(RawCapture(container="c", account_url=ACCOUNT_URL).attempts, 1)
+
+    def test_required_without_storage_settings_fails_every_fetch(self):
+        capture = RawCapture.from_environment({"MARKET_DATA_RAW_REQUIRED": "true"})
+        with self.assertRaisesRegex(raw_capture.RawCopyNotStored, "MARKET_DATA_RAW_CONTAINER"):
+            capture.http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<x/>", key="k")
+        raw_capture.reset(capture)
+        with self.assertRaises(raw_capture.RawCopyNotStored):
+            raw_capture.capture_http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<x/>", key="k")
+        with self.assertRaises(raw_capture.RawCopyNotStored):
+            raw_capture.capture_frame("yahoo-benchmark-history", "Yahoo", frame=_frame(), request={}, key="k")
+        with self.assertRaises(raw_capture.RawCopyNotStored):
+            raw_capture.capture_document("yahoo-sector-profile", "Yahoo", payload={}, request={}, key="k")
+
+    def test_a_blink_is_retried_and_the_copy_is_kept(self):
+        uploads = _Flaky(2)
+        capture = self._required(uploads)
+        name = capture.http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<x/>",
+                            key="year-2026", extension="xml", requested_at=REQUESTED)
+        self.assertTrue(name.startswith("treasury-par-yield/2026/10/16/year-2026-"))
+        self.assertEqual(len(uploads.calls), 3)
+        self.assertEqual({call["name"] for call in uploads.calls}, {name})
+        self.assertEqual(self.pauses, [1.0, 3.0])
+        self.assertEqual(capture.stats["written"], 1)
+        self.assertEqual(capture.stats["failed"], 0)
+        self.assertEqual(capture.digest_of(name), hashlib.sha256(b"<x/>").hexdigest())
+
+    def test_a_copy_that_fails_every_try_fails_the_fetch_and_the_rest_of_the_run(self):
+        uploads = _Uploads(ConnectionError("storage down"))
+        capture = self._required(uploads, budget_seconds=0.0)
+        with self.assertLogs("ibkr_etl.raw_capture", level="ERROR"):
+            with self.assertRaisesRegex(raw_capture.RawCopyNotStored, "after 3 tries .*ConnectionError"):
+                capture.http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<x/>", key="a")
+        self.assertEqual(len(uploads.calls), 3)
+        self.assertIsNone(capture.disabled_reason)
+        self.assertIn("ConnectionError", capture.failed_reason)
+        with self.assertRaisesRegex(raw_capture.RawCopyNotStored, "earlier raw copy"):
+            capture.http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<y/>", key="b")
+        self.assertEqual(len(uploads.calls), 3, "after a copy failed every try, nothing more is sent")
+        self.assertEqual(capture.stats["failed"], 2)
+        summary = capture.summary()
+        self.assertTrue(summary["required"])
+        self.assertIn("ConnectionError", summary["failed_reason"])
+
+    def test_a_file_already_there_counts_as_kept(self):
+        from azure.core.exceptions import ResourceExistsError
+
+        capture = self._required(_Uploads(ResourceExistsError("BlobAlreadyExists")))
+        name = capture.http("treasury-par-yield", "U.S. Treasury", url="https://x", body=b"<x/>", key="a")
+        self.assertIsNotNone(name)
+        self.assertEqual(capture.stats["existing"], 1)
+        self.assertEqual(self.pauses, [])
+
+    def test_no_time_budget_applies(self):
+        uploads = _Uploads()
+        capture = self._required(uploads, budget_seconds=0.0)
+        for key in ("a", "b", "c"):
+            self.assertIsNotNone(capture.http("hkab-hibor", "HKAB", url="https://x", body=key.encode(), key=key))
+        self.assertEqual(capture.stats["written"], 3)
+        self.assertIsNone(capture.disabled_reason)
+
+    def test_a_hung_upload_fails_after_each_try_waits_its_allowance(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hung(account_url, container):
+            def upload(name, content, **_options):
+                release.wait(60)
+            return upload
+
+        capture = RawCapture(container="bronze-market-data", account_url=ACCOUNT_URL, uploader_factory=hung,
+                             required=True, attempts=2, write_wait_seconds=0.2, sleep=lambda _s: None)
+        started = time.monotonic()
+        with self.assertLogs("ibkr_etl.raw_capture", level="ERROR"):
+            with self.assertRaisesRegex(raw_capture.RawCopyNotStored, "TimeoutError"):
+                capture.http("hkab-hibor", "HKAB", url="https://x", body=b"{}", key="a")
+        self.assertLess(time.monotonic() - started, 2 * 0.2 + SCHEDULING_SLACK)
+
+    def test_a_response_that_cannot_be_serialised_or_an_unknown_feed_fails_too(self):
+        capture = self._required(_Uploads())
+
+        class Broken:
+            def to_csv(self):
+                raise ValueError("not a frame")
+
+        with self.assertLogs("ibkr_etl.raw_capture", level="WARNING"):
+            with self.assertRaisesRegex(raw_capture.RawCopyNotStored, "ValueError"):
+                capture.frame("yahoo-benchmark-history", "Yahoo", frame=Broken(), request={}, key="k")
+            with self.assertRaises(raw_capture.RawCopyNotStored):
+                capture.http("not-a-feed", "Nobody", url="https://x", body=b"{}", key="k")
+
+    def test_the_benchmark_fetch_fails_before_parsing_when_its_copy_is_not_kept(self):
+        from ibkr_etl.provisional_benchmark import BENCHMARKS, fetch_benchmark_yfinance
+
+        ticker = _Ticker(_frame())
+        raw_capture.reset(self._required(_Uploads(ConnectionError("storage down"))))
+        with self.assertLogs("ibkr_etl.raw_capture", level="ERROR"):
+            with self.assertRaises(raw_capture.RawCopyNotStored):
+                fetch_benchmark_yfinance(BENCHMARKS[0], date(2025, 1, 20), date(2025, 1, 23), lambda _s: ticker)
+        working = _Uploads()
+        raw_capture.reset(self._required(working))
+        observations = fetch_benchmark_yfinance(BENCHMARKS[0], date(2025, 1, 20), date(2025, 1, 23),
+                                                lambda _s: ticker)
+        self.assertEqual([day for day, _ in observations], ["2025-01-21", "2025-01-22", "2025-01-23"])
+        self.assertEqual(len(working.calls), 1)
+
+    def test_the_treasury_fetch_fails_when_its_copy_is_not_kept(self):
+        from ibkr_etl import risk_free
+
+        raw_capture.reset(self._required(_Uploads(ConnectionError("storage down"))))
+        with patch.object(risk_free, "_get", return_value=b"<feed/>"):
+            with self.assertLogs("ibkr_etl.raw_capture", level="ERROR"):
+                with self.assertRaises(raw_capture.RawCopyNotStored):
+                    risk_free.fetch_treasury_3m_rates(date(2026, 10, 1), date(2026, 10, 2))

@@ -84,11 +84,17 @@ def _seed(owner) -> None:
             owner.execute("INSERT INTO nav_snapshots (account_id, snapshot_date, currency, total_text, "
                           "row_sha256, last_seen_run_id) VALUES (%s, %s, 'USD', %s, md5(%s) || md5(%s), %s)",
                           (account, text, f"{nav}.00", account + text, "nav", run))
-            if account == EMPTIED and day == LAST_DAY:
+            # Cash makes up the rest of the NAV, so every account's NAV rebuilds to the broker's total.
+            held = not (account == EMPTIED and day == LAST_DAY)
+            owner.execute("INSERT INTO cash_snapshots (account_id, snapshot_date, currency, ending_cash_text, "
+                          "row_sha256, last_seen_run_id) VALUES (%s, %s, 'USD', %s, md5(%s) || md5(%s), %s)",
+                          (account, text, f"{nav - (80 if held else 0)}.00", account + text, "cash", run))
+            if not held:
                 continue
             for conid in ("1001", "1002"):
-                owner.execute("INSERT INTO position_snapshots (account_id, snapshot_date, conid, quantity_text, "
-                              "row_sha256, last_seen_run_id) VALUES (%s, %s, %s, '10', md5(%s) || md5(%s), %s)",
+                owner.execute("INSERT INTO position_snapshots (account_id, snapshot_date, conid, currency, "
+                              "quantity_text, mark_price_text, market_value_text, row_sha256, last_seen_run_id) "
+                              "VALUES (%s, %s, %s, 'USD', '10', '4', '40', md5(%s) || md5(%s), %s)",
                               (account, text, conid, account + text + conid, "position", run))
             owner.execute(
                 "INSERT INTO performance_comparison_daily (subject_id, benchmark_id, observation_date, "
@@ -228,17 +234,18 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         for check_id, result in results.items():
             states.setdefault(result["state"], set()).add(check_id)
         self.assertNotIn("unavailable", states)
-        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 43)
+        self.assertEqual(len([c for c in results if c.startswith("schema.")]), 44)
         self.assertEqual({c for c in states.get("fail", ()) if not c.startswith("value.")}, set())
-        # The corrections history (U8) is held: its checks wait for its migration. Held objects
-        # with no silver or gold contract (the U8 setting, the Kiwoom bronze table) have no checks.
+        # A held migration's tables skip their checks until it runs. The corrections history (U8) is
+        # migration 074 now, so the build made its tables and their checks run like any other table's.
         held = {c for c in states["skipped"] if "held migration" in str(results[c]["detail"].get("reason"))}
         self.assertEqual({results[c]["target"] for c in held}, {
             name for name in layer_quality.held_relations(CONTRACTS) if name.split(".", 1)[0] in {"silver", "gold"}})
-        self.assertIn("volume.silver.trades_history", held)
-        self.assertIn("schema.silver.trades_history", held)
+        self.assertEqual(results["volume.silver.trades_history"]["state"], "recorded")  # no earlier total
+        self.assertEqual(results["schema.silver.trades_history"]["state"], "pass")
         rls = {c for c in states["skipped"] - held if c.startswith("rule.")}
-        self.assertEqual(len(rls), 10)  # need an RLS bypass
+        # need an RLS bypass (5 of them on the history tables, 8 the Kiwoom account rules)
+        self.assertEqual(len(rls), 21)
         self.assertEqual(results["volume.gold.certified_figures"]["state"], "recorded")  # no earlier total
         self.assertEqual(results["schema.gold.certified_builds"]["state"], "pass")
         nav = results["volume.silver.nav_snapshots"]
@@ -252,6 +259,32 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         emptied = results["value.positions_to_zero"]
         self.assertEqual((emptied["state"], emptied["severity"]), ("fail", "error"))
         self.assertEqual([f["subject"] for f in emptied["detail"]["failed"]], ["***002"])
+        rebuild = results["value.nav_rebuild"]
+        self.assertEqual((rebuild["state"], rebuild["observed"], rebuild["detail"]["subjects_checked"]),
+                         ("pass", 0, len(ACCOUNTS)))
+        self.assertEqual(rebuild["detail"]["cash_sources"], {"currencies": len(ACCOUNTS)})
+
+    def test_a_cash_balance_that_does_not_add_up_is_a_rebuild_break(self):
+        with layers._connect(self.database) as owner:
+            owner.execute("UPDATE silver.cash_snapshots SET ending_cash_text = '0' "
+                          "WHERE account_id = 'U9100001' AND snapshot_date = %s", (LAST_DAY.isoformat(),))
+            owner.commit()
+        try:
+            rebuild = self._daily(APPROVAL)["value.nav_rebuild"]
+        finally:
+            with layers._connect(self.database) as owner:
+                owner.execute("UPDATE silver.cash_snapshots SET ending_cash_text = "
+                              "(SELECT (total_text::numeric - 80)::text FROM silver.nav_snapshots n "
+                              " WHERE n.account_id = 'U9100001' AND n.snapshot_date = %s) "
+                              "WHERE account_id = 'U9100001' AND snapshot_date = %s",
+                              (LAST_DAY.isoformat(), LAST_DAY.isoformat()))
+                owner.commit()
+        self.assertEqual((rebuild["state"], rebuild["severity"], rebuild["observed"]), ("fail", "warning", 1))
+        failed, = rebuild["detail"]["failed"]
+        self.assertEqual((failed["subject"], failed["date"], failed["cash_source"]),
+                         ("***001", LAST_DAY.isoformat(), "currencies"))
+        self.assertLess(failed["gap_bp"], -9000)  # basis points of the total, never an amount
+        self.assertNotIn("gap", failed)
 
     def test_schema_drift_and_broken_rows_are_found(self):
         with layers._connect(self.database) as owner:
@@ -318,9 +351,14 @@ class LayerQualityDatabaseTests(unittest.TestCase):
         self.assertEqual(targets["silver.checks"]["status"], "missed")  # positions dropped to zero
         self.assertEqual(targets["silver.ready"]["week"]["unmeasured"], 4)  # 12-14 and 16 Oct: no history
         failed = {f["check_id"]: f for f in weekly["failed_checks"]}
-        self.assertEqual(set(failed), {"value.nav_move", "value.positions_to_zero"})
+        # This synthetic data has no Kiwoom account, so the reported-only Kiwoom NAV date is missing:
+        # a warning in the weekly report, never an error against a target.
+        self.assertEqual(set(failed), {"value.nav_move", "value.positions_to_zero", "silver.nav_snapshots.kiwoom"})
+        self.assertEqual(failed["silver.nav_snapshots.kiwoom"]["severity"], "warning")
         self.assertEqual(failed["value.positions_to_zero"]["table"], "silver.subject_position_series")
-        self.assertEqual(weekly["unavailable_checks"]["count"], len(unreadable))
+        # The contract rules the approval login cannot read, and bronze's Kiwoom answers, which it cannot
+        # read yet either (a reported-only freshness check).
+        self.assertEqual(weekly["unavailable_checks"]["count"], len(unreadable) + 1)
         text = layer_quality.render(weekly)
         self.assertIn("silver ready by 09:00 UTC on 99% of business days: MET", text)
         self.assertNotIn("***", text)

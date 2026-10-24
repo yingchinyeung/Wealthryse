@@ -79,6 +79,35 @@ class AcrBuildTest(unittest.TestCase):
             self.run_apply({"web.py": b"live-only change\n"})
         self.assertIn("web.py", str(stop.exception))
 
+    def test_a_changed_file_imported_first_and_missing_from_live_is_added_whole(self):
+        # Run 55 on 22 Oct: certified_build.py changed, web.py imports it for the first time,
+        # and the live image never had it.
+        before = {**BEFORE, "certified_build.py": b"VERSION = 1\n"}
+        after = {**AFTER, "web.py": AFTER["web.py"] + b"from . import certified_build\n", "certified_build.py": b"VERSION = 2\n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(release, "sides", return_value=(dict(before), dict(after))), \
+                    mock.patch.object(release, "design_files", return_value={}):
+                built = release.acr_context(STATE, Path(tmp))
+            self.assertIn("certified_build.py", built["imported"])
+            built["runtime_user"] = f"{os.getuid()}:{os.getgid()}"
+            src = self.live_tree(tmp, {"web.py": BEFORE["web.py"], "db.py": b"db\n", "old.py": b"old\n"})
+            apply_script.apply(built, src=src, files=Path(tmp) / "release" / "files")
+            self.assertEqual((src / "certified_build.py").read_bytes(), b"VERSION = 2\n")
+            self.assertEqual((src / "web.py").read_bytes(), after["web.py"])
+
+    def test_a_changed_file_imported_first_that_drifted_in_live_still_stops_the_build(self):
+        before = {**BEFORE, "certified_build.py": b"VERSION = 1\n"}
+        after = {**AFTER, "web.py": AFTER["web.py"] + b"from . import certified_build\n", "certified_build.py": b"VERSION = 2\n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(release, "sides", return_value=(dict(before), dict(after))), \
+                    mock.patch.object(release, "design_files", return_value={}):
+                built = release.acr_context(STATE, Path(tmp))
+            built["runtime_user"] = f"{os.getuid()}:{os.getgid()}"
+            src = self.live_tree(tmp, {"web.py": BEFORE["web.py"], "certified_build.py": b"live-only\n"})
+            with self.assertRaises(SystemExit) as stop:
+                apply_script.apply(built, src=src, files=Path(tmp) / "release" / "files")
+            self.assertIn("certified_build.py", str(stop.exception))
+
     def test_built_in_designs_are_written_whole_and_checked(self):
         design = {"factsheet_spec/designs/korea-istrategy.json": b'{"design_id": "korea-istrategy"}\n'}
         with tempfile.TemporaryDirectory() as tmp:

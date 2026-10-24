@@ -21,6 +21,8 @@ var rawMarketDataEnv = empty(rawMarketDataContainer) ? [] : [
   { name: 'MARKET_DATA_RAW_CONTAINER', value: rawMarketDataContainer }
   { name: 'AZURE_STORAGE_ACCOUNT_URL', value: 'https://${rawMarketDataStorageAccountName}.blob.${az.environment().suffixes.storage}' }
   { name: 'AZURE_CLIENT_ID', value: jobIdentity.properties.clientId }
+  // A fetch whose raw copy cannot be stored fails (raw_capture required mode).
+  { name: 'MARKET_DATA_RAW_REQUIRED', value: 'true' }
 ]
 
 var tags = {
@@ -77,7 +79,8 @@ resource job 'Microsoft.App/jobs@2024-03-01' = {
       secrets: [
         {
           name: 'database-url'
-          keyVaultUrl: '${vault.properties.vaultUri}secrets/database-app-url'
+          // The loader login (Medallion step 3): only the loader jobs may write silver.
+          keyVaultUrl: '${vault.properties.vaultUri}secrets/database-loader-url'
           identity: jobIdentity.id
         }
       ]

@@ -1,4 +1,5 @@
-"""The daily benchmark job carries on past a subject that has no benchmark yet, and fails on anything else."""
+"""The daily benchmark job carries on past a subject that has no benchmark yet, or whose benchmark
+has not yet published the close its NAV has reached, and fails on anything else."""
 from __future__ import annotations
 
 import importlib.util
@@ -8,7 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from ibkr_etl import publish_gate
-from ibkr_etl.provisional_benchmark import NoBenchmarkContract, mapped_benchmarks
+from ibkr_etl.provisional_benchmark import BenchmarkNotCurrent, NoBenchmarkContract, mapped_benchmarks
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,6 +68,19 @@ class NoBenchmarkContractTests(unittest.TestCase):
         self.assertIn('"U1"', success.call_args.kwargs["reconciliation_json"])
         failed.assert_not_called()
 
+    def test_a_benchmark_behind_the_nav_holds_only_that_subject(self):
+        code, error, success, failed = self._run(BenchmarkNotCurrent(
+            "GSPC comparison failed data-quality checks: freshness (Latest common observation "
+            "2026-10-20 does not match the required XNYS session 2026-10-21 (calendar).)"))
+        self.assertIsNone(error)
+        self.assertEqual(code, publish_gate.EXIT_REJECTED)
+        success.assert_called_once()
+        payload = success.call_args.kwargs["reconciliation_json"]
+        self.assertIn('"benchmark_not_current"', payload)
+        self.assertIn("2026-10-21", payload)
+        self.assertIn('"U1"', payload)
+        failed.assert_not_called()
+
     def test_any_other_failure_still_fails_the_run(self):
         _code, error, success, failed = self._run(RuntimeError("Benchmark data failed quality checks"))
         self.assertIsNotNone(error)
@@ -76,3 +90,38 @@ class NoBenchmarkContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LogSummaryTests(unittest.TestCase):
+    """The console line goes to Log Analytics: keys, dates, counts and statuses, never figures or full ids."""
+
+    def test_the_console_gets_no_metric_values_or_full_account_ids(self):
+        result = {
+            "status": "success", "benchmark_observations": 40, "crisis_replay_observations": 3,
+            "account_ids": ["U16088571", "KIW1234567810"],
+            "accounts": [{
+                "account_id": "KIW1234567810", "quality_status": "warn", "benchmark_observations": 40,
+                "comparison_rows": 20, "crisis_replay": {"observations": 3, "loss": -0.1234},
+                "benchmarks": [{
+                    "benchmark_id": "GSPC", "mapping_type": "primary", "available": True, "quality_status": "warn",
+                    "quality_issues": [{"check_id": "freshness", "status": "fail", "message": "x"},
+                                       {"check_id": "gaps", "status": "warn", "message": "y"}],
+                    "benchmark_observations": 40, "comparison_rows": 20, "latest_benchmark_date": "2026-10-23",
+                    "metrics": {"period_end": "2026-10-23", "portfolio_total_return": 0.0812345,
+                                "beta": 1.04321},
+                }],
+            }],
+            "crisis_scenarios": {"status": "success", "subjects": {"KIW1234567810": {"loss": -0.2222}}},
+            "held_back_by_publish_gate": [{"account_id": "U16088571", "reason": "held for U16088571: drift"}],
+        }
+        line = __import__("json").dumps(_job().log_summary(result))
+        for secret in ("16088571", "1234567810", "0.0812345", "1.04321", "-0.1234", "-0.2222"):
+            self.assertNotIn(secret, line)
+        summary = _job().log_summary(result)
+        subject = summary["subjects"][0]
+        self.assertEqual((subject["subject"], subject["crisis_replay_observations"]), ("***810", 3))
+        self.assertEqual(subject["benchmarks"][0]["failed_checks"], ["freshness"])
+        self.assertEqual(subject["benchmarks"][0]["period_end"], "2026-10-23")
+        self.assertEqual(summary["crisis_scenarios"], {"status": "success", "subjects": 1})
+        self.assertEqual(summary["held_back_by_publish_gate"],
+                         [{"subject": "***571", "kind": "publish_gate", "reason": "held for ***571: drift"}])

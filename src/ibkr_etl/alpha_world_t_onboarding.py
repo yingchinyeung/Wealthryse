@@ -65,8 +65,10 @@ def refresh_onboarding_analytics(connection, *, tenant_id):
         end_date=date.fromisoformat(as_of), ticker_factory=None, commit=False))
     stored = connection.execute('''SELECT benchmark_id,reporting_currency,calculation_version,
             COUNT(*) AS observations,MAX(observation_date) AS latest
-        FROM performance_comparison_daily WHERE tenant_id=? AND subject_id='alpha-world-t'
+        FROM performance_comparison_daily c WHERE tenant_id=? AND subject_id='alpha-world-t'
         AND reporting_currency='HKD' AND calculation_version=?
+        AND EXISTS (SELECT 1 FROM portfolio_benchmark_mapping m WHERE m.tenant_id=c.tenant_id
+            AND m.subject_id=c.subject_id AND m.benchmark_id=c.benchmark_id)
         GROUP BY benchmark_id,reporting_currency,calculation_version''',
         (tenant_id, T_HKD_COMPARISON_VERSION)).fetchall()
     if (len(stored) != 2 or {r['benchmark_id'] for r in stored} != {'HSI', 'GSPC'}

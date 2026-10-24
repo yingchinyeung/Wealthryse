@@ -542,6 +542,20 @@ class RoutingEvaluationTests(unittest.TestCase):
         self.assertEqual(missed, [])
         self.assertGreaterEqual(fast / len(DEFAULT_CASES), 0.6, "most questions take the fast path")
 
+    def test_modelling_looks_up_holdings_and_compares_mixes_with_run_what_if(self):
+        # model-04 and model-06 on 22 Oct: "my largest holding" needs a lookup, and a mix compared with
+        # today's should go through run_what_if rather than one calculation per difference.
+        self.assertIn("get_holdings", registry.BY_NAME["modelling"].tools)
+        self.assertEqual(registry.owner("get_holdings"), "holdings_performance")
+        text = " ".join(prompts.specialist("modelling", account_id="U1", today="2026-10-22", writes_answer=True).split())
+        self.assertIn("Use get_holdings to find a holding by size or name", text)
+        self.assertIn("pass the new weights to run_what_if, which reports both side by side", text)
+        # model-06 on 23 Oct: optimise_portfolio's weights are shares of the sleeve, so converting them
+        # one calculation per holding ran out of steps; run_what_if replays the mix by name instead.
+        self.assertIn("call run_what_if with mix set to its name", text)
+        self.assertIn("each holding's share of the risk", prompts.planner(account_id="U1", today="2026-10-22",
+                                                                          suggested=["modelling"]))
+
     def test_advice_is_flagged_but_worry_is_not(self):
         self.assertTrue(route_chat("Rebalance my portfolio to 60/40.").advice)
         self.assertTrue(route_chat("Should I sell my largest holding?").advice)

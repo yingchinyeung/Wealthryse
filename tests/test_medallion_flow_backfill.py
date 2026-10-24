@@ -14,11 +14,12 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from switch_fixtures import ACCOUNT_A, ACCOUNT_B, FIRST_RUN, settings_for, statement_for_run
 from ibkr_etl.derived_portfolio import _flow_adjusted_nav
-from ibkr_etl.flow_backfill import SECTIONS, BackfillError, apply, load_candidates, plan, without_rows
+from ibkr_etl.flow_backfill import SECTIONS, BackfillError, _equity_totals, apply, load_candidates, plan, without_rows
 from ibkr_etl.performance_periods import performance_periods, period_return, validated_flows, validated_nav
 from ibkr_etl.provisional_benchmark import _external_flows
 from ibkr_etl.service import ingest_content
@@ -215,6 +216,18 @@ class FlowBackfillTests(unittest.TestCase):
 class _NoWrites:
     def execute(self, *_):
         raise AssertionError("the live database must not be touched")
+
+
+class NavTotalsTest(unittest.TestCase):
+    def test_a_daily_record_without_a_total_field_is_traced_by_its_parts(self):
+        # v1.1's Flex query sends EquitySummaryByReportDateInBase without "total"; the loader stores the
+        # sum of the parts, so the trace must read the record the same way.
+        rows = [{"data_json": json.dumps({"reportDate": "20240102", "total": "1000.50"})},
+                {"data_json": json.dumps({"reportDate": "20240103", "cash": "-200", "stock": "1150.25",
+                                          "dividendAccruals": "0.75", "interestAccruals": ""})},
+                {"data_json": json.dumps({"reportDate": "20240104"})}]
+        self.assertEqual(_equity_totals(rows), {"2024-01-02": {Decimal("1000.50")},
+                                                "2024-01-03": {Decimal("951.00")}})
 
 
 if __name__ == "__main__":

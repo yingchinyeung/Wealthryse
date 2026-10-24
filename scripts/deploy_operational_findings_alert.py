@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from audit_azure_runtime import az
 from deploy_metadata_monitor import request, BASE, SUB
+from ibkr_etl import medallion_tags
 from ibkr_etl.operational_alerts import metadata_findings_query
 from run_specialist_gateway_read_verification import retain
 
@@ -17,7 +18,8 @@ FOLDER=Path('.work/system-improvements-20261006/operational-findings-v4')
 
 def definition():
     return {'location':'eastasia','kind':'LogAlert',
-        'tags':{'application':'ibkr-portfolio-platform','purpose':'operational-data-findings','owner':'portfolio-platform'},
+        'tags':medallion_tags.with_medallion(RULE,{'application':'ibkr-portfolio-platform',
+            'purpose':'operational-data-findings','owner':'portfolio-platform'}),
         'properties':{'displayName':'Portfolio data and workflow need attention',
             'description':'Persistent risk/queue/benchmark metadata issues or invalid/stale monitor evidence. '
                 'Two complete captures at least 20 minutes apart for data findings. '
@@ -69,7 +71,8 @@ def verify(current):
             raise ValueError('Alert resource scope mismatch')
     if [x.lower() for x in actual['actions']['actionGroups']]!=[x.lower() for x in expected['actions']['actionGroups']]:
         raise ValueError('Owner notification routing mismatch')
-    if current.get('tags')!=wanted['tags']:
+    # The Medallion tags (layer, component) may be missing still, or there with exactly their values.
+    if not medallion_tags.same_tags(RULE,current.get('tags'),wanted['tags']):
         raise ValueError('Alert ownership tags mismatch')
 
 

@@ -151,6 +151,7 @@ from .util import canonical_json, sha256_text, utc_now_iso
 from .web_theme import ACCOUNT_THEME_CSS, HOME_THEME_CSS, THEME_TOGGLE_HTML, WEB_FONT_FILES, web_font_bytes
 from .web_ui import ACCOUNT_UI_SCRIPT, HOME_SCRIPT, TABLE_SCRIPT
 from .web_ui import CERTIFIED_LINE_SCRIPT
+from . import web_next
 from .web_analytics_ui import (
     ANALYTICS_SCRIPT,
     CORRELATION_CARD,
@@ -242,6 +243,10 @@ ONBOARDING_REPORT_JOB_NAME = os.environ.get(
 ).strip()
 ONBOARDING_ANALYTICS_JOB_NAME = os.environ.get(
     "ONBOARDING_ANALYTICS_JOB_NAME", "ibkrv2stg-onboard-analytics"
+).strip()
+# Run now and Check now on the new onboarding pages (onboarding_worker.py).
+ONBOARDING_WORKER_JOB_NAME = os.environ.get(
+    "ONBOARDING_WORKER_JOB_NAME", "ibkrv2stg-onboard-worker"
 ).strip()
 YAHOO_ONBOARDING_DISCLOSURE_VERSION = yahoo_disclosure.VERSION
 YAHOO_ONBOARDING_SCOPE = yahoo_disclosure.SCOPE
@@ -403,6 +408,28 @@ async def security_audit_middleware(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def page_design_middleware(request: Request, call_next):
+    """Serve the classic design or WealthRyse Next, per the WEB_DESIGN switch (see web_next)."""
+    response = await call_next(request)
+    path = request.url.path
+    if (web_next.setting() == "classic" or request.method != "GET" or response.status_code != 200
+            or path.startswith(("/api/", "/assets/", "/agents/", "/design/", "/.auth"))
+            or not response.headers.get("content-type", "").startswith("text/html")):
+        return response
+    user = getattr(request.state, "portal_user", None) or {}
+    role = str(user.get("role") or "") or None
+    design = web_next.design_for(request.cookies.get(web_next.COOKIE), role)
+    if design == "classic" and not (web_next.setting() == "preview" and role == "owner"):
+        return response
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    back = path + (f"?{request.url.query}" if request.url.query else "")
+    html = web_next.transform(body.decode("utf-8"), design=design, role=role, back=back,
+                              page_scripts={"home": HOME_SCRIPT}, metric_anchors=METRIC_ANCHORS)
+    headers = {k: v for k, v in response.headers.items() if k.lower() != "content-length"}
+    return Response(html, status_code=response.status_code, headers=headers, media_type="text/html")
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, error: Exception) -> JSONResponse:
     """Return a stable JSON envelope without exposing database or server details."""
@@ -537,13 +564,16 @@ def _portable_database_connection(connection):
 
 
 def _authorized_user(request: Request) -> dict[str, object]:
+    user = None
     if AUTHORIZATION_MODE in {"hybrid", "database"}:
-        database_user = _database_authorized_user(request)
-        if database_user is not None:
-            return database_user
-        if AUTHORIZATION_MODE == "database":
+        user = _database_authorized_user(request)
+        if user is None and AUTHORIZATION_MODE == "database":
             raise HTTPException(status_code=403, detail="This account is not authorized")
-    return _legacy_authorized_user(request)
+    if user is None:
+        user = _legacy_authorized_user(request)
+    # Kept for the page-design switch (web_next), so it needs no second lookup.
+    request.state.portal_user = user
+    return user
 
 
 def _owner_user(request: Request) -> dict[str, object]:
@@ -5315,6 +5345,21 @@ def _platform_navigation(user: dict[str, object], *, active: str | None = None) 
         + "".join(link(key, label, href, "platform-menu-link") for key, label, href in operations)
         + "</div></details></nav>"
     )
+
+
+@app.get("/design/{choice}", include_in_schema=False)
+def choose_design(
+    choice: str,
+    back: str = "/",
+    user: dict[str, object] = Depends(_authorized_user),
+) -> RedirectResponse:
+    """Keep this person's choice of the classic design or WealthRyse Next in their browser."""
+    if not web_next.may_choose(choice, str(user.get("role") or "")):
+        raise HTTPException(status_code=404, detail="Not found")
+    response = RedirectResponse(url=web_next.safe_return_path(back), status_code=303)
+    response.set_cookie(web_next.COOKIE, choice, max_age=web_next.COOKIE_MAX_AGE, path="/",
+                        secure=True, httponly=True, samesite="lax")
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -11318,7 +11363,7 @@ def _render_account_page(
 <main><div class="breadcrumbs"><a href="/">Accounts</a><span aria-hidden="true">/</span><span>{account_display_name}</span></div><div class="account-hero"><div class="account-hero-copy"><h1>{account_display_name}</h1><div class="muted">{reporting_currency} reporting · Data from {history_start_date}</div><div id="freshness" class="freshness" hidden></div></div><div class="account-hero-controls"><label class="asof-control{' report-date-hidden' if section == 'reports' else ''}"><span class="label">As of</span><select id="asof-select" class="asof-select" aria-label="Portfolio as of date"><option>Loading…</option></select></label>{account_switcher}</div></div><div class="account-sticky"><nav class="account-nav" aria-label="{account} sections">{navigation}</nav>{section_jumps}</div><h2 class="sr-only">{page_title}</h2>
 <section class="grid" id="portfolio-grid">{preview_notice}<div class="page-view{active['overview']}" data-section="overview"><div class="card wide overview-nav"><div class="overview-nav-head"><div class="overview-nav-copy"><div class="label">Net asset value</div><div class="overview-nav-line"><span id="nav" class="value">—</span><span id="overview-day" class="overview-day"></span></div><div id="overview-asof" class="muted">{reporting_currency} reporting</div></div><svg id="overview-spark" class="overview-spark" viewBox="0 0 320 64" preserveAspectRatio="none" role="img" aria-label="NAV trend over the last year"></svg></div><div id="overview-returns" class="metrics overview-returns"><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div><div class="metric"><div class="skeleton-line"></div><div class="skeleton-line short"></div></div></div></div><div class="card overview-half"><div class="label">Top holdings · <span id="positions">—</span> positions</div><div id="overview-holdings" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">All holdings <span aria-hidden="true">→</span></a></div><div class="card overview-half"><div class="label">Sector allocation</div><div id="overview-sectors" class="sector-bars"></div><a class="overview-more" href="/accounts/{account}/holdings">Sector detail <span aria-hidden="true">→</span></a></div></div>
 <div class="page-view{active['performance']}" data-section="performance">
-<div class="card wide" id="perf-chart"><div class="chart-head"><div class="label chart-title">NAV history</div><div class="chart-mode" role="group" aria-label="Chart view"><button type="button" data-mode="value" data-title="NAV history" class="active" aria-pressed="true">Value</button><button type="button" data-mode="benchmark" data-title="Rebased performance comparison" aria-pressed="false">Vs benchmark</button></div></div><div class="chart-view" data-view="value"><div class="range-buttons" data-chart="#chart" role="group" aria-label="Chart period"><button type="button" data-range="1m">1M</button><button type="button" data-range="3m">3M</button><button type="button" data-range="ytd">YTD</button><button type="button" data-range="1y">1Y</button><button type="button" data-range="all" class="active" aria-pressed="true">All</button></div><div class="chart-wrap"><canvas id="chart" width="1100" height="320" aria-label="NAV history chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div><div class="chart-view" data-view="benchmark" hidden><div class="legend"><span><i class="swatch portfolio"></i>{account_display_name}</span><span><i class="swatch index"></i><span id="benchmark-legend">Primary benchmark</span></span></div><div class="range-buttons" data-chart="#benchmark-chart" role="group" aria-label="Chart period"><button type="button" data-range="1m">1M</button><button type="button" data-range="3m">3M</button><button type="button" data-range="ytd">YTD</button><button type="button" data-range="1y">1Y</button><button type="button" data-range="all" class="active" aria-pressed="true">All</button></div><div class="chart-wrap"><canvas id="benchmark-chart" width="1100" height="320" aria-label="Rebased performance comparison chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div></div>
+<div class="card wide" id="perf-chart"><div class="chart-head"><div class="label chart-title">NAV history</div><div class="chart-mode" role="group" aria-label="Chart view"><button type="button" data-mode="value" data-title="NAV history" class="active" aria-pressed="true">Value</button><button type="button" data-mode="benchmark" data-title="Rebased performance comparison" aria-pressed="false">Vs benchmark</button></div></div><div class="chart-view" data-view="value"><div class="range-buttons" data-chart="#chart" role="group" aria-label="Chart period"><button type="button" data-range="1m">1M</button><button type="button" data-range="3m">3M</button><button type="button" data-range="ytd">YTD</button><button type="button" data-range="1y">1Y</button><button type="button" data-range="all" class="active" aria-pressed="true">All</button></div><div class="chart-wrap"><canvas id="chart" width="1100" height="320" aria-label="NAV history chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div><div class="chart-view" data-view="benchmark" hidden><div class="legend"><span><i class="swatch portfolio"></i>{account_display_name}</span></div><div id="benchmark-chips" class="benchmark-chips" role="group" aria-label="Benchmarks shown on the chart"></div><div id="benchmark-chart-note" class="muted benchmark-chart-note" role="status" aria-live="polite"></div><div class="range-buttons" data-chart="#benchmark-chart" role="group" aria-label="Chart period"><button type="button" data-range="1m">1M</button><button type="button" data-range="3m">3M</button><button type="button" data-range="ytd">YTD</button><button type="button" data-range="1y">1Y</button><button type="button" data-range="all" class="active" aria-pressed="true">All</button></div><div class="chart-wrap"><canvas id="benchmark-chart" width="1100" height="320" aria-label="Rebased performance comparison chart"></canvas><div class="chart-tooltip" role="status" aria-live="polite"></div></div></div></div>
 <div class="card wide" id="perf-returns"><div class="label">Period returns</div><div class="muted">Time-weighted returns (TWR) chain-link daily cash-flow-adjusted returns, so contributions and withdrawals do not count as performance. IRR is the annualised money-weighted return including the timing of those flows.</div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-returns"></tbody></table></div><div class="label" style="margin-top:18px">Custom period</div><div class="filter-grid"><label><span class="label">From</span><input id="period-from" type="date" min="{history_start_date}" aria-label="Custom period start date"></label><label><span class="label">To</span><input id="period-to" type="date" min="{history_start_date}" aria-label="Custom period end date"></label></div><div class="actions"><button id="period-apply" class="button" type="button">Calculate custom period</button></div><div class="table-scroll"><table><thead><tr><th>Period</th><th>From NAV date</th><th>To NAV date</th><th>TWR</th><th>TWR annualised</th><th>IRR annualised</th><th>Net flows ({reporting_currency})</th></tr></thead><tbody id="period-custom"></tbody></table></div><div id="period-note" class="muted" style="margin-top:12px">Loading period returns…</div></div>
 {PERFORMANCE_ANALYTICS_CARDS}
 <div class="card wide" id="perf-benchmark"><div class="label">Comparison benchmark</div><select id="benchmark-select" aria-label="Comparison benchmark"></select><div id="benchmark" class="value">Loading…</div><div id="benchmark-note" class="muted"></div><div id="benchmark-metrics" class="metrics"></div></div>
@@ -11348,7 +11393,7 @@ const chartColors={{portfolio:rootStyle.getPropertyValue('--chart-portfolio').tr
 const chartState=new Map();
 const niceTickStep=(lo,hi,targetIntervals=8)=>{{const span=Math.abs(hi-lo)||Math.max(Math.abs(hi),1),rough=span/Math.max(1,targetIntervals),magnitude=10**Math.floor(Math.log10(rough)),normalized=rough/magnitude,multiplier=normalized<=1?1:normalized<=2?2:normalized<=5?5:10;return multiplier*magnitude}};
 const chartBounds=(values,options)=>{{let lo=Math.min(...values),hi=Math.max(...values);const requestedStep=Number(options.yTickStep),tickStep=Number.isFinite(requestedStep)&&requestedStep>0?requestedStep:options.niceYTicks?niceTickStep(lo,hi,Number(options.targetYIntervals)||8):null;if(tickStep){{lo=Math.floor(lo/tickStep)*tickStep;hi=Math.ceil(hi/tickStep)*tickStep;if(lo===hi){{lo-=tickStep;hi+=tickStep}}return {{lo,hi,tickStep}}}}let range=hi-lo;if(!range)range=Math.max(Math.abs(hi)*.02,1);lo-=range*.05;hi+=range*.05;return {{lo,hi,tickStep:null}}}};
-const renderChart=(id,hoverIndex=null)=>{{const state=chartState.get(id),c=document.querySelector(id),ctx=c.getContext('2d'),tip=c.parentElement.querySelector('.chart-tooltip'),dpr=window.devicePixelRatio||1,cw=c.clientWidth||1100,ch=c.clientHeight||320;if(c.width!==Math.round(cw*dpr)||c.height!==Math.round(ch*dpr)){{c.width=Math.round(cw*dpr);c.height=Math.round(ch*dpr)}}ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,cw,ch);if(!state||!state.series.length){{tip.style.display='none';const empty=state&&state.options.emptyMessage;if(empty){{ctx.fillStyle=chartInk('--chart-text','#667085');ctx.font='13px Segoe UI';ctx.textAlign='center';ctx.fillText(empty,cw/2,ch/2);ctx.textAlign='left'}}return}}const {{series,lines,options}}=state,m={{left:100,right:22,top:18,bottom:48}},w=cw-m.left-m.right,h=ch-m.top-m.bottom,values=lines.flatMap(line=>series.map(row=>Number(row[line.key]))).filter(Number.isFinite),bounds=chartBounds(values,options),lo=bounds.lo,hi=bounds.hi,xFor=i=>m.left+i*w/Math.max(1,series.length-1),yFor=n=>m.top+(hi-n)*h/(hi-lo);ctx.font='12px Segoe UI';ctx.lineWidth=1;const yTicks=bounds.tickStep?Array.from({{length:Math.round((hi-lo)/bounds.tickStep)+1}},(_,i)=>hi-i*bounds.tickStep):Array.from({{length:5}},(_,i)=>hi-i*(hi-lo)/4);yTicks.forEach(value=>{{const y=yFor(value);ctx.strokeStyle=chartInk('--chart-grid','#e7ebf2');ctx.beginPath();ctx.moveTo(m.left,y);ctx.lineTo(cw-m.right,y);ctx.stroke();ctx.fillStyle=chartInk('--chart-text','#667085');ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(axis(value),m.left-9,y)}});for(let i=0;i<5;i++){{const index=Math.round(i*(series.length-1)/4),x=xFor(index);ctx.strokeStyle=chartInk('--chart-grid','#e7ebf2');ctx.beginPath();ctx.moveTo(x,m.top);ctx.lineTo(x,ch-m.bottom);ctx.stroke();ctx.fillStyle=chartInk('--chart-text','#667085');ctx.textAlign=i===0?'left':i===4?'right':'center';ctx.textBaseline='top';ctx.fillText(series[index].date,x,ch-m.bottom+9)}}ctx.strokeStyle=chartInk('--chart-text','#667085');ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(m.left,m.top);ctx.lineTo(m.left,ch-m.bottom);ctx.lineTo(cw-m.right,ch-m.bottom);ctx.stroke();ctx.fillStyle=chartInk('--chart-text','#667085');ctx.textAlign='center';ctx.textBaseline='bottom';ctx.fillText('Date',m.left+w/2,ch-2);ctx.save();ctx.translate(16,m.top+h/2);ctx.rotate(-Math.PI/2);ctx.textBaseline='middle';ctx.fillText(options.yLabel,0,0);ctx.restore();lines.forEach(line=>{{ctx.strokeStyle=line.color;ctx.lineWidth=2;ctx.beginPath();series.forEach((row,i)=>{{const x=xFor(i),y=yFor(Number(row[line.key]));i?ctx.lineTo(x,y):ctx.moveTo(x,y)}});ctx.stroke()}});if(hoverIndex!==null){{const row=series[hoverIndex],x=xFor(hoverIndex);ctx.strokeStyle=chartInk('--chart-axis','#98a2b3');ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,m.top);ctx.lineTo(x,ch-m.bottom);ctx.stroke();ctx.setLineDash([]);lines.forEach(line=>{{ctx.fillStyle=line.color;ctx.beginPath();ctx.arc(x,yFor(Number(row[line.key])),4,0,Math.PI*2);ctx.fill();ctx.strokeStyle=chartInk('--chart-point-ring','#fff');ctx.lineWidth=1.5;ctx.stroke()}});tip.innerHTML=`<strong>${{esc(row.date)}}</strong>`+lines.map(line=>`<div><span style="color:${{line.color}}">●</span> ${{esc(line.label)}}: <strong>${{exact(row[line.key])}}${{options.unit?' '+esc(options.unit):''}}</strong></div>`).join('');const cssX=x*c.clientWidth/cw;tip.style.left=(cssX>c.clientWidth*.72?cssX-205:cssX+12)+'px';tip.style.top='12px';tip.style.display='block'}}else tip.style.display='none'}};
+const renderChart=(id,hoverIndex=null)=>{{const state=chartState.get(id),c=document.querySelector(id),ctx=c.getContext('2d'),tip=c.parentElement.querySelector('.chart-tooltip'),dpr=window.devicePixelRatio||1,cw=c.clientWidth||1100,ch=c.clientHeight||320;if(c.width!==Math.round(cw*dpr)||c.height!==Math.round(ch*dpr)){{c.width=Math.round(cw*dpr);c.height=Math.round(ch*dpr)}}ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,cw,ch);if(!state||!state.series.length){{tip.style.display='none';const empty=state&&state.options.emptyMessage;if(empty){{ctx.fillStyle=chartInk('--chart-text','#667085');ctx.font='13px Segoe UI';ctx.textAlign='center';ctx.fillText(empty,cw/2,ch/2);ctx.textAlign='left'}}return}}const {{series,lines,options}}=state,m={{left:100,right:22,top:18,bottom:48}},w=cw-m.left-m.right,h=ch-m.top-m.bottom,has=v=>v!=null&&Number.isFinite(Number(v)),values=lines.flatMap(line=>series.filter(row=>has(row[line.key])).map(row=>Number(row[line.key]))),bounds=chartBounds(values,options),lo=bounds.lo,hi=bounds.hi,xFor=i=>m.left+i*w/Math.max(1,series.length-1),yFor=n=>m.top+(hi-n)*h/(hi-lo);ctx.font='12px Segoe UI';ctx.lineWidth=1;const yTicks=bounds.tickStep?Array.from({{length:Math.round((hi-lo)/bounds.tickStep)+1}},(_,i)=>hi-i*bounds.tickStep):Array.from({{length:5}},(_,i)=>hi-i*(hi-lo)/4);yTicks.forEach(value=>{{const y=yFor(value);ctx.strokeStyle=chartInk('--chart-grid','#e7ebf2');ctx.beginPath();ctx.moveTo(m.left,y);ctx.lineTo(cw-m.right,y);ctx.stroke();ctx.fillStyle=chartInk('--chart-text','#667085');ctx.textAlign='right';ctx.textBaseline='middle';ctx.fillText(axis(value),m.left-9,y)}});for(let i=0;i<5;i++){{const index=Math.round(i*(series.length-1)/4),x=xFor(index);ctx.strokeStyle=chartInk('--chart-grid','#e7ebf2');ctx.beginPath();ctx.moveTo(x,m.top);ctx.lineTo(x,ch-m.bottom);ctx.stroke();ctx.fillStyle=chartInk('--chart-text','#667085');ctx.textAlign=i===0?'left':i===4?'right':'center';ctx.textBaseline='top';ctx.fillText(series[index].date,x,ch-m.bottom+9)}}ctx.strokeStyle=chartInk('--chart-text','#667085');ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(m.left,m.top);ctx.lineTo(m.left,ch-m.bottom);ctx.lineTo(cw-m.right,ch-m.bottom);ctx.stroke();ctx.fillStyle=chartInk('--chart-text','#667085');ctx.textAlign='center';ctx.textBaseline='bottom';ctx.fillText('Date',m.left+w/2,ch-2);ctx.save();ctx.translate(16,m.top+h/2);ctx.rotate(-Math.PI/2);ctx.textBaseline='middle';ctx.fillText(options.yLabel,0,0);ctx.restore();lines.forEach(line=>{{ctx.strokeStyle=line.color;ctx.lineWidth=2;ctx.beginPath();let started=false;series.forEach((row,i)=>{{if(!has(row[line.key]))return;const x=xFor(i),y=yFor(Number(row[line.key]));started?ctx.lineTo(x,y):ctx.moveTo(x,y);started=true}});ctx.stroke()}});if(hoverIndex!==null){{const row=series[hoverIndex],x=xFor(hoverIndex);ctx.strokeStyle=chartInk('--chart-axis','#98a2b3');ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,m.top);ctx.lineTo(x,ch-m.bottom);ctx.stroke();ctx.setLineDash([]);lines.filter(line=>has(row[line.key])).forEach(line=>{{ctx.fillStyle=line.color;ctx.beginPath();ctx.arc(x,yFor(Number(row[line.key])),4,0,Math.PI*2);ctx.fill();ctx.strokeStyle=chartInk('--chart-point-ring','#fff');ctx.lineWidth=1.5;ctx.stroke()}});tip.innerHTML=`<strong>${{esc(row.date)}}</strong>`+lines.map(line=>`<div><span style="color:${{line.color}}">●</span> ${{esc(line.label)}}: <strong>${{has(row[line.key])?exact(row[line.key])+(options.unit?' '+esc(options.unit):''):'—'}}</strong></div>`).join('');const cssX=x*c.clientWidth/cw;tip.style.left=(cssX>c.clientWidth*.72?cssX-205:cssX+12)+'px';tip.style.top='12px';tip.style.display='block'}}else tip.style.display='none'}};
 const draw=(id,series,lines,options={{}})=>{{chartSource.set(id,{{series,lines,options}});series=rangeSeries(id,series,options);const c=document.querySelector(id);chartState.set(id,{{series,lines,options:{{yLabel:'Value',unit:'',...options}}}});c.onmousemove=e=>{{if(!series.length)return;const r=c.getBoundingClientRect(),x=(e.clientX-r.left)*c.clientWidth/r.width,left=100,right=22,index=Math.max(0,Math.min(series.length-1,Math.round((x-left)/(c.clientWidth-left-right)*Math.max(1,series.length-1))));renderChart(id,index)}};c.onmouseleave=()=>renderChart(id);renderChart(id)}};
 let benchmarks=[];
 const loadCashActivity=async()=>{{
@@ -11395,21 +11440,38 @@ document.querySelector('#flows-statement').innerHTML=f.flows.map(x=>`<tr><td>${{
 document.querySelector('#flows-note').textContent=f.applicable?`Showing ${{f.totals.count}} dated external flows from ${{f.from_date}} through ${{f.to_date||asOf}}, net per day in ${{f.currency}}. Deposits, withdrawals and transfers in or out are external flows; dividends, interest and fees are not.`:f.message;
 }};
 document.querySelector('#period-apply').addEventListener('click',()=>loadPerformancePeriods().catch(()=>{{document.querySelector('#period-note').textContent='Unable to calculate this period. Check that the start date is not after the end date.'}}));
+const comparisonCache=new Map();
+const loadComparison=(id,asOf)=>{{const key=`${{id}}|${{asOf}}`;if(!comparisonCache.has(key))comparisonCache.set(key,fetch(`/api/portfolio/${{account}}/benchmark-comparison?benchmark_id=${{encodeURIComponent(id)}}&as_of=${{encodeURIComponent(asOf)}}`).then(json).catch(error=>{{comparisonCache.delete(key);throw error}}));return comparisonCache.get(key)}};
+const benchmarkPalette=['#0ea5e9','#16a34a','#dc2626','#9333ea','#db2777','#0d9488','#ca8a04','#64748b','#ea580c','#4f46e5','#65a30d'];
+const benchmarkColor=meta=>meta.mapping_type==='primary'?chartColors.benchmark:benchmarkPalette[Math.max(0,benchmarks.filter(x=>x.mapping_type!=='primary').indexOf(meta))%benchmarkPalette.length];
+let chartBenchmarks=new Set(),benchmarkChartRequest=0;
+const renderBenchmarkChips=()=>{{const host=document.querySelector('#benchmark-chips');if(!host)return;host.innerHTML=benchmarks.map(x=>`<button type="button" class="benchmark-chip" data-benchmark-id="${{esc(x.benchmark_id)}}" aria-pressed="${{chartBenchmarks.has(x.benchmark_id)}}" title="${{esc(x.name)}} (${{esc(x.symbol)}})"><i class="swatch" style="background:${{benchmarkColor(x)}}"></i>${{esc(x.name)}}</button>`).join('')+(benchmarks.length>1?'<span class="benchmark-chip-actions"><button type="button" class="benchmark-clear" data-benchmark-set="all">Show all</button><button type="button" class="benchmark-clear" data-benchmark-set="primary">Primary only</button></span>':'')}};
+const renderBenchmarkChart=async asOf=>{{
+const request=++benchmarkChartRequest,chart=document.querySelector('#benchmark-chart'),note=document.querySelector('#benchmark-chart-note'),chosen=benchmarks.filter(x=>chartBenchmarks.has(x.benchmark_id));
+const results=await Promise.all(chosen.map(meta=>loadComparison(meta.benchmark_id,asOf).then(bc=>({{meta,bc}}),()=>({{meta,bc:null}}))));
+if(request!==benchmarkChartRequest)return;
+const shown=results.filter(r=>r.bc&&r.bc.available&&(r.bc.series||[]).length),missing=results.filter(r=>!shown.includes(r)).map(r=>r.meta.name);
+note.textContent=missing.length?`No validated comparison for this date: ${{missing.join(', ')}}.`:'';
+if(!shown.length){{draw('#benchmark-chart',[],[],{{emptyMessage:'No validated comparison is available for this benchmark and date.'}});certifiedLine(chart,null);return}}
+// The first chosen comparison sets the portfolio line; each other benchmark starts where that line is on its first shared date.
+const bc=shown[0].bc,rows=bc.series.map(r=>({{date:r.date,portfolio:r.portfolio}})),byDate=new Map(rows.map(r=>[r.date,r])),lines=[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}}];
+shown.forEach(({{meta,bc}},i)=>{{const key=`benchmark_${{i}}`,anchor=bc.series.find(r=>byDate.has(r.date)&&Number(r.portfolio)&&byDate.get(r.date).portfolio!=null);if(!anchor)return;const scale=Number(byDate.get(anchor.date).portfolio)/Number(anchor.portfolio);bc.series.forEach(r=>{{const row=byDate.get(r.date);if(row&&r.benchmark!=null)row[key]=Number(r.benchmark)*scale}});lines.push({{key,color:benchmarkColor(meta),label:meta.name}})}});
+rows.forEach(r=>lines.forEach(l=>{{if(!(l.key in r))r[l.key]=null}}));
+draw('#benchmark-chart',rows,lines,{{yLabel:'Rebased value',...(lines.length>2?{{niceYTicks:true}}:{{yTickStep:10}})}});
+certifiedLine(chart,lines.length===2?chartsFor(bc.certified_charts,['series.portfolio_daily_return','series.benchmark_daily_return'],'Vs benchmark'):null)
+}};
+document.querySelector('#benchmark-chips')?.addEventListener('click',event=>{{const chip=event.target.closest('[data-benchmark-id]'),set=event.target.closest('[data-benchmark-set]');if(!chip&&!set)return;if(set){{const primary=benchmarks.find(x=>x.mapping_type==='primary')||benchmarks[0];chartBenchmarks=new Set(set.dataset.benchmarkSet==='all'?benchmarks.map(x=>x.benchmark_id):primary?[primary.benchmark_id]:[])}}else{{const id=chip.dataset.benchmarkId;if(chartBenchmarks.has(id)){{if(chartBenchmarks.size===1)return;chartBenchmarks.delete(id)}}else chartBenchmarks.add(id)}}renderBenchmarkChips();renderBenchmarkChart(document.querySelector('#asof-select').value).catch(()=>{{draw('#benchmark-chart',[],[],{{emptyMessage:'The benchmark comparison could not be loaded.'}})}})}});
 const renderBenchmark=async(id,meta,asOf)=>{{
-const query=`benchmark_id=${{encodeURIComponent(id)}}&as_of=${{encodeURIComponent(asOf)}}`;
-const bc=await fetch(`/api/portfolio/${{account}}/benchmark-comparison?${{query}}`).then(json);
+const bc=await loadComparison(id,asOf);
 document.querySelector('#benchmark').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.mapping_type==='primary'?'Primary':meta.mapping_type==='comparison'?'Comparison':'Secondary'}} · ${{meta.return_basis_label||meta.return_convention}}`;
-document.querySelector('#benchmark-legend').textContent=`${{meta.name}} (${{meta.symbol}}) · ${{meta.return_basis==='price_return'?'price return':meta.return_basis==='total_return'?'total return':meta.return_convention}}`;
 document.querySelector('#benchmark-note').textContent=meta.message+`${{meta.return_basis==='price_return'?' The benchmark is a price index: its returns exclude dividends, while portfolio returns include income, so the comparison favours the portfolio by the index dividend yield.':''}} Provider: ${{meta.provider||'—'}} · Convention: ${{meta.return_convention}} · License: ${{meta.license_status}} · Provisional observations: ${{meta.provisional_observations}} · Latest feed observation: ${{meta.latest_provisional_observation||'—'}}`;
 document.querySelector('#benchmark-metrics').innerHTML='';certifiedLine(document.querySelector('#benchmark-metrics'),null);
-draw('#benchmark-chart',[],[],{{emptyMessage:bc.available?'':'No validated comparison is available for this benchmark and date.'}});certifiedLine(document.querySelector('#benchmark-chart'),null);renderRollingBenchmark(null);
+renderRollingBenchmark(null);
 if(bc.available){{
 const m=bc.metrics,items=[['Portfolio total return',pct(m.portfolio_total_return)],['Benchmark total return',pct(m.benchmark_total_return),bc.benchmark_return_basis==='price_return'?'Benchmark price return (excludes dividends)':undefined],['Excess total return',pct(m.excess_total_return),bc.benchmark_return_basis==='price_return'?'Excess return vs price index':undefined],['Tracking error',pct(m.tracking_error)],['Information ratio',m.information_ratio==null?'—':fmt(m.information_ratio)],['Beta',m.beta==null?'—':fmt(m.beta)],['Correlation',m.correlation==null?'—':fmt(m.correlation)],['Relative win rate',pct(m.relative_win_rate)]];
 document.querySelector('#benchmark-note').textContent+=` Aligned comparison: ${{m.period_start}} through ${{m.period_end}} · Reporting currency: ${{bc.reporting_currency}} · ${{m.observations}} common-date observations. Rebased to 100 at the first common observation; unmatched market dates are not filled.`;
 document.querySelector('#benchmark-metrics').innerHTML=items.map(metricCard).join('');certifiedLine(document.querySelector('#benchmark-metrics'),bc.certified);
 renderRollingBenchmark(bc);
-draw('#benchmark-chart',bc.series,[{{key:'portfolio',color:chartColors.portfolio,label:accountDisplayName}},{{key:'benchmark',color:chartColors.benchmark,label:bc.benchmark.name}}],{{yLabel:'Rebased value',yTickStep:10}});
-certifiedLine(document.querySelector('#benchmark-chart'),chartsFor(bc.certified_charts,['series.portfolio_daily_return','series.benchmark_daily_return'],'Vs benchmark'))
 }}
 }};
 {RISK_DISPLAY_SCRIPT}
@@ -11464,7 +11526,8 @@ const cashFrom=document.querySelector('#cash-from'),cashTo=document.querySelecto
 const tradeFrom=document.querySelector('#trade-from'),tradeTo=document.querySelector('#trade-to');if(!tradeFrom.value)tradeFrom.value=historyStartDate;tradeTo.max=asOf;tradeTo.value=asOf;if(tradeFrom.value>asOf)tradeFrom.value=historyStartDate;if(activeSection==='trades')await loadTradeHistory().catch(()=>{{document.querySelector('#trade-note').textContent='Trade history could not be loaded for this date. Refresh the page or pick another As of date.'}});
 draw('#chart',p.series,[{{key:'nav',color:chartColors.portfolio,label:`${{accountDisplayName}} NAV`}}],{{yLabel:`NAV (${{reportingCurrency}})`,unit:reportingCurrency,niceYTicks:true,targetYIntervals:8,emptyMessage:p.failed?'NAV history could not be loaded for this date.':'No NAV history up to this date.'}});
 const benchmarkSelect=document.querySelector('#benchmark-select'),selected=benchmarks.find(x=>x.benchmark_id===benchmarkSelect.value);
-if(activeSection==='performance'&&selected)await renderBenchmark(selected.benchmark_id,selected,asOf).catch(()=>{{document.querySelector('#benchmark-note').textContent='This benchmark comparison could not be loaded for this date.';draw('#benchmark-chart',[],[],{{emptyMessage:'The benchmark comparison could not be loaded.'}})}});
+if(activeSection==='performance'&&selected)await renderBenchmark(selected.benchmark_id,selected,asOf).catch(()=>{{document.querySelector('#benchmark-note').textContent='This benchmark comparison could not be loaded for this date.'}});
+if(activeSection==='performance'&&chartBenchmarks.size)await renderBenchmarkChart(asOf).catch(()=>{{draw('#benchmark-chart',[],[],{{emptyMessage:'The benchmark comparison could not be loaded.'}})}});
 if(activeSection==='risk'){{if(selected)fetch(`/api/portfolio/${{account}}/benchmark-comparison?benchmark_id=${{encodeURIComponent(selected.benchmark_id)}}&as_of=${{encodeURIComponent(asOf)}}`).then(json).then(bc=>renderRollingBenchmark(bc.available?bc:null)).catch(()=>renderRollingBenchmark(null));else renderRollingBenchmark(null)}}
 const periodFrom=document.querySelector('#period-from'),periodTo=document.querySelector('#period-to');periodFrom.max=asOf;periodTo.max=asOf;if(periodTo.value>asOf)periodTo.value=asOf;if(periodFrom.value>asOf)periodFrom.value='';
 if(activeSection==='performance')await loadPerformancePeriods().catch(()=>{{document.querySelector('#period-note').textContent='Period returns are unavailable for this date.'}})
@@ -11514,7 +11577,7 @@ adminPreview.addEventListener('click',async()=>{{adminPreview.disabled=true;admi
 adminExecute.addEventListener('click',async()=>{{if(!currentApproval)return;adminExecute.disabled=true;adminPreview.disabled=true;const result=document.querySelector('#admin-result');result.textContent='Executing the single approved staging action…';try{{const response=await fetch(`/api/admin/actions/${{currentApproval.approval_id}}/approve`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action_payload_sha256:currentApproval.action_payload_sha256,confirmation:adminConfirmation.value}})}}).then(json);result.innerHTML=`<strong>Executed once.</strong> Action: ${{esc(response.action_type)}} · Approval ID: ${{esc(response.approval_id)}} · Correlation ID: ${{esc(response.correlation_id)}}`;currentApproval=null;adminConfirmation.value='';adminConfirmation.disabled=true}}catch(error){{result.textContent='Action was not executed. Check the exact approval phrase or create a new preview.';adminExecute.disabled=false}}finally{{adminPreview.disabled=!admin.enabled}}}});
 asOfSelect.innerHTML=d.dates.map(x=>`<option value="${{esc(x)}}">${{esc(asOfLabel(x))}}</option>`).join('');asOfSelect.value=storedAsOf(d.dates)||d.latest;showFreshness(d.latest);
 benchmarks=b.benchmarks||[];benchmarkSelect.innerHTML=benchmarks.map(x=>`<option value="${{esc(x.benchmark_id)}}">${{x.mapping_type==='primary'?'Primary':x.mapping_type==='comparison'?'Comparison':'Secondary'}} — ${{esc(x.name)}} (${{esc(x.symbol)}})</option>`).join('');
-if(benchmarks.length){{const primary=benchmarks.find(x=>x.mapping_type==='primary')||benchmarks[0];benchmarkSelect.value=primary.benchmark_id;benchmarkSelect.addEventListener('change',()=>{{const selected=benchmarks.find(x=>x.benchmark_id===benchmarkSelect.value);renderBenchmark(selected.benchmark_id,selected,asOfSelect.value).catch(()=>{{document.querySelector('#benchmark-note').textContent='Unable to load this comparison.'}})}})}}else{{document.querySelector('#benchmark').textContent=b.failed?'Unavailable':'Not configured';if(b.failed)document.querySelector('#benchmark-note').textContent='The benchmark list could not be loaded. Refresh the page to try again.';benchmarkSelect.disabled=true}}
+if(benchmarks.length){{const primary=benchmarks.find(x=>x.mapping_type==='primary')||benchmarks[0];benchmarkSelect.value=primary.benchmark_id;chartBenchmarks=new Set([primary.benchmark_id]);renderBenchmarkChips();benchmarkSelect.addEventListener('change',()=>{{const selected=benchmarks.find(x=>x.benchmark_id===benchmarkSelect.value);renderBenchmark(selected.benchmark_id,selected,asOfSelect.value).catch(()=>{{document.querySelector('#benchmark-note').textContent='Unable to load this comparison.'}})}})}}else{{document.querySelector('#benchmark').textContent=b.failed?'Unavailable':'Not configured';if(b.failed)document.querySelector('#benchmark-note').textContent='The benchmark list could not be loaded. Refresh the page to try again.';benchmarkSelect.disabled=true}}
 asOfSelect.addEventListener('change',()=>(rememberAsOf(asOfSelect.value),renderAsOf(asOfSelect.value)).catch(error=>loadFailure(error,'The figures for this date could not be loaded. Pick another date or refresh the page.')));
 if(!previewMode){{const savedConversations=await refreshConversations(null);if(savedConversations.length)await openConversation(savedConversations[0].conversation_id);else{{updateChatHeader(null);emptyChat()}}}}else{{updateChatHeader(null);emptyChat()}}analysisRun.disabled=!a.ai_model.enabled;
 await renderAsOf(asOfSelect.value)
@@ -11561,6 +11624,12 @@ def _upload_intake_document(container: str, blob: str, content: bytes, content_t
     upload_bytes(AZURE_STORAGE_ACCOUNT_URL, container, blob, content, overwrite=False, content_type=content_type)
 
 
+def _start_onboarding_worker() -> str:
+    if not ADMIN_ACTION_CONFIG.subscription_id or not ADMIN_ACTION_CONFIG.resource_group:
+        raise AdminActionError(503, "azure_job_starter_unavailable", "The Azure job starter is not configured")
+    return _default_job_starter(ADMIN_ACTION_CONFIG, ONBOARDING_WORKER_JOB_NAME)
+
+
 # New account onboarding (broker connections and four-stage cases). Every
 # route answers 404 unless ONBOARDING_V2_ENABLED is true; see onboarding_v2_web.py.
 onboarding_v2_web.install(
@@ -11583,6 +11652,8 @@ onboarding_v2_web.install(
     intake_container=ONBOARDING_INTAKE_CONTAINER,
     # "Ask about this case", answered by the agent service from the case's facts (also behind that switch).
     ask_case=lambda: _case_question_stream(),
+    # Run now and Check now start the onboarding worker job (the web identity may start only that job).
+    start_worker=lambda: _start_onboarding_worker(),
 )
 
 

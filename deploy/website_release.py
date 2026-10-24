@@ -11,7 +11,7 @@ Steps, each a subcommand so the workflow can show and stop at each one:
                    the assurance job itself is not changed
 State passes between steps in release-state.json.
 """
-import ast, base64, difflib, gzip, hashlib, json, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
+import ast, base64, difflib, gzip, hashlib, itertools, json, re, secrets, subprocess, sys, tempfile, time, tomllib, urllib.request, urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -150,14 +150,16 @@ def website_modules(files):
 
 
 def first_imported(before, after):
-    """Unchanged files the reviewed website imports and the live one did not.
+    """Files the deployed commit has that the reviewed website imports and the live one did not.
 
-    The patch carries only files that changed, so such a file may be missing from
-    the live image, or be an older copy nothing there imported (run 25 on 14 Oct:
-    the reviewed web.py imports report_design_ui, which the live web.py never did).
-    The build adds these files whole.
+    The live image may lack such a file, or hold an older copy nothing there imported
+    (run 25 on 14 Oct: the reviewed web.py imports report_design_ui, which the live
+    web.py never did). The patch does not carry an unchanged one, and cannot patch a
+    changed one the live image lacks (certified_build.py, run 55 on 22 Oct), so the
+    build adds them whole. A changed one the live image has is patched as usual.
+    Files new in the repo are left to the patch, which creates them.
     """
-    return sorted(n for n in website_modules(after) - website_modules(before) if before.get(n) == after[n])
+    return sorted(n for n in website_modules(after) - website_modules(before) if n in before)
 
 
 def change_set(state, merged=None):
@@ -256,12 +258,13 @@ def prepare():
     if subprocess.run(['git', 'merge-base', '--is-ancestor', deployed, head], cwd=ROOT).returncode:
         raise SystemExit(f'Live website commit {deployed} is not in this branch history')
     changed = [p for p in git('diff', '--name-only', deployed, head).split() if p]
-    # Scripts (Node report renderers and Python job/operator scripts) are run by
-    # the reporting jobs or by hand, never by the website, and this path only
-    # overlays src/ibkr_etl on live anyway, so they keep their live versions.
-    skipped = [p for p in changed if p.startswith('scripts/') and p.endswith(('.mjs', '.py'))]
+    # Scripts (Node report renderers, Python job/operator scripts and the PowerShell
+    # deployment scripts operators run on their own machine) are run by the
+    # reporting jobs or by hand, never by the website, and this path only overlays
+    # src/ibkr_etl on live anyway, so they keep their live versions.
+    skipped = [p for p in changed if p.startswith('scripts/') and p.endswith(('.mjs', '.py', '.ps1'))]
     if skipped:
-        print('Not part of the website release (reporting scripts):\n  ' + '\n  '.join(skipped))
+        print('Not part of the website release (scripts run by jobs or by hand):\n  ' + '\n  '.join(skipped))
     # Database migrations are applied by the bootstrap job, never by this release.
     migrations = [p for p in changed if p.startswith('migrations/postgres/')]
     if migrations:
@@ -384,7 +387,7 @@ def overlay_build(state, merged=None):
         'design_hashes': {n: hashlib.sha256(d).hexdigest() for n, d in designs.items()},
     }
     command = remote_script(config)
-    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    vm = build_vm()
     started = vm.get('powerState') != 'VM running'
     if started:
         print('Starting the build VM')
@@ -492,11 +495,66 @@ def acr_build():
     print('Built', state['pushed_image'])
 
 
+# Run Commands on the build VM, one at a time and each under a name of its own. Twice on
+# 22 Oct (Deploy website runs 56 and 57) the second read of build detail re-created
+# website-detail-0 a minute after the first one was deleted, while the capture before it
+# was still being removed; it never finished and the VM stayed in Updating until it was
+# restarted from the serial console. So no name is reused within a release, and each Run
+# Command is removed, and the removal waited for, before the next one starts.
+RUN_TAG = secrets.token_hex(3)
+_run_serial = itertools.count(1)
+REMOVE_WAIT = 900
+# A Run Command whose removal never finished. Nothing more is run on the VM after one.
+_not_removed = []
+# The tag rule refuses any new resource without these tags, Run Commands included, so each
+# one carries the build VM's own.
+RUN_COMMAND_TAGS = ('layer', 'component', 'owner')
+_vm_tags = {}
+
+
+def build_vm():
+    """The build VM as `az vm show -d` gives it; also notes the tags its Run Commands will carry."""
+    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    tags = {k: str((vm.get('tags') or {}).get(k) or '') for k in RUN_COMMAND_TAGS}
+    if not all(tags.values()):
+        raise SystemExit('The build VM lacks its layer, component or owner tag, so the tag rule would refuse its '
+                         'Run Commands. Nothing was run on it.')
+    _vm_tags.clear()
+    _vm_tags.update(tags)
+    return vm
+
+
+def run_command_name(name):
+    return f'{name}-{RUN_TAG}-{next(_run_serial)}'
+
+
+def remove_run_command(url):
+    """Delete a Run Command and wait until Azure no longer has it; False if it is still there."""
+    for _ in range(2):
+        deleted = subprocess.run(['az', 'rest', '--method', 'delete', '--url', url], capture_output=True, text=True)
+        if deleted.returncode == 0 or 'NotFound' in deleted.stderr:
+            break
+        time.sleep(10)
+    deadline = time.time() + REMOVE_WAIT
+    while time.time() < deadline:
+        got = subprocess.run(['az', 'rest', '--method', 'get', '--url', url], capture_output=True, text=True)
+        if got.returncode != 0 and ('NotFound' in got.stderr or 'Not Found' in got.stderr):
+            return True
+        time.sleep(10)
+    return False
+
+
 def vm_run(base, name, script, location, timeout):
     """Run a script on the build VM through Run Command and return its instance view."""
+    if _not_removed:
+        raise SystemExit(f'Not running {name} on the build VM: Run Command {_not_removed[0]} was never removed, '
+                         'so the VM may be stuck. Check it before the next release.')
+    if not _vm_tags:
+        raise SystemExit(f'Not running {name} on the build VM: its tags were not read, so the tag rule would refuse it.')
+    name = run_command_name(name)
     url = base + name + '?api-version=2024-07-01'
     body = Path('run-command.json')
-    body.write_text(json.dumps({'location': location, 'properties': {
+    body.write_text(json.dumps({'location': location, 'tags': dict(_vm_tags), 'properties': {
         'source': {'script': script}, 'asyncExecution': True, 'timeoutInSeconds': timeout, 'treatFailureAsDeploymentFailure': False}}))
     try:
         az('rest', '--method', 'put', '--url', url, '--body', '@' + str(body), parse=False)
@@ -509,7 +567,13 @@ def vm_run(base, name, script, location, timeout):
                 raise SystemExit('Run Command did not finish in time')
             time.sleep(10)
     finally:
-        subprocess.run(['az', 'rest', '--method', 'delete', '--url', url], capture_output=True)
+        if not remove_run_command(url):
+            _not_removed.append(name)
+            message = (f'Run Command {name} was not removed within {REMOVE_WAIT // 60} minutes, so the build VM may be '
+                       'stuck; nothing more is run on it in this release')
+            if sys.exc_info()[0] is None:
+                raise SystemExit(message)
+            print(message)
 
 
 def read_detail(base, location, path, size):
@@ -524,7 +588,8 @@ def read_detail(base, location, path, size):
             view = vm_run(base, f'website-detail-{offset // 4000}', f"tail -c +{offset + 1} {path} | head -c 4000", location, 900)
             encoded += (view.get('output') or '').strip()
     finally:
-        vm_run(base, 'website-detail-cleanup', 'rm -f ' + path, location, 900)
+        if not _not_removed:
+            vm_run(base, 'website-detail-cleanup', 'rm -f ' + path, location, 900)
     if len(encoded) != size:
         raise SystemExit(f'Read {len(encoded)} of {size} bytes of build detail')
     return encoded
@@ -545,7 +610,7 @@ def remote_script(config):
 
 def read_only_on_vm(config, run_name):
     """Run a read-only capture or inventory on the build VM; return its result and detail."""
-    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    vm = build_vm()
     started = vm.get('powerState') != 'VM running'
     if started:
         az('vm', 'start', '-g', RG, '-n', VM, parse=False)
@@ -700,7 +765,7 @@ def assurance_build():
     code = code.replace(marker, 'CONFIG = json.loads(' + repr(json.dumps(assurance_config(head))) + ')')
     command = "cat > /tmp/wealthryse-website-build.py <<'WEALTHRYSE_EOF'\n" + code + "\nWEALTHRYSE_EOF\n" \
               "unshare --mount --propagation private python3 /tmp/wealthryse-website-build.py; status=$?; rm -f /tmp/wealthryse-website-build.py; exit $status"
-    vm = az('vm', 'show', '-g', RG, '-n', VM, '-d')
+    vm = build_vm()
     started = vm.get('powerState') != 'VM running'
     if started:
         az('vm', 'start', '-g', RG, '-n', VM, parse=False)
@@ -912,8 +977,65 @@ def pages():
     print('Website pages set for', stage)
 
 
+# Website design (src/ibkr_etl/web_next.py): classic, preview (owners can opt in) or next.
+DESIGN_SETTING = 'WEB_DESIGN'
+DESIGN_MODES = ('classic', 'preview', 'next')
+# The page-by-page redesign (web_next_pages) has its own switch: pages-off, pages-preview, pages-on.
+NEXT_PAGES_SETTING = 'WEB_NEXT_PAGES'
+NEXT_PAGES_MODES = ('pages-off', 'pages-preview', 'pages-on')
+NEXT_PAGES_WORDS = {'off': 0, 'preview': 0, 'on': 1}
+
+
+def next_pages_value(mode, previous, latest):
+    """The WEB_NEXT_PAGES value for a mode. Each phase of the page-by-page redesign goes to
+    owners first: pages-preview keeps everyone on the phases they have and gives owners the
+    latest; pages-on gives everyone the latest; pages-off turns it all off."""
+    if mode == 'pages-off':
+        return 'off'
+    if mode == 'pages-on':
+        return str(latest)
+    text = str(previous or 'off').strip().lower()
+    match = re.fullmatch(r'(\d+)(?:/\d+)?', text)
+    live = min(int(match.group(1)), latest) if match else NEXT_PAGES_WORDS.get(text, 0)
+    return str(latest) if live >= latest else f'{live}/{latest}'
+
+
+def next_pages_latest():
+    """How many phases the code in this checkout has (PAGES_PHASES in web_next.py)."""
+    source = (ROOT / 'src' / 'ibkr_etl' / 'web_next.py').read_text(encoding='utf-8')
+    return int(re.search(r'^PAGES_PHASES = (\d+)$', source, re.MULTILINE).group(1))
+
+
+def design():
+    """Set WEB_DESIGN (classic, preview, next) or WEB_NEXT_PAGES (pages-off, pages-preview, pages-on)
+    on the website; leaves the image alone."""
+    mode = sys.argv[2]
+    if mode not in DESIGN_MODES + NEXT_PAGES_MODES:
+        raise SystemExit('Design must be classic, preview, next, pages-off, pages-preview or pages-on')
+    setting = NEXT_PAGES_SETTING if mode in NEXT_PAGES_MODES else DESIGN_SETTING
+    app = az('containerapp', 'show', '-n', APP, '-g', RG)
+    env = {e['name']: e.get('value') for e in app['properties']['template']['containers'][0].get('env', [])}
+    previous = env.get(setting) or ('off' if setting == NEXT_PAGES_SETTING else 'classic')
+    value = next_pages_value(mode, previous, next_pages_latest()) if setting == NEXT_PAGES_SETTING else mode
+    print(setting, 'was', previous)
+    suffix = 'design-' + mode + '-' + str(int(time.time()))[-6:]
+    az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
+       '--set-env-vars', setting + '=' + value, parse=False)
+    STATE.write_text(json.dumps({'changed_files': [setting], 'revision': APP + '--' + suffix,
+                                 'fqdn': app['properties']['configuration']['ingress']['fqdn'],
+                                 'secrets': secret_kinds(app),
+                                 'previous_design': previous, 'design_setting': setting}, indent=2))
+    print(setting, 'set to', value)
+
+
 def rollback():
     state = json.loads(STATE.read_text())
+    if 'previous_design' in state:
+        suffix = 'design-rollback-' + str(int(time.time()))[-6:]
+        az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
+           '--set-env-vars', state.get('design_setting', DESIGN_SETTING) + '=' + state['previous_design'], parse=False)
+        print(state.get('design_setting', DESIGN_SETTING), 'set back to', state['previous_design'])
+        return
     if 'previous_pages' in state:
         suffix = 'pages-rollback-' + str(int(time.time()))[-6:]
         az('containerapp', 'update', '-n', APP, '-g', RG, '--container-name', 'web', '--revision-suffix', suffix,
@@ -932,5 +1054,5 @@ def rollback():
 
 
 if __name__ == '__main__':
-    {'prepare': prepare, 'build': build, 'acr-build': acr_build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat, 'pages': pages,
+    {'prepare': prepare, 'build': build, 'acr-build': acr_build, 'capture': capture, 'deploy': deploy, 'verify': verify, 'rollback': rollback, 'chat': chat, 'pages': pages, 'design': design,
      'assurance-build': assurance_build, 'inventory': inventory}[sys.argv[1]]()

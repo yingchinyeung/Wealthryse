@@ -32,6 +32,9 @@ Checks on each version:
   a NAV has its primary benchmark comparison. A missing secondary, or a comparison more
   than four days behind the NAV, warns only.
 
+The logged line and the verdict never carry money figures (NAV, positions, cash, the books'
+NAV): the line goes to Log Analytics, so gaps are given as a share of NAV instead.
+
 Only a failed check holds a version back; anything that could not be checked warns, so a
 slow database never holds back a good version. Tolerances come from the code that already
 compares these figures (see below).
@@ -323,8 +326,50 @@ def judge_nav(evidence: Mapping[str, Any]) -> dict[str, Any]:
         reasons.append(f"{ambiguous['dates']} day(s) where IBKR's statement has more than one total NAV row "
                        "(TOTAL with ALL or blank)")
     verdict = _worst(states) if checked else SKIPPED
+    for item in problems.values():
+        item["samples"] = [_nav_sample(sample) for sample in item.get("samples") or ()]
     return {"verdict": verdict, "checked": checked, "problems": problems, "ambiguous_ibkr_total": ambiguous,
             "tolerance": {"relative": ROUNDING_RELATIVE, "absolute": ROUNDING_ABSOLUTE}, "reasons": reasons}
+
+
+# Money figures the measuring queries read. Verdicts are logged (PUBLISH_GATE lines in Log
+# Analytics) and stored with certified builds, so none of these ever reaches a verdict.
+MONEY_KEYS = frozenset({"nav", "positions", "cash", "difference", "gold", "books"})
+
+
+def _share(part: Any, whole: Any) -> str | None:
+    """part as a share of whole, to four places (0.0123 is 1.23%); None if either is unreadable or whole is 0."""
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        part, whole = Decimal(str(part)), Decimal(str(whole))
+        if not whole.is_finite() or not part.is_finite() or whole == 0:
+            return None
+        return str((part / abs(whole)).quantize(Decimal("0.0001")))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _nav_sample(sample: Any) -> dict[str, Any]:
+    """A NAV problem sample without its figures: the gap as a share of the books' NAV instead."""
+    sample = dict(sample) if isinstance(sample, Mapping) else {}
+    gold, books = sample.get("gold"), sample.get("books")
+    kept = {key: value for key, value in sample.items() if key not in MONEY_KEYS}
+    if gold is not None and books is not None:
+        try:
+            kept["gap_share"] = _share(float(gold) - float(books), books)
+        except (TypeError, ValueError):
+            pass
+    return kept
+
+
+def without_figures(value: Any) -> Any:
+    """A copy of a verdict with every money figure taken out, at any depth."""
+    if isinstance(value, Mapping):
+        return {key: without_figures(item) for key, item in value.items() if key not in MONEY_KEYS}
+    if isinstance(value, (list, tuple)):
+        return [without_figures(item) for item in value]
+    return value
 
 
 def judge_holdings(evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -356,12 +401,14 @@ def judge_holdings(evidence: Mapping[str, Any]) -> dict[str, Any]:
         tolerance = max(Decimal(1), abs(nav) * HOLDINGS_TIE_TOLERANCE)
         within = abs(difference) <= tolerance
         states.append(PASS if within else WARN)
-        entry.update(nav=str(nav), positions=str(positions), cash=str(cash), difference=str(difference),
-                     within=within)
+        # The verdict is logged to Log Analytics, so it carries how far apart, never the money figures.
+        share = _share(difference, nav)
+        entry.update(within=within, difference_share=share)
         subjects.append(entry)
         if not within:
+            apart = f"{abs(Decimal(share)):.2%}" if share is not None else "more than 1 unit"
             reasons.append(f"{item.get('subject_id')} on {item.get('date')}: positions plus cash differ from NAV "
-                           f"by {difference} {item.get('currency')} (more than 1%)")
+                           f"by {apart} of NAV (more than 1%)")
     verdict = _worst(states) if states else SKIPPED
     return {"verdict": verdict, "subjects": subjects, "reasons": reasons}
 
@@ -958,7 +1005,7 @@ def _log(verdict: dict[str, Any], selected: str, note: str | None, out: Callable
     verdict["mode"] = selected
     if note:
         verdict["mode_note"] = note
-    line = LOG_PREFIX + json.dumps(verdict, sort_keys=True, separators=(",", ":"), default=str)
+    line = LOG_PREFIX + json.dumps(without_figures(verdict), sort_keys=True, separators=(",", ":"), default=str)
     try:
         (out or (lambda text: print(text, flush=True)))(line)
     except Exception:  # noqa: BLE001 - logging must not fail the job
@@ -1072,8 +1119,8 @@ def main(argv: list[str] | None = None) -> int:
     since = datetime.fromisoformat(args.since) if args.since else datetime.combine(now.date(), time(0), timezone.utc)
     if since.tzinfo is None:
         since = since.replace(tzinfo=timezone.utc)
-    print(json.dumps(check(args.job, since=since, run_id=args.run_id, now=now), indent=1, sort_keys=True,
-                     default=str))
+    print(json.dumps(without_figures(check(args.job, since=since, run_id=args.run_id, now=now)), indent=1,
+                     sort_keys=True, default=str))
     return 0
 
 

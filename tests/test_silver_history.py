@@ -3,7 +3,7 @@
 The loader's FX event step (IBKR_FX_EVENT_KEY) on SQLite, the backfill's replay of raw statements
 and account-sync copies, its comparison with live rows, the FX merge plan and the tool's helpers.
 Synthetic data only. tests/test_silver_history_db.py runs the backfill, the check, the FX step and
-the undo on PostgreSQL with the held migrations.
+the undo on PostgreSQL with migration 074 and the held FX step.
 """
 from __future__ import annotations
 

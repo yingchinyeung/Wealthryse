@@ -39,11 +39,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from .kiwoom_client import MAX_SELLING_COST_RATE, AccountValuation, CashMovement, Holding, KiwoomClient, \
-    KiwoomError, UsValuation, kiwoom_selling_cost, reconcile_us_valuation, reconcile_valuation
+    KiwoomError, UsValuation, reconcile_us_valuation, reconcile_valuation, selling_cost_rule_gap
 from .kiwoom_english import apply_english_names, movement_description
 from .security_master import SecurityIdentifier, new_security_key
 
@@ -549,10 +549,9 @@ def _position_issues(row, positions: list[tuple[str, Decimal]]) -> list[dict[str
     stock = _number(row["stock_text"])
     if len(krw) == len(positions) and held != stock:
         issues.append({"date": day.isoformat(), "check": "holdings", "gap": _text(held - stock)})
-    expected = sum((kiwoom_selling_cost(value, day) for value in krw), Decimal("0"))
-    cost = -_number(row["accruals_text"])
-    if abs(expected - cost) > len(krw):
-        issues.append({"date": day.isoformat(), "check": "selling_cost_rule", "gap": _text(cost - expected)})
+    gap = selling_cost_rule_gap(krw, -_number(row["accruals_text"]), day)
+    if abs(gap) > len(krw):
+        issues.append({"date": day.isoformat(), "check": "selling_cost_rule", "gap": _text(gap)})
     return issues
 
 
@@ -626,6 +625,7 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
     closed: list[date] = []
     price_basis: list[dict[str, str]] = []
     repriced: list[str] = []
+    unsettled: list[str] = []
     written: list[dict[str, list[dict[str, Any]]]] = []
     for day in batch:
         valuation = client.balance_on(day)
@@ -638,6 +638,8 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
         loaded.append(day)
         if valuation.repriced_at_close:
             repriced.append(day.isoformat())
+        if valuation.unsettled_trades:
+            unsettled.append(day.isoformat())
         if valuation.price_basis_gap:
             price_basis.append({"date": day.isoformat(), "kiwoom_holdings_value": _text(valuation.valued_holdings),
                                 "at_prices_held": _text(valuation.holdings_value),
@@ -665,7 +667,10 @@ def build_history(connection, client: KiwoomClient, *, broker_account_id: str, h
         "days_left": len(remaining), "gap_days": len({gap["date"] for gap in gaps}), "gaps": gaps[:20],
         "cash_basis": "trade date (ka01690 dbst_bal); Kiwoom's estimated selling cost kept as accruals",
         "holdings_basis": "Kiwoom's own value of the holdings (kt00016 scrt_evlt_amt_to); positions at the "
-                          "official KRX close (ka10081) when ka01690 lists after-market prices",
+                          "official KRX close (ka10081) when ka01690 lists after-market prices; on a day with "
+                          "trades not yet settled, ka01690's holdings when they add up to its total after "
+                          "Kiwoom's per-stock selling cost (kt00016 counts trades once settled)",
+        "unsettled_trade_days_this_run": unsettled[:40],
         "price_basis_days_this_run": len(price_basis), "price_basis": price_basis[:30],
         "priced_at_official_close_this_run": repriced[:40],
         "us_cash_basis": "settled" if include_us else "not collected",
@@ -701,6 +706,18 @@ class Target:
     history_start: date | None
     # The onboarding case's reporting currency; a USD case is loaded by kiwoom_us_account.
     reporting_currency: str | None = None
+    # Whether this case reads the account's U.S. holdings and balances too (the start form's
+    # choice); None leaves it to the run's KIWOOM_INCLUDE_US.
+    include_us: bool | None = None
+
+
+def _optional(row, key: str) -> Any:
+    """A column a database before migration 085 does not have yet, as None."""
+
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
 
 
 def targets(connection, tenant_id: str) -> list[Target]:
@@ -709,7 +726,8 @@ def targets(connection, tenant_id: str) -> list[Target]:
     rows = connection.execute(
         "SELECT b.connection_id, b.environment, b.key_vault_secret_name, a.broker_account_id, c.case_id, c.stage, "
         "COALESCE(c.display_name, a.account_name, b.display_name) AS display_name, c.history_start_date, "
-        "c.reporting_currency "
+        # Read through to_jsonb so a database before migration 085 (no such column) still answers.
+        "c.reporting_currency, (to_jsonb(c) ->> 'kiwoom_include_us')::boolean AS kiwoom_include_us "
         "FROM broker_connections b JOIN broker_connection_accounts a "
         "ON a.tenant_id = b.tenant_id AND a.connection_id = b.connection_id "
         "LEFT JOIN broker_onboarding_cases c ON c.tenant_id = b.tenant_id AND c.connection_id = b.connection_id "
@@ -729,6 +747,7 @@ def targets(connection, tenant_id: str) -> list[Target]:
             display_name=str(row["display_name"]),
             history_start=date.fromisoformat(str(start)[:10]) if start else None,
             reporting_currency=str(row["reporting_currency"]) if row["reporting_currency"] else None,
+            include_us=_optional(row, "kiwoom_include_us"),
         ))
     return found
 
@@ -802,14 +821,35 @@ def _history_record(connection, tenant_id: str, target: Target, build: Callable[
 
 
 def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClient], today: date,
-        now: datetime, include_us: bool = True, bronze: Any = None) -> list[dict[str, Any]]:
+        now: datetime, include_us: bool = True, bronze: Any = None,
+        case_ids: Collection[str] | None = None, connection_ids: Collection[str] | None = None,
+        history: bool = True) -> list[dict[str, Any]]:
     """Collect every Kiwoom account. One account's failure never stops the others.
 
+    ``case_ids`` limits the run to the accounts of those onboarding cases (the onboarding worker's
+    run for one case), and ``connection_ids`` to those connections' accounts (Check now on a new
+    connection); every other account is left as it is. ``history`` false skips the past-day
+    fill, which the worker leaves out during Kiwoom's rebuild hours; the day's load still runs.
+    A case's own U.S. choice (Target.include_us) wins over ``include_us``.
+
     ``bronze`` (kiwoom_bronze.KiwoomBronze, only when KIWOOM_BRONZE=true) stores every inquiry page as received.
+    Required (KIWOOM_BRONZE_REQUIRED=true), a page it cannot store fails that account: its silver writes not yet
+    committed roll back, as for any other failure. Each account's result names its bronze run (``bronze_run_id``).
+    With silver from bronze (KIWOOM_SILVER_FROM_BRONZE=true) every page the account's silver rows are computed
+    from is the page as bronze stored it, read back by the capture; the result then says ``silver_from`` bronze.
     """
 
     results = []
+    wanted = None if case_ids is None else {str(item) for item in case_ids}
+    logins = None if connection_ids is None else {str(item) for item in connection_ids}
+    run_include_us = include_us
     for target in targets(connection, tenant_id):
+        if wanted is not None and target.case_id not in wanted:
+            continue
+        if logins is not None and target.connection_id not in logins:
+            continue
+        target_us = getattr(target, "include_us", None)
+        include_us = run_include_us if target_us is None else bool(target_us)
         result: dict[str, Any] = {"connection_id": target.connection_id, "account": target.broker_account_id,
                                   "case_id": target.case_id}
         client = None
@@ -819,7 +859,10 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
             client = client_for(target)
             capture = bronze.for_target(target) if bronze is not None else None
             if capture is not None:
-                client.set_capture(capture)
+                from_bronze = bool(getattr(capture, "read_back", False))
+                client.set_capture(capture, from_bronze=from_bronze)
+                if from_bronze:
+                    result["silver_from"] = "bronze.kiwoom_responses"
             if target.case_id is None or target.stage not in LOADING_STAGES or target.history_start is None:
                 # Not being onboarded: a connection check only, so the account is never copied in unasked.
                 valuation = client.valuation()
@@ -852,7 +895,10 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
                     if stage != "load_and_reconcile":
                         break
             connection.commit()
-            if stage in HISTORY_STAGES or stage in REFRESH_STAGES:
+            if not history and (stage in HISTORY_STAGES or stage in REFRESH_STAGES):
+                result["history"] = {"check": "skipped", "recorded": False,
+                                     "reason": "Kiwoom's rebuild hours; the next run fills the past days"}
+            elif stage in HISTORY_STAGES or stage in REFRESH_STAGES:
                 result["history"] = _history(connection, tenant_id, client, target, today=today, now=now,
                                              include_us=include_us, record=stage == "build_history")
             results.append({**result, "status": "loaded", "stage": stage, "rows": counts})
@@ -875,4 +921,6 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
             if capture is not None:
                 # This account's own result: none when the run was cut short (a BaseException).
                 capture.finish(len(results) > before and results[-1].get("status") != "failed")
+                if len(results) > before:
+                    results[-1]["bronze_run_id"] = capture.run_id
     return results

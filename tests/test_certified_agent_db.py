@@ -1,11 +1,12 @@
-"""Database tests for the agents' certified figures view (migrations/agent/017_certified_figures.sql).
+"""Database tests for the agents' certified figures views (migrations/agent/017_certified_figures.sql
+and 021_certified_latest.sql).
 
 Needs a disposable PostgreSQL server: set AGENT_TEST_PG_ADMIN_DSN to a superuser DSN (CI starts
 one). Skipped otherwise. Creates and drops its own database; synthetic data only.
 
 It installs the agent schema as scripts/install_agent_schema.py does, first on a database
 without migration 073 (017 then does nothing) and again after 073, and shows that every
-existing grant is unchanged: 017 only adds its own functions and views, for agent_reader.
+existing grant is unchanged: 017 and 021 only add their own functions and views, for agent_reader.
 """
 from __future__ import annotations
 
@@ -24,7 +25,8 @@ from test_wealthryse_agent_db import (  # noqa: E402
 OTHER_TENANT = "00000000-0000-0000-0000-000000000002"
 CERTIFIED_MIGRATION = "073_certified_figures.sql"
 NEW_OBJECTS = {"certified_figures", "certified_builds", "scoped_certified_figures()", "scoped_certified_builds()",
-               "certified_figure_trace(text,text,text,text,text,date)"}
+               "certified_figure_trace(text,text,text,text,text,date)",
+               "certified_latest", "scoped_certified_latest()"}
 FIGURE_RUN = "aaaaaaaa-1111-4000-8000-000000000001"
 SOURCE_RUN = "aaaaaaaa-1111-4000-8000-000000000002"
 RAW_PATH = "raw/flex/UTEST1/2026-03-31/statement.xml"  # a storage path, which must never reach an agent
@@ -286,6 +288,41 @@ class CertifiedAgentViewTests(unittest.TestCase):
         finally:
             reader.close()
 
+    def test_the_newest_published_date_for_each_account_in_scope(self):
+        """agent.certified_latest (021): the newest as-of date a published build covers, and that build.
+        The held build on the same date, the other tenant's build and accounts out of scope never count."""
+        from wealthryse_agent.database import connect, scoped
+
+        reader = connect(self.reader_settings, search_path="agent")
+        try:
+            def latest(subjects):
+                with scoped(reader, subjects):
+                    return [(r["subject_id"], str(r["build_id"]), str(r["as_of_date"])) for r in reader.execute(
+                        "SELECT subject_id, build_id, as_of_date FROM certified_latest ORDER BY subject_id").fetchall()]
+
+            self.assertEqual(latest(["UTEST1", "UTEST2", "UNOBUILD"]),
+                             [("UTEST1", self.published_build, "2026-03-31"),
+                              ("UTEST2", self.published_build, "2026-03-31")])
+            self.assertEqual(latest(["UTEST2"]), [("UTEST2", self.published_build, "2026-03-31")])
+            self.assertEqual(latest([]), [])
+        finally:
+            reader.close()
+
+    def test_the_dispatcher_reads_it_through_the_tool_server(self):
+        import psycopg
+
+        with psycopg.connect(_dsn(ADMIN_DSN, self.database, "agent_test_owner"), autocommit=True,
+                             options=f"-c app.tenant_id={TENANT}") as owner:
+            owner.execute("INSERT INTO agent.service_grants(tenant_id, job_name, subject_id, granted_by) "
+                          "VALUES (%s, 'risk_watch', 'UTEST1', 'test')", (TENANT,))
+            try:
+                result = self._call("get_settled_dates", {"account_id": "UTEST1"}, job="risk_watch")
+                self.assertFalse(result.get("isError"), result)
+                self.assertEqual(result["structuredContent"]["data"]["certified"],
+                                 {"view": True, "as_of_date": "2026-03-31", "build_id": self.published_build})
+            finally:
+                owner.execute("DELETE FROM agent.service_grants WHERE job_name = 'risk_watch'")
+
     def test_the_writer_and_public_cannot_read_it(self):
         import psycopg
 
@@ -294,6 +331,7 @@ class CertifiedAgentViewTests(unittest.TestCase):
         writer = connect(self.writer_settings, search_path="agent")
         try:
             for statement in ("SELECT 1 FROM agent.certified_figures", "SELECT 1 FROM agent.certified_builds",
+                              "SELECT 1 FROM agent.certified_latest",
                               "SELECT agent.certified_figure_trace('UTEST1', 'risk.sharpe_ratio', '', '', '', "
                               "'2026-03-31')"):
                 with self.assertRaises(psycopg.errors.InsufficientPrivilege, msg=statement):

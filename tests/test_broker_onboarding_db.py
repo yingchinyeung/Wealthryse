@@ -136,21 +136,16 @@ class BrokerOnboardingSchemaTests(_MigratedDatabase):
             with self.db.transaction():
                 self.db.execute(statement, params)
 
-    def test_only_one_account_is_onboarded_at_a_time(self):
-        import psycopg
-
+    def test_several_accounts_can_be_onboarded_at_once(self):
+        # Migration 085 dropped the one-at-a-time index; the website limits open cases to three.
         connection_id = self._connection()
         for account in ("50000001", "50000002", "50000003"):
             self._account(connection_id, account)
-        first = self._case(connection_id, "50000001")
-        with self.assertRaises(psycopg.errors.UniqueViolation), self.db.transaction():
-            self._case(connection_id, "50000002")
-        self._subject("KIWOOM-50000001")
-        self.db.execute("UPDATE broker_onboarding_cases SET stage = 'first_month_end', status = 'live', "
-                        "subject_id = 'KIWOOM-50000001', went_live_at = now() WHERE case_id = %s", (first,))
-        self._case(connection_id, "50000002")
-        with self.assertRaises(psycopg.errors.UniqueViolation), self.db.transaction():
-            self._case(connection_id, "50000003")
+            self._case(connection_id, account)
+        open_cases = self.db.execute(
+            "SELECT count(*) AS n FROM broker_onboarding_cases WHERE connection_id = %s AND stage = 'request'",
+            (connection_id,)).fetchone()[0]
+        self.assertEqual(open_cases, 3)
 
     def test_an_account_is_never_onboarded_twice(self):
         import psycopg
@@ -316,8 +311,6 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
         started = self._start(self._kiwoom())
         case_id = started["case_id"]
         self.assertEqual((started["stage"], started["status"]), ("request", "platform_working"))
-        with self.assertRaisesRegex(OnboardingError, "still being onboarded"):
-            self._start(self._kiwoom("50999999"), "50999999")
 
         record_platform_check(self.db, TENANT, case_id, "connection_sees_account", "pass", "Answered.")
         for check_id in ("holdings_and_cash_loaded", "securities_mapped", "nav_reconciled"):
@@ -360,7 +353,7 @@ class BrokerOnboardingFlowTests(_MigratedDatabase):
         self.assertIn("warning_acknowledged", events)
         overview = onboarding_overview(self.db, TENANT, today=date(2026, 10, 13), platform_ip=None)
         self.assertEqual([c["case_id"] for c in overview["cases"]], [case_id])
-        self.assertFalse(overview["can_start"])
+        self.assertEqual((overview["can_start"], overview["open_cases"], overview["max_open_cases"]), (True, 1, 3))
 
     def _yahoo_consent(self, case_id, before_terms):
         """After approval 1 the owner records Yahoo consent where the sector job looks for it."""
@@ -706,7 +699,7 @@ class PortfolioDryRunTests(_MigratedDatabase):
         done = approve("go_live", detail["awaiting_terms_sha256"], confirmation="GO LIVE SYNTHETIC-LONG-SHORT")
         db.commit()
         self.assertEqual(done, {"case_id": case_id, "stage": "first_month_end", "status": "live",
-                                "next_page": "/accounts/synthetic-long-short/overview"})
+                                "next_page": "/accounts/synthetic-long-short/overview", "viewers_given_access": 0})
         lifecycle = db.execute("SELECT lifecycle_status FROM platform_subjects "
                                "WHERE subject_id = 'synthetic-long-short'").fetchone()["lifecycle_status"]
         self.assertEqual(lifecycle, "active")

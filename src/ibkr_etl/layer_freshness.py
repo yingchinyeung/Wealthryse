@@ -74,6 +74,13 @@ RULES: tuple[Rule, ...] = (
          query="SELECT r.started_at AS observed FROM flex_rows f "
                "JOIN ingestion_runs r ON r.run_id = f.first_seen_run_id "
                "ORDER BY f.flex_row_id DESC LIMIT 1"),
+    # Bronze: Kiwoom's answers as received (migration 082). The daily job asks Kiwoom every day,
+    # so an answered page is expected each cycle; refused calls are stored too but never count.
+    # Reported only for now: the administrator's login cannot read this table yet.
+    Rule("bronze.kiwoom_responses", "bronze", "public.kiwoom_responses", LOADED, time(9, 15),
+         timedelta(hours=6), required=False,
+         query="SELECT MAX(received_at) AS observed FROM kiwoom_responses "
+               "WHERE http_status = 200 AND COALESCE(return_code, 0) = 0"),
     # Bronze: newest raw market-data file per feed in its dated folders (S2 raw capture).
     # yahoo-crisis-history has no rule: crisis windows are finished history, filed
     # once under history/, so no new file is expected each day.
@@ -91,6 +98,14 @@ RULES: tuple[Rule, ...] = (
     # Silver.
     Rule("silver.nav_snapshots", "silver", "public.nav_snapshots", AS_OF, time(9, 30),
          timedelta(days=4), query="SELECT MAX(snapshot_date) AS observed FROM nav_snapshots"),
+    # The account-wide NAV date above hides one account falling behind. Each Kiwoom account (Korea in
+    # KRW, the U.S. account in USD) is judged by its own newest TOTAL row, and the stalest one counts.
+    # Reported only until a week of readings shows both accounts fresh.
+    Rule("silver.nav_snapshots.kiwoom", "silver", "public.nav_snapshots", AS_OF, time(9, 30),
+         timedelta(days=4), required=False,
+         query="SELECT MIN(latest) AS observed FROM (SELECT MAX(n.snapshot_date) AS latest FROM nav_snapshots n "
+               "JOIN accounts a ON a.account_id = n.account_id WHERE a.account_type = 'kiwoom' "
+               "AND n.asset_class = 'TOTAL' GROUP BY n.account_id) kiwoom"),
     Rule("silver.position_snapshots", "silver", "public.position_snapshots", AS_OF, time(9, 30),
          timedelta(days=4), query="SELECT MAX(snapshot_date) AS observed FROM position_snapshots"),
     # The benchmark and risk-free jobs re-stamp fetched_at on every run.

@@ -2,7 +2,7 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.position_snapshots
 name: position_snapshots
-version: 1.0.1
+version: 1.0.2
 status: active
 domain: silver
 dataProduct: portfolio-medallion
@@ -19,7 +19,11 @@ description:
     that day''s cur_prc less its pred_pre, since the chart''s own cur_prc is the last trade to 20:00), kept only
     when the holdings add up to Kiwoom''s own value (kt00016) to the won. A KRW day''s positions add up to nav_snapshots.stock_text
     (rule kiwoom_positions_add_up_to_stock there). A Kiwoom row''s row_sha256 is the sha256 of the row as written,
-    not of a Flex row.'
+    not of a Flex row. The U.S. Kiwoom account (ibkr_etl.kiwoom_us_account): a closed U.S. trading day''s positions
+    are rebuilt from Kiwoom''s movements (ust21100, each trade dated by Kiwoom''s per-stock daily holding, usa21730)
+    at each stock''s unadjusted close that day (usa06012). A stock Kiwoom no longer lists has no close and is valued
+    at what is left of Kiwoom''s securities value for the day; that price is derived, not quoted. A day''s positions
+    add up to nav_snapshots.stock_text to the cent a position (rule kiwoom_usd_positions_add_up_to_stock there).'
 tags:
 - silver
 - ibkr
@@ -284,4 +288,5 @@ customProperties:
 - property: additionalProducers
   value:
   - ibkr_etl.kiwoom_collector
+  - ibkr_etl.kiwoom_us_account
 contractCreatedTs: '2026-10-18T00:00:00Z'

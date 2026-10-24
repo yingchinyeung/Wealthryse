@@ -13,7 +13,7 @@ description:
   usage: silver.fx_rates_as_known(at) returns silver.fx_rates as it stood at that moment, with the table's own columns.
     To list what IBKR changed since a figure was published, select versions whose recorded_from is after its as_of_at.
     Readers of today's rows keep reading silver.fx_rates.
-  limitations: Empty and unused until the held migration infra/medallion/drafts/u8_silver_history.sql has run and
+  limitations: Empty and unused until migrations/postgres/074_silver_history.sql has run and
     recording is on (public.silver_history_settings). Written only by the record_version trigger on silver.fx_rates
     and the owner's backfill; the jobs' logins only read it, and it refuses edits other than closing a version.
     Isolated by account like the table. Versions from before the switch-on come from the backfill (v2's raw statements,

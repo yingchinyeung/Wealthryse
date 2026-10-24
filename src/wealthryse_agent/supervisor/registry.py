@@ -26,7 +26,7 @@ DEPLOYMENTS = ("analyst", "reports", "none")
 #   staging  onboarding cases, loaded per case before an account goes live
 #   monitor  import runs, the administrator's runs and incidents, broker login checks
 #   code     no database: the Metrics guide and the calculator
-#   external public market news the market news watch confirmed (migrations/agent/021); no client data
+#   external public market news the market news watch confirmed (migrations/agent/023); no client data
 LAYERS = ("gold", "silver", "bronze", "staging", "monitor", "code", "external")
 TOOL_LAYERS = {
     "list_accounts": "silver",
@@ -37,6 +37,8 @@ TOOL_LAYERS = {
     "get_sector_allocation": "silver",
     "get_cash_flows": "silver",
     "get_data_freshness": "silver",
+    # Silver dates, and the newest published certified build's as-of date once Medallion's view exists.
+    "get_settled_dates": "silver",
     "get_nav_history": "silver",
     "get_risk_metrics": "silver",
     "get_month_end_package": "gold",
@@ -94,9 +96,14 @@ class Member:
     today: str = ""
 
 
+# Tools a specialist borrows from the one that owns them, to look something up before its own tools run:
+# run_what_if and run_stress_test take holdings by symbol, so "my largest holding" needs get_holdings first.
+BORROWED = {"modelling": ("get_holdings",)}
+
+
 def _client(name: str, *tools: str, today: str = "") -> Member:
     return Member(name, "client_analysis", "specialist", "answer", "analyst",
-                  tuple(tools) + SHARED_CLIENT_TOOLS, today=today)
+                  tuple(tools) + BORROWED.get(name, ()) + SHARED_CLIENT_TOOLS, today=today)
 
 
 MEMBERS = (
@@ -185,7 +192,7 @@ def owner(tool: str) -> str | None:
     if tool in SHARED_CLIENT_TOOLS or tool in SERVER_TOOLS:
         return None
     for name in CLIENT_SPECIALISTS:
-        if tool in (BY_NAME[name].tools or ()):
+        if tool in (BY_NAME[name].tools or ()) and tool not in BORROWED.get(name, ()):
             return name
     return None
 

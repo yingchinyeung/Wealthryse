@@ -39,7 +39,7 @@ _RULES = {
         r"how long (could|would|will|can) (the|my|our) (money|savings|account|portfolio) last|"
         r"where could (this|the|my|our) (account|portfolio) be|"
         r"if (i|we) (add|withdraw|invest|contribute|put in|take out)\w*|"
-        r"if (the )?[\w&.-]+( [\w&.-]+)? (fell|falls?|drops?|dropped|"
+        r"if (the |my |our )?[\w&.-]+( [\w&.-]+)? (fell|falls?|drops?|dropped|"
         r"rises?|rose|crash\w*|doubles?|halves?))\b", re.I),
     "metrics_guide": re.compile(
         r"(\bwhat( is|'s| are| does) (a |an |the )?(sharpe|sortino|calmar|twr|mwr|irr|time[- ]weighted|"
@@ -52,9 +52,17 @@ _RULES = {
 # Words that place a question with holdings and performance only when no modelling rule matched:
 # "project my value in 10 years" is a projection, not a valuation, and "if I withdraw 5,000 a month"
 # is an input to it, not a question about past withdrawals.
+# "if my largest holding were half its weight" names a holding to change, which modelling looks up itself.
 _WEAK_HOLDINGS = re.compile(r"\b(value(?! at risk)|worth|today'?s?|portfolio|account|returns?|hold(s|ing|ings)?|"
                             r"positions?|weights?|allocat\w*|withdraw\w*|deposits?|deposited|contribut\w*|"
-                            r"cash)\b", re.I)
+                            r"cash|biggest|largest|top \d+)\b", re.I)
+# Words that place a question with risk only when no modelling rule matched: in "what would the risk look
+# like if ..." or "which holdings carry the most risk", risk is what the model reports, and the modelling
+# tools report it (run_what_if side by side with today's mix, optimise_portfolio per holding). A question
+# that also asks something else ("what is my risk, and what if ...") keeps the risk specialist.
+_WEAK_RISK = re.compile(r"\b(carr(y|ies) the most risk|risk contributions?|risk budgets?|risk[- ]parity|"
+                        r"(?<!value at )risk(s|y|ier|iest)?)\b", re.I)
+_SEVERAL_ASKS = re.compile(r"\b(and|also|plus)\b|[?;].*\w", re.I)
 # A definition asked about no one's account and no period ("what is a Sharpe ratio?") needs only the
 # guide; "what is the excess return since inception?" asks for the account's figure, not a definition.
 _PERSONAL = re.compile(r"\b(my|our|i|me|we|mine|ours|this account|this portfolio)\b", re.I)
@@ -97,6 +105,9 @@ def route_chat(question: str) -> Route:
     if "modelling" in matched and "holdings_performance" in matched \
             and not _RULES["holdings_performance"].search(_WEAK_HOLDINGS.sub(" ", text)):
         matched = tuple(name for name in matched if name != "holdings_performance")
+    if "modelling" in matched and "risk" in matched and not _SEVERAL_ASKS.search(text) \
+            and not _RULES["risk"].search(_WEAK_RISK.sub(" ", text)):
+        matched = tuple(name for name in matched if name != "risk")
     if "holdings_performance" in matched and len(matched) > 1 \
             and not _RULES["holdings_performance"].search(_PERIOD.sub(" ", text)):
         # "my volatility this year": the period says when, not that the question is about returns.

@@ -180,6 +180,11 @@
    "layer": "ops",
    "target_schema": "public"
   },
+  "public.onboarding_worker_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public"
+  },
   "public.burn_in_acceptance_windows": {
    "kind": "table",
    "layer": "ops",
@@ -1037,7 +1042,7 @@
    "kind": "view",
    "layer": "consumer",
    "target_schema": "agent",
-   "note": "Account-scoped facade the agents read (Kiwoom deposits and withdrawals only, amount as text)."
+   "note": "Account-scoped facade the agents read: from silver cash_transactions, the rows that can be a deposit or withdrawal (Kiwoom DEPOSIT and WITHDRAWAL, IBKR deposits and withdrawals), amount as text. Read by the flow reader with FLOWS_SOURCE (agent 020, widened by 022)."
   },
   "agent.certified_builds": {
    "kind": "view",
@@ -1050,6 +1055,12 @@
    "layer": "consumer",
    "target_schema": "agent",
    "note": "Account-scoped facade the agents read (U5): the published certified figures, from gold.v_certified_figures."
+  },
+  "agent.certified_latest": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read (gold): each account's newest as-of date covered by a published certified build, and that build. Dates and ids only; the event dispatcher waits on it (agent 021)."
   },
   "agent.derived_portfolio_cash_ledger": {
    "kind": "view",
@@ -1261,52 +1272,65 @@
    "target_schema": "agent",
    "note": "Account-scoped facade the agents read."
   },
+  "agent.transfers": {
+   "kind": "view",
+   "layer": "consumer",
+   "target_schema": "agent",
+   "note": "Account-scoped facade the agents read: IBKR Transfers records from silver.transfers, the columns the flow reader uses with FLOWS_SOURCE (agent 022)."
+  },
   "silver.cash_transactions_history": {
    "kind": "table",
    "layer": "silver",
    "target_schema": "silver",
    "note": "Every version of silver.cash_transactions rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
-   "source": "ibkr",
-   "held": "infra/medallion/drafts/u8_silver_history.sql"
+   "source": "ibkr"
   },
   "silver.fx_rates_history": {
    "kind": "table",
    "layer": "silver",
    "target_schema": "silver",
    "note": "Every version of silver.fx_rates rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
-   "source": "ibkr",
-   "held": "infra/medallion/drafts/u8_silver_history.sql"
+   "source": "ibkr"
   },
   "silver.fx_transactions_history": {
    "kind": "table",
    "layer": "silver",
    "target_schema": "silver",
    "note": "Every version of silver.fx_transactions rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
-   "source": "ibkr",
-   "held": "infra/medallion/drafts/u8_silver_history.sql"
+   "source": "ibkr"
   },
   "silver.nav_snapshots_history": {
    "kind": "table",
    "layer": "silver",
    "target_schema": "silver",
    "note": "Every version of silver.nav_snapshots rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
-   "source": "ibkr",
-   "held": "infra/medallion/drafts/u8_silver_history.sql"
+   "source": "ibkr"
   },
   "silver.trades_history": {
    "kind": "table",
    "layer": "silver",
    "target_schema": "silver",
    "note": "Every version of silver.trades rows, with when it happened and when we learned it (review item U8). Written only by the record_version trigger and the owner's backfill.",
-   "source": "ibkr",
-   "held": "infra/medallion/drafts/u8_silver_history.sql"
+   "source": "ibkr"
   },
   "public.silver_history_settings": {
    "kind": "table",
    "layer": "ops",
    "target_schema": "public",
-   "note": "Configuration: one row; recording turns the silver history triggers on (review item U8). Owner only.",
-   "held": "infra/medallion/drafts/u8_silver_history.sql"
+   "note": "Configuration: one row; recording turns the silver history triggers on (review item U8). Owner only."
+  },
+  "public.silver_write_watch": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public",
+   "note": "Medallion step 3: each write to a silver table by a login outside the silver_loader group (who, which table, what kind of write, run id, application name; never row values). Written only by the silver_write_watch trigger. Empty for a full daily cycle before SILVER_WRITE_LOCK=on."
+  },
+  "public.transfers": {
+   "kind": "table",
+   "layer": "silver",
+   "target_schema": "silver",
+   "note": "IBKR's Transfers section, one row per record under the parser's key and digest, beside its flex_rows row (migration 084). Read with silver cash_transactions as deposits and withdrawals when FLOWS_SOURCE is fallback or on. Filled from bronze by python -m ibkr_etl.flows_source fill-transfers.",
+   "source": "ibkr"
   },
   "public.kiwoom_responses": {
    "kind": "table",
@@ -1527,6 +1551,13 @@
    ],
    "schedule": "app"
   },
+  "ibkrv2stg-agent-dispatcher": {
+   "hops": [
+    "ops"
+   ],
+   "schedule": "every 5 minutes, see infra/agent-apps.bicep",
+   "note": "Starts the scheduled agent jobs once their data is in and final."
+  },
   "ibkrv2stg-analyst-assurance": {
    "hops": [
     "quality-gate"
@@ -1649,6 +1680,14 @@
     "publish"
    ],
    "schedule": "manual (from the website)"
+  },
+  "ibkrv2stg-onboard-worker": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "every 20 minutes, and from the website (Run now, Check now)",
+   "note": "Self-service onboarding: each open case's Kiwoom load and history (bronze first, then silver), names and sectors, the historical reports and the agent review's check. Outside the daily chain and Kiwoom's rebuild hours."
   },
   "ibkrv2stg-report-snapshot": {
    "hops": [

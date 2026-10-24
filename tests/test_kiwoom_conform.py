@@ -396,6 +396,44 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(compare(result, silver.silver()), {})
 
 
+UNSETTLED = date(2026, 10, 15)
+
+
+class Unsettled(LiveKiwoom):
+    """15 Oct's buy is not yet settled at its close: kt00016 still holds the cash and nothing else, and
+    ka01690's total is its holdings and cash less Kiwoom's per-stock selling cost (15,050 KRW)."""
+
+    def pages(self, api_id, request):
+        day = UNSETTLED.strftime("%Y%m%d")
+        if api_id == "ka01690" and request["qry_dt"] == day:
+            return [{**page, "day_stk_asst": "000000008219517"} for page in super().pages(api_id, request)]
+        if api_id == "kt00016" and request["fr_dt"] == day:
+            return [{**OK, "entr_to": "000000008235617", "scrt_evlt_amt_to": "000000000000000"}]
+        return super().pages(api_id, request)
+
+
+class UnsettledTradeTests(unittest.TestCase):
+    def test_a_day_with_trades_not_yet_settled_replays_as_the_collector_wrote_it(self):
+        bronze_db, silver, results = collector_run(lambda account: Unsettled(), accounts=((ACCOUNT, "KRW"),))
+        self.assertEqual(results[0]["status"], "loaded")
+        self.assertNotEqual(results[0]["history"]["check"], "fail")
+        rows = {table: [row for row in found if row["snapshot_date"] == UNSETTLED.isoformat()]
+                for table, found in silver.silver().items() if table in ("nav_snapshots", "position_snapshots")}
+        # ka01690's holdings, not kt00016's settled figures (nothing held); the cost is Kiwoom's per-stock rule.
+        self.assertEqual([(row["conid"], row["market_value_text"]) for row in rows["position_snapshots"]
+                          if row["conid"].startswith("KRX:")], [("KRX:005930", "7000000")])
+        self.assertEqual([row["accruals_text"] for row in rows["nav_snapshots"] if row["asset_class"] == "TOTAL"],
+                         ["-15050"])
+        transport, result = _replayed(bronze_db, 1)
+        self.assertEqual(result.parts, {"movements": "rebuilt", "history": "rebuilt"})
+        tables = compare(result, silver.silver())
+        for table, counts in tables.items():
+            self.assertEqual((counts["differ"], counts["only_in_rebuild"], counts["only_in_silver"]), (0, 0, 0), table)
+        answers = transport.summary()
+        self.assertEqual((answers["served"], answers["unused"], answers["missing"]), (answers["stored"], 0, 0))
+        self.assertTrue(summary(result, transport, tables)["clean"])
+
+
 class MissingAnswerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

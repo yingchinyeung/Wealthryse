@@ -48,6 +48,10 @@ INSERT INTO flex_rows(account_id, section, record_type, source_key, report_date,
  ('UTEST1', 'Transfers', 'Transfer', 't1', '2026-02-10', 'USD', 'r1',
   '{"date": "20260210", "assetCategory": "CASH", "currency": "USD", "cashTransfer": "1000", "direction": "IN"}',
   1, 1, '00000000-0000-0000-0000-000000000001');
+-- The same deposit in silver.transfers, as the loader writes it beside its flex_rows row (migration 084).
+INSERT INTO transfers(account_id, source_key, transfer_date, asset_category, currency, cash_transfer_text, direction,
+  row_sha256, last_seen_run_id) VALUES
+ ('UTEST1', 't1', '2026-02-10', 'CASH', 'USD', '1000', 'IN', 'r1', 1);
 
 INSERT INTO portfolio_benchmark_mapping(tenant_id, subject_id, benchmark_id, mapping_type, effective_from, reporting_currency, created_at)
 VALUES ('00000000-0000-0000-0000-000000000001', 'UTEST1', 'GSPC', 'primary', '2026-01-01', 'USD', '2026-01-01');

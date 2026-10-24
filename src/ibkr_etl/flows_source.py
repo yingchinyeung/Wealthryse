@@ -17,8 +17,16 @@ FLOWS_SOURCE (docs/MEDALLION_ARCHITECTURE.md, "Flows from silver"):
   on every date: the same dates, and on each date the same amount per currency (summed
   exactly), with the base-currency total within a cent. Otherwise bronze is used and one
   line is logged, ``FLOWS_SOURCE {json}`` with the masked subject and counts only.
-- on: silver only. Not before two clean month-ends in fallback, and not before the
-  Transfers section has a silver table (below).
+- on: silver only, except in the month-end check below. Not before two clean month-ends in
+  fallback. Without silver.transfers (migration 084) it reads bronze and logs why, so a
+  transfer is never left out.
+
+The month-end check. On days 1 to 7 of each month in Hong Kong (MONTH_END_DAYS), when the
+month just closed is reported and frozen, on reads bronze beside silver and keeps bronze
+wherever the two differ, exactly as fallback does, and its lines carry "guard":"month_end".
+So a difference found at a month-end goes into no frozen figure, and any line where a reader
+kept bronze raises the alert in infra/staging-flows-source-alert.bicep. The jobs that freeze
+a month's figures stay on fallback whatever the others run.
 
 How silver holds the same flows. The loader writes each CashTransactions record to bronze
 flex_rows and to silver cash_transactions in the same loop, under the parser's key:
@@ -31,14 +39,24 @@ flex_rows and to silver cash_transactions in the same loop, under the parser's k
 - with IBKR_FLEX_LEGACY_KEY_COMPAT, silver keeps v1.1's key where bronze has the parser's,
   so rows are compared by content (date, currency, amount), never by key.
 
-Two gaps make fallback keep bronze. Silver has no table for the Transfers section (the
-loader writes it to flex_rows only), so a date with a transfer always differs
-(transfers_not_in_silver). And silver cannot tell a consolidated copy (accountId "-",
-which the parser files under the statement's account) from the account's own row; bronze
-skips it.
+The Transfers section has its own silver table, silver.transfers (migration 084). The loader
+writes each Transfers record there and to flex_rows in the same loop, under the same key, once
+the table exists; ``fill-transfers`` (below) copies the records loaded before that from bronze
+with the loader's own function. Silver reads them by bronze's rules: the record's date, else
+its report date; a CASH transfer's cashTransfer in its currency converted to the base; any
+other transfer's positionAmountInBase, else its positionAmount converted. Bronze reads every
+Transfers row of the account, a consolidated copy included, and so does silver.
+
+Where fallback still keeps bronze: a date whose transfer is not in silver yet
+(transfers_not_in_silver, before the fill) or differs (transfer_differs), and a consolidated
+copy of a cash transaction (accountId "-", which the parser files under the statement's
+account): silver cannot tell it from the account's own row, and bronze skips it.
 
 ``python -m ibkr_etl.flows_source compare`` compares bronze and silver for every subject
 over all history in a READ ONLY session and prints counts only.
+``python -m ibkr_etl.flows_source fill-transfers`` counts what silver.transfers lacks against
+bronze in a READ ONLY session; with ``--apply`` (the loader login, as the silver write lock
+requires) it writes those records and commits once per tenant. Counts only.
 """
 from __future__ import annotations
 
@@ -51,6 +69,7 @@ import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
 FLOWS_SOURCE_ENV = "FLOWS_SOURCE"
@@ -63,7 +82,14 @@ DERIVED_TYPES = frozenset({"filtered_portfolio", "composite_portfolio"})
 # Flows are money: the certified comparisons' money tolerance (certified_pages.MONEY_TOLERANCE).
 MONEY_TOLERANCE = 0.005
 # Why a date differs, checked in this order.
-KINDS = ("transfers_not_in_silver", "only_in_bronze", "only_in_silver", "currency_differs", "amount_differs")
+KINDS = ("transfers_not_in_silver", "transfer_differs", "only_in_bronze", "only_in_silver", "currency_differs",
+         "amount_differs")
+
+# The month-end check: on compares with bronze on these days of each month in Hong Kong,
+# which keeps no daylight saving.
+MONTH_END_DAYS = 7
+HONG_KONG = timezone(timedelta(hours=8))
+MONTH_END_GUARD = "month_end"
 
 # (source, date, currency, amount, base amount): source is "cash" or "transfer"; a cash
 # transaction's amount is in its currency, a transfer's is its base amount.
@@ -105,6 +131,19 @@ def mode(environ: Mapping[str, str] | None = None) -> tuple[str, str | None]:
     return OFF, "unknown_setting"
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def month_end_window(now: datetime | None = None) -> bool:
+    """True on days 1 to MONTH_END_DAYS of a month in Hong Kong, when the month just closed
+    is reported and frozen."""
+    moment = _now() if now is None else now
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(HONG_KONG).day <= MONTH_END_DAYS
+
+
 def selected_mode(environ: Mapping[str, str] | None = None, out: Callable[[str], None] | None = None) -> str:
     """The mode the reader runs in. A value not understood reads bronze and is logged once."""
     selected, note = mode(environ)
@@ -128,13 +167,14 @@ def subject_type_of(connection: Any, subject_id: str) -> str:
 
 def silver_external_flows(connection: Any, account_id: str, *,
                           records: list[FlowRecord] | None = None) -> dict[str, float]:
-    """A physical account's flows from silver cash_transactions, by today's rules.
+    """A physical account's flows from silver transfers and cash_transactions, by today's rules.
 
-    The same rule as bronze: IBKR's type "Deposits/Withdrawals", or for older records
-    without a type, a bank-transfer description; the report date (silver's effective_date),
-    else the settle date, else the day of dateTime; converted to the base currency with the
-    account's IBKR FX rates. Transfers have no silver table, so they are not here. A Kiwoom
-    U.S. account's DEPOSIT and WITHDRAWAL rows are added as the bronze reader adds them.
+    Transfers first, as bronze reads them (_silver_transfers); none while silver.transfers
+    is missing. Cash transactions by the same rule as bronze: IBKR's type
+    "Deposits/Withdrawals", or for older records without a type, a bank-transfer
+    description; the report date (silver's effective_date), else the settle date, else the
+    day of dateTime; converted to the base currency with the account's IBKR FX rates. A
+    Kiwoom U.S. account's DEPOSIT and WITHDRAWAL rows are added as the bronze reader adds them.
     """
     from .provisional_benchmark import KIWOOM_FLOW_CURRENCIES, _is_external_cash_transaction, _kiwoom_flows
     from .report import FxConverter, _convert, _flex_date, _number
@@ -152,6 +192,8 @@ def silver_external_flows(connection: Any, account_id: str, *,
         {account_id: account["base_currency"]},
     )
     flows: dict[str, float] = defaultdict(float)
+    if has_transfers_table(connection):
+        _silver_transfers(connection, account_id, converter, flows, records)
     for row in connection.execute(
         "SELECT effective_date, settle_date, event_datetime, transaction_type, description, amount_text, currency "
         "FROM cash_transactions WHERE account_id = ? ORDER BY effective_date, source_key",
@@ -174,6 +216,39 @@ def silver_external_flows(connection: Any, account_id: str, *,
         for flow_date, amount in _kiwoom_flows(connection, account_id, converter, records=records).items():
             flows[flow_date] += amount
     return dict(flows)
+
+
+def has_transfers_table(connection: Any) -> bool:
+    from .loader import has_transfers_table as present
+
+    return present(connection)
+
+
+def _silver_transfers(connection: Any, account_id: str, converter: Any, flows: dict[str, float],
+                      records: list[FlowRecord] | None) -> None:
+    """The account's Transfers records from silver, added to flows as _bronze_external_flows adds
+    them from flex_rows: every record of the account, a consolidated copy included."""
+    from .report import _convert, _flex_date, _number
+
+    for row in connection.execute(
+        "SELECT transfer_date, report_date, asset_category, currency, cash_transfer_text, position_amount_text, "
+        "position_amount_in_base_text FROM transfers WHERE account_id = ? ORDER BY transfer_date, source_key",
+        (account_id,),
+    ):
+        flow_date = _flex_date(row["transfer_date"] or row["report_date"])
+        if not flow_date:
+            continue
+        if str(row["asset_category"] or "").upper() == "CASH":
+            amount = _convert(row["cash_transfer_text"], converter.rate(account_id, row["currency"], flow_date))
+        else:
+            amount = _number(row["position_amount_in_base_text"])
+            if amount is None:
+                amount = _convert(row["position_amount_text"],
+                                  converter.rate(account_id, row["currency"], flow_date))
+        if amount is not None:
+            flows[flow_date] += amount
+            if records is not None:
+                records.append(("transfer", flow_date, str(row["currency"] or ""), amount, amount))
 
 
 def _guarded(connection: Any, read: Callable[[], Any]) -> Any:
@@ -199,8 +274,16 @@ def external_flows(connection: Any, account_id: str, *, subject_type: str | None
         subject_type = subject_type_of(connection, account_id)
     if subject_type in DERIVED_TYPES:
         return _bronze_external_flows(connection, account_id, subject_type=subject_type)
+    guard: dict[str, str] = {}
     if selected == ON:
-        return silver_external_flows(connection, account_id)
+        if not _guarded(connection, lambda: has_transfers_table(connection)):
+            # Silver would leave every transfer out: today's figure instead, and say why.
+            _log(out, decision="bronze", reason="no_silver_transfers", subject=_mask(account_id), mode=selected)
+            return _bronze_external_flows(connection, account_id, subject_type=subject_type)
+        if not month_end_window():
+            return silver_external_flows(connection, account_id)
+        # The month-end check: compare with bronze as fallback does.
+        guard = {"guard": MONTH_END_GUARD}
     bronze_records: list[FlowRecord] = []
     bronze = _bronze_external_flows(connection, account_id, subject_type=subject_type, records=bronze_records)
     silver_records: list[FlowRecord] = []
@@ -208,13 +291,13 @@ def external_flows(connection: Any, account_id: str, *, subject_type: str | None
         silver = _guarded(connection, lambda: silver_external_flows(connection, account_id, records=silver_records))
     except Exception as error:  # noqa: BLE001 - silver unreadable: keep today's figure
         _log(out, decision="bronze", reason="silver_unreadable", subject=_mask(account_id), mode=selected,
-             error=type(error).__name__)
+             error=type(error).__name__, **guard)
         return bronze
     result = compare(bronze, bronze_records, silver, silver_records)
     if result.equal:
         return silver
     _log(out, decision="bronze", reason="silver_differs", subject=_mask(account_id), mode=selected,
-         dates_differing=result.dates_differing, kinds=dict(result.kinds))
+         dates_differing=result.dates_differing, kinds=dict(result.kinds), **guard)
     return bronze
 
 
@@ -249,8 +332,18 @@ def _close(left: float | None, right: float | None) -> bool:
 
 
 def _kind(bronze: Mapping[tuple[str, str], float], silver: Mapping[tuple[str, str], float]) -> str:
-    if any(source == "transfer" for source, _ in bronze):
+    def split(parts: Mapping[tuple[str, str], float]) -> tuple[dict, dict]:
+        return ({key: value for key, value in parts.items() if key[0] == "transfer"},
+                {key: value for key, value in parts.items() if key[0] != "transfer"})
+
+    bronze_transfers, bronze = split(bronze)
+    silver_transfers, silver = split(silver)
+    if bronze_transfers and not silver_transfers:
         return "transfers_not_in_silver"
+    if bronze_transfers != silver_transfers:
+        return "transfer_differs"
+    if bronze == silver:
+        return "amount_differs"  # every part agrees, the base-currency total does not
     if not silver:
         return "only_in_bronze"
     if not bronze:
@@ -302,6 +395,9 @@ def _diagnostics(connection: Any, account_id: str) -> Counter:
             if row["transaction_id"]:
                 ids[str(row["transaction_id"])] += 1
     notes["silver_rows_sharing_a_transaction_id"] = sum(count for count in ids.values() if count > 1)
+    if has_transfers_table(connection):
+        notes["silver_transfer_rows"] = int(connection.execute(
+            "SELECT COUNT(*) FROM transfers WHERE account_id = ?", (account_id,)).fetchone()[0])
     return Counter({key: value for key, value in notes.items() if value})
 
 
@@ -418,21 +514,122 @@ def compare_database(database_url: str, tenants: Iterable[str]) -> dict[str, Any
         raw.close()
 
 
+# ---------------------------------------------------------------- filling silver.transfers
+
+FILL_COUNTS = ("bronze_rows", "inserted", "updated", "unchanged", "bronze_rows_sharing_a_key", "only_in_silver")
+
+
+def fill_transfers(connection: Any, *, apply: bool) -> Counter:
+    """silver.transfers from bronze flex_rows, for the tenant the connection reads.
+
+    Each Transfers row of flex_rows is rebuilt as the parser's FlexRow and written with the
+    loader's upsert_transfer, under its own last run, so silver holds what the loader would
+    have written. A record silver already holds unchanged is left alone. Without apply nothing
+    is written: the counts say what would be. Rows silver has and bronze lacks are counted,
+    never removed. The caller commits.
+    """
+    from .loader import TRANSFER_COLUMNS, transfer_values, upsert_transfer
+    from .parser import FlexRow
+
+    if not has_transfers_table(connection):
+        raise RuntimeError("silver.transfers is missing: apply migration 084 first")
+    existing = {
+        (str(row["account_id"]), str(row["source_key"])): tuple(row[column] for column in TRANSFER_COLUMNS)
+        for row in connection.execute(f"SELECT {', '.join(TRANSFER_COLUMNS)} FROM transfers").fetchall()
+    }
+    counts: Counter = Counter()
+    seen: set[tuple[str, str]] = set()
+    accounts: set[str] = set()
+    for row in connection.execute(
+        "SELECT account_id, section, record_type, source_key, report_date, conid, currency, row_sha256, "
+        "data_json, last_seen_run_id FROM flex_rows WHERE section = 'Transfers' "
+        "ORDER BY account_id, last_seen_run_id, flex_row_id"
+    ).fetchall():
+        data = row["data_json"]
+        attributes = json.loads(data) if isinstance(data, str) else dict(data or {})
+        flex_row = FlexRow(
+            account_id=str(row["account_id"]), section=str(row["section"]), record_type=str(row["record_type"]),
+            attributes={str(name): "" if value is None else str(value) for name, value in attributes.items()},
+            source_key=str(row["source_key"]), row_sha256=str(row["row_sha256"]), report_date=row["report_date"],
+            conid=row["conid"], currency=row["currency"],
+        )
+        run_id = int(row["last_seen_run_id"])
+        counts["bronze_rows"] += 1
+        accounts.add(flex_row.account_id)
+        key = (flex_row.account_id, flex_row.source_key)
+        if key in seen:
+            counts["bronze_rows_sharing_a_key"] += 1  # one silver row holds the latest
+        seen.add(key)
+        values = transfer_values(flex_row, run_id)
+        wanted = tuple(values[column] for column in TRANSFER_COLUMNS)
+        current = existing.get(key)
+        if current is not None and tuple(current) == wanted:
+            counts["unchanged"] += 1
+            continue
+        counts["inserted" if current is None else "updated"] += 1
+        existing[key] = wanted
+        if apply:
+            upsert_transfer(connection, flex_row, run_id)
+    counts["only_in_silver"] = len(set(existing) - seen)
+    counts["accounts"] = len(accounts)
+    return counts
+
+
+def fill_database(database_url: str, tenants: Iterable[str], *, apply: bool) -> dict[str, Any]:
+    """fill_transfers for each tenant: READ ONLY and rolled back without apply, committed once
+    per tenant with it. Counts only."""
+    import psycopg
+
+    from .db import PostgresConnection, _hybrid_row_factory
+
+    raw = psycopg.connect(database_url, connect_timeout=10, row_factory=_hybrid_row_factory,
+                          application_name="flows-fill-transfers",
+                          options="-c statement_timeout=300000 -c lock_timeout=5000")
+    tenants = list(tenants)
+    totals: Counter = Counter()
+    try:
+        raw.read_only = not apply
+        connection = PostgresConnection(raw)
+        for tenant in tenants:
+            connection.execute("SELECT set_config('app.tenant_id', ?, true)", (tenant,))
+            totals.update(fill_transfers(connection, apply=apply))
+            if apply:
+                raw.commit()
+            else:
+                raw.rollback()
+        return {"filled": "silver.transfers from bronze flex_rows Transfers rows",
+                "applied": apply, "tenants": len(tenants),
+                **{name: totals[name] for name in ("accounts", *FILL_COUNTS)}}
+    finally:
+        raw.rollback()
+        raw.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m ibkr_etl.flows_source",
-        description="Compare bronze and silver external flows for every subject (read-only, counts only).")
+        description="Compare bronze and silver external flows (read-only), or fill silver.transfers from bronze. "
+                    "Counts only.")
     commands = parser.add_subparsers(dest="command", required=True)
-    command = commands.add_parser("compare", help="bronze against silver, every subject, all history")
-    command.add_argument("--database-url", default=os.environ.get("DATABASE_URL", ""),
-                         help="default: DATABASE_URL")
-    command.add_argument("--tenant", action="append", default=[],
-                         help="tenant id (repeatable; default: PORTFOLIO_TENANT_ID or the default tenant)")
+    compare_command = commands.add_parser("compare", help="bronze against silver, every subject, all history")
+    fill_command = commands.add_parser(
+        "fill-transfers", help="silver.transfers from bronze flex_rows; counts only without --apply")
+    fill_command.add_argument("--apply", action="store_true",
+                              help="write and commit (the loader login, under the silver write lock)")
+    for command in (compare_command, fill_command):
+        command.add_argument("--database-url", default=os.environ.get("DATABASE_URL", ""),
+                             help="default: DATABASE_URL")
+        command.add_argument("--tenant", action="append", default=[],
+                             help="tenant id (repeatable; default: PORTFOLIO_TENANT_ID or the default tenant)")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     if not args.database_url:
         parser.error("give --database-url or set DATABASE_URL")
     tenants = args.tenant or [os.environ.get("PORTFOLIO_TENANT_ID", DEFAULT_TENANT_ID)]
-    print(json.dumps(compare_database(args.database_url, tenants), indent=1, sort_keys=True, ensure_ascii=False))
+    if args.command == "fill-transfers":
+        result = fill_database(args.database_url, tenants, apply=args.apply)
+    else:
+        result = compare_database(args.database_url, tenants)
+    print(json.dumps(result, indent=1, sort_keys=True, ensure_ascii=False))
     return 0
 
 

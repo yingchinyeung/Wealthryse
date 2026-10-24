@@ -28,7 +28,7 @@ import urllib.request
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_FLOOR, Decimal, InvalidOperation
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 from .security_master import SecurityIdentifier
 
@@ -73,6 +73,12 @@ class KiwoomError(RuntimeError):
 
 class KiwoomUnknownStock(KiwoomError):
     """Kiwoom has no such stock on that exchange (its code 1903), e.g. one delisted after a merger."""
+
+
+class CaptureFailed(RuntimeError):
+    """Raised by a required capture (kiwoom_bronze with KIWOOM_BRONZE_REQUIRED=true) when a page could not be
+    stored, or, with silver from bronze, read back: the call fails before any answer is used. Not a KiwoomError,
+    so no refusal handling catches it."""
 
 
 # Kiwoom answered Python's default user agent with a bare HTTP 400; the fixed-address probe
@@ -133,7 +139,23 @@ class Answer:
     body: bytes
 
 
-Capture = Callable[[Answer], None]
+# Returns None, or, for a client set to take its pages from bronze, the page as bronze stored it.
+Capture = Callable[[Answer], "Answer | None"]
+
+
+def stored_payload(body: bytes) -> object:
+    """A stored body as the live transport hands it to the client: parsed, with the exact bytes in ``raw``.
+
+    The conform replay and a client that takes its pages from bronze both read stored pages through this.
+    """
+
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        # As _urllib_transport reads a refusal that is not JSON; it never hands over a 200 that is not.
+        text = " ".join(body.decode("utf-8", "replace").split())[:150]
+        payload = {"return_msg": f"non-JSON answer: {text}" if text else ""}
+    return RawAnswer(payload, body) if isinstance(payload, Mapping) else payload
 
 
 def kiwoom_number(value: object, *, unsigned: bool = False) -> Decimal:
@@ -217,6 +239,16 @@ def kiwoom_selling_cost(market_value: Decimal, day: date) -> Decimal:
     return tax + _floor(market_value * SELLING_FEE_RATE, 10)
 
 
+def selling_cost_rule_gap(values: Sequence[Decimal], cost: Decimal, day: date) -> Decimal:
+    """A selling cost less Kiwoom's per-stock cost of selling holdings of these values (kiwoom_selling_cost).
+
+    The cost follows Kiwoom's rule when this is at most 1 KRW a holding: the history check
+    (kiwoom_collector) holds every stored day to it, and balance_on a day with trades not yet settled.
+    """
+
+    return cost - sum((kiwoom_selling_cost(value, day) for value in values), Decimal("0"))
+
+
 @dataclass(frozen=True)
 class AccountValuation:
     account_name: str
@@ -232,6 +264,9 @@ class AccountValuation:
     securities_value: Decimal | None = None
     # True when ka01690 listed after-market prices and the holdings were repriced at the close.
     repriced_at_close: bool = False
+    # True on a past day with trades not yet settled at the close: kt00016 counts a trade only once
+    # it settles, so its figures were not used and the day is ka01690's alone (see balance_on).
+    unsettled_trades: bool = False
 
     @property
     def holdings_value(self) -> Decimal:
@@ -356,14 +391,24 @@ class KiwoomClient:
         self._token_expires: datetime | None = None
         self._closes: dict[str, dict[str, Decimal]] = {}
         self._capture: Capture | None = None
+        self._from_bronze = False
 
     def __repr__(self) -> str:
         return f"KiwoomClient(environment={self.environment!r})"
 
-    def set_capture(self, capture: Capture | None) -> None:
-        """Hand every inquiry page, refusals included, to ``capture`` (the bronze writer). Never token calls."""
+    def set_capture(self, capture: Capture | None, *, from_bronze: bool = False) -> None:
+        """Hand every inquiry page, refusals included, to ``capture`` (the bronze writer). Never token calls.
+
+        A capture fault never fails the call, except CaptureFailed, which a required capture raises.
+
+        ``from_bronze`` (KIWOOM_SILVER_FROM_BRONZE=true): the capture hands back each page as bronze stored it,
+        and the call goes on with that page's status, paging headers and body instead of the answer received,
+        so everything the collector writes to silver is computed from bronze's copy. A page the capture does not
+        hand back fails the call with CaptureFailed; the answer received is never used in its place.
+        """
 
         self._capture = capture
+        self._from_bronze = bool(from_bronze) and capture is not None
 
     def _post(self, path: str, headers: Mapping[str, str], body: Mapping[str, object], *,
               page_no: int = 1):
@@ -392,7 +437,13 @@ class KiwoomClient:
                 self._sleep(TRANSPORT_RETRY_SECONDS * (attempt + 1))
                 self._last_call = self._clock()
         if path in INQUIRY_APIS.values() and self._capture is not None:
-            self._hand_over(call, body, page_no, requested_at, status, response_headers, payload)
+            stored = self._hand_over(call, body, page_no, requested_at, status, response_headers, payload)
+            if self._from_bronze:
+                if not isinstance(stored, Answer) or stored.api_id != call or stored.page_no != page_no:
+                    raise CaptureFailed("The Kiwoom page was not read back from bronze, so its answer is not used")
+                status, payload = stored.http_status, stored_payload(stored.body)
+                response_headers = {name: value for name, value in (("cont-yn", stored.cont_yn),
+                                                                     ("next-key", stored.next_key)) if value}
         if not isinstance(payload, Mapping):
             raise KiwoomError(f"Kiwoom returned a non-JSON answer (HTTP {status})")
         code = payload.get("return_code", 0)
@@ -405,8 +456,10 @@ class KiwoomClient:
         return response_headers, payload
 
     def _hand_over(self, api_id: str, body: Mapping[str, object], page_no: int, requested_at: datetime,
-                   status: int, headers: Mapping[str, str], payload: object) -> None:
-        # Bronze is best effort: nothing here may stop or change the inquiry.
+                   status: int, headers: Mapping[str, str], payload: object) -> Answer | None:
+        # Bronze never changes the inquiry. Best effort, it never stops it either; a required capture stops it
+        # with CaptureFailed when the page could not be stored, before the answer is used. Returns what the
+        # capture hands back: the stored page, for a client that takes its pages from bronze.
         try:
             raw = getattr(payload, "raw", None)
             if not isinstance(raw, (bytes, bytearray)):
@@ -418,15 +471,17 @@ class KiwoomClient:
                 return_code = None
             lowered = {str(k).lower(): v for k, v in (headers or {}).items()}
             cont = str(lowered.get("cont-yn") or "").strip().upper() or None
-            self._capture(Answer(
+            return self._capture(Answer(
                 api_id=api_id, request=dict(body), page_no=page_no,
                 cont_yn=cont if cont in ("Y", "N") else None,
                 next_key=(str(lowered.get("next-key") or "").strip() or None),
                 requested_at=requested_at, received_at=max(requested_at, datetime.now(timezone.utc)),
                 http_status=int(status), return_code=return_code, body=bytes(raw),
             ))
-        except Exception:  # noqa: BLE001 - a capture fault never fails the call
-            pass
+        except CaptureFailed:
+            raise
+        except Exception:  # noqa: BLE001 - any other capture fault never fails the call (from bronze: see _post)
+            return None
 
     def _bearer(self) -> str:
         now = self._clock()
@@ -515,6 +570,13 @@ class KiwoomClient:
         plus cash, after its estimated selling costs. Kiwoom's value of the
         holdings is read from the day's account return (kt00016): from 14 Sep
         2026 it can differ from the holdings at the closing prices ka01690 lists.
+
+        kt00016 counts a trade only once it settles, two trading days later
+        (kt00015 dates a trade by its settlement too), while ka01690 counts it
+        on the trade date. On a day with trades not yet settled at the close the
+        two give different cash, and kt00016's value of the holdings leaves out
+        what was bought and keeps what was sold. That day is ka01690's alone
+        (see _unsettled_day).
         """
 
         pages = self.inquire("ka01690", {"qry_dt": _yyyymmdd(day)})
@@ -544,10 +606,9 @@ class KiwoomClient:
         deposit = kiwoom_number(_field(first, "dbst_bal"))
         total = kiwoom_number(_field(first, "day_stk_asst"))
         detail = self.inquire("kt00016", {"fr_dt": _yyyymmdd(day), "to_dt": _yyyymmdd(day)})[0]
-        detail_cash = kiwoom_number(_field(detail, "entr_to"))
-        if detail_cash != deposit:
-            raise KiwoomError(f"kt00016 cash {detail_cash:,} differs from ka01690 cash {deposit:,} on {day.isoformat()}")
         held = tuple(holding for holding in holdings if holding.quantity)
+        if kiwoom_number(_field(detail, "entr_to")) != deposit:
+            return self._unsettled_day(held, deposit, total, day)
         repriced = False
         securities_value = kiwoom_number(_field(detail, "scrt_evlt_amt_to"))
         if sum((item.market_value for item in held), Decimal("0")) != securities_value:
@@ -580,6 +641,40 @@ class KiwoomClient:
             pages = self.inquire("ka10081", {"stk_cd": code, "base_dt": today, "upd_stkpc_tp": "0"}, max_pages=1)
             closes = self._closes[code] = chart_closes(pages)
         return closes.get(_yyyymmdd(day))
+
+    def _unsettled_day(self, held: tuple[Holding, ...], deposit: Decimal, total: Decimal,
+                       day: date) -> AccountValuation:
+        """A past day with trades not yet settled at the close, from ka01690 alone.
+
+        kt00016's figures are on a settled basis that day, so its value of the
+        holdings is not used. ka01690's holdings are kept when they, its cash and
+        Kiwoom's per-stock selling cost add up to its total, within 1 KRW a
+        holding: the rule the history check holds every stored day to. If the
+        listed prices do not add up (after-market prices, from 14 Sep 2026), the
+        holdings at the official close are kept if they do. Otherwise the day
+        fails, naming no amount.
+        """
+
+        def adds_up(items: tuple[Holding, ...]) -> bool:
+            values = [item.market_value for item in items]
+            cost = sum(values, Decimal("0")) + deposit - total
+            return abs(selling_cost_rule_gap(values, cost, day)) <= len(values)
+
+        repriced = False
+        if not adds_up(held):
+            closed = self._at_official_close(held, day)
+            if closed is None or not adds_up(closed):
+                raise KiwoomError(f"ka01690 holdings and cash do not add up to its total after Kiwoom's selling cost "
+                                  f"on {day.isoformat()}, a day with trades not yet settled (kt00016 cash differs)")
+            held, repriced = closed, True
+        return AccountValuation(
+            account_name="",
+            deposit=deposit,
+            estimated_assets=total,
+            holdings=held,
+            repriced_at_close=repriced,
+            unsettled_trades=True,
+        )
 
     def _at_official_close(self, holdings: tuple[Holding, ...], day: date) -> tuple[Holding, ...] | None:
         repriced: list[Holding] = []

@@ -89,7 +89,7 @@ resource jobsIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-
 resource foundry 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
   name: foundryName
   location: aiLocation
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'ai-models' })
   kind: 'AIServices'
   sku: {
     name: 'S0'
@@ -117,7 +117,7 @@ resource project 'Microsoft.CognitiveServices/accounts/projects@2025-06-01' = {
   name: projectName
   dependsOn: [analystDeployment]
   location: aiLocation
-  tags: tags
+  tags: union(tags, { layer: 'ai', component: 'ai-models' })
   identity: {
     type: 'SystemAssigned'
   }
@@ -186,7 +186,7 @@ resource privateEndpoint 'Microsoft.Network/privateEndpoints@2023-11-01' = {
   name: '${foundryName}-pe'
   location: location
   dependsOn: [project]
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'network' })
   properties: {
     subnet: {
       id: peSubnet.id
@@ -206,13 +206,14 @@ resource privateEndpoint 'Microsoft.Network/privateEndpoints@2023-11-01' = {
 resource zones 'Microsoft.Network/privateDnsZones@2020-06-01' = [for zone in dnsZones: if (createPrivateDns) {
   name: zone
   location: 'global'
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'network' })
 }]
 
 resource zoneLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = [for (zone, i) in dnsZones: if (createPrivateDns) {
   parent: zones[i]
   name: '${vnetName}-link'
   location: 'global'
+  tags: union(tags, { layer: 'foundation', component: 'network' })
   properties: {
     registrationEnabled: false
     virtualNetwork: {

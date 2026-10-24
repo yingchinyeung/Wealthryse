@@ -18,6 +18,14 @@ Exit codes: 0 no flow added (or applied), 1 flows would be added, 2 could not ru
 Production, inside the platform image:
   python scripts/medallion_flow_backfill.py --accounts-from-registry --live \\
       --report /tmp/flow-backfill.json
+
+--sections nav loads the sections behind each day's NAV instead (EquitySummaryInBase,
+OpenPositions, CashReport), so every silver NAV day can be traced to IBKR's own record
+in bronze. No figure reads these sections from bronze, so nothing shown changes. With
+--live it also counts, per account, the silver NAV days whose IBKR total is in bronze
+before and after the backfill (traced, differs, untraced; dates and counts, no
+amounts). Exit codes then: 0 every silver day would be traced (or applied), 1 a day
+would still differ or be untraced, 2 could not run.
 """
 from __future__ import annotations
 
@@ -37,7 +45,8 @@ if str(SOURCE_ROOT) not in sys.path:
 
 from ibkr_etl.db import DEFAULT_TENANT_ID  # noqa: E402
 from ibkr_etl.flow_backfill import (  # noqa: E402
-    BackfillError, apply, load_candidates, plan, registry_accounts, unowned_accounts, without_rows,
+    NAV_RUN_TYPE, NAV_SECTIONS, RUN_TYPE, SECTIONS, BackfillError, apply, load_candidates, nav_trace, plan,
+    registry_accounts, unowned_accounts, without_rows,
 )
 from ibkr_etl.switch_dry_run import (  # noqa: E402
     AccountMasker, mask_account_ids, open_read_only, statement_from_bytes,
@@ -62,6 +71,8 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="insert the missing rows into DATABASE_URL")
     parser.add_argument("--accept-flow-changes", action="store_true",
                         help="allow rows that add external flows (live returns change)")
+    parser.add_argument("--sections", choices=("flows", "nav"), default="flows",
+                        help="flows: Transfers and CashTransactions (default); nav: the records behind each day's NAV")
     parser.add_argument("--report", default="medallion-flow-backfill.json", help="JSON report path")
     args = parser.parse_args(argv)
     if args.apply:
@@ -137,19 +148,24 @@ def run(args: argparse.Namespace, work_dir: Path) -> dict:
     accounts = sorted(accounts)
     if not accounts:
         raise BackfillError("No account to backfill")
+    sections, run_type = (NAV_SECTIONS, NAV_RUN_TYPE) if args.sections == "nav" else (SECTIONS, RUN_TYPE)
     statements, read = _sources(args)
-    candidates = load_candidates(statements, read, accounts=accounts, work_dir=work_dir)
+    candidates = load_candidates(statements, read, accounts=accounts, work_dir=work_dir, sections=sections,
+                                 run_type=run_type)
     # Connect only now: loading the archive can take minutes.
     live = _connect(args) if args.live else None
     try:
-        planned = plan(candidates, accounts=accounts, live=live, tenant_id=args.tenant_id)
-        report = {"mode": "apply" if args.apply else "dry_run", "statements": len(statements),
-                  **without_rows(planned)}
+        planned = plan(candidates, accounts=accounts, live=live, tenant_id=args.tenant_id, sections=sections)
+        report = {"mode": "apply" if args.apply else "dry_run", "sections": args.sections,
+                  "statements": len(statements), **without_rows(planned)}
+        if args.sections == "nav" and live is not None:
+            report["nav_trace"] = nav_trace(planned, live, tenant_id=args.tenant_id)
         if args.apply:
             report["applied"] = apply(live, planned, tenant_id=args.tenant_id,
                                       accept_flow_changes=args.accept_flow_changes,
                                       requested=(min((s.from_date for s in statements), default=None),
-                                                 max((s.to_date for s in statements), default=None)))
+                                                 max((s.to_date for s in statements), default=None)),
+                                      run_type=run_type)
         return report
     finally:
         if live is not None:
@@ -157,7 +173,31 @@ def run(args: argparse.Namespace, work_dir: Path) -> dict:
             live.close()
 
 
+def _nav_summary(report: dict) -> list[str]:
+    lines = [f"medallion nav evidence backfill: {report['mode']} over {report['statements']} statements, "
+             f"{report['new_rows']} new rows"]
+    for account, item in sorted(report["accounts"].items()):
+        lines.append(f"  {account}: candidates={item['candidate_rows']} new={item['new_rows']} "
+                     f"live_same={item['already_live_same']} live_different={item['already_live_different']} "
+                     f"first={item['first_date']} last={item['last_date']}")
+    for account, trace in sorted((report.get("nav_trace") or {}).items()):
+        before, after = trace["before"], trace["after"]
+        lines.append(f"  {account}: silver_nav_days={trace['silver_days']} traced {before['traced']}->{after['traced']} "
+                     f"differs {before['differs']}->{after['differs']} untraced {before['untraced']}->{after['untraced']}")
+    if "applied" in report:
+        lines.append(f"  applied: {report['applied']['status']} inserted={report['applied']['inserted']}")
+    return lines
+
+
+def _nav_complete(report: dict) -> bool:
+    trace = report.get("nav_trace")
+    return trace is not None and all(t["after"]["differs"] == 0 and t["after"]["untraced"] == 0
+                                     for t in trace.values())
+
+
 def _summary(report: dict) -> list[str]:
+    if report.get("sections") == "nav":
+        return _nav_summary(report)
     lines = [f"medallion flow backfill: {report['mode']} over {report['statements']} statements, "
              f"{report['new_rows']} new rows, flows added: {'yes' if report['flows_added'] else 'no'}"]
     for account, item in sorted(report["accounts"].items()):
@@ -187,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
         print(line)
     if args.apply:
         return 0
+    if args.sections == "nav":
+        return 0 if _nav_complete(report) else 1
     return 1 if report["flows_added"] else 0
 
 

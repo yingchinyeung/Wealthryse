@@ -1,6 +1,6 @@
 -- The market news watch (supervisor design, data and operations team; docs/AGENTS.md).
 --
--- Applied after 020_kiwoom_flows.sql by scripts/install_agent_schema.py, on purpose and
+-- Applied after 022_silver_flows.sql by scripts/install_agent_schema.py, on purpose and
 -- with approval. Idempotent and additive: three new tables, one view, one inbox kind. No
 -- existing table, view or grant changes otherwise.
 --

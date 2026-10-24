@@ -427,6 +427,70 @@ class FirstPullTests(_Database):
         self.assertEqual(self.execute("SELECT COUNT(*) FROM ingestion_runs WHERE run_type = "
                                       "'v11-archive-flow-backfill' AND status = 'running'")[0][0], 0)
 
+    def test_6_nav_evidence_backfill_traces_every_silver_nav_day_and_changes_no_figure(self):
+        import medallion_flow_backfill as command
+
+        files = []
+        for index, content in enumerate(self.statements):
+            path = self.root / f"nav-{index}.xml"
+            path.write_bytes(content)
+            files += ["--statement-file", str(path)]
+        accounts = ["--account", ACCOUNT_A, "--account", ACCOUNT_B]
+        silver = {table: self.execute(f"SELECT md5(string_agg(row_sha256, ',' ORDER BY row_sha256)) FROM {table}")
+                  for table in ("nav_snapshots", "position_snapshots", "cash_snapshots", "cash_transactions")}
+        flows = self.execute("SELECT COUNT(*) FROM flex_rows WHERE section IN ('Transfers', 'CashTransactions')")
+
+        def run(*extra):
+            report = self.root / "nav-backfill.json"
+            output = io.StringIO()
+            with patch.dict(os.environ, {"DATABASE_URL": self.url, "PORTFOLIO_TENANT_ID": TENANT}), \
+                    redirect_stdout(output):
+                code = command.main(files + accounts + ["--sections", "nav", "--report", str(report), *extra])
+            text = output.getvalue() + report.read_text()
+            self.assertNotIn(ACCOUNT_A, text)
+            self.assertNotIn(ACCOUNT_B, text)
+            return code, json.loads(report.read_text()), output.getvalue()
+
+        code, report, output = run("--live")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(report["sections"], "nav")
+        self.assertGreater(report["new_rows"], 0)
+        for trace in report["nav_trace"].values():
+            # account-sync's history has no bronze rows; the archive covers every silver day.
+            self.assertGreater(trace["before"]["untraced"], 0)
+            self.assertEqual((trace["after"]["traced"], trace["after"]["differs"], trace["after"]["untraced"]),
+                             (trace["silver_days"], 0, 0))
+        self.assertIn("medallion nav evidence backfill: dry_run", output)
+
+        code, applied, _ = run("--apply")
+        self.assertEqual((code, applied["applied"]["inserted"]), (0, report["new_rows"]))
+        run_type = self.execute("SELECT run_type FROM ingestion_runs WHERE run_id = %s",
+                                (applied["applied"]["run_id"],))
+        self.assertEqual(run_type, [("v11-archive-nav-evidence-backfill",)])
+        code, again, _ = run("--live")
+        self.assertEqual((code, again["new_rows"]), (0, 0))
+        for trace in again["nav_trace"].values():
+            self.assertEqual(trace["before"]["traced"], trace["silver_days"])
+        # Bronze only: silver and the flow sections are untouched.
+        self.assertEqual({table: self.execute(f"SELECT md5(string_agg(row_sha256, ',' ORDER BY row_sha256)) "
+                                              f"FROM {table}") for table in silver}, silver)
+        self.assertEqual(self.execute("SELECT COUNT(*) FROM flex_rows WHERE section IN "
+                                      "('Transfers', 'CashTransactions')"), flows)
+
+        # A silver day whose total differs from IBKR's record is reported, and the dry run exits 1.
+        day, total = self.execute("SELECT snapshot_date, total_text FROM nav_snapshots WHERE account_id = %s "
+                                  "ORDER BY snapshot_date LIMIT 1", (ACCOUNT_A,))[0]
+        change = "UPDATE nav_snapshots SET total_text = %s WHERE account_id = %s AND snapshot_date = %s"
+        self.execute(change, ("1.00", ACCOUNT_A, day))
+        try:
+            code, differing, _ = run("--live")
+        finally:
+            self.execute(change, (total, ACCOUNT_A, day))
+        self.assertEqual(code, 1)
+        changed = [t for t in differing["nav_trace"].values() if t["after"]["differs"]]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0]["after"]["differing_dates"], [str(day)[:10]])
+
 
 if __name__ == "__main__":
     unittest.main()

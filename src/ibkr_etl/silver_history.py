@@ -1,7 +1,7 @@
 """"As known on" history for IBKR corrections (review item U8): fill it, check it, merge FX rows.
 
-docs/MEDALLION_AS_KNOWN_ON.md has the design. The held migration
-infra/medallion/drafts/u8_silver_history.sql adds silver.<table>_history beside each tracked
+docs/MEDALLION_AS_KNOWN_ON.md has the design. Migration
+migrations/postgres/074_silver_history.sql adds silver.<table>_history beside each tracked
 table, and a trigger that records every write once public.silver_history_settings.recording
 is true. This module:
 
@@ -39,7 +39,7 @@ from .parser import parse_flex_xml
 from .pilot_snapshot import ACCOUNT_TABLES
 from .util import parse_date_text, pick
 
-# table -> (valid-date column, key columns): as in the held migration.
+# table -> (valid-date column, key columns): as in migration 074_silver_history.sql.
 TRACKED: dict[str, tuple[str, tuple[str, ...]]] = {
     "trades": ("trade_date", ("account_id", "source_key")),
     "cash_transactions": ("effective_date", ("account_id", "source_key")),

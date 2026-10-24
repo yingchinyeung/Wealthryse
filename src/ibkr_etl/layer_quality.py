@@ -210,12 +210,13 @@ VOLUMES: tuple[Volume, ...] = (
     Volume("risk_free_rates", "silver", "rate_date"),
     Volume("synthetic_portfolio_components", "silver", "snapshot_date"),
     Volume("trades", "silver", "trade_date", judged=False),
-    # Corrections history (U8): append-only, so the whole table must not shrink. Held until 9 Nov.
-    Volume("cash_transactions_history", "silver", count_column="version_id", qualified=True, held=True),
-    Volume("fx_rates_history", "silver", count_column="version_id", qualified=True, held=True),
-    Volume("fx_transactions_history", "silver", count_column="version_id", qualified=True, held=True),
-    Volume("nav_snapshots_history", "silver", count_column="version_id", qualified=True, held=True),
-    Volume("trades_history", "silver", count_column="version_id", qualified=True, held=True),
+    Volume("transfers", "silver", "transfer_date", judged=False),
+    # Corrections history (U8, migration 074): append-only, so the whole table must not shrink.
+    Volume("cash_transactions_history", "silver", count_column="version_id", qualified=True),
+    Volume("fx_rates_history", "silver", count_column="version_id", qualified=True),
+    Volume("fx_transactions_history", "silver", count_column="version_id", qualified=True),
+    Volume("nav_snapshots_history", "silver", count_column="version_id", qualified=True),
+    Volume("trades_history", "silver", count_column="version_id", qualified=True),
     # Certified figures (U5): builds and figures are append-only, so neither may shrink.
     Volume("certified_builds", "gold", count_column="build_id"),
     Volume("certified_figures", "gold", count_column="build_id"),
@@ -265,6 +266,36 @@ SELECT n.subject_id, n.nav_date,
        (SELECT max(d.snapshot_date) FROM nav d WHERE d.subject_id = n.subject_id AND d.snapshot_date < n.nav_date)
            AS previous_nav_date
 FROM newest n ORDER BY n.subject_id"""
+# An account's NAV rebuilt from silver on its newest date with cash (ibkr_etl.nav_rebuild): the days to
+# rebuild, then that day's rows. Silver's tables, not the subject views, so only broker accounts.
+NAV_REBUILD_DAYS = """
+SELECT c.account_id, max(c.snapshot_date) AS snapshot_date
+FROM cash_snapshots c
+JOIN nav_snapshots n ON n.account_id = c.account_id AND n.snapshot_date = c.snapshot_date
+                    AND UPPER(n.asset_class) IN ('TOTAL', 'ALL', '')
+WHERE c.snapshot_date >= %s GROUP BY c.account_id"""
+NAV_REBUILD_SQL = {
+    "nav": f"""WITH days AS ({NAV_REBUILD_DAYS})
+SELECT n.account_id, n.snapshot_date, n.currency, n.total_text, n.cash_text, n.stock_text, n.options_text,
+       n.futures_text, n.bonds_text, n.accruals_text, a.base_currency
+FROM days d JOIN nav_snapshots n ON n.account_id = d.account_id AND n.snapshot_date = d.snapshot_date
+LEFT JOIN accounts a ON a.account_id = n.account_id
+WHERE UPPER(n.asset_class) IN ('TOTAL', 'ALL', '')""",
+    "positions": f"""WITH days AS ({NAV_REBUILD_DAYS})
+SELECT p.account_id, p.conid, p.currency, p.quantity_text, p.mark_price_text, p.market_value_text
+FROM days d JOIN position_snapshots p ON p.account_id = d.account_id AND p.snapshot_date = d.snapshot_date""",
+    "cash": f"""WITH days AS ({NAV_REBUILD_DAYS})
+SELECT c.account_id, c.currency, c.ending_cash_text, c.fx_rate_to_base_text
+FROM days d JOIN cash_snapshots c ON c.account_id = d.account_id AND c.snapshot_date = d.snapshot_date""",
+    "fx_rates": f"""WITH days AS ({NAV_REBUILD_DAYS})
+SELECT f.account_id, f.from_currency, f.to_currency, f.rate_text
+FROM days d JOIN fx_rates f ON f.account_id = d.account_id AND f.rate_date = d.snapshot_date""",
+}
+# Within one cent of IBKR's total reconciles. A warning while the check is new (until 30 days of clean
+# history); then an error, as positions_to_zero is.
+NAV_REBUILD_TOLERANCE = Decimal("0.01")
+NAV_REBUILD_SEVERITY = "warning"
+
 HELD_SHARE = 0.8  # positions normally exist on at least this share of a subject's NAV dates
 # A subject with no NAV for a week (a closed account) is not judged, so an old move or drop
 # is not reported again every day.
@@ -284,6 +315,9 @@ VALUE_CHECKS = (
                f"NAV moved more than {NAV_BAND:.0%} between a subject's two newest dates"),
     ValueCheck("value.positions_to_zero", "silver", "silver.subject_position_series",
                "A subject that held positions holds none on its newest dates"),
+    ValueCheck("value.nav_rebuild", "silver", "silver.nav_snapshots",
+               "A broker account's NAV rebuilt from its silver positions, cash and FX differs from the broker's "
+               "own total on its newest date"),
 )
 
 
@@ -501,6 +535,53 @@ def judge_positions(rows: Iterable[Mapping[str, Any]], *, today: date | None = N
     return _result(check.check_id, "value", check.layer, check.target, state,
                    severity="error" if failed else None, observed=len(failed), subjects_checked=checked,
                    subjects_learning=learning, subjects_stale=stale, failed=failed)
+
+
+def judge_nav_rebuild(rows: Mapping[str, Iterable[Mapping[str, Any]]], *, today: date | None = None,
+                      tolerance: Decimal = NAV_REBUILD_TOLERANCE) -> dict[str, Any]:
+    """Each broker account's NAV on its newest date with cash, rebuilt from silver positions, cash and FX
+    (ibkr_etl.nav_rebuild), against the broker's own total. Gaps are reported in basis points of the
+    total, never as amounts."""
+    from . import nav_rebuild
+
+    check = VALUE_CHECKS[2]
+    by_account: dict[str, dict[str, list]] = {}
+    for part in ("nav", "positions", "cash", "fx_rates"):
+        for row in rows.get(part) or ():
+            by_account.setdefault(str(row["account_id"]), {"nav": [], "positions": [], "cash": [],
+                                                           "fx_rates": []})[part].append(row)
+    failed, checked, stale, sources = [], 0, 0, {}
+    for account, parts in sorted(by_account.items()):
+        totals = parts["nav"]
+        base = next((str(r["base_currency"]) for r in totals if r.get("base_currency")), None)
+        total = next((r for r in totals if base and r.get("currency") == base), None)
+        if total is None and len(totals) == 1:
+            total, base = totals[0], str(totals[0].get("currency"))
+        if total is None:
+            continue
+        if _stale(total.get("snapshot_date"), today):
+            stale += 1
+            continue
+        found = nav_rebuild.rebuild(total, parts["positions"], parts["cash"], parts["fx_rates"], base)
+        if found is None:
+            continue
+        checked += 1
+        sources[found["cash_source"]] = sources.get(found["cash_source"], 0) + 1
+        if abs(found["gap"]) > tolerance:
+            broker = found["broker_nav"]
+            cash_gap = (found["cash_value"] - found["broker_cash"]) if found["broker_cash"] is not None else None
+            failed.append({"subject": mask(account), "date": str(total.get("snapshot_date")),
+                           "gap_bp": nav_rebuild.basis_points(found["gap"], broker),
+                           "positions_gap_bp": nav_rebuild.basis_points(
+                               found["positions_value"] - found["broker_positions_value"], broker),
+                           "cash_gap_bp": None if cash_gap is None else nav_rebuild.basis_points(cash_gap, broker),
+                           "cash_source": found["cash_source"], "missing_fx": found["missing_fx"],
+                           "missing_prices": len(found["missing_price"])})
+    state = "fail" if failed else "pass" if checked else "learning"
+    return _result(check.check_id, "value", check.layer, check.target, state,
+                   severity=NAV_REBUILD_SEVERITY if failed else None, observed=len(failed),
+                   subjects_checked=checked, subjects_stale=stale, cash_sources=sources,
+                   tolerance=float(tolerance), failed=failed)
 
 
 def judge_schema(contract: Mapping, actual: Mapping | None) -> dict[str, Any]:
@@ -768,11 +849,14 @@ def measure_daily(connection: Any, pass_plan: Plan, *, now: datetime, results: l
             return judge_volume(rule, {str(r["day"]): int(r["total"]) for r in rows}, today=today)
         attempt(rule.check_id, "volume", rule.layer, rule.target, count)
 
-    nav, positions = VALUE_CHECKS
+    nav, positions, rebuild = VALUE_CHECKS
     attempt(nav.check_id, "value", nav.layer, nav.target,
             lambda: judge_nav_moves(_rows(connection, NAV_MOVE_SQL, (value_since,)), today=today))
     attempt(positions.check_id, "value", positions.layer, positions.target,
             lambda: judge_positions(_rows(connection, POSITIONS_SQL, (value_since, value_since)), today=today))
+    attempt(rebuild.check_id, "value", rebuild.layer, rebuild.target,
+            lambda: judge_nav_rebuild({part: _rows(connection, query, (value_since,))
+                                       for part, query in NAV_REBUILD_SQL.items()}, today=today))
 
     if pass_plan.contracts_error:
         for kind in ("schema", "rule"):

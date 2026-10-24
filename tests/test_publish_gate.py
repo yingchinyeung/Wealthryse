@@ -377,6 +377,34 @@ class BeforeCommitTests(unittest.TestCase):
                 self.assertEqual(scope.partition, tuple(PARTITION[COMPARISON].items()))
                 self.assertEqual(measure.call_args.kwargs["tenant_id"], TENANT)
 
+    def test_no_money_figure_reaches_the_log_or_the_verdict(self):
+        # PUBLISH_GATE lines go to Log Analytics, where figures never go in the clear.
+        observation = clean_observation()
+        observation["checks"]["cash_plus_positions"]["subjects"][0].update(
+            nav="81780843.25", positions="71823075.5", cash="8112050.75")
+        observation["checks"]["nav_matches_ibkr"]["problems"] = {"mismatch": {"rows": 1, "samples": [
+            {"subject_id": "U9100001", "date": "2026-10-16", "gold": 45878.07, "books": 45870.0, "source": "ibkr"}]}}
+        held, _, lines, _ = self._run("enforce", observation)
+        self.assertIsInstance(held, gate.BuildHeldBack)
+        record = json.loads(lines[0].removeprefix(gate.LOG_PREFIX))
+        for text in (lines[0], json.dumps(held.verdict, default=str), str(held)):
+            for figure in ("81780843", "71823075", "8112050", "1845717", "45878", "45870"):
+                self.assertNotIn(figure, text)
+        table = record["tables"][COMPARISON]["checks"]
+        holdings = table["cash_plus_positions"]["subjects"][0]
+        self.assertEqual((holdings["within"], holdings["difference_share"]), (False, "-0.0226"))
+        self.assertIn("differ from NAV by 2.26% of NAV (more than 1%)", " ".join(record["reasons"]))
+        sample = table["nav_matches_ibkr"]["problems"]["mismatch"]["samples"][0]
+        self.assertEqual(sample, {"subject_id": "U9100001", "date": "2026-10-16", "source": "ibkr",
+                                  "gap_share": "0.0002"})
+
+    def test_without_figures_reaches_any_depth(self):
+        verdict = {"tables": {"x": {"checks": {"y": {"subjects": [{"nav": 1, "cash": 2, "date": "d"}],
+                                                     "samples": ({"gold": 3, "books": 4, "subject_id": "s"},)}}}}}
+        self.assertEqual(gate.without_figures(verdict),
+                         {"tables": {"x": {"checks": {"y": {"subjects": [{"date": "d"}],
+                                                            "samples": [{"subject_id": "s"}]}}}}})
+
     def test_enforce_holds_back_a_failing_version(self):
         held, connection, lines, _ = self._run("enforce", broken_observation())
         self.assertIsInstance(held, gate.BuildHeldBack)

@@ -16,7 +16,7 @@ applied. Each stage is approved separately (see "Stages" below).
 |---|---|---|
 | Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, Kiwoom REST answers (from migration 082), live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
 | Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmark prices, FX closes, risk-free rates), sectors, derived and composite portfolios | Each table's `source` in the catalog says how it is rebuilt: `ibkr` tables from bronze (v2's own Flex pull from the switch on; v1.1's history from its archived statements), `market-data` tables once their raw responses are kept in bronze (from S3b), `derived` tables from other silver tables. A record IBKR re-sends replaces the earlier one here; every version stays in the raw statement files. |
-| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: the benchmark comparison reads bronze `flex_rows` for cash flows, and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
+| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: return figures still read deposits and withdrawals from bronze `flex_rows` as well as silver, and use bronze wherever the two differ (`FLOWS_SOURCE=fallback` since 24 Oct 2026), and the crisis jobs fetch prices while they compute until `CRISIS_PRICES_SOURCE=silver` is on (below). The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
 | Ops | Runs, approvals, audit, access, onboarding workflow, configuration and hand-maintained settings (subjects, benchmark list and mapping, metric catalogue), agent state | Control plane, not a data layer. Stays in `public`. |
 | Platform | `tenants`, `schema_migrations`, row-level security helpers | Stays in `public`. |
 
@@ -42,8 +42,9 @@ applied. Each stage is approved separately (see "Stages" below).
   `infra/medallion/applied-tags.json` records what was added on 17 Oct 2026. A Bicep file
   that deploys one of those resources sets the same tags with `union(tags, {...})`, so a
   redeploy keeps them. `tests/test_bicep_medallion_tags.py` checks this. A new resource
-  in a Bicep file gets its three tags in the same PR. The resource group's audit rule
-  (Azure Policy, "Medallion rule") reports any resource without them.
+  in a Bicep file gets its three tags in the same PR. The resource group's tag rule
+  (Azure Policy, "Medallion rule") refuses a new or changed resource without them (see
+  [Tag rule](#tag-rule-step-4)).
 
 ## Adding a table, view or container
 
@@ -86,11 +87,26 @@ Each batch is one migration:
     finds the existing blob, so nothing new is kept under the legal hold.
   - It is off unless the job sets `MARKET_DATA_RAW_CONTAINER` and
     `AZURE_STORAGE_ACCOUNT_URL`.
-  - It is fail-soft:
+  - By default it is fail-soft:
     - it uses managed identity only, with short timeouts and no retries;
     - every thread shares one time budget, which is a hard limit;
     - the first storage error or timeout turns capture off for the rest of the run,
       and the job carries on.
+  - With `MARKET_DATA_RAW_REQUIRED=true` the raw copy is part of the fetch:
+    - a response whose copy cannot be stored raises `RawCopyNotStored`, so its fetch
+      fails before anything is parsed and nothing from it reaches silver;
+    - each copy gets three tries (pauses of 1 and 3 seconds) with longer timeouts and no
+      time budget, and a file already there counts as kept;
+    - once one copy has failed every try, the rest of the run's fetches fail at once;
+    - without `MARKET_DATA_RAW_CONTAINER` and `AZURE_STORAGE_ACCOUNT_URL` every fetch
+      fails, so the setting only goes on jobs that have both.
+- **Rebuild check** (`src/ibkr_etl/market_data_rebuild.py`,
+  `scripts/check_market_data_rebuild.py`): read-only. It rebuilds the recent rows of
+  `silver.benchmark_prices` (each row names its raw file by `raw_sha256`) and of the U.S.
+  Treasury series in `silver.risk_free_rates` (the newest stored year file) with the jobs'
+  own parsers, and prints one `MARKET_DATA_REBUILD` line with counts: matched, differing
+  (by id and date, never values), missing from the file, and rows whose file was not
+  found. It exits 1 when a row differs (`--require-files` also fails on a missing file).
 - **Freshness checks** (`src/ibkr_etl/layer_freshness.py`):
   - The autonomous administrator runs explicit rules for each layer in one READ ONLY
     transaction, within a hard 15-second limit. By default it uses its own
@@ -118,6 +134,12 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
     imports for its newest run date (`institutional_work_items`). They must all have
     succeeded and must cover yesterday, because the pull asks IBKR for data up to
     yesterday;
+    institutional-daily's newest run in the lineage records can only delay. It loads the
+    Kiwoom accounts after the IBKR work items, so the work items can all have succeeded
+    while those accounts' NAV is still coming in (22 Oct: benchmark-daily started before
+    the U.S. Kiwoom account was loaded, and its risk figures were blocked). Its steps are
+    separate processes, each with its own run, so a run that ended in the last 120
+    seconds also holds, until the next step's START shows;
   - benchmarks and FX: the newest finished benchmark run in `ingestion_runs`. The
     newest sector-classification run in the lineage records (below) can only delay;
   - derived: each subject's newest calculation in derived-daily's newest execution
@@ -135,8 +157,8 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
   go through `workflow_dates`, as a persisted date policy would. If the shadow ledger
   ever has rows for the cycle (`daily:<date>`, subject `daily-cycle`), they must agree
   too. Today it has none: migrations 054 and 060 are held back in production.
-- **Lineage records as start and finish.** With `LINEAGE_RECORDING=true`, risk-snapshots,
-  sector-classification and month-end-factsheet leave a START row in `lineage_events`
+- **Lineage records as start and finish.** With `LINEAGE_RECORDING=true`, institutional-daily,
+  risk-snapshots, sector-classification and month-end-factsheet leave a START row in `lineage_events`
   (migration 071) and one COMPLETE, FAIL or ABORT row when they end. For each of them
   the check reads the newest run:
   - a START with no end, younger than the job's `replicaTimeout`, means still running.
@@ -156,11 +178,13 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
     Risk is then judged by its snapshots alone, as before, and reports are not checked
     (assurance is then judged by the steps before reports).
 
-  Sectors are a soft dependency. A sector run still running holds up the jobs after it
-  only within the wait. One that failed, crashed or never ended, or that ended after a
-  step that reads it, goes in `notes`, never in `reasons`: yesterday's sector
-  classifications are good enough for a day. The decision says in `notes` whenever a
-  record was not used, and notes never make the inputs not ready.
+  Sectors and institutional-daily's account loads are soft dependencies. A run of
+  either that is still running holds up the jobs after it only within the wait. One
+  that failed, crashed or never ended, or a sector run that ended after a step that
+  reads it, goes in `notes`, never in `reasons`: yesterday's sector classifications are
+  good enough for a day, and a failed account load is judged by the work items and each
+  subject's own checks. The decision says in `notes` whenever a record was not used,
+  and notes never make the inputs not ready.
 - **How it runs.** One READ ONLY session with short timeouts
   (`layer_freshness.open_read_only`), within a hard 10-second limit, using the job's own
   `DATABASE_URL` (`INPUT_READINESS_DATABASE_URL` overrides it; that login needs SELECT on
@@ -190,7 +214,7 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
 
   | Job | Starts (UTC) | `replicaTimeout` | Waits for | Wait | Recheck | Left for the job |
   |---|---|---|---|---|---|---|
-  | benchmark-daily | 08:30 | 1200 s | pull (08:20) | 300 s | 30 s | at least 840 s |
+  | benchmark-daily | 08:30 | 1200 s | pull and account loads (08:20, done about 08:34) | 600 s | 30 s | at least 570 s |
   | sector-classification | 08:45 | 1800 s | pull | 600 s | 60 s | at least 1110 s |
   | derived-daily | 08:50 | 3600 s | pull, benchmark, sectors | 900 s | 60 s | at least 2610 s |
   | risk-snapshots | 08:55 | 3600 s | derived, benchmark, sectors | 900 s | 60 s | at least 2610 s |
@@ -210,7 +234,7 @@ are benchmark-daily and sector-classification (benchmarks and FX), derived-daily
   exactly, or Azure refuses it, the job starts as configured and the web log says so.
 - **Switching it on** is a separate approved step: add `INPUT_READINESS_MODE` (and for
   enforce the wait settings) to the seven job definitions, with `LINEAGE_RECORDING=true`
-  on risk-snapshots, sector-classification and month-end-factsheet, on an image built
+  on institutional-daily, risk-snapshots, sector-classification and month-end-factsheet, on an image built
   from a `main` that has this code. To read the results:
   `ContainerAppConsoleLogs_CL | where Log_s startswith 'INPUT_READINESS '`. Explain
   every "not ready". The evidence queries are judged on synthetic data only so far.
@@ -239,8 +263,14 @@ finds stops a job or holds back publication. Only the publish gate does that.
       the typical count for the same kind of day (both markets open, Hong Kong only or
       New York only);
     - each table's live schema against its data contract;
-    - two value checks: a NAV move of more than 10% between a subject's two newest
-      dates, and positions dropping to zero;
+    - three value checks: a NAV move of more than 10% between a subject's two newest
+      dates, positions dropping to zero, and the NAV rebuild (`value.nav_rebuild`):
+      each broker account's positions, cash and FX in silver, plus IBKR's accruals, on
+      its newest date with cash, must add up to IBKR's own total within one cent
+      (`src/ibkr_etl/nav_rebuild.py`, which the onboarding reconciliation agent also
+      uses). When the Cash Report has no per-currency rows, its base-currency total
+      (`BASE_SUMMARY`) is the account's cash. A break is reported in basis points of the
+      total, never as an amount;
     - the contract quality rules, apart from any the publish gate already ran that day.
 - **Avoiding false alarms.**
   - A count is judged only once there are 10 earlier days of the same kind. It fails
@@ -254,6 +284,10 @@ finds stops a job or holds back publication. Only the publish gate does that.
   - Positions to zero applies only to subjects that held positions on at least 80% of
     their NAV dates. It is reported once, on the day positions drop to zero.
   - A NAV move is a warning: it can be a deposit or a withdrawal.
+  - A NAV rebuild break is a warning while the check is new. Once it has a month of
+    clean history it becomes an error (`NAV_REBUILD_SEVERITY`). The platform's NAV is
+    IBKR's own total, so a break means the silver positions, cash or FX do not add up
+    to it, not that the NAV shown is wrong.
 - **History.** One row per result in `quality_check_results` (migration 072): readiness,
   freshness, counts, schema, value and rule results. The table is append-only and kept
   per tenant. A table rather than Log Analytics, because the weekly report reads 13 weeks
@@ -395,33 +429,140 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
     `FLOWS_SOURCE {"dates_differing":1,"decision":"bronze","kinds":{"transfers_not_in_silver":1},"mode":"fallback","reason":"silver_differs","subject":"u…01"}`
     (`reason` is `silver_differs` or `silver_unreadable`; counts and masked subjects only). To
     read them: `ContainerAppConsoleLogs_CL | where Log_s startswith 'FLOWS_SOURCE '`.
-  - `on`: silver only. Not before two clean month-ends in `fallback`, and not before the
-    Transfers section has a silver table (below).
+  - `on`: silver only, except in the month-end check below. Not before two clean month-ends
+    in `fallback`. Without `silver.transfers` it reads bronze and logs `no_silver_transfers`,
+    so a transfer is never left out.
+- **The month-end check.** On days 1 to 7 of each month in Hong Kong, when the month just
+  closed is reported and frozen, `on` reads bronze beside silver and keeps bronze wherever the
+  two differ, exactly as `fallback` does, and its lines add `"guard":"month_end"`. So a
+  difference found at a month-end goes into no frozen figure. The jobs that freeze a month's
+  figures (the certified build, the month-end factsheet and the report snapshot) stay on
+  `fallback` whatever the others run, which also covers a month reported after the 7th.
+- **The alert.** `infra/staging-flows-source-alert.bicep` deploys
+  `ibkrv2stg-flows-source-kept-bronze`, a log alert to `ibkrv2stg-alerts` on any
+  `FLOWS_SOURCE` line where a reader kept bronze, by job or app and reason, checked every 15
+  minutes. It shows no subject or value. In `fallback` it is how a difference is noticed the
+  day it shows, and two clean month-ends means no alert across each. On since 24 Oct 2026
+  03:17 UTC (deployment `flows-source-alert-a3a91aa`, from main a3a91aa).
+- **Live:** `fallback` since 24 Oct 2026 02:19 UTC on the website and the five jobs that build
+  return figures (the certified build, derived-daily, benchmark-daily, crisis-scenarios-daily
+  and the month-end factsheet), with no image changed. A read-only comparison just before found
+  every account equal in silver and bronze, so no figure changed. The onboarding analytics and
+  render jobs and the report snapshot job stay unset until they run an image with the switch.
+  `silver.transfers` (084) since 02:56 UTC the same day: applied alone, filled from bronze (no
+  Transfers rows yet, so nothing to copy), and compared again, 4 of 4 accounts matching.
+  `ibkrv2stg-institutional-daily` runs main-397d77a, so its daily load writes IBKR transfers to
+  silver as well as bronze. The readers keep their older images, which read no transfers from
+  silver, so until each runs 397d77a or later `fallback` keeps bronze, with one log line, for
+  any account that has a transfer. `ibkrv2stg-flex-discovery` still writes transfers to bronze
+  only, which `fallback` reads as `transfers_not_in_silver`.
+  `on` waits for two clean month-ends (31 Oct and 30 Nov) and images with the month-end check
+  on every reader that goes to `on`; the alert is on.
 - **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to
   `silver.cash_transactions` in the same loop, under the parser's key. The daily 14-day
   re-send updates the same row in both; a correction under the same key overwrites both; a
   correction under a new key (no IBKR transaction id) adds a row to both. With
   `IBKR_FLEX_LEGACY_KEY_COMPAT` silver keeps v1.1's key, so the comparison matches rows by
-  content, never by key. Two gaps keep bronze in `fallback`: silver has no table for the
-  Transfers section (the loader writes it to `flex_rows` only), and it cannot tell a
-  consolidated copy (`accountId` "-") from the account's own row, which bronze skips.
-- **Leave the agent tool server unset** until the agent schema has a view over silver flows:
-  its login reads only the `agent` views, so `fallback` there always logs
-  `silver_unreadable` and keeps bronze (the failed read is inside a savepoint). Removing
-  `agent.flex_rows` comes after that.
+  content, never by key. The Transfers section has its own table, `silver.transfers`
+  (migration 084, below). Where `fallback` still keeps bronze: a date whose transfer silver
+  does not hold yet (`transfers_not_in_silver`, before the fill) or holds differently
+  (`transfer_differs`), and a consolidated copy of a cash transaction (`accountId` "-"), which
+  silver cannot tell from the account's own row and bronze skips.
+- **`silver.transfers` (084).** One row per Transfers record under the parser's key and
+  digest, beside its `flex_rows` row; dates as ISO text, amounts as decimal text, and IBKR's
+  own `accountId` in `flex_account_id` ("-" on a consolidated copy, which bronze reads and so
+  does silver). Created in public and moved into silver with a view left in public, isolated
+  by account and watched (083) like the other silver tables. `bootstrap_postgres.py
+  --only-migration 084_silver_transfers.sql` applies it alone, with the same
+  `SILVER_WRITE_LOCK` setting as the bootstrap before it, so the grants and the lock cover
+  it. Once it exists, the loader (an image with 084's loader) writes each Transfers record
+  there and to `flex_rows` in the same loop; a database or image without it keeps Transfers
+  in `flex_rows` only, as before. The records loaded before that come from bronze:
+  `python -m ibkr_etl.flows_source fill-transfers` counts, in a READ ONLY session, what silver
+  lacks (`inserted`, `updated`, `unchanged`, `only_in_silver`, never a value); with `--apply`,
+  run as the loader login (the silver write lock lets no other login write), it writes them
+  with the loader's own function and commits once per tenant. Running it again changes
+  nothing. Silver reads a transfer by bronze's rules: its date, else its report date; a CASH
+  transfer's `cashTransfer` converted with the account's IBKR FX rate; any other transfer's
+  `positionAmountInBase`, else its `positionAmount` converted. Undo:
+  `infra/medallion/undo/084_silver_transfers_undo.sql` after `FLOWS_SOURCE` is off; bronze
+  keeps every record.
+- **The agent tool server** reads only the `agent` views, so it needs
+  `migrations/agent/022_silver_flows.sql` before `fallback` means anything there; without it
+  every call logs `silver_unreadable` and keeps bronze (the failed read is inside a
+  savepoint). 022 widens `agent.cash_transactions` (020's Kiwoom rows) to the rows of the
+  accounts in scope that can be a deposit or withdrawal, with the four columns the silver
+  reader also selects, and adds `agent.transfers` over `silver.transfers` (skipped until 084
+  is applied). `provisional_benchmark._is_external_cash_transaction` still decides each
+  row; dividends, fees and trades stay out of both views. With the setting off nothing
+  reads the new part. `infra/agent-apps.bicep` sets it on the tool server alone
+  (`flowsSource`, default `off`, which leaves the variable out). The order: 022 installed
+  (`install_agent_schema.py --existing-logins`, a dry run first), the tool server on an
+  agent image with `flows_source` from main 397d77a or later (earlier images read no
+  transfers from silver), then `flowsSource=fallback`. Removing `agent.flex_rows` comes
+  after `on`.
 - **Undo:** remove the setting. Nothing is written anywhere.
 - **Before switching on, on a restored copy:**
   `python -m ibkr_etl.flows_source compare --database-url "<copy URL>" --tenant <tenant id>`
   reads every subject over all history in READ ONLY transactions and prints counts: subjects,
   accounts, matching, differing, errors, the kinds of difference (subjects and dates each),
-  and notes that explain them (`bronze_transfer_rows`, `bronze_consolidated_copies`,
-  `silver_rows_sharing_a_transaction_id`). It must show no errors, and every differing
+  and notes that explain them (`bronze_transfer_rows`, `silver_transfer_rows`,
+  `bronze_consolidated_copies`, `silver_rows_sharing_a_transaction_id`). It must show no errors, and every differing
   account explained by its notes, for example an account-sync account whose bronze flows were
   never backfilled (`only_in_silver`). Matching accounts are the ones `fallback` reads from
   silver; the others keep bronze and log one line on every read.
-- **Before `on`:** two clean month-ends in `fallback`; a silver table for Transfers (a
-  migration, the loader writing it, and a fill from `flex_rows`), or proof that no account
-  has Transfers rows; and the agent view above.
+- **Order of the switch-on:** 084 applied; the loader jobs on an image with 084's loader;
+  `fill-transfers --apply`; `compare` showing every account matching, or each difference
+  explained; then `fallback` on the website, the certified build, derived-daily and the
+  monthly and month-end jobs.
+- **Before `on`:** two clean month-ends in `fallback`, and the agent views above installed with the tool
+  server on `fallback` through both.
+
+## Crisis prices from silver (S6): `CRISIS_PRICES_SOURCE`
+
+The crisis replay (2008, `crisis_replay`, run by benchmark-daily, derived-daily and the
+onboarding jobs) and the crisis scenarios (2008, 2015, 2020 and 2022, `crisis_scenarios`, run by
+crisis-scenarios-daily) need Yahoo Finance closes and FX quotes for the holdings they replay.
+Today they fetch them while they compute, the known exception in the Gold row above.
+`ibkr_etl.crisis_prices` splits that into a fetch step that fills silver and a calculation
+that reads silver only.
+
+- **The setting:** `CRISIS_PRICES_SOURCE` on each job.
+  - `off`, the default (also unset): fetched while computing, exactly as before. Nothing new
+    is stored. A value other than `off` or `silver` stops the job.
+  - `silver`: two steps. The fetch step runs the calculation once against Yahoo only to learn
+    what it asks for: every reply is kept in `bronze-market-data` by raw capture, as before,
+    its parsed closes are written to `silver.market_data_prices` and committed, and that run's
+    results are thrown away. Then the calculation runs again reading silver only, and only
+    those results are stored. One `CRISIS_PRICES {json}` line per step gives counts only
+    (requests, failed requests, rows inserted, updated, deleted and unchanged, and reads that
+    matched today's fetch or came from an earlier one), never a price, ticker or account. To
+    read them: `ContainerAppConsoleLogs_CL | where Log_s startswith 'CRISIS_PRICES '`.
+- **What silver holds.** `instrument_id` `yahoo-<ticker in lower case>`, `symbol` the ticker,
+  `price_type` `adjusted_close` for securities and indices (Yahoo's Adj Close, as the replays
+  use) and `unadjusted_close` for the FX quotes (`HKD=X` and the other `FX_TICKERS`, units of
+  that currency per USD; cross pairs are worked out from two quotes at read time, as the fetch
+  does). `currency` is the currency the close is in. A reply with closes replaces that ticker's
+  rows on the dates it asked for: new dates inserted, changed closes updated, dates Yahoo no
+  longer has deleted. An empty or failed reply changes nothing, so silver keeps the last good
+  answer. The `crisis-replay-<ticker>` rows the replay already writes (its series in the
+  reporting currency) are unchanged.
+- **Same results.** On a day Yahoo answers, silver holds exactly what was just fetched, so the
+  results are the ones fetching while computing gives (tests compare both for the USD, won and
+  composite replays and the scenarios).
+- **When Yahoo cannot be reached:** the calculation uses the closes silver kept from earlier
+  fetches. Yahoo's "no prices" for a ticker (a holding listed after a window, a ticker variant
+  that does not exist) is not kept, so a subject holding such a ticker stops for the day
+  (`NotInSilver`) and its last stored results stay, where fetching while computing stored
+  scenarios marked unavailable, or failed the replay. A request today's fetch did not answer,
+  with nothing in silver for it, is never read as "no prices".
+- **Who writes.** crisis-scenarios-daily writes silver in its fetch step, so it is a loader job
+  (`silver_writers.LOADER_JOBS`) and logs in with `database-loader-url` from the switch-on;
+  benchmark-daily, derived-daily and the onboarding jobs already do.
+- **Not covered:** the website's what-if crisis replay (Modelling) still asks Yahoo for tickers
+  someone types in, which silver cannot hold in advance.
+- **Undo:** remove the setting (and put crisis-scenarios-daily back on `database-app-url` while
+  the silver write lock is off). The `yahoo-` rows stay in silver, unread.
 
 ## Release data report
 
@@ -441,15 +582,94 @@ the plan that closes the gap.
 
 | Source | Bronze | Silver written by | Plan |
 |---|---|---|---|
-| IBKR Flex | `ibkr-raw` files, `bronze.raw_reports`, `bronze.flex_rows` | The loader, from bronze (S5, 17 Oct) | Done. |
+| IBKR Flex | `ibkr-raw` files, `bronze.raw_reports`, `bronze.flex_rows` | The loader, from bronze (S5, 17 Oct) | Done for v2's own pulls. The days account-sync imported from v1.1 have silver rows but no `flex_rows`. `scripts/medallion_flow_backfill.py --sections nav` loads the records behind each day's NAV (EquitySummaryInBase, OpenPositions, CashReport) from v1.1's archived statements in `ibkr-raw` into `bronze.flex_rows`, inserting only missing rows and never overwriting. With `--live` it counts, per account, the silver NAV days whose IBKR total is in bronze before and after (traced, differs, untraced; no amounts). No figure reads these sections from bronze, so nothing shown changes. |
 | IBKR live (TWS) | `bronze.live_*` | Not used for silver | Done. |
-| Kiwoom REST | None yet | `ibkr_etl.kiwoom_collector`, from the live answer | `bronze.kiwoom_responses` (migration 082, applied alone after the U8 record; first capture on the 23 Oct daily run). The collector stores every page first (`KIWOOM_BRONZE=true`, `ibkr_etl.kiwoom_bronze`). The conform step `ibkr_etl.kiwoom_conform` (`scripts/run_kiwoom_conform.py check --run-id N` or `--latest`) replays one bronze run's stored answers through the collector's own functions, never calling Kiwoom, and compares the rows with silver by the collector's keys. It is read-only and prints counts only (matched, differing, only in the rebuild, only in silver, missing answers, refusals replayed). Letting it write silver comes later. Each account's history is fetched again into bronze and silver rebuilt from it; any difference is kept as a restated version (U8) with a note. A past day is Kiwoom's daily balance (`ka01690`) with its account return for that day (`kt00016`, Kiwoom's own value of the holdings) and, when `ka01690` lists after-market prices, each stock's official KRX close, read as the next trading day's base price on the unadjusted daily chart (`ka10081`), so a day's close is known from the next trading day; all three are kept in bronze. Silver checks each Kiwoom day to the won: the positions add up to Kiwoom's holdings value, and the selling cost follows Kiwoom's per-stock rule. History fetches run outside 16:00–18:00 and 19:00–22:00 UTC, when `ka01690` answers with empty figures; the 08:00 UTC daily run is unaffected. Open quality exceptions hold that account's reports until the owner accepts them by name. |
-| Market data | `bronze-market-data` files since 18 Oct, best effort | The fetchers, from the live answer | From 26 Oct a fetch whose raw copy cannot be stored fails, a rebuild check compares silver with what the stored files parse to, and the bronze file freshness checks turn on. Nothing raw exists before 18 Oct. |
-| One-off scripts | None | Hand-run backfills and cut-overs in `scripts/` | From 28 Oct only the named loaders' logins write silver, and a CI check refuses new code that writes silver anywhere else. |
+| Kiwoom REST | `bronze.kiwoom_responses`, every page since the 22 Oct daily run (Korea and the U.S. account) | `ibkr_etl.kiwoom_collector` (Korea, KRW) and `ibkr_etl.kiwoom_us_account` (the U.S. account, USD), from the live answer; with `KIWOOM_SILVER_FROM_BRONZE=true`, from the pages as bronze stored them | `bronze.kiwoom_responses` (migration 082, applied alone after the U8 record). The collector stores every page first (`KIWOOM_BRONZE=true`, `ibkr_etl.kiwoom_bronze`). The conform step `ibkr_etl.kiwoom_conform` (`scripts/run_kiwoom_conform.py check --run-id N` or `--latest`) replays one bronze run's stored answers through the collector's own functions, never calling Kiwoom, and compares the rows with silver by the collector's keys. It is read-only and prints counts only (matched, differing, only in the rebuild, only in silver, missing answers, refusals replayed). With `KIWOOM_BRONZE_REQUIRED=true` as well, storing each page is part of the call, as with market data: a page bronze cannot store after three tries (or an account whose bronze run cannot be opened) fails that account before the answer is used, its uncommitted silver rows roll back, and every later account fails before Kiwoom is called, so silver only ever holds rows built from answers already in bronze. After such a run the collector rebuilds each loaded account's bronze run and compares it with silver (`kiwoom_rebuild`, one more line of counts, read-only). With `KIWOOM_SILVER_FROM_BRONZE=true` as well (it needs both switches above, or nothing is collected), silver is written from bronze: each page is read back from `bronze.kiwoom_responses` in the same transaction that stores it, and the client carries on with the stored page (its status, paging headers and body) instead of the answer it received, so every Kiwoom silver row is computed by the collector's own functions from bronze's copy, as the conform replay computes it. A page this call stored must read back exactly as received (a next-key longer than the 200 characters bronze keeps fails here), and a request asked twice in one run reads back its first answer, as the replay does. A page that cannot be read back fails its account like one that cannot be stored. The account's result says `silver_from` and the run's lineage marks its silver outputs `via` `bronze.kiwoom_responses`. Every past day is already in bronze and rebuilds with no differences (385 Korea days and 144 U.S. days, checked 22 and 23 Oct 2026), so switching it on rewrites nothing in silver; only later daily runs change. The institutional daily job has it on since 23 Oct 2026 (main-dc3a700); its first run with it is 24 Oct, and its undo is main-1ad4a87 without the switch. A failed day is filled by the next daily run, which lists the movements again in full and fills any missing past day. The past days silver held before capture began are asked for again into bronze by `scripts/run_kiwoom_bronze_history.py` (`ibkr_etl.kiwoom_bronze_history`). It is run by hand in the daily job's place, outside the daily run and Kiwoom's 16:00–18:00 and 19:00–22:00 UTC rebuild. It makes the collector's own calls for each loaded account's silver days that bronze lacks (a day held only by a bronze run that failed part-way counts as lacking), writes bronze only (its account reads are read-only), and checks each run with the conform step. The silver contracts state the rules both accounts' rows keep: the total adds up on every Kiwoom row, rows are in the account's own currency, the U.S. account's positions add up to Kiwoom's securities value and its cash rows to its NAV cash, and trades and flows carry the right direction. Two freshness checks watch Kiwoom: `bronze.kiwoom_responses` (an answered page each cycle) and `silver.nav_snapshots.kiwoom` (each Kiwoom account's newest NAV, so one account falling behind shows). Both are reported only until the administrator's login can read bronze and a week of readings is fresh. Each account's history is fetched again into bronze and silver rebuilt from it; any difference is kept as a restated version (U8) with a note. A past day is Kiwoom's daily balance (`ka01690`) with its account return for that day (`kt00016`, Kiwoom's own value of the holdings) and, when `ka01690` lists after-market prices, each stock's official KRX close, read as the next trading day's base price on the unadjusted daily chart (`ka10081`), so a day's close is known from the next trading day; all three are kept in bronze. `kt00016` counts a trade only once it settles, two trading days later, while `ka01690` counts it on the trade date; on a day with trades not yet settled at the close the two give different cash, and the day is `ka01690`'s alone, kept only when its holdings, cash and Kiwoom's per-stock selling cost add up to its total within 1 KRW a holding (at the official close when `ka01690` lists after-market prices), and otherwise failed. Silver checks each Kiwoom day to the won: the positions add up to Kiwoom's holdings value, and the selling cost follows Kiwoom's per-stock rule. History fetches run outside 16:00–18:00 and 19:00–22:00 UTC, when `ka01690` answers with empty figures; the 08:00 UTC daily run is unaffected. Open quality exceptions hold that account's reports until the owner accepts them by name. |
+| Market data | `bronze-market-data` files since 18 Oct, best effort | The fetchers, from the live answer | Next, a fetch whose raw copy cannot be stored fails (`MARKET_DATA_RAW_REQUIRED` on the benchmark, risk-free, sector and crisis jobs), the rebuild check compares silver with what the stored files parse to, and the bronze file freshness checks turn on (`LAYER_FRESHNESS_BLOB_CHECKS`). Nothing raw exists before 18 Oct. When Yahoo's history reply for a benchmark ends before the session a subject needs (on 22 Oct 2026 Yahoo served Azure the 21 Oct bars with no close), benchmark-daily reads that one close from Yahoo's quote, stores the quote reply in `yahoo-benchmark-history` next to the history file, and records the row with the quote's own `source_reference` and `raw_sha256` plus a `benchmark_close_from_quote` warning. `BENCHMARK_QUOTE_FALLBACK=off` turns it off. |
+| One-off scripts | None | Hand-run backfills and cut-overs in `scripts/` | Only the named loaders' login writes silver (see [Silver write lock](#silver-write-lock-step-3)), and a CI check refuses new code that writes silver anywhere else. |
 
 The Kiwoom table keeps inquiry answers only. Token calls are never stored, and
 `request_key` holds the account number and query fields, never a key, secret, token or
 header. Like every bronze table, the website, renderers and agents never read it.
+
+## Silver write lock (step 3)
+
+Only the named loader jobs write silver. Three parts, each with its own undo:
+
+1. **Watch** (migration 083). A statement trigger on every silver table but the U8 history
+   notes each write by a login outside the `silver_loader` group in
+   `public.silver_write_watch`: the login, the table, the kind of write, the lineage run id
+   and the application name, never row values. It refuses nothing. The tables' owner
+   (migrations, the approved FX step) is not noted. Live since 22 Oct 2026. Undo:
+   `infra/medallion/undo/083_silver_write_watch_undo.sql`.
+2. **Loader login.** With `DATABASE_LOADER_PASSWORD` (and `DATABASE_LOADER_ROLE`) set,
+   `bootstrap_postgres.py` keeps a loader login that is a member of the app login, so it may do
+   everything the app login does, and of `silver_loader`, which may write every silver table
+   and the public view over it. The loader jobs read their database URL from the
+   `database-loader-url` secret; every other job keeps `database-app-url`. Once they have
+   moved, the watch stays empty through a full daily cycle before the next part. Live since
+   24 Oct 2026 00:38 UTC: the 9 loader jobs (institutional-daily, flex-discovery, the import
+   job, benchmark-daily, risk-free-daily, sector-classification, derived-daily,
+   onboard-analytics and onboard-render) log in as `ibkr_stg_loader`. The bootstrap job
+   carries the loader settings (`loaderRole` in `infra/staging-bootstrap-job.bicep`). The
+   onboarding worker (`ibkrv2stg-onboard-worker`, `infra/staging-onboarding-worker-job.bicep`,
+   docs/SELF_SERVICE_ONBOARDING.md) is a loader job from its first deploy. Undo:
+   the jobs back on `database-app-url`; the login and secrets stay, unused. The undo is
+   refused while the lock is on.
+3. **Lock.** Bootstrap with `SILVER_WRITE_LOCK=on` takes INSERT, UPDATE, DELETE and TRUNCATE
+   on silver (tables, their public views, and tables made later) from the app login, and
+   refuses to finish if any login other than the loader can still write silver. Reading is
+   unchanged. Every later bootstrap run must carry the setting (`silverWriteLock` in
+   `infra/staging-bootstrap-job.bicep`, `off` until the lock is on); bootstrap without it gives
+   the app login its write rights back, which is the undo.
+
+`src/ibkr_etl/silver_writers.py` names the loader jobs and every file that writes silver,
+and `tests/test_silver_writers.py` fails on code that writes silver outside that register.
+
+## Tag rule (step 4)
+
+Three Azure Policy assignments on the resource group, `medallion-tag-layer`,
+`medallion-tag-component` and `medallion-tag-owner`, each the built-in "Require a tag on
+resources" for one tag. They reported only (`DoNotEnforce`) from 19 Oct 2026.
+
+- **Enforced since 24 Oct 2026 01:11 UTC.** Azure refuses to create or change a resource in
+  the group when the result would lack `layer`, `component` or `owner`. The error is
+  `RequestDisallowedByPolicy`, it names the rule, and its message says which tag to add.
+- **Exclusions.** Each rule excludes by resource ID the resources that lacked its tag at that
+  moment: 71 of 175 lacked `layer` and `component`, 27 lacked `owner`. They are mostly network
+  resources, the Container Apps environment, alert rules and a workbook whose release checks
+  compare their tags exactly, Smart Detection, trial leftovers and `ibkrv2stg-agent-dispatcher`
+  (its Bicep now carries the tags). They can be changed as before. On 24 Oct 2026 between
+  04:41 and 05:10 UTC, 69 of them were given their missing tags (Merge only, nothing
+  overwritten) and dropped from the exclusions: the 21 monitors and identities, then the 48
+  network resources agreed with their owner. Left excluded: the Container Apps environment and
+  the build VM's sign-in extension.
+- **Exact tag checks.** The code that checks a whole tag map (the metadata monitor's release,
+  the cost workbook, the operational and secret-metadata findings alerts and the secret-metadata
+  job and identity) accepts each resource either as before or with exactly the extra tags that
+  `src/ibkr_etl/medallion_tags.py` names for it, and the deploys of the workbook and both alerts
+  write them. `infra/platform-schedule-watchdogs.bicep` carries `layer`, `component` and `owner`
+  for the schedule watchdogs.
+- **Network Bicep.** `infra/staging.bicep` (the vnet, the Postgres private DNS zone and its
+  link) and `infra/agent-foundation.bicep` (the agents' private endpoint, its three DNS zones
+  and links) set `layer: 'foundation'` and `component: 'network'` on top of their `tags`, and
+  the Foundry account and project `layer: 'ai'` and `component: 'ai-models'`, so a redeploy
+  keeps the tags those resources carry and the rule accepts it. The Container Apps environment
+  in `infra/staging.bicep` sets `layer: 'foundation'` and `component: 'container-apps'`. The
+  build VM's sign-in extension (`AADSSHLoginForLinux`, made by a script, not Bicep) carries the
+  VM's own `layer: 'ops'` and `component: 'build-vm'`.
+- **Not affected:** job starts and executions, data in the database or storage, Key Vault
+  secrets, role assignments and storage containers. The rule is Indexed, so it checks only
+  resource types that carry tags and a location.
+- **Run Commands on the build VM** are resources too, so each one the image builds and
+  `deploy/website_release.py` create carries the VM's own `layer`, `component` and `owner`,
+  and nothing is run when the VM lacks one. The first image build after the switch was
+  refused for this (24 Oct 2026 02:30 UTC) and changed nothing. `az vm run-command invoke`
+  is an action, not a resource, and is not checked.
+- **Checked** by validation only: an untagged throwaway identity was refused and a tagged one
+  accepted, and neither was created.
+- **Undo:** the three rules back on `DoNotEnforce` with no exclusions, as saved before the
+  switch, by the administrator's script with `-Mode undo`.
 
 ## Stages
 

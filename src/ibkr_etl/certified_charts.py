@@ -685,9 +685,11 @@ def rehearse(database_url: str, *, web=None, only_subjects: Iterable[str] = (), 
         plan = [(subject, list(reversed(subject.dates))[:dates or None]) for subject in found]
         counts["subject_dates_planned"] = sum(len(days) for _, days in plan)
         full_history = sum(len(subject.dates) for subject in found)
-        with psycopg.connect(database_url, options=f"-c app.tenant_id={web.TENANT_ID} "
-                                                   "-c default_transaction_read_only=on") as connection:
-            published = build.published_rows(connection, [subject.id for subject in found])
+        options = f"-c app.tenant_id={web.TENANT_ID} -c default_transaction_read_only=on"
+        with psycopg.connect(database_url, options=options) as connection:
+            published_chart_rows = connection.execute(
+                "SELECT count(*) FROM gold.v_certified_figures WHERE subject_id = ANY(%s) AND figure_id = ANY(%s)",
+                ([subject.id for subject in found], sorted(FIGURES))).fetchone()[0]
             connection.rollback()
         stopped = False
         for subject, days in plan:
@@ -713,6 +715,11 @@ def rehearse(database_url: str, *, web=None, only_subjects: Iterable[str] = (), 
                     counts["website"][who] = _website_check(web, subject, day)
             if stopped:
                 break
+    # The published rows only for the dates read: the whole history does not fit in memory.
+    with psycopg.connect(database_url, options=options) as connection:
+        published = build.published_rows(connection, [subject.id for subject in found],
+                                         on_dates=build.dates_read(rows))
+        connection.rollback()
     result = build.compare(rows, published)
     failures = build.rule_failures(rows)
     counts["rule_failures"] = dict(Counter(failures))
@@ -722,7 +729,7 @@ def rehearse(database_url: str, *, web=None, only_subjects: Iterable[str] = (), 
                   same_inputs_new_answer_figures=sorted({row.figure_id for row in result["violations"]}),
                   page_unavailable=notes.get("page_unavailable", {}),
                   reader_errors=notes.get("chart_errors", {}), subjects=len(found), subjects_skipped=len(skipped),
-                  published_chart_rows=sum(key[1] in FIGURES for key in published),
+                  published_chart_rows=int(published_chart_rows),
                   rows_per_date=round(sum(per_date) / len(per_date), 1) if per_date else 0.0,
                   full_history_dates=full_history)
     counts["full_history_rows"] = round(counts["rows_per_date"] * full_history)

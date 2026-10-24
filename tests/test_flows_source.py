@@ -14,7 +14,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,6 +29,8 @@ OTHER = "U9300002"
 FIRST = date(2026, 9, 1)
 DAYS = 40
 LOOKBACK = 14
+# Outside the month-end check, so that on reads silver only (MonthEndCheckTests sets its own).
+MID_MONTH = datetime(2026, 10, 15, 4, 0, tzinfo=timezone.utc)
 
 
 def _d(day: date) -> str:
@@ -55,9 +57,19 @@ def dividend(day: date) -> dict:
                 dateTime=f"{_d(day)};160000", type="Dividends", description="SYNA CASH DIVIDEND", amount="12.50")
 
 
-def transfer(day: date, amount: str) -> dict:
-    return dict(currency="USD", assetCategory="CASH", date=_d(day), type="INTERNAL", direction="IN",
-                cashTransfer=amount)
+def transfer(day: date, amount: str, *, currency="USD", **extra) -> dict:
+    """A cash transfer between accounts, as IBKR reports it in Transfers."""
+    return dict(currency=currency, assetCategory="CASH", date=_d(day), type="INTERNAL", direction="IN",
+                cashTransfer=amount, **extra)
+
+
+def position_transfer(day: date, ident: str, *, in_base: str | None = None, amount="5000", currency="HKD") -> dict:
+    """Shares moved in from another broker: valued by IBKR in the base currency when it says so."""
+    row = dict(currency=currency, assetCategory="STK", conid="9001", symbol="SYNA", date=_d(day), type="ACATS",
+               direction="IN", quantity="100", positionAmount=amount, transactionID=ident)
+    if in_base is not None:
+        row["positionAmountInBase"] = in_base
+    return row
 
 
 def statement(account: str, start: date, end: date, *, cash=(), transfers=()) -> bytes:
@@ -142,6 +154,12 @@ class FlowsSourceTestCase(unittest.TestCase):
         emitter = patch.object(flows_source, "emit", self.lines.append)
         emitter.start()
         self.addCleanup(emitter.stop)
+        self.at(MID_MONTH)
+
+    def at(self, moment: datetime) -> None:
+        clock = patch.object(flows_source, "_now", return_value=moment)
+        clock.start()
+        self.addCleanup(clock.stop)
 
     def flows(self, mode: str, account=ACCOUNT, subject_type="physical_account") -> dict[str, float]:
         with patch.dict(os.environ, {"FLOWS_SOURCE": mode}):
@@ -305,15 +323,24 @@ class DifferenceTests(FlowsSourceTestCase):
         self.assert_no_values_or_ids()
         return lines[0]
 
-    def test_transfers_have_no_silver_home_so_bronze_is_kept(self):
+    def test_a_transfer_silver_does_not_hold_yet_keeps_bronze(self):
+        # Loaded before silver.transfers existed: bronze has it, silver not until the fill.
         self.db.load([statement(ACCOUNT, FIRST, FIRST + timedelta(days=24), cash=standard_cash(),
                                 transfers=[transfer(FIRST + timedelta(days=12), "3000")])])
+        self.db.connection.execute("DELETE FROM transfers")
         self.expected = self.bronze()
         self.assertEqual(self.expected[(FIRST + timedelta(days=12)).isoformat()], 3000.0)
         self.assertEqual(self.decision(), {"dates_differing": 1, "decision": "bronze", "mode": "fallback",
                                            "kinds": {"transfers_not_in_silver": 1}, "reason": "silver_differs",
                                            "subject": "u…01"})
         self.assertTrue(self.lines[0].startswith('FLOWS_SOURCE {"dates_differing":1,"decision":"bronze"'))
+
+    def test_a_transfer_that_differs(self):
+        self.db.load([statement(ACCOUNT, FIRST, FIRST + timedelta(days=24), cash=standard_cash(),
+                                transfers=[transfer(FIRST + timedelta(days=12), "3000")])])
+        self.db.connection.execute("UPDATE transfers SET cash_transfer_text = '3000.01'")
+        self.expected = self.bronze()
+        self.assertEqual(self.decision()["kinds"], {"transfer_differs": 1})
 
     def test_a_flow_only_silver_has(self):
         # An account-sync account whose bronze rows were never backfilled: silver has the deposit.
@@ -357,6 +384,203 @@ class DifferenceTests(FlowsSourceTestCase):
         on = self.flows("on")
         self.assertNotIn((FIRST + timedelta(days=17)).isoformat(), on)
         self.assertEqual(self.lines, [])
+
+
+class MonthEndCheckTests(FlowsSourceTestCase):
+    """On days 1 to 7 of a Hong Kong month, on compares with bronze as fallback does."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.load(daily_statements(ACCOUNT, cash=standard_cash(), days=25))
+        self.expected = self.bronze()
+
+    def test_the_window_is_days_one_to_seven_in_hong_kong(self):
+        cases = [
+            (datetime(2026, 10, 31, 15, 59, tzinfo=timezone.utc), False),  # 31 Oct 23:59 in Hong Kong
+            (datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc), True),    # 1 Nov 00:00 in Hong Kong
+            (datetime(2026, 11, 7, 15, 59, tzinfo=timezone.utc), True),    # 7 Nov 23:59
+            (datetime(2026, 11, 7, 16, 0, tzinfo=timezone.utc), False),    # 8 Nov 00:00
+            (datetime(2026, 12, 1, 9, 0), True),                           # no zone: read as UTC
+            (MID_MONTH, False),
+        ]
+        for moment, inside in cases:
+            self.assertIs(flows_source.month_end_window(moment), inside, moment)
+
+    def test_on_uses_silver_at_a_month_end_when_it_equals_bronze(self):
+        self.at(datetime(2026, 11, 2, 1, 0, tzinfo=timezone.utc))
+        with patch.object(provisional_benchmark, "_bronze_external_flows",
+                          wraps=provisional_benchmark._bronze_external_flows) as bronze:
+            self.assertEqual(self.flows("on"), self.expected)
+        bronze.assert_called_once()
+        self.assertEqual(self.lines, [])
+
+    def test_on_keeps_bronze_at_a_month_end_when_silver_differs(self):
+        self.db.connection.execute("DELETE FROM cash_transactions WHERE transaction_id = 'D4'")
+        self.at(datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))
+        self.assertEqual(self.flows("on"), self.expected)
+        self.assertEqual(self.logged(), [{"dates_differing": 1, "decision": "bronze", "guard": "month_end",
+                                          "kinds": {"only_in_bronze": 1}, "mode": "on",
+                                          "reason": "silver_differs", "subject": "u…01"}])
+        self.assert_no_values_or_ids()
+
+    def test_on_keeps_bronze_at_a_month_end_when_silver_is_unreadable(self):
+        self.db.connection.execute("ALTER TABLE cash_transactions RENAME TO cash_transactions_elsewhere")
+        self.at(datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc))
+        self.assertEqual(self.flows("on"), self.expected)
+        self.assertEqual(self.logged(), [{"decision": "bronze", "error": "OperationalError", "guard": "month_end",
+                                          "mode": "on", "reason": "silver_unreadable", "subject": "u…01"}])
+
+    def test_on_shows_silver_after_the_month_end(self):
+        self.db.connection.execute("DELETE FROM cash_transactions WHERE transaction_id = 'D4'")
+        self.at(datetime(2026, 11, 8, 1, 0, tzinfo=timezone.utc))
+        with patch.object(provisional_benchmark, "_bronze_external_flows",
+                          side_effect=AssertionError("bronze read")):
+            on = self.flows("on")
+        self.assertNotIn((FIRST + timedelta(days=17)).isoformat(), on)
+        self.assertEqual(self.lines, [])
+
+    def test_fallback_lines_carry_no_guard(self):
+        self.db.connection.execute("DELETE FROM cash_transactions WHERE transaction_id = 'D4'")
+        for moment in (datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc), MID_MONTH):
+            self.lines.clear()
+            self.at(moment)
+            self.assertEqual(self.flows("fallback"), self.expected)
+            self.assertNotIn("guard", self.logged()[0])
+
+    def test_portfolios_are_untouched_at_a_month_end(self):
+        self.at(datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))
+        with patch.object(flows_source, "silver_external_flows", side_effect=AssertionError("silver read")):
+            for subject_type in sorted(flows_source.DERIVED_TYPES):
+                with patch.object(provisional_benchmark, "_bronze_external_flows", return_value={}) as ledger:
+                    self.flows("on", subject_type=subject_type)
+                ledger.assert_called_once()
+
+
+class TransferTests(FlowsSourceTestCase):
+    """The Transfers section in silver.transfers (084): written by the loader, read by bronze's rules."""
+
+    def setUp(self):
+        super().setUp()
+        self.days = {offset: (FIRST + timedelta(days=offset)) for offset in (4, 9, 12, 15, 19)}
+        self.transfers = [
+            transfer(self.days[4], "3000", transactionID="T1"),
+            transfer(self.days[9], "-1250.75", transactionID="T2"),
+            transfer(self.days[12], "20000", currency="HKD", transactionID="T3"),
+            position_transfer(self.days[15], "T4", in_base="642.5"),
+            position_transfer(self.days[19], "T5"),  # no base amount: positionAmount at the HKD rate
+            transfer(self.days[19], "75"),  # no id: the key hashes the record
+        ]
+        self.db.load(daily_statements(ACCOUNT, cash=standard_cash(), transfers=self.transfers, days=25))
+
+    def count(self, table: str, where: str = "1 = 1") -> int:
+        return self.db.connection.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}").fetchone()[0]
+
+    def test_each_record_is_held_once_beside_its_bronze_row(self):
+        self.assertEqual(self.count("flex_rows", "section = 'Transfers'"), 6)
+        self.assertEqual(self.count("transfers"), 6)
+        pairs = self.db.connection.execute(
+            "SELECT COUNT(*) FROM transfers t JOIN flex_rows f ON f.account_id = t.account_id "
+            "AND f.section = 'Transfers' AND f.source_key = t.source_key AND f.row_sha256 = t.row_sha256 "
+            "AND f.last_seen_run_id = t.last_seen_run_id").fetchone()[0]
+        self.assertEqual(pairs, 6)
+        row = self.db.connection.execute("SELECT * FROM transfers WHERE transaction_id = 'T4'").fetchone()
+        self.assertEqual((row["transfer_date"], row["asset_category"], row["currency"], row["quantity_text"],
+                          row["position_amount_text"], row["position_amount_in_base_text"], row["flex_account_id"]),
+                         (self.days[15].isoformat(), "STK", "HKD", "100", "5000", "642.5", ACCOUNT))
+
+    def test_silver_reads_what_bronze_reads(self):
+        bronze = self.bronze()
+        expected = {
+            self.days[4]: 3000.0, self.days[9]: -1250.75, self.days[12]: 20000 * 0.1285, self.days[15]: 642.5,
+            self.days[19]: 5000 * 0.1285 + 75.0,
+        }
+        for day, amount in expected.items():
+            self.assertAlmostEqual(bronze[day.isoformat()], amount, places=9)
+        bronze_records: list = []
+        silver_records: list = []
+        bronze = _bronze_external_flows(self.db.connection, ACCOUNT, subject_type="physical_account",
+                                        records=bronze_records)
+        silver = flows_source.silver_external_flows(self.db.connection, ACCOUNT, records=silver_records)
+        self.assertEqual(sorted(record for record in silver_records if record[0] == "transfer"),
+                         sorted(record for record in bronze_records if record[0] == "transfer"))
+        self.assertTrue(flows_source.compare(bronze, bronze_records, silver, silver_records).equal)
+
+    def test_fallback_and_on_read_silver(self):
+        for mode in ("fallback", "on"):
+            with self.subTest(mode=mode):
+                result = self.flows(mode)
+                self.assertEqual(set(result), set(self.bronze()))
+                for day, amount in self.bronze().items():
+                    self.assertAlmostEqual(result[day], amount, places=9)
+        self.assertEqual(self.lines, [])
+
+    def test_a_consolidated_copy_of_a_transfer_is_read_by_both(self):
+        # Bronze reads every Transfers row of the account, "-" included; silver keeps "-" and reads it too.
+        day = FIRST + timedelta(days=22)
+        self.db.load([statement(ACCOUNT, day, day, transfers=[transfer(day, "40", accountId="-", transactionID="T6")])])
+        self.assertEqual(self.db.connection.execute(
+            "SELECT account_id, flex_account_id FROM transfers WHERE transaction_id = 'T6'").fetchone()[:],
+            (ACCOUNT, "-"))
+        self.assertEqual(self.bronze()[day.isoformat()], 40.0)
+        self.assertEqual(self.flows("fallback"), self.flows("on"))
+        self.assertEqual(self.lines, [])
+
+    def test_a_correction_under_the_same_key_replaces_it_in_both(self):
+        self.db.load([statement(ACCOUNT, FIRST, FIRST + timedelta(days=24),
+                                transfers=[transfer(self.days[4], "3100", transactionID="T1")])])
+        self.assertEqual(self.bronze()[self.days[4].isoformat()], 3100.0)
+        self.assertEqual(self.flows("on")[self.days[4].isoformat()], 3100.0)
+        self.assertEqual(self.count("transfers"), 6)
+
+    def test_on_without_the_table_reads_bronze_and_says_why(self):
+        self.db.connection.execute("DROP TABLE transfers")
+        self.assertEqual(self.flows("on"), self.bronze())
+        self.assertEqual(self.logged(), [{"decision": "bronze", "mode": "on", "reason": "no_silver_transfers",
+                                          "subject": "u…01"}])
+        self.assert_no_values_or_ids()
+
+    def test_fallback_without_the_table_keeps_bronze(self):
+        self.db.connection.execute("DROP TABLE transfers")
+        self.assertEqual(self.flows("fallback"), self.bronze())
+        self.assertEqual(self.logged()[0]["kinds"], {"transfers_not_in_silver": 5})
+
+    def test_the_fill_copies_what_the_loader_would_have_written(self):
+        written = {tuple(row) for row in self.db.connection.execute("SELECT * FROM transfers ORDER BY source_key")}
+        self.db.connection.execute("DELETE FROM transfers WHERE transaction_id IN ('T2', 'T4')")
+        self.db.connection.execute("UPDATE transfers SET cash_transfer_text = '1' WHERE transaction_id = 'T3'")
+        self.db.connection.execute(
+            "INSERT INTO transfers (account_id, source_key, row_sha256, last_seen_run_id) VALUES (?, 'x', 'x', 1)",
+            (OTHER,))
+        counts = flows_source.fill_transfers(self.db.connection, apply=False)
+        self.assertEqual({name: counts[name] for name in flows_source.FILL_COUNTS},
+                         {"bronze_rows": 6, "inserted": 2, "updated": 1, "unchanged": 3,
+                          "bronze_rows_sharing_a_key": 0, "only_in_silver": 1})
+        self.assertEqual(self.count("transfers"), 5)  # nothing written without apply
+        counts = flows_source.fill_transfers(self.db.connection, apply=True)
+        self.assertEqual((counts["inserted"], counts["updated"], counts["unchanged"]), (2, 1, 3))
+        self.db.connection.execute("DELETE FROM transfers WHERE account_id = ?", (OTHER,))
+        self.assertEqual({tuple(row) for row in self.db.connection.execute(
+            "SELECT * FROM transfers ORDER BY source_key")}, written)
+        counts = flows_source.fill_transfers(self.db.connection, apply=True)
+        self.assertEqual((counts["inserted"], counts["updated"], counts["unchanged"]), (0, 0, 6))
+
+    def test_the_fill_needs_the_table(self):
+        self.db.connection.execute("DROP TABLE transfers")
+        with self.assertRaisesRegex(RuntimeError, "084"):
+            flows_source.fill_transfers(self.db.connection, apply=False)
+
+
+class LoaderWithoutTransfersTableTests(FlowsSourceTestCase):
+    def test_a_database_without_the_table_loads_as_before(self):
+        self.db.load(daily_statements(ACCOUNT, cash=standard_cash(), days=1))
+        self.db.connection.execute("DROP TABLE transfers")
+        self.db.connection.commit()
+        with patch("ibkr_etl.service.initialize"):  # keep the table dropped
+            self.db.load([statement(ACCOUNT, FIRST, FIRST + timedelta(days=5),
+                                    transfers=[transfer(FIRST + timedelta(days=4), "3000")])])
+        self.assertEqual(self.bronze()[(FIRST + timedelta(days=4)).isoformat()], 3000.0)
+        self.assertIsNone(self.db.connection.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'transfers'").fetchone())
 
 
 class KiwoomFlowsTests(FlowsSourceTestCase):
@@ -462,6 +686,7 @@ class CompareSubjectsTests(FlowsSourceTestCase):
         self.db.load(daily_statements(ACCOUNT, cash=standard_cash(), days=25))
         self.db.load(daily_statements(OTHER, cash=standard_cash(), transfers=[transfer(FIRST + timedelta(days=4), "10")],
                                       days=25))
+        self.db.connection.execute("DELETE FROM transfers")  # loaded before silver.transfers existed
         tally = flows_source.compare_subjects(self.db.connection, [
             (ACCOUNT, "physical_account"), (OTHER, "physical_account"), ("U9399999", "physical_account"),
             ("alpha-test", "composite_portfolio")])
@@ -475,9 +700,16 @@ class CompareSubjectsTests(FlowsSourceTestCase):
         self.assertEqual(report["notes"]["bronze_transfer_rows"], {"subjects": 1, "rows": 1})
         self.assertEqual(report["notes"]["bronze_external_cash_rows"], {"subjects": 2, "rows": 10})
         self.assertEqual(report["notes"]["silver_external_cash_rows"], {"subjects": 2, "rows": 10})
+        self.assertNotIn("silver_transfer_rows", report["notes"])
         self.assertEqual(report["differing_subjects"], [
             {"subject": "u…02", "dates_differing": 1, "kinds": {"transfers_not_in_silver": 1},
              "notes": {"bronze_external_cash_rows": 5, "bronze_transfer_rows": 1, "silver_external_cash_rows": 5}}])
+        # Filled from bronze, the transfer is in silver and every account matches.
+        self.assertEqual(flows_source.fill_transfers(self.db.connection, apply=True)["inserted"], 1)
+        report = flows_source.compare_subjects(self.db.connection, [
+            (ACCOUNT, "physical_account"), (OTHER, "physical_account")]).report(tenants=1)
+        self.assertEqual((report["matching"], report["differing"]), (2, 0))
+        self.assertEqual(report["notes"]["silver_transfer_rows"], {"subjects": 1, "rows": 1})
         text = json.dumps(report, ensure_ascii=False)
         self.assertNotRegex(text, r"U9\d{5}")
         self.assertEqual(self.lines, [])  # the comparison reports; it does not log decisions
@@ -510,9 +742,10 @@ class OneSwitchTests(unittest.TestCase):
 
 class CommandTests(unittest.TestCase):
     def test_the_command_needs_a_database(self):
-        with patch.dict(os.environ, {"DATABASE_URL": ""}), redirect_stderr(io.StringIO()), \
-                self.assertRaises(SystemExit):
-            flows_source.main(["compare"])
+        for command in (["compare"], ["fill-transfers"], ["fill-transfers", "--apply"]):
+            with self.subTest(command=command), patch.dict(os.environ, {"DATABASE_URL": ""}), \
+                    redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                flows_source.main(command)
 
 
 if __name__ == "__main__":

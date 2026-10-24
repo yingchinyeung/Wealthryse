@@ -2,7 +2,8 @@
 records); nothing is sent, published or released.
 
     python -m wealthryse_agent.jobs holdings_explainer   # daily, after the account sync
-    python -m wealthryse_agent.jobs month_end_drafter    # 1st–7th of each month
+    python -m wealthryse_agent.jobs month_end_drafter    # 2nd–7th of each month, for accounts whose month's
+                                                         # data are final (the 7th drafts the rest)
     python -m wealthryse_agent.jobs data_quality         # daily; also applies chat retention
     python -m wealthryse_agent.jobs weekly_brief         # Saturdays: each account's weekly brief
     python -m wealthryse_agent.jobs live_market          # every 15 minutes in trading hours: alert on big
@@ -23,7 +24,7 @@ records); nothing is sent, published or released.
     python -m wealthryse_agent.jobs month_team --replay --from 2026-01-31 --to 2026-08-31
     python -m wealthryse_agent.jobs month_team --replay --round 2 --from 2026-01-31
                                                          # re-check months already released
-    python -m wealthryse_agent.jobs onboarding           # hourly: draft new cases' terms from their documents,
+    python -m wealthryse_agent.jobs onboarding           # every 10 minutes: draft new cases' terms from their documents,
                                                          # reconcile new broker accounts, and review new
                                                          # composites' historical reports, and watch
                                                          # newly live accounts until their first month-end
@@ -34,12 +35,18 @@ Accounts come from agent.service_grants for the job, enforced by the tool server
 onboarding job has no accounts: its cases are not live yet, and it sees only the case views
 its own tools give it. Neither has the operations job: it reads only incidents, run records and
 Azure telemetry, never client data.
+
+A Kiwoom account's newest sessions are provisional (settled_days.py): the holdings explainer, risk
+watch, weekly brief and export packs work on its latest settled date, since none of them redoes a
+date. The event dispatcher (supervisor/dispatcher.py) can start these jobs and the month-end
+commentary job for one account as soon as its data are in; their schedules stay as the backup.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import logging
+import os
 import sys
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -50,9 +57,9 @@ from .auth import TokenSource
 from .config import DatabaseSettings, ModelSettings, RuntimeSettings
 from .database import connect
 from .month_team.agents import BudgetExhausted
-from . import certified_tools, guide_tools
+from . import certified_tools, guide_tools, settled_days
 from .prompts import (GUIDE_CHECKER, GUIDE_KEEPER, HOLDINGS_EXPLAINER, LIVE_ALERT, MONTH_END_CERTIFIED, MONTH_END_DRAFTER,
-                      RISK_ALERT, WEEKLY_BRIEF)
+                      RISK_ALERT, RISK_ALERT_AS_OF, WEEKLY_BRIEF)
 from .runtime import Agent, AgentError
 from .store import Store
 from .tool_client import ToolCallFailed, ToolClient
@@ -60,6 +67,14 @@ from .tool_client import ToolCallFailed, ToolClient
 LOGGER = logging.getLogger("wealthryse_agent.jobs")
 STALE_VALUATION_DAYS = 4
 STALE_BENCHMARK_DAYS = 5
+# The month-end commentary job's scheduled runs draft only accounts whose month's data are final, so a Kiwoom
+# month is not drafted from provisional values that the job would never redo. "off" drafts every account on
+# every run, as before.
+MONTH_END_WAIT_SETTING = "AGENT_MONTH_END_WAITS_FOR_DATA"
+# The supervisor's record of each month_team run in agent.tasks: "on" writes it; anything else, as before.
+MONTH_TEAM_RECORD_SETTING = "AGENT_MONTH_TEAM_RECORD"
+# The onboarding job runs every 10 minutes; a run still going (up to its one-hour limit) makes the next one skip.
+ONBOARDING_RUN_MINUTES = 60
 
 
 def _run_agent(agent: Agent, tools: ToolClient, account_id: str, task: str, allowed: list[str]) -> tuple[str, list, dict, bool]:
@@ -79,8 +94,7 @@ def _sum_usage(total: dict[str, int], usage: dict[str, int]) -> None:
 def holdings_explainer(store: Store, tools: ToolClient, agent: Agent, accounts: list[str], usage: dict) -> int:
     written = 0
     for account_id in accounts:
-        fresh = tools.call("get_data_freshness", {"account_id": account_id})["data"]
-        end = fresh.get("latest_holdings_date")
+        end = settled_days.settled(settled_days.read_dates(tools.call, account_id), "latest_holdings_date")
         if not end or store.inbox_exists("holdings_explainer", account_id, end):
             continue
         start = (date.fromisoformat(end) - timedelta(days=1)).isoformat()
@@ -122,11 +136,43 @@ def month_end_drafter(store: Store, tools: ToolClient, agent: Agent, accounts: l
     return written
 
 
+def month_end_waits(environ: dict[str, str] | None = None) -> bool:
+    environ = os.environ if environ is None else environ
+    return str(environ.get(MONTH_END_WAIT_SETTING, "on")).strip().lower() != "off"
+
+
+def month_team_records(environ: dict[str, str] | None = None) -> bool:
+    environ = os.environ if environ is None else environ
+    return str(environ.get(MONTH_TEAM_RECORD_SETTING, "off")).strip().lower() == "on"
+
+
+def month_end_ready(tools: ToolClient, accounts: list[str], today: date) -> list[str]:
+    """The accounts the month-end commentary job may draft today: those whose month's data are final.
+
+    The others wait for a later run or the event dispatcher. On the last day of the job's window every
+    account goes ahead, as before, so no month is left without a draft. How the job drafts is unchanged.
+    """
+    if today.day >= max(settled_days.MONTH_END_DAYS):
+        return list(accounts)
+    period_end = settled_days.month_end(today)
+    ready = []
+    for account_id in accounts:
+        try:
+            final = settled_days.month_final(settled_days.read_dates(tools.call, account_id), period_end)
+        except ToolCallFailed:
+            final = False  # cannot tell: leave it for a later run
+        if final:
+            ready.append(account_id)
+        else:
+            LOGGER.info("month-end draft waits: the month's data are not final yet for one account")
+    return ready
+
+
 def weekly_brief(store: Store, tools: ToolClient, agent: Agent, accounts: list[str], usage: dict) -> int:
     """One brief per account per week of data, in the website inbox for the people who can see the account."""
     written = 0
     for account_id in accounts:
-        end = tools.call("get_data_freshness", {"account_id": account_id})["data"].get("latest_holdings_date")
+        end = settled_days.settled(settled_days.read_dates(tools.call, account_id), "latest_holdings_date")
         if not end:
             continue
         year, week, _ = date.fromisoformat(end).isocalendar()
@@ -271,12 +317,23 @@ def risk_watch(store: Store, tools: ToolClient, agent: Agent, accounts: list[str
     today = today or date.today()
     written = 0
     for account_id in accounts:
+        # A Kiwoom account's newest sessions are provisional: read the risk picture as of its latest settled day.
         try:
-            outlook = tools.call("get_risk_outlook", {"account_id": account_id})["data"]
+            dates = settled_days.read_dates(tools.call, account_id)
         except ToolCallFailed:
-            continue  # too little history, or no valuations: nothing to watch yet
+            continue
+        through = settled_days.settled(dates, "latest_valuation_date")
+        if not through:
+            continue  # no valuations, or none settled yet: nothing to watch yet
+        arguments = {"account_id": account_id}
+        if through != dates.get("latest_valuation_date"):
+            arguments["as_of"] = through
         try:
-            regimes = tools.call("get_market_regimes", {"account_id": account_id})["data"]
+            outlook = tools.call("get_risk_outlook", arguments)["data"]
+        except ToolCallFailed:
+            continue  # too little history: nothing to watch yet
+        try:
+            regimes = tools.call("get_market_regimes", arguments)["data"]
         except ToolCallFailed:
             regimes = None
         end = outlook["window_end"]
@@ -284,9 +341,11 @@ def risk_watch(store: Store, tools: ToolClient, agent: Agent, accounts: list[str
         for key, title, trigger in risk_triggers(outlook, regimes):
             if store.inbox_exists("risk_alert", account_id, key):
                 continue
+            task = RISK_ALERT.format(account_id=account_id, trigger=trigger, from_date=start, to_date=end)
+            if "as_of" in arguments:
+                task += RISK_ALERT_AS_OF.format(as_of=through)
             answer, citations, used, ok = _run_agent(
-                agent, tools, account_id, RISK_ALERT.format(account_id=account_id, trigger=trigger, from_date=start,
-                                                            to_date=end),
+                agent, tools, account_id, task,
                 ["get_risk_outlook", "get_market_regimes", "get_holdings_changes", "get_factor_exposures",
                  "get_sector_allocation"])
             _sum_usage(usage, used)
@@ -449,8 +508,8 @@ def export_packs(store: Store, tools: ToolClient, accounts: list[str]) -> int:
         if account_id not in accounts:
             continue
         if account_id not in latest:
-            latest[account_id] = tools.call("get_data_freshness", {"account_id": account_id})["data"].get(
-                "latest_valuation_date")
+            latest[account_id] = settled_days.settled(settled_days.read_dates(tools.call, account_id),
+                                                      "latest_valuation_date")
         if not latest[account_id]:
             continue
         period = period_for(pack["schedule"], latest[account_id])
@@ -492,6 +551,7 @@ def month_team(store: Store, tools: ToolClient, accounts: list[str], usage: dict
     from .month_team.coordinator import Coordinator
     from .month_team.settings import TeamSettings, validate_report_model
     from .month_team.store import MonthStore
+    from .supervisor import team_record
 
     settings, model_settings = TeamSettings.from_env(), ModelSettings.from_env()
     settings.validate()
@@ -513,17 +573,29 @@ def month_team(store: Store, tools: ToolClient, accounts: list[str], usage: dict
         first, last = (args.from_period, args.to_period) if args.replay else (period, period)
         LOGGER.info("retrying %s stopped runs", team_store.retry_stopped(mode, first, last,
                                                                        args.round if args.replay else None))
+    counts: dict[str, int] = {}
+    error_code = None
     try:
         if mode == "month":
             counts = coordinator.run_month(accounts, period, "month")
         else:
-            counts = {}
             for account_id, period in replay_targets(tools, accounts, args.from_period, args.to_period):
                 stage = coordinator.advance(account_id, period, "replay", args.round)
                 counts[stage] = counts.get(stage, 0) + 1
+    except BudgetExhausted:
+        error_code = "budget_exhausted"
+        raise
+    except Exception as error:
+        error_code = str(getattr(error, "code", None) or "internal_error")[:40]
+        raise
     finally:
         if "model" in holder:
             _sum_usage(usage, holder["model"].usage)
+        # The supervisor's record of this run (agent.tasks); it never changes or stops the team.
+        if month_team_records():
+            team_record.record_month_team(store, correlation_id, live=settings.live, mode=mode,
+                                          period=period if mode == "month" else f"{args.from_period}..{args.to_period}",
+                                          counts=counts, usage=usage, error_code=error_code)
     LOGGER.info("month team stages: %s", counts)
     return counts.get("ready", 0)
 
@@ -613,6 +685,9 @@ def main(argv: list[str] | None = None) -> int:
     db, runtime = DatabaseSettings.from_env(), RuntimeSettings.from_env()
     correlation_id = str(uuid.uuid4())
     store = Store(connect(db, search_path="agent"), db.tenant_id)
+    if args.job == "onboarding" and store.run_in_progress("onboarding", ONBOARDING_RUN_MINUTES):
+        LOGGER.info("an earlier onboarding run is still going; this one skips")
+        return 0
     tools = ToolClient(runtime.tool_server_url, TokenSource(runtime.managed_identity_client_id, runtime.tool_server_audience),
                        job=args.job, correlation_id=correlation_id)
     run_id = store.start_run(args.job, correlation_id)
@@ -648,6 +723,8 @@ def main(argv: list[str] | None = None) -> int:
             if store.tokens_used_today() >= runtime.daily_token_budget:
                 store.finish_run(run_id, status="failed", items=0, usage=usage, error_code="budget_exhausted")
                 return 1
+            if args.job == "month_end_drafter" and month_end_waits():
+                accounts = month_end_ready(tools, accounts, date.today())
             agent = Agent(ModelSettings.from_env())
             job = {"holdings_explainer": holdings_explainer, "weekly_brief": weekly_brief,
                    "live_market": live_market, "risk_watch": risk_watch,

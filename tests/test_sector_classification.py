@@ -99,6 +99,22 @@ class SectorClassificationTests(unittest.TestCase):
             "verified_historical_override:twse-delisting-2025-06-27",
         )
 
+    def test_kiwoom_us_takeovers_keep_the_sector_their_factsheets_print(self) -> None:
+        from ibkr_etl.us_istrategy_securities import DELISTED, DELISTED_YAHOO_SECTOR, lookup
+
+        for ticker in ("DFS", "FYBR"):
+            result = lookup_classification(
+                {"conid": f"US:{ticker}", "symbol": ticker, "currency": "USD"},
+                fetcher=lambda symbol, timeout: {"quotes": []},
+                profile_fetcher=lambda symbol: {},
+            )
+            self.assertEqual(result["status"], "classified")
+            self.assertIn("sec.gov", result["source_url"])
+            self.assertEqual(result["sector"], DELISTED_YAHOO_SECTOR[ticker])
+            self.assertEqual((result["long_name"], result["industry"]), DELISTED[ticker])
+            stored = {"long_name": result["long_name"], "sector": result["sector"], "sub_sector": result["industry"]}
+            self.assertEqual(lookup({"symbol": ticker}, stored), lookup({"symbol": ticker}, None))
+
     def test_new_warrant_override_uses_underlying_sector_until_yahoo_has_one(
         self,
     ) -> None:

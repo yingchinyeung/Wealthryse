@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ibkr_etl import layer_freshness
+from test_medallion_layers_db import NEEDS_LAYERS
 
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,9 +41,12 @@ FRESHNESS_GRANTS = (
     "GRANT SELECT (tenant_id, flex_row_id, first_seen_run_id) ON flex_rows TO {role}",
     "GRANT SELECT (tenant_id, as_of_date) ON risk_analytics_snapshots TO {role}",
     "GRANT SELECT (tenant_id, holdings_as_of) ON crisis_scenario_results, crisis_replay_daily TO {role}",
+    "GRANT SELECT (tenant_id, received_at, http_status, return_code) ON kiwoom_responses TO {role}",
 )
 UNREADABLE_TODAY = {"bronze.raw_reports", "bronze.flex_rows", "gold.risk_analytics_snapshots",
                     "gold.crisis_scenario_results", "gold.crisis_replay_daily"}
+# Reported only, so unreadable is never an incident.
+UNREADABLE_OPTIONAL = {"bronze.kiwoom_responses"}
 
 
 def _supervisor():
@@ -87,6 +91,34 @@ def _seed(connection) -> None:
     connection.execute(
         "INSERT INTO position_snapshots(account_id, snapshot_date, conid, row_sha256, last_seen_run_id) "
         "VALUES ('U0000001', '2026-10-15', '1', %s, %s)", ("d" * 64, run))
+    # Two Kiwoom accounts (Korea in KRW, a U.S. account in USD): the stalest one's newest TOTAL row
+    # is the Kiwoom NAV date, and an answered page is bronze's newest Kiwoom answer.
+    connection.execute(
+        "INSERT INTO accounts(account_id, base_currency, account_type, first_seen_at, last_seen_at, source_json) "
+        "VALUES ('KIWOOM-K', 'KRW', 'kiwoom', '2026-01-01', '2026-10-16', '{}'), "
+        "('KIWOOM-U', 'USD', 'kiwoom', '2026-01-01', '2026-10-16', '{}')")
+    connection.execute(
+        "INSERT INTO nav_snapshots(account_id, snapshot_date, currency, asset_class, row_sha256, last_seen_run_id) "
+        "VALUES ('KIWOOM-K', '2026-10-15', 'KRW', 'TOTAL', %s, %s), ('KIWOOM-U', '2026-10-14', 'USD', 'TOTAL', %s, %s), "
+        "('KIWOOM-U', '2026-10-13', 'USD', 'TOTAL', %s, %s)", ("1" * 64, run, "2" * 64, run, "3" * 64, run))
+    connection_id = uuid.uuid4()
+    connection.execute(
+        "INSERT INTO broker_connections (connection_id, broker, environment, display_name, key_vault_secret_name, "
+        "credential_fingerprint, status) VALUES (%s, 'kiwoom_rest', 'mock', 'Kiwoom', %s, %s, 'pending_check')",
+        (connection_id, "broker-kiwoom-rest-" + connection_id.hex, "0" * 16))
+    kiwoom_run = connection.execute(
+        "INSERT INTO ingestion_runs(run_type, started_at, completed_at, status) VALUES ('kiwoom_rest_bronze', "
+        "'2026-10-16T08:24:00+00:00', '2026-10-16T08:27:00+00:00', 'success') RETURNING run_id").fetchone()[0]
+    for page, (received, status, code) in enumerate((("2026-10-16T08:25:00+00:00", 200, 0),
+                                                       # A later refused call never counts as fresh data.
+                                                       ("2026-10-16T08:26:00+00:00", 200, 1),
+                                                       ("2026-10-16T08:27:00+00:00", 429, None)), start=1):
+        body = b'{"return_code":%d}' % (code or 0)
+        connection.execute(
+            "INSERT INTO kiwoom_responses(run_id, connection_id, api_id, request_key, page_no, requested_at, "
+            "received_at, http_status, return_code, body, body_sha256) VALUES (%s, %s, 'kt00004', '{}', %s, %s, %s, "
+            "%s, %s, %s, encode(sha256(%s), 'hex'))",
+            (kiwoom_run, connection_id, page, received, received, status, code, body, body))
     connection.execute(
         "INSERT INTO benchmark_master(benchmark_id, symbol, name, currency, return_convention, "
         "created_at, updated_at) VALUES ('SYN', '^SYN', 'Synthetic', 'USD', 'price', '2026-01-01', '2026-01-01')")
@@ -145,9 +177,10 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
             admin.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         with psycopg.connect(_dsn(cls.database, OWNER)) as owner:
             for path in sorted((ROOT / "migrations" / "postgres").glob("*.sql")):
-                if "_medallion_" in path.name:
+                if "_medallion_" in path.name or path.name in NEEDS_LAYERS:
                     # The approval login as it is before the layer moves, which bootstrap makes with
-                    # their grants (test_medallion_layers_db and the S3 runs cover the moves).
+                    # their grants (test_medallion_layers_db and the S3 runs cover the moves). 074
+                    # runs only after them.
                     continue
                 try:
                     owner.execute(path.read_text(encoding="utf-8"))
@@ -190,6 +223,8 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
         # A failed benchmark row never counts as fresh data.
         self.assertEqual(results["silver.benchmark_prices"]["observed"], "2026-10-16T08:31:00+00:00")
         self.assertEqual(results["gold.crisis_scenario_results"]["observed"], "2026-10-15")
+        self.assertEqual(results["bronze.kiwoom_responses"]["observed"], "2026-10-16T08:25:00+00:00")
+        self.assertEqual(results["silver.nav_snapshots.kiwoom"]["observed"], "2026-10-14")
 
     def test_the_session_refuses_writes(self):
         import psycopg
@@ -225,7 +260,7 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
 
         today = self._results(APPROVAL)
         unreadable = {k for k, r in today.items() if r["state"] == "unavailable"}
-        self.assertEqual(unreadable, UNREADABLE_TODAY)
+        self.assertEqual(unreadable, UNREADABLE_TODAY | UNREADABLE_OPTIONAL)
         self.assertTrue(all("InsufficientPrivilege" in today[k]["error"] for k in unreadable))
         self.assertFalse(any(r["late"] for r in today.values()))
         with psycopg.connect(_dsn(self.database, OWNER)) as owner:
@@ -238,15 +273,20 @@ class LayerFreshnessDatabaseTests(unittest.TestCase):
             with psycopg.connect(_dsn(self.database, APPROVAL)) as approval:
                 with self.assertRaises(psycopg.errors.InsufficientPrivilege):
                     approval.execute("SELECT data_json FROM flex_rows")
+            with psycopg.connect(_dsn(self.database, APPROVAL)) as approval:
+                # Kiwoom's answers carry the account number: the grant reaches the times only.
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    approval.execute("SELECT body FROM kiwoom_responses")
         finally:
             with psycopg.connect(_dsn(self.database, OWNER)) as owner:
                 owner.execute(f"REVOKE SELECT ON raw_reports, flex_rows, risk_analytics_snapshots, "
-                              f"crisis_scenario_results, crisis_replay_daily FROM {APPROVAL}")
+                              f"crisis_scenario_results, crisis_replay_daily, kiwoom_responses FROM {APPROVAL}")
                 for table, columns in (("raw_reports", "tenant_id, received_at"),
                                        ("flex_rows", "tenant_id, flex_row_id, first_seen_run_id"),
                                        ("risk_analytics_snapshots", "tenant_id, as_of_date"),
                                        ("crisis_scenario_results", "tenant_id, holdings_as_of"),
-                                       ("crisis_replay_daily", "tenant_id, holdings_as_of")):
+                                       ("crisis_replay_daily", "tenant_id, holdings_as_of"),
+                                       ("kiwoom_responses", "tenant_id, received_at, http_status, return_code")):
                     owner.execute(f"REVOKE SELECT ({columns}) ON {table} FROM {APPROVAL}")
                 owner.commit()
 

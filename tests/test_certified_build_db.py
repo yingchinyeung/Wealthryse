@@ -341,6 +341,32 @@ class CertifiedBuildTests(_BuildDatabase):
         self.assertIn("Nothing changed, so no build is written.", lines)
         self.assertEqual(len(self._builds()), 1)
 
+    def test_4b_a_run_loads_the_published_rows_only_for_the_dates_it_reads(self):
+        # The whole history does not fit in the job's memory once the charts are stored (23 Oct
+        # 2026: killed at 2 GiB), so a run asks for the dates first and the rows of the dates read.
+        everything = self._published()
+        calls, real = [], build.published_rows
+
+        def recorded(connection, subject_ids, on_dates=None):
+            calls.append(on_dates)
+            return real(connection, subject_ids, on_dates=on_dates)
+
+        with patch.object(build, "published_rows", recorded):
+            code, lines = self._run()
+        self.assertEqual(code, 0)
+        self.assertIn("Nothing changed, so no build is written.", lines)
+        self.assertEqual(len(calls), 1)
+        due = set(_business_days(FIRST, LAST)[-build.RECHECK_DATES:])
+        self.assertEqual(calls[0], {SUBJECT: due})
+        with layers._connect(self.database, WEB) as web:
+            dates = build.published_dates(web, [SUBJECT])
+            some = build.published_rows(web, [SUBJECT], on_dates={SUBJECT: [LAST.isoformat()]})
+            self.assertEqual(build.published_rows(web, [SUBJECT], on_dates={}), {})
+            self.assertEqual(build.published_dates(web, [SUBJECT], figure_ids=["no.such_figure"]), {})
+        self.assertEqual(dates, {SUBJECT: {key[5] for key in everything}})
+        self.assertEqual(some, {key: row for key, row in everything.items() if key[5] == LAST.isoformat()})
+        self.assertTrue(some)
+
     def test_5_a_changed_answer_from_the_same_inputs_holds_the_build(self):
         before = self._value("stats.sortino_ratio", LAST.isoformat())
         original = self.web.portfolio_analytics_view
@@ -509,6 +535,33 @@ class BenchmarkHolidayTests(_BuildDatabase):
             "AND as_of_date = %s", SUBJECT, shut)
         self.assertEqual(source_key["observation_date"], days[-21])
 
+
+@unittest.skipUnless(ADMIN_DSN, "AGENT_TEST_PG_ADMIN_DSN is not set")
+class RestatedComparisonTests(_BuildDatabase):
+    """The comparison job restates a day's portfolio return while the values stay the same, as a
+    corrected flow does: the Vs benchmark figures move with a new fingerprint and publish."""
+
+    def test_a_restated_return_is_a_new_input_not_a_changed_answer(self):
+        code, lines = self._run()
+        self.assertEqual(code, 0, lines)
+        last = LAST.isoformat()
+        before = self._value("benchmark.beta", last, benchmark_id="SYNIDX")
+        with layers._connect(self.database) as owner:
+            owner.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+            owner.execute("UPDATE performance_comparison_daily SET portfolio_return = portfolio_return + 0.01, "
+                          "excess_return = excess_return + 0.01 WHERE subject_id = %s AND observation_date::text = %s",
+                          (SUBJECT, last))
+            owner.commit()
+        code, lines = self._run()
+        self.assertEqual(code, 0, lines)
+        _, status, reason, checks = self._builds()[-1]
+        self.assertEqual((status, reason), ("published", None), checks)
+        self.assertEqual(checks["same_inputs_new_answer_count"], 0, checks)
+        self.assertGreater(checks["changed"], 0, checks)
+        comparison = self.web.benchmark_comparison(SUBJECT, as_of=last, user=build.BUILD_USER)
+        after = self._value("benchmark.beta", last, benchmark_id="SYNIDX")
+        self.assertNotEqual(after, before)
+        self.assertEqual(after, comparison["metrics"]["beta"])
 
 def _gate(states: dict[str, str]):
     def check(job, *, since, environ, now):

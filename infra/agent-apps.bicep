@@ -58,6 +58,10 @@ param dispatcherMode string = 'watch'
 @description('With dispatcherMode live: the jobs it may run, comma-separated (holdings_explainer, risk_watch, weekly_brief, month_end_drafter, export_packs). Empty: none.')
 param dispatcherJobs string = ''
 
+@description('Where the tool server reads investors\' deposits and withdrawals for returns (FLOWS_SOURCE, docs/MEDALLION_ARCHITECTURE.md). off: bronze, as before. fallback: silver wherever it equals bronze, else bronze and one log line. Needs migrations/agent/022 installed; on waits for two clean month-ends.')
+@allowed(['off', 'fallback', 'on'])
+param flowsSource string = 'off'
+
 param agentAppName string = 'ibkrv2stg-agent'
 param toolsAppName string = 'ibkrv2stg-agent-tools'
 
@@ -191,7 +195,7 @@ resource tools 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'AGENT_TOOLS_AUDIENCE', value: toolsAudience }
             { name: 'AGENT_TOOLS_USER_CALLERS', value: agentIdentity.properties.principalId }
             { name: 'AGENT_TOOLS_JOB_CALLERS', value: jobsIdentity.properties.principalId }
-          ])
+          ], flowsSource == 'off' ? [] : [{ name: 'FLOWS_SOURCE', value: flowsSource }])
           resources: { cpu: json('0.5'), memory: '1Gi' }
           probes: probes
         }

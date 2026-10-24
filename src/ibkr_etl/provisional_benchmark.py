@@ -730,10 +730,10 @@ KIWOOM_FLOW_TYPES = ("DEPOSIT", "WITHDRAWAL")
 
 
 def _is_kiwoom(connection: Any, account_id: str) -> bool:
-    """Only a Kiwoom account reads silver cash rows, as flows_source.silver_external_flows does.
+    """Only a Kiwoom account reads silver cash rows here, as flows_source.silver_external_flows does.
 
-    An IBKR account's flows come from its Flex file alone, wherever it is read from: the agents'
-    scoped views have flex_rows but no cash_transactions.
+    An IBKR account's bronze flows come from its Flex file alone, wherever it is read from (the agents'
+    agent.flex_rows too); flows_source reads its silver rows.
     """
     row = connection.execute("SELECT account_type FROM accounts WHERE account_id = ?", (account_id,)).fetchone()
     return row is not None and str(row["account_type"] or "") == "kiwoom"

@@ -20,8 +20,17 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
        AND c.transaction_type IN ('DEPOSIT', 'WITHDRAWAL')
 $$;
 
-CREATE OR REPLACE VIEW agent.cash_transactions AS
-    SELECT account_id, effective_date, transaction_type, amount_text, currency FROM agent.scoped_kiwoom_flows();
+-- 022_silver_flows.sql widens this view for the silver flow reader (FLOWS_SOURCE) with four more
+-- columns, which a view can only gain, never lose: so this file creates it only where it is missing.
+DO $view$
+BEGIN
+    IF to_regclass('agent.cash_transactions') IS NULL THEN
+        CREATE VIEW agent.cash_transactions AS
+            SELECT account_id, effective_date, transaction_type, amount_text, currency
+              FROM agent.scoped_kiwoom_flows();
+    END IF;
+END
+$view$;
 
 REVOKE ALL ON FUNCTION agent.scoped_kiwoom_flows() FROM PUBLIC;
 REVOKE ALL ON agent.cash_transactions FROM PUBLIC;

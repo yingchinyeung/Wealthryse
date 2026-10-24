@@ -919,10 +919,13 @@ waiting for, on settled dates:
 | month-end commentary | the month final for that account (the 2nd to the 7th), with no draft yet | 02:00 UTC, 2nd to 7th |
 | export packs | a new settled valuation date (no model) | 01:45 UTC daily |
 
-- **The certified build.** Once Medallion's view `agent.certified_latest` exists, an
-  event also waits until the newest published certified build covers its data date, and
-  the record says it woke on the certified layer and which build. Until then it wakes on
-  silver, as recorded.
+- **The certified build.** Once Medallion's view `agent.certified_latest`
+  (`migrations/agent/021_certified_latest.sql`) is installed, an event also waits until the
+  newest published certified build covers its data date, and the record says it woke on the
+  certified layer and which build. Until then it wakes on silver, as recorded. The view has
+  one row per account in scope: the newest as-of date any published build of the tenant
+  covers for it, and the newest published build that wrote figures for that date. Held,
+  shadow and rolled-back builds never count, and it carries dates and ids only.
 - **`AGENT_DISPATCHER=watch`** records one tree per event in `agent.tasks` (source
   `event`): supervisor, `event_dispatcher`, then the job, with the data date, the layer,
   the job's next fixed time and how many minutes earlier the event came. Nothing runs.

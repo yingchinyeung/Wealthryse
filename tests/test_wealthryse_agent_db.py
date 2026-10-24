@@ -44,6 +44,23 @@ def _dsn(base: str, database: str, user: str | None = None) -> str:
     return make_conninfo(**params)
 
 
+def _publish_certified_build(owner, subject_id: str, as_of_date: str) -> str:
+    """One published certified build with one figure for subject_id on as_of_date; its build id."""
+    from ibkr_etl import certified_figures as register
+
+    build_id, item = str(uuid.uuid4()), register.figure("overview.nav")
+    owner.execute("INSERT INTO gold.certified_builds(build_id, run_kind, started_at, status) "
+                  "VALUES (%s, 'daily', %s, 'shadow')", (build_id, f"{as_of_date}T23:00:00Z"))
+    owner.execute(
+        "INSERT INTO gold.certified_figures(build_id, subject_id, figure_id, as_of_date, value, unit, currency, status, "
+        "definition_id, definition_version, calculation_version, input_sha256, source_table, source_key) VALUES "
+        "(%s, %s, 'overview.nav', %s, 1000, 'money', 'USD', 'ok', %s, %s, 'test-v1', %s, 'silver.nav_snapshots', '{}')",
+        (build_id, subject_id, as_of_date, item.definition_id, item.definition_version, "e" * 64))
+    owner.execute("UPDATE gold.certified_builds SET status = 'published', published_at = %s WHERE build_id = %s",
+                  (f"{as_of_date}T23:30:00Z", build_id))
+    return build_id
+
+
 TOLERATED_MIGRATIONS = {"027_legacy_external_market_data_approval.sql", "056_specialist_audit_ledger.sql"}
 
 
@@ -298,6 +315,131 @@ class AgentDatabaseTests(unittest.TestCase):
                                               "to_date": "2026-03-31"}, user=VIEWER)["structuredContent"]["data"]
         self.assertEqual(flows["net"], 1000.0)
 
+    # Deposits and withdrawals from silver (agent/022, FLOWS_SOURCE) ----------------------------
+
+    def _flow_lines(self):
+        """Capture FLOWS_SOURCE lines, with the clock mid-month (outside the month-end check)."""
+        from datetime import datetime, timezone
+        from unittest import mock
+
+        from ibkr_etl import flows_source
+
+        lines: list[str] = []
+        for patcher in (mock.patch.object(flows_source, "emit", lines.append),
+                        mock.patch.object(flows_source, "_now",
+                                          return_value=datetime(2026, 3, 16, 4, 0, tzinfo=timezone.utc))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return lines
+
+    def test_the_installer_widens_the_view_020_installed(self):
+        """Production has 020's five-column agent.cash_transactions: running every file again must widen it."""
+        import psycopg
+
+        with psycopg.connect(_dsn(ADMIN_DSN, self.database, "agent_test_owner"),
+                             options=f"-c app.tenant_id={TENANT}") as owner:
+            try:
+                owner.execute("DROP VIEW agent.cash_transactions")
+                owner.execute("CREATE VIEW agent.cash_transactions AS SELECT account_id, effective_date, "
+                              "transaction_type, amount_text, currency FROM agent.scoped_kiwoom_flows()")
+                for text in _agent_schema_sql(owner):
+                    owner.execute(text)
+                columns = [r[0] for r in owner.execute(
+                    "SELECT attname FROM pg_attribute WHERE attrelid = 'agent.cash_transactions'::regclass "
+                    "AND attnum > 0 ORDER BY attnum").fetchall()]
+                self.assertEqual(columns, ["account_id", "effective_date", "transaction_type", "amount_text", "currency",
+                                           "settle_date", "event_datetime", "description", "source_key"])
+                self.assertTrue(owner.execute("SELECT has_table_privilege('agent_reader', 'agent.cash_transactions', "
+                                              "'SELECT')").fetchone()[0])
+            finally:
+                owner.rollback()
+
+    def test_the_tool_server_reads_deposits_from_silver(self):
+        from unittest import mock
+
+        lines = self._flow_lines()
+        for mode in ("off", "fallback", "on"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, {"FLOWS_SOURCE": mode}):
+                flows = self._call("get_cash_flows", {"account_id": "UTEST1", "from_date": "2026-01-01",
+                                                      "to_date": "2026-03-31"}, user=VIEWER)["structuredContent"]["data"]
+                # on reads silver alone, so the deposit there is silver.transfers' row.
+                self.assertEqual(flows["flows"], [{"date": "2026-02-10", "amount": 1000.0}])
+                data = self._call("get_performance", {"account_id": "UTEST1"}, user=VIEWER)["structuredContent"]["data"]
+                self.assertTrue(data["flows_included"])
+                self.assertAlmostEqual(next(p for p in data["periods"] if p["key"] == "mtd")["twr"], 12705 / 12100 - 1)
+        # fallback found silver readable and equal to bronze, so it kept silver and said nothing.
+        self.assertEqual(lines, [])
+
+    def test_the_flow_views_show_only_flows_of_the_accounts_in_scope(self):
+        import json
+
+        import psycopg
+
+        from ibkr_etl import flows_source
+        from ibkr_etl.db import PostgresConnection, _hybrid_row_factory
+        from ibkr_etl.provisional_benchmark import _bronze_external_flows
+
+        lines = self._flow_lines()
+        raw = psycopg.connect(_dsn(ADMIN_DSN, self.database, "agent_test_owner"), row_factory=_hybrid_row_factory)
+        try:
+            raw.execute("SELECT set_config('app.tenant_id', %s, true)", (TENANT,))
+            raw.execute("INSERT INTO accounts(account_id, alias, base_currency, account_type, first_seen_at, last_seen_at, "
+                        "source_json, tenant_id) VALUES ('KTEST-FLOW', 'k', 'USD', 'kiwoom', '2026-03-01', '2026-03-31', "
+                        "'{}', %s)", (TENANT,))
+            # UTEST2: a typed deposit, a dividend, and two older rows without a type (a bank transfer and a dividend),
+            # each in bronze and in silver as the loader writes them. The Kiwoom account: a deposit and a dividend.
+            cash = [("UTEST2", "c1", "Deposits/Withdrawals", "CASH RECEIPTS / ELECTRONIC FUND TRANSFERS", "500", "20260305"),
+                    ("UTEST2", "c2", "Dividends", "SPY CASH DIVIDEND", "12.5", "20260306"),
+                    ("UTEST2", "c3", "", "ELECTRONIC FUND TRANSFER", "-200", "20260310"),
+                    ("UTEST2", "c4", "", "SPY CASH DIVIDEND", "3", "20260311"),
+                    ("KTEST-FLOW", "k1", "DEPOSIT", "", "700", "20260312"),
+                    ("KTEST-FLOW", "k2", "DIVIDEND", "", "9", "20260313")]
+            for account, key, kind, description, amount, day in cash:
+                iso = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+                if not account.startswith("KTEST"):
+                    values = {"type": kind, "description": description, "amount": amount, "currency": "USD",
+                              "reportDate": day}
+                    raw.execute("INSERT INTO flex_rows(account_id, section, record_type, source_key, report_date, "
+                                "currency, row_sha256, data_json, first_seen_run_id, last_seen_run_id, tenant_id) "
+                                "VALUES (%s, 'CashTransactions', 'CashTransaction', %s, %s, 'USD', %s, %s, 1, 1, %s)",
+                                (account, key, iso, key, json.dumps(values), TENANT))
+                raw.execute("INSERT INTO cash_transactions(account_id, source_key, effective_date, transaction_type, "
+                            "description, amount_text, currency, row_sha256, last_seen_run_id) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, 'USD', %s, 1)",
+                            (account, key, iso, kind or None, description or None, amount, key))
+            # Now as the tool server reads: its role, the agent schema only, these accounts in scope.
+            raw.execute("SET LOCAL ROLE agent_test_reader")
+            raw.execute("SELECT set_config('search_path', 'agent', true)")
+            raw.execute("SELECT set_config('agent.subjects', 'UTEST2,KTEST-FLOW', true)")
+            seen = raw.execute("SELECT account_id, source_key, settle_date, event_datetime, description FROM cash_transactions "
+                               "ORDER BY account_id, source_key").fetchall()
+            self.assertEqual([(r["account_id"], r["source_key"]) for r in seen],
+                             [("KTEST-FLOW", "k1"), ("UTEST2", "c1"), ("UTEST2", "c3")])
+            self.assertEqual(raw.execute("SELECT count(*) FROM transfers").fetchone()[0], 0)  # UTEST1's is out of scope
+            connection = PostgresConnection(raw)
+            for account, expected in (("UTEST2", {"2026-03-05": 500.0, "2026-03-10": -200.0}),
+                                      ("KTEST-FLOW", {"2026-03-12": 700.0})):
+                with self.subTest(account=account):
+                    self.assertEqual(_bronze_external_flows(connection, account, subject_type="physical_account"),
+                                     expected)
+                    for mode in ("fallback", "on"):
+                        self.assertEqual(flows_source.external_flows(connection, account, subject_type="physical_account",
+                                                                     selected=mode), expected)
+            raw.execute("SELECT set_config('agent.subjects', 'UTEST1', true)")
+            self.assertEqual([(r["account_id"], r["transfer_date"], r["cash_transfer_text"]) for r in raw.execute(
+                "SELECT account_id, transfer_date, cash_transfer_text FROM transfers").fetchall()],
+                [("UTEST1", "2026-02-10", "1000")])
+            self.assertEqual(raw.execute("SELECT count(*) FROM cash_transactions").fetchone()[0], 0)
+            # Never the tables themselves, nor their public names.
+            self.assertFalse(raw.execute("SELECT has_schema_privilege(current_user, 'silver', 'USAGE')").fetchone()[0])
+            for table in ("public.cash_transactions", "public.transfers"):
+                self.assertFalse(raw.execute("SELECT has_table_privilege(current_user, %s, 'SELECT')", (table,))
+                                 .fetchone()[0], table)
+        finally:
+            raw.rollback()
+            raw.close()
+        self.assertEqual(lines, [])
+
     def test_holdings_and_sectors_in_reporting_currency(self):
         data = self._call("get_sector_allocation", {"account_id": "UTEST1"}, user=VIEWER)["structuredContent"]["data"]
         weights = {a["sector"]: a["weight"] for a in data["allocation"]}
@@ -346,16 +488,15 @@ class AgentDatabaseTests(unittest.TestCase):
                     data = result["structuredContent"]["data"]
                     return data["provisional_sessions"], data["settled_through"], data["certified"]
 
-                self.assertEqual(dates("UTEST1"), (0, "2026-03-31", {"view": False, "as_of_date": None, "build_id": None}))
+                # Medallion's view of the newest published certified build (agent/021): none published yet.
+                self.assertEqual(dates("UTEST1"), (0, "2026-03-31", {"view": True, "as_of_date": None, "build_id": None}))
                 self.assertEqual(dates("KTEST-US")[:2], (2, "2026-03-27"), "U.S. iStrategy: its latest two sessions settle")
                 self.assertEqual(dates("KTEST-KR")[:2], (1, "2026-03-30"), "Korea: the next day's run makes a day final")
                 # Only the scheduled jobs see it; website chat never does.
                 self.assertTrue(self._call("get_settled_dates", {"account_id": "UTEST1"}, user=OWNER).get("isError"))
-                # Medallion's per-account view of the newest published build, once installed.
-                owner.execute("CREATE VIEW agent.certified_latest AS SELECT 'UTEST1'::text AS subject_id, "
-                              "'b-7'::text AS build_id, DATE '2026-03-30' AS as_of_date")
-                owner.execute("GRANT SELECT ON agent.certified_latest TO agent_reader")
-                self.assertEqual(dates("UTEST1")[2], {"view": True, "as_of_date": "2026-03-30", "build_id": "b-7"})
+                # Once a build covering 30 March is published, the dates say so, with the build.
+                build_id = _publish_certified_build(owner, "UTEST1", "2026-03-30")
+                self.assertEqual(dates("UTEST1")[2], {"view": True, "as_of_date": "2026-03-30", "build_id": build_id})
                 self.assertEqual(dates("KTEST-US")[2], {"view": True, "as_of_date": None, "build_id": None})
                 # A view this role cannot read leaves the dates usable, on silver.
                 owner.execute("REVOKE SELECT ON agent.certified_latest FROM agent_reader")
@@ -366,7 +507,7 @@ class AgentDatabaseTests(unittest.TestCase):
                     result = self._call(name, {"account_id": "KTEST-US", "as_of": "2026-03-01"}, job="risk_watch")
                     self.assertEqual(result["structuredContent"]["error"]["code"], "no_valuation", name)
             finally:
-                owner.execute("DROP VIEW IF EXISTS agent.certified_latest")
+                owner.execute("GRANT SELECT ON agent.certified_latest TO agent_reader")
                 owner.execute("DELETE FROM agent.service_grants WHERE job_name = 'risk_watch'")
                 owner.execute("DELETE FROM nav_snapshots WHERE account_id LIKE 'KTEST-%%'")
                 owner.execute("DELETE FROM platform_subjects WHERE subject_id LIKE 'KTEST-%%'")

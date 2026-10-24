@@ -492,19 +492,26 @@ Only the named loader jobs write silver. Three parts, each with its own undo:
    notes each write by a login outside the `silver_loader` group in
    `public.silver_write_watch`: the login, the table, the kind of write, the lineage run id
    and the application name, never row values. It refuses nothing. The tables' owner
-   (migrations, the approved FX step) is not noted. Undo:
+   (migrations, the approved FX step) is not noted. Live since 22 Oct 2026. Undo:
    `infra/medallion/undo/083_silver_write_watch_undo.sql`.
 2. **Loader login.** With `DATABASE_LOADER_PASSWORD` (and `DATABASE_LOADER_ROLE`) set,
    `bootstrap_postgres.py` keeps a loader login that is a member of the app login, so it may do
    everything the app login does, and of `silver_loader`, which may write every silver table
    and the public view over it. The loader jobs read their database URL from the
    `database-loader-url` secret; every other job keeps `database-app-url`. Once they have
-   moved, the watch stays empty through a full daily cycle before the next part.
+   moved, the watch stays empty through a full daily cycle before the next part. Live since
+   24 Oct 2026 00:38 UTC: the 9 loader jobs (institutional-daily, flex-discovery, the import
+   job, benchmark-daily, risk-free-daily, sector-classification, derived-daily,
+   onboard-analytics and onboard-render) log in as `ibkr_stg_loader`. The bootstrap job
+   carries the loader settings (`loaderRole` in `infra/staging-bootstrap-job.bicep`). Undo:
+   the jobs back on `database-app-url`; the login and secrets stay, unused. The undo is
+   refused while the lock is on.
 3. **Lock.** Bootstrap with `SILVER_WRITE_LOCK=on` takes INSERT, UPDATE, DELETE and TRUNCATE
    on silver (tables, their public views, and tables made later) from the app login, and
    refuses to finish if any login other than the loader can still write silver. Reading is
-   unchanged. Every later bootstrap run must carry the setting; bootstrap without it gives the
-   app login its write rights back, which is the undo.
+   unchanged. Every later bootstrap run must carry the setting (`silverWriteLock` in
+   `infra/staging-bootstrap-job.bicep`, `off` until the lock is on); bootstrap without it gives
+   the app login its write rights back, which is the undo.
 
 `src/ibkr_etl/silver_writers.py` names the loader jobs and every file that writes silver,
 and `tests/test_silver_writers.py` fails on code that writes silver outside that register.

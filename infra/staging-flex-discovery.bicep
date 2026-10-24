@@ -27,7 +27,8 @@ resource applicationVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
 }
 resource databaseSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' existing = {
   parent: applicationVault
-  name: 'database-app-url'
+  // The loader login (Medallion step 3): only the loader jobs may write silver.
+  name: 'database-loader-url'
 }
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
   name: storageAccountName
@@ -90,9 +91,11 @@ resource flexSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' =
   }
 }
 
-// The same worker can read only the application database URL secret, not the full application vault.
+// The same worker can read only the loader database URL secret, not the full application vault.
+// The name is the assignment the loader line made on 24 Oct 2026, so a redeploy updates it instead
+// of failing on a duplicate. Its earlier grant on database-app-url is no longer used by the job.
 resource databaseSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(databaseSecret.id, identity.id, 'database-secret-reader')
+  name: '6a4fd119-9a22-5db7-a2e4-eeb649c88599'
   scope: databaseSecret
   properties: {
     principalId: identity.properties.principalId

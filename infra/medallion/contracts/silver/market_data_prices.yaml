@@ -2,13 +2,14 @@ apiVersion: v3.0.2
 kind: DataContract
 id: wealthryse.silver.market_data_prices
 name: market_data_prices
-version: 1.0.0
+version: 1.1.0
 status: active
 domain: silver
 dataProduct: portfolio-medallion
 description:
   purpose: 'Daily closes from Yahoo Finance for instruments needed outside the IBKR statements: the Hang Seng index
-    and SPY for the composites, and the stand-in ETFs of the crisis replay.'
+    and SPY for the composites, the stand-in ETFs of the crisis replay, and (yahoo-<ticker>, written by the fetch step
+    of CRISIS_PRICES_SOURCE=silver) every close and FX quote the crisis replay and crisis scenarios compute from.'
 tags:
 - silver
 - market-data
@@ -36,7 +37,9 @@ schema:
     primaryKey: true
     primaryKeyPosition: 2
     classification: internal
-    description: Platform id of the instrument, such as hang-seng-price-index, spy-settlement or crisis-replay-<ticker>.
+    description: Platform id of the instrument, such as hang-seng-price-index, spy-settlement, crisis-replay-<ticker>
+      (a replay's series in its reporting currency) or yahoo-<ticker> (the provider's own close, in the ticker's
+      currency; FX quotes such as hkd=x are units of that currency per USD).
   - name: price_date
     physicalType: text
     logicalType: date
@@ -163,12 +166,14 @@ customProperties:
   value:
   - ibkr_etl.alpha_world_t_crisis
   - ibkr_etl.analyst_export
+  - ibkr_etl.crisis_prices
   - ibkr_etl.derived_portfolio
   - ibkr_etl.layer_freshness
   - ibkr_etl.onboarding_v2_web
   - ibkr_etl.web
 - property: producers
   value:
+  - ibkr_etl.crisis_prices
   - ibkr_etl.crisis_replay
   - ibkr_etl.market_data
 - property: freshnessCheck

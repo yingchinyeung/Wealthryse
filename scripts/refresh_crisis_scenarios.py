@@ -3,6 +3,8 @@ sending its ticker symbols to Yahoo Finance. Runs as its own scheduled job after
 problem here never fails the benchmark, derived or risk jobs.
 
 Exits 1 when any subject fails or nothing is stored, so the failure shows on the job's execution.
+With CRISIS_PRICES_SOURCE=silver it fetches every price into silver first, then computes from silver only
+(ibkr_etl.crisis_prices).
 """
 from __future__ import annotations
 
@@ -51,6 +53,11 @@ def main() -> int:
         code, result = run(connection)
         if result.get("subjects"):
             lineage.current().output("gold.crisis_scenario_results")
+        if result.get("prices"):  # CRISIS_PRICES_SOURCE=silver: the fetch step wrote silver, and the calculation read it
+            written = result["prices"].get("written") or {}
+            lineage.current().output("silver.market_data_prices",
+                                     rows=sum(int(written.get(k) or 0) for k in ("inserted", "updated", "deleted")))
+            lineage.current().input("silver.market_data_prices")
         print(canonical_json(result), flush=True)
         return code
     finally:

@@ -13,8 +13,8 @@ so they are not listed.
 tests/test_silver_writers.py scans the code and fails when a file writes silver without an
 entry here, when an entry no longer writes, or when SILVER_RELATIONS drifts from those migrations. A new
 writer goes in WRITER_FILES with its job; a new job that writes goes in LOADER_JOBS as well.
-Every other job (risk-snapshots, crisis-scenarios, certified-figures, month-end-factsheet,
-autonomous-admin, the agents) and the web app only read silver.
+Every other job (risk-snapshots, certified-figures, month-end-factsheet, autonomous-admin, the
+agents) and the web app only read silver.
 """
 from __future__ import annotations
 
@@ -72,6 +72,8 @@ LOADER_JOBS: dict[str, str] = {
         "started by the web app for a new account: benchmark, crisis-replay prices, classifications, English names",
     "ibkrv2stg-onboard-render":
         "started by the web app to render a new account's reports; also runs one-off scripts as an override",
+    "ibkrv2stg-crisis-scenarios-daily":
+        "the crisis scenarios' Yahoo closes and FX quotes (CRISIS_PRICES_SOURCE=silver), before it computes from them",
     "ibkrv2stg-bootstrap":
         "the admin login: migrations, the reference subject rename and the silver history baseline (as an override)",
 }
@@ -120,6 +122,11 @@ WRITER_FILES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "src/ibkr_etl/crisis_replay.py": (
         ("market_data_prices",),
         ("ibkrv2stg-benchmark-daily", "ibkrv2stg-derived-daily", *_ONBOARDING),
+    ),
+    # The fetch step of CRISIS_PRICES_SOURCE=silver, for the replay and the scenarios.
+    "src/ibkr_etl/crisis_prices.py": (
+        ("market_data_prices",),
+        ("ibkrv2stg-benchmark-daily", "ibkrv2stg-derived-daily", "ibkrv2stg-crisis-scenarios-daily", *_ONBOARDING),
     ),
     "src/ibkr_etl/hibor.py": (("risk_free_rates",), ("ibkrv2stg-risk-free-daily",)),
     "src/ibkr_etl/korea_cd_rate.py": (("risk_free_rates",), ("ibkrv2stg-risk-free-daily",)),

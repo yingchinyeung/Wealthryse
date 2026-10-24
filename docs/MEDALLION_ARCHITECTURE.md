@@ -16,7 +16,7 @@ applied. Each stage is approved separately (see "Stages" below).
 |---|---|---|
 | Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, Kiwoom REST answers (from migration 082), live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
 | Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmark prices, FX closes, risk-free rates), sectors, derived and composite portfolios | Each table's `source` in the catalog says how it is rebuilt: `ibkr` tables from bronze (v2's own Flex pull from the switch on; v1.1's history from its archived statements), `market-data` tables once their raw responses are kept in bronze (from S3b), `derived` tables from other silver tables. A record IBKR re-sends replaces the earlier one here; every version stays in the raw statement files. |
-| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: return figures still read deposits and withdrawals from bronze `flex_rows` as well as silver, and use bronze wherever the two differ (`FLOWS_SOURCE=fallback` since 24 Oct 2026), and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
+| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: return figures still read deposits and withdrawals from bronze `flex_rows` as well as silver, and use bronze wherever the two differ (`FLOWS_SOURCE=fallback` since 24 Oct 2026), and the crisis jobs fetch prices while they compute until `CRISIS_PRICES_SOURCE=silver` is on (below). The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
 | Ops | Runs, approvals, audit, access, onboarding workflow, configuration and hand-maintained settings (subjects, benchmark list and mapping, metric catalogue), agent state | Control plane, not a data layer. Stays in `public`. |
 | Platform | `tenants`, `schema_migrations`, row-level security helpers | Stays in `public`. |
 
@@ -442,7 +442,8 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   `ibkrv2stg-flows-source-kept-bronze`, a log alert to `ibkrv2stg-alerts` on any
   `FLOWS_SOURCE` line where a reader kept bronze, by job or app and reason, checked every 15
   minutes. It shows no subject or value. In `fallback` it is how a difference is noticed the
-  day it shows, and two clean month-ends means no alert across each.
+  day it shows, and two clean month-ends means no alert across each. On since 24 Oct 2026
+  03:17 UTC (deployment `flows-source-alert-a3a91aa`, from main a3a91aa).
 - **Live:** `fallback` since 24 Oct 2026 02:19 UTC on the website and the five jobs that build
   return figures (the certified build, derived-daily, benchmark-daily, crisis-scenarios-daily
   and the month-end factsheet), with no image changed. A read-only comparison just before found
@@ -455,8 +456,8 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   silver, so until each runs 397d77a or later `fallback` keeps bronze, with one log line, for
   any account that has a transfer. `ibkrv2stg-flex-discovery` still writes transfers to bronze
   only, which `fallback` reads as `transfers_not_in_silver`.
-  `on` waits for two clean month-ends (31 Oct and 30 Nov), images with the month-end check on
-  every reader, and the alert deployed.
+  `on` waits for two clean month-ends (31 Oct and 30 Nov) and images with the month-end check
+  on every reader that goes to `on`; the alert is on.
 - **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to
   `silver.cash_transactions` in the same loop, under the parser's key. The daily 14-day
   re-send updates the same row in both; a correction under the same key overwrites both; a
@@ -505,6 +506,52 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   explained; then `fallback` on the website, the certified build, derived-daily and the
   monthly and month-end jobs.
 - **Before `on`:** two clean month-ends in `fallback`, and the agent view above.
+
+## Crisis prices from silver (S6): `CRISIS_PRICES_SOURCE`
+
+The crisis replay (2008, `crisis_replay`, run by benchmark-daily, derived-daily and the
+onboarding jobs) and the crisis scenarios (2008, 2015, 2020 and 2022, `crisis_scenarios`, run by
+crisis-scenarios-daily) need Yahoo Finance closes and FX quotes for the holdings they replay.
+Today they fetch them while they compute, the known exception in the Gold row above.
+`ibkr_etl.crisis_prices` splits that into a fetch step that fills silver and a calculation
+that reads silver only.
+
+- **The setting:** `CRISIS_PRICES_SOURCE` on each job.
+  - `off`, the default (also unset): fetched while computing, exactly as before. Nothing new
+    is stored. A value other than `off` or `silver` stops the job.
+  - `silver`: two steps. The fetch step runs the calculation once against Yahoo only to learn
+    what it asks for: every reply is kept in `bronze-market-data` by raw capture, as before,
+    its parsed closes are written to `silver.market_data_prices` and committed, and that run's
+    results are thrown away. Then the calculation runs again reading silver only, and only
+    those results are stored. One `CRISIS_PRICES {json}` line per step gives counts only
+    (requests, failed requests, rows inserted, updated, deleted and unchanged, and reads that
+    matched today's fetch or came from an earlier one), never a price, ticker or account. To
+    read them: `ContainerAppConsoleLogs_CL | where Log_s startswith 'CRISIS_PRICES '`.
+- **What silver holds.** `instrument_id` `yahoo-<ticker in lower case>`, `symbol` the ticker,
+  `price_type` `adjusted_close` for securities and indices (Yahoo's Adj Close, as the replays
+  use) and `unadjusted_close` for the FX quotes (`HKD=X` and the other `FX_TICKERS`, units of
+  that currency per USD; cross pairs are worked out from two quotes at read time, as the fetch
+  does). `currency` is the currency the close is in. A reply with closes replaces that ticker's
+  rows on the dates it asked for: new dates inserted, changed closes updated, dates Yahoo no
+  longer has deleted. An empty or failed reply changes nothing, so silver keeps the last good
+  answer. The `crisis-replay-<ticker>` rows the replay already writes (its series in the
+  reporting currency) are unchanged.
+- **Same results.** On a day Yahoo answers, silver holds exactly what was just fetched, so the
+  results are the ones fetching while computing gives (tests compare both for the USD, won and
+  composite replays and the scenarios).
+- **When Yahoo cannot be reached:** the calculation uses the closes silver kept from earlier
+  fetches. Yahoo's "no prices" for a ticker (a holding listed after a window, a ticker variant
+  that does not exist) is not kept, so a subject holding such a ticker stops for the day
+  (`NotInSilver`) and its last stored results stay, where fetching while computing stored
+  scenarios marked unavailable, or failed the replay. A request today's fetch did not answer,
+  with nothing in silver for it, is never read as "no prices".
+- **Who writes.** crisis-scenarios-daily writes silver in its fetch step, so it is a loader job
+  (`silver_writers.LOADER_JOBS`) and logs in with `database-loader-url` from the switch-on;
+  benchmark-daily, derived-daily and the onboarding jobs already do.
+- **Not covered:** the website's what-if crisis replay (Modelling) still asks Yahoo for tickers
+  someone types in, which silver cannot hold in advance.
+- **Undo:** remove the setting (and put crisis-scenarios-daily back on `database-app-url` while
+  the silver write lock is off). The `yahoo-` rows stay in silver, unread.
 
 ## Release data report
 

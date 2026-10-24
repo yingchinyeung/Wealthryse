@@ -424,6 +424,7 @@ def fetch_fx_to_reporting_yfinance(
     start_date: date,
     end_date: date,
     ticker_factory: Callable[[str], Any] | None = None,
+    fetch: Callable[..., list[tuple[str, float]]] | None = None,
 ) -> tuple[list[tuple[str, float]], str]:
     """Fetch native-currency-to-reporting-currency closes from Yahoo Finance.
 
@@ -432,6 +433,9 @@ def fetch_fx_to_reporting_yfinance(
     direct HKD=X or KRW=X quote for USD -> HKD or USD -> KRW. A pair with no
     USD side (for example TWD -> HKD) goes through USD: native -> USD times
     USD -> reporting, on the days both quotes exist. No other pairs are approved.
+
+    fetch, when given, answers in place of fetch_benchmark_yfinance (same arguments and
+    result): the crisis replays pass one that reads the quotes from silver instead.
     """
 
     native = from_currency.upper()
@@ -440,9 +444,9 @@ def fetch_fx_to_reporting_yfinance(
         raise ValueError("FX retrieval is unnecessary for identical currencies")
     if is_cross_pair(native, reporting):
         to_usd, native_symbol = fetch_fx_to_reporting_yfinance(
-            native, "USD", start_date, end_date, ticker_factory)
+            native, "USD", start_date, end_date, ticker_factory, fetch)
         from_usd, reporting_symbol = fetch_fx_to_reporting_yfinance(
-            "USD", reporting, start_date, end_date, ticker_factory)
+            "USD", reporting, start_date, end_date, ticker_factory, fetch)
         second_leg = dict(from_usd)
         crossed = [(day, value * second_leg[day]) for day, value in to_usd if day in second_leg]
         if not crossed:
@@ -457,7 +461,7 @@ def fetch_fx_to_reporting_yfinance(
         )
     symbol = FX_TICKERS[reporting] if direct_quote else FX_TICKERS[native]
     quote_currency = reporting if direct_quote else native
-    direct = fetch_benchmark_yfinance(
+    direct = (fetch or fetch_benchmark_yfinance)(
         BenchmarkSpec(
             benchmark_id=f"USD{quote_currency}",
             symbol=symbol,

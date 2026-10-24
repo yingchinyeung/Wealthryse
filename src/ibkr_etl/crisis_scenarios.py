@@ -14,6 +14,10 @@ The Lehman window is the one the existing replay uses, 15 September 2008 to
 9 March 2009. That replay, its stored rows and the MS and T qualified replays
 are not changed by this module; these results are stored separately and are
 shown on the website. Internal/shareholder use only.
+
+Where the prices come from is CRISIS_PRICES_SOURCE (crisis_prices): off fetches
+from Yahoo while computing; silver fetches everything into silver first, then
+computes reading silver only.
 """
 from __future__ import annotations
 
@@ -24,11 +28,11 @@ import math
 from typing import Any, Callable, Iterable, Mapping
 
 from .crisis_replay import (
-    CRISIS_END, CRISIS_START, PROVIDER, PROXY_BY_CURRENCY, PROXY_BY_SYMBOL, RAW_FEED,
-    _execute, _fx_rate_as_of, fetch_adjusted_history, resolve_holdings_as_of,
+    CRISIS_END, CRISIS_START, PROVIDER, PROXY_BY_CURRENCY, PROXY_BY_SYMBOL,
+    _execute, _fx_rate_as_of, resolve_holdings_as_of,
 )
-from . import publish_gate
-from .provisional_benchmark import convert_levels_to_reporting_currency, fetch_fx_to_reporting_yfinance
+from . import crisis_prices, publish_gate
+from .provisional_benchmark import convert_levels_to_reporting_currency
 from .sector_classification import candidate_symbols
 from .util import canonical_json, utc_now_iso
 
@@ -144,18 +148,24 @@ def combine(weights: Mapping[str, float], paths: Mapping[str, list[float]], cale
 
 
 class Prices:
-    """Yahoo Finance closes and FX, fetched once per symbol and window."""
+    """Closes and FX, asked for once per symbol and window: from Yahoo Finance (crisis_prices.Yahoo, the
+    default) or from silver (crisis_prices.Silver)."""
 
-    def __init__(self, ticker_factory: Callable[[str], Any] | None = None, cache: dict | None = None):
+    def __init__(self, ticker_factory: Callable[[str], Any] | None = None, cache: dict | None = None,
+                 source: Any = None):
         self.ticker_factory = ticker_factory
         self.cache = cache if cache is not None else {}
+        self.source = source if source is not None else crisis_prices.Yahoo(ticker_factory)
+        # The currency each ticker trades in, as the calculation assumes it; stored with silver's rows.
+        self.currency_of = {**{symbol: currency for symbol, currency in HEDGES.values()}, **STAND_IN_CURRENCY}
 
     def history(self, symbol: str, start: date, end: date) -> dict[str, float]:
         key = ("price", symbol, start.isoformat(), end.isoformat())
         if key not in self.cache:
             try:
-                self.cache[key] = fetch_adjusted_history(symbol, self.ticker_factory, start_date=start,
-                                                         end_date=end, capture_feed=RAW_FEED)
+                self.cache[key] = self.source.adjusted(symbol, start, end, self.currency_of.get(symbol, "USD"))
+            except crisis_prices.NotInSilver:
+                raise
             except Exception:  # an unknown or delisted ticker has no history, nothing more
                 self.cache[key] = {}
         return self.cache[key]
@@ -163,10 +173,11 @@ class Prices:
     def fx(self, native: str, reporting: str, start: date, end: date) -> list[tuple[str, float]]:
         key = ("fx", native, reporting, start.isoformat(), end.isoformat())
         if key not in self.cache:
-            self.cache[key], _ = fetch_fx_to_reporting_yfinance(native, reporting, start, end, self.ticker_factory)
+            self.cache[key], _ = self.source.fx(native, reporting, start, end)
         return self.cache[key]
 
     def in_currency(self, symbol: str, native: str, reporting: str, start: date, end: date) -> dict[str, float]:
+        self.currency_of.setdefault(symbol, native)
         series = self.history(symbol, start, end)
         if not series or native == reporting:
             return series
@@ -470,17 +481,17 @@ def load(connection, subject_id: str, *, as_of: str | None = None, tenant_id: st
 # Refresh ---------------------------------------------------------------------------------
 
 
-def refresh(connection, *, accounts: Iterable[str], composites: Iterable[str],
-            ticker_factory: Callable[[str], Any] | None = None) -> dict[str, Any]:
-    """Accounts first, then composites (sleeves before the composites that hold them).
+def _walk(connection, accounts: list[str], composites: list[str], prices: Prices,
+          keep: Callable[[Mapping[str, Any]], None] | None) -> tuple[dict[str, Mapping[str, Any]], dict[str, str]]:
+    """Accounts first, then composites (sleeves before the composites that hold them). keep stores and
+    commits each result; without it nothing is stored (the fetch step).
 
     One subject's failure is recorded and never stops the others.
     """
 
-    prices = Prices(ticker_factory)
     done: dict[str, Mapping[str, Any]] = {}
     failures: dict[str, str] = {}
-    composite_ids = set(composites)
+    account_ids, composite_ids = set(accounts), set(composites)
 
     def run(subject_id: str, stack: tuple[str, ...] = ()) -> Mapping[str, Any]:
         if subject_id in done:
@@ -496,17 +507,11 @@ def refresh(connection, *, accounts: Iterable[str], composites: Iterable[str],
             result = account_scenarios(connection, subject_id, prices)
         else:
             raise RuntimeError(f"{subject_id} is not approved for crisis-period price retrieval")
-        store(connection, result)
-        # The publish gate (off by default). In enforce a failing version is rolled back and
-        # recorded below as this subject's failure; load() then shows the previous one.
-        publish_gate.before_commit(connection, {"gold.crisis_scenario_results": {
-            "subject_id": result["subject_id"], "holdings_as_of": result["holdings_as_of"],
-            "calculation_version": VERSION}}, writer="crisis_scenarios")
-        connection.commit()
+        if keep is not None:
+            keep(result)
         done[subject_id] = result
         return result
 
-    account_ids = set(accounts)
     for subject_id in [*sorted(account_ids), *sorted(composite_ids)]:
         if subject_id in done:
             continue
@@ -515,7 +520,41 @@ def refresh(connection, *, accounts: Iterable[str], composites: Iterable[str],
         except Exception as error:  # recorded per subject; never fails the caller's job
             connection.rollback()
             failures[subject_id] = " ".join(str(error).split())[:300]
-    return {"version": VERSION, "subjects": {k: {"holdings_as_of": v["holdings_as_of"],
-                                                 "available": sum(1 for s in v["scenarios"] if s["available"])}
-                                             for k, v in done.items()},
-            "failures": failures}
+    return done, failures
+
+
+def refresh(connection, *, accounts: Iterable[str], composites: Iterable[str],
+            ticker_factory: Callable[[str], Any] | None = None, source: str | None = None) -> dict[str, Any]:
+    """Every approved subject's scenarios, stored. source (default CRISIS_PRICES_SOURCE) is off, prices
+    fetched from Yahoo while computing, or silver: the fetch step first, then a calculation from silver only."""
+
+    accounts, composites = list(accounts), list(composites)
+    chosen = crisis_prices.mode({crisis_prices.SOURCE_ENV: source} if source else None)
+
+    def keep(result: Mapping[str, Any]) -> None:
+        store(connection, result)
+        # The publish gate (off by default). In enforce a failing version is rolled back and
+        # recorded as this subject's failure; load() then shows the previous one.
+        publish_gate.before_commit(connection, {"gold.crisis_scenario_results": {
+            "subject_id": result["subject_id"], "holdings_as_of": result["holdings_as_of"],
+            "calculation_version": VERSION}}, writer="crisis_scenarios")
+        connection.commit()
+
+    silver = step = None
+    if chosen == "silver":
+        fetched = crisis_prices.Yahoo(ticker_factory, keep=True)
+        step = crisis_prices.fetch_into_silver(
+            connection, fetched, lambda: _walk(connection, accounts, composites, Prices(source=fetched), None),
+            writer="crisis_scenarios")
+        silver = crisis_prices.Silver(connection, fetched, raised_is_empty=True)
+        prices = Prices(source=silver)
+    else:
+        prices = Prices(ticker_factory)
+    done, failures = _walk(connection, accounts, composites, prices, keep)
+    summary = {"version": VERSION, "subjects": {k: {"holdings_as_of": v["holdings_as_of"],
+                                                    "available": sum(1 for s in v["scenarios"] if s["available"])}
+                                                for k, v in done.items()},
+               "failures": failures}
+    if step is not None:
+        summary["prices"] = crisis_prices.log(step, silver)
+    return summary

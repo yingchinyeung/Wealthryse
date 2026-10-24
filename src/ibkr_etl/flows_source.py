@@ -17,8 +17,16 @@ FLOWS_SOURCE (docs/MEDALLION_ARCHITECTURE.md, "Flows from silver"):
   on every date: the same dates, and on each date the same amount per currency (summed
   exactly), with the base-currency total within a cent. Otherwise bronze is used and one
   line is logged, ``FLOWS_SOURCE {json}`` with the masked subject and counts only.
-- on: silver only. Not before two clean month-ends in fallback. Without silver.transfers
-  (migration 084) it reads bronze and logs why, so a transfer is never left out.
+- on: silver only, except in the month-end check below. Not before two clean month-ends in
+  fallback. Without silver.transfers (migration 084) it reads bronze and logs why, so a
+  transfer is never left out.
+
+The month-end check. On days 1 to 7 of each month in Hong Kong (MONTH_END_DAYS), when the
+month just closed is reported and frozen, on reads bronze beside silver and keeps bronze
+wherever the two differ, exactly as fallback does, and its lines carry "guard":"month_end".
+So a difference found at a month-end goes into no frozen figure, and any line where a reader
+kept bronze raises the alert in infra/staging-flows-source-alert.bicep. The jobs that freeze
+a month's figures stay on fallback whatever the others run.
 
 How silver holds the same flows. The loader writes each CashTransactions record to bronze
 flex_rows and to silver cash_transactions in the same loop, under the parser's key:
@@ -61,6 +69,7 @@ import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Mapping
 
 FLOWS_SOURCE_ENV = "FLOWS_SOURCE"
@@ -75,6 +84,12 @@ MONEY_TOLERANCE = 0.005
 # Why a date differs, checked in this order.
 KINDS = ("transfers_not_in_silver", "transfer_differs", "only_in_bronze", "only_in_silver", "currency_differs",
          "amount_differs")
+
+# The month-end check: on compares with bronze on these days of each month in Hong Kong,
+# which keeps no daylight saving.
+MONTH_END_DAYS = 7
+HONG_KONG = timezone(timedelta(hours=8))
+MONTH_END_GUARD = "month_end"
 
 # (source, date, currency, amount, base amount): source is "cash" or "transfer"; a cash
 # transaction's amount is in its currency, a transfer's is its base amount.
@@ -114,6 +129,19 @@ def mode(environ: Mapping[str, str] | None = None) -> tuple[str, str | None]:
     if value in (FALLBACK, ON):
         return value, None
     return OFF, "unknown_setting"
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def month_end_window(now: datetime | None = None) -> bool:
+    """True on days 1 to MONTH_END_DAYS of a month in Hong Kong, when the month just closed
+    is reported and frozen."""
+    moment = _now() if now is None else now
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(HONG_KONG).day <= MONTH_END_DAYS
 
 
 def selected_mode(environ: Mapping[str, str] | None = None, out: Callable[[str], None] | None = None) -> str:
@@ -246,12 +274,16 @@ def external_flows(connection: Any, account_id: str, *, subject_type: str | None
         subject_type = subject_type_of(connection, account_id)
     if subject_type in DERIVED_TYPES:
         return _bronze_external_flows(connection, account_id, subject_type=subject_type)
+    guard: dict[str, str] = {}
     if selected == ON:
         if not _guarded(connection, lambda: has_transfers_table(connection)):
             # Silver would leave every transfer out: today's figure instead, and say why.
             _log(out, decision="bronze", reason="no_silver_transfers", subject=_mask(account_id), mode=selected)
             return _bronze_external_flows(connection, account_id, subject_type=subject_type)
-        return silver_external_flows(connection, account_id)
+        if not month_end_window():
+            return silver_external_flows(connection, account_id)
+        # The month-end check: compare with bronze as fallback does.
+        guard = {"guard": MONTH_END_GUARD}
     bronze_records: list[FlowRecord] = []
     bronze = _bronze_external_flows(connection, account_id, subject_type=subject_type, records=bronze_records)
     silver_records: list[FlowRecord] = []
@@ -259,13 +291,13 @@ def external_flows(connection: Any, account_id: str, *, subject_type: str | None
         silver = _guarded(connection, lambda: silver_external_flows(connection, account_id, records=silver_records))
     except Exception as error:  # noqa: BLE001 - silver unreadable: keep today's figure
         _log(out, decision="bronze", reason="silver_unreadable", subject=_mask(account_id), mode=selected,
-             error=type(error).__name__)
+             error=type(error).__name__, **guard)
         return bronze
     result = compare(bronze, bronze_records, silver, silver_records)
     if result.equal:
         return silver
     _log(out, decision="bronze", reason="silver_differs", subject=_mask(account_id), mode=selected,
-         dates_differing=result.dates_differing, kinds=dict(result.kinds))
+         dates_differing=result.dates_differing, kinds=dict(result.kinds), **guard)
     return bronze
 
 

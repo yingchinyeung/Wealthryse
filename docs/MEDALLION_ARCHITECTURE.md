@@ -16,7 +16,7 @@ applied. Each stage is approved separately (see "Stages" below).
 |---|---|---|
 | Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, Kiwoom REST answers (from migration 082), live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
 | Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmark prices, FX closes, risk-free rates), sectors, derived and composite portfolios | Each table's `source` in the catalog says how it is rebuilt: `ibkr` tables from bronze (v2's own Flex pull from the switch on; v1.1's history from its archived statements), `market-data` tables once their raw responses are kept in bronze (from S3b), `derived` tables from other silver tables. A record IBKR re-sends replaces the earlier one here; every version stays in the raw statement files. |
-| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: the benchmark comparison reads bronze `flex_rows` for cash flows, and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
+| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: return figures still read deposits and withdrawals from bronze `flex_rows` as well as silver, and use bronze wherever the two differ (`FLOWS_SOURCE=fallback` since 24 Oct 2026), and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
 | Ops | Runs, approvals, audit, access, onboarding workflow, configuration and hand-maintained settings (subjects, benchmark list and mapping, metric catalogue), agent state | Control plane, not a data layer. Stays in `public`. |
 | Platform | `tenants`, `schema_migrations`, row-level security helpers | Stays in `public`. |
 
@@ -429,9 +429,34 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
     `FLOWS_SOURCE {"dates_differing":1,"decision":"bronze","kinds":{"transfers_not_in_silver":1},"mode":"fallback","reason":"silver_differs","subject":"u…01"}`
     (`reason` is `silver_differs` or `silver_unreadable`; counts and masked subjects only). To
     read them: `ContainerAppConsoleLogs_CL | where Log_s startswith 'FLOWS_SOURCE '`.
-  - `on`: silver only. Not before two clean month-ends in `fallback`. Without
-    `silver.transfers` it reads bronze and logs `no_silver_transfers`, so a transfer is never
-    left out.
+  - `on`: silver only, except in the month-end check below. Not before two clean month-ends
+    in `fallback`. Without `silver.transfers` it reads bronze and logs `no_silver_transfers`,
+    so a transfer is never left out.
+- **The month-end check.** On days 1 to 7 of each month in Hong Kong, when the month just
+  closed is reported and frozen, `on` reads bronze beside silver and keeps bronze wherever the
+  two differ, exactly as `fallback` does, and its lines add `"guard":"month_end"`. So a
+  difference found at a month-end goes into no frozen figure. The jobs that freeze a month's
+  figures (the certified build, the month-end factsheet and the report snapshot) stay on
+  `fallback` whatever the others run, which also covers a month reported after the 7th.
+- **The alert.** `infra/staging-flows-source-alert.bicep` deploys
+  `ibkrv2stg-flows-source-kept-bronze`, a log alert to `ibkrv2stg-alerts` on any
+  `FLOWS_SOURCE` line where a reader kept bronze, by job or app and reason, checked every 15
+  minutes. It shows no subject or value. In `fallback` it is how a difference is noticed the
+  day it shows, and two clean month-ends means no alert across each.
+- **Live:** `fallback` since 24 Oct 2026 02:19 UTC on the website and the five jobs that build
+  return figures (the certified build, derived-daily, benchmark-daily, crisis-scenarios-daily
+  and the month-end factsheet), with no image changed. A read-only comparison just before found
+  every account equal in silver and bronze, so no figure changed. The onboarding analytics and
+  render jobs and the report snapshot job stay unset until they run an image with the switch.
+  `silver.transfers` (084) since 02:56 UTC the same day: applied alone, filled from bronze (no
+  Transfers rows yet, so nothing to copy), and compared again, 4 of 4 accounts matching.
+  `ibkrv2stg-institutional-daily` runs main-397d77a, so its daily load writes IBKR transfers to
+  silver as well as bronze. The readers keep their older images, which read no transfers from
+  silver, so until each runs 397d77a or later `fallback` keeps bronze, with one log line, for
+  any account that has a transfer. `ibkrv2stg-flex-discovery` still writes transfers to bronze
+  only, which `fallback` reads as `transfers_not_in_silver`.
+  `on` waits for two clean month-ends (31 Oct and 30 Nov), images with the month-end check on
+  every reader, and the alert deployed.
 - **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to
   `silver.cash_transactions` in the same loop, under the parser's key. The daily 14-day
   re-send updates the same row in both; a correction under the same key overwrites both; a
@@ -559,6 +584,11 @@ resources" for one tag. They reported only (`DoNotEnforce`) from 19 Oct 2026.
 - **Not affected:** job starts and executions, data in the database or storage, Key Vault
   secrets, role assignments and storage containers. The rule is Indexed, so it checks only
   resource types that carry tags and a location.
+- **Run Commands on the build VM** are resources too, so each one the image builds and
+  `deploy/website_release.py` create carries the VM's own `layer`, `component` and `owner`,
+  and nothing is run when the VM lacks one. The first image build after the switch was
+  refused for this (24 Oct 2026 02:30 UTC) and changed nothing. `az vm run-command invoke`
+  is an action, not a resource, and is not checked.
 - **Checked** by validation only: an untagged throwaway identity was refused and a tagged one
   accepted, and neither was created.
 - **Undo:** the three rules back on `DoNotEnforce` with no exclusions, as saved before the

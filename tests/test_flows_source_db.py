@@ -23,7 +23,7 @@ import os
 import tempfile
 import unittest
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,7 +33,7 @@ from ibkr_etl.config import Settings
 from ibkr_etl.db import PostgresConnection, _hybrid_row_factory
 from ibkr_etl.provisional_benchmark import _bronze_external_flows, _external_flows
 from ibkr_etl.service import ingest_content
-from test_flows_source import ACCOUNT, FIRST, OTHER, daily_statements, standard_cash, transfer
+from test_flows_source import ACCOUNT, FIRST, MID_MONTH, OTHER, daily_statements, standard_cash, transfer
 
 ADMIN_DSN = os.environ.get("AGENT_TEST_PG_ADMIN_DSN", "")
 TENANT, OTHER_TENANT = layers.TENANT, layers.OTHER_TENANT
@@ -105,6 +105,12 @@ class FlowsSourceDbTests(unittest.TestCase):
         emitter = patch.object(flows_source, "emit", self.lines.append)
         emitter.start()
         self.addCleanup(emitter.stop)
+        self.at(MID_MONTH)
+
+    def at(self, moment):
+        clock = patch.object(flows_source, "_now", return_value=moment)
+        clock.start()
+        self.addCleanup(clock.stop)
 
     @contextlib.contextmanager
     def read_only(self, user: str = layers.OWNER):
@@ -189,6 +195,17 @@ class FlowsSourceDbTests(unittest.TestCase):
                                           "reason": "silver_unreadable", "subject": "u…01"}])
         with self.read_only(READER) as (_raw, connection), self.assertRaises(Exception):
             self.flows(connection, ACCOUNT, "on")
+
+    def test_the_month_end_check_keeps_bronze_and_the_transaction(self):
+        self.at(datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc))
+        with self.without_silver_transfers() as (raw, connection):
+            bronze = _bronze_external_flows(connection, OTHER)
+            self.assertEqual(self.flows(connection, OTHER, "on"), bronze)
+        with self.read_only(READER) as (raw, connection):
+            self.assertEqual(self.flows(connection, ACCOUNT, "on"), _bronze_external_flows(connection, ACCOUNT))
+            self.assertEqual(raw.info.transaction_status.name, "INTRANS")
+        self.assertEqual([(line["reason"], line.get("guard"), line["mode"]) for line in self.logged()],
+                         [("silver_differs", "month_end", "on"), ("silver_unreadable", "month_end", "on")])
 
     def test_the_website_reader_goes_through_the_switch(self):
         from ibkr_etl import web

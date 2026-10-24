@@ -442,7 +442,8 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   `ibkrv2stg-flows-source-kept-bronze`, a log alert to `ibkrv2stg-alerts` on any
   `FLOWS_SOURCE` line where a reader kept bronze, by job or app and reason, checked every 15
   minutes. It shows no subject or value. In `fallback` it is how a difference is noticed the
-  day it shows, and two clean month-ends means no alert across each.
+  day it shows, and two clean month-ends means no alert across each. On since 24 Oct 2026
+  03:17 UTC (deployment `flows-source-alert-a3a91aa`, from main a3a91aa).
 - **Live:** `fallback` since 24 Oct 2026 02:19 UTC on the website and the five jobs that build
   return figures (the certified build, derived-daily, benchmark-daily, crisis-scenarios-daily
   and the month-end factsheet), with no image changed. A read-only comparison just before found
@@ -455,8 +456,8 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   silver, so until each runs 397d77a or later `fallback` keeps bronze, with one log line, for
   any account that has a transfer. `ibkrv2stg-flex-discovery` still writes transfers to bronze
   only, which `fallback` reads as `transfers_not_in_silver`.
-  `on` waits for two clean month-ends (31 Oct and 30 Nov), images with the month-end check on
-  every reader, and the alert deployed.
+  `on` waits for two clean month-ends (31 Oct and 30 Nov) and images with the month-end check
+  on every reader that goes to `on`; the alert is on.
 - **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to
   `silver.cash_transactions` in the same loop, under the parser's key. The daily 14-day
   re-send updates the same row in both; a correction under the same key overwrites both; a

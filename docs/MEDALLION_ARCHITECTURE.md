@@ -628,6 +628,12 @@ resources" for one tag. They reported only (`DoNotEnforce`) from 19 Oct 2026.
   compare their tags exactly, Smart Detection, trial leftovers and `ibkrv2stg-agent-dispatcher`
   (its Bicep now carries the tags). They can be changed as before. Tagging one and dropping
   it from the exclusions is a later step for its owner.
+- **Exact tag checks.** The code that checks a whole tag map (the metadata monitor's release,
+  the cost workbook, the operational and secret-metadata findings alerts and the secret-metadata
+  job and identity) accepts each resource either as before or with exactly the extra tags that
+  `src/ibkr_etl/medallion_tags.py` names for it, and the deploys of the workbook and both alerts
+  write them. `infra/platform-schedule-watchdogs.bicep` carries `layer`, `component` and `owner`
+  for the schedule watchdogs.
 - **Not affected:** job starts and executions, data in the database or storage, Key Vault
   secrets, role assignments and storage containers. The rule is Indexed, so it checks only
   resource types that carry tags and a location.

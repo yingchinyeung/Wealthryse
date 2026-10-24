@@ -21,7 +21,8 @@ _RULES = {
         r"dividends?|inflows?|outflows?|contribut\w*|movers?|top \d+|biggest|largest|live|intraday|right now|"
         r"today'?s?|(this|last) (week|month|quarter|year)|how (did|have|has|is|are) (i|we|my \w+|the portfolio|"
         r"the account|it) (do|done|doing|perform\w*|gone)|how much of (the|my|this|our) (account|portfolio) is|"
-        r"up[- ]to[- ]date|last updated|how recent|fresh(ness)?|stale)\b", re.I),
+        r"up[- ]to[- ]date|last updated|how recent|fresh(ness)?|stale|news|headlines?|"
+        r"(market|exchange|trading) (hours|holiday|closure|closed|halt\w*|rule\w*|change\w*)|after[- ]market)\b", re.I),
     "risk": re.compile(
         r"\b(risk(s|y|ier|iest)?|volatil\w*|drawdowns?|sharpe|sortino|calmar|beta|alpha|value at risk|c?var|"
         r"expected shortfall|downside|tracking error|correlat\w*|regimes?|garch|outlook|forecast\w*|"

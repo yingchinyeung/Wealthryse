@@ -15,7 +15,12 @@ four checks that nothing recorded before this agent:
     the latest day and each month-end, and compared with IBKR's own NAV. Every
     break is explained: which side it is on (positions or cash) and its likely
     cause (a corporate action, a missing price, a missing FX rate, a
-    settlement), or "not found" when nothing in the data explains it.
+    settlement), or "not found" when nothing in the data explains it. A break
+    on the positions side that nothing loaded explains is checked against the
+    market changes the market news watch confirmed (trading hours, closing
+    prices, closures) on the account's markets, from the last day that
+    reconciled to the first that broke (supervisor/news_link.py); when none
+    fits, the watch is asked to search that market's news for the window.
 
 Arithmetic runs in code, in Decimal, on the stored values. The model only
 words the explanation of a break from the facts code found, and any number in
@@ -45,10 +50,12 @@ from ibkr_etl.security_master import (SecurityConflict, SecurityIdentifier, Secu
                                       new_security_key)
 
 from .month_team.agents import TeamModel, TeamModelError
+from .supervisor import markets as market_list
+from .supervisor import news_link
 
 LOGGER = logging.getLogger("wealthryse_agent.onboarding_reconcile")
 CHECK_IDS = ("holdings_and_cash_loaded", "transactions_loaded", "securities_mapped", "nav_reconciled")
-CAUSES = ("corporate_action", "missing_price", "missing_fx_rate", "settlement_timing", "not_found")
+CAUSES = ("corporate_action", "missing_price", "missing_fx_rate", "settlement_timing", "market_event", "not_found")
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
 _NUMBER = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
 
@@ -318,7 +325,9 @@ def _facts(row: Mapping[str, Any]) -> dict[str, Any]:
             "cash_value": _money(row["cash_value"], currency),
             "broker_cash": _money(row["broker_cash"], currency) if row["broker_cash"] is not None else None,
             "missing_fx": row["missing_fx"], "missing_price": row["missing_price"],
-            "corporate_actions": row["corporate_actions"], "settlements": row["settlements"]}
+            "corporate_actions": row["corporate_actions"], "settlements": row["settlements"],
+            "market_events": [{k: e[k] for k in ("market", "kind", "effective_date", "summary", "wording")}
+                              for e in row.get("market_events") or []]}
 
 
 def explanation_is_grounded(text: str, facts: Mapping[str, Any]) -> bool:
@@ -334,6 +343,8 @@ class BreakExplainer:
     def explain(self, row: Mapping[str, Any], usage: dict[str, int]) -> tuple[str, str, str]:
         """(cause, explanation, who worded it: agent or code)."""
         cause, text = _code_explanation(row)
+        if cause == "not_found" and row.get("market_events"):
+            cause, text = "market_event", str(row["market_events"][0]["wording"])
         facts = _facts(row)
         try:
             answer, used = self._model_factory().ask(name="nav_break", instructions=EXPLAIN_INSTRUCTIONS,
@@ -344,9 +355,46 @@ class BreakExplainer:
         for key, value in used.items():
             usage[key] = usage.get(key, 0) + int(value)
         wording = " ".join(str(answer.get("explanation") or "").split())[:600]
+        # A market change code matched to the break's window is evidence; "nothing explains it" can't overrule it.
+        if cause == "market_event" and answer.get("cause") == "not_found":
+            return cause, text, "code"
         if answer.get("cause") in CAUSES and wording and explanation_is_grounded(wording, facts):
             return str(answer["cause"]), wording, "agent"
         return cause, text, "code"
+
+
+def case_markets(overview: Mapping[str, Any], days: Sequence[Mapping[str, Any]] = ()) -> frozenset[str]:
+    """The markets the account's holdings trade on: listing exchange first, else currency."""
+    found = {market_list.market_for(exchange=s.get("listing_exchange"),
+                                    currency=s.get("currency") or s.get("position_currency"))
+             for s in overview.get("securities") or []}
+    found |= {market_list.market_for(currency=p.get("currency")) for d in days for p in d.get("positions") or []}
+    return frozenset(m for m in found if m)
+
+
+def market_context(rows: Sequence[dict[str, Any]], events: Sequence[Mapping[str, Any]], held: frozenset[str],
+                   unexplained: Callable[[news_link.Issue, list], Any] | None = None, *, ref: str | None = None) -> None:
+    """Attach to each positions-side break the market events that could explain it (``row["market_events"]``).
+
+    The window runs from the last checked day that reconciled to the break day. A break with no
+    event is passed to ``unexplained`` so the market news watch can search that window.
+    """
+    if not held:
+        return
+    last_right: str | None = None
+    for row in sorted(rows, key=lambda r: r["date"]):
+        if not row["side"]:
+            last_right = row["date"]
+            continue
+        if row["side"] == "cash":
+            continue
+        issue = news_link.Issue("valuation_gap", held, date.fromisoformat(row["date"]),
+                                date.fromisoformat(last_right) if last_right else None, ref=ref)
+        links = news_link.link(issue, events)
+        row["market_events"] = [l.as_dict() for l in links[:3]]
+        if not links and unexplained is not None and not (row["missing_fx"] or row["missing_price"]
+                                                          or row["corporate_actions"] or row["settlements"]):
+            unexplained(issue, links)
 
 
 def nav_check(rows: Sequence[Mapping[str, Any]], explainer: BreakExplainer, usage: dict[str, int], *,
@@ -363,6 +411,8 @@ def nav_check(rows: Sequence[Mapping[str, Any]], explainer: BreakExplainer, usag
             cause, explanation, worded_by = explainer.explain(row, usage)
             entry.update(cause=cause, explanation=explanation, worded_by=worded_by,
                          severity="fail" if abs(row["gap_pct"]) > settings.fail_pct else "warn")
+            if row.get("market_events"):
+                entry["market_events"] = row["market_events"]
             breaks.append({**entry, "_pct": abs(row["gap_pct"])})
         days.append(entry)
     evidence = {"days": days, "method": "positions at IBKR's mark value plus cash, each in the base currency at "
@@ -404,15 +454,20 @@ def data_digest(overview: Mapping[str, Any], days: Sequence[Mapping[str, Any]], 
 
 
 class Reconciler:
-    def __init__(self, model: Callable[[], TeamModel], settings: ReconcileSettings = ReconcileSettings()) -> None:
+    def __init__(self, model: Callable[[], TeamModel], settings: ReconcileSettings = ReconcileSettings(), *,
+                 unexplained: Callable[[news_link.Issue, list], Any] | None = None) -> None:
         self.settings = settings
         self.explainer = BreakExplainer(model)
+        # Asks the market news watch to search a window no stored event explains.
+        self.unexplained = unexplained
 
     def gather(self, call: Callable[[str, dict], dict], case_id: str) -> tuple[dict, list[dict]]:
         overview = call("get_onboarding_broker_overview", {"case_id": case_id})["data"]
-        days = [call("get_onboarding_broker_day", {"case_id": case_id, "date": day})["data"]
-                for day in reconciliation_days(overview, self.settings)]
-        return overview, days
+        dates = reconciliation_days(overview, self.settings)
+        days = [call("get_onboarding_broker_day", {"case_id": case_id, "date": day})["data"] for day in dates]
+        events = market_events_for(call, case_markets(overview, days), dates)
+        # Kept with the overview so the data digest changes, and the case is checked again, when a new event arrives.
+        return ({**overview, "market_events": events} if events else overview), days
 
     def reconcile(self, overview: Mapping[str, Any], days: Sequence[Mapping[str, Any]], *, today: date) -> Result:
         usage: dict[str, int] = {}
@@ -422,6 +477,8 @@ class Reconciler:
             base = str(totals[-1]["currency"]) if totals else ""
         securities, proposals = securities_check(overview)
         rows = [r for r in (rebuild(day, base, self.settings) for day in days) if r]
+        market_context(rows, overview.get("market_events") or [], case_markets(overview, days), self.unexplained,
+                       ref=f"onboarding:{overview['case'].get('case_id', '')}"[:120])
         checks = {
             "holdings_and_cash_loaded": holdings_check(overview, days[-1] if days else None, today=today,
                                                        settings=self.settings),
@@ -430,6 +487,27 @@ class Reconciler:
             "nav_reconciled": nav_check(rows, self.explainer, usage, settings=self.settings),
         }
         return Result(checks, proposals, usage)
+
+
+def market_events_for(call: Callable[[str, dict], dict], held: frozenset[str], dates: Sequence[str]) -> list[dict]:
+    """The stored market events on the account's markets over the checked days; empty when the tool is off."""
+    if not held or not dates:
+        return []
+    start = (date.fromisoformat(min(dates)) - timedelta(days=news_link.MAX_WINDOW_DAYS + news_link.LAG_DAYS))
+    end = date.fromisoformat(max(dates))
+    events: list[dict] = []
+    for market in sorted(market_list.related(held)):
+        cursor = start
+        while cursor <= end:
+            stop = min(end, cursor + timedelta(days=119))
+            try:
+                events += call("get_market_events", {"market": market, "from_date": cursor.isoformat(),
+                                                     "to_date": stop.isoformat()})["data"]["events"]
+            except Exception:
+                LOGGER.info("market events not read for %s", market)
+                return events
+            cursor = stop + timedelta(days=1)
+    return events
 
 
 class ReconciliationStore:

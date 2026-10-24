@@ -313,8 +313,33 @@ def _parse_time(value: Any) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+# How far before an incident began the market changes it is given start.
+MARKET_EVENT_DAYS = 10
+
+
+def market_source(call: Callable[[str, dict], dict], incident: Mapping[str, Any]) -> list[Source]:
+    """Market changes confirmed from the news around the incident's first day (get_market_events), when the tool is on.
+
+    A data check that fails on a day a market changed its hours, closed or changed its closing price is
+    explained by that change, not by the platform; the diagnosis sees both.
+    """
+    seen = _parse_time(incident.get("first_seen_at"))
+    last = _parse_time(incident.get("last_seen_at")) or seen
+    if seen is None:
+        return []
+    start = (seen - timedelta(days=MARKET_EVENT_DAYS)).date()
+    end = max(last.date(), start)
+    end = min(end, start + timedelta(days=119))
+    try:
+        events = call("get_market_events", {"from_date": start.isoformat(), "to_date": end.isoformat()})["data"]["events"]
+    except Exception:
+        return []
+    return [Source("market:events", "Stock market changes confirmed from the news (trading hours, closing prices, "
+                   "closures, halts, taxes) from 10 days before the incident began", redact(events[:40]))]
+
+
 def platform_sources(call: Callable[[str, dict], dict], incident: Mapping[str, Any]) -> list[Source]:
-    """The incident itself and the platform's recent runs, from the tool server."""
+    """The incident itself, the platform's recent runs and nearby market changes, from the tool server."""
     history = call("get_operations_history", {})["data"]
     return [
         Source("platform:incident", "The incident and the administrator's evidence", [redact(dict(incident))]),
@@ -323,7 +348,7 @@ def platform_sources(call: Callable[[str, dict], dict], incident: Mapping[str, A
                redact(history["admin_runs"][:40])),
         Source("platform:admin_actions", "The administrator's actions over the last 7 days",
                redact(history["admin_actions"][:20])),
-    ]
+    ] + market_source(call, incident)
 
 
 # Diagnosis ----------------------------------------------------------------------------------

@@ -26,7 +26,8 @@ DEPLOYMENTS = ("analyst", "reports", "none")
 #   staging  onboarding cases, loaded per case before an account goes live
 #   monitor  import runs, the administrator's runs and incidents, broker login checks
 #   code     no database: the Metrics guide and the calculator
-LAYERS = ("gold", "silver", "bronze", "staging", "monitor", "code")
+#   external public market news the market news watch confirmed (migrations/agent/023); no client data
+LAYERS = ("gold", "silver", "bronze", "staging", "monitor", "code", "external")
 TOOL_LAYERS = {
     "list_accounts": "silver",
     "get_holdings": "silver",
@@ -70,6 +71,7 @@ TOOL_LAYERS = {
     guide_tools.SEARCH: "code",
     guide_tools.DRIFT: "code",
     calculator.NAME: "code",
+    "get_market_events": "external",
 }
 
 # Every client analysis specialist may also use these; they say nothing about which area a question is in.
@@ -109,7 +111,7 @@ MEMBERS = (
     Member("planner", "client_analysis", "lead", "answer", "analyst", ()),
     _client("holdings_performance", "get_holdings", "get_holdings_changes", "get_performance",
             "compare_to_benchmark", "get_sector_allocation", "get_cash_flows", "get_nav_history",
-            "get_live_snapshot", today="website chat (one generalist)"),
+            "get_live_snapshot", "get_market_events", today="website chat (one generalist)"),
     _client("risk", "get_risk_metrics", "get_risk_outlook", "get_market_regimes", "get_factor_exposures",
             today="website chat (one generalist)"),
     _client("modelling", "project_wealth", "run_what_if", "optimise_portfolio", "run_stress_test",
@@ -161,6 +163,10 @@ MEMBERS = (
            today="guide_keeper job"),
     Member("incident_diagnosis", "operations", "specialist", "propose", "reports", jobs=("operations",),
            today="operations job"),
+    # Reads world stock market news hourly and keeps the market changes it can confirm (supervisor/market_news.py);
+    # news_link.py relates them to numbers that don't add up, for the onboarding and operations agents and chat.
+    Member("market_news", "operations", "specialist", "draft", "reports", ("get_market_events",),
+           jobs=("market_news",)),
     # New: says why a gold build was held. Its tools come with Medallion's monitor views.
     Member("gate_investigator", "operations", "specialist", "draft", "reports", ()),
 )

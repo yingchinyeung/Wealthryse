@@ -101,8 +101,8 @@ class SwitchesAreOffByDefaultTest(unittest.TestCase):
         self.assertEqual(certified_tools.served({certified_tools.PAGES_SETTING: "overview=on"}), {})
 
     def test_tool_lists_are_todays_for_people_and_every_job(self):
-        def today(job):  # the rule before the certified tools existed
-            return [t.name for t in TOOLS if t.name not in CERTIFIED and (not t.only_jobs or job in t.only_jobs)]
+        def today(job):  # the rule before switched tools (certified figures, market events) existed
+            return [t.name for t in TOOLS if t.switch is None and (not t.only_jobs or job in t.only_jobs)]
 
         for job in (None, "month_end_drafter", "operations", "guide_check"):
             self.assertEqual([t["name"] for t in tool_server.tool_list(job)], today(job), job)

@@ -122,6 +122,8 @@ TAGGED_LATER = [
     ("agent-foundation.bicep", "privateEndpoint", "foundation", "network"),
     ("agent-foundation.bicep", "zones", "foundation", "network"),
     ("agent-foundation.bicep", "zoneLinks", "foundation", "network"),
+    # The Container Apps environment, the last resource with Bicep that the rule excluded.
+    ("staging.bicep", "managedEnvironment", "foundation", "container-apps"),
 ]
 
 # In a tags expression: a `key: 'value'` pair, a lookup such as `medallionAlertTags[jobName]`,

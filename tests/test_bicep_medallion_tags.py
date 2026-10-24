@@ -40,6 +40,8 @@ MAPPING = [
     ("agent-foundation.bicep", "agentIdentity", "id-wr-agent"),
     ("agent-foundation.bicep", "toolsIdentity", "id-wr-agent-tools"),
     ("agent-foundation.bicep", "jobsIdentity", "id-wr-agent-jobs"),
+    ("agent-foundation.bicep", "foundry", "wr-agents-sea"),
+    ("agent-foundation.bicep", "project", "wr-agents-sea/wealthryse-agents"),
     ("staging.bicep", "workspace", "ibkrv2stg-logs"),
     ("staging.bicep", "registry", "ibkrv2stgauhecwc4itaoo"),
     ("staging.bicep", "storage", "ibkrv2stgauhecwc4itaoo"),
@@ -113,6 +115,13 @@ CATALOG_JOBS = json.loads((INFRA / "medallion" / "catalog.json").read_text(encod
 # (Bicep file, resource symbolic name, layer, component). The tag line writes the same values.
 TAGGED_LATER = [
     ("platform-schedule-watchdogs.bicep", "alerts", "ops", "alerts"),
+    # The network resources the tag rule excluded until they were tagged on 24 Oct 2026.
+    ("staging.bicep", "vnet", "foundation", "network"),
+    ("staging.bicep", "privateDnsZone", "foundation", "network"),
+    ("staging.bicep", "privateDnsLink", "foundation", "network"),
+    ("agent-foundation.bicep", "privateEndpoint", "foundation", "network"),
+    ("agent-foundation.bicep", "zones", "foundation", "network"),
+    ("agent-foundation.bicep", "zoneLinks", "foundation", "network"),
 ]
 
 # In a tags expression: a `key: 'value'` pair, a lookup such as `medallionAlertTags[jobName]`,

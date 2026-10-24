@@ -51,6 +51,14 @@ WEB_LAYER_STATEMENTS = (
     "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT ON TABLES TO {role}",
     "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT EXECUTE ON FUNCTIONS TO {role}",
 )
+# What the website's write login (the approval role) needs for self-service onboarding (085), by the
+# table that must exist first. tests/test_onboarding_worker_db.py runs the website's writes with exactly these.
+APPROVAL_ONBOARDING_GRANTS = (
+    ("public.onboarding_worker_runs", "GRANT SELECT, INSERT, UPDATE ON TABLE onboarding_worker_runs TO {}"),
+    ("public.onboarding_worker_runs",
+     "GRANT SELECT (tenant_id, entra_object_id, email, display_name, status) ON TABLE app_users TO {}"),
+    ("public.onboarding_worker_runs", "GRANT SELECT, INSERT ON TABLE user_account_access TO {}"),
+)
 # The approval login gets nothing schema-wide. Its named grants below reach the
 # public views, and mirror_privileges copies them onto the tables behind them.
 APPROVAL_LAYER_STATEMENTS = (
@@ -413,6 +421,12 @@ def main(argv: list[str] | None = None) -> int:
             connection.execute(sql.SQL(
                 "GRANT SELECT, INSERT ON TABLE broker_onboarding_events TO {}"
             ).format(sql.Identifier(approval_role)))
+            # Self-service onboarding (085): Run now and Check now write the worker's run requests, and
+            # the go-live form gives the ticked viewers read access (only adds rows; never changes or
+            # removes one).
+            for table, statement in APPROVAL_ONBOARDING_GRANTS:
+                if connection.execute("SELECT to_regclass(%s)", (table,)).fetchone()[0]:
+                    connection.execute(sql.SQL(statement).format(sql.Identifier(approval_role)))
             connection.execute(sql.SQL(
                 "GRANT SELECT ON TABLE qualified_report_designs, active_report_designs TO {}"
             ).format(sql.Identifier(approval_role)))

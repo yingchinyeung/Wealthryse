@@ -72,6 +72,12 @@ Contributor on the `internal-reports` container only, for the reports' review co
 (`infra/staging-web.bicep`). A start that Azure refuses leaves the request for the next scheduled
 run.
 
+The website writes through its approval login, which has no rights schema-wide. Bootstrap gives it
+`APPROVAL_ONBOARDING_GRANTS` (`scripts/bootstrap_postgres.py`) once 085 is in. That's SELECT, INSERT and UPDATE on
+`onboarding_worker_runs` for Run now and Check now. For viewer access at go-live it's SELECT on the five
+`app_users` columns the form lists and SELECT and INSERT on `user_account_access`: it can add read
+access and never change or remove a grant.
+
 ## Migration 085
 
 `migrations/postgres/085_onboarding_worker.sql`: the run records table, `benchmarks_json` and

@@ -7,11 +7,27 @@ Skipped otherwise. Creates and drops its own database and uses synthetic data on
 """
 from __future__ import annotations
 
+import sys
 import unittest
 import uuid
 from datetime import date, datetime, timezone
+from pathlib import Path
 
-from test_broker_onboarding_db import ADMIN_DSN, IDENTITY, OWNER_ROLE, TENANT, _dsn, _MigratedDatabase
+from test_broker_onboarding_db import ADMIN_DSN, IDENTITY, OWNER_ROLE, TEST_PASSWORD, TENANT, _dsn, _MigratedDatabase
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+WEBSITE_WRITER = "onboarding_worker_test_writer"
+# What scripts/bootstrap_postgres.py gives the website's write login (the approval role) for these
+# pages before 085; the 085 grants come from its APPROVAL_ONBOARDING_GRANTS.
+WRITER_BEFORE_085 = (
+    "GRANT USAGE ON SCHEMA public TO {role}",
+    "GRANT EXECUTE ON FUNCTION app_tenant_id() TO {role}",
+    "GRANT SELECT, INSERT, UPDATE ON TABLE broker_connections, broker_connection_accounts, broker_onboarding_cases, "
+    "broker_onboarding_checks, broker_onboarding_approvals, platform_subjects, app_user_roles TO {role}",
+    "GRANT SELECT, INSERT ON TABLE broker_onboarding_events TO {role}",
+    "GRANT INSERT ON TABLE audit_events TO {role}",
+    "GRANT USAGE, SELECT ON SEQUENCE audit_events_audit_event_id_seq TO {role}",
+)
 
 AFTER_CHAIN = datetime(2026, 10, 26, 10, 0, tzinfo=timezone.utc)
 IN_CHAIN = datetime(2026, 10, 26, 8, 30, tzinfo=timezone.utc)
@@ -222,6 +238,83 @@ class OnboardingWorkerDatabaseTests(_MigratedDatabase):
         levels = self.db.execute("SELECT entra_object_id, access_level FROM user_account_access "
                                  "WHERE subject_id = 'KIWOOM-5400000001'").fetchall()
         self.assertEqual([(row["entra_object_id"], row["access_level"]) for row in levels], [("viewer-one", "read")])
+
+
+    def test_the_website_login_can_do_run_now_and_viewer_access_with_the_bootstrap_grants(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        from ibkr_etl.onboarding_v2_web import OnboardingError, _grant_viewers, note_worker_start, request_worker_run
+
+        if str(SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(SCRIPTS))
+        from bootstrap_postgres import APPROVAL_ONBOARDING_GRANTS
+
+        case_id = self._start("5500000001")["case_id"]
+        self.db.execute("INSERT INTO platform_subjects (tenant_id, subject_id, subject_type, display_name, "
+                        "base_currency, reporting_currency, history_start_date, inception_date, lifecycle_status, "
+                        "metadata_json) VALUES (%s, 'KIWOOM-5500000001', 'physical_account', 'Synthetic', 'KRW', "
+                        "'KRW', '2025-01-02', '2025-01-02', 'active', '{}'::jsonb) ON CONFLICT DO NOTHING", (TENANT,))
+        self.db.execute("INSERT INTO app_users (tenant_id, entra_object_id, email, display_name, role_name, status, "
+                        "created_at, updated_at) VALUES (%s, 'viewer-five', 'viewer-five@example.com', 'Five', "
+                        "'viewer', 'active', '2026-01-01', '2026-01-01')", (TENANT,))
+        self.db.execute("INSERT INTO app_user_roles (tenant_id, entra_object_id, role_name, effective_from) "
+                        "VALUES (%s, 'viewer-five', 'viewer', '2026-01-01')", (TENANT,))
+        self.db.commit()
+        with psycopg.connect(_dsn(ADMIN_DSN, "postgres"), autocommit=True) as admin:
+            admin.execute(f"DROP ROLE IF EXISTS {WEBSITE_WRITER}")
+            admin.execute(f"CREATE ROLE {WEBSITE_WRITER} LOGIN PASSWORD '{TEST_PASSWORD}'")
+        self.addCleanup(self._drop_writer)
+        for statement in WRITER_BEFORE_085:
+            self.db.execute(statement.format(role=WEBSITE_WRITER))
+        self.db.commit()
+
+        def writer():
+            connection = psycopg.connect(_dsn(ADMIN_DSN, self.database, WEBSITE_WRITER), row_factory=dict_row,
+                                         options=f"-c app.tenant_id={TENANT}")
+            self.addCleanup(connection.close)
+            return connection
+
+        before = writer()
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            request_worker_run(before, TENANT, actor=IDENTITY, case_id=case_id)
+        before.rollback()
+        with self.assertRaisesRegex(OnboardingError, "cannot give viewers access"):
+            _grant_viewers(before, TENANT, "KIWOOM-5500000001", ["viewer-five"], IDENTITY)
+        before.close()
+
+        for _table, statement in APPROVAL_ONBOARDING_GRANTS:
+            self.db.execute(statement.format(WEBSITE_WRITER))
+        self.db.commit()
+        website = writer()
+        request = request_worker_run(website, TENANT, actor=IDENTITY, case_id=case_id)
+        note_worker_start(website, TENANT, request["run_id"], "ibkrv2stg-onboard-worker-abc", None)
+        self.assertEqual(request_worker_run(website, TENANT, actor=IDENTITY, case_id=case_id)["status"],
+                         "already_waiting")
+        self.assertEqual(_grant_viewers(website, TENANT, "KIWOOM-5500000001", ["viewer-five"], IDENTITY), 1)
+        website.commit()
+        # Read access only is added; the website login can never change or remove a grant.
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            website.execute("DELETE FROM user_account_access WHERE subject_id = 'KIWOOM-5500000001'")
+        website.rollback()
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            website.execute("UPDATE user_account_access SET access_level = 'write' "
+                            "WHERE subject_id = 'KIWOOM-5500000001'")
+        website.rollback()
+        website.close()
+        self.assertEqual(self.db.execute("SELECT execution_reference FROM onboarding_worker_runs WHERE run_id = %s",
+                                         (request["run_id"],)).fetchone()["execution_reference"],
+                         "ibkrv2stg-onboard-worker-abc")
+        self.db.rollback()
+
+    def _drop_writer(self):
+        import psycopg
+
+        self.db.rollback()
+        with psycopg.connect(_dsn(ADMIN_DSN, self.database), autocommit=True) as admin:
+            admin.execute(f"DROP OWNED BY {WEBSITE_WRITER}")
+        with psycopg.connect(_dsn(ADMIN_DSN, "postgres"), autocommit=True) as admin:
+            admin.execute(f"DROP ROLE IF EXISTS {WEBSITE_WRITER}")
 
 
 if __name__ == "__main__":

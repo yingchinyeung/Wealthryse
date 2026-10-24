@@ -16,7 +16,7 @@ applied. Each stage is approved separately (see "Stages" below).
 |---|---|---|
 | Bronze | IBKR Flex statements and their records, hand-off files, raw market-data responses, Kiwoom REST answers (from migration 082), live TWS snapshots, uploads (onboarding files and factsheet templates) | Append only, never edited. Data received from IBKR must not be modified, and the same applies to every source. |
 | Silver | Accounts, securities, trades, positions, cash, NAV, FX, parsed market data (prices, benchmark prices, FX closes, risk-free rates), sectors, derived and composite portfolios | Each table's `source` in the catalog says how it is rebuilt: `ibkr` tables from bronze (v2's own Flex pull from the switch on; v1.1's history from its archived statements), `market-data` tables once their raw responses are kept in bronze (from S3b), `derived` tables from other silver tables. A record IBKR re-sends replaces the earlier one here; every version stays in the raw statement files. |
-| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: the benchmark comparison reads bronze `flex_rows` for cash flows, and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
+| Gold | Performance and benchmark comparison, risk snapshots, crisis results, frozen report payloads | Built from silver. Month-end snapshots never change; risk and crisis tables are rebuilt daily. Known exceptions until S6 and S7: return figures still read deposits and withdrawals from bronze `flex_rows` as well as silver, and use bronze wherever the two differ (`FLOWS_SOURCE=fallback` since 24 Oct 2026), and the crisis jobs fetch prices while they compute. The website, renderers and agents read gold, plus the silver read contracts, and never bronze. The one exception is a page or agent reading back a file a person uploaded through it, such as a factsheet template. Each gold figure maps to an entry in the Metrics guide. |
 | Ops | Runs, approvals, audit, access, onboarding workflow, configuration and hand-maintained settings (subjects, benchmark list and mapping, metric catalogue), agent state | Control plane, not a data layer. Stays in `public`. |
 | Platform | `tenants`, `schema_migrations`, row-level security helpers | Stays in `public`. |
 
@@ -432,6 +432,13 @@ not affected. `ibkr_etl.flows_source` adds the silver reader and the switch.
   - `on`: silver only. Not before two clean month-ends in `fallback`. Without
     `silver.transfers` it reads bronze and logs `no_silver_transfers`, so a transfer is never
     left out.
+- **Live:** `fallback` since 24 Oct 2026 02:19 UTC on the website and the five jobs that build
+  return figures (the certified build, derived-daily, benchmark-daily, crisis-scenarios-daily
+  and the month-end factsheet), with no image changed. A read-only comparison just before found
+  every account equal in silver and bronze, so no figure changed. The onboarding analytics and
+  render jobs and the report snapshot job stay unset until they run an image with the switch.
+  `on` waits for two clean month-ends (31 Oct and 30 Nov) and a check before each month-end
+  build that falls back to bronze for any account whose silver differs.
 - **What silver holds.** The loader writes each CashTransactions record to `flex_rows` and to
   `silver.cash_transactions` in the same loop, under the parser's key. The daily 14-day
   re-send updates the same row in both; a correction under the same key overwrites both; a

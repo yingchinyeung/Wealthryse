@@ -62,7 +62,7 @@ resource workspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
 resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   name: vnetName
   location: location
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'network' })
   properties: {
     addressSpace: {
       addressPrefixes: [
@@ -105,14 +105,14 @@ resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
 resource privateDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' = {
   name: privateDnsZoneName
   location: 'global'
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'network' })
 }
 
 resource privateDnsLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2020-06-01' = {
   parent: privateDnsZone
   name: '${prefix}-dns-link'
   location: 'global'
-  tags: tags
+  tags: union(tags, { layer: 'foundation', component: 'network' })
   properties: {
     registrationEnabled: false
     virtualNetwork: {

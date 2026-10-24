@@ -634,6 +634,11 @@ resources" for one tag. They reported only (`DoNotEnforce`) from 19 Oct 2026.
   `src/ibkr_etl/medallion_tags.py` names for it, and the deploys of the workbook and both alerts
   write them. `infra/platform-schedule-watchdogs.bicep` carries `layer`, `component` and `owner`
   for the schedule watchdogs.
+- **Network Bicep.** `infra/staging.bicep` (the vnet, the Postgres private DNS zone and its
+  link) and `infra/agent-foundation.bicep` (the agents' private endpoint, its three DNS zones
+  and links) set `layer: 'foundation'` and `component: 'network'` on top of their `tags`, and
+  the Foundry account and project `layer: 'ai'` and `component: 'ai-models'`, so a redeploy
+  keeps the tags those resources carry and the rule accepts it.
 - **Not affected:** job starts and executions, data in the database or storage, Key Vault
   secrets, role assignments and storage containers. The rule is Indexed, so it checks only
   resource types that carry tags and a location.

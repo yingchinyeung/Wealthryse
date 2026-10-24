@@ -90,3 +90,38 @@ class NoBenchmarkContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LogSummaryTests(unittest.TestCase):
+    """The console line goes to Log Analytics: keys, dates, counts and statuses, never figures or full ids."""
+
+    def test_the_console_gets_no_metric_values_or_full_account_ids(self):
+        result = {
+            "status": "success", "benchmark_observations": 40, "crisis_replay_observations": 3,
+            "account_ids": ["U16088571", "KIW1234567810"],
+            "accounts": [{
+                "account_id": "KIW1234567810", "quality_status": "warn", "benchmark_observations": 40,
+                "comparison_rows": 20, "crisis_replay": {"observations": 3, "loss": -0.1234},
+                "benchmarks": [{
+                    "benchmark_id": "GSPC", "mapping_type": "primary", "available": True, "quality_status": "warn",
+                    "quality_issues": [{"check_id": "freshness", "status": "fail", "message": "x"},
+                                       {"check_id": "gaps", "status": "warn", "message": "y"}],
+                    "benchmark_observations": 40, "comparison_rows": 20, "latest_benchmark_date": "2026-10-23",
+                    "metrics": {"period_end": "2026-10-23", "portfolio_total_return": 0.0812345,
+                                "beta": 1.04321},
+                }],
+            }],
+            "crisis_scenarios": {"status": "success", "subjects": {"KIW1234567810": {"loss": -0.2222}}},
+            "held_back_by_publish_gate": [{"account_id": "U16088571", "reason": "held for U16088571: drift"}],
+        }
+        line = __import__("json").dumps(_job().log_summary(result))
+        for secret in ("16088571", "1234567810", "0.0812345", "1.04321", "-0.1234", "-0.2222"):
+            self.assertNotIn(secret, line)
+        summary = _job().log_summary(result)
+        subject = summary["subjects"][0]
+        self.assertEqual((subject["subject"], subject["crisis_replay_observations"]), ("***810", 3))
+        self.assertEqual(subject["benchmarks"][0]["failed_checks"], ["freshness"])
+        self.assertEqual(subject["benchmarks"][0]["period_end"], "2026-10-23")
+        self.assertEqual(summary["crisis_scenarios"], {"status": "success", "subjects": 1})
+        self.assertEqual(summary["held_back_by_publish_gate"],
+                         [{"subject": "***571", "kind": "publish_gate", "reason": "held for ***571: drift"}])

@@ -146,7 +146,8 @@ class OnboardingWorkerDatabaseTests(_MigratedDatabase):
         self.assertEqual((first["status"], again["status"], again["run_id"]),
                          ("requested", "already_waiting", first["run_id"]))
         self.db.commit()
-        waiting = case_detail(self.db, TENANT, case_id)["platform_work"]
+        # A fixed time after the daily chain, so the check passes at any hour (the chain plans nothing).
+        waiting = case_detail(self.db, TENANT, case_id, now=AFTER_CHAIN)["platform_work"]
         self.assertEqual(waiting["waiting"]["status"], "requested")
         self.assertIn("Kiwoom load and history", waiting["run_now_does"])
         self.db.rollback()

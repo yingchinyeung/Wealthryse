@@ -956,7 +956,7 @@ def cancel_case(connection, tenant_id: str, case_id: str, *, reason: str, actor:
     return {"case_id": case_id, "status": "cancelled"}
 
 
-def case_detail(connection, tenant_id: str, case_id: str) -> dict:
+def case_detail(connection, tenant_id: str, case_id: str, *, now: datetime | None = None) -> dict:
     row, checks, approvals, case = _load_case(connection, tenant_id, case_id)
     by_id = {str(item["check_id"]): item for item in checks}
     account_display = _display(case)
@@ -1034,7 +1034,7 @@ def case_detail(connection, tenant_id: str, case_id: str) -> dict:
     if design and design.get("owner_action") and detail["next_owner_action"] is None:
         detail["next_owner_action"] = design["owner_action"]
     # The worker's run records come with migration 085; before it the panel says so and nothing else changes.
-    detail["platform_work"] = _platform_work(connection, tenant_id, row, checks, case, external)
+    detail["platform_work"] = _platform_work(connection, tenant_id, row, checks, case, external, now=now)
     return detail
 
 

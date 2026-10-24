@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -194,6 +195,56 @@ def _record_outputs(result: dict) -> None:
         pass
 
 
+# Account ids anywhere in a text (IBKR U…/F…, Kiwoom KIW…): the log keeps the last three characters.
+_ACCOUNT_ID_IN_TEXT = re.compile(r"[A-Z]{1,3}\d{5,}")
+
+
+def _mask(text: object) -> str:
+    return _ACCOUNT_ID_IN_TEXT.sub(lambda match: "***" + match.group()[-3:], str(text))
+
+
+def log_summary(result: dict) -> dict:
+    """What the console (and so Log Analytics) gets: keys, dates, counts and statuses only.
+    No metric values and no full account ids; the full result stays in ingestion_runs."""
+    subjects = []
+    for account in result.get("accounts") or []:
+        benchmarks = []
+        for item in account.get("benchmarks") or []:
+            benchmarks.append({
+                "benchmark_id": item.get("benchmark_id"), "mapping_type": item.get("mapping_type"),
+                "available": item.get("available"), "quality_status": item.get("quality_status"),
+                "failed_checks": sorted({issue.get("check_id") for issue in item.get("quality_issues") or []
+                                         if issue.get("status") == "fail"}),
+                "benchmark_observations": item.get("benchmark_observations"),
+                "comparison_rows": item.get("comparison_rows"),
+                "latest_benchmark_date": item.get("latest_benchmark_date"),
+                "period_end": (item.get("metrics") or {}).get("period_end"),
+            })
+        replay = account.get("crisis_replay") or {}
+        subjects.append({
+            "subject": _mask(account.get("account_id")), "quality_status": account.get("quality_status"),
+            "benchmark_observations": account.get("benchmark_observations"),
+            "comparison_rows": account.get("comparison_rows"),
+            **({"crisis_replay_observations": replay.get("observations", 0)} if replay else {}),
+            "benchmarks": benchmarks,
+        })
+    scenarios = result.get("crisis_scenarios") or {}
+    summary = {
+        "status": result.get("status"), "subjects": subjects,
+        "benchmark_observations": result.get("benchmark_observations"),
+        "crisis_replay_observations": result.get("crisis_replay_observations"),
+        "crisis_scenarios": {"status": scenarios.get("status", "success"),
+                             "subjects": len(scenarios.get("subjects") or {}),
+                             **({"error": _mask(scenarios["error"])} if scenarios.get("error") else {})},
+    }
+    if result.get("held_back_by_publish_gate"):
+        summary["held_back_by_publish_gate"] = [
+            {"subject": _mask(item.get("account_id")), "kind": item.get("kind", "publish_gate"),
+             "reason": _mask(item.get("reason", ""))[:500]}
+            for item in result["held_back_by_publish_gate"]]
+    return summary
+
+
 def main() -> int:
     input_readiness.gate("benchmark-daily")
     if os.environ.get("DEPLOYMENT_ENVIRONMENT", "").lower() not in {
@@ -321,7 +372,7 @@ def main() -> int:
             reconciliation_json=payload,
         )
         _record_outputs(result)
-        print(payload)
+        print(canonical_json(log_summary(result)))
         # The run record stays a success, so the next jobs' readiness is not stopped for
         # every subject; the exit code shows the hold.
         return publish_gate.EXIT_REJECTED if held_back else 0

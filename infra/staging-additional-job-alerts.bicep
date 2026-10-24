@@ -7,6 +7,7 @@ param jobNames array = [
   'ibkrv2stg-derived-daily'
   'ibkrv2stg-risk-snapshots'
   'ibkrv2stg-institutional-daily'
+  'ibkrv2stg-onboard-worker'
   'ibkrv2stg-flex-discovery'
   'ibkrv2stg-onboard-render'
   'ibkrv2stg-onboard-analytics'

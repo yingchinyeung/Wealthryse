@@ -108,6 +108,7 @@ MAPPING = [
 PLANNED = [
     ("staging-certified-figures-job.bicep", "job", "ibkrv2stg-certified-figures", "apps", "daily-pipeline"),
     ("agent-apps.bicep", "dispatcherJob", "ibkrv2stg-agent-dispatcher", "ai", "agents"),
+    ("staging-onboarding-worker-job.bicep", "job", "ibkrv2stg-onboard-worker", "data", "onboarding"),
 ]
 CATALOG_JOBS = json.loads((INFRA / "medallion" / "catalog.json").read_text(encoding="utf-8"))["jobs"]
 

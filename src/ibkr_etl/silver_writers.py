@@ -72,6 +72,8 @@ LOADER_JOBS: dict[str, str] = {
         "started by the web app for a new account: benchmark, crisis-replay prices, classifications, English names",
     "ibkrv2stg-onboard-render":
         "started by the web app to render a new account's reports; also runs one-off scripts as an override",
+    "ibkrv2stg-onboard-worker":
+        "self-service onboarding: an open case's Kiwoom load and history, English names and classifications",
     "ibkrv2stg-crisis-scenarios-daily":
         "the crisis scenarios' Yahoo closes and FX quotes (CRISIS_PRICES_SOURCE=silver), before it computes from them",
     "ibkrv2stg-bootstrap":
@@ -85,6 +87,7 @@ ONE_OFF = "one-off script run by hand or as a job command override"
 NOT_A_JOB: tuple[str, ...] = (LOCAL_ONLY, TEMP_ONLY, ONE_OFF_RENDER, ONE_OFF)
 
 _ONBOARDING = ("ibkrv2stg-onboard-analytics", "ibkrv2stg-onboard-render")
+_WORKER = "ibkrv2stg-onboard-worker"
 
 # path -> (silver relations it writes, sorted; the jobs that run it, or a NOT_A_JOB marker)
 WRITER_FILES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
@@ -97,18 +100,18 @@ WRITER_FILES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "src/ibkr_etl/kiwoom_collector.py": (
         ("accounts", "cash_snapshots", "cash_transactions", "fx_rates", "instruments",
          "nav_snapshots", "position_snapshots", "trades"),
-        ("ibkrv2stg-institutional-daily",),
+        ("ibkrv2stg-institutional-daily", _WORKER),
     ),
     "src/ibkr_etl/kiwoom_us_account.py": (
         ("accounts",),
-        ("ibkrv2stg-institutional-daily",),
+        ("ibkrv2stg-institutional-daily", _WORKER),
     ),
     # apply_english_names runs in the collector and in every classification refresh;
     # translate_account runs from scripts/translate_kiwoom_text.py.
     "src/ibkr_etl/kiwoom_english.py": (
         ("cash_transactions", "instruments", "trades"),
         ("ibkrv2stg-institutional-daily", "ibkrv2stg-sector-classification", "ibkrv2stg-derived-daily",
-         *_ONBOARDING, ONE_OFF),
+         *_ONBOARDING, _WORKER, ONE_OFF),
     ),
     "src/ibkr_etl/pilot_import.py": (
         ("accounts", "cash_snapshots", "cash_transactions", "corporate_actions", "fx_rates",
@@ -133,7 +136,7 @@ WRITER_FILES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "src/ibkr_etl/risk_free.py": (("risk_free_rates",), ("ibkrv2stg-risk-free-daily",)),
     "src/ibkr_etl/sector_classification.py": (
         ("instrument_classifications",),
-        ("ibkrv2stg-sector-classification", "ibkrv2stg-derived-daily", *_ONBOARDING),
+        ("ibkrv2stg-sector-classification", "ibkrv2stg-derived-daily", *_ONBOARDING, _WORKER),
     ),
     "src/ibkr_etl/derived_portfolio.py": (
         ("derived_portfolio_cash_balances", "derived_portfolio_cash_ledger", "derived_portfolio_exclusions",

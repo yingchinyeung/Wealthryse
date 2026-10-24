@@ -244,6 +244,10 @@ ONBOARDING_REPORT_JOB_NAME = os.environ.get(
 ONBOARDING_ANALYTICS_JOB_NAME = os.environ.get(
     "ONBOARDING_ANALYTICS_JOB_NAME", "ibkrv2stg-onboard-analytics"
 ).strip()
+# Run now and Check now on the new onboarding pages (onboarding_worker.py).
+ONBOARDING_WORKER_JOB_NAME = os.environ.get(
+    "ONBOARDING_WORKER_JOB_NAME", "ibkrv2stg-onboard-worker"
+).strip()
 YAHOO_ONBOARDING_DISCLOSURE_VERSION = yahoo_disclosure.VERSION
 YAHOO_ONBOARDING_SCOPE = yahoo_disclosure.SCOPE
 YAHOO_ONBOARDING_SCOPE_SHA256 = yahoo_disclosure.SCOPE_SHA256
@@ -11620,6 +11624,12 @@ def _upload_intake_document(container: str, blob: str, content: bytes, content_t
     upload_bytes(AZURE_STORAGE_ACCOUNT_URL, container, blob, content, overwrite=False, content_type=content_type)
 
 
+def _start_onboarding_worker() -> str:
+    if not ADMIN_ACTION_CONFIG.subscription_id or not ADMIN_ACTION_CONFIG.resource_group:
+        raise AdminActionError(503, "azure_job_starter_unavailable", "The Azure job starter is not configured")
+    return _default_job_starter(ADMIN_ACTION_CONFIG, ONBOARDING_WORKER_JOB_NAME)
+
+
 # New account onboarding (broker connections and four-stage cases). Every
 # route answers 404 unless ONBOARDING_V2_ENABLED is true; see onboarding_v2_web.py.
 onboarding_v2_web.install(
@@ -11642,6 +11652,8 @@ onboarding_v2_web.install(
     intake_container=ONBOARDING_INTAKE_CONTAINER,
     # "Ask about this case", answered by the agent service from the case's facts (also behind that switch).
     ask_case=lambda: _case_question_stream(),
+    # Run now and Check now start the onboarding worker job (the web identity may start only that job).
+    start_worker=lambda: _start_onboarding_worker(),
 )
 
 

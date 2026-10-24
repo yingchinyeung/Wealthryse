@@ -180,6 +180,11 @@
    "layer": "ops",
    "target_schema": "public"
   },
+  "public.onboarding_worker_runs": {
+   "kind": "table",
+   "layer": "ops",
+   "target_schema": "public"
+  },
   "public.burn_in_acceptance_windows": {
    "kind": "table",
    "layer": "ops",
@@ -1639,6 +1644,14 @@
     "publish"
    ],
    "schedule": "manual (from the website)"
+  },
+  "ibkrv2stg-onboard-worker": {
+   "hops": [
+    "ingest",
+    "conform"
+   ],
+   "schedule": "every 20 minutes, and from the website (Run now, Check now)",
+   "note": "Self-service onboarding: each open case's Kiwoom load and history (bronze first, then silver), names and sectors, the historical reports and the agent review's check. Outside the daily chain and Kiwoom's rebuild hours."
   },
   "ibkrv2stg-report-snapshot": {
    "hops": [

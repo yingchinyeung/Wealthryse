@@ -260,6 +260,38 @@ class OnboardingV2WebTests(unittest.TestCase):
         self.assertEqual(consent.call_args.kwargs["scope_sha256"], "b" * 64)
         self.assertEqual(web.YAHOO_ONBOARDING_SCOPE_SHA256, onboarding_v2_web.yahoo_disclosure.SCOPE_SHA256)
 
+    def test_run_now_writes_one_request_and_starts_only_the_worker_job(self):
+        connection = _RecordingConnection()
+        case_id = "00000000-0000-0000-0000-000000000001"
+        with patch.dict(os.environ, ON), \
+                patch.object(web, "_approval_database", side_effect=lambda: _database(connection)), \
+                patch.object(onboarding_v2_web, "request_worker_run",
+                             return_value={"run_id": "r1", "status": "requested"}) as request, \
+                patch.object(onboarding_v2_web, "note_worker_start") as noted, \
+                patch.object(web, "_start_onboarding_worker", return_value="ibkrv2stg-onboard-worker-abc") as start:
+            response = self.client.post(f"/api/onboarding-v2/cases/{case_id}/run-now")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual((response.json()["status"], response.json()["started"]), ("requested", True))
+        self.assertEqual(request.call_args.kwargs["case_id"], case_id)
+        start.assert_called_once_with()
+        self.assertEqual(noted.call_args.args[2:], ("r1", "ibkrv2stg-onboard-worker-abc", None))
+        self.assertEqual(web.ONBOARDING_WORKER_JOB_NAME, "ibkrv2stg-onboard-worker")
+
+    def test_a_worker_that_cannot_start_leaves_the_request_for_the_schedule(self):
+        connection = _RecordingConnection()
+        with patch.dict(os.environ, ON), \
+                patch.object(web, "_approval_database", side_effect=lambda: _database(connection)), \
+                patch.object(onboarding_v2_web, "request_worker_run",
+                             return_value={"run_id": "r2", "status": "requested"}), \
+                patch.object(onboarding_v2_web, "note_worker_start") as noted, \
+                patch.object(web, "_start_onboarding_worker", side_effect=RuntimeError("refused")):
+            response = self.client.post(
+                "/api/broker-connections/00000000-0000-0000-0000-000000000002/check")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["started"])
+        self.assertIn("next scheduled run", response.json()["message"])
+        self.assertIn("next scheduled run", noted.call_args.args[4])
+
     def test_refusals_come_back_as_plain_messages(self):
         connection = _RecordingConnection()
         refusal = onboarding_v2_web.OnboardingError("Another account is still being onboarded")

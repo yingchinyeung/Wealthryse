@@ -39,7 +39,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 from .kiwoom_client import MAX_SELLING_COST_RATE, AccountValuation, CashMovement, Holding, KiwoomClient, \
@@ -706,6 +706,18 @@ class Target:
     history_start: date | None
     # The onboarding case's reporting currency; a USD case is loaded by kiwoom_us_account.
     reporting_currency: str | None = None
+    # Whether this case reads the account's U.S. holdings and balances too (the start form's
+    # choice); None leaves it to the run's KIWOOM_INCLUDE_US.
+    include_us: bool | None = None
+
+
+def _optional(row, key: str) -> Any:
+    """A column a database before migration 085 does not have yet, as None."""
+
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
 
 
 def targets(connection, tenant_id: str) -> list[Target]:
@@ -714,7 +726,8 @@ def targets(connection, tenant_id: str) -> list[Target]:
     rows = connection.execute(
         "SELECT b.connection_id, b.environment, b.key_vault_secret_name, a.broker_account_id, c.case_id, c.stage, "
         "COALESCE(c.display_name, a.account_name, b.display_name) AS display_name, c.history_start_date, "
-        "c.reporting_currency "
+        # Read through to_jsonb so a database before migration 085 (no such column) still answers.
+        "c.reporting_currency, (to_jsonb(c) ->> 'kiwoom_include_us')::boolean AS kiwoom_include_us "
         "FROM broker_connections b JOIN broker_connection_accounts a "
         "ON a.tenant_id = b.tenant_id AND a.connection_id = b.connection_id "
         "LEFT JOIN broker_onboarding_cases c ON c.tenant_id = b.tenant_id AND c.connection_id = b.connection_id "
@@ -734,6 +747,7 @@ def targets(connection, tenant_id: str) -> list[Target]:
             display_name=str(row["display_name"]),
             history_start=date.fromisoformat(str(start)[:10]) if start else None,
             reporting_currency=str(row["reporting_currency"]) if row["reporting_currency"] else None,
+            include_us=_optional(row, "kiwoom_include_us"),
         ))
     return found
 
@@ -807,8 +821,16 @@ def _history_record(connection, tenant_id: str, target: Target, build: Callable[
 
 
 def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClient], today: date,
-        now: datetime, include_us: bool = True, bronze: Any = None) -> list[dict[str, Any]]:
+        now: datetime, include_us: bool = True, bronze: Any = None,
+        case_ids: Collection[str] | None = None, connection_ids: Collection[str] | None = None,
+        history: bool = True) -> list[dict[str, Any]]:
     """Collect every Kiwoom account. One account's failure never stops the others.
+
+    ``case_ids`` limits the run to the accounts of those onboarding cases (the onboarding worker's
+    run for one case), and ``connection_ids`` to those connections' accounts (Check now on a new
+    connection); every other account is left as it is. ``history`` false skips the past-day
+    fill, which the worker leaves out during Kiwoom's rebuild hours; the day's load still runs.
+    A case's own U.S. choice (Target.include_us) wins over ``include_us``.
 
     ``bronze`` (kiwoom_bronze.KiwoomBronze, only when KIWOOM_BRONZE=true) stores every inquiry page as received.
     Required (KIWOOM_BRONZE_REQUIRED=true), a page it cannot store fails that account: its silver writes not yet
@@ -818,7 +840,16 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
     """
 
     results = []
+    wanted = None if case_ids is None else {str(item) for item in case_ids}
+    logins = None if connection_ids is None else {str(item) for item in connection_ids}
+    run_include_us = include_us
     for target in targets(connection, tenant_id):
+        if wanted is not None and target.case_id not in wanted:
+            continue
+        if logins is not None and target.connection_id not in logins:
+            continue
+        target_us = getattr(target, "include_us", None)
+        include_us = run_include_us if target_us is None else bool(target_us)
         result: dict[str, Any] = {"connection_id": target.connection_id, "account": target.broker_account_id,
                                   "case_id": target.case_id}
         client = None
@@ -864,7 +895,10 @@ def run(connection, tenant_id: str, *, client_for: Callable[[Target], KiwoomClie
                     if stage != "load_and_reconcile":
                         break
             connection.commit()
-            if stage in HISTORY_STAGES or stage in REFRESH_STAGES:
+            if not history and (stage in HISTORY_STAGES or stage in REFRESH_STAGES):
+                result["history"] = {"check": "skipped", "recorded": False,
+                                     "reason": "Kiwoom's rebuild hours; the next run fills the past days"}
+            elif stage in HISTORY_STAGES or stage in REFRESH_STAGES:
                 result["history"] = _history(connection, tenant_id, client, target, today=today, now=now,
                                              include_us=include_us, record=stage == "build_history")
             results.append({**result, "status": "loaded", "stage": stage, "rows": counts})

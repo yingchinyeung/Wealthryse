@@ -50,10 +50,11 @@ class OnboardingTablesDatabaseTests(unittest.TestCase):
         self.bundle["database"] = self.database
         # The medallion layer migrations (068 on) came after this rollout and move its tables, and
         # NEEDS_LAYERS (074) runs only once they have; 082 (Kiwoom's raw answers in bronze) came
-        # after it too and refers to its broker_connections.
+        # after it too and refers to its broker_connections, as 085 (the onboarding worker) does to its
+        # cases.
         later = {path.name for path in (ROOT / "migrations" / "postgres").glob("*_medallion_*.sql")}
         later.update(NEEDS_LAYERS)
-        later.add("082_kiwoom_bronze.sql")
+        later.update({"082_kiwoom_bronze.sql", "085_onboarding_worker.sql"})
         self.bundle["expected"] = {k: v for k, v in self.bundle["expected"].items() if k not in later}
         skipped = (set(self.bundle["targets"]) | set(self.bundle["held_back"]) | set(self.bundle["other_rollouts"])
                    | later)

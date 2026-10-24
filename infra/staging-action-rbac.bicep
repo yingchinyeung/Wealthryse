@@ -6,6 +6,7 @@ param riskFreeJobName string = 'ibkrv2stg-risk-free-daily'
 param derivedRefreshJobName string = 'ibkrv2stg-derived-daily'
 param onboardingReportJobName string = 'ibkrv2stg-onboard-render'
 param onboardingAnalyticsJobName string = 'ibkrv2stg-onboard-analytics'
+param onboardingWorkerJobName string = 'ibkrv2stg-onboard-worker'
 param keyVaultName string
 param approvalDatabaseSecretName string = 'database-approval-url'
 
@@ -31,6 +32,11 @@ resource onboardingReportJob 'Microsoft.App/jobs@2024-03-01' existing = {
 
 resource onboardingAnalyticsJob 'Microsoft.App/jobs@2024-03-01' existing = {
   name: onboardingAnalyticsJobName
+}
+
+// Run now and Check now on the onboarding pages start this job (staging-onboarding-worker-job.bicep).
+resource onboardingWorkerJob 'Microsoft.App/jobs@2024-03-01' existing = {
+  name: onboardingWorkerJobName
 }
 
 resource vault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
@@ -104,6 +110,16 @@ resource onboardingAnalyticsOperator 'Microsoft.Authorization/roleAssignments@20
   }
 }
 
+resource onboardingWorkerOperator 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(onboardingWorkerJob.id, webIdentity.id, jobsOperatorRole.id)
+  scope: onboardingWorkerJob
+  properties: {
+    principalId: webIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    roleDefinitionId: jobsOperatorRole.id
+  }
+}
+
 resource approvalSecretReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(approvalDatabaseSecret.id, webIdentity.id, keyVaultSecretsUserRole.id)
   scope: approvalDatabaseSecret
@@ -119,4 +135,5 @@ output riskFreeJobId string = riskFreeJob.id
 output derivedRefreshJobId string = derivedRefreshJob.id
 output onboardingReportJobId string = onboardingReportJob.id
 output onboardingAnalyticsJobId string = onboardingAnalyticsJob.id
+output onboardingWorkerJobId string = onboardingWorkerJob.id
 output approvalDatabaseSecretId string = approvalDatabaseSecret.id

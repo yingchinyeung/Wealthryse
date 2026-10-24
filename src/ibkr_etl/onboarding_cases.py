@@ -36,9 +36,10 @@ STAGE_LABELS = {
     "first_month_end": "First month-end",
     "closed": "Closed",
 }
-# Only one account at a time is onboarded: a new case may start once every
-# other case has gone live (or was cancelled).
+# Cases before go-live. Up to MAX_OPEN_CASES of them at a time (migration 085 replaced the
+# one-at-a-time index with this limit); a new case may start once one goes live or is cancelled.
 PRE_LIVE_STAGES = ("request", "load_and_reconcile", "build_history")
+MAX_OPEN_CASES = 3
 
 SOURCE_KINDS = ("broker_account", "filtered_portfolio", "composite_portfolio")
 DERIVED_SOURCE_KINDS = ("filtered_portfolio", "composite_portfolio")
@@ -285,8 +286,9 @@ def assert_can_start(
     broker_account_id: str | None = None,
     target_subject_id: str | None = None,
 ) -> None:
-    """One account at a time, and never the same account or portfolio twice."""
+    """At most MAX_OPEN_CASES before go-live, and never the same account or portfolio twice."""
 
+    pre_live = 0
     for other in open_cases:
         if other.cancelled:
             continue
@@ -295,9 +297,11 @@ def assert_can_start(
         if target_subject_id and other.target_subject_id == target_subject_id:
             raise ValueError("This portfolio ID already has an onboarding case")
         if other.stage in PRE_LIVE_STAGES:
-            raise ValueError(
-                "Another account is still being onboarded; it must go live or be cancelled first"
-            )
+            pre_live += 1
+    if pre_live >= MAX_OPEN_CASES:
+        raise ValueError(
+            f"{MAX_OPEN_CASES} accounts are already being onboarded; one must go live or be cancelled first"
+        )
 
 
 def progress(case: OnboardingCase) -> list[dict[str, str]]:

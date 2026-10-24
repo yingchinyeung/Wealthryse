@@ -600,7 +600,9 @@ Only the named loader jobs write silver. Three parts, each with its own undo:
    24 Oct 2026 00:38 UTC: the 9 loader jobs (institutional-daily, flex-discovery, the import
    job, benchmark-daily, risk-free-daily, sector-classification, derived-daily,
    onboard-analytics and onboard-render) log in as `ibkr_stg_loader`. The bootstrap job
-   carries the loader settings (`loaderRole` in `infra/staging-bootstrap-job.bicep`). Undo:
+   carries the loader settings (`loaderRole` in `infra/staging-bootstrap-job.bicep`). The
+   onboarding worker (`ibkrv2stg-onboard-worker`, `infra/staging-onboarding-worker-job.bicep`,
+   docs/SELF_SERVICE_ONBOARDING.md) is a loader job from its first deploy. Undo:
    the jobs back on `database-app-url`; the login and secrets stay, unused. The undo is
    refused while the lock is on.
 3. **Lock.** Bootstrap with `SILVER_WRITE_LOCK=on` takes INSERT, UPDATE, DELETE and TRUNCATE

@@ -41,6 +41,7 @@ param adminActionsEnabled bool = false
 param derivedRefreshJobName string = 'ibkrv2stg-derived-daily'
 param onboardingReportJobName string = 'ibkrv2stg-onboard-render'
 param onboardingAnalyticsJobName string = 'ibkrv2stg-onboard-analytics'
+param onboardingWorkerJobName string = 'ibkrv2stg-onboard-worker'
 param storageAccountUrl string = 'https://ibkrv2stgauhecwc4itaoo.blob.${environment().suffixes.storage}'
 param internalReportContainer string = 'internal-reports'
 param onboardingIntakeContainer string = 'onboarding-intake'
@@ -155,6 +156,7 @@ resource web 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'DERIVED_REFRESH_JOB_NAME', value: derivedRefreshJobName }
             { name: 'ONBOARDING_REPORT_JOB_NAME', value: onboardingReportJobName }
             { name: 'ONBOARDING_ANALYTICS_JOB_NAME', value: onboardingAnalyticsJobName }
+            { name: 'ONBOARDING_WORKER_JOB_NAME', value: onboardingWorkerJobName }
             { name: 'AZURE_STORAGE_ACCOUNT_URL', value: storageAccountUrl }
             { name: 'INTERNAL_REPORT_CONTAINER', value: internalReportContainer }
             { name: 'ONBOARDING_INTAKE_CONTAINER', value: onboardingIntakeContainer }

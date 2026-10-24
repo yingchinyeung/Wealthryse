@@ -194,12 +194,13 @@ class OnboardingCaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a check"):
             record_check(case, "history_built", "pass")
 
-    def test_one_account_at_a_time(self) -> None:
+    def test_up_to_three_accounts_at_a_time(self) -> None:
         live = _case(case_id="a", broker_account_id="50123456", stage="first_month_end")
-        working = _case(case_id="b", broker_account_id="50999999", stage="build_history")
+        working = [_case(case_id=f"b{n}", broker_account_id=f"5099999{n}", stage="build_history") for n in range(3)]
         assert_can_start(broker="ibkr_flex", broker_account_id="U16088571", open_cases=[live])
-        with self.assertRaisesRegex(ValueError, "still being onboarded"):
-            assert_can_start(broker="ibkr_flex", broker_account_id="U16088571", open_cases=[live, working])
+        assert_can_start(broker="ibkr_flex", broker_account_id="U16088571", open_cases=[live, *working[:2]])
+        with self.assertRaisesRegex(ValueError, "3 accounts are already being onboarded"):
+            assert_can_start(broker="ibkr_flex", broker_account_id="U16088571", open_cases=[live, *working])
         with self.assertRaisesRegex(ValueError, "already has"):
             assert_can_start(broker="kiwoom_rest", broker_account_id="50123456", open_cases=[live])
         cancelled = _case(case_id="c", broker_account_id="50999999", cancelled=True)
@@ -219,9 +220,12 @@ class OnboardingCaseTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "portfolio ID already has"):
             assert_can_start(target_subject_id="synthetic-long-short", open_cases=[composite])
-        with self.assertRaisesRegex(ValueError, "still being onboarded"):
+        others = [_case(case_id=f"o{n}", broker_account_id=f"5077777{n}") for n in range(2)]
+        assert_can_start(broker="kiwoom_rest", broker_account_id="50123456",
+                         target_subject_id="KIWOOM-50123456", open_cases=[composite, *others[:1]])
+        with self.assertRaisesRegex(ValueError, "already being onboarded"):
             assert_can_start(broker="kiwoom_rest", broker_account_id="50123456",
-                             target_subject_id="KIWOOM-50123456", open_cases=[composite])
+                             target_subject_id="KIWOOM-50123456", open_cases=[composite, *others])
         with self.assertRaisesRegex(ValueError, "broker account case"):
             _case(source_kind="composite_portfolio", target_subject_id="synthetic-long-short")
         with self.assertRaisesRegex(ValueError, "broker account case"):

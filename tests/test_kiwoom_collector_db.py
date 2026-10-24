@@ -407,6 +407,26 @@ class KiwoomCollectorDatabaseTests(_MigratedDatabase):
         self._run({"3234567890": FakeKiwoom(total="8100000")})
         self.assertEqual(self._checks(case_id)["nav_reconciled"], "fail")
 
+    def test_the_onboarding_worker_runs_one_case_and_its_us_choice(self):
+        from ibkr_etl.kiwoom_collector import run, targets
+        from ibkr_etl.onboarding_v2_web import set_case_terms
+
+        _, first = self._kiwoom_account("44345601")
+        second_connection, second = self._kiwoom_account("44345602")
+        set_case_terms(self.db, TENANT, second, benchmarks=None, include_us=True, actor=None)
+        self.db.commit()
+        found = {target.case_id: target.include_us for target in targets(self.db, TENANT)}
+        self.assertEqual((found[first], found[second]), (None, True))
+        clients = {"44345601": FakeKiwoom(), "44345602": FakeKiwoom()}
+        only = run(self.db, TENANT, client_for=lambda target: clients[target.broker_account_id], today=TODAY,
+                   now=NOW, include_us=False, case_ids={first})
+        self.assertEqual([item["case_id"] for item in only], [first])
+        self.assertEqual(only[0]["status"], "loaded")
+        self.assertEqual(self._count("position_snapshots", "KIWOOM-44345602"), 0)
+        checked = run(self.db, TENANT, client_for=lambda target: clients[target.broker_account_id], today=TODAY,
+                      now=NOW, include_us=False, connection_ids={second_connection}, case_ids=set(), history=False)
+        self.assertEqual(checked, [])
+
     def test_an_account_without_a_case_is_only_checked(self):
         connection_id, _ = self._kiwoom_account("44345678", case=False)
         results = self._run({"44345678": FakeKiwoom()})

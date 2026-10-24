@@ -9,6 +9,10 @@ The optional FX event step (IBKR_FX_EVENT_KEY, review item U8) needs the FX
 step's migration (silver.fx_transactions.event_key). With it, an FX row IBKR
 re-sends with restated amounts updates the row for the same FX event instead of
 adding a second one. Without it, nothing here reads or writes event_key.
+
+The Transfers section goes to silver.transfers (migration 084) as well as to
+flex_rows, once that table exists; a database without it keeps Transfers in
+flex_rows only, as before.
 """
 from __future__ import annotations
 
@@ -333,6 +337,54 @@ def _upsert_cash_transaction(connection: sqlite3.Connection, row: FlexRow, run_i
     )
 
 
+TRANSFERS_TABLE = "transfers"
+TRANSFER_COLUMNS = ("account_id", "source_key", "flex_account_id", "transaction_id", "transfer_date", "report_date",
+                    "asset_category", "transfer_type", "direction", "description", "conid", "currency",
+                    "quantity_text", "cash_transfer_text", "position_amount_text", "position_amount_in_base_text",
+                    "row_sha256", "last_seen_run_id")
+
+
+def has_transfers_table(connection) -> bool:
+    """Whether silver.transfers (migration 084) is there to write; SQLite has it from 001_init.sql."""
+    if getattr(connection, "backend", "sqlite") == "postgresql":
+        return connection.execute("SELECT to_regclass(?)", (TRANSFERS_TABLE,)).fetchone()[0] is not None
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?", (TRANSFERS_TABLE,)
+    ).fetchone() is not None
+
+
+def transfer_values(row: FlexRow, run_id: int) -> dict[str, Any]:
+    """A Transfers record as silver.transfers holds it: IBKR's own accountId (a consolidated copy carries
+    "-"), dates as ISO text, amounts as decimal text, under the same key and digest as its flex_rows row."""
+    a = row.attributes
+
+    def text(*names: str) -> str | None:
+        return pick(a, *names) or None
+
+    return {
+        "account_id": row.account_id, "source_key": row.source_key,
+        "flex_account_id": text("accountId"), "transaction_id": text("transactionID"),
+        "transfer_date": parse_date_text(pick(a, "date")), "report_date": parse_date_text(pick(a, "reportDate")),
+        "asset_category": text("assetCategory"), "transfer_type": text("type"), "direction": text("direction"),
+        "description": text("description"), "conid": row.conid, "currency": text("currency"),
+        "quantity_text": decimal_text(pick(a, "quantity")),
+        "cash_transfer_text": decimal_text(pick(a, "cashTransfer")),
+        "position_amount_text": decimal_text(pick(a, "positionAmount")),
+        "position_amount_in_base_text": decimal_text(pick(a, "positionAmountInBase")),
+        "row_sha256": row.row_sha256, "last_seen_run_id": run_id,
+    }
+
+
+def upsert_transfer(connection, row: FlexRow, run_id: int) -> None:
+    values = transfer_values(row, run_id)
+    updates = ", ".join(f"{column}=excluded.{column}" for column in TRANSFER_COLUMNS[2:])
+    connection.execute(
+        f"INSERT INTO transfers({', '.join(TRANSFER_COLUMNS)}) VALUES ({', '.join('?' for _ in TRANSFER_COLUMNS)}) "
+        f"ON CONFLICT(account_id, source_key) DO UPDATE SET {updates}",
+        tuple(values[column] for column in TRANSFER_COLUMNS),
+    )
+
+
 def _upsert_corporate_action(connection: sqlite3.Connection, row: FlexRow, run_id: int) -> None:
     a = row.attributes
     connection.execute(
@@ -571,6 +623,8 @@ def load_report(
         reused += 1
         return replace(row, source_key=legacy)
 
+    transfers = any(row.section == "Transfers" for row in report.rows) and has_transfers_table(connection)
+
     # Instrument details can appear after trades in a Flex document. Load all
     # dimensions first so security resolution is independent of XML section order.
     for row in report.rows:
@@ -583,6 +637,9 @@ def load_report(
     for row in report.rows:
         counts[row.record_type] = counts.get(row.record_type, 0) + 1
         _upsert_flex_row(connection, row, run_id)
+
+        if transfers and row.section == "Transfers":
+            upsert_transfer(connection, row, run_id)
 
         kind = row.record_type.lower()
         section = row.section.lower()

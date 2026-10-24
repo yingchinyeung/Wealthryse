@@ -5,10 +5,12 @@ Skipped otherwise. Builds its own database with every migration (the layer moves
 loads made-up daily Flex statements with today's loader, and checks:
 
 - fallback inside a READ ONLY transaction, as the website and the agents read: silver when it
-  equals bronze, bronze and one log line when it does not;
+  equals bronze, transfers included (silver.transfers, 084), bronze and one log line when it
+  does not;
 - a login that cannot read silver cash_transactions (as the agent tool server's today): bronze,
   one log line, and the caller's transaction still usable afterwards;
-- the comparison command: read-only, every subject of each tenant named, counts only.
+- the comparison command: read-only, every subject of each tenant named, counts only;
+- the fill command: read-only without --apply, and with it silver.transfers as the loader wrote it.
 
 Synthetic accounts and amounts only.
 """
@@ -117,6 +119,20 @@ class FlowsSourceDbTests(unittest.TestCase):
             raw.rollback()
             raw.close()
 
+    @contextlib.contextmanager
+    def without_silver_transfers(self):
+        """A transaction, rolled back, in which silver.transfers is empty, as before the fill."""
+        import psycopg
+
+        raw = psycopg.connect(layers._dsn(self.database, layers.OWNER), row_factory=_hybrid_row_factory)
+        try:
+            raw.execute("SELECT set_config('app.tenant_id', %s, true)", (TENANT,))
+            self.assertEqual(raw.execute("DELETE FROM silver.transfers").rowcount, 1)
+            yield raw, PostgresConnection(raw)
+        finally:
+            raw.rollback()
+            raw.close()
+
     def flows(self, connection, subject: str, mode: str) -> dict[str, float]:
         with patch.dict(os.environ, {"FLOWS_SOURCE": mode}):
             return _external_flows(connection, subject)
@@ -136,8 +152,19 @@ class FlowsSourceDbTests(unittest.TestCase):
             self.assertEqual(raw.info.transaction_status.name, "INTRANS")
         self.assertEqual(self.lines, [])
 
-    def test_a_transfer_keeps_bronze_and_logs_one_line(self):
+    def test_a_transfer_is_read_from_silver(self):
         with self.read_only() as (_raw, connection):
+            bronze = _bronze_external_flows(connection, OTHER)
+            self.assertEqual(bronze[(FIRST + timedelta(days=4)).isoformat()], 3000.0)
+            silver = flows_source.silver_external_flows(connection, OTHER)
+            self.assertEqual(silver, bronze)
+            for mode in ("fallback", "on"):
+                with self.subTest(mode=mode):
+                    self.assertEqual(self.flows(connection, OTHER, mode), silver)
+        self.assertEqual(self.lines, [])
+
+    def test_a_transfer_not_in_silver_keeps_bronze_and_logs_one_line(self):
+        with self.without_silver_transfers() as (_raw, connection):
             bronze = _bronze_external_flows(connection, OTHER)
             self.assertEqual(self.flows(connection, OTHER, "fallback"), bronze)
         self.assertEqual(self.logged(), [{"dates_differing": 1, "decision": "bronze", "kinds":
@@ -167,7 +194,7 @@ class FlowsSourceDbTests(unittest.TestCase):
         from ibkr_etl import web
 
         access = {"subject_type": "physical_account", "base_currency": "USD", "reporting_currency": "USD"}
-        with self.read_only() as (raw, connection):
+        with self.without_silver_transfers() as (raw, connection):
             bronze = _bronze_external_flows(connection, OTHER)
             with patch.dict(os.environ, {"FLOWS_SOURCE": "fallback"}):
                 self.assertEqual(web._subject_external_flows(raw, OTHER, access), bronze)
@@ -180,7 +207,8 @@ class FlowsSourceDbTests(unittest.TestCase):
             with layers._connect(self.database) as owner:
                 return [owner.execute(f"SELECT count(*), md5(string_agg(t::text, ',' ORDER BY t::text)) FROM {table} t")
                         .fetchone() for table in ("bronze.flex_rows", "silver.cash_transactions",
-                                                  "public.platform_subjects", "public.ingestion_runs")]
+                                                  "silver.transfers", "public.platform_subjects",
+                                                  "public.ingestion_runs")]
 
         before = checksum()
         out = io.StringIO()
@@ -193,13 +221,48 @@ class FlowsSourceDbTests(unittest.TestCase):
         report = json.loads(text)
         self.assertEqual({key: report[key] for key in ("tenants", "subjects", "accounts", "portfolios_not_affected",
                                                        "matching", "differing", "errors")},
-                         {"tenants": 2, "subjects": 4, "accounts": 3, "portfolios_not_affected": 1, "matching": 2,
-                          "differing": 1, "errors": 0})
-        self.assertEqual(report["differences"], {"transfers_not_in_silver": {"subjects": 1, "dates": 1}})
-        self.assertEqual(report["flow_dates"], {"bronze": 13, "silver": 12})
+                         {"tenants": 2, "subjects": 4, "accounts": 3, "portfolios_not_affected": 1, "matching": 3,
+                          "differing": 0, "errors": 0})
+        self.assertEqual(report["differences"], {})
+        self.assertEqual(report["flow_dates"], {"bronze": 13, "silver": 13})
         self.assertEqual(report["notes"]["bronze_transfer_rows"], {"subjects": 1, "rows": 1})
-        self.assertEqual([item["subject"] for item in report["differing_subjects"]], ["u…02"])
+        self.assertEqual(report["notes"]["silver_transfer_rows"], {"subjects": 1, "rows": 1})
+        self.assertEqual(report["differing_subjects"], [])
         self.assertEqual(self.lines, [])
+
+    def test_the_fill_counts_read_only_and_writes_with_apply(self):
+        def rows() -> list:
+            with layers._connect(self.database) as owner:
+                owner.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+                return [tuple(row) for row in owner.execute("SELECT * FROM silver.transfers ORDER BY 1, 2")]
+
+        def fill(*extra: str) -> dict:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(flows_source.main(["fill-transfers", "--database-url", self.url, "--tenant", TENANT,
+                                                    "--tenant", OTHER_TENANT, *extra]), 0)
+            self.assertNotRegex(out.getvalue(), r"U9\d{5}")
+            return json.loads(out.getvalue())
+
+        written = rows()
+        self.assertEqual(len(written), 1)
+        report = fill()
+        self.assertEqual({key: report[key] for key in ("applied", "tenants", "accounts", "bronze_rows", "inserted",
+                                                       "updated", "unchanged", "only_in_silver")},
+                         {"applied": False, "tenants": 2, "accounts": 1, "bronze_rows": 1, "inserted": 0,
+                          "updated": 0, "unchanged": 1, "only_in_silver": 0})
+        with layers._connect(self.database) as owner:
+            owner.execute("SELECT set_config('app.tenant_id', %s, false)", (TENANT,))
+            owner.execute("DELETE FROM silver.transfers")
+            owner.commit()
+        try:
+            self.assertEqual(fill()["inserted"], 1)
+            self.assertEqual(rows(), [])  # nothing written without --apply
+            report = fill("--apply")
+            self.assertEqual((report["applied"], report["inserted"]), (True, 1))
+        finally:
+            self.assertEqual(rows(), written)  # as the loader wrote it, under the same run
+        self.assertEqual(fill()["unchanged"], 1)
 
     def test_the_comparison_names_only_the_tenants_given(self):
         out = io.StringIO()

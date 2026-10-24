@@ -1,7 +1,8 @@
 """Who may write the silver layer: the register behind the silver write lock.
 
-Plain data, no behaviour. SILVER_RELATIONS is the `moved` list of migration 070 (the tables
-and views now in the `silver` schema, still reachable as public.<name>). LOADER_JOBS are the
+Plain data, no behaviour. SILVER_RELATIONS is the `moved` list of migration 070 and the tables
+later migrations create and move into silver as 070 did (084: transfers), all in the `silver`
+schema and still reachable as public.<name>. LOADER_JOBS are the
 Container Apps jobs (their Bicep names) whose runs may write silver. WRITER_FILES lists every
 Python file under src/ and scripts/ that holds SQL writing a silver relation (INSERT, UPDATE,
 DELETE, TRUNCATE, COPY, MERGE, LOCK TABLE, SELECT ... FOR UPDATE / SHARE), with the relations
@@ -10,7 +11,7 @@ the live tables. The silver.<table>_history tables are written by a trigger, nev
 so they are not listed.
 
 tests/test_silver_writers.py scans the code and fails when a file writes silver without an
-entry here, when an entry no longer writes, or when SILVER_RELATIONS drifts from 070. A new
+entry here, when an entry no longer writes, or when SILVER_RELATIONS drifts from those migrations. A new
 writer goes in WRITER_FILES with its job; a new job that writes goes in LOADER_JOBS as well.
 Every other job (risk-snapshots, crisis-scenarios, certified-figures, month-end-factsheet,
 autonomous-admin, the agents) and the web app only read silver.
@@ -39,6 +40,7 @@ SILVER_RELATIONS: tuple[str, ...] = (
     "risk_free_rates",
     "synthetic_portfolio_components",
     "trades",
+    "transfers",
     "subject_cash_activity_series",
     "subject_cash_balance_series",
     "subject_live_positions",
@@ -87,7 +89,7 @@ WRITER_FILES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     # --- loader jobs
     "src/ibkr_etl/loader.py": (
         ("accounts", "cash_snapshots", "cash_transactions", "corporate_actions", "fx_rates",
-         "fx_transactions", "instruments", "nav_snapshots", "position_snapshots", "trades"),
+         "fx_transactions", "instruments", "nav_snapshots", "position_snapshots", "trades", "transfers"),
         ("ibkrv2stg-institutional-daily", "ibkrv2stg-flex-discovery"),
     ),
     "src/ibkr_etl/kiwoom_collector.py": (

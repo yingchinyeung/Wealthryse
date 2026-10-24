@@ -210,6 +210,7 @@ VOLUMES: tuple[Volume, ...] = (
     Volume("risk_free_rates", "silver", "rate_date"),
     Volume("synthetic_portfolio_components", "silver", "snapshot_date"),
     Volume("trades", "silver", "trade_date", judged=False),
+    Volume("transfers", "silver", "transfer_date", judged=False),
     # Corrections history (U8, migration 074): append-only, so the whole table must not shrink.
     Volume("cash_transactions_history", "silver", count_column="version_id", qualified=True),
     Volume("fx_rates_history", "silver", count_column="version_id", qualified=True),

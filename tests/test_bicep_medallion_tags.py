@@ -109,6 +109,12 @@ PLANNED = [
 ]
 CATALOG_JOBS = json.loads((INFRA / "medallion" / "catalog.json").read_text(encoding="utf-8"))["jobs"]
 
+# Resources S4a left untagged that the tag line of 24 Oct 2026 tags, deployed by these files:
+# (Bicep file, resource symbolic name, layer, component). The tag line writes the same values.
+TAGGED_LATER = [
+    ("platform-schedule-watchdogs.bicep", "alerts", "ops", "alerts"),
+]
+
 # In a tags expression: a `key: 'value'` pair, a lookup such as `medallionAlertTags[jobName]`,
 # or the file's own `tags` object. Read left to right, a later key wins, as in union().
 TOKEN = re.compile(
@@ -251,6 +257,13 @@ class BicepMedallionTagsTest(unittest.TestCase):
                 self.assertTrue(deployed.get("owner"))
                 self.assertIn(layer, LAYERS)
                 self.assertEqual(deployed.get("hop"), "+".join(CATALOG_JOBS[live]["hops"]))
+
+    def test_resources_tagged_later_carry_layer_component_and_owner(self):
+        for file, symbol, layer, component in TAGGED_LATER:
+            with self.subTest(file=file, symbol=symbol):
+                deployed = evaluate(file, symbol, "", with_base=True)
+                self.assertEqual((deployed.get("layer"), deployed.get("component")), (layer, component))
+                self.assertTrue(deployed.get("owner"))
 
     def test_the_table_lists_each_resource_once(self):
         self.assertEqual(len(MAPPING), len(set(MAPPING)))

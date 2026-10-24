@@ -3,6 +3,7 @@ from datetime import datetime,timedelta,timezone
 import hashlib,json,sys
 from pathlib import Path
 import control_secret_metadata_monitor_20261010 as c
+from ibkr_etl import medallion_tags
 
 RULE='ibkr-v2-secret-metadata-findings'
 PATH=c.rid('Microsoft.Insights/scheduledQueryRules',RULE)+'?api-version=2023-12-01'
@@ -40,7 +41,7 @@ union
 
 
 def definition():
-    return {'location':'eastasia','kind':'LogAlert','tags':c.TAGS,
+    return {'location':'eastasia','kind':'LogAlert','tags':medallion_tags.with_medallion(RULE,c.TAGS),
         'properties':{'displayName':'Credential metadata needs review','description':'Metadata-only expiry ownership age review and monitor-liveness alert. No secret values, no automatic expiry or rotation. Age threshold requests review only.',
             'enabled':True,'severity':2,'scopes':[c.BASE+'Microsoft.OperationalInsights/workspaces/ibkrv2stg-logs'],
             'evaluationFrequency':'PT15M','windowSize':'PT15M','overrideQueryTimeRange':'P2D','autoMitigate':True,'skipQueryValidation':False,
@@ -52,7 +53,8 @@ def definition():
 
 def verify(live):
     expected=definition()
-    if live['id'].lower()!=PATH.split('?')[0].lower() or live.get('tags')!=expected['tags']:raise ValueError('Unexpected alert identity')
+    # The Medallion tags (layer, component) may be missing still, or there with exactly their values.
+    if live['id'].lower()!=PATH.split('?')[0].lower() or not medallion_tags.same_tags(RULE,live.get('tags'),expected['tags']):raise ValueError('Unexpected alert identity')
     for key,value in expected['properties'].items():
         actual=live['properties'].get(key)
         if key=='scopes':

@@ -11,9 +11,13 @@ resource alerts 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = [for rule 
   name: rule.name
   location: 'eastasia'
   kind: 'LogAlert'
+  // layer, component and owner: the resource group's Medallion tag rule refuses a rule without them.
   tags: {
     application: 'ibkr-portfolio-platform'
     purpose: 'schedule-telemetry-watchdog'
+    layer: 'ops'
+    component: 'alerts'
+    owner: 'ying'
   }
   properties: {
     displayName: rule.name

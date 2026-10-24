@@ -10,6 +10,10 @@ import html
 import json
 import re
 
+from . import medallion_tags
+
+TAGS_KEY='resource-cost-visibility'
+
 SUB='3956e821-cee4-403f-8708-e84e2ed490eb'
 SCOPE=f'/subscriptions/{SUB}/resourceGroups/rg-ibkr-database-v11'
 DISPLAY='Portfolio platform — resource ownership and costs'
@@ -108,7 +112,8 @@ def workbook(summary, *, location):
             'showRefreshButton':True,'gridSettings':{'filter':True},
             'noDataMessage':'Inventory unavailable or empty — inspect query status; do not assume all resources were retired.'},'name':'ownership-inventory'}]}
     return {'location':location,'kind':'shared',
-        'tags':{'application':'ibkr-portfolio-platform','purpose':'resource-cost-visibility','owner':'portfolio-platform'},
+        'tags':medallion_tags.with_medallion(TAGS_KEY,{'application':'ibkr-portfolio-platform',
+            'purpose':'resource-cost-visibility','owner':'portfolio-platform'}),
         'properties':{'displayName':DISPLAY,'serializedData':json.dumps(notebook,ensure_ascii=False,allow_nan=False),
             'version':'1.0','sourceId':SCOPE,'category':'workbook',
             'description':'Read-only ownership metadata and qualified cost snapshot. Live costs use native Cost Analysis.'}}
@@ -127,7 +132,8 @@ def verify_workbook(actual,expected,resource_id):
     if 'hidden-title' in tags:
         if tags.pop('hidden-title')!=expected['properties']['displayName']:
             raise ValueError('Native workbook title tag differs')
-    if tags!=expected['tags']:raise ValueError('Workbook tags differ')
+    # The Medallion tags (layer, component) may be missing still, or there with exactly their values.
+    if not medallion_tags.same_tags(TAGS_KEY,tags,expected['tags']):raise ValueError('Workbook tags differ')
     for key,value in expected['properties'].items():
         observed=actual.get('properties',{}).get(key)
         if key=='sourceId':matches=isinstance(observed,str) and observed.lower()==value.lower()
